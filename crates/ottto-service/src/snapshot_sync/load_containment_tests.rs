@@ -57,9 +57,7 @@ fn lc_scan_page(
 }
 
 fn lc_damage(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
-    let mut value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    mutate(&mut value);
-    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::mutate_index_for_test(path, mutate);
 }
 
 fn lc_item<'a>(scan: &'a crate::snapshots::SourceScanResult, session: &str) -> &'a SnapshotItem {
@@ -87,7 +85,7 @@ fn repaired_activity_clock_keeps_stable_accepted_only_file_out_of_upload_selecti
             .map(|item| item.snapshot_fingerprint.clone())
             .collect(),
     );
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let entries = serde_json::to_value(&index.files).unwrap();
     let activity = index.snapshot_activity_at[&fingerprint].clone();
     assert!(index
@@ -133,7 +131,7 @@ fn repaired_activity_clock_keeps_stable_accepted_only_file_out_of_upload_selecti
     .unwrap();
     assert_eq!(result, ResumableUploadResult::Completed);
     assert_eq!(accepted, 0);
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let mut reloaded = ScanIndex::load(&path).unwrap();
     let settled = lc_scan_page(&root, &mut reloaded, false);
     assert_eq!(
@@ -169,7 +167,7 @@ fn lc_repaired_retry_upload(mixed: bool) {
     index
         .quarantined_snapshot_fingerprints
         .insert(retry.snapshot_fingerprint.clone(), record.clone());
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let entries = serde_json::to_value(&index.files).unwrap();
     let generation = index.generation;
     assert!(index

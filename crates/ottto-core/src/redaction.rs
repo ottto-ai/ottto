@@ -615,11 +615,11 @@ mod tests {
     #[test]
     fn redacts_paths_account_ids_and_raw_prompt_inline() {
         let redacted = redact_inline(
-            "failed path=/Users/ron/.codex/config.toml account=org_123 raw_prompt=explain my code",
+            "failed path=/Users/example/.codex/config.toml account=org_123 raw_prompt=explain my code",
         );
 
         assert_eq!(redacted, "failed [path] [account_id] [prompt]");
-        assert!(!redacted.contains("/Users/ron"));
+        assert!(!redacted.contains("/Users/example"));
         assert!(!redacted.contains("org_123"));
         assert!(!redacted.contains("explain my code"));
     }
@@ -645,7 +645,7 @@ mod tests {
             RedactedValue::String("[machine_id]".to_string())
         );
         assert_eq!(
-            redact_key_value("config_path", "/Users/ron/.codex/config.toml"),
+            redact_key_value("config_path", "/Users/example/.codex/config.toml"),
             RedactedValue::String("[path]".to_string())
         );
         assert_eq!(

@@ -41,3 +41,19 @@ sparse_lifetime_counters! {
 pub(crate) fn snapshot() -> Counts {
     Counts::totals()
 }
+
+/// Rows the local OTLP relay appended in this process.
+#[cfg(not(test))]
+pub(crate) fn otlp_appended_rows() -> u64 {
+    snapshot().otlp_relay_appended_rows
+}
+
+/// Rows this test thread appended while observed.
+#[cfg(test)]
+pub(crate) fn otlp_appended_rows() -> u64 {
+    TEST_EVENTS.with(|events| {
+        events
+            .get()
+            .map_or(0, |values| values[Event::OtlpRelayAppendedRows as usize])
+    })
+}

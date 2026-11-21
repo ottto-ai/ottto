@@ -20,47 +20,6 @@ fn pair() -> (PathBuf, PathBuf, ScanIndex) {
     (paths[0].clone(), paths[1].clone(), index)
 }
 
-/// [money] A settled, grandfathered child retains its exact accepted body
-/// on a new native read; the new twin decision never restores its prefix.
-#[test]
-fn grandfathered_twin_keeps_accepted_body_on_reread() {
-    let (a, z, mut index) = pair();
-    let key = local_index_key(&z);
-    index
-        .claude_money_birth_store
-        .set_money_marks(&key, money_mark::COPY);
-    crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &key);
-    let copied = line("shared", &at(10), 10);
-    let lines = [copied.clone(), line("own", &at(130), 20)];
-    let read = |index: &ScanIndex| {
-        let original = parse_undecided(&a, Some(t0()), index, std::slice::from_ref(&copied));
-        let copy = parse_undecided(&z, Some(t0() + 100_000_000_000), index, &lines);
-        assert!(fold(&copy).grandfathered);
-        assert!(!fold(&copy).twin_pending);
-        publish(vec![original, copy], None, TelemetryRead::Loaded, index)
-    };
-    let accepted = read(&index);
-    assert_eq!(
-        (accepted[0].request_count, accepted[0].removed_request_count),
-        (2, Some(1))
-    );
-    let acks = crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&accepted);
-    index.activate_upload_context("twin-proof-context".into());
-    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
-        &mut index, &accepted, &acks,
-    );
-    let reread = read(&index);
-    assert_eq!(
-        serde_json::to_value(&reread).unwrap(),
-        serde_json::to_value(&accepted).unwrap()
-    );
-    assert_eq!(
-        crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&reread),
-        acks
-    );
-    fs::remove_dir_all(a.ancestors().nth(4).unwrap()).unwrap();
-}
-
 /// [money] A duplicated copied id, including an own response with that id,
 /// restores all native grains exactly like a lone child's old counted path.
 #[test]

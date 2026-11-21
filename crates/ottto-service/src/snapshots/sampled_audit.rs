@@ -646,7 +646,7 @@ mod tests {
     }
     #[test]
     fn sampled_audit_missing_source_and_existing_cas_cannot_erase_obligation() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-audit-index-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -667,7 +667,7 @@ mod tests {
         );
         index.remove_file_entry(&key);
         assert!(index.files.contains_key(&key));
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let mut older = ScanIndex::load(&path).unwrap();
         let mut current = ScanIndex::load(&path).unwrap();
         assert!(current.files[&key].has_unverified_source());
@@ -690,6 +690,7 @@ mod tests {
             150
         );
         fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -1642,6 +1643,17 @@ pub(super) fn expired_growth_claims(
     due
 }
 
+/// `expired_growth_claims` is non-empty, without its wake diagnostic.
+pub(super) fn growth_claim_expired(index: &ScanIndex, now: u64) -> bool {
+    growth_active(index)
+        && index.v2().growth_retention.values().any(|state| {
+            state.predecessor_size.is_some()
+                && state
+                    .last_growth_full_unix
+                    .is_some_and(|claim| now >= claim.saturating_add(GROWTH_FULL_INTERVAL))
+        })
+}
+
 /// The claim is one store transaction CAS'd on this lineage's G; no
 /// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {
@@ -2063,7 +2075,7 @@ mod growth_tests {
         assert_eq!(serde_json::to_vec(&restart(&index)).unwrap(), before);
         let mut census = ScanCensus::default();
         let now = unix_seconds(SystemTime::now()).unwrap() + 40 * 86400;
-        // Main's #876 retains an indexed grown file across the window
+        // Ordinary discovery retains an indexed grown file across the window
         // (DiscoveryRetention::owes_stamped / sources::codex::eof_fragment::grown); OFF
         // selects it exactly as main does, without any v2 growth custody.
         assert!(candidate_from_traversal_path(

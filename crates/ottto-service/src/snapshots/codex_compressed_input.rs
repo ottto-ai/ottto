@@ -44,17 +44,17 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// Darwin's large-block cache can return up to 2x a request, so no single peak
-// receipt bounds it (Mac CI run 41373345993 refused at 16,285,728 charged bytes).
-// Credit: zstd 1.5.7 WindowLogMax(23) requested peak 8,894,480 bytes (Mac CI run
-// 41213075990), doubled, plus 10%, rounded up to 64 KiB = 19,595,264 bytes.
+// Darwin's large-block cache can return up to 2x a request. A macOS CI run
+// refused at 16,285,728 charged bytes. Double zstd 1.5.7's measured requested
+// peak of 8,894,480 bytes at WindowLogMax(23), add 10%, and round up to 64 KiB
+// for a credit of 19,595,264 bytes.
 // Paid inside unchanged STATE_BYTES; admission preserves the primary Tail floor.
 #[cfg(target_os = "macos")]
 const COMPRESSED_INPUT_CREDIT: usize = (2 * 8_894_480 * 11_usize)
     .div_ceil(10)
     .next_multiple_of(64 * 1024);
-// Other platforms retain CI run 40774588149's 8,894,448-byte requested peak
-// plus 10%, rounded up to 64 KiB. No non-Darwin credit change.
+// For other platforms, the measured requested peak was 8,894,448 bytes.
+// Add 10% and round up to 64 KiB.
 #[cfg(not(target_os = "macos"))]
 const COMPRESSED_INPUT_CREDIT: usize = 9_830_400;
 
@@ -442,12 +442,12 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
-    /// [regress] Darwin decoder peak outgrew the old 9.8 MB credit (Mac CI run 40942402563).
+    /// [regress] Darwin decoder peak outgrew the old 9.8 MB credit.
     #[test]
     fn decoder_credit_preserves_the_platform_receipt_and_margin() {
         #[cfg(target_os = "macos")]
         {
-            let measured_peak = 16_285_728_usize; // Mac run 41373345993, zstd 1.5.7.
+            let measured_peak = 16_285_728_usize; // Measured on macOS with zstd 1.5.7.
             assert!(
                 compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
             );
@@ -460,7 +460,7 @@ pub(in crate::snapshots) mod tests {
     }
 
     /// [regress] An allocation refusal after partial decode was read as corrupt input and
-    /// quiet-latched valid data (Mac CI run 41373345993).
+    /// quiet-latched valid data.
     #[test]
     fn allocation_refusal_after_partial_decode_stays_owed() {
         let mut encoded = Vec::new();
@@ -683,20 +683,27 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, Option<crate::test_scratch::ScratchDir>);
     impl Drop for Fixture {
         fn drop(&mut self) {
+            if self.0.parent().is_some_and(Path::exists)
+                && e2_pipeline_scan_fixture::fixture_binding(&self.0).is_some()
+            {
+                state_v2::erase_published(&self.0);
+            }
             let _ = fs::remove_file(&self.0);
+            drop(self.1.take());
         }
     }
     fn fixture(bytes: &[u8], suffix: &str) -> Fixture {
-        let path = std::env::temp_dir().join(format!(
+        let scratch = crate::test_scratch::ScratchDir::canonical("compressed-input");
+        let path = scratch.join(format!(
             "ottto-compressed-input-{}-{}{suffix}",
             std::process::id(),
             NEXT.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         fs::write(&path, bytes).unwrap();
-        Fixture(path)
+        Fixture(path, Some(scratch))
     }
 
     // Same synthetic Codex shapes as transcript_acquisition_tests.
@@ -952,7 +959,7 @@ pub(in crate::snapshots) mod tests {
                 codex_session_id_from_path(&archive.0).as_deref(),
                 Some(owner)
             );
-            let plain = Fixture(archive.0.with_extension(""));
+            let plain = Fixture(archive.0.with_extension(""), None);
             fs::write(&plain.0, &bytes).unwrap();
             let mut bodies = Vec::new();
             for (path, compressed) in [(&plain.0, false), (&archive.0, true)] {
@@ -1009,6 +1016,7 @@ pub(in crate::snapshots) mod tests {
     impl Drop for ArchiveFixture {
         fn drop(&mut self) {
             fs::remove_dir_all(self.0.parent().unwrap()).unwrap();
+            state_v2::close_removed_routes_for_test();
         }
     }
     fn selector_scan(
@@ -1236,11 +1244,7 @@ pub(in crate::snapshots) mod tests {
             let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
             let mut parser = codex_parser(OpenedInput::plain(file), &f.0);
             sampled_scan::configure_tier_replay(&mut parser, &f.candidate(), &old);
-            sources::codex::counting::version::configure_singleton(
-                &mut parser,
-                &f.candidate(),
-                &old,
-            );
+
             while !parser.step().unwrap() {}
             let parsed = parser
                 .finish(
@@ -1397,7 +1401,9 @@ pub(in crate::snapshots) mod tests {
                 pending.census_member && pending.watcher_hint,
                 "both selection flags survive refusal"
             );
-            refused.save(&checkpoint.0).unwrap();
+            refused
+                .save_fixture_for_source(&checkpoint.0, SnapshotSource::Codex)
+                .unwrap();
             occupied.close();
             let restored = ScanIndex::load(&checkpoint.0).unwrap();
             let restart = selector_scan(
@@ -1438,7 +1444,8 @@ pub(in crate::snapshots) mod tests {
             let mut owed = scan.index.clone();
             let restart_file = fixture(b"", ".json");
             fs::remove_file(&restart_file.0).unwrap();
-            owed.save(&restart_file.0).unwrap();
+            owed.save_fixture_for_source(&restart_file.0, SnapshotSource::Codex)
+                .unwrap();
             let (((), prefix), first_logs) = crate::local_resource_diagnostics::capture(|| {
                 observe_consumed(|| {
                     let mut scan = scan;
@@ -1734,7 +1741,9 @@ pub(in crate::snapshots) mod tests {
             assert!(decoded.decode_holds.is_empty());
             assert!(decoded.accepted_snapshot_fingerprints.is_empty());
             assert_eq!(serde_json::to_value(&decoded).unwrap(), before);
-            decoded.save(&checkpoint.0).unwrap();
+            decoded
+                .save_fixture_for_source(&checkpoint.0, SnapshotSource::Codex)
+                .unwrap();
             let restored = ScanIndex::load(&checkpoint.0).unwrap();
             assert!(restored.decode_holds.is_empty());
             assert!(restored.files.is_empty());
@@ -2074,7 +2083,15 @@ pub(in crate::snapshots) mod tests {
         let singleton = downgrade_member(&out.join("activation"), owner, true);
         let mut activation = downgrade_accepted(&singleton, &native.snapshots[0]);
         downgrade_seed(&mut activation, &singleton);
-        activation.save(&out.join("activation.json")).unwrap();
+        // The legacy decoder view is separate from the service's native route.
+        let route = out
+            .join("native-activation")
+            .join("a".repeat(64))
+            .join("codex-scan-index.json");
+        activation = e2_pipeline_scan_fixture::seed_index_for_test(&activation, &route);
+        activation.save_fixture(&route).unwrap();
+        // The historical binary reads only this legacy export.
+        e2_pipeline_scan_fixture::legacy_view_for_test(&activation, &out.join("activation.json"));
         fs::write(out.join("activation-key.txt"), local_index_key(&singleton)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

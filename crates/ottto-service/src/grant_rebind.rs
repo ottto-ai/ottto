@@ -87,6 +87,11 @@ fn refusals() -> &'static Mutex<BTreeMap<AttemptKey, RebindFailure>> {
     REFUSALS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Rest-heap diagnostics: remembered terminal refusals, or None while busy.
+pub(crate) fn refusal_entries() -> Option<usize> {
+    refusals().try_lock().ok().map(|refusals| refusals.len())
+}
+
 pub(crate) fn attempt(
     kind: GrantKind,
     grant_id: &str,

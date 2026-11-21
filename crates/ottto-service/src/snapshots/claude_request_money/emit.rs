@@ -69,8 +69,6 @@ pub(super) fn grain_row(
         evidence_ref: None,
         identity_parts: None,
         copy_unproven,
-        identity_retained: false,
-        copy_invalidated: false,
         cost_usd: grain.cost().map(dollars),
         input_cost_usd: None,
         output_cost_usd: None,
@@ -79,8 +77,13 @@ pub(super) fn grain_row(
     }
 }
 
-/// `summed`: the entity sums two or more path folds of one session.
-pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody, summed: bool) -> bool {
+/// `span_last`: the latest last-activity clock over every on-page file the
+/// entity sums, so the body keeps it whichever file carries it.
+pub(super) fn apply(
+    item: &mut SnapshotItem,
+    entity: &ClaudeEntityBody,
+    span_last: Option<&str>,
+) -> bool {
     if entity.held || !entity.certificate_ok {
         return false;
     }
@@ -263,6 +266,9 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody, summed: 
     item.telemetry_owned_complete = Some(entity.telemetry_owned_complete);
     item.resolver_conflict_count =
         (entity.resolver_conflicts > 0).then_some(entity.resolver_conflicts);
+    if let Some(last) = span_last {
+        super::super::sources::claude::census::usage_ledger::widen_last_activity(item, last);
+    }
     let latest = entity
         .activity_nanos
         .max(i128::from(entity.activity_unix) * 1_000_000_000);
@@ -271,19 +277,11 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody, summed: 
             .and_then(super::super::rfc3339_unix_nanos)
             .unwrap_or(0)
     };
+    // A request clock later than every file's last record ends the session
+    // there; otherwise the end stays as the files left it.
     if let Some(clock) = timestamp(latest) {
-        let later = latest > nanos(item.source_last_activity_at.as_deref());
-        // Summed path twins: the end follows the summed clock whichever copy
-        // carries the body, so an equal last cannot leave it unset.
-        let end = if summed {
-            latest > 0 && latest >= nanos(item.source_ended_at.as_deref())
-        } else {
-            later
-        };
-        if end {
+        if latest > nanos(item.source_last_activity_at.as_deref()) {
             item.source_ended_at = Some(clock.clone());
-        }
-        if later {
             item.source_last_activity_at = Some(clock);
         }
     }
@@ -352,7 +350,7 @@ mod tests {
             );
         }
         entity.telemetry_owned_complete = false;
-        assert!(apply(&mut item, &entity, false));
+        assert!(apply(&mut item, &entity, None));
         assert_eq!(
             item.usage_accounting_contract.as_deref(),
             Some(REQUEST_OWNED_USAGE_CONTRACT)
@@ -420,30 +418,30 @@ mod tests {
     #[test]
     fn emission_keeps_uniform_account_and_refuses_tagged_identity() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
-        assert!(apply(&mut item, &one_grain(0), false));
+        assert!(apply(&mut item, &one_grain(0), None));
         super::super::super::set_session_account_hash(&mut item, Some("h"));
-        assert!(apply(&mut item, &one_grain(0), false));
+        assert!(apply(&mut item, &one_grain(0), None));
         assert!(!item.model_usage.is_empty());
         assert_eq!(exact_session_account_hash(&item).as_deref(), Some("h"));
         // Rows already tagged with evidence cannot be regrouped: refuse,
         // never wipe the tags.
         item.model_usage[0].evidence_ref = Some(0);
         let before = serde_json::to_vec(&item).unwrap();
-        assert!(!apply(&mut item, &one_grain(0), false));
+        assert!(!apply(&mut item, &one_grain(0), None));
         assert_eq!(serde_json::to_vec(&item).unwrap(), before);
     }
 
     #[test]
     fn resolver_conflicts_emit_nonzero_only_and_change_the_fingerprint() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
-        assert!(apply(&mut item, &one_grain(0), false));
+        assert!(apply(&mut item, &one_grain(0), None));
         assert_eq!(item.resolver_conflict_count, None);
         assert!(serde_json::to_value(&item)
             .unwrap()
             .get("resolver_conflict_count")
             .is_none());
         let clean = item.snapshot_fingerprint.clone();
-        assert!(apply(&mut item, &one_grain(2), false));
+        assert!(apply(&mut item, &one_grain(2), None));
         assert_eq!(item.resolver_conflict_count, Some(2));
         assert_eq!(
             serde_json::to_value(&item).unwrap()["resolver_conflict_count"],
@@ -453,29 +451,58 @@ mod tests {
     }
 
     #[test]
-    fn summed_twin_end_follows_the_summed_clock_and_single_path_is_unchanged() {
+    fn last_clock_spans_the_summed_files_and_the_end_follows_only_a_later_request() {
         let at = "2026-08-02T09:05:00Z";
+        let tail = "2026-08-02T09:30:00Z";
         let mut entity = one_grain(0);
         entity.activity_nanos = super::super::super::rfc3339_unix_nanos(at).unwrap();
-        let body = |summed: bool, end: Option<&str>| {
+        let body = |last: &str, span_last: Option<&str>| {
             let mut item = crate::snapshots::tests::sample_session_artifact_item();
-            item.source_last_activity_at = Some(at.into());
-            item.source_ended_at = end.map(Into::into);
-            assert!(apply(&mut item, &entity, summed));
-            assert_eq!(item.source_last_activity_at.as_deref(), Some(at));
-            item.source_ended_at
+            item.source_started_at = Some("2026-08-02T09:00:00Z".into());
+            item.source_last_activity_at = Some(last.into());
+            item.source_ended_at = None;
+            assert!(apply(&mut item, &entity, span_last));
+            assert_eq!(
+                item.source_started_at.as_deref(),
+                Some("2026-08-02T09:00:00Z"),
+                "the carrier keeps its own start"
+            );
+            (item.source_last_activity_at, item.source_ended_at)
         };
-        // The carrier already holds the summed last: the end is still set.
-        assert_eq!(body(true, None).as_deref(), Some(at));
-        // A later end survives; an earlier end advances to the summed clock.
-        let later = "2026-08-02T09:30:00Z";
-        assert_eq!(body(true, Some(later)).as_deref(), Some(later));
+        let both = |last: &str, end: Option<&str>| (Some(last.to_owned()), end.map(str::to_owned));
+        // A last clock equal to the request clock keeps the missing end,
+        // whether one file or several contribute it.
+        assert_eq!(body(at, None), both(at, None));
+        assert_eq!(body(at, Some(at)), both(at, None));
+        // Another file's later record is the body's last; the end stays unset.
+        assert_eq!(body(at, Some(tail)), both(tail, None));
+        assert_eq!(body("2026-08-02T09:01:00Z", Some(tail)), both(tail, None));
+        // A request clock after every file's last record sets end and last.
+        let early = "2026-08-02T09:02:00Z";
         assert_eq!(
-            body(true, Some("2026-08-02T09:01:00Z")).as_deref(),
-            Some(at)
+            body("2026-08-02T09:01:00Z", Some(early)),
+            both(at, Some(at))
         );
-        // One path with equal clocks keeps its missing end.
-        assert_eq!(body(false, None), None);
+        // The span never lowers the carrier's own later last clock.
+        assert_eq!(body(tail, Some(early)), both(tail, None));
+    }
+
+    #[test]
+    fn refused_entity_keeps_its_clocks_whatever_the_span() {
+        let held = ClaudeEntityBody {
+            held: true,
+            ..one_grain(0)
+        };
+        let uncertified = ClaudeEntityBody {
+            certificate_ok: false,
+            ..one_grain(0)
+        };
+        for entity in [held, uncertified] {
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
+            let before = serde_json::to_vec(&item).unwrap();
+            assert!(!apply(&mut item, &entity, Some("2026-08-02T23:00:00Z")));
+            assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+        }
     }
 
     #[test]
@@ -486,7 +513,7 @@ mod tests {
             certificate_ok: false,
             ..Default::default()
         };
-        assert!(!apply(&mut item, &entity, false));
+        assert!(!apply(&mut item, &entity, None));
         assert_eq!(serde_json::to_vec(&item).unwrap(), before);
     }
 }

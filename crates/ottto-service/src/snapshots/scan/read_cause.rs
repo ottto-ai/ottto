@@ -1,7 +1,7 @@
 //! The selection-time first cause of a file read, for the daemon-local
 //! change-reason counts. It reads only persisted state the gate already
 //! decided on and never changes a decision.
-use crate::local_resource_diagnostics::change_reason::{self as counts, Token};
+use crate::local_resource_diagnostics::change_reason::{self as counts, AdminCause, Token};
 use crate::snapshots::*;
 
 /// The selector arm behind a `SourceChanged` read (an account memo-miss
@@ -22,20 +22,28 @@ impl ScanIndex {
         source_change: Option<SourceChange>,
     ) {
         let key = local_index_key(&candidate.path);
-        let (token, sidecar) = self.change_reason(source, &key, reason, source_change);
-        counts::selected(source.api_slug(), key, token, sidecar);
+        let (token, cause) = self.change_reason(
+            source,
+            &key,
+            reason,
+            source_change,
+            candidate.fingerprint_changed_nanos,
+        );
+        counts::selected(source.api_slug(), key, token, cause);
     }
 
-    /// `(first cause, sidecar_or_fingerprint)`. `SourceChanged` labels three
+    /// `(first cause, admin_other cause)`. `SourceChanged` labels three
     /// causes: a pending copy removal, a moved fingerprint (sidecars, launcher
-    /// context, scan identity) and an account memo-miss.
+    /// context, scan identity) and an account memo-miss. `changed_nanos` is
+    /// the ctime the candidate's fingerprint used.
     fn change_reason(
         &self,
         source: SnapshotSource,
         key: &str,
         reason: Option<CandidateParseReason>,
         source_change: Option<SourceChange>,
-    ) -> (Token, bool) {
+        changed_nanos: u64,
+    ) -> (Token, AdminCause) {
         use CandidateParseReason as R;
         let delivered = || {
             self.files
@@ -44,24 +52,40 @@ impl ScanIndex {
         };
         let token = match reason {
             Some(R::TranscriptChanged) => Token::Append,
-            Some(R::NewFile) => counts::new_file_token(source.api_slug()),
+            Some(R::NewFile) => {
+                let token = counts::new_file_token(source.api_slug());
+                return (token, AdminCause::NewFileFreshIndex);
+            }
             Some(R::TerminalDisposition | R::LegacyIdentity) => Token::ParserRevision,
             Some(R::AuthorityQuarantine | R::ForcedFamily) => Token::CopyOwnership,
             Some(R::ActivityOrQuarantineRetry) => Token::AckRecovery,
-            Some(R::BodyWitnessAdoption) => self.revision_change_reason(key),
+            Some(R::BodyWitnessAdoption) => {
+                return (self.revision_change_reason(key), AdminCause::Adoption);
+            }
+            Some(R::Rearmed) => return (Token::AdminOther, AdminCause::Rearm),
+            Some(R::Audit) => return (Token::AdminOther, AdminCause::Audit),
             Some(R::UploadContext) if delivered() && counts::privacy_off(source.api_slug()) => {
                 Token::PrivacyOffErase
             }
             Some(R::SourceChanged) => {
                 return match source_change {
-                    Some(SourceChange::CopyRemoval) => (Token::CopyOwnership, false),
-                    Some(SourceChange::Fingerprint) => (Token::AdminOther, true),
-                    None => (Token::AdminOther, false),
+                    Some(SourceChange::CopyRemoval) => (Token::CopyOwnership, AdminCause::Other),
+                    // The stored fingerprint used the stored ctime: another
+                    // proves the object moved. No stored input names a sidecar.
+                    Some(SourceChange::Fingerprint) => {
+                        let stored = self.files.get(key).map_or(0, |e| e.opened_changed_nanos);
+                        if stored != 0 && stored != changed_nanos {
+                            (Token::AdminOther, AdminCause::FingerprintObject)
+                        } else {
+                            (Token::AdminOther, AdminCause::FingerprintUnattributed)
+                        }
+                    }
+                    None => (Token::AdminOther, AdminCause::Memo),
                 };
             }
             _ => Token::AdminOther,
         };
-        (token, false)
+        (token, AdminCause::Other)
     }
 
     /// An operator re-owe (`REOWED`) is exact; otherwise an owed revision
@@ -197,9 +221,9 @@ mod tests {
                 .file_snapshot_fingerprints
                 .insert(key.into(), BTreeSet::from([entity.clone()]));
             setup(&mut index);
-            let (token, _) =
-                index.change_reason(SnapshotSource::ClaudeCode, key, Some(reason), change);
-            counts::selected("claude_code", key.into(), token, false);
+            let (token, cause) =
+                index.change_reason(SnapshotSource::ClaudeCode, key, Some(reason), change, 0);
+            counts::selected("claude_code", key.into(), token, cause);
             counts::read("claude_code", key, mode, 10, 2);
             counts::propagate("claude_code", &index);
             counts::attempted("claude_code", &entity, None, None, 7);
@@ -209,6 +233,54 @@ mod tests {
             assert_eq!(upload.len(), 1, "{reason:?}");
             assert_eq!(upload[expected]["entities"], 1, "{reason:?}");
             assert_eq!(page["read"][expected]["files"], 1);
+            counts::index_loaded("claude_code", false, None);
+        }
+    }
+
+    /// [behaviour] Each `admin_other` selection path counts its read under
+    /// one cause; a fingerprint move is `fingerprint_object` only when the
+    /// candidate's ctime witness differs from the stored one.
+    #[test]
+    fn admin_other_selection_paths_split_by_cause() {
+        use crate::transcript_acquisition::ReadMode;
+        use CandidateParseReason as R;
+        let key = "/synthetic/one.jsonl";
+        let moved = Some(SourceChange::Fingerprint);
+        let cases = [
+            (R::SourceChanged, moved, 6, "fingerprint_object"),
+            (R::SourceChanged, moved, 5, "fingerprint_unattributed"),
+            (R::SourceChanged, None, 5, "memo"),
+            (R::BodyWitnessAdoption, None, 5, "adoption"),
+            (R::Rearmed, None, 5, "rearm"),
+            (R::NewFile, None, 5, "new_file_fresh_index"),
+            (R::Audit, None, 5, "audit"),
+            (R::UnknownOutcome, None, 5, "other"),
+        ];
+        for (reason, change, changed_nanos, expected) in cases {
+            let mut index = ScanIndex::default();
+            index.files.insert(
+                key.into(),
+                ScanIndexEntry {
+                    opened_changed_nanos: 5,
+                    ..ScanIndexEntry::default()
+                },
+            );
+            counts::index_loaded("claude_code", true, None);
+            let (token, cause) = index.change_reason(
+                SnapshotSource::ClaudeCode,
+                key,
+                Some(reason),
+                change,
+                changed_nanos,
+            );
+            counts::selected("claude_code", key.into(), token, cause);
+            counts::read("claude_code", key, ReadMode::Tail, 10, 2);
+            counts::admin_read("claude_code", key, Some((ReadMode::Tail, 10)), 0);
+            let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
+            let split = page["admin_other_read"].as_object().unwrap();
+            assert_eq!(split.len(), 1, "{reason:?}");
+            assert_eq!(split[&format!("{expected}.tail")]["files"], 1, "{reason:?}");
+            assert_eq!(page["read"]["admin_other"]["files"], 1, "{reason:?}");
             counts::index_loaded("claude_code", false, None);
         }
     }

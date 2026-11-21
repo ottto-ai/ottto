@@ -1,6 +1,4 @@
-// Frozen complete ScanIndexEntry codec, identical at both released source pins:
-// 0.1.201 f174d111fbcdfb0ab9c2abeb299c12d50b435c29
-// 0.1.202 79488a7297817edfe1eb5cfc34b779408d511726
+// Complete ScanIndexEntry codec shared by releases 0.1.201 and 0.1.202.
 // Original `pub struct ScanIndexEntry { ... }` plus newline SHA-256:
 // bfc03bb32dfec991075afffa371183519c6123ff46749c215b38efd02288e169
 // Owner/AppliedTierReceipt decode paths copied unchanged; enclosing imports only.

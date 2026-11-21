@@ -35,6 +35,10 @@ fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
+    // This metadata-only CLI deliberately inspects a legacy input view.
+    let view = home.join("scan-index.json");
+    e2_pipeline_scan_fixture::save_owner_for_test(SnapshotSource::ClaudeCode, &mut index, &view);
+    e2_pipeline_scan_fixture::legacy_view_for_test(&index, &view);
     let scope = home.join("scope.json");
     fs::write(scope, serde_json::to_vec(&paths).unwrap()).unwrap();
     (home, root, index, paths)
@@ -68,6 +72,7 @@ fn walk(
         true,
         scope,
         None,
+        false,
     );
     let mut opened = Vec::new();
     for _ in 0..100_000 {
@@ -512,7 +517,9 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
-    index.save(&home.join("scan-index.json")).unwrap();
+    let view = home.join("scan-index.json");
+    e2_pipeline_scan_fixture::save_owner_for_test(SnapshotSource::ClaudeCode, &mut index, &view);
+    e2_pipeline_scan_fixture::legacy_view_for_test(&index, &view);
     let family = claude_index_path_member_ref(&main).unwrap().root;
     let expected = index
         .files

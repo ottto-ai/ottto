@@ -114,7 +114,6 @@ fn login_only_telemetry_never_borrows_a_proven_marker_org() {
         );
         let pass = |scanner: &E2ScanFixture, index: ScanIndex| {
             let mut accepted = AcceptedBuckets::for_test();
-            accepted.set_account_source_enabled(true);
             let mut page = c.raw(scanner, index, 100, true, &[]);
             page.enrich_with(&c, Some(&mut accepted));
             page.finish();

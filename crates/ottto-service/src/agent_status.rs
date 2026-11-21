@@ -68,8 +68,6 @@ use claude::collect::apply_claude_token_owner;
 #[cfg(test)]
 use claude::collect::claude_alternative_auth;
 pub(crate) use claude::collect::claude_alternative_auth_layers;
-#[cfg(test)]
-pub(crate) use claude::collect::claude_login_route_candidate;
 pub(crate) use claude::collect::claude_refresher_skip_reason;
 #[cfg(test)]
 use claude::collect::claude_runtime_defaults_from_paths;
@@ -779,6 +777,11 @@ use statics::{CLAUDE_DESKTOP_JSON_READ_RECEIPT, CODEX_APP_SERVER_TEST_TIMEOUTS};
 
 mod claude_credit_pools;
 mod claude_token_owner;
+
+/// Rest-heap diagnostics: homes with a remembered token verdict.
+pub(crate) fn token_owner_entries() -> usize {
+    claude_token_owner::owner_entries()
+}
 mod codex_credit_grants;
 mod codex_last_known;
 #[cfg(test)]

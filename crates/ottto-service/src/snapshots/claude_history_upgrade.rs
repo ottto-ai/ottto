@@ -585,7 +585,7 @@ crate::heap_layout_bound::fields!(HistoryPage; files, bytes, resident_charge, re
 const PEAK_LINE_MIB: u64 = 500;
 const FLOOR_MIB: u64 = 150;
 const FINISH_RESERVE_MIB: u64 = 120;
-/// D326 amendment: soft admission allowance, not a footprint guarantee.
+/// Soft admission allowance, not a footprint guarantee.
 /// The AIMD file limit binds above ≈200 MiB on observed waves.
 pub(super) const RESIDENT_PAGE_BUDGET_MIB: u64 = PEAK_LINE_MIB - FLOOR_MIB - FINISH_RESERVE_MIB;
 const _: () = assert!(PEAK_LINE_MIB > FLOOR_MIB + FINISH_RESERVE_MIB);
@@ -1278,7 +1278,7 @@ struct PriorHistoryUnverifiedAlarm {
     claude_cycles: u64,
 }
 
-/// Count-only local diagnostic (StateMissing r3 of #712), useful where a
+/// Count-only local diagnostic for an unverified history rebuild, useful where a
 /// Claude census rarely settles: "prior_history_unverified set since T". T is
 /// the first Claude cycle this process read the marker set; the marker's own
 /// set time is not recorded, and this path never writes the backfill state,
@@ -1743,8 +1743,8 @@ impl ScanIndex {
         before - snapshots.len()
     }
 
-    /// Hook for resend paths outside the page (StateMissing #706 re-offer
-    /// leases, #692 in-place resends) and for MONEY's literal items, which
+    /// Hook for resend paths outside the page (StateMissing re-offer
+    /// leases, in-place resends) and for literal money items, which
     /// are built after the emission seam: drop every item of a source file
     /// the history gate holds this cycle, every request-owned literal item
     /// of a literal-denied file, and every literal the guard denies whether
@@ -1850,7 +1850,7 @@ impl ScanIndex {
         true
     }
 
-    /// Counts only (#799 page carrier): each upgrade the history gate
+    /// Counts only on the page diagnostics row: each upgrade the history gate
     /// permitted this page that finalized below the active revision, by its
     /// hold.
     pub(in crate::snapshots) fn note_claude_history_not_stamped(&self) {

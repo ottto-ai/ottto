@@ -1610,6 +1610,12 @@ impl DurableCertificate {
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
         let (admission, head, boundary, current) =
             self.admit_samples(file, allow_append, read_changed_nanos)?;
+        #[cfg(test)]
+        let scope = if RESTORED_SCOPE_MISMATCH.with(std::cell::Cell::get) {
+            Scope(String::new())
+        } else {
+            scope
+        };
         let checkpoint = Checkpoint {
             // The live device number: a reboot or remount may have renumbered
             // the volume since this certificate was stored.
@@ -1741,6 +1747,8 @@ thread_local! {
     pub(crate) static OLD_SAMPLE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A retained checkpoint `prepare` must refuse as `InvalidCheckpoint`.
     pub(crate) static OLD_CHECKPOINT_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Native Full-proof fixtures model an incompatible restored acquisition scope.
+    pub(crate) static RESTORED_SCOPE_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -2354,8 +2362,8 @@ mod tests {
     }
 
     /// Ordinary checkpoint completion shares admission's audit predicate;
-    /// the exact-stamp proof seal still refuses elapsed debt. At 57ffaa32,
-    /// the overdue ordinary seal below returns PrefixRefusal::AuditDue.
+    /// the exact-stamp proof seal still refuses elapsed debt. Before the fix,
+    /// the overdue ordinary seal also returned PrefixRefusal::AuditDue.
     #[test]
     fn overdue_tail_seals_with_identical_debt_but_proof_horizon_still_refuses() {
         let f = Fixture::new(b"one\n");

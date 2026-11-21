@@ -1,7 +1,6 @@
 //! One copy route: a copied prefix goes only on request-id proof from an
 //! earlier accepted main file of another session in the copy's own folder
-//! (whatever Claude Code version wrote it), and an accepted copy decided
-//! before `COPY_PROOF_FROM` keeps its decision.
+//! (whatever Claude Code version wrote it), however early it was decided.
 
 use super::*;
 
@@ -400,14 +399,12 @@ fn save_marks_copy_when_holder_session_gains_an_owner_in_another_folder() {
     }
 }
 
-/// [money] The grandfather's gates: a resume whose first own response
-/// (provider time) is before `COPY_PROOF_FROM`, settled with its copies
-/// removed and accepted, with no saved removal, keeps that decision with no
-/// holder to prove it, whatever later own turns follow. Any missing
-/// condition or an all-copy file takes the request-id proof (here: none, so
-/// it counts). The cutoff itself is in the pipeline oracle.
+/// [money] A resume whose first own response (provider time) is before
+/// `COPY_PROOF_FROM`, settled with its copies removed and accepted, takes
+/// the request-id proof like any other copy: with no holder it counts,
+/// flagged. Only a saved removal under an accepted holder stays removed.
 #[test]
-fn accepted_pre_cutoff_copy_keeps_its_decision() {
+fn accepted_pre_cutoff_copy_takes_the_request_id_proof() {
     let [copy_a, copy_b] = copies();
     let own = line("own", &at(101), 20);
     let late = line("own-late", AFTER_CUTOFF, 20);
@@ -420,7 +417,7 @@ fn accepted_pre_cutoff_copy_keeps_its_decision() {
             true,
             true,
             false,
-            2,
+            0,
         ),
         ("no copy mark", resumed.to_vec(), false, true, false, 0),
         ("no accepted body", resumed.to_vec(), true, false, false, 0),
