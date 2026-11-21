@@ -848,6 +848,16 @@ enum AckScriptedPost {
     Conflict,
     /// The identity-unavailable shed naming every entity, at this status.
     Identity(&'static str),
+    /// A plain 503 with `Retry-After: 60`: the backend sheds the page.
+    Shed,
+    /// The connection closes before any answer.
+    Drop,
+    /// The backend refuses the relay authorization (401).
+    Unauthorized,
+    /// A 422 that names no item.
+    UnnamedRejection,
+    /// A well-formed ACK for a fingerprint the request did not carry.
+    ForeignAck,
 }
 
 type CheckpointRace = (PathBuf, Arc<Mutex<Option<Vec<u8>>>>);
@@ -860,6 +870,16 @@ struct AckScriptedServer {
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
     script: Arc<Mutex<VecDeque<AckScriptedPost>>>,
     advance_before_ack: Arc<Mutex<Option<CheckpointRace>>>,
+    /// Every terminal status body, in arrival order.
+    statuses: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// While set, the terminal status endpoint answers 500.
+    status_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// The next snapshot POST takes this progress ledger's lock, as another
+    /// owner would, and keeps it in `held_progress_lock` until the test
+    /// drops it: the page's own ledger save then fails.
+    lock_progress_on_post: Arc<Mutex<Option<PathBuf>>>,
+    held_progress_lock:
+        Arc<Mutex<Option<crate::snapshot_sync::progress_rows::SnapshotProgressLock>>>,
 }
 
 impl AckScriptedServer {
@@ -876,6 +896,14 @@ impl AckScriptedServer {
         let posts = script.clone();
         let advance_before_ack = Arc::new(Mutex::new(None::<CheckpointRace>));
         let checkpoint_race = advance_before_ack.clone();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let reported = statuses.clone();
+        let status_fails = Arc::new(AtomicBool::new(false));
+        let failing = status_fails.clone();
+        let lock_progress_on_post = Arc::new(Mutex::new(None::<PathBuf>));
+        let lock_on_post = lock_progress_on_post.clone();
+        let held_progress_lock = Arc::new(Mutex::new(None));
+        let held = held_progress_lock.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -915,12 +943,53 @@ impl AckScriptedServer {
                         *saved.lock().unwrap() =
                             Some(serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap());
                     }
+                    if let Some(path) = lock_on_post.lock().unwrap().take() {
+                        *held.lock().unwrap() = Some(
+                            crate::snapshot_sync::progress_rows::SnapshotProgressLock::acquire(
+                                &path,
+                            )
+                            .unwrap(),
+                        );
+                    }
                     let post = posts
                         .lock()
                         .unwrap()
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
+                        AckScriptedPost::Drop => {
+                            drop(stream);
+                            continue;
+                        }
+                        AckScriptedPost::Shed => {
+                            status = "503 Service Unavailable";
+                            serde_json::json!({})
+                        }
+                        AckScriptedPost::Unauthorized => {
+                            status = "401 Unauthorized";
+                            serde_json::json!({})
+                        }
+                        AckScriptedPost::UnnamedRejection => {
+                            status = "422 Unprocessable Entity";
+                            serde_json::json!({})
+                        }
+                        AckScriptedPost::ForeignAck => {
+                            let foreign = items
+                                .iter()
+                                .map(|item| {
+                                    serde_json::json!({
+                                "source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":"f".repeat(64),
+                                "occurrence_count":1})
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({"accepted":items.len(),
+                                "sessions_reconciled":items.len(),"session_ids":[],
+                                "disabled":false,"disabled_reason":null,
+                                "entity_ack_contract":"snapshot_entity_ack:v1",
+                                "accepted_entities":foreign,"unchanged_entities":[],
+                                "rejected_entities":[],"conflict_entities":[]})
+                        }
                         AckScriptedPost::Identity(code) => {
                             status = code;
                             serde_json::json!({"code":"snapshot_original_identity_unavailable",
@@ -969,9 +1038,16 @@ impl AckScriptedServer {
                         }
                     }
                 } else {
+                    if value["report_kind"] == "scan_status" {
+                        reported.lock().unwrap().push(value.clone());
+                        if failing.load(Ordering::Relaxed) {
+                            // Not a shed: a 503 here would also defer the source.
+                            status = "500 Internal Server Error";
+                        }
+                    }
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                if status == "200 OK" {
+                if matches!(status, "200 OK" | "500 Internal Server Error") {
                     bounded_native_response(&mut stream, status, &response.to_string());
                 } else {
                     let body = response.to_string();
@@ -986,6 +1062,10 @@ impl AckScriptedServer {
             offered,
             script,
             advance_before_ack,
+            statuses,
+            status_fails,
+            lock_progress_on_post,
+            held_progress_lock,
         }
     }
 }
