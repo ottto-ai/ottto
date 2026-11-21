@@ -243,8 +243,9 @@ sparse map of closed snake_case keys (`state_missing`, `audit_due`,
 `clock_changed`, `scope_changed`, `invalid_checkpoint`, `replaced`, `shrunk`,
 `same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`).
 Their sum equals `full_selections`. It also records `priority_full_replays`,
-`audits_started`, `audits_completed`, `max_start_overdue_seconds` and
-`max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
+`audits_started` (a Full whose audit debt was already due; one that only carries
+a later-due debt is not counted), `audits_completed`, `max_start_overdue_seconds`
+and `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
 record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
 existing index calculations. These three fields are state gauges. The same
 object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
