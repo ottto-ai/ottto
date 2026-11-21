@@ -652,7 +652,7 @@ mod tests {
     }
     fn temp(name: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "birth-store-{name}-{}-{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -937,15 +937,15 @@ mod tests {
         index
             .claude_money_birth_store
             .record_observation("session", a, 100);
-        index.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        index.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(index);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", a),
             Some(100)
         );
         loaded.files.remove(a);
-        loaded.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        loaded.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(loaded);
         assert_eq!(
             loaded
                 .claude_money_birth_store
@@ -983,9 +983,10 @@ mod tests {
             held.claude_money_birth_store.effective_cutoff("session", b),
             Some(100)
         );
+        drop(subset);
         let mut held = held;
-        held.save(&file).unwrap();
-        let loaded = ScanIndex::load(&file).unwrap();
+        held.save_fixture(&file).unwrap();
+        let loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(held);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", b),
             Some(200)
@@ -1017,9 +1018,8 @@ mod tests {
         let file = root.join("index.json");
         let mut index = ScanIndex::default();
         index.files.insert("kept.jsonl".into(), entry());
-        index.save(&file).unwrap();
-        let original: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        index.save_fixture(&file).unwrap();
+        let original = serde_json::to_value(&index).unwrap();
         for bad in [
             None,
             Some(serde_json::json!({"wrong":"shape"})),
@@ -1035,8 +1035,11 @@ mod tests {
                     .unwrap()
                     .remove("claude_money_birth_store");
             }
-            std::fs::write(&file, serde_json::to_vec(&wire).unwrap()).unwrap();
-            let loaded = ScanIndex::load(&file).unwrap();
+            // Malformed optional values are decoder inputs, never native fences.
+            let loaded = crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &file,
+                &serde_json::to_vec(&wire).unwrap(),
+            );
             assert!(loaded.files.contains_key("kept.jsonl"));
             assert_eq!(loaded.generation, index.generation);
             assert!(loaded.claude_money_birth_store.is_empty());
@@ -1047,6 +1050,7 @@ mod tests {
             .to_string_lossy()
             .contains("corrupt")));
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
     #[test]
     fn m4_size_memory_and_wire_receipt() {

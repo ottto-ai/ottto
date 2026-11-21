@@ -61,8 +61,8 @@ impl ProviderPriceLineKind {
 /// cache writes (Codex `input_tokens` already includes its cached prefix).
 ///
 /// The table is pinned as `fixtures/snapshot-audit/provider-price-lines-v1.json`
-/// and the backend compares that artifact with the catalog thresholds
-/// (backend/tests/unit/test_daemon_price_line_mirror.py). Change both together.
+/// and the receiver's parity test compares it with the catalog thresholds.
+/// Change both together.
 pub(super) const PROVIDER_PRICE_LINES: &[(&str, u64, ProviderPriceLineKind)] = &[
     // OpenAI: 2x input and cache, 1.5x output for the whole request.
     ("gpt-5-4", 272_000, ProviderPriceLineKind::Tiered),

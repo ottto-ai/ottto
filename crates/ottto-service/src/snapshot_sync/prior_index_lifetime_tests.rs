@@ -145,7 +145,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
         &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
         &namespace,
     ));
-    ScanIndex::default().save(&index_path).unwrap();
+    ScanIndex::default().save_fixture(&index_path).unwrap();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -163,7 +163,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
         let daemon = test_daemon("otm_test");
         let client = SnapshotApiClient::new(server.url.clone());
         let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
                 &client,
@@ -176,21 +175,28 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
         .expect("actual due preparation");
         let (mut preparation, index, scan) =
             with_rotation_budget(budget, || collect_preparation_with_rotation(frame));
+        let current = index.clone();
         let (index, scan) = {
-            let (index, scan, started) = common
+            let (mut index, scan, started) = common
                 .entry((budget, conflict))
-                .or_insert_with(|| (index, scan, preparation.scan_started_at.clone()))
+                .or_insert_with(|| {
+                    let mut logical = index;
+                    crate::snapshots::e2_pipeline_scan_fixture::detach_route_for_test(&mut logical);
+                    (logical, scan, preparation.scan_started_at.clone())
+                })
                 .clone();
             preparation.scan_started_at = started;
+            index.retain_persistence_baseline_from(&current);
+            index.generation = current.generation;
             (index, scan)
         };
+        drop(current);
         let progress_path = preparation.upload_progress_path.clone();
         let guard = Guard::new(
             keep_prior,
@@ -211,7 +217,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         drop(guard);
@@ -273,8 +278,10 @@ fn e2_real_caller_parity_at_tight_allowances() {
     // The support directory (index, progress and sidecars)
     // is put back before every arm; the transcripts are only read.
     let mut saved = Vec::new();
+    crate::snapshots::state_v2::cold_close_for_test(&index_path).unwrap();
     files(&support, &mut saved);
     let mut run = |budget: usize, conflict: bool, keep_prior: bool| {
+        crate::snapshots::state_v2::cold_close_for_test(&index_path).unwrap();
         std::fs::remove_dir_all(&support).unwrap();
         for (path, bytes, permissions) in &saved {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

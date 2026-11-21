@@ -8,8 +8,9 @@
 // durable index settlement, no-body settlement on the selected checkpoint,
 // then a save and a reload from disk. Requests are appended naturally to
 // member transcripts together with paired local OTEL API and trace rows.
-// Beyond the stored starting state below, tests edit no clock, quarantine,
-// witness or index state by hand. Tests named `controlled_*` say so: one seeds
+// Between visits the helper ages listing clocks to model elapsed passes.
+// Beyond the stored starting state below, tests edit no quarantine, witness
+// or index state by hand. Tests named `controlled_*` say so: one seeds
 // the owed set through the persisted index after the stored grant, and the
 // selection and checkpoint-cost tests drive the real locked partial checkpoint
 // on a synthetic persisted index.
@@ -161,6 +162,7 @@ struct ApcFixture {
     /// Members whose owner proof is withheld on the next pages.
     withheld_owners: std::cell::RefCell<BTreeSet<String>>,
     next_sequence: std::cell::Cell<u64>,
+    listing_hour: std::cell::Cell<Option<i64>>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
     /// Opt-in production account-audit release on settled pages, with no
@@ -183,13 +185,14 @@ impl ApcFixture {
         let fixture = Self {
             case,
             index_path: base.join("claude-scan-index.json"),
-            progress_path: base.join("claude-upload-progress.json"),
+            progress_path: snapshot_upload_progress_path(&base.join("claude-scan-index.json")),
             base,
             root,
             support,
             owners,
             withheld_owners: std::cell::RefCell::new(BTreeSet::new()),
             next_sequence: std::cell::Cell::new(1),
+            listing_hour: std::cell::Cell::new(None),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
             audit_release: std::cell::Cell::new(false),
@@ -210,6 +213,9 @@ impl ApcFixture {
         for (agent, request, second) in APC_FAMILY_REQUESTS {
             fixture.append_family_request(agent, request, second);
         }
+        ScanIndex::default()
+            .save_fixture(&fixture.index_path)
+            .unwrap();
         fixture
     }
 
@@ -252,8 +258,7 @@ impl ApcFixture {
         let index = ScanIndex::load(&self.index_path).expect("load the granted index");
         let keys = Self::family_keys(&index);
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&self.index_path).expect("read saved index"))
-                .expect("decode saved index");
+            serde_json::to_value(ScanIndex::load(&self.index_path).unwrap()).unwrap();
         let record = &mut value["claude_usage_authority_quarantine"][APC_ROOT];
         let map = record["member_source_file_fingerprints"]
             .as_object_mut()
@@ -270,8 +275,14 @@ impl ApcFixture {
             }
         }
         record["proof_correction"]["owed_member_ids"] = serde_json::json!(owed);
-        std::fs::write(&self.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("write seeded index");
+        // Only this authority row changes; retain the native Tail heads and
+        // progress rows that the delivered baseline earned.
+        crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
+            &index,
+            "refusal.authority",
+            APC_ROOT,
+            |native| *native = value["claude_usage_authority_quarantine"][APC_ROOT].clone(),
+        );
         let seeded = ScanIndex::load(&self.index_path).expect("load the seeded index");
         assert_eq!(
             self.quarantined_index_count(),
@@ -415,17 +426,53 @@ impl ApcFixture {
     }
 
     /// One page through the production stage order of `finish_sync_source`.
+    fn trace_stage(&self, at: &str, stage: &str, index: &ScanIndex) {
+        let record = index.claude_authority_record_for_test(APC_ROOT);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "receipt": "native_correction_fixture_stage",
+                "case": self.case,
+                "at": at,
+                "stage": stage,
+                "generation": index.generation,
+                "record_contract": record.as_ref().map(|r| r.contract.as_str()),
+                "owed": record.as_ref().and_then(|r| r.correction.as_ref()).map(|(_, owed)| owed),
+                "witness": index.claude_usage_family_witness_digest_for_test(APC_ROOT),
+                "quarantined_entities": index.quarantined_snapshot_fingerprints.len(),
+            })
+        );
+    }
+
+    /// One bounded page with the same acquisition and retry clock.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
-        // Ordinary transcripts: each file exists before its records (`e2`).
-        crate::snapshots::claude_request_money::e2::with_fixture_birth(
-            1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
-            || self.page_born(collected_at, upload),
-        )
+        // The minute suffix identifies bounded pages of one synthetic visit.
+        // Keep their acquisition clock fixed so every member's one-hour
+        // audit becomes due together on the following visit.
+        let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64
+            / 3600
+            * 3600;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            // Ordinary transcripts: each file exists before its records (`e2`).
+            crate::snapshots::claude_request_money::e2::with_fixture_birth(
+                1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
+                || self.page_born(collected_at, upload),
+            )
+        })
     }
 
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
-        let before = ScanIndex::load(&self.index_path).expect("load scan index");
+        let mut before = ScanIndex::load(&self.index_path).expect("load scan index");
+        let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            / 3600;
+        if self.listing_hour.replace(Some(hour)) != Some(hour) {
+            crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
+        }
         let mut index = before.clone();
         // As the service's source prepare: the context also binds the index's
         // quarantine witness, so refused bodies hold instead of re-reading.
@@ -434,16 +481,40 @@ impl ApcFixture {
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         self.load_exclusion_list(&mut index);
-        let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files.get(),
-            &self.support,
+        let empty_progress = test_upload_progress();
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.progress_path,
+            &empty_progress.destination_namespace_hash,
+            crate::snapshots::snapshot_quarantine_witness_for_context(
+                SnapshotSource::ClaudeCode,
+                APC_UPLOAD_CONTEXT,
+            ),
         )
-        .expect("scan bounded Claude page");
+        .expect("reload exact synthetic upload progress");
+        // finish_cycle transfers terminal quarantine to the index. Restore
+        // that custody before acquisition, as production prepare does.
+        if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
+            progress
+                .save(&self.progress_path)
+                .expect("save native fixture quarantine preparation");
+        }
+        let committed_index = index.clone();
+        self.trace_stage(collected_at, "before_scan", &index);
+        let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
+        let mut scan =
+            crate::snapshots::e2_pipeline_scan_fixture::scan_native_full_pipeline_for_test(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                &self.support,
+                None,
+            )
+            .expect("scan bounded Claude page");
+        self.trace_stage(collected_at, "after_scan", &index);
         let parsed = scan
             .snapshots
             .iter()
@@ -451,6 +522,7 @@ impl ApcFixture {
             .collect();
         let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        self.trace_stage(collected_at, "after_evidence", &index);
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -478,16 +550,6 @@ impl ApcFixture {
             &cutoff_state,
         );
         assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
-        let empty_progress = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load(
-            &self.progress_path,
-            &empty_progress.destination_namespace_hash,
-            crate::snapshots::snapshot_quarantine_witness_for_context(
-                SnapshotSource::ClaudeCode,
-                APC_UPLOAD_CONTEXT,
-            ),
-        )
-        .expect("reload exact synthetic upload progress");
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         let candidates =
             index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {
@@ -516,6 +578,7 @@ impl ApcFixture {
             },
         );
         index.advance_empty_claude_proof_corrections(&scan);
+        self.trace_stage(collected_at, "after_finalize", &index);
         let sessions_by_fingerprint = scan
             .snapshots
             .iter()
@@ -546,6 +609,7 @@ impl ApcFixture {
             .collect();
         if upload == ApcUpload::Crash {
             // Nothing after the scan reaches the network or the disk.
+            drop(native_pass);
             return ApcPage {
                 upload,
                 scan,
@@ -584,7 +648,7 @@ impl ApcFixture {
         let mut offered = BTreeSet::new();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
-        let persist_refusal = self.progress_path.exists()
+        let persist_refusal = progress.rows.is_some()
             || matches!(
                 upload,
                 ApcUpload::PermanentRejection | ApcUpload::RetryableRejection
@@ -647,7 +711,6 @@ impl ApcFixture {
                                     head_etag: None,
                                     head_challenge: None,
                                     unchanged_basis: None,
-                                    retained_proof_missing: Vec::new(),
                                     cache_observations_state: None,
                                 })
                                 .collect(),
@@ -664,7 +727,7 @@ impl ApcFixture {
             },
             |progress| {
                 if persist_refusal {
-                    progress.save(&self.progress_path)
+                    progress.save_fixture(&self.progress_path)
                 } else {
                     Ok(())
                 }
@@ -681,10 +744,11 @@ impl ApcFixture {
             &progress.accepted_fingerprints,
             &progress.accepted_body_witnesses,
         );
+        self.trace_stage(collected_at, "after_exact_settlement", &index);
         index.log_claude_proof_correction_debt();
         if shed {
             progress
-                .save(&self.progress_path)
+                .save_fixture(&self.progress_path)
                 .expect("persist upload progress");
             checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
@@ -702,9 +766,8 @@ impl ApcFixture {
                 body_drains,
             )
             .expect("checkpoint shed page");
-            if !persist_refusal {
-                let _ = std::fs::remove_file(&self.progress_path);
-            }
+
+            drop(native_pass);
             return ApcPage {
                 upload,
                 scan,
@@ -768,6 +831,7 @@ impl ApcFixture {
                 }),
             },
         );
+        self.trace_stage(collected_at, "after_selected_settlement", &index);
         // As the service finish, after the selected settlement: this page's
         // exact ACKs earn their file receipts. The synthetic responder answers
         // count ACKs, which the service never takes as receipt evidence; under
@@ -796,6 +860,18 @@ impl ApcFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        self.trace_stage(collected_at, "after_save", &index);
+        // Keep the page's upload observation for its assertions. The durable
+        // ledger follows the real post-save ACK retirement and cycle finish.
+        let observed_progress = progress.clone();
+        progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
+        progress
+            .finish_cycle(&self.progress_path)
+            .expect("finish native fixture progress");
+        native_pass
+            .commit_tail()
+            .expect("commit native fixture Tail");
+        drop(native_pass);
         ApcPage {
             upload,
             scan,
@@ -812,7 +888,7 @@ impl ApcFixture {
             uploaded,
             shed,
             candidates,
-            progress,
+            progress: observed_progress,
         }
     }
 
@@ -966,7 +1042,7 @@ impl ApcFixture {
             )
         );
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the stored witness");
         assert_eq!(
             self.quarantined_index_count(),
@@ -1105,7 +1181,7 @@ impl ApcFixture {
         );
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the owed correction");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the owed correction");
         assert_eq!(
@@ -1184,7 +1260,7 @@ impl ApcFixture {
         );
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the pre-flip index");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the pre-flip index");
         assert_eq!(
@@ -1444,6 +1520,7 @@ impl ApcFixture {
 impl Drop for ApcFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -1980,8 +2057,13 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
     let scratch = crate::test_scratch::ScratchDir::new("apc-a2-checkpoint");
     let index_path = scratch.join("claude-scan-index.json");
     let progress_path = scratch.join("claude-upload-progress.json");
-    let committed = apc_m2_index(1, 1, false, prior);
-    let current = apc_m2_index(1, 1, true, prior);
+    let committed = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(
+        &apc_m2_index(1, 1, false, prior),
+        &index_path,
+    );
+    let mut current = apc_m2_index(1, 1, true, prior);
+    current.retain_persistence_baseline_from(&committed);
+    current.generation = committed.generation;
     let (session, agent, key) = (apc_m2_root(0), apc_m2_agent(0), apc_m2_agent_key(0));
     let advanced = current
         .claude_authority_record_for_test(&session)
@@ -1996,7 +2078,7 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
     );
     let mut progress = test_upload_progress();
     progress
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("persist upload progress");
     checkpoint_partial_snapshot_index(
         &current,
@@ -2145,7 +2227,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
             );
             let scratch = crate::test_scratch::ScratchDir::new("apc-last-empty-cycle");
             let path = scratch.join("index.json");
-            index.save(&path).unwrap();
+            index.save_fixture(&path).unwrap();
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 loaded.claude_authority_proof_correction_pending(),
@@ -2279,11 +2361,16 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
             let progress_path = scratch.join("claude-upload-progress.json");
             let ((phase_peak, owed_after, agent_revision, expected_revision), stats) =
                 crate::retry_allocation_probe::measure(|| {
-                    let committed = apc_m2_index(roots, owed, false, prior);
-                    let current = apc_m2_index(roots, owed, advance, prior);
+                    let committed = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(
+                        &apc_m2_index(roots, owed, false, prior),
+                        &index_path,
+                    );
+                    let mut current = apc_m2_index(roots, owed, advance, prior);
+                    current.retain_persistence_baseline_from(&committed);
+                    current.generation = committed.generation;
                     let mut progress = test_upload_progress();
                     progress
-                        .save(&progress_path)
+                        .save_fixture(&progress_path)
                         .expect("persist upload progress");
                     crate::retry_allocation_probe::phase_begin();
                     let committable = checkpoint_partial_snapshot_index(
@@ -2323,7 +2410,7 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
             assert_eq!(owed_after, (owed > 0).then_some(owed), "{variant}");
             assert_eq!(
                 agent_revision, expected_revision,
-                "{variant}: A2 rolls the map back with a restored entity, else carries it"
+                "{variant}: roll the map back for restored entities and carry it forward otherwise"
             );
             let saved = std::fs::metadata(&index_path).expect("saved index").len();
             let line = serde_json::json!({
@@ -2375,8 +2462,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
         .claude_authority_record_for_test(APC_ROOT)
         .expect("natural authority record persists");
     let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
-            .expect("decode saved index");
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
     // A held family can already be re-armed. Seed nonempty revisions (the
     // record's where retained, otherwise a controlled synthetic one) so this
     // drop must clear every member before real pages prove they are re-read.
@@ -2388,10 +2474,18 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
             .unwrap_or_else(|| "5".repeat(64));
         value["files"][&key]["source_file_fingerprint"] = serde_json::json!(revision);
     }
-    value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
-        serde_json::json!("9".repeat(64));
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
-        .expect("write unbound index");
+    let seeded = crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &fixture.index_path,
+        &serde_json::to_vec(&value).unwrap(),
+    );
+    crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
+        &seeded,
+        "refusal.authority",
+        APC_ROOT,
+        |record| {
+            record["proven_witness_fingerprint"] = serde_json::json!("9".repeat(64));
+        },
+    );
 
     let (drops, rearmed) = crate::snapshots::claude_authority_drops_for_test();
     let mut reread = BTreeSet::new();
@@ -3321,7 +3415,7 @@ fn apc_f1_redrain(
 /// beside an unselected drained revision. The retry drains it again at the
 /// revision its saved entry has, offering at most the same exact body.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
+/// (`ApcFixture::pre_flip_grant`). With the wrong order, the restore runs
 /// before the release, carries the drain and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]
@@ -3375,10 +3469,10 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Not a discriminator of 2015e841f on its
-/// own: if selection kept agent b's committed re-arm marker, either order
-/// re-owes it, and the page exposes no pre-release entry to tell. The last
-/// owed and permanent refusal F1 tests are the discriminators.
+/// (`ApcFixture::pre_flip_grant`). This case alone can pass in either order
+/// if selection kept agent b's committed re-arm marker. Both orders leave
+/// it owed, and the page exposes no pre-release entry to distinguish them.
+/// The last-owed and permanent-refusal cases distinguish the ordering.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
@@ -3449,7 +3543,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 /// its pre-drain pair, and drains again at the revision its saved entry has
 /// once the retry re-reads it.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the drain never
+/// (`ApcFixture::pre_flip_grant`). With the wrong order, the drain never
 /// reaches the restore and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]

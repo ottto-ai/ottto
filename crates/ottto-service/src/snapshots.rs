@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::{BufWriter, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -178,12 +180,9 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 pub(in crate::snapshots) use codex_file_join::tests::older_build_logs_tier;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{
-    counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
-    older_build_logs_priority,
+    bound_rows as codex_bound_fixture_rows, counting_v2_fixture, native_join_fixture_root,
+    older_build_logs_expired, older_build_logs_priority,
 };
-pub(crate) mod billing_route;
-#[cfg(test)]
-pub(crate) use sources::codex::counting::version::TestCutover;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -192,10 +191,11 @@ mod session_start;
 /// Tail state codecs: each source's head and pages in the state database.
 #[cfg(unix)]
 mod tail_source;
-pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
+#[cfg(test)]
+pub(crate) use disappearance_diagnostics::observe_sites;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
@@ -221,8 +221,6 @@ mod resident_wave_tests;
 pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
 mod oversized_discovery;
-#[path = "pi_retry_inputs.rs"]
-mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
 pub(crate) mod sampled_scan;
@@ -245,7 +243,6 @@ use claude_history_upgrade::{
 use claude_reemission_exclusions::ReemissionExclusions;
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use codex_compressed_input::{is_compressed_codex_rollout, refuse_compressed_codex, OpenedInput};
-pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
@@ -287,8 +284,7 @@ pub const USAGE_DECREASE_HOLD_ACK_CONTRACT: &str = "usage_decrease_hold_ack:v1";
 /// behind each stored ref's body witness. Older servers ignore the field.
 pub const CACHE_STATE_ACK_CONTRACT: &str = "cache_state_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
-// cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
-// is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
+// cut over to v6. The receiver's status request model still requires v5.
 pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // The per-request long-context price bucket (`provider_context_bucket`)
 // restates recent Codex history once. It rides the release's single bundled
@@ -321,8 +317,7 @@ pub use scan::identity::{
 use scan::limits::CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS;
 pub(crate) use scan::limits::LISTING_INTERVAL_SECONDS;
 use scan::limits::{
-    dated_on_or_after, in_codex_forward_evidence_epoch, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS,
-    LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
+    in_codex_forward_evidence_epoch, LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
     UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS, UNHEALTHY_SCAN_RETRY_MAX_SECONDS,
 };
 pub use scan::limits::{
@@ -359,7 +354,7 @@ pub(crate) use wire::batch_validation::validate_snapshot_batch_request_with_item
 #[cfg(test)]
 use wire::content_hash::{
     policy_neutral_component_hashes, snapshot_content_hash, snapshot_content_identity_body,
-    snapshot_revision_hash, snapshot_revision_v2_body, snapshot_revision_v2_hash,
+    snapshot_revision_v2_body, snapshot_revision_v2_hash,
 };
 pub(crate) use wire::content_hash::{
     snapshot_fingerprint, snapshot_fingerprint_from_component_hashes,
@@ -374,14 +369,12 @@ pub(crate) use wire::content_hash::{
     SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION,
 };
 pub(crate) use wire::{
-    declares_usage_decrease_hold_ack, ACCOUNT_SOURCE_CONTRACT,
-    CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
-    CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS, MAX_SEMANTIC_ENVELOPE_BYTES,
-    MAX_SESSION_ARTIFACT_VALUE_CHARS, MAX_SNAPSHOT_BATCH_WIRE_BYTES,
+    declares_usage_decrease_hold_ack, CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE,
+    CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS, CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS,
+    MAX_SEMANTIC_ENVELOPE_BYTES, MAX_SESSION_ARTIFACT_VALUE_CHARS, MAX_SNAPSHOT_BATCH_WIRE_BYTES,
     MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, MAX_SNAPSHOT_ITEM_WIRE_BYTES,
     MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, POLICY_NEUTRAL_COMPONENTS,
-    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
-    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    SNAPSHOT_REVISION_V2_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use wire::{
     default_true, is_false, is_zero_u16, is_zero_u64, is_zero_u8, SnapshotItemWire,
@@ -576,6 +569,10 @@ pub struct SourceScanResult {
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
     pub census_complete: bool,
+    /// The walk gate held this pass: nothing was listed or read.
+    pub(crate) walk_idle: bool,
+    /// This page retired a clean walk (`walk_idle`).
+    pub(crate) settled_walk: bool,
     pub census_window_end: String,
     /// State-only Codex census is separate from transcript discovery. If an
     /// existing SQLite source was unreadable, its previous durable map must be
@@ -632,7 +629,6 @@ pub struct SourceScanResult {
     )]
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
-    codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
     /// Request-census shadow, measured by a complete Claude terminal scan.
     /// Count-only; the local evidence line reports it.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
@@ -680,72 +676,7 @@ impl SourceScanResult {
         }
         Ok(())
     }
-    pub(crate) fn reconcile_codex_legacy_joining(
-        &mut self,
-        index: &mut ScanIndex,
-        previous: &ScanIndex,
-        machine_id: &str,
-        mut project: impl FnMut(&mut ScanIndex, &mut Vec<SnapshotItem>),
-    ) {
-        let mut held = BTreeSet::new();
-        for mut baseline in std::mem::take(&mut self.codex_legacy_join_baselines) {
-            project(index, &mut baseline.snapshots);
-            let matches = |snapshots: &[SnapshotItem]| {
-                let fingerprints = snapshots
-                    .iter()
-                    .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot))
-                    .collect::<BTreeSet<_>>();
-                snapshot_file_entity_set_hex(fingerprints) == baseline.expected
-            };
-            if matches(&baseline.snapshots) {
-                continue;
-            }
-            // Explicit missing/conflict creator evidence intentionally retracts
-            // legacy guessed ownership. Compare with the previously cached
-            // binding only to isolate that authorized correction; never emit it.
-            for item in &mut baseline.snapshots {
-                if item
-                    .session_account_evidence
-                    .as_ref()
-                    .is_some_and(|evidence| {
-                        evidence.evidence_source == "codex_creator_header:v1"
-                            && matches!(evidence.identity_disposition, Some("missing" | "conflict"))
-                    })
-                {
-                    let key =
-                        sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
-                    if let Some(binding) = previous.session_account_bindings.get(&key) {
-                        set_session_account_hash(item, Some(&binding.account_identifier_hash));
-                    }
-                }
-            }
-            if !matches(&baseline.snapshots) {
-                held.insert(baseline.owner);
-            }
-        }
-        if held.is_empty() {
-            if self.census_complete
-                && !self.pending_finalization.iter().any(|pending| {
-                    index
-                        .files
-                        .get(&pending.index_key)
-                        .is_some_and(|entry| entry.codex_applied_tier_receipt.is_some())
-                })
-            {
-                index.traversal = None;
-                index.resume_after_path = None;
-                index.resume_upper_bound_path = None;
-                index.resume_census_window_end = None;
-            }
-            return;
-        }
-        self.hold_codex_groups(
-            index,
-            previous,
-            &held,
-            "legacy applied output could not be reproduced",
-        );
-    }
+
     pub(crate) fn hold_codex_groups(
         &mut self,
         index: &mut ScanIndex,
@@ -1490,12 +1421,9 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
 pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
 
 #[cfg(test)]
-pub(crate) use discovery::directory::with_test_directory_entries;
-#[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
@@ -1503,6 +1431,8 @@ use discovery::directory::{
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
+#[cfg(test)]
+pub(crate) use discovery::directory::{with_directory_read_fault, with_test_directory_entries};
 use discovery::first_read_order;
 use discovery::retention::{AccountMoveObservations, DiscoveryRetention};
 
@@ -1524,6 +1454,7 @@ use discovery::candidate_open::{
     opened_object_identity_from, reopen_for_replay, resolve_configured_scan_root, unix_nanos,
     unix_seconds, OpenedContentSamples,
 };
+pub(crate) use discovery::walk_idle;
 
 use discovery::candidate_open::{open_candidate_beneath_root, opened_object_identity};
 #[cfg(test)]
@@ -1658,6 +1589,11 @@ use session_facts::display_title::{
 };
 
 mod scan;
+
+/// Rest-heap diagnostics: cached repository identities, or None while busy.
+pub(crate) fn repository_identity_entries() -> Option<usize> {
+    scan::accumulator::repository_identity_entries()
+}
 use scan::source_session_id::codex_identity_is_uuid_shaped;
 
 #[cfg(test)]

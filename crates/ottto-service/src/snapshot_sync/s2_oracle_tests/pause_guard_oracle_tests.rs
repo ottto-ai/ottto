@@ -127,7 +127,7 @@ fn paused_list_owed_unchanged_history_held() {
     });
 }
 
-/// [money] G3: a family first uploaded while the list is paused sends the
+/// [money] A family first uploaded while the list is paused sends the
 /// unpaused body but stamps nothing; it stays held while the pause lasts.
 /// Once the list is back it is adopted: anything it sends again is the
 /// accepted body itself, it stamps, and a quiet restart reads nothing.

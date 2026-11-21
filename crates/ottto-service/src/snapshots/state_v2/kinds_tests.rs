@@ -166,12 +166,7 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
     {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (kind, field, introduced) in catalogue::LAYOUTS {
-            // Archive custody is written only while held; this fixture holds
-            // none. A retired kind is never written.
-            if *introduced > previous_layout
-                && !["v1_field.archives", "v1_field.archive_deferred_alarm_count"].contains(kind)
-                && !field.starts_with("retired_")
-            {
+            if *introduced > previous_layout && !field.starts_with("retired_") {
                 assert!(
                     tx.get(&mapper::key(kind, "", 0).unwrap())
                         .unwrap()
@@ -879,8 +874,8 @@ fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
     );
 }
 
-/// [format] #938 copy removals map losslessly between checked v1 bytes and v2.
-/// Goldens are CCR2 of #938's persisted-field fixture plus one prefix-hold
+/// [format] Copy removals map losslessly between checked v1 bytes and v2.
+/// Goldens are CCR2 of the persisted copy-removals fixture plus one prefix-hold
 /// debt file, with definite and lost metadata; an absent slot stays empty.
 #[test]
 fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
@@ -962,8 +957,8 @@ fn shipped_traversal(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::V
 }
 
 /// [regress] 0.1.215 writes `upload_context_proof.direction` every source
-/// cycle (383f8bca6 upload_context_receipt.rs:920-934); #1287 retired it as a
-/// decode-only placeholder. The real v2 read path must still decode it.
+/// cycle. The field is now a decode-only placeholder that the real v2 read path
+/// must still decode.
 #[test]
 fn shipped_0_1_215_upload_context_proof_direction_hydrates() {
     let row = serde_json::json!({ "direction": shipped_direction() });
@@ -973,7 +968,7 @@ fn shipped_0_1_215_upload_context_proof_direction_hydrates() {
 }
 
 /// [regress] 0.1.212-0.1.215 persist nonzero
-/// `counts.caps.inventory_hold_keys_discarded` (removed by #1290).
+/// `counts.caps.inventory_hold_keys_discarded`, now retired.
 #[test]
 fn shipped_0_1_215_traversal_caps_inventory_hold_keys_discarded_hydrates() {
     let row = shipped_traversal(|counts| {
@@ -985,7 +980,7 @@ fn shipped_0_1_215_traversal_caps_inventory_hold_keys_discarded_hydrates() {
 }
 
 /// [regress] 0.1.208-0.1.215 persist nonzero
-/// `counts.listing_owed_pace_evicted` (removed by #1290).
+/// `counts.listing_owed_pace_evicted`, now retired.
 #[test]
 fn shipped_0_1_215_traversal_listing_owed_pace_evicted_hydrates() {
     let row = shipped_traversal(|counts| {
@@ -1246,7 +1241,7 @@ fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
         super::save_graph(&mut db, &identity, before, &mut upgraded, &mut cx).unwrap();
         expected.generation = upgraded.generation;
         assert_persisted(&mut db, &expected);
-        // D59: a previous reader HOLDs when its required root is absent.
+        // A previous reader HOLDs when its required root is absent.
         // A later old writer can restore its original rows before the next upgrade.
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (field, mode, _, empty) in &rows {
@@ -1409,6 +1404,7 @@ pub(in crate::snapshots::state_v2) fn seed_retired_rows(
             continue;
         }
         let count: u64 = match *kind {
+            "v1_field.codex_counting_tombstones" | "v1_field.codex_counting_evicted_legacy" => 1,
             "usage.pending" | "family.requests" if members => 2,
             "account_window" if members => 3,
             "account.current" | "account.absent_members" | "proof.account" if members => 1,
@@ -1540,7 +1536,11 @@ pub(in crate::snapshots::state_v2) fn set_refs(
 fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
     let mut tx = db.begin(TxnMode::Read).unwrap();
     keys.iter()
-        .filter(|key| tx.get(key).unwrap().is_some())
+        .filter(|key| {
+            tx.get(key)
+                .unwrap()
+                .is_some_and(|h| !kinds_misc::empty_counting_root(&mut tx, &h).unwrap())
+        })
         .count()
 }
 
@@ -1816,4 +1816,23 @@ fn graph_save_keeps_progress_rows_outside_the_graph() {
     save_graph(&mut db, &identity, &current, &mut next, &mut cx).unwrap();
     assert_eq!(headers(&mut db), before);
     assert_persisted(&mut db, &next);
+}
+
+/// A checkpoint stored before the walk gate's `rewalk_owed` existed decodes
+/// exactly and re-encodes to the same bytes; a set flag is the only addition.
+#[test]
+fn checkpoint_without_rewalk_owed_keeps_its_bytes() {
+    type Checkpoint = Option<crate::snapshots::ScanTraversalCheckpoint>;
+    let stored = serde_json::to_vec(&fixture().traversal).unwrap();
+    let row: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert!(row.get("rewalk_owed").is_none());
+    let (decoded, canonical) = codec::exact_json::<Checkpoint>(&stored).unwrap();
+    assert_eq!(canonical, stored);
+    let mut checkpoint = decoded.unwrap();
+    assert!(!checkpoint.rewalk_owed);
+    let index = hydrate_with_shipped_row("scan_state.traversal", row).unwrap();
+    assert!(!index.traversal.as_ref().unwrap().rewalk_owed);
+    checkpoint.rewalk_owed = true;
+    let flagged = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(flagged["rewalk_owed"], true);
 }

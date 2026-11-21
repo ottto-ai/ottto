@@ -98,6 +98,9 @@ pub(in crate::snapshots) struct ScanTraversalCounts {
     /// out. Never an unreadable path, a retryable problem or an error.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub(in crate::snapshots) growth_deferred: u64,
+    /// The same changes by class and first or repeat sight; report only.
+    #[serde(skip_serializing_if = "no_class_counts")]
+    pub(in crate::snapshots) listing_changes_by_class: [[u64; 2]; 6],
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -109,7 +112,29 @@ pub(in crate::snapshots) struct SettledScanResidue {
     pub(in crate::snapshots) dropped_usage_record_count: u64,
 }
 
+fn no_class_counts(counts: &[[u64; 2]; 6]) -> bool {
+    *counts == [[0; 2]; 6]
+}
+
 impl ScanTraversalCounts {
+    /// By class: Claude main, subagent; Codex live, archived, compressed; Pi.
+    pub(in crate::snapshots) fn note_change_without_hint(
+        &mut self,
+        source: SnapshotSource,
+        root: &Path,
+        path: &Path,
+        first: bool,
+    ) {
+        let class = match source {
+            SnapshotSource::ClaudeCode => usize::from(claude_subagent_identity(path).is_some()),
+            SnapshotSource::Codex if is_compressed_codex_rollout(Some(path), None) => 4,
+            SnapshotSource::Codex => 2 + usize::from(root.ends_with("archived_sessions")),
+            SnapshotSource::Pi => 5,
+        };
+        self.listing_changes_without_hint += 1;
+        self.listing_changes_by_class[class][usize::from(!first)] += 1;
+    }
+
     #[track_caller]
     pub(in crate::snapshots) fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
         // Preserve the existing public count and operational predicates.
@@ -267,6 +292,9 @@ pub(in crate::snapshots) struct ScanTraversalCheckpoint {
     /// with that pass's start. Stamps older than the pace are pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(in crate::snapshots) listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
+    /// A history budget hold left a change unread: the walk gate stays off.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(in crate::snapshots) rewalk_owed: bool,
 }
 
 // A candidate's scan root is not only where its no-follow open starts: it is
@@ -518,8 +546,8 @@ impl From<String> for ReasonReofferCooldown {
 crate::heap_layout_bound::fields!(ReasonReofferCooldown; body_witness, input_change_only);
 
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, retired_parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, rewalk_owed);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, retired_parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred, listing_changes_by_class);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; growth_retries, index_keys, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
@@ -572,5 +600,80 @@ mod hold_gate_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod relist_class_tests {
+    use super::*;
+
+    /// Every change without a hint lands in exactly one class and sight
+    /// cell, so the cells sum to the existing total. All-zero cells are not
+    /// serialized; set cells round-trip.
+    #[test]
+    fn class_counts_sum_to_changes_without_hint() {
+        let claude = Path::new("/h/.claude/projects/p");
+        let codex = Path::new("/h/.codex/sessions");
+        let archived = Path::new("/h/.codex/archived_sessions");
+        let pi = Path::new("/h/.pi/agent/sessions");
+        let changes = [
+            (
+                SnapshotSource::ClaudeCode,
+                claude,
+                "/h/.claude/projects/p/s.jsonl",
+                0,
+            ),
+            (
+                SnapshotSource::ClaudeCode,
+                claude,
+                "/h/.claude/projects/p/s/subagents/agent-a.jsonl",
+                1,
+            ),
+            (
+                SnapshotSource::Codex,
+                codex,
+                "/h/.codex/sessions/2026/11/01/rollout-a.jsonl",
+                2,
+            ),
+            (
+                SnapshotSource::Codex,
+                archived,
+                "/h/.codex/archived_sessions/rollout-b.jsonl",
+                3,
+            ),
+            (
+                SnapshotSource::Codex,
+                archived,
+                "/h/.codex/archived_sessions/rollout-c.jsonl.zst",
+                4,
+            ),
+            (SnapshotSource::Pi, pi, "/h/.pi/agent/sessions/x/s.jsonl", 5),
+        ];
+        let mut counts = ScanTraversalCounts::default();
+        assert!(serde_json::to_value(&counts)
+            .unwrap()
+            .get("listing_changes_by_class")
+            .is_none());
+        for (repeat, (source, root, path, class)) in changes.iter().chain(&changes).enumerate() {
+            let first = repeat < changes.len();
+            counts.note_change_without_hint(*source, root, Path::new(path), first);
+            assert_eq!(
+                counts.listing_changes_by_class[*class][usize::from(!first)],
+                1
+            );
+        }
+        let cells = counts
+            .listing_changes_by_class
+            .iter()
+            .flatten()
+            .sum::<u64>();
+        assert_eq!(cells, counts.listing_changes_without_hint);
+        assert_eq!(cells, 12);
+        let decoded: ScanTraversalCounts =
+            serde_json::from_value(serde_json::to_value(&counts).unwrap()).unwrap();
+        assert_eq!(
+            decoded.listing_changes_by_class,
+            counts.listing_changes_by_class
+        );
     }
 }

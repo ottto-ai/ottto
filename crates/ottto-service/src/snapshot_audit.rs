@@ -9,10 +9,10 @@
 use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
     apply_upload_policy, collector_version, finalize_scan_after_policy,
-    scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
-    snapshot_semantic_envelope, ScanIndex, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
-    BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    snapshot_semantic_envelope, OwnedSourceScan, OwnedSourceScanStep, ScanIndex, SnapshotItem,
+    SnapshotSource, SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, MAX_BACKFILL_FILES_PER_SOURCE,
+    SNAPSHOT_REVISION_V2_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v4";
+const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v5";
 const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
@@ -76,6 +76,8 @@ pub struct SnapshotAuditReport {
     pub discovered_file_count: usize,
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
+    pub oversized_file_count: usize,
+    pub census_complete: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -85,7 +87,7 @@ pub struct SnapshotAuditReport {
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
-    // Kept for the v4 report schema; always 0 since the daemon builds no curves.
+    // Kept for the v5 report schema; always 0 since the daemon builds no curves.
     pub context_curve_present_session_count: usize,
     pub context_curve_available_session_count: usize,
     pub context_curve_unavailable_session_count: usize,
@@ -208,24 +210,115 @@ pub fn run_snapshot_audit<W: Write>(
         )
     })?;
     crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
-    let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
-    let mut index = ScanIndex::load(&index_path)?;
+    prepare_audit_state_dir(&options.audit_state_dir)?;
+    let mut index = ScanIndex::default();
+    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+    let mut sessions = BTreeMap::new();
+    let mut uploads = BTreeMap::new();
+    let mut scanned_files = 0;
+    let mut scanned_sessions = 0;
+    let mut semantic_noops = 0;
+    let mut held_sessions = 0;
+    let mut report = loop {
+        let (mut page, pending, snapshots) = audit_page(
+            &options,
+            &mut index,
+            &attribution_context,
+            &audit_key,
+            &cache,
+        )?;
+        scanned_files += page.scanned_file_count;
+        scanned_sessions += page.scanned_session_count;
+        semantic_noops += page.semantic_noop_count;
+        held_sessions += page.claude_locally_held_session_count.unwrap_or_default();
+        for session in page.sessions.drain(..) {
+            sessions.insert(session.session_key.clone(), session);
+        }
+        for snapshot in snapshots {
+            uploads.insert(snapshot.source_session_id.clone(), snapshot);
+        }
+        if !pending {
+            break page;
+        }
+    };
+    report.sessions = sessions.into_values().collect();
+    report.emitted_session_count = report.sessions.len();
+    report.scanned_file_count = scanned_files;
+    report.scanned_session_count = scanned_sessions;
+    report.semantic_noop_count = semantic_noops;
+    if report.claude_locally_held_session_count.is_some() {
+        report.claude_locally_held_session_count = Some(held_sessions);
+    }
+    if let Some(path) = options.private_upload_payload_out.as_deref() {
+        let policy = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            workspace_labels_enabled: false,
+            session_artifacts_enabled: false,
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        };
+        let request = crate::snapshot_sync::snapshot_batch_request(
+            options.source,
+            &options.machine_id,
+            uploads.into_values().collect(),
+            policy,
+            crate::client_report::ClientReport::empty(),
+        );
+        write_private_json(path, &request)?;
+    }
+    serde_json::to_writer_pretty(&mut *output, &report).context("write snapshot audit report")?;
+    output
+        .write_all(b"\n")
+        .context("finish snapshot audit report")?;
+    output.flush().context("flush snapshot audit report")?;
+    Ok(report)
+}
+
+fn audit_page(
+    options: &SnapshotAuditOptions,
+    index: &mut ScanIndex,
+    attribution_context: &SessionAttributionContext,
+    audit_key: &[u8],
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+) -> Result<(SnapshotAuditReport, bool, Vec<SnapshotItem>)> {
     // As a sync cycle does before scanning: the active body revision is not
     // persisted, and below it the history veto drops every request-owned body.
     index.activate_effective_upload_body_witness_revision(
         crate::snapshot_sync::effective_upload_body_witness_revision(options.source),
     );
-    let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
+    let scope = crate::transcript_acquisition::Scope("snapshot-audit".into());
+    let mut listing = crate::snapshot_watcher::ListingRequest::default();
+    let mut state = OwnedSourceScan::new_with_recovery_priority(
         options.source,
         &options.roots,
-        &mut index,
+        std::mem::take(index),
         &options.collected_at,
         options.backfill_window_days,
-        Some(&attribution_context),
+        MAX_BACKFILL_FILES_PER_SOURCE,
         options.claude_support_dir.as_deref(),
         &[],
         false,
-    )?;
+        &mut listing,
+        cfg!(test) || crate::snapshots::claude_request_identity::captures(options.source),
+        &[],
+        Some((cache, &scope)),
+        false,
+    )
+    .with_sampled_acquisition(cache.clone(), scope);
+    let mut scan = loop {
+        match state.step(Some(attribution_context)) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete {
+                index: complete,
+                scan,
+                ..
+            } => {
+                *index = complete;
+                break scan;
+            }
+        }
+    };
+    let pending = scan.census_status.pending_work;
     let mut claude_local_evidence = None;
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
@@ -233,13 +326,13 @@ pub fn run_snapshot_audit<W: Write>(
         if let Some(support_dir) = options.claude_support_dir.as_deref() {
             crate::snapshots::claude_request_identity::retain_root_accounts(
                 &mut scan.snapshots,
-                &index,
+                index,
                 &options.machine_id,
             );
             let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 support_dir,
                 &mut scan,
-                &mut index,
+                index,
             );
             claude_authority_disposition = disposition;
             claude_local_evidence = Some(stats);
@@ -259,7 +352,7 @@ pub fn run_snapshot_audit<W: Write>(
     };
     apply_upload_policy(options.source, &mut scan.snapshots, upload_policy);
     let post_policy_snapshots = scan.snapshots.clone();
-    finalize_scan_after_policy(options.source, &mut scan, &mut index);
+    finalize_scan_after_policy(options.source, &mut scan, index);
     let audit_upload_policy = SnapshotAuditUploadPolicy {
         session_titles_enabled: upload_policy.session_titles_enabled,
         workspace_labels_enabled: upload_policy.workspace_labels_enabled,
@@ -286,7 +379,7 @@ pub fn run_snapshot_audit<W: Write>(
             let envelope = snapshot_semantic_envelope(options.source, snapshot, upload_policy);
             Some(SnapshotAuditSession {
                 session_key: keyed_hex(
-                    &audit_key,
+                    audit_key,
                     &[
                         AUDIT_SCHEMA_VERSION,
                         options.source.api_slug(),
@@ -295,28 +388,28 @@ pub fn run_snapshot_audit<W: Write>(
                     ],
                 ),
                 semantic_key: keyed_hex(
-                    &audit_key,
+                    audit_key,
                     &[
                         AUDIT_SCHEMA_VERSION,
                         "semantic",
                         &snapshot.snapshot_fingerprint,
                     ],
                 ),
-                revision_key: blinded_revision_key(&audit_key, &envelope.revision_hash),
+                revision_key: blinded_revision_key(audit_key, &envelope.revision_v2_hash),
                 legacy_revision_proof_available: false,
                 legacy_policy_candidate_semantic_keys: legacy_policy_candidate_semantic_keys(
-                    &audit_key,
+                    audit_key,
                     options.source,
                     pre_policy_snapshot,
                 )
                 .expect("valid upload policies stay within the audited candidate cap"),
                 policy_neutral_component_keys: blinded_component_keys(
-                    &audit_key,
+                    audit_key,
                     &envelope.component_hashes,
                     &POLICY_NEUTRAL_COMPONENTS,
                 ),
                 policy_sensitive_component_keys: blinded_component_keys(
-                    &audit_key,
+                    audit_key,
                     &envelope.component_hashes,
                     &POLICY_SENSITIVE_COMPONENTS,
                 ),
@@ -341,32 +434,16 @@ pub fn run_snapshot_audit<W: Write>(
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.session_key.cmp(&right.session_key));
 
-    if let Some(path) = options.private_upload_payload_out.as_deref() {
-        let mut uploadable_snapshots = scan.snapshots.clone();
-        // Production keeps the full scan for local consumers, then withholds
-        // only authority-demoting revisions at the network boundary. The
-        // audit report covers the full local scan; its optional private payload
-        // reproduces the narrower production upload exactly.
-        claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
-        let request = crate::snapshot_sync::snapshot_batch_request(
-            options.source,
-            &options.machine_id,
-            uploadable_snapshots,
-            upload_policy,
-            // The audit is an offline reproduction of one upload, so it reports
-            // no losses of its own; the live counters belong to the sync loop.
-            crate::client_report::ClientReport::empty(),
-        );
-        write_private_json(path, &request)?;
-    }
+    let mut uploadable_snapshots = scan.snapshots.clone();
+    claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
 
     let report = SnapshotAuditReport {
         schema_version: AUDIT_SCHEMA_VERSION,
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
-        revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
+        revision_contract_version: SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
         source: options.source.api_slug().to_string(),
         machine_key: keyed_hex(
-            &audit_key,
+            audit_key,
             &[AUDIT_SCHEMA_VERSION, "machine", &options.machine_id],
         ),
         upload_policy: audit_upload_policy,
@@ -392,6 +469,8 @@ pub fn run_snapshot_audit<W: Write>(
         discovered_file_count: scan.discovered_file_count,
         skipped_file_count_due_to_limit: scan.skipped_file_count_due_to_limit,
         scan_cap_hit: scan.scan_cap_hit,
+        oversized_file_count: scan.oversized_file_count,
+        census_complete: scan.census_complete,
         scanned_file_count: scan.scanned_file_count,
         scanned_session_count: scan.scanned_session_count,
         semantic_noop_count: scan.semantic_noop_count,
@@ -410,17 +489,7 @@ pub fn run_snapshot_audit<W: Write>(
         sessions,
     };
 
-    // The report is the acknowledgement for an audit scan. Commit its private
-    // state only after both optional payload output and stdout are durable from
-    // this process's point of view; a closed pipe must remain retryable.
-    serde_json::to_writer_pretty(&mut *output, &report).context("write snapshot audit report")?;
-    output
-        .write_all(b"\n")
-        .context("finish snapshot audit report")?;
-    output.flush().context("flush snapshot audit report")?;
-    write_private_json(&index_path, &index)?;
-
-    Ok(report)
+    Ok((report, pending, uploadable_snapshots))
 }
 
 fn blinded_component_keys(
@@ -456,7 +525,7 @@ fn blinded_revision_key(audit_key: &[u8], revision_hash: &str) -> String {
         &[
             AUDIT_SCHEMA_VERSION,
             "revision",
-            SNAPSHOT_REVISION_CONTRACT_VERSION,
+            SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
             revision_hash,
         ],
     )
@@ -469,7 +538,7 @@ fn snapshot_revision_key(
     snapshot: &SnapshotItem,
 ) -> String {
     let envelope = snapshot_semantic_envelope(source, snapshot, SnapshotUploadPolicy::default());
-    blinded_revision_key(audit_key, &envelope.revision_hash)
+    blinded_revision_key(audit_key, &envelope.revision_v2_hash)
 }
 
 pub(crate) fn valid_upload_policies() -> Vec<SnapshotUploadPolicy> {
@@ -693,7 +762,10 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::{scan_source_roots_before_policy, scan_source_roots_with_attribution};
+    use crate::snapshots::{
+        scan_source_roots_before_policy, scan_source_roots_with_attribution,
+        scan_source_roots_with_attribution_and_claude_effort_and_hints,
+    };
     use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -766,7 +838,16 @@ mod tests {
             .as_str()
             .expect("raw source file fingerprint");
         assert_eq!(report.emitted_session_count, 1);
-        assert_eq!(report.schema_version, "local_snapshot_audit:v4");
+        assert_eq!(report.schema_version, "local_snapshot_audit:v5");
+        assert_eq!(report.revision_contract_version, "snapshot_revision:v2");
+        assert_eq!(
+            private_payload["snapshots"][0]["semantic_envelope"]["revision_v2_hash"]
+                .as_str()
+                .map(|hash| blinded_revision_key(&fixture[..MIN_AUDIT_KEY_BYTES], hash)),
+            Some(report.sessions[0].revision_key.clone())
+        );
+        assert_eq!(report.oversized_file_count, 0);
+        assert!(report.census_complete);
         assert_eq!(report.context_curve_evidence_scope, "source_native");
         assert_eq!(report.component_contract_version, "snapshot_semantic:v1");
         assert_eq!(
@@ -807,7 +888,7 @@ mod tests {
                 <= MAX_LEGACY_POLICY_CANDIDATES
         );
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -852,8 +933,8 @@ mod tests {
                 0o700
             );
             assert_eq!(
-                fs::metadata(audit_state_dir.join(AUDIT_SCAN_INDEX_FILE))
-                    .expect("audit index metadata")
+                fs::metadata(audit_state_dir.join(AUDIT_STATE_MARKER_FILE))
+                    .expect("audit marker metadata")
                     .permissions()
                     .mode()
                     & 0o777,
@@ -894,15 +975,92 @@ mod tests {
 
         let first = run_snapshot_audit(options.clone(), &mut Vec::new()).expect("first audit");
         assert_eq!(first.emitted_session_count, 1);
-        let index = ScanIndex::load(&audit_state_dir.join(AUDIT_SCAN_INDEX_FILE))
-            .expect("load settled audit index");
-        assert_eq!(index.file_snapshot_fingerprints.len(), 1);
-        assert_eq!(index.snapshot_activity_at.len(), 1);
+        assert!(!audit_state_dir.join(AUDIT_SCAN_INDEX_FILE).exists());
 
         let second = run_snapshot_audit(options, &mut Vec::new()).expect("second audit");
-        assert_eq!(second.emitted_session_count, 0);
+        assert_eq!(second.emitted_session_count, 1);
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stateless_audit_finishes_multiple_pages_without_a_checkpoint() {
+        let home = temp_dir("audit-multiple-pages");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let fixture = include_str!("../../../fixtures/snapshot-audit/pi-session.jsonl");
+        let count = MAX_BACKFILL_FILES_PER_SOURCE + 1;
+        for n in 0..count {
+            let content = fixture.replace(
+                "fixture-session-019e2700-1111-7000-9000-111111111111",
+                &format!("fixture-session-{n}"),
+            );
+            fs::write(sessions.join(format!("session-{n:04}.jsonl")), content).unwrap();
+        }
+        let key = home.join("audit.key");
+        fs::write(&key, &fixture.as_bytes()[..MIN_AUDIT_KEY_BYTES]).unwrap();
+        let options = SnapshotAuditOptions {
+            source: SnapshotSource::Pi,
+            roots: vec![sessions],
+            audit_state_dir: home.join("audit-state"),
+            audit_key_path: key,
+            session_attribution_hmac_key_path: attribution_key_file(&home),
+            attribution_home: Some(home.clone()),
+            machine_id: "fixture-machine".into(),
+            collected_at: "2026-07-22T08:02:00Z".into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let report = run_snapshot_audit(options.clone(), &mut Vec::new()).unwrap();
+            assert_eq!(report.emitted_session_count, count);
+            assert_eq!(report.scanned_file_count, count);
+            assert!(!options.audit_state_dir.join(AUDIT_SCAN_INDEX_FILE).exists());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn stateless_audit_funds_compressed_codex_input() {
+        let home = temp_dir("audit-compressed-codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"compressed-fixture"}}),
+            serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:00:00Z", "payload":{
+                "type":"token_count","info":{"model":"gpt-synthetic","total_token_usage":{
+                    "input_tokens":100,"cached_input_tokens":50,"output_tokens":10}, "last_token_usage":{
+                    "input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}),
+        ];
+        let plain = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        let compressed = zstd::stream::encode_all(plain.as_bytes(), 1).unwrap();
+        fs::write(
+            sessions.join("rollout-compressed-fixture.jsonl.zst"),
+            compressed,
+        )
+        .unwrap();
+        let key = home.join("audit.key");
+        fs::write(&key, &plain.as_bytes()[..MIN_AUDIT_KEY_BYTES]).unwrap();
+        let report = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::Codex,
+                roots: vec![sessions],
+                audit_state_dir: home.join("audit-state"),
+                audit_key_path: key,
+                session_attribution_hmac_key_path: attribution_key_file(&home),
+                attribution_home: Some(home.clone()),
+                machine_id: "fixture-machine".into(),
+                collected_at: "2026-10-07T10:02:00Z".into(),
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(report.emitted_session_count, 1);
+        assert_eq!(report.sessions[0].input_tokens, 100);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -1193,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_neutral_and_revision_keys_ignore_upload_policy() {
+    fn policy_neutral_keys_ignore_policy_while_v2_revision_keys_bind_it() {
         let fixture = include_bytes!("../../../fixtures/snapshot-audit/pi-session.jsonl");
         let key = &fixture[..MIN_AUDIT_KEY_BYTES];
         let root = temp_dir("policy-boundary");
@@ -1250,7 +1408,7 @@ mod tests {
         assert_ne!(original_sensitive, stripped_sensitive);
         let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -1260,7 +1418,7 @@ mod tests {
                 .expect("golden revision key")
         );
         let stripped_revision = snapshot_revision_key(key, SnapshotSource::Pi, &stripped);
-        assert_eq!(original_revision, stripped_revision);
+        assert_ne!(original_revision, stripped_revision);
         let mut later_observation = stripped.clone();
         later_observation.collected_at = "2026-07-22T09:00:00Z".to_string();
         assert_eq!(

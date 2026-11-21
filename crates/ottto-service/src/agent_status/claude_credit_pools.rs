@@ -2785,11 +2785,11 @@ mod tests {
         with_trigger(Trigger::Setup, || harness.collect(respond_recognized));
         // A fresh reading inside its slot: served, no request, no line.
         harness.collect(respond_recognized);
-        // An older app's status refresh marks the read; the lane thread that
-        // makes it keeps that label.
+        // A setup check marks the read; the lane thread that makes it keeps
+        // that label.
         harness.age_reading(90);
         with_trigger(
-            Trigger::OlderAppCompat,
+            Trigger::Setup,
             super::super::request_claude_explicit_refresh,
         );
         harness.collect(respond_recognized);
@@ -2814,7 +2814,7 @@ mod tests {
             summary,
             [
                 ("anthropic", "setup", "ok", "observed", 1),
-                ("anthropic", "older_app_compat", "ok", "observed", 1),
+                ("anthropic", "setup", "ok", "observed", 1),
                 ("anthropic", "explicit_refresh", "http_500", "observed", 1),
             ]
         );

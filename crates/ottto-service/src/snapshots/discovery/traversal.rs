@@ -399,6 +399,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: rfc3339_unix_seconds(collected_at),
         listing_owed_requeued_unix_seconds: Default::default(),
+        rewalk_owed: false,
     });
     TraversalProgress::Started
 }

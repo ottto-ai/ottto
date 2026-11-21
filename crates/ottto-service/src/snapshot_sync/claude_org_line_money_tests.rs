@@ -52,7 +52,6 @@ fn org_line_governs_from_t_and_a_restarted_tail_matches_cold() {
         c.evidence(&[side.clone()], &[trace_for(ROOT, "side", "")]);
         let pass = |scanner: &E2ScanFixture, index: ScanIndex| {
             let mut accepted = AcceptedBuckets::for_test();
-            accepted.set_account_source_enabled(true);
             let mut page = c.raw(scanner, index, 100, true, &[]);
             page.enrich_with(&c, Some(&mut accepted));
             page.finish();

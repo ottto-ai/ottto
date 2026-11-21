@@ -445,6 +445,15 @@ The pass contains macOS `malloc_in_use_bytes_start` and
 A finish without a matching prepare omits `pass`. Three fixed source slots
 retain only endpoint samples.
 
+The pass reports each of the following outcome counts even when it is zero.
+
+- `selected` counts snapshots after policy and local hold filtering, including telemetry-only snapshots.
+- `accepted` is the accepted snapshot count used by the terminal Success receipt.
+- `index_saved` is 1 when a scan-index save or state-v2 graph commit advanced the generation.
+- `progress_committed` counts state-v2 progress pages that committed.
+- `progress_unchanged` counts state-v2 progress pages that already matched the saved rows.
+- `progress_not_published` counts state-v2 progress pages that returned `NotPublished`.
+
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
 `accounts_identity_bytes`, and `traversal_bytes`. The last three split the
@@ -468,6 +477,18 @@ fields are
 inline stack storage, and conservatively charge shared buffers per owner.
 Codex sidecar facts retain only the active cycle scope; a scope change drops
 the previous scope's idle facts when the new pass returns its facts.
+
+`process_rest_heap` is one row per ordinary sync cycle, written by the sync
+loop after the cycle and never inside a pass. It reports what the process holds
+at rest: `malloc_in_use_bytes` (macOS), `sqlite_memory_used_bytes` and
+`sqlite_memory_highwater_bytes` (SQLite's own heap across every connection),
+and entry counts for process-lifetime maps: `rearm_clear_tags`,
+`rearm_open_pages`, `counted_poison_scopes`, `counted_poison_fingerprints`,
+`telemetry_notice_dirs`, `telemetry_notice_roots`, `state_v2_routes`,
+`grant_rebind_refusals`, `claude_token_owners`, `claude_spawn_admitted`, and
+`repository_identities`. Counts only, never keys. A map whose lock is busy
+reports `null` instead of waiting. A count that keeps rising across quiet hours
+names the map behind a rising rest footprint.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
 zeros; finishes without the capture omit the object. Title facts use completion
 accounting with a separate existing visit counter per cached entry; ordinary
@@ -861,7 +882,7 @@ the age gate. Grown since committed: retention ends when the growth is committed
 (`size_bytes` catches up). Untouched and truncated files gain no exemption. This
 covers the walk, candidate/open rechecks and Codex roster.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by
-source on the #799 page line, drained per page and omitted at zero. It counts
+source on the page diagnostics line, drained per page and omitted at zero. It counts
 one event per gate check, even if another retention source also matches; a file
 may pass several gates. Oversized growth stays observed for reconciliation
 without a full parse under the existing size cap. Retention grants no new
@@ -950,7 +971,7 @@ frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it i
 not limited to once per outer sync cycle. Thus the bound is per preparation,
 not per process or per day.
 
-On the #799 Codex `native_collection_page` line,
+On the Codex `native_collection_page` diagnostics line,
 `counts.codex_fragment_tail_repeat{files, bytes}` counts this residual using the
 approved fallback: actual aged Tail completions with no RAM fragment witness,
 an unchanged sampled source fingerprint, a start equal to the committed prefix,
@@ -1013,9 +1034,9 @@ its existing due time. Unknown identity or resource refusal grants no new Skip
 or completion credit. It applies only to an aged grown key admitted solely by the
 grown-since-committed retention arm. A recent grown key keeps main's immediate
 TranscriptChanged selection. At its retained due time, the aged key takes the
-existing Audit cause. Main's #903 fixes virtual-deadline to sampled-marker
-conversion: restoration carries the minimum owed due time, and only a successful
-secure open marks the slot attempted. Failed opens preserve the owed due time;
+existing Audit cause. When virtual deadlines convert to sampled markers,
+restoration carries the minimum owed due time, and only a successful secure
+open marks the slot attempted. Failed opens preserve the owed due time;
 stat-aware backoff and parking pace retries. The RAM backoff map admits 256 keys;
 longest-quiet eviction is counted and transfers the evicted owed deadline into
 the next slot, failing toward reading rather than dropping the obligation.
@@ -1118,7 +1139,7 @@ that change the member are not attempted, and out-of-root destinations are not
 covered; these retain ordinary positively proven deletion semantics. Hold caps
 and ordinary size gates remain.
 
-Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+Same-size middle-only rewrites remain an accepted residual.
 Evidence outside stamped inputs (including API/trace metadata tokens and
 reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account
@@ -1152,6 +1173,28 @@ gate, cap and upload nothing.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
+- **`admin_other_read`** (per file, at body-read completion): `files` and
+  `native_bytes` of `admin_other` reads by fixed joint label, each prefixed by
+  the selection cause. `fingerprint_object` is a moved fingerprint whose
+  opened-object ctime witness differs from the stored one (a sidecar may have
+  moved too). `fingerprint_unattributed` is any other moved fingerprint: the
+  index keeps no per-input digest, so a Desktop store, OTLP sidecar, launcher
+  context, inode or sampled-byte move cannot be told apart. `adoption` is a
+  non-money body-witness revision adoption, `rearm` a cleared entry
+  fingerprint, `memo` an account memo-miss, `new_file_fresh_index` a new file
+  after a fresh index without prior-history evidence, `audit` a due audit, and
+  `other` the rest.
+  - `<cause>.<mode>` is the actual acquisition mode: `unchanged`, `tail`,
+    `full:<reason>`, or `no_plan`. A `no_plan` read counts its parser bytes and
+    is never in `read`, so the planned modes sum to `read.admin_other`.
+  - `<cause>.restore.<outcome>` is the Tail restore at selection: `miss` (cold
+    or held), `bypass` (no load), `hit_discarded_by_cap`, or `hit`. A kept `hit`
+    compares the loaded seal and the plan's opening extent with the prior
+    indexed size: `hit.indexed_gap` (seal below it), `hit.new_bytes` (extent
+    above it), `hit.both` or `hit.neither`. A re-fold of a moved fingerprint
+    should read 0 native bytes in `tail` or `unchanged`.
+  - `<cause>.retry.audit_cap_clear` marks a read selected while its entry
+    carries an audit-cap clear.
 
 Upload counts land on the line after the source's next page line.
 
@@ -1410,10 +1453,10 @@ the Ottto support directory, readable only by the user:
 
 - `provider` is `openai`, `anthropic`, or `unknown` for a model request whose
   provider the daemon cannot tell (the Pi smoke prompt on Pi's default route).
-- `trigger` is `schedule`, `explicit_refresh`, `older_app_compat`, `setup`,
-  `startup` or `other`. A person's Verify is `setup`; the first status pass
-  after the daemon starts is `startup`, and the first pass after the Mac wakes
-  is `schedule`.
+- `trigger` is `schedule`, `explicit_refresh`, `setup`, `startup` or `other`.
+  A person's Verify is `setup`; the first status pass after the daemon starts
+  is `startup`, and the first pass after the Mac wakes is `schedule`. Older
+  retained lines may still show `older_app_compat`.
 - `account` is the first 8 hex characters of the account identifier hash, or
   `unknown`.
 - `result` is `ok`, `http_<status>`, `timeout`, `exit_<code>` or a short
@@ -1609,6 +1652,26 @@ read and a page that read and listed nothing new do not. A page whose selected
 files are all skipped waits the ordinary cadence. These observations add no
 timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
+
+## Idle passes of a settled source
+
+A pass the walk gate held logs `walk_idle=true` at the end of its
+`snapshot terminal_census` line, with `census_complete=false` and no scanned
+files. It sends no status receipt, so the last walk's receipt, loss disclosure
+and manifest stay current; check-in beats keep them fresh, and while a record is
+armed the cycle-start beat carries no scan start. Nothing was read, uploaded or
+saved. A hint, a listing request, a changed input, a failure, an account switch
+or a restart makes the next pass walk, and a settled source still walks at
+least once every listing interval (three hours).
+
+`bounded_traversal_transition` rows carry the walk's counts, including
+`listing_changes_without_hint`: changed files a listing queued that no watcher
+hint announced. `listing_changes_by_class` splits that total into six rows of
+`[first, repeat]` counts, in this order: Claude main transcripts, Claude
+subagent transcripts, Codex live rollouts, Codex archived rollouts, compressed
+Codex rollouts and Pi sessions. `first` counts a file's first sighting in the
+walk's generation and `repeat` a later one. The cells sum to the total. The
+field is report only and is omitted while every cell is zero.
 
 ## Prior Held Family Observation
 
@@ -1885,11 +1948,6 @@ refusals. While a placeholder is stored, a contract change cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
 
-Retained Pi retry authority also binds the original client's API endpoint digest.
-An endpoint-only transition refuses before relay-token acquisition and batch
-submission, even if device credentials and the account witness stay unchanged.
-The digest is RAM-only authority and is never emitted in diagnostic records.
-
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include
@@ -2094,8 +2152,6 @@ retry timer, Held queue or separate power/work gate remains.
 Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
 win before header/body selection, and both encodings use the same mtime age rules;
 compressed rollouts keep their original modification time, so they age as the plain file did.
-Legacy archive member keys retain first-seen eligibility under the ordinary 60-day gate;
-no disposition or attempt count is applied, and normal header/ownership admission remains.
 Never-seen old plain and compressed files are skipped equally.
 One secure header opener
 supplies ownership proof. The inventory has no file-count, directory-count, cache
@@ -2123,7 +2179,7 @@ scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo o
 header attempt per archive; no money effect. Whether an older binary decodes carried
 state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
-On close, each body decoder prints `codex_zst_input` on the #799 carrier with
+On close, each body decoder prints `codex_zst_input` on the diagnostics row with
 consumed `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder
 thread `codex_zst_cpu_micros`, including failures. Inventory header reads decode
 every `.zst` once per walk, so their closes print no row of their own: the Codex
@@ -2257,7 +2313,7 @@ observed scalar; the pre-existing scalar arithmetic itself is unchanged.
 Persistence uses the existing traversal counts: `causes` is a trailing defaulted
 slot after retired positional slots. Its eight numeric contribution slots keep
 the prior order (six causes, two retired input counters). Empty `causes` is omitted
-from object-form checkpoints and #799 JSON rows, including Claude/Pi defaults;
+from object-form checkpoints and JSON diagnostics rows, including Claude/Pi defaults;
 fixed positional arrays retain zero elements because position is their schema.
 SOURCE approved class N counts and these absence/re-upgrade semantics on
 2026-10-29. Object form is the only supported downgrade representation;
@@ -2434,54 +2490,14 @@ timeout (ran out of its VM budget), busy, disk_full, engine or decode. Drift is
 counted separately in `reference_drift`.
 Only registered kind labels and counts are emitted, never keys or values.
 
-### Option (ii): `identity_retained` bucket rows
+### Removed: `identity_retained` bucket rows
 
-Off unless the activity hint carries exactly
-`session_request_identity_retained_contract: "session_request_identity_retained:v1"`;
-any other value keeps the bodies above byte-identical. When on, the backend
-retains per-row proof, so the accepted priority is not used: fresh tags take
-the plain newest-first order within the unchanged caps.
-
-A bucket row enters the local proved-row ledger only when a stored-body entity
-ACK (no `unchanged_basis`) covers a body where that row carried a positive tag,
-only while the capability is on, and only when that ACK declares a body witness
-version and its digest equals the local body witness of a body that has a
-public witness version (session account evidence or cache observations), so
-the ACK validator also checked the exact version. The
-ledger keeps truncated keyed digests of the row key and of that proof
-(authorities plus the eight counts and five costs); later positive proof
-replaces it. Per revision, a proved row whose current proof equals the ACKed
-proof in a closed hour, or whose transcript no longer proves it, is sent
-untagged with full amounts and `identity_retained: true`; it is not a refusal.
-Different proof, the open hour and never-proved rows get fresh tags. A row is
-never both tagged and marked; top-level rows are never marked. If the
-untagged fallback cannot fit every marker beside the stripped body, it keeps
-the newest that fit and counts each dropped proved row as a refusal.
-
-Before any upload, a proved row that the outgoing body freshly tags with a
-different proof becomes a proof-free tombstone, and progress is saved before
-the request, so a lost reply cannot leave a stale proof that a later marker
-would honour. While that tombstone stands, a row the transcript no longer
-proves is a counted refusal; the replacement's ACK replaces it.
-A stored-body ACK's optional `retained_proof_missing` bucket starts remove that
-body's marked rows, so a later revision re-tags them through the same
-allocator. A destination namespace or historical replay generation change
-clears all proved rows, as does key rotation. Limits: 1,024 proved rows per session, persisted as
-versioned base64 of 73-byte records, and 64 pending missing buckets (diagnostic
-only). Each proved record also stores the proving revision's optional row-level
-account hash (class H, bounded and erased with the session). Login markers resend
-that ACK-bound hash for grain only; parts markers have no hash. Old records without
-hash provenance fail closed to fresh tags. Markers require contract 6
-(`claude_request_owned_usage:v1`); contract-5-only bodies send fresh tags.
-Rows evicted at the proof cap also send fresh tags through the usual caps. At every cap one session's hints stay below 512 KiB of JSON and
-256 KiB of requested layout.
-
-Sparse `identity_cap` counters, omitted while zero: `retained_marker_rows`,
-`retained_proof_missing_received`, `retained_set_cleared`, `proved_rows_capped`
-(rows not retained at the proof cap), and
-`retained_missing_unfit` (a missing-proof bucket whose fresh proof did not fit
-and kept today's untagged/refused rule). `accepted_share_changed` also counts
-proved rows sent with different proof.
+The daemon no longer reads `session_request_identity_retained_contract` and
+never sends `identity_retained` or `copy_invalidated` on bucket rows; every body
+uses the accepted-priority rules above. A stored identity hint that still
+carries the removed `proved` or `missing` field, in the JSON ledger or as a
+state_v2 identity row, loads with those fields dropped; the next write of that
+hint omits them.
 
 ### Freshness alarm (all sources)
 
@@ -2493,7 +2509,16 @@ cannot be read. Each listed file's owed changes are kept as metadata of its
 or rewrite adds a revision timed at the live mtime, and only the file's own
 matched exact upload receipt retires it, and only the prefix it covers (a newer
 suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
-receipt elsewhere retires nothing. A rewritten file folds its old debt into the
+receipt elsewhere retires nothing. One answer stands in for the receipt that no
+stored body can earn: `unchanged` with `unchanged_basis: usage_identical` says
+the server already holds that body's usage. The daemon then holds the exact body
+terminally at once, so it is not offered again (a current-context re-offer
+answered `dominated_by_head` keeps its 6 h, then 12 h retry). For a file with one
+entity, the walk retires the read prefix as a receipt would, while the index
+still holds that body under the same destination, upload context and replay
+generation. The
+answer is kept in process memory only: a restart before the walk that lists
+the file leaves its debt held until the file changes. A rewritten file folds its old debt into the
 new object with the earliest time. Compressed Codex extents count by compressed size, and
 outside the discovery window no new debt starts. `outstanding_files` counts every
 owed file, `held_files` those whose debt is read or held rather than unread

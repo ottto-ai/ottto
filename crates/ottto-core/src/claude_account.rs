@@ -157,7 +157,7 @@ mod tests {
         assert!(claude_cli_account_identifier_hash_from_config(&serde_json::json!({})).is_empty());
         assert!(
             claude_cli_account_identifier_hash_from_config(&serde_json::json!({
-                "oauthAccount": { "accountUuid": "   ", "displayName": "Ron" }
+                "oauthAccount": { "accountUuid": "   ", "displayName": "Alex" }
             }))
             .is_empty()
         );

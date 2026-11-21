@@ -203,6 +203,7 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
+pub(crate) mod rest_heap;
 #[cfg(unix)]
 mod shutdown;
 #[cfg(unix)]
@@ -1561,6 +1562,7 @@ pub(crate) fn source_prepare<T>(
     let probe = Probe::start();
     let (malloc_in_use_bytes, malloc_allocated_bytes) = footprint::malloc_zone();
     if let Some(slot) = source_slot(source) {
+        PASS_OUTCOMES.set(Some(PassOutcomes::default()));
         with_passes(|p| {
             p.lock().unwrap_or_else(|e| e.into_inner())[slot] = Some((
                 probe.started,
@@ -1636,6 +1638,7 @@ fn source_finish_inner<T>(
     let started = Instant::now();
     let after = process_sample();
     let zone_end = footprint::malloc_zone();
+    let outcomes = PASS_OUTCOMES.take().unwrap_or_default();
     window.finish_sample = Some(after);
     window.pass = source_slot(source)
         .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
@@ -1660,6 +1663,7 @@ fn source_finish_inner<T>(
                 malloc_allocated_bytes: zone_end.1,
                 sample_cost_us: wall_us(started).saturating_add(retained_cost_us),
                 retained_heap_bytes,
+                outcomes,
             }
         });
     drop(window);
@@ -1712,6 +1716,26 @@ pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedByte
         });
     }
 }
+#[derive(Default, Serialize)]
+pub(crate) struct PassOutcomes {
+    pub(crate) selected: u64,
+    pub(crate) accepted: u64,
+    pub(crate) index_saved: u64,
+    pub(crate) progress_committed: u64,
+    pub(crate) progress_unchanged: u64,
+    pub(crate) progress_not_published: u64,
+}
+thread_local! {
+    // Rotation owns a source from prepare through finish on the same thread.
+    static PASS_OUTCOMES: std::cell::RefCell<Option<PassOutcomes>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn pass_outcomes(record: impl FnOnce(&mut PassOutcomes)) {
+    PASS_OUTCOMES.with_borrow_mut(|outcomes| {
+        if let Some(outcomes) = outcomes {
+            record(outcomes);
+        }
+    });
+}
 process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([const { None }; 3]));
 process_static!(fn with_pass_starts: AtomicU64 = AtomicU64::new(0));
 /// Passes started so far, then whether one is open. Read at an off-pass
@@ -1730,6 +1754,7 @@ fn pass_state() -> (u64, bool) {
 /// longer open; a finished pass already took its slot.
 pub(crate) fn pass_ended(source: &str) {
     if let Some(slot) = source_slot(source) {
+        PASS_OUTCOMES.set(None);
         with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot] = None);
     }
 }
@@ -1750,6 +1775,8 @@ struct PassSummary {
     sample_cost_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     retained_heap_bytes: Option<RetainedBytes>,
+    #[serde(flatten)]
+    outcomes: PassOutcomes,
 }
 /// Named stage window, emitted on normal drop; unwinding emits nothing.
 /// `offpass_` stages add CPU split scalars and do not start footprint sampling.
@@ -2342,7 +2369,7 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
-/// State-v2 backend observations use the existing local-only #799 sink.
+/// State-v2 backend observations use the existing local-only diagnostics sink.
 /// Callers supply counts, lengths and bounded states, never storage keys.
 pub(crate) fn claude_state_v2(counts: &impl Serialize) {
     traversal_point("claude_state_v2", "claude_code", counts);
@@ -2481,7 +2508,7 @@ pub(crate) struct ReadCounts {
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
-    /// Resumable large-file Codex read cursor (#606). `null` when its
+    /// Resumable large-file Codex read cursor. `null` when its
     /// snapshot could not be obtained (no Codex cursor page tick in this scan,
     /// or the cursor state was busy at completion): unknown, never zero
     /// activity.
@@ -3517,6 +3544,46 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(control["trust_checks"], 3);
             assert!(control["trust_us_max"].as_u64() <= control["trust_us_sum"].as_u64());
+        }
+    }
+
+    #[test]
+    fn source_finish_reports_pass_outcomes_and_resets_counts() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(
+                    source,
+                    || pass_outcomes(|counts| counts.progress_unchanged += 1),
+                    |_| false,
+                );
+                source_finish(source, false, || {
+                    pass_outcomes(|counts| {
+                        counts.selected = 5;
+                        counts.accepted = 3;
+                        counts.index_saved = 1;
+                        counts.progress_committed += 2;
+                        counts.progress_unchanged += 1;
+                        counts.progress_not_published += 1;
+                    });
+                    Ok(())
+                })
+                .unwrap();
+                source_prepare(source, || (), |_| false);
+                source_finish(source, false, || Ok(())).unwrap();
+            });
+            assert_finish_record(&records[1], source);
+            assert_finish_record(&records[3], source);
+            for (field, expected) in [
+                ("selected", 5_u64),
+                ("accepted", 3),
+                ("index_saved", 1),
+                ("progress_committed", 2),
+                ("progress_unchanged", 2),
+                ("progress_not_published", 1),
+            ] {
+                assert_eq!(records[1]["counts"]["pass"][field].as_u64(), Some(expected));
+                assert_eq!(records[3]["counts"]["pass"][field].as_u64(), Some(0));
+            }
         }
     }
 
@@ -4709,7 +4776,7 @@ mod continuation_tests {
     }
 }
 
-/// Fixed low-cardinality storage observations on the existing #799 envelope.
+/// Fixed low-cardinality storage observations on the existing diagnostics envelope.
 pub(crate) fn scan_index_storage(
     source: &'static str,
     orphans: u64,
@@ -4868,7 +4935,7 @@ impl StateV2Probe {
     }
 }
 
-/// V2 growth counters use the existing local #799 row. No keys or paths.
+/// V2 growth counters use the existing local diagnostics row. No keys or paths.
 pub(crate) fn v2_growth_retained(bytes: u64) {
     claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
 }

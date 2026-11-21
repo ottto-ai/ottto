@@ -104,8 +104,6 @@ impl ScanIndex {
         self.files
             .retain(|_, entry| entry.retain_history_evidence());
         // Retired entries' ACK evidence resets with the entries it outlived.
-        self.codex_counting_tombstones.clear();
-        self.codex_counting_evicted_legacy = Default::default();
         let active = self.active_effective_upload_body_witness_revision;
         for (_, entry) in self.files.slots_mut() {
             let entry = entry.make_mut();
@@ -397,6 +395,7 @@ impl ScanIndex {
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
+            rewalk_owed: false,
         });
     }
 

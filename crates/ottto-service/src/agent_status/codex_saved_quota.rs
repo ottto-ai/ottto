@@ -1299,17 +1299,13 @@ fn scheduled_read_due_at(
     due_at
 }
 
-/// Whether an explicit refresh may read the home now: at most once a minute
-/// (or `min_gap_seconds`, if longer), counting any read.
-pub(super) fn explicit_refresh_allowed(
-    saved: Option<&SavedCodexQuota>,
-    min_gap_seconds: u64,
-    now: u64,
-) -> bool {
+/// Whether an explicit refresh may read the home now: at most once a minute,
+/// counting any read.
+pub(super) fn explicit_refresh_allowed(saved: Option<&SavedCodexQuota>, now: u64) -> bool {
     saved.map_or(true, |saved| {
         let last = saved.last_attempt_at_epoch_seconds;
         last > now.saturating_add(CLOCK_SKEW_SECONDS)
-            || now.saturating_sub(last) >= min_gap_seconds.max(EXPLICIT_REFRESH_MIN_GAP_SECONDS)
+            || now.saturating_sub(last) >= EXPLICIT_REFRESH_MIN_GAP_SECONDS
     })
 }
 
@@ -1874,15 +1870,14 @@ pub(crate) struct CodexExplicitRefresh {
 }
 
 /// Explicit refresh: read every Codex home now, each at most once a minute,
-/// or once per `min_gap_seconds` if longer, counting any read. Homes that
-/// hold the same login are read once, by the home that reads for them.
-pub(crate) fn refresh_codex_quota_now(min_gap_seconds: u64) -> CodexExplicitRefresh {
+/// counting any read. Homes that hold the same login are read once, by the
+/// home that reads for them.
+pub(crate) fn refresh_codex_quota_now() -> CodexExplicitRefresh {
     let support_dir = saved_quota_support_dir();
     let now = current_unix_seconds();
     refresh_homes_now(
         &support_dir,
         scheduled_homes(&support_dir, now),
-        min_gap_seconds,
         now,
         |home| read_codex_usage_from_provider(&home.home, home.trust),
     )
@@ -1891,7 +1886,6 @@ pub(crate) fn refresh_codex_quota_now(min_gap_seconds: u64) -> CodexExplicitRefr
 fn refresh_homes_now(
     support_dir: &Path,
     homes: Vec<ScheduledHome>,
-    min_gap_seconds: u64,
     now: u64,
     read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
 ) -> CodexExplicitRefresh {
@@ -1908,7 +1902,7 @@ fn refresh_homes_now(
         support_dir,
         homes,
         now,
-        |saved, _, now| explicit_refresh_allowed(saved, min_gap_seconds, now),
+        |saved, _, now| explicit_refresh_allowed(saved, now),
         read,
     );
     if read > 0 {
@@ -2509,9 +2503,8 @@ mod tests {
         )
         .is_some());
         assert_eq!(reads.get(), 2);
-        let explicit = |saved: Option<&SavedCodexQuota>, now: u64| {
-            explicit_refresh_allowed(saved, EXPLICIT_REFRESH_MIN_GAP_SECONDS, now)
-        };
+        let explicit =
+            |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
         assert!(read_and_save_at(
             &root,
             &home,
@@ -3008,7 +3001,7 @@ mod tests {
         }
 
         fn refresh(&self, at: u64) -> (CodexExplicitRefresh, Vec<String>) {
-            let outcome = refresh_homes_now(&self.root, self.scheduled(&[], at), 0, at, |home| {
+            let outcome = refresh_homes_now(&self.root, self.scheduled(&[], at), at, |home| {
                 self.read(home, at)
             });
             (outcome, self.taken_reads())

@@ -1663,8 +1663,8 @@ fn claude_worker_receipt_publication_respects_controls_rebind_and_removal() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// AutoReview P2 on 83657166: an admitted fresh login whose first quota
-/// read is unavailable must still become the canonical anchor over a dead
+/// An admitted fresh login whose first quota read is unavailable must still
+/// become the canonical anchor over a dead
 /// slot that only has older complete limits, in both the collector's
 /// selection and the persisted anchor coverage readers use.
 #[test]
@@ -1800,8 +1800,8 @@ fn usable_connection_outranks_dead_slot_with_complete_history_for_canonical_anch
     );
 }
 
-/// Opus review F1 on 6d43ff24: the limits/upload choice must follow the
-/// health-first canonical choice. An old slot with valid access but a
+/// The limits/upload choice must follow the health-first canonical choice.
+/// An old slot with valid access but a
 /// passed refresh deadline (fresh, complete limits, unusable) and a new
 /// working login with partial limits: the new login is canonical, preferred
 /// and uploads; the old slot is the duplicate, never the reverse.
@@ -3824,13 +3824,13 @@ fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() 
     codex_saved_quota::forget_running_homes();
     let before = codex_app_server_runs();
 
-    let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now(0));
+    let first = with_trigger(Trigger::ExplicitRefresh, refresh_codex_quota_now);
     assert_eq!(first.read, 1);
     assert_eq!(first.rate_limited, 0);
     assert_eq!(codex_app_server_runs(), before + 1);
 
     // A second press within the minute reads nothing.
-    let second = refresh_codex_quota_now(0);
+    let second = refresh_codex_quota_now();
     assert_eq!(second.read, 0);
     assert_eq!(second.rate_limited, 1);
     assert_eq!(codex_app_server_runs(), before + 1);
@@ -3952,7 +3952,7 @@ fn codex_background_refresh_off_stops_the_schedule_but_not_refresh_or_setup() {
     assert_eq!(codex_app_server_runs(), before);
 
     // A person's Refresh reads.
-    let refreshed = refresh_codex_quota_now(0);
+    let refreshed = refresh_codex_quota_now();
     assert_eq!((refreshed.read, refreshed.rate_limited), (1, 0));
     assert_eq!(codex_app_server_runs(), before + 1);
     // The setup check's provider read reads too.
@@ -8729,7 +8729,7 @@ fn registered_claude_accounts_carry_their_product_into_source_health() {
     // on its own slot snapshot, and the app titles its rows from these
     // observations — without the merge they read as a bare email.
     let current = claude_account_snapshot(
-        "ron@ottto.net",
+        "user@example.com",
         "claude_max_20x",
         "hash-current",
         "org-current",
@@ -8771,7 +8771,7 @@ fn registered_claude_accounts_carry_their_product_into_source_health() {
     assert_eq!(
         described,
         vec![
-            ("ron@ottto.net", "claude_max_20x", Some(true)),
+            ("user@example.com", "claude_max_20x", Some(true)),
             ("personal.member@example.com", "claude_max_20x", Some(false)),
             (
                 "team.member@example.com",
@@ -8788,7 +8788,7 @@ fn registered_claude_plan_observations_describe_each_account_once() {
     // and again as its own registered slot. It must not gain a second
     // observation, which would give the app two rows for one account.
     let current = claude_account_snapshot(
-        "ron@ottto.net",
+        "user@example.com",
         "claude_max_20x",
         "hash-current",
         "org-current",
@@ -10116,7 +10116,7 @@ fn claude_desktop_metadata_observations_split_current_desktop_account() {
               "cliSessionId": "identity-cli-session",
               "lastActivityAt": "2026-07-06T10:00:00Z",
               "emailAddress": "team.member@example.com",
-              "accountName": "Ron",
+              "accountName": "Alex",
               "organizationName": "Acme",
               "subscriptionType": "team",
               "initialMessage": "must not be persisted"
@@ -11291,7 +11291,24 @@ fn legacy_usage_cache_migrates_into_its_physical_account_store() {
     )
     .expect("write legacy cache");
 
-    assert!(read_claude_oauth_usage_cache("account-b", "organization-b").is_none());
+    {
+        let lock = claude_oauth_account_state_lock("account-b", "organization-b");
+        let _transaction = lock.lock().expect("account lock");
+        let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("migration lock");
+        claude::oauth_cache::migrate_legacy_claude_oauth_usage_cache_locked(
+            "account-b",
+            "organization-b",
+        );
+    }
+    assert!(read_claude_oauth_usage_cache_with_legacy_migration(
+        "account-b",
+        "organization-b",
+        false,
+    )
+    .is_none());
     assert!(claude_oauth_usage_legacy_cache_path().is_file());
     assert_eq!(
         read_claude_oauth_usage_cache("account-a", "organization-a")
@@ -11306,139 +11323,80 @@ fn legacy_usage_cache_migrates_into_its_physical_account_store() {
 
 #[test]
 #[serial]
-fn default_account_state_is_mirrored_for_downgrade_without_custom_account_leakage() {
-    let support_dir = std::env::temp_dir().join(format!(
-        "ottto-claude-oauth-downgrade-mirror-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&support_dir);
-    fs::create_dir_all(&support_dir).expect("create support dir");
-    let _guard = EnvVarGuard::set_os(
+fn legacy_root_cleanup_removes_leftovers_and_preserves_account_files() {
+    let support_dir = single_caller_test_support_dir("root-cleanup");
+    let _support_guard = EnvVarGuard::set_os(
         "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
         support_dir.as_os_str().to_os_string(),
     );
-    let default_cache = ClaudeOAuthUsageCache {
-        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-        account_identifier_hash: "account-default".to_string(),
-        organization_identifier_hash: "organization-default".to_string(),
-        observed_at_epoch_seconds: 100,
-        next_refresh_after_epoch_seconds: u64::MAX,
-        windows: vec![AgentQuotaWindow {
-            name: "session".to_string(),
-            used_percent: Some(20),
-            account_identifier_hash: Some("account-default".to_string()),
-            organization_identifier_hash: Some("organization-default".to_string()),
-            ..Default::default()
-        }],
-        credit_balances: Vec::new(),
-        account_weekly_not_offered: false,
-        account_session_not_offered: false,
-    };
-    let custom_cache = ClaudeOAuthUsageCache {
-        account_identifier_hash: "account-custom".to_string(),
-        organization_identifier_hash: "organization-custom".to_string(),
-        windows: vec![AgentQuotaWindow {
-            name: "session".to_string(),
-            used_percent: Some(80),
-            account_identifier_hash: Some("account-custom".to_string()),
-            organization_identifier_hash: Some("organization-custom".to_string()),
-            ..Default::default()
-        }],
-        ..default_cache.clone()
-    };
-    write_claude_oauth_usage_cache(&default_cache).expect("write default account cache");
-    write_legacy_claude_oauth_usage_cache(&default_cache).expect("mirror legacy cache");
-    assert!(read_claude_oauth_usage_cache_with_legacy_migration(
-        "account-custom",
-        "organization-custom",
-        false,
-    )
-    .is_none());
-    assert!(
-        claude_oauth_usage_legacy_cache_path().is_file(),
-        "a custom-first read must not consume the default downgrade cache"
-    );
-    write_claude_oauth_usage_cache(&custom_cache).expect("write custom account cache");
+    let (account, organization) = ("account-cleanup", "organization-cleanup");
+    let cache_path = claude_oauth_usage_cache_path(account, organization);
+    let breaker_path = claude_oauth_usage_breaker_path(account, organization);
+    fs::create_dir_all(cache_path.parent().expect("account dir")).expect("create account dir");
+    fs::write(&cache_path, b"account cache").expect("write account cache");
+    fs::write(&breaker_path, b"account breaker").expect("write account breaker");
+    let root_cache = claude_oauth_usage_legacy_cache_path();
+    let root_breaker = claude_oauth_usage_legacy_breaker_path();
+    fs::write(&root_cache, b"old cache").expect("write root cache");
+    fs::write(&root_breaker, b"old breaker").expect("write root breaker");
 
-    let legacy_cache: ClaudeOAuthUsageCache = serde_json::from_str(
-        &fs::read_to_string(claude_oauth_usage_legacy_cache_path()).expect("read legacy cache"),
-    )
-    .expect("parse legacy cache");
-    assert_eq!(legacy_cache.account_identifier_hash, "account-default");
-    assert_eq!(
-        legacy_cache.schema_version,
-        CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION
+    let lock = claude_oauth_account_state_lock(account, organization);
+    let _transaction = lock.lock().expect("account lock");
+    let cleanup = std::sync::Once::new();
+    claude::oauth_cache::migrate_and_clean_up_legacy_claude_oauth_usage_locked(
+        account,
+        organization,
+        &cleanup,
     );
-    assert_eq!(legacy_cache.windows[0].used_percent, Some(20));
+    assert!(!root_cache.exists());
+    assert!(!root_breaker.exists());
     assert_eq!(
-        read_claude_oauth_usage_cache("account-custom", "organization-custom")
-            .expect("read custom cache")
-            .windows[0]
-            .used_percent,
-        Some(80)
+        fs::read(&cache_path).expect("account cache"),
+        b"account cache"
+    );
+    assert_eq!(
+        fs::read(&breaker_path).expect("account breaker"),
+        b"account breaker"
     );
 
-    let fingerprint = "fingerprint-default";
-    record_claude_oauth_usage_failure_with_legacy(
-        ClaudeOAuthUsageFailure::AuthRejected,
-        "account-default",
-        "organization-default",
-        fingerprint,
-        1_000,
-        true,
+    // The process makes only one removal attempt, even if a root file reappears.
+    fs::write(&root_breaker, b"reappeared").expect("recreate root breaker");
+    claude::oauth_cache::migrate_and_clean_up_legacy_claude_oauth_usage_locked(
+        account,
+        organization,
+        &cleanup,
     );
-    assert!(read_claude_oauth_usage_breaker_with_legacy_migration(
-        "account-custom",
-        "organization-custom",
-        "fingerprint-custom",
-        false,
-    )
-    .is_none());
-    assert!(
-        claude_oauth_usage_legacy_breaker_path().is_file(),
-        "a custom-first read must not consume the default downgrade breaker"
-    );
-    record_claude_oauth_usage_failure_with_legacy(
-        ClaudeOAuthUsageFailure::ResponseShape,
-        "account-custom",
-        "organization-custom",
-        "fingerprint-custom",
-        1_000,
-        false,
-    );
-    let legacy_breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(
-        &fs::read_to_string(claude_oauth_usage_legacy_breaker_path()).expect("read legacy breaker"),
-    )
-    .expect("parse legacy breaker");
-    assert_eq!(legacy_breaker.account_identifier_hash, "account-default");
-    assert_eq!(legacy_breaker.config_fingerprint, fingerprint);
-    assert_eq!(legacy_breaker.auth_failures, 1);
-    assert_eq!(legacy_breaker.shape_failures, 0);
-    assert_eq!(
-        read_claude_oauth_usage_breaker(
-            "account-custom",
-            "organization-custom",
-            "fingerprint-custom"
-        )
-        .expect("read custom breaker")
-        .shape_failures,
-        1
-    );
+    assert_eq!(fs::read(&root_breaker).expect("one attempt"), b"reappeared");
+    let _ = fs::remove_dir_all(support_dir);
+}
 
-    clear_claude_oauth_usage_breaker_with_legacy("account-default", "organization-default", true);
-    assert!(!claude_oauth_usage_legacy_breaker_path().exists());
-    assert!(read_claude_oauth_usage_breaker(
-        "account-default",
-        "organization-default",
-        fingerprint
-    )
-    .is_none());
-    assert!(read_claude_oauth_usage_breaker(
-        "account-custom",
-        "organization-custom",
-        "fingerprint-custom"
-    )
-    .is_some());
+#[test]
+#[serial]
+fn legacy_root_cleanup_tolerates_missing_files() {
+    let support_dir = single_caller_test_support_dir("root-cleanup-missing");
+    let _support_guard = EnvVarGuard::set_os(
+        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+        support_dir.as_os_str().to_os_string(),
+    );
+    let root_cache = claude_oauth_usage_legacy_cache_path();
+    let root_breaker = claude_oauth_usage_legacy_breaker_path();
+    assert!(!root_cache.exists());
+    assert!(!root_breaker.exists());
+    // A missing cache must not prevent removal of the other leftover file.
+    fs::write(&root_breaker, b"old breaker").expect("write root breaker");
+    let lock = claude_oauth_account_state_lock("account-missing", "organization-missing");
+    let _transaction = lock.lock().expect("account lock");
+    let cleanup = std::sync::Once::new();
+    claude::oauth_cache::migrate_and_clean_up_legacy_claude_oauth_usage_locked(
+        "account-missing",
+        "organization-missing",
+        &cleanup,
+    );
+    assert!(cleanup.is_completed());
+    assert!(!root_cache.exists());
+    assert!(!root_breaker.exists());
+    assert!(!claude_oauth_usage_cache_path("account-missing", "organization-missing").exists());
+    assert!(!claude_oauth_usage_breaker_path("account-missing", "organization-missing").exists());
     let _ = fs::remove_dir_all(support_dir);
 }
 
@@ -11778,48 +11736,6 @@ fn concurrent_breaker_failures_are_one_account_transaction_without_lost_updates(
     .expect("concurrent breaker");
     assert_eq!(breaker.auth_failures, WORKERS as u32);
     assert_eq!(emitted.len(), 1, "open transition should emit exactly once");
-    let _ = fs::remove_dir_all(support_dir);
-}
-
-#[test]
-#[serial]
-fn legacy_breaker_migrates_into_its_physical_account_store() {
-    let support_dir = std::env::temp_dir().join(format!(
-        "ottto-claude-oauth-breaker-migration-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&support_dir);
-    fs::create_dir_all(&support_dir).expect("create support dir");
-    let _guard = EnvVarGuard::set_os(
-        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-        support_dir.as_os_str().to_os_string(),
-    );
-    let breaker = ClaudeOAuthUsageBreaker {
-        schema_version: CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION,
-        account_identifier_hash: "account-a".to_string(),
-        organization_identifier_hash: "organization-a".to_string(),
-        config_fingerprint: "fingerprint-a".to_string(),
-        auth_failures: 2,
-        ..Default::default()
-    };
-    fs::write(
-        claude_oauth_usage_legacy_breaker_path(),
-        serde_json::to_vec_pretty(&breaker).expect("serialize legacy breaker"),
-    )
-    .expect("write legacy breaker");
-
-    assert!(
-        read_claude_oauth_usage_breaker("account-b", "organization-b", "fingerprint-a").is_none()
-    );
-    assert!(claude_oauth_usage_legacy_breaker_path().is_file());
-    assert_eq!(
-        read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-a")
-            .expect("migrated breaker")
-            .auth_failures,
-        2
-    );
-    assert!(claude_oauth_usage_breaker_path("account-a", "organization-a").is_file());
-    assert!(!claude_oauth_usage_legacy_breaker_path().exists());
     let _ = fs::remove_dir_all(support_dir);
 }
 
@@ -12709,8 +12625,7 @@ fn breaker_files_never_persist_the_raw_slot_id_and_migrate_raw_keys() {
     let raw_slot_id = "claude_slot_0123456789abcdef0123456789abcdef";
     let slot = ClaudeOAuthUsageCaller::RegisteredSlot(raw_slot_id.to_string());
     let (account, organization, fingerprint) = ("account-o", "organization-o", "fingerprint-o");
-    // The default login mirrors into the legacy file; the slot writes the
-    // per-account file. Neither may carry the raw id.
+    // Both callers share the per-account file; neither may persist the raw id.
     record_claude_oauth_usage_auth_failure(
         &slot,
         401,
@@ -12729,17 +12644,13 @@ fn breaker_files_never_persist_the_raw_slot_id_and_migrate_raw_keys() {
         1_001,
         None,
     );
-    for path in [
-        claude_oauth_usage_breaker_path(account, organization),
-        claude_oauth_usage_legacy_breaker_path(),
-    ] {
-        let body = fs::read_to_string(&path).expect("breaker body");
-        assert!(
-            !body.contains(raw_slot_id),
-            "raw slot id persisted in {path:?}"
-        );
-        assert!(body.contains(&claude_oauth_usage_slot_caller_key(raw_slot_id)));
-    }
+    let path = claude_oauth_usage_breaker_path(account, organization);
+    let body = fs::read_to_string(&path).expect("breaker body");
+    assert!(
+        !body.contains(raw_slot_id),
+        "raw slot id persisted in {path:?}"
+    );
+    assert!(body.contains(&claude_oauth_usage_slot_caller_key(raw_slot_id)));
     assert_ne!(
         claude_oauth_usage_slot_caller_key(raw_slot_id),
         claude_oauth_usage_slot_caller_key("claude_slot_other")
@@ -12840,60 +12751,6 @@ fn rotated_default_credential_is_released_from_its_predecessors_hold() {
         state.backoff_until_epoch_seconds,
         1_003 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
     );
-}
-
-#[test]
-#[serial]
-fn slot_success_is_not_resurrected_from_the_legacy_mirror() {
-    let support_dir = single_caller_test_support_dir("legacy-resurrect");
-    let _support_guard = EnvVarGuard::set_os(
-        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-        support_dir.as_os_str().to_os_string(),
-    );
-    let (account, organization, fingerprint) = ("account-r", "organization-r", "fingerprint-r");
-    let slot_a = ClaudeOAuthUsageCaller::RegisteredSlot("slot-a".to_string());
-    let default = ClaudeOAuthUsageCaller::Default;
-    record_claude_oauth_usage_auth_failure(
-        &slot_a,
-        401,
-        account,
-        organization,
-        fingerprint,
-        1_000,
-        None,
-    );
-    // The default login succeeds after A's hold expired: A's streak is
-    // kept and the default path mirrors it into the legacy file.
-    let after_hold = 1_000 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS + 60;
-    clear_claude_oauth_usage_breaker_after_success(
-        &default,
-        account,
-        organization,
-        fingerprint,
-        after_hold,
-    );
-    assert!(fs::read_to_string(claude_oauth_usage_legacy_breaker_path())
-        .expect("legacy mirror")
-        .contains(&slot_a.breaker_key()));
-    // A's own success retires its streak and deletes the account file.
-    clear_claude_oauth_usage_breaker_after_success(
-        &slot_a,
-        account,
-        organization,
-        fingerprint,
-        after_hold + 1,
-    );
-    assert!(!claude_oauth_usage_breaker_path(account, organization).exists());
-    // The next default read migrates the legacy file if present; A's
-    // retired streak must not come back.
-    let resurrected = read_claude_oauth_usage_breaker(account, organization, fingerprint);
-    assert!(
-        resurrected
-            .as_ref()
-            .is_none_or(|breaker| !breaker.auth_callers.contains_key(&slot_a.breaker_key())),
-        "a caller's success must permanently retire its streak: {resurrected:?}"
-    );
-    let _ = fs::remove_dir_all(support_dir);
 }
 
 #[test]

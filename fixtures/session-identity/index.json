@@ -14435,7 +14435,7 @@
       "file": "p1-authority-swap.json",
       "file_sha256": "e3bc116adaefa4994dd4989d16bc65ea0bb1ef9b1659aa6000e34e5218f093bf",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/authority-swap.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for authority swap",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3ccc0568a912c266a33547771f8addee6d2d8e1d425cc9ddf7735113d86ada6d",
@@ -14540,7 +14540,7 @@
       "file": "p1-basis-only-change.json",
       "file_sha256": "221d01533a5a04743cc859474c382873c47b8357f25098c932124426b9c2ae5c",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/basis-only-change.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for basis only change",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "c87724712f430ae702cd8abd1fa12fae2ab35e63e339a1c23f0948983c61b9a9",
@@ -14645,7 +14645,7 @@
       "file": "p1-mixed-hour-full-basis.json",
       "file_sha256": "83f271a9c4a0e5a09bbaae4ca1eb80426c3138e79b93940d6edf60768a517004",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/mixed-hour-full-basis.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for mixed hour full basis",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "c87724712f430ae702cd8abd1fa12fae2ab35e63e339a1c23f0948983c61b9a9",
@@ -14780,7 +14780,7 @@
       "file": "p1-mixed-hour-reordered-wire.json",
       "file_sha256": "8329de5918365c251247712c87da8db7ef8b31bfeca2c6875be80adbec1023e7",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/mixed-hour-reordered-wire.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for mixed hour reordered wire",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "c87724712f430ae702cd8abd1fa12fae2ab35e63e339a1c23f0948983c61b9a9",
@@ -14915,7 +14915,7 @@
       "file": "p1-part-money-micro.json",
       "file_sha256": "b50d1d7188ae2a8e50d8e20b8f3df4793d64511f13fcd43bba6f1c79c7dc4dbf",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/part-money-micro.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for part money micro",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "06de8510d9e4f88825cfa50da82388e6055ca57235a88e2378cacf616a7b434b",
@@ -15018,7 +15018,7 @@
       "file": "p1-refused-positive.json",
       "file_sha256": "73dd5d4da02daaa1ecd628e3b26de385211ffea0ae531a18fbbeada64933691f",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/refused-positive.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for refused positive",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "c87724712f430ae702cd8abd1fa12fae2ab35e63e339a1c23f0948983c61b9a9",
@@ -15123,7 +15123,7 @@
       "file": "p1-single-identity-rows.json",
       "file_sha256": "133d99299e266ac60ad44e618f53b5ba31afef3378665d9a7654e4d954658a83",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/single-identity-rows.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for single identity rows",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "c87724712f430ae702cd8abd1fa12fae2ab35e63e339a1c23f0948983c61b9a9",
@@ -15228,7 +15228,7 @@
       "file": "p1-transcript-org-part.json",
       "file_sha256": "27c1d9c48ab064ebd22ebf466016c115a4477b2359a56fd543d6e130cdfb6652",
       "kind": "p1_subset",
-      "source": "P1 #9485 backend/tests/fixtures/session_identity_contract5/transcript-org-part.json at commit 8e610139d7d18fb01314024f077f3f5c07d337c2",
+      "source": "Historical receiver fixture for transcript org part",
       "component_hashes": {
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "06de8510d9e4f88825cfa50da82388e6055ca57235a88e2378cacf616a7b434b",

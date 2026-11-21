@@ -1,18 +1,15 @@
 // Included inside the money-equivalence fixture. One copy route through the
-// production scan, settlement and reload: an accepted copy an earlier build
-// decided keeps its decision (forward-only), and a listed holder never
-// reverses a saved removal.
+// production scan, settlement and reload: the request-id proof decides a
+// growing copy, and a listed holder never reverses a saved removal.
 use super::*;
 
 /// How the copy's settled prefix removal reached the growth page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Earlier {
-    /// Settled before the cutoff by an earlier build: COPY-marked, accepted,
-    /// nothing saved, and its origin no longer proves it.
-    Grandfathered,
     /// Removed by request ids and saved: the holder proves it again.
     Saved,
-    /// As `Grandfathered`, but every turn is after the cutoff.
+    /// Settled after the cutoff: COPY-marked, accepted, nothing saved, and
+    /// its origin is listed.
     AfterCutoff,
 }
 
@@ -77,8 +74,8 @@ fn grown_copy(arm: Earlier) -> ((u64, u64), Vec<u64>) {
     );
     let mut prior = settle(&c, &prior, first, &mut progress);
     if arm != Earlier::Saved {
-        // What an earlier build left: the settled COPY body and its marks,
-        // no saved removal; the origin is listed, so it proves nothing new.
+        // The settled COPY body and its marks, no saved removal; the origin
+        // is listed.
         prior.claude_copy_removals = Default::default();
         crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT]);
     }
@@ -97,16 +94,13 @@ fn grown_copy(arm: Earlier) -> ((u64, u64), Vec<u64>) {
     )
 }
 
-/// [money] Forward-only: an accepted copy settled before the cutoff keeps
-/// its removed prefix as it grows, with no holder to prove it and without
-/// counting as a newly corrected family; the same copy proven by a saved
-/// removal is a corrected family; after the cutoff the request-id proof
-/// alone decides, including the holder's earlier accepted body after listing.
+/// [money] A copy proven by a saved removal is a corrected family as it
+/// grows; with nothing saved the request-id proof alone decides, including
+/// the holder's earlier accepted body after listing.
 #[test]
-fn accepted_pre_cutoff_copy_keeps_its_decision_through_growth() {
+fn request_id_proof_decides_copy_through_growth() {
     with_e2(|| {
         for (arm, tuple, counters) in [
-            (Earlier::Grandfathered, (2, 2), [0, 0]),
             (Earlier::Saved, (2, 2), [1, 0]),
             (Earlier::AfterCutoff, (2, 2), [1, 0]),
         ] {

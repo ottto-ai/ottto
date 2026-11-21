@@ -342,19 +342,19 @@ pub(super) fn refresh_agent_status_for(
 }
 
 /// Explicit quota refresh (a user's Refresh action) of every account of the
-/// source(s). Codex homes are read here, each at most once a minute or
-/// `min_gap_seconds` if longer (one `codex app-server` run per home, up to its
-/// timeout, before the reply). Claude accounts are marked for the collection
-/// that follows, whose usage gate reads them at most once a minute and keeps
-/// every hold, breaker and Retry-After; the lane's next own pass answers a
-/// mark that collection missed (one already in flight).
-pub(super) fn request_explicit_quota_refresh(source: Option<&SourceKind>, min_gap_seconds: u64) {
+/// source(s). Codex homes are read here, each at most once a minute (one
+/// `codex app-server` run per home, up to its timeout, before the reply).
+/// Claude accounts are marked for the collection that follows, whose usage
+/// gate reads them at most once a minute and keeps every hold, breaker and
+/// Retry-After; the lane's next own pass answers a mark that collection
+/// missed (one already in flight).
+pub(super) fn request_explicit_quota_refresh(source: Option<&SourceKind>) {
     if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
         crate::agent_status::request_claude_explicit_refresh();
         crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
     }
     if source.map_or(true, |source| source == &SourceKind::Codex) {
-        let outcome = crate::agent_status::refresh_codex_quota_now(min_gap_seconds);
+        let outcome = crate::agent_status::refresh_codex_quota_now();
         eprintln!(
             "explicit Codex quota refresh: read={} rate_limited={}",
             outcome.read, outcome.rate_limited

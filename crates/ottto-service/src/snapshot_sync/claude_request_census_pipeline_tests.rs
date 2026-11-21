@@ -152,7 +152,10 @@ fn census_pre_hold_bodies_born(
     collected_at: &str,
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
-    let mut index = ScanIndex::load(&fixture.index_path).expect("preview index");
+    let committed = ScanIndex::load(&fixture.index_path).expect("preview index");
+    let mut index =
+        crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(&committed, &fixture.base);
+    drop(committed);
     // The same activation as `PipelineFixture::page`: the hashed context bound
     // to the index and the ledger, so entity fingerprints match the page's.
     let mut progress = test_upload_progress();
@@ -327,7 +330,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
                 .1
                 .is_empty());
             index
-                .save(&fixture.index_path)
+                .save_fixture(&fixture.index_path)
                 .expect("save live debt before the actual replay page");
         }
         let cycle = PipelineCycle {

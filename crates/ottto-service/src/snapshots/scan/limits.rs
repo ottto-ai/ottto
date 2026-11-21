@@ -10,14 +10,6 @@ use crate::snapshots::rfc3339_unix_seconds;
 /// usage accepted before the release keeps exactly the row it had.
 pub(in crate::snapshots) const CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS: u64 = 1_794_182_400;
 
-/// 2026-11-04T00:00:00Z, a 00:00Z expected on/after install of the release
-/// that carries the Legacy repeat gate. Legacy drops an equal-total repeat
-/// only when the repeated line itself is dated from here, so its row is a
-/// function of its file's bytes on every read route and history before this
-/// keeps exactly the rows it had. Correcting older repeats is an operator
-/// decision.
-pub(in crate::snapshots) const CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS: u64 = 1_793_750_400;
-
 /// `false` for a missing or unparsable timestamp.
 pub(in crate::snapshots) fn dated_on_or_after(
     timestamp: Option<&str>,

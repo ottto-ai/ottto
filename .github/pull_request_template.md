@@ -1,6 +1,6 @@
 ## Summary
 
-<!-- What changes and why. Link the issue it fixes, if any (for example "Fixes #123"). -->
+<!-- What changes and why. Link the issue this fixes, if any. -->
 
 ## Validation
 

@@ -44,10 +44,9 @@ fn own(login: char, org: char, source: Option<AccountSource>) -> Placement {
     )
 }
 
-/// One page of `scanner` over `index`, with this cycle's account-source hints.
+/// One page of `scanner` over `index`, with a fresh accepted ledger.
 fn pass(c: &Corpus, scanner: &E2ScanFixture, index: ScanIndex) -> Page {
     let mut accepted = AcceptedBuckets::for_test();
-    accepted.set_account_source_enabled(true);
     let mut page = c.raw(scanner, index, 100, true, &[]);
     page.enrich_with(c, Some(&mut accepted));
     deliver_page(page)
@@ -234,7 +233,6 @@ fn first_request_own_login_survives_later_growth() {
             stamp(&mut rows, &cutoff_clock(0));
             c.evidence(&rows, &[]);
             let mut ledger = AcceptedBuckets::for_test();
-            ledger.set_account_source_enabled(true);
             let scanner = E2ScanFixture::capturing_identity();
             let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
             warm.enrich_with(&c, Some(&mut ledger));

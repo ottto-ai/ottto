@@ -1255,7 +1255,7 @@ mod tests {
             user: Some(LocalAccountUser {
                 id: "user_test".to_string(),
                 email: "ron@example.com".to_string(),
-                display_name: Some("Ron".to_string()),
+                display_name: Some("Alex".to_string()),
             }),
             organization: Some(LocalAccountOrganization {
                 id: "org_test".to_string(),

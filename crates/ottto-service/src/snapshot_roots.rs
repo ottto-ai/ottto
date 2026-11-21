@@ -259,7 +259,7 @@ mod tests {
             .all(|row| row.account_identifier_hash.is_none()));
         // Restart uses the ordinary persisted index, not a folder-specific cursor.
         let index_path = scratch.join("index.json");
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
         let mut restarted = ScanIndex::load(&index_path).unwrap();
         let repeated = scan_source_roots(
             SnapshotSource::ClaudeCode,

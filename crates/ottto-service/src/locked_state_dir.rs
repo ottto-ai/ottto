@@ -1,12 +1,12 @@
 //! The daemon's held state-directory lock, reachable from the library.
 //!
-//! `serve` and `serve-xpc` take #801's `StateDirLock` before anything else
+//! `serve` and `serve-xpc` take the `StateDirLock` before anything else
 //! and hand it here, where it stays for the life of the process. Writers of
 //! daemon-owned caches that must never have a second writer (the
 //! durable-tail store) ask for it with [`held_for`]; a process that does not
 //! hold it (a CLI command, a test) gets `None` and writes nothing.
 //!
-//! Dropping #801's lock unlocks it (#812). The holder here is a process
+//! Dropping the state-directory lock unlocks it. The holder here is a process
 //! static, never dropped (like `StateDirLock::hold_until_exit`), so the lock
 //! is released at process exit (or crash) and not before. Nothing here
 //! relies on when that happens.
@@ -25,7 +25,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// #801's lock together with the directory it locks.
+/// The lock together with the directory it protects.
 #[derive(Debug)]
 pub struct LockedStateDir {
     dir: PathBuf,
@@ -156,7 +156,7 @@ pub(crate) fn replace_json_cache(
 }
 
 /// Tests stand in for the daemon on their own scratch state directory. The
-/// lock is taken with #801's real `acquire` and kept until the test process
+/// lock is taken with the real `StateDirLock::acquire` and kept until the test process
 /// exits (it is never dropped), like the daemon's.
 #[cfg(test)]
 pub(crate) mod test_locks {

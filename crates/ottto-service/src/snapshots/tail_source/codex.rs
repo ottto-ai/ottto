@@ -465,7 +465,7 @@ impl TailSource for Codex {
     /// reconstruction, labelled with the check that refused it
     /// (`INCOMPATIBLE_*`). Never a silent success. In order: the counting rule,
     /// the priority decisions, the sidecar's projected ordinal; then the file
-    /// birth. Last, the file's lineage (D131): the stored head continues only
+    /// birth. Last, the file's lineage: the stored head continues only
     /// the session its owning header named when it was written, so a header
     /// rewritten to another id is another file (a counted `Identity`
     /// reconstruction), and a header this read cannot read waits. A protected
@@ -484,10 +484,7 @@ impl TailSource for Codex {
         if stored.codex_sidecar_binding != live.codex_sidecar_binding {
             return Err(incompatible(INCOMPATIBLE_SIDECAR_BINDING));
         }
-        if !sources::codex::counting::version::reusable(
-            stored.codex_counting.as_deref(),
-            live.codex_counting.as_deref(),
-        ) {
+        if !sources::codex::counting::version::reusable(stored, live) {
             return Err(incompatible(INCOMPATIBLE_COUNTING_VERSION));
         }
         // A stored read that dropped its witnesses cannot show its decisions

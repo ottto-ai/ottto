@@ -1131,7 +1131,7 @@ fn codex_daemon_sign_in_reconnect_counts_only_the_clis_own_sign_in() {
 
         // A scheduled round and an explicit refresh during the run.
         crate::agent_status::codex_scheduled_round_now(later());
-        crate::agent_status::refresh_codex_quota_now(0);
+        crate::agent_status::refresh_codex_quota_now();
         assert_eq!(fixture.app_server_runs_for(&home), 2, "exit {exit}");
         // The person's own Codex session refreshes the credential.
         write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
@@ -2637,32 +2637,6 @@ fn count_backup_files(path: &Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
-}
-
-/// Only an app without `quota_refresh` (protocol 15 or older) has its
-/// status refresh stand in for Refresh, and only for Codex; the CLI and
-/// newer apps do not.
-#[test]
-fn only_older_companion_apps_status_refresh_reads_codex_quota() {
-    for version in [15, 14] {
-        assert_eq!(
-            status_refresh_quota_source(Some(LocalClientKind::CompanionApp), version),
-            Some(SourceKind::Codex)
-        );
-    }
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::CompanionApp), 16),
-        None
-    );
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::Cli), 15),
-        None
-    );
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::WebUi), 15),
-        None
-    );
-    assert_eq!(status_refresh_quota_source(None, 15), None);
 }
 
 #[test]
@@ -5088,7 +5062,7 @@ fn local_only_logout_retains_prior_proof_and_rejection_becomes_reattach_required
             &mut stream,
             409,
             "Conflict",
-            r#"{"detail":{"code":"reattach_required","message":"Existing installation authority requires an explicit relay device","reason":"existing_authority","device_name":"Founder M4","last_seen_at":"2026-09-07T12:30:00Z","can_reconnect":true,"can_replace":true,"replacement_approved":false}}"#,
+            r#"{"detail":{"code":"reattach_required","message":"Existing installation authority requires an explicit relay device","reason":"existing_authority","device_name":"Example Mac","last_seen_at":"2026-09-07T12:30:00Z","can_reconnect":true,"can_replace":true,"replacement_approved":false}}"#,
         );
     });
     let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
@@ -5110,7 +5084,7 @@ fn local_only_logout_retains_prior_proof_and_rejection_becomes_reattach_required
     assert_eq!(status.account.can_reconnect, Some(true));
     let message = status.account.message.unwrap();
     assert_eq!(message.code, "reattach_required:existing_authority");
-    assert!(message.text.contains("Founder M4"));
+    assert!(message.text.contains("Example Mac"));
     assert!(message.text.contains("2026-09-07T12:30:00Z"));
     assert!(message.text.contains("Reconnect it"));
 }
@@ -7561,12 +7535,12 @@ fn install_owner_detection_routes_known_install_paths() {
         InstallOwner::Homebrew
     );
     assert_eq!(
-        install_owner_for_path(Path::new("/Users/ron/.ottto/bin/ottto-service")),
+        install_owner_for_path(Path::new("/Users/example/.ottto/bin/ottto-service")),
         InstallOwner::HostedInstaller
     );
     assert_eq!(
         install_owner_for_path(Path::new(
-            "/Users/ron/Applications/Ottto.app/Contents/Helpers/ottto-service"
+            "/Users/example/Applications/Ottto.app/Contents/Helpers/ottto-service"
         )),
         InstallOwner::AppBundle
     );
@@ -7662,7 +7636,6 @@ fn auth_only_command_keeps_trust_and_poisoned_state_refusals() {
             authorization,
             command(),
             InstallOwner::Unknown,
-            None,
             false,
         )
     };
@@ -7987,7 +7960,7 @@ fn diagnostics_collect_is_local_only_without_upload() {
     assert!(response.ok, "{response:?}");
     let payload = response.payload.expect("payload");
     assert!(!serde_json::to_string(&payload).unwrap().contains(canary));
-    // STATE: no stored session fact reaches the bundle.
+    // The bundle excludes stored session facts.
     for fact in crate::snapshots::TAIL_FACT_LITERALS {
         let literal = format!("{canary}-{fact}");
         assert!(!serde_json::to_string(&payload).unwrap().contains(&literal));
@@ -8133,7 +8106,7 @@ fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
     assert!(body.contains("\"support_claim_provided\":true"));
     assert!(!body.contains("support_123"));
     assert!(!body.contains(canary));
-    // STATE: no stored session fact reaches the uploaded bundle.
+    // The uploaded bundle excludes stored session facts.
     for fact in crate::snapshots::TAIL_FACT_LITERALS {
         let literal = format!("{canary}-{fact}");
         assert!(!body.contains(&literal));
@@ -10455,7 +10428,7 @@ fn pi_default_route_smoke_is_one_unknown_provider_line() {
 #[test]
 fn command_diagnostics_are_redacted_before_display() {
     let diagnostic = redact_command_diagnostic(
-        "Token sk-secret123 is expired at /Users/ron/.aws/sso/cache/file.json account_id=org_123 raw_prompt=show private repo",
+        "Token sk-secret123 is expired at /Users/example/.aws/sso/cache/file.json account_id=org_123 raw_prompt=show private repo",
     )
     .expect("diagnostic");
 
@@ -10463,7 +10436,7 @@ fn command_diagnostics_are_redacted_before_display() {
     assert!(diagnostic.contains("[path]"));
     assert!(diagnostic.contains("[account_id]"));
     assert!(diagnostic.contains("[prompt]"));
-    assert!(!diagnostic.contains("/Users/ron"));
+    assert!(!diagnostic.contains("/Users/example"));
     assert!(!diagnostic.contains("org_123"));
     assert!(!diagnostic.contains("sk-secret123"));
     assert!(!diagnostic.contains("show private repo"));
@@ -11080,7 +11053,6 @@ fn relay_runtime_failure_health_survives_control_and_config_intents() {
                 RequestAuthorization::Token("token".into()),
                 command,
                 InstallOwner::Unknown,
-                None,
                 false,
             )
             .unwrap();
@@ -13041,11 +13013,13 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     // A second whole-index incident inside 24 hours pauses the source.
     let pause = |source: SnapshotSource| {
         let path = root.join(format!("{}-scan-index.json", source.api_slug()));
-        fs::write(&path, b"{").expect("first damage");
-        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(&path, source, &root)
-            .expect("first incident rebuilds");
-        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
-        fs::write(&path, &damage).expect("second damage");
+        crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
+        crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
+        let (_, origin) =
+            crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(&path, source, &root)
+                .expect("first incident publishes and then adopts fresh native custody");
+        assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+        crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
         path
     };
     let refused = |path: &Path, source: SnapshotSource| {
@@ -13137,10 +13111,13 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
         again.authority.message.code,
         "scan_index_rebuild_override_cooldown"
     );
-    let (index, origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(&pi, SnapshotSource::Pi, &root)
-            .expect("the armed press passes the guard once");
-    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+    let (index, origin) = crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(
+        &pi,
+        SnapshotSource::Pi,
+        &root,
+    )
+    .expect("the armed press publishes and the next pass adopts the carried rebuild");
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     assert!(index.files.is_empty());
     assert!(!crate::snapshots::scan_index_rebuild_paused(
         SnapshotSource::Pi
@@ -13154,7 +13131,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
 
     // A fresh failure inside 24 hours of the override refuses again,
     // and a press inside 24 hours names the cooldown and the retry time.
-    fs::write(&pi, &damage).expect("third damage");
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&pi, &damage);
     refused(&pi, SnapshotSource::Pi);
     let cooling = repair(
         None,
@@ -13218,6 +13195,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     assert!(plan.authority.message.text.contains("too damaged"));
     assert!(plan.authority.message.text.contains("retries by itself at"));
     let _ = fs::remove_dir_all(&root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]

@@ -315,8 +315,8 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
-private_project_path = "/" + "Users/" + "ronshub/private/project"
-operator_log_path = "/" + "Users/" + "ronshub/Library/Logs/Ottto/local.log"
+private_project_path = "/Users/example/private/project"
+operator_log_path = "/Users/example/Library/Logs/Ottto/local.log"
 payload["upload"]["support_claim"] = "support_123456"
 payload["sections"].append({
     "name": "unsafe_support_context",

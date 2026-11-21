@@ -78,7 +78,7 @@ fn opened(store: &LockedStore) -> (Value, LoadedRoot) {
 #[test]
 fn frozen_sharded_generation_is_seekable_and_next_save_is_legacy() {
     let s = Scratch::new();
-    let mut expected = s.install();
+    let expected = s.install();
     let store = s.store();
     let (actual, root) = opened(&store);
     assert_eq!(actual, expected);
@@ -96,17 +96,8 @@ fn frozen_sharded_generation_is_seekable_and_next_save_is_legacy() {
     reader.read_to_end(&mut all).unwrap();
     assert_eq!(tail, all[(end / 2) as usize..]);
     drop(reader);
-    expected["generation"] = json!(8);
-    let next = store
-        .write_legacy(&root, 8, |out| {
-            serde_json::to_writer(out, &expected)?;
-            Ok(())
-        })
-        .unwrap();
-    assert!(next.is_legacy());
+    assert!(store.require_legacy_rebuild().is_err());
     assert_eq!(opened(&store).0, expected);
-    assert_eq!(opened(&store).0, expected);
-    assert!(store.compare(&root).is_err());
     // N writes no immutable shard files and does not remove predecessor shards.
     assert_eq!(
         fs::read_dir(s.0.join("scan-index.json.shards"))
@@ -120,24 +111,15 @@ fn equal_generation_root_change_missing_and_bad_encoder_refuse() {
     let s = Scratch::new();
     s.install();
     let store = s.store();
-    let (_, root) = opened(&store);
     let before = fs::read(s.root()).unwrap();
-    assert!(store
-        .write_legacy(&root, 8, |out| {
-            std::io::Write::write_all(
-                out,
-                b"{\"schema_version\":3,\"files\":{},\"generation\":8}",
-            )?;
-            Ok(())
-        })
-        .is_err());
+    assert!(store.require_legacy_rebuild().is_err());
     assert_eq!(fs::read(s.root()).unwrap(), before);
     let mut manifest: Value = serde_json::from_slice(&before).unwrap();
     manifest["padding_bytes"] = json!(1);
     fs::write(s.root(), serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(store.compare(&root).is_err());
+    assert!(store.require_legacy_rebuild().is_err());
     fs::remove_file(s.root()).unwrap();
-    assert!(store.compare(&root).is_err());
+    assert!(store.open().is_err());
 }
 #[test]
 fn corrupt_missing_shard_and_future_manifest_never_rebuild() {
@@ -175,16 +157,13 @@ fn corrupt_missing_shard_and_future_manifest_never_rebuild() {
 fn missing_then_legacy_write_uses_existing_format() {
     let s = Scratch::new();
     let store = s.store();
-    let Opened::Missing(root) = store.open().unwrap() else {
+    let Opened::Missing(_) = store.open().unwrap() else {
         panic!()
     };
     let value = json!({"schema_version":2,"generation":1,"files":{}});
-    let root = store
-        .write_legacy(&root, 1, |out| {
-            serde_json::to_writer(out, &value)?;
-            Ok(())
-        })
-        .unwrap();
+    fs::write(s.root(), serde_json::to_vec(&value).unwrap()).unwrap();
+    let (_, root) = opened(&store);
+    store.require_legacy_rebuild().unwrap();
     assert!(root.is_legacy());
     assert_eq!(opened(&store).0, value);
     assert!(ottto_service::snapshots::ScanIndex::load(&s.root()).is_ok());
@@ -210,8 +189,8 @@ fn legacy_optional_depth_and_syntax_reach_existing_semantic_decoder() {
     )
     .unwrap();
     assert!(matches!(s.store().open().unwrap(), Opened::Legacy(_, _)));
-    assert!(ottto_service::snapshots::ScanIndex::load(&s.root()).is_ok());
-    assert!(!s.root().exists());
+    assert!(ottto_service::snapshots::ScanIndex::load(&s.root()).is_err());
+    assert!(s.root().exists());
 }
 #[test]
 fn fifo_shard_refuses_without_waiting_for_a_writer() {
@@ -274,15 +253,10 @@ fn whitespace_padded_legacy_controls_keep_their_generation() {
     );
     fs::write(s.root(), bytes).unwrap();
     let store = s.store();
-    let (mut logical, root) = opened(&store);
+    let (logical, root) = opened(&store);
     assert_eq!(root.generation(), Some(7));
-    logical["generation"] = json!(8);
-    store
-        .write_legacy(&root, 8, |out| {
-            serde_json::to_writer(out, &logical)?;
-            Ok(())
-        })
-        .unwrap();
+    store.require_legacy_rebuild().unwrap();
+    assert_eq!(logical["generation"], 7);
     assert_eq!(opened(&store).0, logical);
 }
 
@@ -367,16 +341,8 @@ fn optional_restore_siblings_fail_closed_before_cleanup_or_encoding() {
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
                 .collect::<std::collections::BTreeSet<_>>();
-            if let Some(root) = baseline {
-                assert!(
-                    store
-                        .write_legacy(&root, 1, |_| panic!("must refuse before encoding"))
-                        .is_err(),
-                    "{kind}"
-                );
-            } else {
-                assert!(store.open().is_err(), "{kind}");
-            }
+            let _ = baseline;
+            assert!(store.open().is_err(), "{kind}");
             assert_eq!(fs::read(&temp).unwrap(), b"not discarded");
             assert_eq!(fs::read(target.join("content")).unwrap(), b"untouched");
             assert_eq!(

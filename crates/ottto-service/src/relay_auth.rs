@@ -631,10 +631,9 @@ mod http_tests {
 
     #[test]
     #[serial_test::serial]
-    fn relay_401_is_shared_across_snapshot_clients_bounded_and_composition_health_for_one_source() {
+    fn relay_401_is_shared_across_snapshot_clients_and_composition_health_for_one_source() {
         let backend = Backend::start(vec![401, 401]);
-        let client =
-            SnapshotApiClient::new(&backend.base).with_bounded_retry_loopback_http_for_test();
+        let client = SnapshotApiClient::new(&backend.base);
         let device = device();
         let secret = "shared-dead-credential";
         let first = client
@@ -683,23 +682,6 @@ mod http_tests {
                     .suppressed
             );
         }
-        let mut budget =
-            crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO).unwrap();
-        budget.enter(Instant::now()).unwrap();
-        assert!(
-            client
-                .issue_relay_token_bounded(
-                    &device,
-                    secret,
-                    SnapshotSource::Codex,
-                    &budget,
-                    &mut || Ok(())
-                )
-                .unwrap_err()
-                .downcast_ref::<RelayTokenAuthorizationRejected>()
-                .unwrap()
-                .suppressed
-        );
         assert_eq!(backend.calls(), 1);
         let key = client.relay_auth_binding(&device, secret, SnapshotSource::Codex);
         assert!(take_setup_refresh(key));

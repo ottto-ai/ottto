@@ -27,10 +27,11 @@ several coding agents on your Mac, such as Claude Code, Codex and Pi.
 - **Edits agent settings** on setup and repair: Claude Code's `~/.claude/settings.json` (telemetry
   and status line) and a marked line in `~/.zshrc`. Later checks put its status line back. At
   start it removes only its own old entries from `~/.codex/config.toml`.
-- **Receives Claude Code's telemetry** on 127.0.0.1 and keeps only content-free counters, which feed
-  the usage it uploads.
+- **Receives Claude Code's telemetry** on 127.0.0.1 and keeps content-free per-request rows (ids,
+  model, effort, speed, reported cost and token counts), which feed the usage it uploads.
 
-Details: [docs/privacy.md](docs/privacy.md).
+The Mac app is a client of this daemon: it doesn't read transcripts or agent credentials and
+uploads no usage itself. Details: [docs/privacy.md](docs/privacy.md).
 
 ## Get started
 
@@ -165,7 +166,7 @@ ottto costs --json --days 7   # the last 7 days of cost across your account, as 
 
 **Ottto never uploads your transcripts or full conversations.**
 
-**What never leaves your Mac**
+**What Ottto never uploads**
 
 - Your transcripts and full conversations, including your agents' responses
 - Code, file contents, and tool and command output
@@ -173,8 +174,9 @@ ottto costs --json --days 7   # the last 7 days of cost across your account, as 
 - Instruction, memory and skill text, and absolute file paths (except text an MCP server itself
   puts in a tool description or input schema)
 
-To show your Claude plan limits, Ottto uses your Claude Code sign-in only to ask Anthropic for your
-usage, and never sends it to Ottto. Turn this off in Ottto.app settings: **Read subscription usage**.
+To show your Claude plan limits, Ottto uses your Claude Code sign-in only with Anthropic, to read
+your usage and which account it belongs to, and never sends it to Ottto. Turn this off in Ottto.app
+settings: **Read subscription usage**.
 
 **What is sent, only once you connect this Mac to an Ottto account (setup)**
 

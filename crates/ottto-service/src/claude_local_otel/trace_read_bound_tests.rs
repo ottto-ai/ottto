@@ -2,7 +2,7 @@
 //! from a file that grew or was replaced. Fixtures are synthetic.
 use super::*;
 
-/// Main's trace reader before the bound (ba8e21a7f), frozen as the stable
+/// The trace reader before bounded reads, frozen as the stable
 /// input reference. It streams the opened file to EOF.
 fn main_reference(support_dir: &Path, session_id: &str) -> ClaudeTraceOwnershipLoadReport {
     let mut report = ClaudeTraceOwnershipLoadReport::default();

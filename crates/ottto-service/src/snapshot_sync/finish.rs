@@ -31,7 +31,6 @@ use super::identity_cache_wire_reserve;
 use super::is_upload_outage;
 use super::lane::ensure_snapshot_destination_current;
 use super::lane::ensure_snapshot_scan_authority;
-use super::live_snapshot_retry;
 use super::log_retained_permanent_refusals;
 use super::mark_backfill_complete_for_destination;
 use super::note_shed_and_backoff;
@@ -114,6 +113,7 @@ use super::SnapshotSourceManifest;
 #[cfg(test)]
 use super::SnapshotUploadPolicy;
 use super::SnapshotUploadProgress;
+use crate::local_resource_diagnostics::pass_outcomes;
 
 /// Commit a `Completed` upload that left local holds. Every uploaded entity was
 /// accepted or unchanged; only the held revisions are unsettled.
@@ -385,9 +385,12 @@ pub(crate) fn checkpoint_account_release_for_test(
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.destination_namespace_hash =
+        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(paths.0).1;
+    let (progress_path, mut progress) = tests::routed_progress(previous, paths.0, progress);
     // Actual no-ACK partial save restores the prior accepted entry before
     // transferring retry custody. Head binding above still had to succeed.
-    progress.save(paths.1)?;
+    progress.save(&progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         &index,
         previous,
@@ -396,7 +399,7 @@ pub(crate) fn checkpoint_account_release_for_test(
         Some(scan),
         &holds.held_fingerprints,
         paths.0,
-        paths.1,
+        &progress_path,
         || Ok(()),
         None,
         Some(UnsettledUploadCause::UploadError),
@@ -818,7 +821,7 @@ pub(crate) fn checkpoint_page_for_test(
             result? == ResumableUploadResult::Completed,
             "fixture exact ACK"
         );
-        progress.save(progress_path)?;
+        progress.save_fixture(progress_path)?;
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
             &mut index,
@@ -828,7 +831,7 @@ pub(crate) fn checkpoint_page_for_test(
         index.save(index_path)?;
         return Ok(index);
     }
-    progress.save(progress_path)?;
+    progress.save_fixture(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed,
@@ -1126,7 +1129,7 @@ pub(super) fn clear_source_manifests_for_test() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
 }
-#[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
@@ -1140,14 +1143,13 @@ pub(super) fn finish_sync_source(
     support_dir: &Path,
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
-    retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
     );
     let SourcePreparation {
-        retry_authority,
         source,
+        walk_idle_pass,
         claude_scan_roots,
         account_witness,
         scan_started_at,
@@ -1186,23 +1188,6 @@ pub(super) fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .set_item_cap(identity_item_cap);
-    upload_progress
-        .accepted_identity_buckets
-        .set_retained_enabled(
-            source == SnapshotSource::ClaudeCode
-                && activity_hint
-                    .session_request_identity_retained_contract
-                    .as_deref()
-                    == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
-        );
-    upload_progress
-        .accepted_identity_buckets
-        .set_account_source_enabled(
-            activity_hint
-                .session_request_account_source_contract
-                .as_deref()
-                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
-        );
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -1233,6 +1218,9 @@ pub(super) fn finish_sync_source(
         // A held pass authenticates local recovery here before any upload IO.
         validate_recovery_save()?;
         ensure_destination_authority()?;
+    } else if scan_result.walk_idle {
+        // An idle pass took no census: the fenced one stays.
+        ensure_authority()?;
     } else {
         codex_scan_diagnostics::after_existing_census_fence(
             source,
@@ -1240,6 +1228,32 @@ pub(super) fn finish_sync_source(
             ensure_authority,
             || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
         )?;
+    }
+    if scan_result.walk_idle && crate::snapshots::walk_idle::idle_finish(&index) {
+        // Nothing was read: no body, save or receipt. The walk's terminal
+        // receipt and manifest stand; check-in beats keep them fresh.
+        if crate::snapshots::maintain_state_v2_idle(&index_path, &index, true).is_err() {
+            eprintln!("local state maintenance deferred for {}", source.api_slug());
+        }
+        with_source_cadence(source, |cadence| {
+            cadence.record_scan_success(Instant::now(), 0)
+        });
+        let counts = SyncCounts::from_scan_result(&scan_result, 0, receipt_window_days);
+        eprintln!("{}", counts.terminal_census_line(source.api_slug()));
+        if let Some((pass, _)) = walk_idle_pass {
+            crate::snapshots::walk_idle::arm_after_finish(
+                pass,
+                &index,
+                &index_path,
+                &scan_result,
+                false,
+            );
+        }
+        return Ok(());
+    }
+    // A pass that started a walk while finishing is an ordinary page.
+    if std::mem::take(&mut scan_result.walk_idle) {
+        crate::snapshots::walk_idle::clear(source);
     }
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
@@ -1305,7 +1319,7 @@ pub(super) fn finish_sync_source(
             receipt_window_days,
             &mut disposition,
         );
-        // Copy-derived rows (#944): the bodies just built treat these
+        // Copy-derived rows: the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
         if upload_progress
@@ -1357,15 +1371,6 @@ pub(super) fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
-    // Billing route annotation: after ownership is bound, before upload policy.
-    // Process memory only; off, nothing runs.
-    crate::snapshots::billing_route::annotate_session_billing_routes(
-        &upload_destination_namespace,
-        source,
-        machine_id,
-        &mut scan_result.snapshots,
-        activity_hint.session_billing_route_contract.as_deref(),
-    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -1459,17 +1464,7 @@ pub(super) fn finish_sync_source(
             source.api_slug(),
         );
     }
-    scan_result.reconcile_codex_legacy_joining(
-        &mut index,
-        &committed_index,
-        machine_id,
-        |index, snapshots| {
-            index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            // Checks a fingerprint an older release persisted, under that release's rules.
-            crate::upload_policy::apply_upload_policy_v1(source, snapshots, upload_policy);
-            apply_backfill_cutoff(snapshots, &backfill_state);
-        },
-    );
+
     backfill_succeeded &= scan_result.census_complete;
     let deferred_cache_head_identities = capture_deferred_cache_head_identities(
         source,
@@ -1622,6 +1617,7 @@ pub(super) fn finish_sync_source(
         &mut scan_result,
         &claude_authority_disposition,
     );
+    pass_outcomes(|counts| counts.selected = scan_result.snapshots.len() as u64);
     let locally_held_fingerprints = &local_holds.held_fingerprints;
     if let Some(validate_recovery_save) = recovery_save_guard {
         // Retry a consistent local delta before any upload/ACK. Reuse the
@@ -2025,6 +2021,7 @@ pub(super) fn finish_sync_source(
             )
         })
     };
+    pass_outcomes(|counts| counts.accepted = accepted);
     // Main-upload mode ends with it; retries never record or drain custody.
     let identity_503_this_pass = upload_progress.identity_503_pass.take();
     // The logical offer ends here; normal bounded HTTP retries happened inside.
@@ -2099,12 +2096,12 @@ pub(super) fn finish_sync_source(
     let walk_retired = index.walk_retired_since(&committed_index);
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
-    // obligations this full scan references before any selection (#794 F1).
+    // obligations this full scan references before any selection.
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Shed and upload-error partial checkpoint: save wholly settled files,
-    // then release adopted ACK capacity against the full scan's references
-    // (#778 R2-2). A failed save is logged and yields `None`; a failed
+    // then release adopted ACK capacity against the full scan's references.
+    // A failed save is logged and yields `None`; a failed
     // release fails the pass.
     let mut partial_checkpoint =
         |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {
@@ -2212,39 +2209,10 @@ pub(super) fn finish_sync_source(
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
-            let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let (checkpoint_succeeded, committable) =
-                match partial_checkpoint(UnsettledUploadCause::Shed, true)? {
-                    Some(committable) => (true, committable),
-                    None => (false, committed_index),
-                };
-            if retry.enabled()
-                && checkpoint_succeeded
-                && locally_held_fingerprints.is_empty()
-                && legacy_reconciliation_pending.is_empty()
-                && active_legacy_reconciliation.is_empty()
-            {
-                if let Some(live) = retry_authority {
-                    retry.capture_after_shed(
-                        live,
-                        _home,
-                        source,
-                        machine_id,
-                        upload_policy,
-                        account_witness,
-                        &scan_result.snapshots,
-                        &mut index,
-                        &committable,
-                        &upload_progress,
-                        &index_path,
-                        &upload_progress_path,
-                        first_shed,
-                        retry_after,
-                    );
-                }
-            }
+            let committable =
+                partial_checkpoint(UnsettledUploadCause::Shed, true)?.unwrap_or(committed_index);
             report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -2759,6 +2727,10 @@ pub(super) fn finish_sync_source(
         // reporting failure does not change the resolved transport outcome.
         return Ok(());
     } else {
+        // This walk's loss blocks arming; standing terminal holds do not.
+        let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
+            .with_snapshot_terminal_counts(&index);
+        let loss_free = !counts.has_walk_loss(&index);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -2774,11 +2746,31 @@ pub(super) fn finish_sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-                    .with_snapshot_terminal_counts(&index),
+                counts,
                 state: CollectorState::Success,
             },
         )?;
+        if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
+            let now = crate::scan_clock::utc_seconds();
+            let outside = cycle_owed_nothing
+                && loss_free
+                && upload_fully_settled
+                && super::prepare::upload_owes_nothing(
+                    source,
+                    &upload_progress,
+                    support_dir,
+                    &activity_hint,
+                    &index,
+                    now,
+                );
+            crate::snapshots::walk_idle::arm_after_finish(
+                pass,
+                &index,
+                &index_path,
+                &scan_result,
+                outside,
+            );
+        }
     }
     Ok(())
 }

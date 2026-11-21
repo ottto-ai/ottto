@@ -253,7 +253,9 @@ impl ProofChain {
             self.enrich(&mut index, &mut scan);
         }
         self.accept(&mut index, &mut scan);
-        index.save(&self.home.join("scan-index.json")).unwrap();
+        let view = self.home.join("scan-index.json");
+        fixture::save_owner_for_test(SnapshotSource::ClaudeCode, &mut index, &view);
+        fixture::legacy_view_for_test(&index, &view);
         let items = scan.snapshots;
         assert!(items.iter().map(|item| item.request_count).sum::<u64>() > 7);
         (index, items)
@@ -314,8 +316,10 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
             (1, Some(2))
         );
         chain.accept(&mut index, &mut recovered);
-        index.save(&chain.home.join("scan-index.json")).unwrap();
-        let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
+        let restart = chain.home.join("restart-scan-index.json");
+        fixture::save_for_test(&mut index, &restart);
+        fixture::legacy_view_for_test(&index, &chain.home.join("scan-index.json"));
+        let mut index = ScanIndex::load(&restart).unwrap();
         assert!(chain.prepare(&mut index).is_empty());
         let temp = chain.support.join("same-request.json");
         fs::write(&temp, serde_json::to_vec(&request).unwrap()).unwrap();
@@ -390,8 +394,9 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
         let (mut index, prior) = chain.residue();
         publish(&chain.home, &chain.support, false);
         chain.prepare(&mut index);
-        index.save(&chain.home.join("scan-index.json")).unwrap();
-        let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
+        let restart = chain.home.join("restart-scan-index.json");
+        fixture::save_for_test(&mut index, &restart);
+        let mut index = ScanIndex::load(&restart).unwrap();
         index = state_v2::money_test_support::roundtrip(
             &index,
             &chain.home.join("nonce.v2.sqlite.import"),

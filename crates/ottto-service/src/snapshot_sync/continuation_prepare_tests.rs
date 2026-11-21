@@ -51,11 +51,15 @@ struct ContinuationFixture {
 impl ContinuationFixture {
     fn quiescent(name: &str) -> Self {
         let root = test_dir(name);
+        let index_path = root
+            .join("snapshots/destinations")
+            .join(CONTINUATION_NAMESPACE)
+            .join("codex-index.json");
         let fixture = Self {
             home: root.join("home"),
             support_dir: root.join("support"),
-            index_path: root.join("codex-index.json"),
-            upload_progress_path: root.join("codex-upload-progress.json"),
+            upload_progress_path: snapshot_upload_progress_path(&index_path),
+            index_path,
         };
         std::fs::create_dir_all(&fixture.home).unwrap();
         std::fs::create_dir_all(&fixture.support_dir).unwrap();
@@ -72,16 +76,18 @@ impl ContinuationFixture {
 
     fn load(&self) -> (SnapshotUploadProgress, ScanIndex) {
         let source = SnapshotSource::Codex;
-        let progress = SnapshotUploadProgress::load(
-            &self.upload_progress_path,
-            CONTINUATION_NAMESPACE,
-            snapshot_quarantine_witness(source),
-        )
-        .unwrap();
         let (index, _) = ScanIndex::load_for_snapshot_source_with_origin(
             &self.index_path,
             source,
             &self.support_dir,
+        )
+        .unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.upload_progress_path,
+            CONTINUATION_NAMESPACE,
+            snapshot_quarantine_witness(source),
         )
         .unwrap();
         (progress, index)
@@ -114,7 +120,7 @@ impl ContinuationFixture {
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
         );
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
         progress.save(&self.upload_progress_path).unwrap();
     }
 
@@ -122,6 +128,8 @@ impl ContinuationFixture {
     fn disk(&self) -> Vec<Option<Vec<u8>>> {
         [
             self.index_path.clone(),
+            self.index_path.with_extension("json.v2.sqlite"),
+            self.index_path.with_extension("json.v2.sqlite-wal"),
             self.upload_progress_path.clone(),
             crate::backfill::backfill_state_path(&self.support_dir),
         ]
@@ -135,7 +143,6 @@ impl ContinuationFixture {
     fn preparation(&self, attribution: bool) -> SourcePreparation {
         let status = test_agent_status(SourceKind::Codex);
         SourcePreparation {
-            retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
             account_witness: [3; 32],
@@ -175,6 +182,7 @@ impl ContinuationFixture {
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
+            walk_idle_pass: None,
         }
     }
 
@@ -371,10 +379,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     );
 
     // The documented SKIPs.
-    assert!(
-        prepared.retry_authority.is_none(),
-        "no LiveAuthority capture"
-    );
     assert!(!prepared.backfill_pending);
     assert!(prepared.legacy_reconciliation_pending.is_empty());
     assert!(prepared.active_legacy_reconciliation.is_empty());
@@ -449,7 +453,9 @@ fn a_continuation_page_mirrors_an_open_head_conflict() {
             last_answer_unix: 1,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
@@ -593,7 +599,7 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     );
     // The ordinary prepare's arming and save.
     assert!(index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE));
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.snapshot_admission_reoffer_pending());
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
 }
@@ -610,7 +616,7 @@ fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
     let mut index: ScanIndex = serde_json::from_value(value).unwrap();
     assert!(index.legacy_settlement_ledger_needs_migration());
     assert!(!index.snapshot_admission_reoffer_pending());
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.legacy_settlement_ledger_needs_migration());
     fixture.assert_refused(ContinuationRefusal::LegacySettlement);
 }
@@ -633,7 +639,9 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
             disposition: SnapshotQuarantineDisposition::RetryPending,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     fixture.assert_refused(ContinuationRefusal::UploadClaim);
 }
 
@@ -675,7 +683,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
             }),
         },
     );
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     progress.save(&fixture.upload_progress_path).unwrap();
     let (progress, index) = fixture.load();
     assert!(!index.snapshot_admission_reoffer_pending());

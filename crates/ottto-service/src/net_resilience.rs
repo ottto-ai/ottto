@@ -92,11 +92,10 @@ type ProbeResolveFn = dyn Fn(&str, Duration) -> Option<Vec<IpAddr>> + Send + Syn
 const DNS_PROBE_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A consecutive-failure streak with the anti-thrash rebuild stamping shared
-/// by both process-local outage ladders: the DNS resolution streak (#234,
-/// 2026-07-15 incident) and the transport-layer sync-cycle streak (2026-07-17
-/// `transport_connection` stall after an `en0` MAGICWAKE network transition,
-/// which the DNS-keyed ladder structurally could not observe because the host
-/// kept resolving).
+/// by both process-local outage ladders: the DNS resolution streak and the
+/// transport-layer sync-cycle streak. The latter catches a
+/// `transport_connection` stall after a network transition even when DNS still
+/// resolves the host.
 #[derive(Default)]
 struct OutageStreak {
     consecutive_failures: u32,

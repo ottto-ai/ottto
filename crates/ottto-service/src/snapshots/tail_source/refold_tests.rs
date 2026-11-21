@@ -1,4 +1,4 @@
-//! L02 (D168-3): a late-evidence re-fold from stored state is the body a
+//! A late-evidence re-fold from stored state is the body a
 //! fresh native read sends now, byte for byte. It goes as an ordinary update,
 //! with no rescan claim, counted by its reason (the row is
 //! `oracle_tests::differing_stored_body_is_sent_as_the_cold_full_body`). A
@@ -167,7 +167,7 @@ fn a_retry_pending_body_refolds_from_tail() {
     }
 }
 
-/// [money] D142(a): a file whose session owes a head-CAS answer never
+/// [money] A file whose session owes a head-CAS answer never
 /// continues from stored state, whatever its selection: late evidence, a
 /// change and a grown file all read a native Full from byte 0, so the answer
 /// rides only a real Full. The read counts under `head_conflict`.

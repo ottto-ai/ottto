@@ -213,9 +213,9 @@ fn save_backfill_state_locked(state_dir: &Path, state: &BackfillState) -> Result
     sync_state_directory(state_dir)
 }
 
-// Addendum 3 (AutoReview P2 on #712 c4e3f426): the state directory this
-// process last synced after the last rename it made. Accessed only under
-// BACKFILL_SAVE_LOCK. One directory: the daemon has one state directory.
+// The state directory this process last synced after renaming a state file.
+// Only code holding `BACKFILL_SAVE_LOCK` may access it.
+// The daemon has one state directory.
 #[cfg(not(test))]
 static SYNCED_STATE_DIRECTORY: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
@@ -999,8 +999,6 @@ mod tests {
             claude_org_markers: None,
             claude_account_withheld_reason: None,
             claude_account_display: None,
-            session_billing_route: None,
-            claude_route_evidence: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "final".to_string(),
@@ -1347,10 +1345,9 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Addendum 3 (AutoReview P2 on #712 c4e3f426): a save can rename the
-    /// state into place and then fail its directory fsync. A later unchanged
-    /// update, such as an already-Set intent read, syncs the directory once
-    /// per process before it reports success, and still rewrites nothing.
+    /// A save can rename the state into place and then fail to sync the directory.
+    /// A later unchanged update, such as an already-Set intent read, syncs the directory
+    /// once per process before reporting success without rewriting the state.
     #[test]
     fn an_unchanged_state_syncs_its_directory_once_before_success() {
         let dir = temp_dir("backfill-noop-directory-sync");

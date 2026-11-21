@@ -17,6 +17,11 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
+
+/// Rest-heap diagnostics: open store routes, or None while busy.
+pub(crate) fn route_entries() -> Option<usize> {
+    runtime::route_entries()
+}
 #[cfg(test)]
 pub(crate) use runtime::{
     before_progress_import_for_test, claim_growth_for_test, damage_identity_row_for_test,
@@ -26,19 +31,22 @@ pub(crate) use runtime::{
     take_progress_set_aside_for_test,
 };
 #[cfg(test)]
-pub(crate) use runtime::{cold_close_for_test, release_collection_page_limit_for_test};
+pub(crate) use runtime::{
+    close_removed_routes_for_test, cold_close_for_test, release_collection_page_limit_for_test,
+};
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
-#[cfg(test)]
-pub(super) use runtime::guard_local;
 #[cfg(any(test, target_os = "macos"))]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, idle,
-    load_locked, published, recovery_save_guard, runtime_path, save_locked,
+    after_v1_locked, collection_page_limit, fence_published, guard_containment_locked,
+    guard_external, idle, load_locked, publish_rebuilt_locked, published, recovery_save_guard,
+    runtime_path, save_locked,
 };
+#[cfg(test)]
+pub(super) use runtime::{erase_published, guard_local};
 mod catalogue;
 mod codec;
 
@@ -69,9 +77,9 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, legacy_archive_was_seen, load_head, load_revisions,
-    load_tail, observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail,
-    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail,
+    observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
+    tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
@@ -215,7 +223,7 @@ pub(super) enum Fixed {
     RequestSet { commitment: [u8; 32], refs: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Header {
     key: RowKey,
     fixed: Fixed,
@@ -662,5 +670,24 @@ pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &
             tx.commit(index.generation, index.generation + 1),
             DurableCommitOutcome::Committed(index.generation + 1)
         );
+    });
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn assert_0217_archive_rows_for_test(
+    index: &ScanIndex,
+    key: &str,
+    present: bool,
+) {
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for (kind, member, position) in [
+            ("v1_field.archives", "", 0),
+            ("v1_field.archives", key, 1),
+            ("v1_field.archive_deferred_alarm_count", "", 0),
+        ] {
+            let row = mapper::key(kind, member, position).unwrap();
+            assert_eq!(tx.get(&row).unwrap().is_some(), present, "{row:?}");
+        }
     });
 }
