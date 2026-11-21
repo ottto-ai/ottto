@@ -15,7 +15,10 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 /// A session whose cold requests are what the cache capability carries.
 const COLD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-const PROMPT: &str = "Review the synthetic checkout flow and report only safe results.";
+// Keep this money-equivalence fixture below the job fingerprint evidence floor.
+// Forward-only job facts intentionally differ after a missing/rotated key;
+// job_template tests cover that boundary independently. All money rows stay equal.
+const PROMPT: &str = "Review synthetic checkout flow and report results.";
 const SKILL: &str = "synthetic-review";
 
 /// The state a flip starts from. A key only shows while attribution is on, so

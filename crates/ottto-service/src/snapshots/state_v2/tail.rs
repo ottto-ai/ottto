@@ -126,6 +126,7 @@ pub(in crate::snapshots) enum Change {
 /// One file's staged state: its complete new head and only its changed pages.
 #[derive(Default)]
 pub(in crate::snapshots) struct StagedFile {
+    pub(in crate::snapshots) job_template_pending: bool,
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) head: Vec<u8>,
     pub(in crate::snapshots) collections: BTreeMap<Collection, CollectionMeta>,
@@ -212,6 +213,7 @@ pub(in crate::snapshots) struct InventoryFacts {
 /// The versioned common head body; the source's reduction follows it, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct Common {
+    pub(in crate::snapshots) job_template_pending: bool,
     pub(in crate::snapshots) representation: Representation,
     pub(in crate::snapshots) debt: DebtSummary,
     /// The next revision id; ids are never reused, even after deletion.
@@ -615,6 +617,8 @@ const ENVELOPE: u8 = 1;
 /// The envelope's last code, before the optional parts it announces.
 const HAS_REDUCTION: u8 = 1;
 const HAS_INVENTORY: u8 = 2;
+const JOB_TEMPLATE_PENDING: u8 = 4;
+pub(in crate::snapshots) const JOB_TEMPLATE_PAGE: u64 = 6;
 /// Only a Tail head holds a reduction, whichever way the head is crossing.
 fn check_shape(representation: Representation, has_reduction: bool) -> Result<()> {
     ensure!(
@@ -688,7 +692,8 @@ pub(super) fn encode_head(
     out.extend_from_slice(&debt.reason_bits.to_be_bytes());
     out.push(debt.disposition.map_or(0, |d| d as u8));
     let parts = u8::from(reduction.is_some()) * HAS_REDUCTION
-        + u8::from(common.inventory.is_some()) * HAS_INVENTORY;
+        + u8::from(common.inventory.is_some()) * HAS_INVENTORY
+        + u8::from(reduction.is_some() && common.job_template_pending) * JOB_TEMPLATE_PENDING;
     out.push(parts);
     if let Some(facts) = &common.inventory {
         encode_inventory(&mut out, facts)?;
@@ -773,11 +778,19 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
             _ => Some(NoUploadRequired::ZeroTokens),
         },
     };
-    let parts = code(&mut input, HAS_REDUCTION | HAS_INVENTORY)?;
+    let parts = code(
+        &mut input,
+        HAS_REDUCTION | HAS_INVENTORY | JOB_TEMPLATE_PENDING,
+    )?;
     let inventory = (parts & HAS_INVENTORY != 0)
         .then(|| decode_inventory(&mut input))
         .transpose()?;
     let has_reduction = parts & HAS_REDUCTION != 0;
+    let job_template_pending = parts & JOB_TEMPLATE_PENDING != 0;
+    ensure!(
+        !job_template_pending || has_reduction,
+        "state_v2_tail_value_shape"
+    );
     check_shape(representation, has_reduction)?;
     let reduction = has_reduction.then(|| input.0.to_vec());
     ensure!(
@@ -788,6 +801,7 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         revision,
         table,
         common: Common {
+            job_template_pending,
             representation,
             debt,
             next_revision_id,
@@ -825,6 +839,36 @@ pub(super) fn load_head(
         generation,
     }))
 }
+/// Only the job slot for a Full read; the caller binds the returned head to
+/// the opened file. No display prompt or other source page is read.
+pub(super) fn load_job_template(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    revision: u32,
+    generation: u64,
+) -> Result<Option<(TailHead, Option<Vec<u8>>)>> {
+    let Some(head) = load_head(tx, file, revision, generation)? else {
+        return Ok(None);
+    };
+    if head.metadata_only {
+        return Ok(None);
+    }
+    let collection = Collection::SessionFacts;
+    let page = JOB_TEMPLATE_PAGE;
+    let key = row(collection.kind(), file, page)?;
+    let fact = tx
+        .get(&key)?
+        .map(|header| {
+            ensure!(
+                head.table.contains_key(&collection),
+                "state_v2_tail_membership"
+            );
+            read_inline(tx, &header)
+        })
+        .transpose()?;
+    Ok(Some((head, fact)))
+}
+
 /// `head`'s reduction pages in one read snapshot, one page at a time: `visit`
 /// owns each page's bytes as it goes and must discard them all on `Err`. A
 /// metadata-only head refuses before any page. A later generation is
@@ -1115,6 +1159,27 @@ fn write_file(
         ..Default::default()
     };
     if let Some(staged) = staged {
+        if staged.job_template_pending
+            || staged
+                .pages
+                .contains_key(&(Collection::SessionFacts, JOB_TEMPLATE_PAGE))
+        {
+            let layout = mapper::layout(tx)?;
+            // A Tail-only save may raise a layout-8 graph: layout 9 adds no
+            // graph roots. Older graphs need their normal graph upgrade first.
+            if layout == catalogue::JOB_TEMPLATE_LAYOUT - 1 {
+                mapper::put(
+                    tx,
+                    &RowKey::Meta("catalogue_layout".into()),
+                    &catalogue::JOB_TEMPLATE_LAYOUT,
+                )?;
+            } else {
+                ensure!(
+                    layout >= catalogue::JOB_TEMPLATE_LAYOUT,
+                    "state_v2_job_template_layout"
+                );
+            }
+        }
         let named = staged
             .collections
             .keys()
@@ -1174,6 +1239,7 @@ fn write_file(
             );
             applied.page_bytes += value.len() as u64;
         }
+        common.job_template_pending = staged.job_template_pending;
         revision = staged.revision;
         reduction = Some(staged.head.clone());
         common.representation = Representation::Tail;
@@ -1488,7 +1554,8 @@ pub(super) fn commit_exit(
     let mut tx = db.begin(TxnMode::Write)?;
     // Only the layout before Tail, and only up to Tail's: an older store still
     // lacks graph roots its next full save fills in, and recording a later layout
-    // would refuse them. Never a later layout from a Tail-only write.
+    // would refuse them. A staged format change can raise a complete graph
+    // separately at the same boundary as the first incompatible row.
     if mapper::layout(&mut tx)? + 1 == catalogue::TAIL_LAYOUT {
         put(
             &mut tx,

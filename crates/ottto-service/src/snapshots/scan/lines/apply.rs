@@ -38,6 +38,11 @@ pub(in crate::snapshots) fn claude_prompt_content(
     if real_prompt.is_some() {
         accumulator.session_start.note_user_turn();
     }
+    if accumulator.job_template_pending {
+        accumulator.observe_job(crate::snapshots::sources::claude::line::claude_user_text(
+            value, false,
+        ));
+    }
     accumulator.set_first_prompt_title(real_prompt);
 }
 pub(in crate::snapshots) fn claude_workspace_content(
@@ -69,6 +74,11 @@ pub(in crate::snapshots) fn codex_prompt_content(
     accumulator: &mut SnapshotAccumulator,
 ) {
     accumulator.set_title(codex_transcript_title(value), "transcript_title");
+    if accumulator.job_template_pending {
+        accumulator.observe_job(crate::snapshots::sources::codex::line::codex_user_text(
+            value, false,
+        ));
+    }
     accumulator.set_first_prompt_title(codex_first_user_prompt(value));
 }
 pub(in crate::snapshots) fn codex_workspace_content(
@@ -91,6 +101,9 @@ pub(in crate::snapshots) fn pi_prompt_content(
     accumulator: &mut SnapshotAccumulator,
 ) {
     if role == Some("user") {
+        if accumulator.job_template_pending && !accumulator.seen_pi_usage_keys.copied_entry(value) {
+            accumulator.observe_job(crate::snapshots::sources::pi::pi_user_text(value, false));
+        }
         accumulator.set_first_prompt_title(pi_message_text(value));
     }
 }

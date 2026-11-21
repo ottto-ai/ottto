@@ -52,6 +52,71 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
     with_codec!(source, S => S::REDUCTION_REVISION)
 }
 
+/// A native Full starts at byte zero, but job attribution belongs to the
+/// run's first observation. Restore its durable decision independently of
+/// the transcript checkpoint, which may have been invalidated by an edit.
+pub(in crate::snapshots) fn seed_full_job_template(
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    acc: &mut SnapshotAccumulator,
+) {
+    let key = local_index_key(&candidate.path);
+    acc.job_template_pending = !index.files.contains_key(&key) && !load::held_new(index, &key);
+    // A route error gives no first-read authority. Other snapshot fields
+    // still use the existing native recovery path.
+    let route = match state_v2::tail_route_path(index) {
+        Ok(Some(route)) => route,
+        Ok(None) => return,
+        Err(_) => {
+            acc.job_template_pending = false;
+            return;
+        }
+    };
+    let (head, fact) =
+        match state_v2::load_job_template(index, &key, reduction_revision(acc.source)) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return,
+            Err(_) => {
+                acc.job_template_pending = false;
+                return;
+            }
+        };
+    acc.job_template_pending = false;
+    let id = HeadIdentity::new(
+        &route,
+        acc.source,
+        &candidate.scan_root,
+        &candidate.path,
+        acc.claude_request_identity_capture,
+    );
+    let mut decoder = Dec::new(&head.body);
+    let Ok(saved) = HeadIdentity::take(&mut decoder) else {
+        return;
+    };
+    // Key changes affect upload policy, not the saved decision. Device
+    // numbers can change across boots; the inode and known birth bind it.
+    if saved.binding != id.binding {
+        return;
+    }
+    let Ok(certificate) = DurableCertificate::take(&mut decoder) else {
+        return;
+    };
+    if !candidate
+        .physical_identity
+        .is_some_and(|[_, inode]| inode == certificate.inode)
+        || (certificate.birth_nanos != 0
+            && candidate.fingerprint_birth_nanos != 0
+            && certificate.birth_nanos != candidate.fingerprint_birth_nanos)
+    {
+        return;
+    }
+    if let Some(bytes) = fact {
+        let _ = Fact::take(state_v2::JOB_TEMPLATE_PAGE, &bytes, acc);
+    } else {
+        acc.job_template_pending = head.common.job_template_pending;
+    }
+}
+
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.
 #[allow(
@@ -838,14 +903,16 @@ enum Fact {
     AgentLabel = 4,
     /// Codex: the session-start prelude parser, with its loaded texts.
     CodexPrelude = 5,
+    JobTemplate = state_v2::JOB_TEMPLATE_PAGE as isize,
 }
-const FACTS: [Fact; 6] = [
+const FACTS: [Fact; 7] = [
     Fact::Title,
     Fact::FirstPrompt,
     Fact::Workspace,
     Fact::OpeningSettings,
     Fact::AgentLabel,
     Fact::CodexPrelude,
+    Fact::JobTemplate,
 ];
 const FACT_VERSION: u64 = 1;
 const WORKSPACE_BINDING_VERSION: u64 = 2;
@@ -861,6 +928,7 @@ crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
 impl Fact {
     fn present(self, acc: &SnapshotAccumulator) -> bool {
         match self {
+            Self::JobTemplate => acc.job_template.is_some(),
             Self::Title => acc.title.is_some(),
             Self::FirstPrompt => {
                 acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some()
@@ -881,6 +949,7 @@ impl Fact {
             FACT_VERSION
         })?;
         match self {
+            Self::JobTemplate => acc.job_template.put(e),
             Self::Title => acc.title.put(e),
             Self::FirstPrompt => {
                 acc.first_prompt_material.put(e)?;
@@ -930,6 +999,16 @@ impl Fact {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
+            Self::JobTemplate => {
+                let job = <Option<(Option<String>, String)> as Durable>::take(&mut d)?;
+                d.finish()?;
+                let Some(job) = job else {
+                    return Err(ReconstructCause::Corrupt);
+                };
+                into.job_template = Some(job);
+                into.job_template_pending = false;
+                return Ok(());
+            }
             Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
             Self::FirstPrompt => {
                 into.first_prompt_material = <Option<String> as Durable>::take(&mut d)?;
@@ -1053,6 +1132,9 @@ head_fields! {
         N title_source: Option<String>,
         X first_prompt_title: Option<String>,
         X first_prompt_material: Option<String>,
+        I job_template: Option<(Option<String>, String)>,
+        I job_template_pending: bool,
+        I job_material: Option<String>,
         N provider_skills: BTreeSet<String>,
         N started_at: Option<String>,
         N ended_at: Option<String>,
@@ -1299,3 +1381,6 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
 
 #[cfg(test)]
 pub(in crate::snapshots) mod historical_codex;
+
+#[cfg(test)]
+mod tests;

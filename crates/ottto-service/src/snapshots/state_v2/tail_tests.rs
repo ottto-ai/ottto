@@ -591,6 +591,45 @@ fn exit_commit_moves_g_and_fences_stale_siblings() {
     assert_eq!(pages[&(Collection::Responses, 0)], b"page");
 }
 
+/// Layout 8 readers refuse the whole source after either publication path
+/// writes the job fact. The refused load leaves the committed rows intact.
+#[test]
+fn job_fact_publication_fences_layout_eight_readers() {
+    use crate::snapshots::{scan_index_health, SnapshotSource};
+    let source = SnapshotSource::ClaudeCode;
+    for exit in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        let mut index = load_with(&f.path, false).unwrap().unwrap();
+        with_session_db(&index, |db| db.control("catalogue_layout", &8_u32).unwrap());
+        // Load the layout-8 baseline so the graph-save case must publish its upgrade.
+        index = load_with(&f.path, false).unwrap().unwrap();
+        let page = (Collection::SessionFacts, tail::JOB_TEMPLATE_PAGE);
+        let fact = b"synthetic kind-six page";
+        stage_tail(&f.path, FILE, staged(b"head", &[(page.0, page.1, fact)])).unwrap();
+        if exit {
+            BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
+        } else {
+            save_with(&f.path, &mut index).unwrap();
+        }
+        with_session_db(&index, |db| {
+            assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(9));
+        });
+        let previous = mapper::MAX_CATALOGUE_LAYOUT.replace(8);
+        let refused = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support);
+        mapper::MAX_CATALOGUE_LAYOUT.set(previous);
+        let error = refused.unwrap_err();
+        assert!(error
+            .chain()
+            .any(|cause| cause.downcast_ref::<Hold>() == Some(&Hold::Future)));
+        assert!(scan_index_health::current(source).is_some());
+        let reloaded = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
+        assert!(scan_index_health::current(source).is_none());
+        assert_eq!(reloaded.generation, G + 1);
+        assert_eq!(read(&reloaded, FILE).unwrap().1[&page], fact);
+    }
+}
+
 /// [format] An unconfirmed exit never adopts a stamp: refused stays G, and a
 /// commit that published without confirmation reloads what committed. A store
 /// behind the previous layout keeps its layout until a full save fills it in.
@@ -956,7 +995,7 @@ fn debt_survives_reset_and_retire_until_settled() {
     };
     let encoded = tail::encode_head(REVISION, &Default::default(), &common, None).unwrap();
     assert!(tail::decode_head(&encoded).is_ok());
-    for (at, value) in [(5, 2), (6, 4), (24, 3), (30, 4)] {
+    for (at, value) in [(5, 2), (6, 4), (24, 3), (30, 8)] {
         let mut newer = encoded.clone();
         newer[at] = value;
         let error = tail::decode_head(&newer).err().unwrap();

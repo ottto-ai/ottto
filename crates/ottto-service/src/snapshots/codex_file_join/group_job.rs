@@ -782,6 +782,16 @@ impl GroupBoot {
         } else {
             new_group_parser(file, &first, inputs.metadata).map_err(|_| GroupEnd::Strict)?
         };
+        tail_source::seed_full_job_template(inputs.index, &first, &mut parser.accumulator);
+        if members.iter().any(|member| {
+            inputs
+                .index
+                .files
+                .contains_key(&local_index_key(&member.path))
+        }) {
+            // A previously indexed carrier is still the original run.
+            parser.accumulator.job_template_pending = false;
+        }
         let mut join = Box::new(if independent {
             StreamProof::independent(group.owner.clone(), members.len())
         } else {
@@ -1192,7 +1202,9 @@ fn independent_member_eof(
         .map_err(|_| GroupEnd::Strict)?;
     let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
     input.close();
-    let parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
+    let mut parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
+    // The original member supplies the folded session's attribution.
+    parser.accumulator.job_template_pending = false;
     let mut old = std::mem::replace(&mut active.parser, parser);
     active
         .parser

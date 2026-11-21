@@ -170,6 +170,7 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 #[derive(Default)]
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
+    pub(super) job_template_pending: bool,
     /// In load order: page key, then digest and encoded resident byte length.
     pages: Vec<((Collection, u64), PageStamp)>,
     logs: Vec<(Collection, LogBase)>,
@@ -276,6 +277,7 @@ impl TailBase {
             return Err(Refuse::NonEmpty(field));
         }
         let mut staged = StagedFile {
+            job_template_pending: acc.job_template_pending && acc.job_template.is_none(),
             revision: S::REDUCTION_REVISION,
             head: S::encode_head(view, certificate, id)?,
             change,
@@ -345,6 +347,7 @@ impl TailBase {
         let changed = change == Change::Reset
             || !staged.pages.is_empty()
             || !staged.obsolete.is_empty()
+            || staged.job_template_pending != self.job_template_pending
             || page_digest(&staged.head) != self.head;
         Ok(changed.then_some(staged))
     }

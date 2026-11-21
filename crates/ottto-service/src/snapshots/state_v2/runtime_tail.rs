@@ -172,6 +172,15 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
+pub(in crate::snapshots) fn load_job_template(
+    index: &ScanIndex,
+    key: &str,
+    revision: u32,
+) -> Result<Option<(TailHead, Option<Vec<u8>>)>> {
+    read_txn_at(index, |tx, stamp| {
+        super::super::tail::load_job_template(tx, key.as_bytes(), revision, stamp.0)
+    })
+}
 pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {
     let path = runtime_path(index).ok()??;
     with_state(&path, |s| {

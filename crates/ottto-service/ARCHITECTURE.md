@@ -755,3 +755,17 @@ Rows survive refusal, temporary census loss, historical replay and bounded rebui
 A destination change clears them; positive deletion prunes only hashes no stored copy names.
 The rows confer no upload receipt authority. State layout 8 stores each slot separately;
 older readers refuse this layout and require a forward update.
+
+## Job fingerprint
+
+The first qualifying human task supplies `job_template_id` independently of display
+titles. Balanced leading envelopes are stripped, volatile values are masked, and
+the first 30 and last 60 whitespace words are HMACed with the attribution key.
+Only tasks with eight non-placeholder words and at most 64 KiB qualify. Equal
+windows can identify different middle tasks; this is inferred grouping evidence.
+The id and key epoch, or a terminal no-id decision, are stored in SessionFacts
+kind 6. A new run waiting for its first task keeps only an eligibility bit in
+its Tail head. Full reads carry that decision forward for the same file and
+leave indexed legacy runs ineligible. No new prompt text is persisted for this
+id. Catalogue layout 9 fences older readers at source load before either Tail
+format extension can be published.

@@ -431,6 +431,8 @@ fn stored<S: TailSource>(
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
     let mut base = TailBase::new(&head.body);
+    base.job_template_pending = head.common.job_template_pending;
+    acc.job_template_pending = head.common.job_template_pending;
     let mut failed = None;
     let mut page_bytes = 0u64;
     let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {

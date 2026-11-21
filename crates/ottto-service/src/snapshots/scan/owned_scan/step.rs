@@ -1629,6 +1629,11 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     };
+                    tail_source::seed_full_job_template(
+                        index,
+                        &active.candidate,
+                        &mut parser.accumulator,
+                    );
                     acquisition.mode = mode;
                     if let Some(plan) = parser.reader.acquisition.as_ref() {
                         parser
@@ -4967,6 +4972,11 @@ impl OwnedSourceScan {
                 });
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
+            }
+            if planned_mode.is_none_or(|(mode, _)| {
+                matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+            }) {
+                tail_source::seed_full_job_template(index, &candidate, &mut parser.accumulator);
             }
             // Every physical Full/Tail acquisition stops at its opening extent,
             // including native/forced reads and cursor-only preparation.

@@ -766,12 +766,12 @@ fn codex_content_loads_back_from_its_session_facts() {
     let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
     Codex::decode_head(staged.revision, &staged.head, &mut into).unwrap();
     let unknown = Enc::count_write(usize::MAX, |e| {
-        e.varint(6)?;
+        e.varint(7)?;
         e.varint(1)
     })
     .unwrap();
     assert_eq!(
-        Codex::decode_page(Collection::SessionFacts, 6, &unknown, &mut into).err(),
+        Codex::decode_page(Collection::SessionFacts, 7, &unknown, &mut into).err(),
         Some(ReconstructCause::INCOMPATIBLE)
     );
 }

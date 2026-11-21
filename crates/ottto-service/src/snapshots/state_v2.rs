@@ -77,9 +77,9 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail,
-    observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
-    tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_job_template, load_revisions,
+    load_tail, observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail,
+    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
@@ -91,6 +91,7 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 pub(in crate::snapshots) use tail::{
     Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, NoUploadRequired,
     Observation, PathCarry, Representation, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+    JOB_TEMPLATE_PAGE,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
