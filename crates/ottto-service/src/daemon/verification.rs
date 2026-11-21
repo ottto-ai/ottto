@@ -52,7 +52,7 @@ const SMOKE_QUOTA_LIMITED_MESSAGE_CODE: &str = "smoke_quota_limited";
 
 pub(crate) const PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE: &str = "pi_route_smoke_failed";
 
-/// Shared by every single-route Pi failure text, so a stale failure stays
+/// In the Pi "default model not found" text, so that stale failure stays
 /// recognisable after its wording names the route.
 pub(crate) const PI_DEFAULT_MODEL_TEXT: &str = "Pi's default model";
 

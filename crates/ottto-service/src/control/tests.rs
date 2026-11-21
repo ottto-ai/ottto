@@ -1487,7 +1487,12 @@ fn subscription_oauth_local_evidence_accepts_recent_session_or_identity() {
 }
 
 #[test]
-fn pi_single_route_failure_names_the_default_model() {
+#[serial]
+fn pi_default_model_not_found_names_the_model() {
+    let _lock = lock_backend_test_env();
+    // The route builder reads Pi's auth file under HOME; keep it empty.
+    let root = control_test_root("pi-default-model-not-found");
+    let _home_guard = EnvVarGuard::set_path("HOME", &root);
     let failed_smoke = |diagnostic: &str| SmokeResult {
         command_found: true,
         succeeded: false,
@@ -1502,6 +1507,7 @@ fn pi_single_route_failure_names_the_default_model() {
     let label = format!("{} / {}", route.provider, route.model);
     let failed =
         |diagnostic: &str| pi_route_result_from_smoke(&route, &failed_smoke(diagnostic), None);
+    let generic = "No Pi model routes passed smoke verification.";
 
     let not_found = pi_route_aggregate_result(vec![failed(
         r#"Error: 404 {"error":{"code":404,"message":"Publisher Model was not found or your project does not have access to it."}}"#,
@@ -1515,18 +1521,20 @@ fn pi_single_route_failure_names_the_default_model() {
         )
     );
 
-    let other = pi_route_aggregate_result(vec![failed("connection reset by peer")]);
-    assert_eq!(other.message.code, "pi_route_smoke_failed");
-    assert_eq!(
-        other.message.text,
-        format!("Ottto's check of Pi's default model, {label}, failed.")
-    );
-
-    let two_routes = pi_route_aggregate_result(vec![failed("a"), failed("b")]);
-    assert_eq!(
-        two_routes.message.text,
-        "No Pi model routes passed smoke verification."
-    );
+    for other in [
+        "connection reset by peer",
+        "Error: 404 page not found",
+        "model is overloaded",
+    ] {
+        let result = pi_route_aggregate_result(vec![failed(other)]);
+        assert_eq!(result.status, SourceVerificationStatus::Failed, "{other}");
+        assert_eq!(result.message.code, "pi_route_smoke_failed", "{other}");
+        assert_eq!(result.message.text, generic, "{other}");
+    }
+    let not_found_404 = r#"404 model not found"#;
+    let two_routes = pi_route_aggregate_result(vec![failed(not_found_404), failed(not_found_404)]);
+    assert_eq!(two_routes.message.text, generic);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

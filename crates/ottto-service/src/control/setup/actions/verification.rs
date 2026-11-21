@@ -1223,26 +1223,29 @@ pub(in crate::control) fn pi_route_has_local_verification_evidence(
         || identity.credential_fingerprint_hash.is_some()
 }
 
-/// One checked route is Pi's saved default model: name it, and say so plainly
-/// when its provider answered that the model does not exist for the account.
+/// Pi Verify checks only the saved default model. When its provider answered
+/// that the model was not found, name it and say what to do; every other
+/// failure keeps the generic text (the Companion keys its repair tone on it).
 fn pi_route_failed_text(route_results: &[SourceRouteVerificationResult]) -> String {
+    const GENERIC: &str = "No Pi model routes passed smoke verification.";
     let [route] = route_results else {
-        return "No Pi model routes passed smoke verification.".to_string();
+        return GENERIC.to_string();
     };
     let (Some(provider), Some(model)) = (route.provider.as_deref(), route.model.as_deref()) else {
-        return "No Pi model routes passed smoke verification.".to_string();
+        return GENERIC.to_string();
     };
-    let provider_not_found = route.diagnostic.as_deref().is_some_and(|diagnostic| {
+    let model_not_found = route.diagnostic.as_deref().is_some_and(|diagnostic| {
         let diagnostic = diagnostic.to_ascii_lowercase();
-        diagnostic.contains("404") && diagnostic.contains("not found")
+        diagnostic.contains("404")
+            && diagnostic.contains("model")
+            && diagnostic.contains("not found")
     });
-    if provider_not_found {
-        format!(
-            "The provider couldn't find {PI_DEFAULT_MODEL_TEXT}, {provider} / {model}. Choose another default model in Pi, or ignore this; usage collection is not affected."
-        )
-    } else {
-        format!("Ottto's check of {PI_DEFAULT_MODEL_TEXT}, {provider} / {model}, failed.")
+    if !model_not_found {
+        return GENERIC.to_string();
     }
+    format!(
+        "The provider couldn't find {PI_DEFAULT_MODEL_TEXT}, {provider} / {model}. Choose another default model in Pi, or ignore this; usage collection is not affected."
+    )
 }
 
 pub(in crate::control) fn pi_route_result_from_smoke(

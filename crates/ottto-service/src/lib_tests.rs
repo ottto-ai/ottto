@@ -2008,7 +2008,6 @@ mod tests {
         for text in [
             "No Pi model routes passed smoke verification.",
             "The provider couldn't find Pi's default model, gcp-glm / zai-org/glm-5-maas. Choose another default model in Pi, or ignore this; usage collection is not affected.",
-            "Ottto's check of Pi's default model, gcp-glm / zai-org/glm-5-maas, failed.",
         ] {
             available_pi_route_clears_stale_smoke_failure(text);
         }
