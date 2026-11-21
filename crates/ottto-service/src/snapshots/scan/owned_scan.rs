@@ -765,7 +765,13 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| codex_fresh_data_pending(candidate, index))
-            && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
+            && codex_selection_may_exhaust_page(
+                traversal,
+                selection_limit,
+                &index.files,
+                sampled_scan::codex_cursor::Limits::current()
+                    .page_singleton(index.first_import_pending),
+            );
         let census_page = source == SnapshotSource::Codex
             && selection_limit > 0
             && !ordinary_turn
@@ -1386,6 +1392,10 @@ impl OwnedSourceScan {
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());
+        // Fixed before the scan runs; the freshness estimate above read the
+        // same flag, so the estimate and the reads use one page total.
+        let codex_first_import =
+            source == SnapshotSource::Codex && owned_index.first_import_pending;
         Self {
             resource_probe,
             sampling: None,
@@ -1435,6 +1445,7 @@ impl OwnedSourceScan {
             codex_join_completed: Vec::new(),
             codex_page: sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(
                 next_generation_hints,
+                codex_first_import,
             ),
             selected_flags,
             continuation_ticket: None,

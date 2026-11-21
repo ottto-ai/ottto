@@ -309,6 +309,31 @@ pub(super) fn backfill_replay_pending(
         .contains(&source)
 }
 
+/// This source's first import for the destination is pending and no other
+/// granted source's is: the same bootstrap predicate finish uses, so a replay
+/// of a completed destination is not a first import. While another source
+/// also imports, the shared sync thread keeps ordinary page sizes. A source
+/// the device does not grant never syncs, so it never imports.
+pub(super) fn first_import_alone(
+    source: SnapshotSource,
+    device: &LocalDeviceBinding,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+) -> bool {
+    let importing = |candidate| {
+        crate::backfill::bootstrap_pending_for_destination(
+            backfill_state,
+            candidate,
+            destination_namespace,
+        )
+    };
+    importing(source)
+        && super::lane::SNAPSHOT_SOURCES
+            .into_iter()
+            .filter(|other| *other != source && super::lane::source_granted(device, *other))
+            .all(|other| !importing(other))
+}
+
 /// Claude only: the unreadable backfill state suppresses replays until a
 /// Claude census under the history gate clears it (N2).
 pub(super) fn claude_replay_suppressed(
@@ -1002,6 +1027,13 @@ pub(super) fn prepare_sync_source_inner(
     let backfill_pending =
         backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
     index.first_read_pending = backfill_pending;
+    index.first_import_pending = backfill_pending
+        && first_import_alone(
+            source,
+            device,
+            &backfill_state,
+            &upload_destination_namespace,
+        );
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {

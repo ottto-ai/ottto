@@ -1665,9 +1665,18 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     let expected = other(&unpaged);
     assert_eq!(expected.0, 2, "one alias per member");
 
+    let paged_group = inventory_groups(&root)
+        .into_iter()
+        .find(|group| group.owner == OTHER)
+        .expect("the paged group");
+    let own_page_asked = |cache: &SharedCache| {
+        cache.group_own_page(&Scope("group-fixture".into()), &job_key(&paged_group), None)
+    };
     let cache = Arc::new(SharedCache::default());
     with_test_limits(8192, singleton, 64, || {
-        let (mut index, _) = sampled(&root, ScanIndex::default(), 10, &cache);
+        let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
+        assert_eq!(other(&first).0, 0, "held on the shared page");
+        assert!(own_page_asked(&cache), "the cure takes a page of its own");
 
         index.traversal = None;
         let (_, joined, _) = pages_at(&root, index, &cache, "2026-10-06T23:01:00Z", || {
@@ -1677,6 +1686,45 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
         assert_eq!(after.parked_hits, 0, "{after:?}");
         assert_eq!(after.jobs_certified, 1, "{after:?}");
         assert_eq!(other(&joined), expected, "counted once, as unpaged");
+    });
+
+    // The first-import page total: the shared page's remainder now covers
+    // the probes, so the group orders on that page, asks for no page of its
+    // own and joins once, as unpaged. The threshold is unchanged, so it is
+    // still a paged (cursor) group.
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(8192, singleton, 64, || {
+        let flagged = ScanIndex {
+            first_import_pending: true,
+            ..ScanIndex::default()
+        };
+        let (index, first) = sampled(&root, flagged, 10, &cache);
+        assert!(index.first_import_pending, "the flag rides the page");
+        assert!(!own_page_asked(&cache), "no own page at the larger total");
+        let mut published = first.snapshots;
+        if completions(&cache) == 0 {
+            let (_, last, earlier) = pages(&root, index, &cache, || {
+                assert!(!own_page_asked(&cache), "no own page at the larger total");
+                completions(&cache) == 1
+            });
+            for page in earlier.into_iter().chain([last]) {
+                published.extend(page.snapshots);
+            }
+        }
+        let after = counters(&cache);
+        assert_eq!(after.parked_hits, 0, "{after:?}");
+        assert_eq!(after.jobs_certified, 1, "{after:?}");
+        assert!(after.jobs_started >= 1, "a paged group: {after:?}");
+        let joined = published
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == OTHER)
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (joined.len(), joined.into_iter().collect::<BTreeSet<_>>()),
+            expected,
+            "counted once, as unpaged"
+        );
     });
     fs::remove_dir_all(root).unwrap();
 }

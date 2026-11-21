@@ -80,7 +80,11 @@ impl Budget {
         }
         // Oversized Codex singletons keep their resumable cursor: each page's
         // chunk is bounded by the cursor's own page allowance, never by this
-        // room, on its start and resume pages alike (`PageBudget`, B_s = B).
+        // room, on its start and resume pages alike. The per-file threshold
+        // and this room stay T on every page; only the ordinary singleton
+        // aggregate of a first-import page is larger (`Limits::page_singleton`).
+        // Ordinary native bytes past T there leave no context room and no
+        // context cursor room (`charge_cursor_ordinary`): the unit stays owed.
         let size = candidates.iter().fold(0u64, |sum, candidate| {
             sum.saturating_add(candidate.size_bytes)
         });
@@ -310,5 +314,58 @@ mod tests {
         page.charge(true, 1);
         assert!(page.cursor_exhausted(limits));
         budget.charge_cursor_ordinary(&mut page); // charged only once
+    }
+
+    /// [behaviour] A first-import page keeps the context-read room and the
+    /// context cursor's room at the singleton threshold; only the ordinary
+    /// singleton aggregate grows. Ordinary native bytes at or past the
+    /// threshold leave a context unit owed and a context cursor no room on
+    /// that page, while ordinary singleton room remains on the first-import
+    /// page. An oversized context unit keeps its cursor admission.
+    #[test]
+    fn first_import_page_keeps_the_context_room_at_the_threshold() {
+        let limits = sampled_scan::codex_cursor::Limits::current();
+        let threshold = limits.singleton();
+        for (first_import, ordinary) in [
+            (false, threshold - 1),
+            (true, threshold - 1),
+            (true, threshold),
+            (true, threshold + threshold / 2),
+        ] {
+            let case = format!("first_import={first_import} ordinary={ordinary}");
+            let mut budget = Budget::new(SnapshotSource::Codex);
+            assert_eq!(budget.native_limit, threshold, "{case}: the context room");
+            budget.native_read = ordinary;
+            let mut page =
+                sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(0, first_import);
+            page.charge(false, ordinary);
+            assert_eq!(
+                page.singleton_remaining(limits),
+                limits.page_singleton(first_import).saturating_sub(ordinary),
+                "{case}"
+            );
+            let mut index = ScanIndex::default();
+            let mut unit =
+                crate::snapshots::tests::test_candidate(PathBuf::from("/synthetic/context.jsonl"));
+            unit.size_bytes = 1;
+            assert_eq!(
+                budget.admit(SnapshotSource::Codex, &mut index, &unit, &[]),
+                ordinary < threshold,
+                "{case}: a context unit"
+            );
+            let mut large = unit.clone();
+            large.path = PathBuf::from("/synthetic/large-context.jsonl");
+            large.size_bytes = threshold + 1;
+            assert!(
+                budget.admit(SnapshotSource::Codex, &mut index, &large, &[]),
+                "{case}: cursor admission"
+            );
+            budget.charge_cursor_ordinary(&mut page);
+            assert_eq!(
+                page.cursor_exhausted(limits),
+                ordinary >= threshold,
+                "{case}: the context cursor's room"
+            );
+        }
     }
 }

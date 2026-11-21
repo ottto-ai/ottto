@@ -50,6 +50,12 @@ pub struct ScanIndex {
     /// the first read is pending. Set at prepare; never saved.
     #[serde(skip)]
     pub(crate) first_read_pending: bool,
+    /// This source's first import for the destination is pending and no
+    /// other source's is: a Codex selecting page may read the larger
+    /// singleton aggregate (`Limits::page_singleton`). Set at prepare;
+    /// never saved; only Codex reads it.
+    #[serde(skip)]
+    pub(crate) first_import_pending: bool,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -604,6 +610,7 @@ impl Default for ScanIndex {
             decode_holds: lenient_decode::Holds::default(),
             withheld_memo: Default::default(),
             first_read_pending: false,
+            first_import_pending: false,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,

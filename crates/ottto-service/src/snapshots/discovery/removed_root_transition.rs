@@ -1108,3 +1108,16 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
         }
     }
 }
+
+/// The census and deletion rows above, every page flagged as a first-import
+/// page: drain, restart, disk restore, evicted cache and upgrade; the
+/// unproven removal that stays red; and the drain behind an inventory hold
+/// keep their census, retirement and ACK results at the larger page total.
+#[test]
+fn removed_root_rows_hold_at_the_first_import_page_total() {
+    with_first_import_pages(|| {
+        removed_account_root_drains_and_retires_on_every_resume_path();
+        unproven_root_removal_stays_red_and_restored_files_skip();
+        removed_root_drain_waits_for_the_inventory_hold();
+    });
+}
