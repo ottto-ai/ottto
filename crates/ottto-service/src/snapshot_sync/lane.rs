@@ -580,6 +580,12 @@ pub(super) fn set_one_shot_sync_in_flight(value: bool) {
 }
 
 /// `walk_all`: a requested sync walks every source (cleared under the lock).
+/// An armed source may idle: its cycle-start beat carries no scan start, so the
+/// server keeps the window the walk's manifest is paired with.
+pub(super) fn cycle_start_scan_started_at(source: SnapshotSource, at: &str) -> Option<&str> {
+    (!crate::snapshots::walk_idle::armed(source)).then_some(at)
+}
+
 pub(super) fn sync_once(
     home: &Path,
     support_dir: &Path,
@@ -632,7 +638,7 @@ pub(super) fn sync_once(
             &device_secret,
             source,
             &machine_id,
-            Some(&cycle_started_at),
+            cycle_start_scan_started_at(source, &cycle_started_at),
         ) {
             eprintln!(
                 "local snapshot cycle-start receipt skipped for {}: {}",

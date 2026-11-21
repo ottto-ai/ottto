@@ -34,7 +34,8 @@ file-system hint / periodic listing → select file → read new bytes from save
   finish left. Until `WALK_GAP` (the listing interval, three hours) after that walk's first
   pass, a pass with no watcher hint or listing request, unchanged inputs, a live watcher covering
   every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
-  it reads, uploads and saves nothing, and reports a healthy source with the manifest withdrawn.
+  it reads, uploads and saves nothing and sends no status receipt: the walk's receipt and manifest
+  stand, and check-in beats (sent with no scan start while a record is armed) keep them fresh.
   Anything else walks as before: any failure, an account switch, a restart or another writer's
   save. A due sampled audit waits for the next walk, at the latest the backstop. A pass that took
   a hint clears the record before any fallible step, so a failed pass is followed by a walk. An

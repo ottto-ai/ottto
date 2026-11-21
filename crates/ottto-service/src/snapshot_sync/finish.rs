@@ -1230,28 +1230,16 @@ pub(super) fn finish_sync_source(
         )?;
     }
     if scan_result.walk_idle && crate::snapshots::walk_idle::idle_finish(&index) {
-        // Nothing was read: no body, save or manifest; a healthy receipt.
+        // Nothing was read: no body, save or receipt. The walk's terminal
+        // receipt and manifest stand; check-in beats keep them fresh.
         if crate::snapshots::maintain_state_v2_idle(&index_path, &index, true).is_err() {
             eprintln!("local state maintenance deferred for {}", source.api_slug());
         }
         with_source_cadence(source, |cadence| {
             cadence.record_scan_success(Instant::now(), 0)
         });
-        report_status_with_fresh_relay_token(
-            client,
-            device,
-            device_secret,
-            support_dir,
-            source,
-            TerminalManifestSource::Withdraw,
-            CollectorStatus {
-                source,
-                machine_id,
-                scan_started_at: &scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, 0, receipt_window_days),
-                state: CollectorState::Success,
-            },
-        )?;
+        let counts = SyncCounts::from_scan_result(&scan_result, 0, receipt_window_days);
+        eprintln!("{}", counts.terminal_census_line(source.api_slug()));
         if let Some((pass, _)) = walk_idle_pass {
             crate::snapshots::walk_idle::arm_after_finish(
                 pass,
@@ -2739,10 +2727,10 @@ pub(super) fn finish_sync_source(
         // reporting failure does not change the resolved transport outcome.
         return Ok(());
     } else {
-        // The receipt's own loss: an idle pass must never replace a disclosure.
+        // This walk's loss blocks arming; standing terminal holds do not.
         let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
             .with_snapshot_terminal_counts(&index);
-        let loss_free = !counts.has_disclosed_loss();
+        let loss_free = !counts.has_walk_loss(&index);
         report_status_with_fresh_relay_token(
             client,
             device,

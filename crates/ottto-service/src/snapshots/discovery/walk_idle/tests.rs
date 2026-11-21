@@ -134,6 +134,34 @@ fn settled_walk_idles_until_the_start_to_start_backstop() {
     assert_eq!(armed_for_test(SnapshotSource::Pi), None);
 }
 
+/// `armed` is what the lane reads before a cycle's passes: true from a
+/// settled walk until a walking gate, a clear or a restart drops the record.
+#[test]
+fn armed_follows_the_record() {
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    let index = ScanIndex::default();
+    assert!(!armed(source), "nothing armed yet");
+    fixture.walk(&index, START);
+    assert!(armed(source));
+    assert!(!armed(SnapshotSource::Pi), "per source");
+    assert!(fixture.gate(&index, START + 1800), "an idle pass");
+    assert!(armed(source), "an idle pass keeps it");
+    clear(source);
+    assert!(!armed(source), "cleared");
+    fixture.walk(&index, START + 3600);
+    assert!(armed(source), "re-armed");
+    assert!(
+        !fixture.gate(&index, START + 3600 + WALK_GAP),
+        "the backstop"
+    );
+    assert!(!armed(source), "a walking gate drops it");
+    fixture.walk(&index, START + 3600 + WALK_GAP + 60);
+    assert!(armed(source));
+    restart_for_test();
+    assert!(!armed(source), "a restart drops it");
+}
+
 #[test]
 fn pass_gap_equal_to_twice_the_longest_interval_idles_and_longer_walks() {
     assert_eq!(PASS_GAP, 2 * 30 * 60);
