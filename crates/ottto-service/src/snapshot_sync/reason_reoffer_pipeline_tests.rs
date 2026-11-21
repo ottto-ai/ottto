@@ -1639,7 +1639,7 @@ fn refused_then_conflicted_holding(
 /// Margin receipt for the scan workers' stack. The real prepare,
 /// rotation and finish cycle (a full scan, then a restart that restores the
 /// durable copy) completes in the optimized build on a thread with the
-/// 2 MiB spawn default, as do the Codex join ACK and refusal paths.
+/// 2 MiB spawn default, as do the Codex join ACK and creator-overlap paths.
 /// An overflow aborts the test process. Release only: the debug build's
 /// frames are far larger. Run by the dispatch-only `scan-stack-margin` job
 /// in `.github/workflows/ci.yml`.
@@ -1681,22 +1681,23 @@ fn scan_worker_stack_margin_receipt() {
         .unwrap()
         .join()
         .unwrap();
-    let ((ack_boots, ack_eofs), (refusal_boots, refusal_eofs, refusal_files)) =
+    let ((ack_boots, ack_eofs), (overlap_boots, overlap_eofs, overlap_files)) =
         run_on_scan_worker_stack_with_size(STACK_BYTES, || {
             use super::once_credit_oracle_tests::{
-                codex_join_ack_on_worker_stack, codex_join_refusal_on_worker_stack,
+                codex_join_ack_on_worker_stack, codex_join_creator_overlap_on_worker_stack,
             };
             (
                 codex_join_ack_on_worker_stack(STACK_BYTES),
-                codex_join_refusal_on_worker_stack(STACK_BYTES),
+                codex_join_creator_overlap_on_worker_stack(STACK_BYTES),
             )
         });
-    let codex_boots = ack_boots + refusal_boots;
-    let codex_eofs = ack_eofs + refusal_eofs;
+    let codex_boots = ack_boots + overlap_boots;
+    let codex_eofs = ack_eofs + overlap_eofs;
     eprintln!(
         "SCAN_STACK_MARGIN_RECEIPT stack_bytes={STACK_BYTES} profile=release cycles=3 \
          restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored} \
-         codex_boots={codex_boots} codex_eofs={codex_eofs} codex_refusal_files={refusal_files}"
+         codex_boots={codex_boots} codex_eofs={codex_eofs} \
+         codex_creator_overlap_refusal_files={overlap_files}"
     );
 }
 

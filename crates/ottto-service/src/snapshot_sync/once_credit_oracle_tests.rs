@@ -6,6 +6,8 @@ use super::*;
 use crate::snapshot_sync::tests::claude_money_e2_pipeline_tests::{
     assert_joined_ack, assert_joined_post, revert_archives,
 };
+#[cfg(unix)]
+use crate::snapshots::e2_pipeline_scan_fixture::file_entity_set_hex_for_test;
 use crate::snapshots::e2_pipeline_scan_fixture::observe_codex_group_eofs;
 use crate::snapshots::sampled_scan::transition_fixture::{self as transition, with_scan_clock};
 use crate::test_effects::{self, Handle, Recording, Scalar};
@@ -2229,9 +2231,9 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
 }
 
 #[cfg(unix)]
-fn assert_codex_join_boot_and_eofs(cycle: &Cycle) -> (usize, usize) {
+fn assert_codex_join_boot_and_eofs(cycle: &Cycle, expected_eofs: usize) -> (usize, usize) {
     assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
-    assert!(cycle.consumed > 0, "the group read both archives");
+    assert!(cycle.consumed > 0, "the group consumed parser bytes");
     assert_eq!(cycle.steps[0]["before"]["join_active"], false);
     assert_eq!(cycle.steps.last().unwrap()["before"]["join_active"], false);
     let boots = cycle
@@ -2243,7 +2245,7 @@ fn assert_codex_join_boot_and_eofs(cycle: &Cycle) -> (usize, usize) {
         })
         .count();
     assert_eq!(boots, 1, "one contiguous active join boot");
-    assert_eq!(cycle.group_eofs, 2, "both member EOFs before finish");
+    assert_eq!(cycle.group_eofs, expected_eofs, "member EOFs before finish");
     (boots, cycle.group_eofs)
 }
 
@@ -2263,7 +2265,7 @@ pub(super) fn codex_join_ack_on_worker_stack(stack_bytes: usize) -> (usize, usiz
     let paths = install_revert_archives(&home, "a");
 
     let cold = home.cycle_on_worker_stack(&server, &recording, stack_bytes);
-    let counts = assert_codex_join_boot_and_eofs(&cold);
+    let counts = assert_codex_join_boot_and_eofs(&cold, 2);
     assert_eq!(cold.before.len(), 1);
     assert_eq!(cold.finalized.len(), 1);
     let item = &cold.finalized[0];
@@ -2292,9 +2294,18 @@ pub(super) fn codex_join_ack_on_worker_stack(stack_bytes: usize) -> (usize, usiz
         original.source_file_fingerprint,
         revert.source_file_fingerprint
     );
-    for entry in [original, revert] {
+    let acknowledged_entities = BTreeSet::from([fingerprint.clone()]);
+    let file_fingerprint = file_entity_set_hex_for_test(&acknowledged_entities);
+    for (path, entry) in paths.iter().zip([original, revert]) {
         assert!(!entry.source_file_fingerprint.is_empty());
-        assert_eq!(entry.last_snapshot_fingerprint.as_ref(), Some(fingerprint));
+        assert_eq!(
+            cold.index.file_snapshot_fingerprints.get(&index_key(path)),
+            Some(&acknowledged_entities)
+        );
+        assert_eq!(
+            entry.last_snapshot_fingerprint.as_ref(),
+            Some(&file_fingerprint)
+        );
         assert_eq!(entry.codex_joined_member_set.as_ref(), Some(member_set));
         assert!(entry.codex_captured_joined_member_set.is_none());
     }
@@ -2312,16 +2323,34 @@ pub(super) fn codex_join_ack_on_worker_stack(stack_bytes: usize) -> (usize, usiz
 }
 
 #[cfg(unix)]
-pub(super) fn codex_join_refusal_on_worker_stack(stack_bytes: usize) -> (usize, usize, u64) {
+pub(super) fn codex_join_creator_overlap_on_worker_stack(stack_bytes: usize) -> (usize, usize, u64) {
     let _decoder = transition::codex_decoder_test_lock();
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
-    home.row = "codex_join_refusal";
+    home.row = "codex_join_creator_overlap_before_second_eof";
     let paths = install_revert_archives(&home, "b");
 
     let held = home.cycle_on_worker_stack(&server, &recording, stack_bytes);
-    let (boots, eofs) = assert_codex_join_boot_and_eofs(&held);
+    let (boots, eofs) = assert_codex_join_boot_and_eofs(&held, 1);
+    let member_key =
+        |path: &Path| format!("root-0/{}", path.file_name().unwrap().to_string_lossy());
+    let second_key = member_key(&paths[1]);
+
+    // A creator overlap refuses on the second member's first record, before EOF.
+    let mut second_steps = held
+        .steps
+        .iter()
+        .filter(|step| step["before"]["active_key"] == second_key.as_str());
+    let refusal = second_steps.next().expect("second member was stepped");
+    assert!(second_steps.next().is_none(), "refused on the first record");
+    assert_eq!(refusal["outcome"], "pending");
+    assert_eq!(refusal["before"]["pending_finalization"], json!([]));
+    assert!(refusal["after"]["active_key"].is_null());
+    assert_eq!(
+        refusal["after"]["pending_finalization"],
+        held.gate["pending_finalization"]
+    );
     let incomplete = held.gate["ownership_incomplete_file_count"]
         .as_u64()
         .unwrap();
@@ -2329,19 +2358,16 @@ pub(super) fn codex_join_refusal_on_worker_stack(stack_bytes: usize) -> (usize, 
     assert_eq!(held.gate["residue_count"], 2);
     let pending = held.gate["pending_finalization"].as_array().unwrap();
     assert_eq!(pending.len(), 2);
-    assert!(pending
-        .iter()
-        .all(|row| row["parse_complete"].as_bool() == Some(false)));
+    assert!(pending.iter().all(|row| {
+        row["parse_complete"].as_bool() == Some(false) && row["parsed_snapshot_count"] == 0
+    }));
     let pending_keys = pending
         .iter()
         .map(|row| row["key"].as_str().unwrap().to_owned())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         pending_keys,
-        paths
-            .iter()
-            .map(|path| format!("root-0/{}", path.file_name().unwrap().to_string_lossy()))
-            .collect()
+        paths.iter().map(|path| member_key(path)).collect()
     );
 
     assert!(held.before.is_empty() && held.finalized.is_empty());
@@ -2353,7 +2379,10 @@ pub(super) fn codex_join_refusal_on_worker_stack(stack_bytes: usize) -> (usize, 
         .is_empty());
     assert!(held.progress.accepted_body_witnesses.is_empty());
     assert!(held.index.files.values().all(|entry| {
-        entry.last_snapshot_fingerprint.is_none() && entry.codex_joined_member_set.is_none()
+        entry.last_snapshot_fingerprint.is_none()
+            && entry.last_upload_body_witness.is_none()
+            && entry.codex_joined_member_set.is_none()
+            && entry.upload_context_receipt.is_none()
     }));
     (boots, eofs, incomplete)
 }
@@ -2370,8 +2399,8 @@ fn codex_join_boot_and_both_eofs_before_exact_ack() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn codex_join_boot_and_both_eofs_before_ownership_refusal() {
-    codex_join_refusal_on_worker_stack(SNAPSHOT_SYNC_WORKER_STACK_BYTES);
+fn codex_join_boot_then_creator_overlap_refuses_before_second_eof() {
+    codex_join_creator_overlap_on_worker_stack(SNAPSHOT_SYNC_WORKER_STACK_BYTES);
 }
 
 fn codex_member(
