@@ -991,6 +991,52 @@ def receipt_dirs(testcase, base, head, bodies=None):
     return left, right
 
 
+@mock.patch.object(money_equivalence, "REQUIRED_STEP_TRACES", {"existing-0"})
+class StepTraceTests(unittest.TestCase):
+    def compare(self, base, head, missing_file=None):
+        left, right = receipt_dirs(self, [], [])
+        logs = {}
+        for arm, directory, traces in (("base", left, base), ("head", right, head)):
+            trace_dir = directory / "step-trace"
+            trace_dir.mkdir()
+            lines = []
+            for name, data in traces.items():
+                if (arm, name) != missing_file:
+                    (trace_dir / f"{name}.json").write_bytes(data)
+                lines.append(f"STEP_TRACE {name} sha256={hashlib.sha256(data).hexdigest()}")
+            logs[arm] = "\n".join(lines)
+        return money_equivalence.compare_step_traces(left, right, logs)
+
+    def test_equal_traces_and_byte_difference(self):
+        base = {"existing-0": b"[]"}
+        self.assertEqual(self.compare(base, base), {"compared": 1, "uncompared_head_only": []})
+        with self.assertRaisesRegex(RuntimeError, "step-trace bytes differ"):
+            self.compare(base, {"existing-0": b"[ ]"})
+
+    def test_required_or_reported_trace_missing(self):
+        base = {"existing-0": b"[]"}
+        for left, right, missing_file in (({}, {}, None), (base, {}, None),
+                                          (base, base, ("base", "existing-0"))):
+            with self.subTest(left=left, right=right, missing_file=missing_file):
+                with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+                    self.compare(left, right, missing_file)
+
+    def test_extra_trace_requires_a_head_only_declaration(self):
+        base = {"existing-0": b"[]"}
+        head = base | {"new-0": b"[]"}
+        with self.assertRaisesRegex(RuntimeError, "step-trace names differ"):
+            self.compare(base, head)
+        with mock.patch.object(money_equivalence, "HEAD_ONLY_STEP_TRACES", {"new-0"}):
+            self.assertEqual(self.compare(base, head),
+                             {"compared": 1, "uncompared_head_only": ["new-0"]})
+            self.assertEqual(self.compare(head, head),
+                             {"compared": 2, "uncompared_head_only": []})
+            with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+                self.compare(base, base)
+            with self.assertRaisesRegex(RuntimeError, "step-trace bytes differ"):
+                self.compare(head, head | {"new-0": b"[1]"})
+
+
 class HeadOnlyFixtureTests(unittest.TestCase):
     """A new native fixture is required on the head, optional and UNCOMPARED on the base."""
 

@@ -109,6 +109,35 @@ HEAD_ONLY_FIXTURES = (
     "claude_status_s24_boundaries",
 )
 
+# Fixed cycles and the required first/last witnesses of bounded drain rows.
+# The STEP_TRACE lines enumerate the remaining cycles as they execute.
+_TRACE_CYCLES = {
+    "c01_claude": 2, "c01_codex": 2, "c01_pi": 2,
+    "c02": 2, "c03": 2, "c04": 2, "c04_cold": 1, "c05": 5,
+    "c06_dropped": 2, "c06_lost_ack": 2, "c06_selected_save": 2,
+    "c07": 2, "c08": 2, "c09": 3, "c10": 3, "c11_account_hold": 2,
+    "c11_both": 1, "c11_marker": 2, "c12": 10, "c12_cold": 1,
+    "c13": 3, "c13_cold": 1,
+}
+REQUIRED_STEP_TRACES = {
+    f"{row}-{i}" for row, count in _TRACE_CYCLES.items() for i in range(count)
+} | {
+    f"{row}-{run * 128 + cycle}"
+    for row, runs, cycles in (
+        ("schedule_equal_birth_twins", 32, 3),
+        ("schedule_equal_birth_twins_before_cutoff", 32, 4),
+        ("schedule_claude", 32, 1), ("schedule_codex", 16, 1), ("schedule_pi", 16, 1),
+    )
+    for run in range(runs) for cycle in range(cycles)
+} | {
+    f"schedule_{source}-result-{run}"
+    for source, runs in (("claude", 32), ("codex", 16), ("pi", 16))
+    for run in range(runs)
+}
+# A new row is required on the head and can be uncompared only when absent
+# from the base. Once present on both sides its receipt must match.
+HEAD_ONLY_STEP_TRACES = frozenset()
+
 
 # Base and head bodies must match exactly. The only accepted difference is a
 # new key ADDED where both sides have the record, and only when it is not money:
@@ -603,6 +632,40 @@ def receipt_names(left, right, head_expected, base_expected=None):
     return sorted(base & head), sorted(head - base)
 
 
+def compare_step_traces(left, right, logs):
+    """Verify the emitted trace manifests and compare shared receipts byte for byte."""
+    if REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES:
+        raise RuntimeError("head-only step traces overlap required traces")
+    manifests = {}
+    for arm, directory in (("base", left), ("head", right)):
+        lines = re.findall(r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
+        digests = dict(lines)
+        required = REQUIRED_STEP_TRACES | (HEAD_ONLY_STEP_TRACES if arm == "head" else set())
+        files = {path.stem for path in (directory / "step-trace").glob("*.json")}
+        if len(lines) != len(digests) or files != digests.keys() or not required <= files:
+            raise RuntimeError(f"incomplete {arm} step-trace coverage")
+        manifests[arm] = digests
+    base, head = manifests["base"], manifests["head"]
+    new = head.keys() - base.keys()
+    if base.keys() - head.keys() or new - HEAD_ONLY_STEP_TRACES:
+        raise RuntimeError("base/head step-trace names differ")
+
+    def read(directory, name, digest):
+        data = (directory / "step-trace" / f"{name}.json").read_bytes()
+        if not data or hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"invalid {directory.name} step-trace digest: {name}")
+        return data
+
+    changed = []
+    for name in sorted(head):
+        data = read(right, name, head[name])
+        if name in base and read(left, name, base[name]) != data:
+            changed.append(name)
+    if changed:
+        raise RuntimeError("base/head step-trace bytes differ: " + ", ".join(changed))
+    return {"compared": len(base), "uncompared_head_only": sorted(new)}
+
+
 def require_saved_digests(directory, name):
     cross_name = Path(name).with_suffix(".cross-build.json")
     for body_name in (Path(name), cross_name):
@@ -711,7 +774,7 @@ def main():
         # Nothing is transplanted: each arm builds its own tree unchanged.
         require_base_scan_fixture(base)
         require_base_harness(base)
-        expected = {}
+        expected, logs = {}, {}
         for arm, tree in [("base", base), ("head", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
@@ -734,6 +797,7 @@ def main():
             (receipts / f"{arm}.log").write_text(result.stdout)
             result.check_returncode()
             expected[arm] = native_coverage(arm, result.stdout)
+            logs[arm] = result.stdout
         left, right = receipts / "base", receipts / "head"
         names, uncompared = receipt_names(left, right, expected["head"], expected["base"])
         signed_lists = signed_money_lists(declarations, names + uncompared)
@@ -771,6 +835,7 @@ def main():
                           "nothing to match): " + ", ".join(signed_uncompared))
         if errors:
             raise RuntimeError("; ".join(errors))
+        manifest["step_traces"] = compare_step_traces(left, right, logs)
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
@@ -780,6 +845,9 @@ def main():
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
+            traces = manifest["step_traces"]
+            f.write(f"Step traces: {traces['compared']} byte-equal; "
+                    f"{len(traces['uncompared_head_only'])} head-only uncompared.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 
