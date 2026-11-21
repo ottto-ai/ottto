@@ -551,14 +551,61 @@ fn file_removed_mid_read_ends_incomplete() {
     let root = Root::new("ld-held");
     three_line_file(&root);
     let recorder = Recorder::default();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
+            .with_sampled_acquisition(
+                Arc::clone(&cache),
+                crate::transcript_acquisition::Scope("ld-held".into()),
+            )
             .with_line_observer("test", Box::new(recorder.clone())),
         two_lines_delivered(&recorder),
     );
-    drop(scan.active_file.take());
-    finish(scan);
+    assert!(
+        recorder.ends().is_empty(),
+        "mid-read Pending keeps delivery open"
+    );
+    assert!(!scan.active_file.holds_lease_for_test());
+    let active = scan.active_file.take().expect("partially delivered file");
+    // Feed the old selection back through its second-open check. A removed
+    // selection yields Pending before the ordinary page close can end delivery.
+    let candidate = active.candidate.clone();
+    drop(active);
+    fs::remove_file(&candidate.path).unwrap();
+    scan.identified_candidates.push_front(candidate);
+    let OwnedSourceScanStep::Pending(scan) = scan.step(None) else {
+        panic!("the vanished candidate should yield before closing the page");
+    };
+    assert!(scan.active_file.is_none());
+    assert!(!scan.active_file.holds_lease_for_test());
     assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+    drop(scan);
+    assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+    let counters = cache.counters_for_test();
+    assert_eq!((counters.jobs_frame_returned, counters.jobs_lost), (0, 0));
+    assert!(cache.cursor_slot_free());
+}
+
+#[test]
+fn completed_read_keeps_its_index_write_across_the_pending_frame() {
+    let root = Root::new("ld-index");
+    three_line_file(&root);
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let initial = ScanIndex::default();
+    let scan = step_until(new_scan(&root.projects(), initial.clone()), |scan| {
+        scan.pending_finalization
+            .iter()
+            .any(|row| row.index_key == key)
+    });
+    let entry = &scan.index.files[&key];
+    assert_eq!(entry.size_bytes, fs::metadata(path).unwrap().len());
+    let fingerprint = entry.source_file_fingerprint.clone();
+    assert!(!initial.files.contains_key(&key));
+    let OwnedSourceScanStep::Complete { index, .. } = scan.step(None) else {
+        panic!("the read was the last selection");
+    };
+    assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
 }
 
 /// A failed read ends once `Incomplete` and is counted.
