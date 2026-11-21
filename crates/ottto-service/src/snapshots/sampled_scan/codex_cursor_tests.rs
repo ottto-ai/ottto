@@ -2197,7 +2197,8 @@ fn a_touch_during_an_in_flight_full_earns_the_credit_it_earns_without_counts() {
 /// [money] A cursor job's head whose seal stops before an invalid EOF fragment
 /// it withheld, touched at its size: under an unchanged write generation
 /// count the next read continues from that head as a Tail past the seal (no
-/// Full); without counts the touch is the same-size edit it was.
+/// Full); without counts the touch is the same-size edit it was, a Full whose
+/// cursor job records that reason on the page it starts.
 #[test]
 fn a_touched_cursor_head_before_a_withheld_fragment_tails_under_an_equal_count() {
     use crate::transcript_acquisition::{FullReason, Generations, UseGenerations};
@@ -2240,7 +2241,8 @@ fn a_touched_cursor_head_before_a_withheld_fragment_tails_under_an_equal_count()
             now += 10;
             clock.set(now);
             page_number += 1;
-            let (_, _, selections) = page_selections(
+            let before = counter(&cache, |c| c.jobs_started);
+            let (mut index, _, selections) = page_selections(
                 &fixture,
                 routed(index, &cache),
                 Some(Arc::clone(&cache)),
@@ -2252,10 +2254,36 @@ fn a_touched_cursor_head_before_a_withheld_fragment_tails_under_an_equal_count()
             if generations == Generations::Simulated {
                 assert_eq!(selections.full_reasons, [0; 11], "no Full");
                 assert_eq!(selections.modes.1, 1, "a Tail past the seal");
-            } else {
-                let edits = selections.full_reasons[FullReason::SameSizeEdit.slot()];
-                assert_eq!(edits, 1);
+                return;
             }
+            // A Full larger than the page budget is a cursor job: its mode
+            // and reason are recorded on the page the job starts, not on a
+            // page that defers or fences the start.
+            let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
+            let mut opened =
+                (counter(&cache, |c| c.jobs_started) > before).then_some(selections.full_reasons);
+            while opened.is_none() && page_number < 128 {
+                let started = counter(&cache, |c| c.jobs_started);
+                now += step;
+                clock.set(now);
+                page_number += 1;
+                let (next, _, selections) = page_selections(
+                    &fixture,
+                    routed(index, &cache),
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                    &collected_at(page_number),
+                    |_| {},
+                    10_000,
+                );
+                index = next;
+                if counter(&cache, |c| c.jobs_started) > started {
+                    opened = Some(selections.full_reasons);
+                    break;
+                }
+            }
+            let reasons = opened.unwrap_or_else(|| panic!("no Full job: {}", counters(&cache)));
+            assert_eq!(reasons[FullReason::SameSizeEdit.slot()], 1, "{reasons:?}");
         });
     }
 }
