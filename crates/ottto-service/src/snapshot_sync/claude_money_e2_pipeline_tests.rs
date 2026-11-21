@@ -1429,6 +1429,207 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
+/// A response line that also calls `tools`, one `tool_use` block each.
+fn tool_line(request: &str, at: &str, tokens: u64, tools: &[&str]) -> String {
+    let mut turn: serde_json::Value =
+        serde_json::from_str(&line(ROOT, request, at, tokens)).unwrap();
+    turn["message"]["role"] = json!("assistant");
+    turn["message"]["content"] = tools
+        .iter()
+        .enumerate()
+        .map(|(n, name)| {
+            json!({"type": "tool_use", "id": format!("toolu_{request}_{n}"),
+                "name": name, "input": {}})
+        })
+        .collect();
+    turn.to_string() + "\n"
+}
+/// The one twin body: tool rows, truncation, money totals, total cost and
+/// requests per hour bucket.
+type TwinBody = (
+    Vec<(String, u64)>,
+    bool,
+    [u64; 6],
+    Option<String>,
+    Vec<(String, u64)>,
+);
+fn twin_body(page: &Page) -> TwinBody {
+    literal(page);
+    assert_eq!(page.scan.snapshots.len(), 1, "one body per session");
+    let item = &page.scan.snapshots[0];
+    let tools = item
+        .tool_usage
+        .as_deref()
+        .expect("a Claude body lists tools");
+    (
+        tools
+            .iter()
+            .map(|row| (row.name.clone(), row.count))
+            .collect(),
+        item.tool_usage_truncated,
+        [
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cache_read_tokens,
+            item.cache_creation_5m_tokens,
+            item.cache_creation_1h_tokens,
+        ],
+        item.cost
+            .as_ref()
+            .and_then(|cost| cost.total_cost_usd.clone()),
+        item.usage_buckets
+            .iter()
+            .map(|bucket| {
+                let requests = bucket.model_usage.iter().map(|row| row.request_count);
+                (bucket.bucket_start.clone(), requests.sum())
+            })
+            .collect(),
+    )
+}
+fn tool_rows(rows: &[(&str, u64)]) -> Vec<(String, u64)> {
+    rows.iter()
+        .map(|(name, count)| (name.to_string(), *count))
+        .collect()
+}
+/// Path twins of `ROOT` (an original and its later copy) read cold on one
+/// page in the requested discovery order: the one body sent.
+fn tool_twins(name: &str, reverse: bool, original: &str, copy: &str) -> TwinBody {
+    let mut c = Corpus::new(&format!("{name}-{reverse}"));
+    let (old_dir, new_dir) = if reverse {
+        ("z-original", "a-copy")
+    } else {
+        ("a-original", "z-copy")
+    };
+    c.write_at(
+        &format!("{old_dir}/{ROOT}.jsonl"),
+        original,
+        "2026-08-02T07:00:00Z",
+    );
+    c.write_at(
+        &format!("{new_dir}/{ROOT}.jsonl"),
+        copy,
+        "2026-11-04T07:03:00Z",
+    );
+    let scanner = E2ScanFixture::default();
+    let page = ready(&c, &scanner, ScanIndex::default(), 100, false);
+    let paths = scanner.paths();
+    assert_eq!(paths.len(), 2, "{name}: both twins are read");
+    assert!(
+        paths[0].ends_with(format!(
+            "{}/{ROOT}.jsonl",
+            if reverse { new_dir } else { old_dir }
+        )),
+        "{name}: fixture must exercise the requested discovery order"
+    );
+    twin_body(&page)
+}
+
+/// [regress] Tool usage is display data. One body per session sums every
+/// path twin's money but kept only the first-read twin's tool counts, so the
+/// discovery order decided `tool_usage`. Each tool now takes its highest
+/// count over the twins: a turn only one twin holds is kept, a copied turn
+/// counts once, and a superset twin adds its extra tool. Money is unchanged
+/// and the same in both orders.
+#[test]
+fn e2_pipeline_twin_tool_usage_is_independent_of_scan_order() {
+    let (r2_at, r2_tokens) = ("2026-11-04T07:03:10Z", 20);
+    for (name, original, copy, expected) in [
+        (
+            "e2-twin-tools-one-side",
+            line(ROOT, "r1", AT, 10),
+            line(ROOT, "r1", AT, 10) + &tool_line("r2", r2_at, r2_tokens, &["Read"]),
+            tool_rows(&[("Read", 1)]),
+        ),
+        (
+            "e2-twin-tools-copied",
+            tool_line("r1", AT, 10, &["Read"]),
+            tool_line("r1", AT, 10, &["Read"]) + &line(ROOT, "r2", r2_at, r2_tokens),
+            tool_rows(&[("Read", 1)]),
+        ),
+        (
+            "e2-twin-tools-superset",
+            tool_line("r1", AT, 10, &["Read"]),
+            tool_line("r1", AT, 10, &["Read"]) + &tool_line("r2", r2_at, r2_tokens, &["Bash"]),
+            tool_rows(&[("Bash", 1), ("Read", 1)]),
+        ),
+    ] {
+        with_e2(|| {
+            let forward = tool_twins(name, false, &original, &copy);
+            let reverse = tool_twins(name, true, &original, &copy);
+            assert_eq!(
+                (&forward.0, forward.1),
+                (&expected, false),
+                "{name}: tool rows"
+            );
+            assert_eq!(forward.2[0], 2, "{name}: r1 counts once, plus r2");
+            assert_eq!(forward, reverse, "{name}: both orders send one body");
+        });
+    }
+}
+
+/// [regress] A tool turn appended to one settled twin, hinted first: the
+/// tail sends the same body as a cold full read of the same bytes, which
+/// reads the twin without the tool turn first.
+#[test]
+fn e2_pipeline_twin_tool_turn_tail_matches_cold_full() {
+    with_e2(|| {
+        let seed = |c: &mut Corpus| {
+            c.write_at(
+                &format!("a/{ROOT}.jsonl"),
+                &line(ROOT, "r1", AT, 10),
+                "2026-08-02T07:00:00Z",
+            );
+            c.write_at(
+                &format!("z/{ROOT}.jsonl"),
+                &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-11-04T07:03:10Z", 20)),
+                "2026-11-04T07:03:00Z",
+            )
+        };
+        let r3 = tool_line("r3", "2026-11-04T07:04:00Z", 30, &["Read"]);
+        let mut c = Corpus::new("e2-twin-tools-tail");
+        let grown = seed(&mut c);
+        let scanner = E2ScanFixture::default();
+        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        assert_eq!(twin_body(&first).0, tool_rows(&[]), "no tool turn yet");
+        first.finish();
+        let prior = c.reload(&mut first.index);
+        append(&grown, &r3);
+        let mut page = c.raw(&scanner, prior, 100, false, std::slice::from_ref(&grown));
+        page.enrich(&c);
+        let mut deferred = 0;
+        while page.scan.snapshots.is_empty() {
+            deferred += 1;
+            assert!(deferred <= 3, "the grown twin is read on a later page");
+            page.finish();
+            let next = c.reload(&mut page.index);
+            page = c.raw(&scanner, next, 100, false, &[]);
+            page.enrich(&c);
+        }
+        let tail = twin_body(&page);
+
+        let mut cold = Corpus::new("e2-twin-tools-tail-cold");
+        append(&seed(&mut cold), &r3);
+        let cold_scanner = E2ScanFixture::default();
+        let full = ready(&cold, &cold_scanner, ScanIndex::default(), 100, false);
+        assert!(
+            cold_scanner.paths()[0].ends_with(format!("a/{ROOT}.jsonl")),
+            "the cold full reads the twin without the tool turn first"
+        );
+        let full = twin_body(&full);
+        assert_eq!(
+            (&full.0, full.1),
+            (&tool_rows(&[("Read", 1)]), false),
+            "cold full keeps the tool turn"
+        );
+        assert_eq!(full.2[0], 3, "r1 counts once, plus r2 and r3");
+        assert_eq!(
+            tail, full,
+            "the hinted tail and the cold full send one body"
+        );
+    });
+}
+
 /// A current Claude Code version. No writer version decides a copy: every
 /// copied prefix takes request-id proof.
 const UNLISTED_WRITER: &str = "2.1.316";

@@ -5008,6 +5008,24 @@ pub(crate) fn finish_page_planned(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // Tool usage is display data: the one body carries every twin's names,
+    // each at its highest per-file count, so scan order cannot change it. A
+    // copied turn counts once; distinct same-tool turns split across twins
+    // undercount, never overcount.
+    let mut twin_tools = BTreeMap::<String, (BTreeMap<String, u64>, bool)>::new();
+    for item in items.iter().filter(|item| item.claude_money.is_some()) {
+        let Some(rows) = item.tool_usage.as_deref() else {
+            continue;
+        };
+        let (counts, truncated) = twin_tools
+            .entry(item.source_session_id.clone())
+            .or_default();
+        *truncated |= item.tool_usage_truncated;
+        for row in rows {
+            let count = counts.entry(row.name.clone()).or_default();
+            *count = (*count).max(row.count);
+        }
+    }
     let mut withheld = BTreeSet::new();
     items.retain_mut(|item| {
         if item.claude_money.is_none() {
@@ -5030,6 +5048,20 @@ pub(crate) fn finish_page_planned(
         // its fold gets its own entity back (moved out above).
         let emitted = super::emit::apply(item, &entity, span_last);
         if emitted {
+            if let Some((counts, truncated)) = twin_tools.remove(&item.source_session_id) {
+                let mut rows = super::super::bounded_tool_usage_counts(&counts);
+                let truncated = truncated || rows.len() > super::super::MAX_TOOL_USAGE_NAMES;
+                rows.truncate(super::super::MAX_TOOL_USAGE_NAMES);
+                if item.tool_usage.as_ref() != Some(&rows) || item.tool_usage_truncated != truncated
+                {
+                    item.tool_usage = Some(rows);
+                    item.tool_usage_truncated = truncated;
+                    item.snapshot_fingerprint = super::super::snapshot_fingerprint(
+                        super::super::SnapshotSource::ClaudeCode,
+                        item,
+                    );
+                }
+            }
             item.request_contributions = contributions.into_boxed_slice();
             if let Some(marked) = item.copy_unproven_counts {
                 let mut counts = Counts::default();
