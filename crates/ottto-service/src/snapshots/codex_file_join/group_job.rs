@@ -782,16 +782,12 @@ impl GroupBoot {
         } else {
             new_group_parser(file, &first, inputs.metadata).map_err(|_| GroupEnd::Strict)?
         };
-        tail_source::seed_full_job_template(inputs.index, &first, &mut parser.accumulator);
-        if members.iter().any(|member| {
-            inputs
-                .index
-                .files
-                .contains_key(&local_index_key(&member.path))
-        }) {
-            // A previously indexed carrier is still the original run.
-            parser.accumulator.job_template_pending = false;
-        }
+        tail_source::seed_full_job_template(
+            inputs.index,
+            &first,
+            &members[1..],
+            &mut parser.accumulator,
+        );
         let mut join = Box::new(if independent {
             StreamProof::independent(group.owner.clone(), members.len())
         } else {

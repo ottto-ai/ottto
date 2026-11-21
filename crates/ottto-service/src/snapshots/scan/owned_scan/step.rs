@@ -1632,6 +1632,7 @@ impl OwnedSourceScan {
                     tail_source::seed_full_job_template(
                         index,
                         &active.candidate,
+                        &[],
                         &mut parser.accumulator,
                     );
                     acquisition.mode = mode;
@@ -4998,7 +4999,12 @@ impl OwnedSourceScan {
             if planned_mode.is_none_or(|(mode, _)| {
                 matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
             }) {
-                tail_source::seed_full_job_template(index, &candidate, &mut parser.accumulator);
+                tail_source::seed_full_job_template(
+                    index,
+                    &candidate,
+                    &[],
+                    &mut parser.accumulator,
+                );
             }
             // Every physical Full/Tail acquisition stops at its opening extent,
             // including native/forced reads and cursor-only preparation.

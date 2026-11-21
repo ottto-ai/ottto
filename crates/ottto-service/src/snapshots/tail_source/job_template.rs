@@ -6,13 +6,20 @@ use state_v2::JobTemplateObservation;
 /// A native Full starts at byte zero, but job attribution belongs to the
 /// run's first observation. Restore its durable decision independently of
 /// the transcript checkpoint, which may have been invalidated by an edit.
+/// Indexed group siblings rule out first observation; a saved decision still
+/// applies to the original member.
 pub(in crate::snapshots) fn seed_full_job_template(
     index: &ScanIndex,
     candidate: &CandidateFile,
+    group_siblings: &[CandidateFile],
     acc: &mut SnapshotAccumulator,
 ) {
     let key = local_index_key(&candidate.path);
-    acc.job_template_pending = !index.files.contains_key(&key) && !load::held_new(index, &key);
+    acc.job_template_pending = !index.files.contains_key(&key)
+        && !load::held_new(index, &key)
+        && !group_siblings
+            .iter()
+            .any(|sibling| index.files.contains_key(&local_index_key(&sibling.path)));
     // A route error gives no first-read authority. Other snapshot fields
     // still use the existing native recovery path.
     let route = match state_v2::tail_route_path(index) {

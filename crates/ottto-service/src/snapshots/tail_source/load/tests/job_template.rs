@@ -29,7 +29,11 @@ fn job_survives_database_restart() {
 
 const TASK: &str = "inspect the service and explain every failure with clear evidence";
 
-fn job_full(route: &super::Route, path: &std::path::Path) -> crate::snapshots::OwnedJsonlParser {
+fn job_full(
+    route: &super::Route,
+    path: &std::path::Path,
+    group_siblings: &[crate::snapshots::CandidateFile],
+) -> crate::snapshots::OwnedJsonlParser {
     use super::super::settlement_tests::candidate;
     use super::{scope, NOW};
     use crate::snapshots::tail_source::seed_full_job_template;
@@ -45,7 +49,7 @@ fn job_full(route: &super::Route, path: &std::path::Path) -> crate::snapshots::O
             .unwrap(),
         ReadMode::Full(_)
     ));
-    seed_full_job_template(&route.index, &file, &mut parser.accumulator);
+    seed_full_job_template(&route.index, &file, group_siblings, &mut parser.accumulator);
     while !parser.step().unwrap() {}
     parser
 }
@@ -71,7 +75,7 @@ fn indexed_legacy_run_cannot_mint_during_full() {
     route.index.files.insert(key, ScanIndexEntry::default());
     assert!(tail.publish(&native));
     route.save(false);
-    let mut parser = job_full(&route, &path);
+    let mut parser = job_full(&route, &path, &[]);
     assert!(parser.accumulator.first_prompt_material.is_some());
     parser
         .accumulator
@@ -89,7 +93,7 @@ fn terminal_offline_run_cannot_mint_during_full_after_reconnect() {
     route.index.files.insert(key, ScanIndexEntry::default());
     assert!(tail.publish(&native));
     route.save(false);
-    let mut parser = job_full(&route, &path);
+    let mut parser = job_full(&route, &path, &[]);
     parser
         .accumulator
         .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
@@ -131,7 +135,7 @@ fn pending_run_has_no_job_slot_and_can_mint_on_full() {
     .unwrap();
     rows.push(task);
     std::fs::write(&path, rows.join("\n") + "\n").unwrap();
-    let mut parser = job_full(&route, &path);
+    let mut parser = job_full(&route, &path, &[]);
     parser
         .accumulator
         .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
@@ -173,7 +177,7 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
     let metadata = std::fs::metadata(&path).unwrap();
     file.physical_identity = Some([metadata.dev(), metadata.ino()]);
     let key = crate::snapshots::local_index_key(&path);
-    let mut first = job_full(&route, &path);
+    let mut first = job_full(&route, &path, &[]);
     let context = crate::session_attribution::job_template::context(7);
     first.accumulator.finish_job_template(Some(&context));
     let expected = first.accumulator.job_template.clone().unwrap();
@@ -186,7 +190,7 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
         .insert(key.clone(), ScanIndexEntry::default());
     route.save(false);
     assert!(route.head(&key).is_none());
-    let mut next = job_full(&route, &path);
+    let mut next = job_full(&route, &path, &[]);
     next.accumulator.finish_job_template(Some(&context));
     assert_eq!(next.accumulator.job_template, Some(expected.clone()));
 
@@ -214,7 +218,7 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
     .unwrap();
     route.save(false);
     assert!(route.head(&key).is_none());
-    let mut reread = job_full(&route, &path);
+    let mut reread = job_full(&route, &path, &[]);
     reread.accumulator.finish_job_template(Some(&context));
     assert_eq!(reread.accumulator.job_template, Some(expected));
 
@@ -235,7 +239,7 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
 }
 
 #[test]
-fn detached_pending_run_can_mint_after_its_first_task() {
+fn detached_pending_group_can_mint_after_its_first_task() {
     use super::super::settlement_tests::candidate;
     use crate::snapshots::{
         state_v2,
@@ -250,6 +254,19 @@ fn detached_pending_run_can_mint_after_its_first_task() {
     let metadata = std::fs::metadata(&path).unwrap();
     file.physical_identity = Some([metadata.dev(), metadata.ino()]);
     let key = crate::snapshots::local_index_key(&path);
+    let sibling_path = route.dir.join("indexed-sibling.jsonl");
+    std::fs::write(&sibling_path, "").unwrap();
+    let sibling = candidate(&sibling_path);
+    route.index.files.insert(
+        crate::snapshots::local_index_key(&sibling_path),
+        ScanIndexEntry::default(),
+    );
+    let group_siblings = [sibling];
+    let context = crate::session_attribution::job_template::context(7);
+    let mut legacy = job_full(&route, &path, &group_siblings);
+    legacy.accumulator.finish_job_template(Some(&context));
+    assert!(legacy.accumulator.job_template.is_none());
+
     let pending = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     let job = job_template_observation(&file, &pending).unwrap();
     assert!(job.fact.is_none());
@@ -260,9 +277,7 @@ fn detached_pending_run_can_mint_after_its_first_task() {
         .insert(key.clone(), ScanIndexEntry::default());
     route.save(false);
     assert!(route.head(&key).is_none());
-    let mut parser = job_full(&route, &path);
-    parser
-        .accumulator
-        .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
+    let mut parser = job_full(&route, &path, &group_siblings);
+    parser.accumulator.finish_job_template(Some(&context));
     assert!(parser.accumulator.job_template.unwrap().0.is_some());
 }
