@@ -1239,6 +1239,7 @@ fn pi_route_failed_text(route_results: &[SourceRouteVerificationResult]) -> Stri
         diagnostic.contains("404")
             && diagnostic.contains("model")
             && diagnostic.contains("not found")
+            && !diagnostic.contains("endpoint")
     });
     if !model_not_found {
         return GENERIC.to_string();

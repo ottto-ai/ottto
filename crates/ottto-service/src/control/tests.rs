@@ -1490,9 +1490,10 @@ fn subscription_oauth_local_evidence_accepts_recent_session_or_identity() {
 #[serial]
 fn pi_default_model_not_found_names_the_model() {
     let _lock = lock_backend_test_env();
-    // The route builder reads Pi's auth file under HOME; keep it empty.
+    // The route builder reads Pi's auth file; keep both lookups empty.
     let root = control_test_root("pi-default-model-not-found");
     let _home_guard = EnvVarGuard::set_path("HOME", &root);
+    let _pi_dir_guard = EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &root.join("pi-agent"));
     let failed_smoke = |diagnostic: &str| SmokeResult {
         command_found: true,
         succeeded: false,
@@ -1524,6 +1525,7 @@ fn pi_default_model_not_found_names_the_model() {
     for other in [
         "connection reset by peer",
         "Error: 404 page not found",
+        "404 /v1/models endpoint not found",
         "model is overloaded",
     ] {
         let result = pi_route_aggregate_result(vec![failed(other)]);
