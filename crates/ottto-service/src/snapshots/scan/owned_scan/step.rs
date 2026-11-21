@@ -4627,7 +4627,6 @@ impl OwnedSourceScan {
                             .observe(context.audit_metadata_supported);
                         context.admission.protected_history.observe(protected);
                         context.admission.forced_family.observe(forced_family);
-                        context.admission.comparison_target.observe(false);
 
                         context.admission.audit_debt_present.observe(debt.is_some());
                         context

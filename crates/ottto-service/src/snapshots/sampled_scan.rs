@@ -320,11 +320,13 @@ impl Context {
             ReadMode::Full(reason) => {
                 self.full_files += 1;
                 self.full_reasons[reason.slot()] += 1;
-                if let Some(due) = audit_due {
+                // A Full carries any staged debt; only one already due is
+                // an audit start.
+                let now = now_seconds();
+                if let Some(due) = audit_due.filter(|due| now >= *due) {
                     self.audits_started += 1;
-                    self.start_overdue_seconds = self
-                        .start_overdue_seconds
-                        .max(now_seconds().saturating_sub(due));
+                    self.start_overdue_seconds =
+                        self.start_overdue_seconds.max(now.saturating_sub(due));
                 }
             }
             ReadMode::Tail => self.tail_files += 1,
@@ -789,5 +791,51 @@ mod retained_heap_tests {
             cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"]
                 > empty["codex_sidecar_facts_bytes"]
         );
+    }
+}
+
+#[cfg(test)]
+mod record_mode_tests {
+    use super::*;
+    use crate::transcript_acquisition::FullReason;
+
+    /// [behaviour] A Full that carries a debt not yet due is no audit start;
+    /// one carrying a due debt starts an audit with its overdue seconds.
+    #[test]
+    fn only_a_due_debt_counts_as_an_audit_start() {
+        let mut context = Context {
+            cache: Arc::new(SharedCache::default()),
+            namespace: Scope(String::new()),
+            audit_metadata_supported: true,
+            audit_slots: CACHE_ENTRIES,
+            full_files: 0,
+            tail_files: 0,
+            unchanged_files: 0,
+            native_bytes: 0,
+            full_native_bytes: 0,
+            sample_bytes: 0,
+            full_reasons: [0; 11],
+            priority_replays: 0,
+            audits_started: 0,
+            audits_completed: 0,
+            audit_quiet_retired: 0,
+            audit_cap_full: 0,
+            audit_cap_delay: 0,
+            pace_evicted: 0,
+            start_overdue_seconds: 0,
+            completion_overdue_seconds: 0,
+            admission: Default::default(),
+        };
+        set_test_now(Some(1_000));
+        let full = ReadMode::Full(FullReason::SameSizeEdit);
+        context.record_mode(full, Some(1_001));
+        assert_eq!((context.full_files, context.audits_started), (1, 0));
+        context.record_mode(full, Some(940));
+        context.record_mode(full, Some(1_000));
+        context.record_mode(full, None);
+        set_test_now(None);
+        assert_eq!(context.full_files, 4);
+        assert_eq!(context.audits_started, 2);
+        assert_eq!(context.start_overdue_seconds, 60);
     }
 }
