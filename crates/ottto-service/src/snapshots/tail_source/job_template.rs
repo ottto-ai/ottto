@@ -42,7 +42,8 @@ pub(in crate::snapshots) fn seed_full_job_template(
         return Ok(());
     }
     if let Some(since) = since.filter(|_| candidate.physical_identity.is_some()) {
-        acc.job_template = Some(if candidate.fingerprint_birth_nanos >= since {
+        let birth = candidate.fingerprint_birth_nanos;
+        acc.job_template = Some(if birth != 0 && birth >= since {
             JobState::Pending
         } else {
             JobState::NoId
@@ -82,23 +83,40 @@ fn same_birth(saved: u64, live: u64, modified: Option<u64>) -> bool {
         || crate::transcript_acquisition::birth_clamped_at(saved, live, modified)
 }
 
-/// Carry only the job that belongs to the proven predecessor reduction. The
-/// destination may be a different inode after provider compression.
-pub(in crate::snapshots) fn job_for_carry(
-    head: &TailHead,
-    inode: u64,
-    birth_nanos: u64,
-) -> Option<FileJob> {
-    let job = head.common.job.as_ref()?;
-    let cert = certified_certificate(&head.body).ok()?;
+/// A reset or compression may retain only state for the certified object.
+pub(in crate::snapshots) fn job_matches_checkpoint(job: &FileJob, body: &[u8]) -> bool {
+    let Ok(cert) = certified_certificate(body) else {
+        return false;
+    };
     let modified = u64::try_from(cert.modified.0)
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
         .and_then(|nanos| nanos.checked_add(u64::try_from(cert.modified.1).ok()?));
-    if job.inode != cert.inode || !same_birth(cert.birth_nanos, job.birth_nanos, modified) {
-        return None;
-    }
-    Some(FileJob {
+    job.inode == cert.inode && same_birth(job.birth_nanos, cert.birth_nanos, modified)
+}
+
+/// An ordinary move can check the filed decision directly against the open
+/// destination. Provider compression creates a new object, so bind the old
+/// decision to the certified predecessor before rekeying it.
+pub(in crate::snapshots) fn job_for_carry(
+    head: &TailHead,
+    metadata: &std::fs::Metadata,
+    compression: bool,
+) -> Option<FileJob> {
+    use std::os::unix::fs::MetadataExt;
+    let job = head.common.job.as_ref()?;
+    let inode = metadata.ino();
+    let birth_nanos = crate::transcript_acquisition::birth_unix_nanos(metadata);
+    let bound = if compression {
+        job_matches_checkpoint(job, &head.body)
+    } else {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(discovery::candidate_open::unix_nanos);
+        job.inode == inode && same_birth(job.birth_nanos, birth_nanos, modified)
+    };
+    bound.then(|| FileJob {
         inode,
         birth_nanos,
         state: job.state.clone(),

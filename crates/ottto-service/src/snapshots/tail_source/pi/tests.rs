@@ -90,7 +90,7 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
             .filter(|(stored, _)| *stored == collection)
             .count()
     };
-    // Pi sets no title before finish: first prompt, workspace and job-attempt facts.
+    // Pi sets no title before finish: first prompt and workspace facts only.
     assert_eq!(
         [
             Collection::PiUsageKeys,
@@ -98,7 +98,7 @@ fn every_pi_field_home_round_trips_through_head_and_pages() {
             Collection::SessionFacts
         ]
         .map(pages),
-        [2, 6, 3]
+        [2, 6, 2]
     );
     let contents: [&[u8]; 2] = [b"please review", b"/tmp/tail-pi"];
     let holds =

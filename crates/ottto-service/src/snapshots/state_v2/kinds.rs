@@ -140,7 +140,6 @@ pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut Kin
                 "state_v2_populate_nonempty"
             );
         }
-        initialize_job_template_since(tx)?;
         let mut rows = mapper::Rows {
             tx: Some(tx),
             ..Default::default()

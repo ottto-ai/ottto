@@ -1,6 +1,8 @@
 //! Carry-specific transaction cases use the existing native route fixture.
-use super::super::tail_route::carry_tail;
+use super::super::tail::{FileJob, JobUpdate};
+use super::super::tail_route::{carry_tail, stage_job};
 use super::*;
+use crate::session_attribution::job_template::JobState;
 use crate::snapshots::ScanResidueWitness;
 
 const MOVED: &str = "/synthetic/tail/file.jsonl.zst";
@@ -17,6 +19,13 @@ fn facts() -> InventoryFacts {
         ),
     }
 }
+fn job(inode: u64) -> FileJob {
+    FileJob {
+        inode,
+        birth_nanos: 1700,
+        state: JobState::NoId,
+    }
+}
 fn pair(index: &mut ScanIndex) -> Result<()> {
     carry_tail(
         index,
@@ -26,7 +35,7 @@ fn pair(index: &mut ScanIndex) -> Result<()> {
             scan_root: PathBuf::from("/synthetic/tail"),
             head: b"rebound".to_vec(),
             inventory: facts(),
-            job: None,
+            job: Some(job(2)),
         },
     )
 }
@@ -64,6 +73,7 @@ fn seed(f: &Fixture) -> ScanIndex {
     )
     .unwrap();
     observe_tail(&f.path, FILE, observation(&[b"unaccepted revision"])).unwrap();
+    stage_job(&f.path, FILE, JobUpdate::Set(job(1))).unwrap();
     save_with(&f.path, &mut index).unwrap();
     set_aside_tail(&f.path, FILE, SetAsideCause::Encode).unwrap();
     save_with(&f.path, &mut index).unwrap();
@@ -104,6 +114,7 @@ fn assert_pair(index: &ScanIndex, moved: bool) {
     assert_eq!(head.body, if moved { &b"rebound"[..] } else { &b"old"[..] });
     assert_eq!(head.common.debt.earliest_unacked_change_at, Some(7_000));
     assert_eq!(head.common.next_revision_id, 1);
+    assert_eq!(head.common.job, Some(job(if moved { 2 } else { 1 })));
     assert_eq!(pages[&(Collection::Responses, 0)], long_value());
     assert_eq!(
         revisions(index, live),

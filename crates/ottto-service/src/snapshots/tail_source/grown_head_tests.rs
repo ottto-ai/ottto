@@ -315,7 +315,7 @@ fn the_codex_head_page_and_prelude_layout_is_pinned() {
 // The binding is an ignored head field stored in Workspace v2; existing head
 // bytes and Workspace v1 still decode without a reduction-revision change.
 const CLAUDE_LAYOUT_SHA256: &str =
-    "ab19c6364016b6476007451963b7d3e7330a1f3dd493d4f8b1c0e346bc9b869f";
+    "1ea509a1ddeda988faff10eb18a284ed0f10373df2154429affb01bc4a593c35";
 
 /// [money] Any drift of the stored Claude head or page layout fails here.
 #[test]

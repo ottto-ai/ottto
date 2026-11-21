@@ -67,6 +67,9 @@ fn map_graph_at(
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
     cx.presence = original.claude_presence();
+    // Store-local control belongs to the real import transaction. Read-back
+    // replays only the deterministic graph mapping.
+    kinds::initialize_job_template_since(&mut tx)?;
     kinds::populate(index, &mut tx, &mut cx)?;
     anyhow::ensure!(
         tx.commit(index.generation, generation) == DurableCommitOutcome::Committed(generation),

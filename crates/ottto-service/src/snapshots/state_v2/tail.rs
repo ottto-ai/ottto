@@ -784,7 +784,9 @@ pub(super) fn encode_head(
 ) -> Result<Vec<u8>> {
     check_shape(common.representation, reduction.is_some())?;
     let body = reduction.unwrap_or_default();
-    let mut out = Vec::with_capacity(31 + table.len() * 54 + body.len());
+    let mut out = Vec::with_capacity(
+        31 + table.len() * 54 + body.len() + usize::from(common.job.is_some()) * JOB_BYTES,
+    );
     out.extend_from_slice(&revision.to_be_bytes());
     out.push(table.len() as u8);
     for (collection, entry) in table {
@@ -1313,6 +1315,14 @@ fn write_file(
         revision = staged.revision;
         reduction = Some(staged.head.clone());
         common.representation = Representation::Tail;
+        if reset
+            && job.is_none()
+            && common.job.as_ref().is_some_and(|saved| {
+                !super::super::tail_source::job_matches_checkpoint(saved, &staged.head)
+            })
+        {
+            common.job = None;
+        }
     }
     if let Some(observation) = debt {
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;

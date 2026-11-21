@@ -53,7 +53,9 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
 }
 
 mod job_template;
-pub(in crate::snapshots) use job_template::{job_for_carry, job_update, seed_full_job_template};
+pub(in crate::snapshots) use job_template::{
+    job_for_carry, job_matches_checkpoint, job_update, seed_full_job_template,
+};
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.

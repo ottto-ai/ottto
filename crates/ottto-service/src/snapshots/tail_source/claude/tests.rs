@@ -130,7 +130,7 @@ fn every_claude_field_home_round_trips_through_head_and_pages() {
             Collection::SessionFacts,
         ]
         .map(pages),
-        [2, 2, 1, 5, 2, 5]
+        [2, 2, 1, 5, 2, 4]
     );
     let contents: [&[u8]; 4] = [
         b"please review",

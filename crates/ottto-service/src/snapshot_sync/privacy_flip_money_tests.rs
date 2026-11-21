@@ -8,7 +8,8 @@ use super::*;
 use crate::session_attribution::{normalize_template_material, opaque_hmac_id};
 use crate::snapshots::privacy_flip_modes::{all as policy_all, link, Mode, FLIPS};
 use crate::snapshots::sampled_scan::transition_fixture::{
-    money_oracle::assert_equivalent, RouteResult,
+    money_oracle::{assert_equivalent, assert_placement_equivalent, entity_differences},
+    RouteResult,
 };
 
 /// A resumed session: its copied prefix is what the copy capability marks.
@@ -404,29 +405,41 @@ fn flipped_policy_tail_places_money_like_a_full() {
                     .collect::<BTreeSet<_>>();
                 assert!(accounts.len() >= 2, "positive control: two accounts placed");
                 let mut tampered = routed(&tail, after.policy);
-                let (cold, tail) = (routed(&cold, after.policy), routed(&tail, after.policy));
-                assert_wire(&cold, after, JOB_PROMPT, &format!("{label}/cold"));
+                let mut cold_post = routed(&cold, after.policy);
+                let tail = routed(&tail, after.policy);
+                assert_wire(&cold_post, after, JOB_PROMPT, &format!("{label}/cold"));
                 assert_wire(&tail, after, JOB_PROMPT, &format!("{label}/tail"));
-                assert_job_wire(
-                    &cold,
-                    after,
-                    after.policy.session_attribution_enabled,
-                    &label,
-                );
-                assert_job_wire(
-                    &tail,
-                    after,
-                    before.policy.session_attribution_enabled
-                        && after.policy.session_attribution_enabled
-                        && before.key == after.key,
-                    &label,
-                );
-                assert_equivalent(&cold, &tail);
+                let cold_has_job = after.policy.session_attribution_enabled;
+                let tail_has_job = cold_has_job
+                    && before.policy.session_attribution_enabled
+                    && before.key == after.key;
+                assert_job_wire(&cold_post, after, cold_has_job, &label);
+                assert_job_wire(&tail, after, tail_has_job, &label);
+                if cold_has_job && !tail_has_job {
+                    // Check the posted usage and placement before aligning the
+                    // single, already-asserted job difference for body equality.
+                    assert_placement_equivalent(&cold_post, &tail);
+                    let mut differences = Vec::new();
+                    entity_differences(&cold_post, &tail, &mut differences);
+                    assert!(differences.is_empty(), "{label}: {differences:?}");
+                    let root = cold
+                        .scan
+                        .snapshots
+                        .iter_mut()
+                        .find(|item| item.source_session_id == ROOT)
+                        .unwrap();
+                    root.attribution_facts
+                        .retain(|fact| fact.field != "job_template_id");
+                    root.snapshot_fingerprint =
+                        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, root);
+                    cold_post = routed(&cold, after.policy);
+                }
+                assert_equivalent(&cold_post, &tail);
                 let body = tampered.snapshots.values_mut().next().unwrap();
                 body["input_tokens"] = json!(u32::MAX);
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        assert_equivalent(&cold, &tampered)
+                        assert_equivalent(&cold_post, &tampered)
                     }))
                     .is_err(),
                     "positive control: the oracle sees a token difference"

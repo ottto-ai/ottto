@@ -242,11 +242,11 @@ impl ScanIndex {
                         && tail_source::certified_certificate(&head.body).is_ok(),
                     "codex_carry_certificate"
                 );
-                proven.push((from, old_root, owner, head));
+                proven.push((from, old_root, owner, head, compression));
             }
         }
         ensure!(proven.len() <= 1, "codex_carry_ambiguous");
-        let [(from, old_root, owner, head)] = proven.as_slice() else {
+        let [(from, old_root, owner, head, compression)] = proven.as_slice() else {
             return Ok(false);
         };
         let old_path = Path::new(from);
@@ -307,11 +307,7 @@ impl ScanIndex {
                 scan_root: candidate.scan_root.clone(),
                 head: rebound,
                 inventory,
-                job: tail_source::job_for_carry(
-                    head,
-                    stamp.parts().1,
-                    crate::transcript_acquisition::birth_unix_nanos(&metadata),
-                ),
+                job: tail_source::job_for_carry(head, &metadata, *compression),
             },
         )?;
         if let Some((cache, namespace)) = sampling {
