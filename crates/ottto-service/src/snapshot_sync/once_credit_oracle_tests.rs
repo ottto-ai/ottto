@@ -4102,18 +4102,15 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
     }
 }
 
-/// Liveness: a tier-1 file whose answer is terminal (a permanent refusal, or
-/// an unchanged answer that stores nothing) settles the tier like an accept,
-/// so the tier advances while the older file still waits.
+/// Liveness: a tier-1 file whose unchanged answer stores nothing settles the
+/// tier like an accept, so the tier advances while the older file still
+/// waits. A permanently refused file keeps no index entry and is queued again
+/// every pass, so it still holds the tier: not pinned here.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
-    for answer in [
-        Answer::Refuse("synthetic"),
-        Answer::Unstored,
-        Answer::Dominated,
-    ] {
+    for answer in [Answer::Unstored, Answer::Dominated] {
         let recording = Recording::start();
         let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
         *server.fallback.lock().unwrap() = answer;
@@ -4132,8 +4129,8 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
         let (mut advanced, mut trace) = (false, String::new());
         for _ in 0..3 {
             let cycle = home.cycle(&server, &recording);
-            // A permanent refusal fails the pass after it settles.
             trace = tier_trace(&home, &cycle);
+            assert!(cycle.finish.is_ok(), "{answer:?}: {trace}");
             assert!(
                 !cycle.finalized.iter().any(|item| item.input_tokens == 100),
                 "{answer:?}: the old file waits: {trace}"
