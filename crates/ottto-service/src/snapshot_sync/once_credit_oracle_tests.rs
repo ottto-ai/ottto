@@ -3689,7 +3689,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
     }
 }
 
-mod money_equivalence_tests {
+pub(in crate::snapshot_sync) mod money_equivalence_tests {
     use super::*;
     use crate::snapshot_sync::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::{
         receipt_with_output, ReceiptBody,
@@ -3827,7 +3827,7 @@ mod money_equivalence_tests {
         rows
     }
 
-    pub(super) fn emit_money(
+    pub(in crate::snapshot_sync) fn emit_money(
         name: &str,
         bodies: Vec<ReceiptBody>,
         inputs: BTreeMap<String, Vec<u8>>,
