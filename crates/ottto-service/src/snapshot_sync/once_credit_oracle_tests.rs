@@ -782,15 +782,12 @@ impl OracleHome {
                         preparation,
                         index,
                         scan,
-                        &self.client,
                         &self.device,
                         "device-secret",
-                        self.source,
                         "otm_test",
                         &self.fixture.home,
                         &self.support,
                         &self.daemon,
-                        &mut self.transport,
                     )
                 })
             })

@@ -1186,20 +1186,17 @@ struct PassEnd<'a> {
     terminal_scan_started_at: &'a str,
 }
 
-#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
     mut scan_result: SourceScanResult,
-    _client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
-    _source: SnapshotSource,
     machine_id: &str,
-    _home: &Path,
+    home: &Path,
     support_dir: &Path,
     daemon: &LocalDaemon,
-    _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
@@ -1285,7 +1282,7 @@ pub(super) fn finish_sync_source(
         ensure_snapshot_scan_authority(device, source, client, &account_witness, daemon)?;
         ensure_snapshot_destination_current(&upload_destination_namespace)?;
         if let Some(roots) = &claude_scan_roots {
-            crate::snapshot_roots::validate_claude_roots(_home, roots)?;
+            crate::snapshot_roots::validate_claude_roots(home, roots)?;
         }
         Ok(())
     };
