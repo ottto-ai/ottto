@@ -1,6 +1,8 @@
 use super::*;
 
 #[cfg(unix)]
+mod claude_collection_oracle_tests;
+#[cfg(unix)]
 mod claude_selection_oracle_tests;
 
 /// The account resolution `collect_claude_status` performs, for tests that
