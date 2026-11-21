@@ -233,54 +233,91 @@ impl ScanIndex {
             let Some(head) = head else {
                 continue;
             };
-            // The two approved proofs: exact provider compression, or the same
-            // object and content. Unrelated stale paths are not proof candidates.
-            if compression || physical_matches(&head, &metadata) {
-                ensure!(
-                    !self.decode_holds_file(&from)
-                        && !head.metadata_only
-                        && tail_source::certified_certificate(&head.body).is_ok(),
-                    "codex_carry_certificate"
-                );
-                proven.push((from, old_root, owner, head));
-            }
+            let job = tail_source::job_for_carry(&head, &metadata, compression);
+            // A settled metadata-only head can prove job custody by file
+            // identity. Outstanding revisions keep the existing owner hold.
+            let contents = match job {
+                Some(job)
+                    if head.metadata_only
+                        && !compression
+                        && !head.table.contains_key(&state_v2::Collection::Revisions) =>
+                {
+                    state_v2::CarryContents::Job(job)
+                }
+                job if !head.metadata_only
+                    && (compression || physical_matches(&head, &metadata)) =>
+                {
+                    ensure!(
+                        tail_source::certified_certificate(&head.body).is_ok(),
+                        "codex_carry_certificate"
+                    );
+                    let rebound = tail_source::carry_codex_head(
+                        index_path,
+                        &old_root,
+                        old_path,
+                        &candidate.scan_root,
+                        &candidate.path,
+                        &head.body,
+                    )?;
+                    state_v2::CarryContents::File {
+                        head: rebound,
+                        inventory: state_v2::InventoryFacts {
+                            owner,
+                            created_unix_ms: head
+                                .common
+                                .inventory
+                                .as_ref()
+                                .and_then(|facts| facts.created_unix_ms),
+                            read_bytes: head
+                                .common
+                                .inventory
+                                .as_ref()
+                                .map_or(0, |facts| facts.read_bytes),
+                            stamp,
+                        },
+                        job,
+                    }
+                }
+                _ if compression || physical_matches(&head, &metadata) => {
+                    // A partial census can revisit the predecessor before its
+                    // ordinary retirement, after the job alone moved.
+                    if !compression
+                        && !self.decode_holds_file(&from)
+                        && absent(old_path)
+                        && state_v2::load_head(self, &to, revision)?
+                            .as_ref()
+                            .is_some_and(|head| {
+                                tail_source::job_for_carry(head, &metadata, false).is_some()
+                            })
+                    {
+                        if let Some(walk) = self.traversal.as_mut() {
+                            walk.observed_index_keys.remove(&from);
+                        }
+                        continue;
+                    }
+                    anyhow::bail!("codex_carry_certificate");
+                }
+                _ => continue,
+            };
+            ensure!(!self.decode_holds_file(&from), "codex_carry_certificate");
+            proven.push((from, contents));
         }
         ensure!(proven.len() <= 1, "codex_carry_ambiguous");
-        let [(from, old_root, owner, head)] = proven.as_slice() else {
+        let Some((from, contents)) = proven.pop() else {
             return Ok(false);
         };
-        let old_path = Path::new(from);
-        let rebound = tail_source::carry_codex_head(
-            index_path,
-            old_root,
-            old_path,
-            &candidate.scan_root,
-            &candidate.path,
-            &head.body,
-        )?;
-        let inventory = state_v2::InventoryFacts {
-            owner: owner.clone(),
-            created_unix_ms: head
-                .common
-                .inventory
-                .as_ref()
-                .and_then(|facts| facts.created_unix_ms),
-            read_bytes: head
-                .common
-                .inventory
-                .as_ref()
-                .map_or(0, |facts| facts.read_bytes),
-            stamp,
-        };
+        let old_path = Path::new(&from);
+        let job_only = matches!(contents, state_v2::CarryContents::Job(_));
         // Bracket the metadata-only proof, including predecessor absence.
         let reopened = open_candidate_beneath_root(candidate)?;
         ensure!(
             OpenStamp::capture(&reopened)?.content_stamp() == stamp
                 && (absent(old_path)
-                    || codex_file_join::shadowed_compressed_path(
-                        old_path,
-                        &BTreeSet::from([to.clone()])
-                    )),
+                    || !job_only
+                        && codex_file_join::shadowed_compressed_path(
+                            old_path,
+                            &BTreeSet::from([to.clone()])
+                        )),
             "codex_carry_changed"
         );
         ensure!(
@@ -295,7 +332,7 @@ impl ScanIndex {
             // A live job must finish or fail its ordinary path revalidation
             // before this pass can rehome its committed checkpoint.
             ensure!(
-                !cache.cursor_job_owns(from) && !cache.cursor_job_owns(&to),
+                !cache.cursor_job_owns(&from) && !cache.cursor_job_owns(&to),
                 "codex_carry_active_job"
             );
         }
@@ -305,10 +342,14 @@ impl ScanIndex {
             state_v2::PathCarry {
                 from: from.clone(),
                 scan_root: candidate.scan_root.clone(),
-                head: rebound,
-                inventory,
+                contents,
             },
         )?;
+        if job_only {
+            if let Some(walk) = self.traversal.as_mut() {
+                walk.observed_index_keys.remove(&from);
+            }
+        }
         if let Some((cache, namespace)) = sampling {
             for key in [from.as_str(), to.as_str()] {
                 cache.refresh_header(key.to_owned(), None);

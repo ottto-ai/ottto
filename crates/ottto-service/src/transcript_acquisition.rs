@@ -1541,6 +1541,11 @@ pub(crate) fn birth_clamped(certified: u64, birth: u64, metadata: &Metadata) -> 
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|since| u64::try_from(since.as_nanos()).ok());
+    birth_clamped_at(certified, birth, modified)
+}
+
+#[cfg(unix)]
+pub(crate) fn birth_clamped_at(certified: u64, birth: u64, modified: Option<u64>) -> bool {
     birth < certified && modified == Some(birth)
 }
 

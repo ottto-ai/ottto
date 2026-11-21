@@ -225,11 +225,15 @@ fn pi_usage_occurrence_digest(
 }
 
 pub(in crate::snapshots) fn pi_message_text(value: &Value) -> Option<String> {
+    pi_user_text(value, true)
+}
+
+pub(in crate::snapshots) fn pi_user_text(value: &Value, truncate: bool) -> Option<String> {
     string_at(value, &["content"])
         .or_else(|| string_at(value, &["text"]))
         .or_else(|| string_at(value, &["message", "content"]))
-        .or_else(|| text_from_array(value.get("content")))
-        .or_else(|| text_from_array(value.pointer("/message/content")))
+        .or_else(|| text_from_array(value.get("content"), truncate))
+        .or_else(|| text_from_array(value.pointer("/message/content"), truncate))
 }
 
 fn pi_timestamp_field(value: &Value) -> Option<String> {
@@ -390,21 +394,23 @@ impl PiFork {
     /// parent's copied spend: skip it, counted. An entry without a valid
     /// time counts normally. The envelope time comes first, as Pi copies it.
     fn copied_usage(&self, value: &Value) -> Option<UsageTotals> {
-        let header = self.header_nanos?;
-        // A present invalid envelope is not evidence for skipping. Only an
-        // absent envelope falls back to the provider clock.
-        let at = pi_timestamp_value(
+        self.copied_entry(value)
+            .then(|| pi_message_usage(value))
+            .flatten()
+    }
+
+    fn copied_entry(&self, value: &Value) -> bool {
+        let Some(header) = self.header_nanos else {
+            return false;
+        };
+        pi_timestamp_value(
             value
                 .get("timestamp")
                 .or_else(|| value.pointer("/message/timestamp")),
         )
         .as_deref()
-        .and_then(pi_timestamp_nanos)?;
-        if at < header {
-            pi_message_usage(value)
-        } else {
-            None
-        }
+        .and_then(pi_timestamp_nanos)
+        .is_some_and(|at| at < header)
     }
 }
 
@@ -454,6 +460,12 @@ impl PiLedger {
                 .as_deref()
                 .and_then(pi_timestamp_nanos),
         }));
+    }
+
+    pub(in crate::snapshots) fn copied_entry(&self, value: &Value) -> bool {
+        self.fork
+            .as_deref()
+            .is_some_and(|fork| fork.copied_entry(value))
     }
 
     pub(in crate::snapshots) fn is_fork_copy(&self, value: &Value) -> bool {
@@ -551,7 +563,7 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
     (flat.saturating_sub(cache_1h), cache_1h)
 }
 
-fn text_from_array(value: Option<&Value>) -> Option<String> {
+fn text_from_array(value: Option<&Value>, truncate: bool) -> Option<String> {
     let Value::Array(items) = value? else {
         return None;
     };
@@ -571,7 +583,12 @@ fn text_from_array(value: Option<&Value>) -> Option<String> {
             _ => {}
         }
     }
-    normalize_title(parts.join("\n"))
+    let text = parts.join("\n");
+    if truncate {
+        normalize_title(text)
+    } else {
+        Some(text)
+    }
 }
 
 #[derive(Clone, Default)]

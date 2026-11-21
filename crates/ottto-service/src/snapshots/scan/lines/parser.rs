@@ -664,6 +664,7 @@ impl OwnedJsonlParser {
             }
             accumulator.repository_binding.clone().or(live)
         });
+        accumulator.finish_job_template(attribution_context);
         // PRE-finalization seam: the accumulator before any finalization
         // reads it; no early exit lies between.
         if let Some(pre) = pre {

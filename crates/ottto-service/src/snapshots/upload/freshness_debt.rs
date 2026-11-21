@@ -130,6 +130,18 @@ fn summary(owed: &[Revision], disposition: Option<NoUploadRequired>) -> DebtSumm
     }
 }
 
+/// Recover only debt proved by readable revision rows after losing the head.
+pub(in crate::snapshots) fn summarize_stored_revisions(
+    values: impl Iterator<Item = anyhow::Result<Vec<u8>>>,
+) -> anyhow::Result<DebtSummary> {
+    let owed: Vec<_> = values
+        .map(|bytes| {
+            Revision::decode(&bytes?).ok_or_else(|| anyhow::anyhow!("state_v2_tail_revision"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(summary(&owed, None))
+}
+
 /// What the index and this listing prove about one file now.
 #[derive(Clone, Copy, Debug)]
 struct Live {

@@ -77,9 +77,9 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail,
-    observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
-    tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_job_head, load_revisions, load_tail,
+    observe_tail, observe_tails, retire_tail, set_aside_tail, stage_job, stage_tail,
+    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
@@ -89,8 +89,9 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
     reason = "the acquisition cutover consumes these staged types"
 )]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, InventoryFacts, NoUploadRequired,
-    Observation, PathCarry, Representation, SetAside, SetAsideCause, Shape, StagedFile, TailHead,
+    CarryContents, Change, Collection, CollectionMeta, Common, DebtSummary, FileJob,
+    InventoryFacts, JobUpdate, NoUploadRequired, Observation, PathCarry, Representation, SetAside,
+    SetAsideCause, Shape, StagedFile, TailHead, UnreadableHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
@@ -565,6 +566,7 @@ fn control_name(name: &str) -> bool {
         "identity"
             | "schema_version"
             | "catalogue_layout"
+            | "job_template_since"
             | "generation"
             | "phase"
             | "erasure_success"
@@ -636,6 +638,34 @@ pub(super) use runtime::{claim_growth_locked, confirmed_growth_stamp};
 
 pub(super) fn growth_claim_refused(reason: &'static str) {
     telemetry::event("growth_claim_refused", &reason);
+}
+
+/// The synthetic money oracle reads identical files through separate stores.
+/// Give each fixture store a cutoff predating those inputs.
+#[cfg(test)]
+pub(crate) fn seed_job_fixture_cutoff(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| {
+        db.control("job_template_since", &1_u64).unwrap();
+    });
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &mapper::key("tail.head", key, 0).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &[0],
+        })
+        .unwrap();
+        let next = index.generation + 1;
+        assert_eq!(
+            tx.commit(index.generation, next),
+            DurableCommitOutcome::Committed(next)
+        );
+    });
 }
 
 /// A historical store fixture: ordinary layout-2 archive manifest and members,

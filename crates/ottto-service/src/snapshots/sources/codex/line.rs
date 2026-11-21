@@ -751,26 +751,36 @@ pub(in crate::snapshots) fn codex_transcript_title(value: &Value) -> Option<Stri
 }
 
 pub(in crate::snapshots) fn codex_first_user_prompt(value: &Value) -> Option<String> {
+    codex_user_text(value, true)
+}
+
+pub(in crate::snapshots) fn codex_user_text(value: &Value, truncate: bool) -> Option<String> {
     if string_eq_at(value, &["payload", "type"], "user_message") {
         return string_at(value, &["payload", "message"])
             .or_else(|| string_at(value, &["payload", "text"]))
-            .or_else(|| prompt_text_from_array(value.pointer("/payload/text_elements")));
+            .or_else(|| prompt_text_from_array(value.pointer("/payload/text_elements"), truncate));
     }
     if string_eq_at(value, &["type"], "user_message") {
         return string_at(value, &["message"])
             .or_else(|| string_at(value, &["text"]))
-            .or_else(|| prompt_text_from_array(value.get("text_elements")));
+            .or_else(|| prompt_text_from_array(value.get("text_elements"), truncate));
     }
     if string_eq_at(value, &["payload", "type"], "message")
         && string_eq_at(value, &["payload", "role"], "user")
     {
-        return prompt_text_from_array(value.pointer("/payload/content"));
+        return prompt_text_from_array(value.pointer("/payload/content"), truncate);
     }
     None
 }
 
-fn prompt_text_from_array(value: Option<&Value>) -> Option<String> {
-    let Value::Array(items) = value? else {
+fn prompt_text_from_array(value: Option<&Value>, truncate: bool) -> Option<String> {
+    let value = value?;
+    if let Value::String(text) = value {
+        if !truncate {
+            return Some(text.clone());
+        }
+    }
+    let Value::Array(items) = value else {
         return None;
     };
     let parts = items.iter().filter_map(|item| {
@@ -782,8 +792,17 @@ fn prompt_text_from_array(value: Option<&Value>) -> Option<String> {
                 .or_else(|| item.get("input_text").and_then(Value::as_str)),
             _ => None,
         }?;
-        let text = crate::session_attribution::prompt_without_injected_scaffolding(text);
+        let text = if truncate {
+            crate::session_attribution::prompt_without_injected_scaffolding(text)
+        } else {
+            text
+        };
         (!text.is_empty()).then_some(text)
     });
-    normalize_title(parts.collect::<Vec<_>>().join("\n"))
+    let text = parts.collect::<Vec<_>>().join("\n");
+    if truncate {
+        normalize_title(text)
+    } else {
+        Some(text)
+    }
 }

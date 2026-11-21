@@ -11,9 +11,8 @@ use crate::snapshots::sources::codex::identity::{
 };
 use crate::snapshots::sources::pi::pi_message_text;
 use crate::snapshots::{
-    claude_first_user_prompt, codex_creator_header_evidence, codex_first_user_prompt,
-    codex_session_meta_payload, codex_transcript_title, CodexOwnershipBoundary,
-    SnapshotAccumulator,
+    codex_creator_header_evidence, codex_first_user_prompt, codex_session_meta_payload,
+    codex_transcript_title, CodexOwnershipBoundary, SnapshotAccumulator,
 };
 
 fn claude_title_content(value: &Value, accumulator: &mut SnapshotAccumulator) {
@@ -34,7 +33,11 @@ pub(in crate::snapshots) fn claude_prompt_content(
     accumulator: &mut SnapshotAccumulator,
 ) {
     claude_title_content(value, accumulator);
-    let real_prompt = claude_first_user_prompt(value);
+    let raw = crate::snapshots::sources::claude::line::claude_user_text(value);
+    if let Some(raw) = &raw {
+        accumulator.observe_job(raw);
+    }
+    let real_prompt = raw.and_then(crate::snapshots::normalize_title);
     if real_prompt.is_some() {
         accumulator.session_start.note_user_turn();
     }
@@ -69,6 +72,11 @@ pub(in crate::snapshots) fn codex_prompt_content(
     accumulator: &mut SnapshotAccumulator,
 ) {
     accumulator.set_title(codex_transcript_title(value), "transcript_title");
+    if accumulator.job_pending() {
+        if let Some(raw) = crate::snapshots::sources::codex::line::codex_user_text(value, false) {
+            accumulator.observe_job(&raw);
+        }
+    }
     accumulator.set_first_prompt_title(codex_first_user_prompt(value));
 }
 pub(in crate::snapshots) fn codex_workspace_content(
@@ -91,6 +99,11 @@ pub(in crate::snapshots) fn pi_prompt_content(
     accumulator: &mut SnapshotAccumulator,
 ) {
     if role == Some("user") {
+        if accumulator.job_pending() && !accumulator.seen_pi_usage_keys.copied_entry(value) {
+            if let Some(raw) = crate::snapshots::sources::pi::pi_user_text(value, false) {
+                accumulator.observe_job(&raw);
+            }
+        }
         accumulator.set_first_prompt_title(pi_message_text(value));
     }
 }
