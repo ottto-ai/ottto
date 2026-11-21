@@ -1004,7 +1004,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
 
     @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", ())
     def test_empty_head_only_set_is_todays_gate(self):
-        self.assertEqual(len(NATIVE_FIXTURES), 11)
+        self.assertEqual(len(NATIVE_FIXTURES), 13)
         names = sorted(NATIVE_FIXTURES)
         self.assertEqual(self.coverage_and_receipts(names, names),
                          ([f"{name}.json" for name in names], []))
@@ -1015,7 +1015,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
             receipt_names(*self.receipts(names, names + [NEW_FIXTURE]), NATIVE_FIXTURES)
         self.assertEqual(
             verified_summary(names, [], "b", "h", 1.0),
-            "Money equivalence VERIFIED: 11 + 2 disk-restore fixtures, base `b`, head `h`. "
+            "Money equivalence VERIFIED: 13 + 2 disk-restore fixtures, base `b`, head `h`. "
             "1.0s. Family vector/Pi remain ignored.\n")
 
     def test_alias_receipt_on_both_arms_is_red(self):
@@ -1031,7 +1031,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
         compared, uncompared = self.coverage_and_receipts(names, names + [NEW_FIXTURE])
         self.assertEqual(compared, [f"{name}.json" for name in names])
         self.assertEqual(uncompared, [f"{NEW_FIXTURE}.json"])
-        self.assertIn(f"11 compared | 1 new fixtures uncompared (absent on base): {NEW_FIXTURE}.json.",
+        self.assertIn(f"13 compared | 1 new fixtures uncompared (absent on base): {NEW_FIXTURE}.json.",
                       verified_summary(compared, uncompared, "b", "h", 1.0))
         _, right = self.receipts(names, names + [NEW_FIXTURE])
         with contextlib.redirect_stdout(io.StringIO()) as log:
@@ -1172,7 +1172,6 @@ class StatusFixtureCatalogTests(unittest.TestCase):
         self.assertEqual(tuple(n for n in registered if n.startswith("claude_status_")),
                          STATUS_FIXTURE_NAMES)
         self.assertEqual(tuple(n for n in registered if not n.startswith("claude_status_")), (
-            "once_credit_claude", "once_credit_native",
             "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
             "resumed_prefix_sidecar_receipt", "root_twin_scoped_family"))
         self.assertEqual(len(require_disjoint_head_only()), len(registered))
