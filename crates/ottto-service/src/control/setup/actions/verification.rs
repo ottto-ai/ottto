@@ -116,12 +116,7 @@ pub(in crate::control) fn run_verify_source_action(
 ) -> Result<SetupVerifyActionOutcome, LocalApiError> {
     if source == SourceKind::Codex {
         reconcile_codex_source_off()?;
-        let result = verify_source(
-            daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            source,
-            false,
-        )?;
+        let result = verify_source(daemon, &RequestAuthorization::DaemonInternal, source, false)?;
         let ready = result.message.code == "codex_local_import" && result.config.drift.is_empty();
         return Ok((
             if ready { "succeeded" } else { "failed" }.to_string(),
@@ -690,7 +685,7 @@ pub(crate) fn reverify_failed_source(
     daemon: &LocalDaemon,
     source: SourceKind,
 ) -> Result<SourceVerificationResult, LocalApiError> {
-    let authorization = RequestAuthorization::TrustedCompanionApp;
+    let authorization = RequestAuthorization::DaemonInternal;
     let result =
         crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Schedule, || {
             verify_source(daemon, &authorization, source, false)

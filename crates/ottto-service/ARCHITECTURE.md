@@ -719,6 +719,16 @@ complete UTC day at that `collected_at`. `provider_daily_reference::tests::accou
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
 
+## Local control dispatch
+
+Control dispatch validates the protocol version, then checks the command's
+caller policy. Local commands check caller authority before daemon-state poison
+and release the state lock before dispatch. Session launch consume and report
+also require a CLI token. Cached agent status checks caller authority alone.
+Public updates and backend-token commands use their own handler paths. Identity
+commands keep their handler-side authorization and invalidate pending launch
+handoffs before mutation.
+
 ## Local health diagnostics
 
 Verification authorizes before source reads or result writes; setup authorizes
@@ -729,9 +739,10 @@ Telemetry status and disable also require the validated device to match the
 local health device binding and the request key id to equal the validated key id
 (including both absent), before any local reads or effects for the action.
 Codex daily-reference controls build their complete returned status from local
-stores before releasing that lock. Browser control requires an allowed Origin
-and loopback Host with the listener's port. Probes return their existing identity
-and detailed health replies with that same Origin/Host boundary, without a token.
+stores before releasing that lock. Browser control requires an HTTPS Origin
+of ottto.net, www.ottto.net or app.ottto.net and a loopback Host with the
+listener's port. Probes return their existing identity and detailed health
+replies with that same Origin/Host boundary, without a token.
 Other probe callers receive only liveness/version. Duplicate Host, Origin and Authorization
 headers are refused.
 

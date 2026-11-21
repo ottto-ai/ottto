@@ -61,7 +61,9 @@ pub(super) fn status_for(
 ) -> Result<ottto_protocol::DaemonStatus, LocalApiError> {
     match authorization {
         RequestAuthorization::Token(token) => daemon.status(token),
-        RequestAuthorization::TrustedCompanionApp => daemon.status_for_trusted_client(),
+        RequestAuthorization::TrustedCompanionApp | RequestAuthorization::DaemonInternal => {
+            daemon.status_for_trusted_client()
+        }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
 }
@@ -328,7 +330,7 @@ pub(super) fn refresh_agent_status_for(
         RequestAuthorization::Token(token) => {
             daemon.refresh_agent_status(token, source, captured_at, expires_at)
         }
-        RequestAuthorization::TrustedCompanionApp => {
+        RequestAuthorization::TrustedCompanionApp | RequestAuthorization::DaemonInternal => {
             daemon.refresh_agent_status_for_trusted_client(source, captured_at, expires_at)
         }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),

@@ -194,6 +194,7 @@ mod backend_http;
 mod diagnostics;
 mod managed_config;
 mod peer;
+mod policy;
 mod protocol;
 mod setup;
 mod status;
@@ -252,6 +253,8 @@ use auth::provider_daily_reference_control;
 #[cfg(test)]
 use auth::provider_daily_reference_control_with_stores;
 use auth::require_authorized_local_client;
+use auth::require_cli_token;
+use auth::require_local_caller;
 use auth::require_local_control_account;
 use auth::require_non_empty_field;
 use auth::validate_control_token_fresh;
@@ -953,17 +956,25 @@ pub fn handle_request_with_peer(
         };
     }
     let authorization = request_authorization(&request, peer.as_ref());
-    let client_install_owner = request
-        .client_install_owner
-        .unwrap_or(InstallOwner::Unknown);
     let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
-    match handle_command(
-        daemon,
-        authorization,
-        request.command,
-        client_install_owner,
+    let admitted = policy::admit(
+        &policy::policy(&request.command),
         cli_session_exec,
-    ) {
+        &authorization,
+        daemon,
+    );
+    match admitted.and_then(|()| {
+        let client_install_owner = request
+            .client_install_owner
+            .unwrap_or(InstallOwner::Unknown);
+        handle_command(
+            daemon,
+            authorization,
+            request.command,
+            client_install_owner,
+            cli_session_exec,
+        )
+    }) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -1036,21 +1047,19 @@ fn handle_command(
     client_install_owner: InstallOwner,
     cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
+    #[cfg(test)]
+    crate::test_effects::record(
+        "control_dispatch_entered",
+        vec![(
+            "trusted_companion",
+            crate::test_effects::Scalar::Bool(
+                authorization == RequestAuthorization::TrustedCompanionApp,
+            ),
+        )],
+    );
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
-    if matches!(
-        &command,
-        LocalControlCommand::AuthComplete { .. }
-            | LocalControlCommand::AuthCompletePending { .. }
-            | LocalControlCommand::AuthSwitchAccount { .. }
-            | LocalControlCommand::AuthReset { .. }
-            | LocalControlCommand::ClaudeAccountRemove { .. }
-            | LocalControlCommand::ClaudeAccountReconnect { .. }
-            | LocalControlCommand::ClaudeAccountReconnectTarget { .. }
-            | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. }
-            | LocalControlCommand::CodexAccountRemove { .. }
-            | LocalControlCommand::CodexAccountReconnect { .. }
-    ) {
+    if policy::policy(&command).changes_identity {
         require_authorized_local_client(daemon, &authorization)?;
         daemon
             .session_launch
@@ -1090,11 +1099,7 @@ fn handle_command(
             secret,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            // Only the token-authenticated CLI owns the exec plan. The trusted
-            // Companion can prepare/poll/cancel, but never consume a handoff.
-            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
-                return Err(LocalApiError::Unauthorized);
-            }
+            require_cli_token(cli_session_exec, &authorization)?;
             require_session_launch_schema(schema_version)?;
             to_value(
                 daemon
@@ -1111,9 +1116,7 @@ fn handle_command(
             reason,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
-                return Err(LocalApiError::Unauthorized);
-            }
+            require_cli_token(cli_session_exec, &authorization)?;
             require_session_launch_schema(schema_version)?;
             to_value(daemon.session_launch.lock().or_state_poisoned()?.report(
                 &launch_id,
@@ -1273,13 +1276,7 @@ fn handle_command(
         LocalControlCommand::AgentStatusCached { source } => {
             // Unlike the usual authorization helper, this skips the daemon-state
             // poison check: the cached read uses no daemon state.
-            match &authorization {
-                RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
-                RequestAuthorization::TrustedCompanionApp => {}
-                RequestAuthorization::Untrusted => {
-                    return Err(LocalApiError::LocalClientNotTrusted)
-                }
-            }
+            require_local_caller(daemon, &authorization)?;
             to_value(crate::agent_status_refresh::cached(source.as_ref()))
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
@@ -1600,7 +1597,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::RelayStop => {
@@ -1619,7 +1618,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::Verify { source, repair } => {
@@ -1735,6 +1736,11 @@ fn handle_command(
             to_value(plan_local_uninstall(&home))
         }
         LocalControlCommand::UninstallExecute { confirm } => {
+            // Only a request caller may uninstall: refuse the daemon's own
+            // caller before the shared check admits it and before any work.
+            if authorization == RequestAuthorization::DaemonInternal {
+                return Err(LocalApiError::LocalClientNotTrusted);
+            }
             require_authorized_local_client(daemon, &authorization)?;
             if !confirm {
                 return Err(LocalApiError::InvalidRequest(
@@ -1753,7 +1759,7 @@ fn handle_command(
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.stop(token)?,
                 RequestAuthorization::TrustedCompanionApp => daemon.stop_for_trusted_client()?,
-                RequestAuthorization::Untrusted => {
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
                     return Err(LocalApiError::LocalClientNotTrusted)
                 }
             }

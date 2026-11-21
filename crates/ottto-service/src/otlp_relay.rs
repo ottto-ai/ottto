@@ -1284,21 +1284,7 @@ fn is_allowed_control_origin(origin: &str) -> bool {
     matches!(
         origin,
         "https://ottto.net" | "https://www.ottto.net" | "https://app.ottto.net"
-    ) || is_loopback_origin(origin, "http", "localhost")
-        || is_loopback_origin(origin, "http", "127.0.0.1")
-        || is_loopback_origin(origin, "https", "localhost")
-        || is_loopback_origin(origin, "https", "127.0.0.1")
-}
-
-fn is_loopback_origin(origin: &str, scheme: &str, host: &str) -> bool {
-    let prefix = format!("{scheme}://{host}");
-    let Some(suffix) = origin.strip_prefix(&prefix) else {
-        return false;
-    };
-    suffix.is_empty()
-        || suffix
-            .strip_prefix(':')
-            .is_some_and(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+    )
 }
 
 fn source_from_request(request: &HttpRequest) -> Option<SnapshotSource> {
@@ -1756,13 +1742,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn control_origin_allowlist_accepts_production_and_loopback_only() {
+    fn control_origin_allowlist_accepts_production_only() {
         assert!(is_allowed_control_origin("https://ottto.net"));
+        assert!(is_allowed_control_origin("https://www.ottto.net"));
         assert!(is_allowed_control_origin("https://app.ottto.net"));
-        assert!(is_allowed_control_origin("http://localhost:3000"));
-        assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
+        assert!(!is_allowed_control_origin("http://localhost:3000"));
+        assert!(!is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
         assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn control_preflight_refuses_loopback_origins_before_cors() {
+        let daemon = test_daemon();
+        for (origin, allowed) in [
+            ("http://localhost:3000", false),
+            ("http://127.0.0.1:3001", false),
+            ("https://app.ottto.net", true),
+        ] {
+            let (mut client, mut server) = loopback_pair();
+            let port = server.local_addr().unwrap().port();
+            let request = HttpRequest {
+                method: "OPTIONS".into(),
+                path: "/control".into(),
+                headers: BTreeMap::from([
+                    ("host".into(), format!("127.0.0.1:{port}")),
+                    ("origin".into(), origin.into()),
+                ]),
+                body: vec![],
+            };
+            handle_control_request(&mut server, &daemon, request).unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            if allowed {
+                assert!(headers.starts_with("HTTP/1.1 204"), "{response}");
+                assert!(headers.contains(&format!("Access-Control-Allow-Origin: {origin}")));
+            } else {
+                assert!(headers.starts_with("HTTP/1.1 403"), "{response}");
+                assert!(
+                    !headers.to_ascii_lowercase().contains("access-control-"),
+                    "{response}"
+                );
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(payload["error"], "origin_forbidden");
+            }
+        }
     }
 
     #[test]
@@ -1792,6 +1818,12 @@ pub(crate) mod tests {
                 (Some("null"), "loopback", Some("origin_forbidden")),
                 (
                     Some("https://ottto.net.evil"),
+                    "loopback",
+                    Some("origin_forbidden"),
+                ),
+                // A loopback dev page gets liveness only from the probes.
+                (
+                    Some("http://localhost:3000"),
                     "loopback",
                     Some("origin_forbidden"),
                 ),
@@ -1944,6 +1976,142 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Past the Origin and Host gate, the browser route forwards only its two
+    /// backend-token commands, and never as a trusted Companion.
+    #[test]
+    #[serial_test::serial]
+    fn browser_control_forwards_only_backend_token_commands_untrusted() {
+        use crate::test_effects::{Effect, Recording, Scalar};
+        use ottto_protocol::{
+            CliErrorCode, LocalClientKind, LocalControlResponse, SourceKind, TelemetryControlAction,
+        };
+        let files = crate::control::tests::ControlFilesFixture::new();
+        // A loopback stub stands in for the public release manifest, so a
+        // regressed allowlist cannot reach the network; it must see no request.
+        let manifest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind manifest stub");
+        manifest.set_nonblocking(true).unwrap();
+        let _manifest_url = crate::control::tests::EnvVarGuard::set_str(
+            "OTTTO_RELEASE_MANIFEST_URL",
+            &format!("http://{}/manifest.json", manifest.local_addr().unwrap()),
+        );
+        let launch = || LocalControlCommand::SessionLaunchPrepare {
+            schema_version: 1,
+            provider: ottto_protocol::SessionLaunchProviderV1::Codex,
+            slot_id: "missing".into(),
+            expected_account_identifier_hash: "".into(),
+            expected_organization_identifier_hash: None,
+            folder: ottto_protocol::SessionLaunchFolderV1 {
+                path: None,
+                recent_id: None,
+            },
+            terminal: None,
+        };
+        let status = || LocalControlCommand::Status {
+            refresh_agent_status: true,
+            retry_relay_authorization: true,
+        };
+        let telemetry = || LocalControlCommand::TelemetryControl {
+            action: TelemetryControlAction::Status,
+            source: SourceKind::Codex,
+            control_token: String::new(),
+            api_base_url: None,
+            key_id: None,
+            organization_id: None,
+            otlp_endpoint: None,
+            ingest_key: None,
+        };
+        let mut cases = Vec::new();
+        // Even the daemon's own token cannot widen the browser route.
+        for token in ["forged-token", TOKEN] {
+            for (command, mismatched) in [
+                (status(), false),
+                (LocalControlCommand::UpdateCheck, false),
+                (LocalControlCommand::UpdateCheck, true),
+                (launch(), false),
+            ] {
+                let error = if mismatched {
+                    "bad_request"
+                } else {
+                    "unsupported_command"
+                };
+                cases.push((command, mismatched, Some(token), Err(error)));
+            }
+        }
+        // A mismatched protocol version fails request parsing, before command
+        // filtering, so even an allowed command is a bad request.
+        cases.push((telemetry(), true, None, Err("bad_request")));
+        // A Companion claim without a token reaches dispatch untrusted.
+        cases.push((
+            telemetry(),
+            false,
+            None,
+            Ok(CliErrorCode::LocalClientNotTrusted),
+        ));
+        for (command, mismatched, token, expected) in cases {
+            let context = format!("{command:?} mismatched={mismatched}");
+            let version = ottto_protocol::expected_local_control_protocol_version(&command);
+            let body = serde_json::to_vec(&LocalControlRequest {
+                request_id: "browser-allowlist".into(),
+                protocol_version: version + u16::from(mismatched),
+                token: token.map(str::to_owned),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command,
+            })
+            .unwrap();
+            let (mut client, mut server) = loopback_pair();
+            let port = server.local_addr().unwrap().port();
+            let request = HttpRequest {
+                method: "POST".into(),
+                path: "/control".into(),
+                headers: BTreeMap::from([
+                    ("origin".to_string(), "https://app.ottto.net".to_string()),
+                    ("host".to_string(), format!("127.0.0.1:{port}")),
+                ]),
+                body,
+            };
+            let recording = Recording::start();
+            files
+                .assert_unchanged(|| handle_control_request(&mut server, &test_daemon(), request))
+                .unwrap();
+            let entered = recording.take();
+            drop(recording);
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (_, payload) = response.split_once("\r\n\r\n").unwrap();
+            let expected = match expected {
+                Ok(code) => code,
+                Err(error) => {
+                    assert!(
+                        response.starts_with("HTTP/1.1 400"),
+                        "{context}: {response}"
+                    );
+                    let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert_eq!(payload["error"], error, "{context}");
+                    assert!(entered.is_empty(), "{context}");
+                    continue;
+                }
+            };
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{context}: {response}"
+            );
+            let payload: LocalControlResponse = serde_json::from_str(payload).unwrap();
+            assert_eq!(payload.error.unwrap().code, expected, "{context}");
+            let dispatched = vec![Effect {
+                label: "control_dispatch_entered",
+                fields: vec![("trusted_companion", Scalar::Bool(false))],
+            }];
+            assert_eq!(entered, dispatched, "{context}");
+        }
+        let hits = manifest.accept();
+        assert!(
+            matches!(&hits, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the release manifest stub saw a request: {hits:?}"
+        );
     }
 
     #[test]
