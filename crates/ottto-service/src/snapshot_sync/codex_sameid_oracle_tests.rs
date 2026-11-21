@@ -1,36 +1,54 @@
-fn revert_archives(c: &Corpus, second_account: &str) -> Vec<PathBuf> {
-    rollout(c, A, "a", 8);
-    let original = c
-        .root
-        .join(format!("rollout-2026-10-27T07-00-00-{A}.jsonl"));
-    let first = std::fs::read_to_string(&original).unwrap();
-    rollout(c, A, second_account, 88);
-    let mut second = std::fs::read_to_string(&original)
-        .unwrap()
+pub(in crate::snapshot_sync) fn revert_archives(
+    root: &Path,
+    day: &str,
+    second_account: &str,
+) -> Vec<PathBuf> {
+    let first = rollout_body(day, A, "a", 8);
+    let mut second = rollout_body(day, A, second_account, 88)
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
     second[0]["payload"]["history_base"] =
         json!({"thread_id": A, "end_ordinal_exclusive": 1, "end_byte_offset": 1});
-    second[0]["payload"]["timestamp"] = json!("2026-10-27T07:01:00Z");
-    second[0]["timestamp"] = json!("2026-10-27T07:01:00Z");
+    second[0]["payload"]["timestamp"] = json!(format!("{day}T07:01:00Z"));
+    second[0]["timestamp"] = json!(format!("{day}T07:01:00Z"));
     for row in &mut second[1..] {
-        row["timestamp"] = json!("2026-10-27T07:31:00Z");
+        row["timestamp"] = json!(format!("{day}T07:31:00Z"));
     }
     let second = second
         .iter()
         .map(|row| row.to_string() + "\n")
         .collect::<String>();
-    std::fs::remove_file(&original).unwrap();
     let paths = vec![
-        original.with_extension("jsonl.zst"),
-        c.root
-            .join(format!("rollout-2026-10-27T07-01-00-{A}_{B}.jsonl.zst")),
+        root.join(format!("rollout-{day}T07-00-00-{A}.jsonl.zst")),
+        root.join(format!("rollout-{day}T07-01-00-{A}_{B}.jsonl.zst")),
     ];
+    std::fs::create_dir_all(root).unwrap();
     for (path, body) in paths.iter().zip([first, second]) {
         std::fs::write(path, zstd::stream::encode_all(body.as_bytes(), 1).unwrap()).unwrap();
     }
     paths
+}
+
+pub(in crate::snapshot_sync) fn assert_joined_post<'a>(
+    batches: &'a [Value],
+    fingerprint: &str,
+) -> &'a Value {
+    assert_eq!(batches.len(), 1, "exactly one POST");
+    let items = batches[0]["snapshots"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "one summed body, no singleton, not held");
+    let item = &items[0];
+    assert_eq!(item["source_session_id"], A);
+    assert_eq!(item["request_count"], 96);
+    assert_eq!(item["snapshot_fingerprint"], fingerprint);
+    item
+}
+
+pub(in crate::snapshot_sync) fn assert_joined_ack(index: &ScanIndex, fingerprint: &str) {
+    assert!(
+        index.accepted_snapshot_fingerprint_recorded(fingerprint),
+        "the accepted ACK settled"
+    );
 }
 
 /// [money] Capture every physical revision, exact-ACK the combined body, persist
@@ -43,7 +61,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
     c.support = c.base.join("support");
-    let paths = revert_archives(&c, "a");
+    let paths = revert_archives(&c.root, ROLLOUT_DAY, "a");
     let (session, previous) =
         StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
     // The prior binary independently finished and uploaded 8 and 88 requests.
@@ -301,7 +319,7 @@ fn combined_codex_account_switch_holds_without_request_evidence() {
     let _decoder = fixture::codex_decoder_test_lock();
 
     let c = Corpus::new("codex-combined-account-switch");
-    revert_archives(&c, "b");
+    revert_archives(&c.root, ROLLOUT_DAY, "b");
     let original_account =
         ottto_core::billing_identity_hash("openai", "account", "synthetic-user-a").unwrap();
     let original_workspace =
@@ -345,7 +363,7 @@ fn codex_group_capture_commits_on_its_state_store_after_first_load_rearm() {
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
     c.support = c.base.join("support");
-    let paths = revert_archives(&c, "a");
+    let paths = revert_archives(&c.root, ROLLOUT_DAY, "a");
     let (session, previous) =
         StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
     // An earlier build finished and accepted both files as singletons.
@@ -500,7 +518,7 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
     c.support = c.base.join("support");
-    let paths = revert_archives(&c, "a");
+    let paths = revert_archives(&c.root, ROLLOUT_DAY, "a");
     let (session, previous) =
         StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &c.base.join("state"));
     // An earlier build finished and accepted both files as singletons.
@@ -665,34 +683,11 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         .filter(|request| request.contains("/agent-session-snapshots/batches"))
         .map(|request| http_request_json(request.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(batches.len(), 1, "exactly one body");
-    let posted = batches[0]["snapshots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|item| {
-            (
-                item["source_session_id"].as_str().unwrap().to_string(),
-                item["request_count"].as_u64().unwrap(),
-                item["snapshot_fingerprint"].as_str().unwrap().to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        posted,
-        [(
-            A.to_string(),
-            96,
-            expected.snapshots[0].snapshot_fingerprint.clone()
-        )],
-        "one summed body, no singleton, not held"
-    );
+    let fingerprint = &expected.snapshots[0].snapshot_fingerprint;
+    assert_joined_post(&batches, fingerprint);
     let mut prior = ScanIndex::load(session.path()).unwrap();
     assert!(prior.generation > generation, "the pass committed");
-    assert!(
-        prior.accepted_snapshot_fingerprint_recorded(&expected.snapshots[0].snapshot_fingerprint),
-        "the accepted ACK settled"
-    );
+    assert_joined_ack(&prior, fingerprint);
     fixture::codex_rearm_unsettled(&mut prior);
     assert!(
         prior
@@ -754,7 +749,7 @@ fn uncertified_revert_header_with_the_original_pair_folds_one_body() {
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
     c.support = c.base.join("support");
-    let paths = revert_archives(&c, "a");
+    let paths = revert_archives(&c.root, ROLLOUT_DAY, "a");
     let (account, workspace) = original_pair();
     let mut prior = ScanIndex::default();
     let key = fixture::codex_start_binding(
@@ -962,7 +957,7 @@ fn uncertified_revert_header_without_the_original_pair_holds() {
     let (account, workspace) = original_pair();
     for (tag, second, strip) in [("different", "b", false), ("missing", "a", true)] {
         let c = Corpus::new(&format!("codex-uncertified-revert-{tag}"));
-        let paths = revert_archives(&c, second);
+        let paths = revert_archives(&c.root, ROLLOUT_DAY, second);
         edit_revert_header(&paths[1], |header| {
             header["ordinal"] = json!(1);
             if strip {
@@ -1005,7 +1000,7 @@ fn uncertified_revert_folds_untagged_when_the_saved_account_differs() {
     let _decoder = fixture::codex_decoder_test_lock();
 
     let c = Corpus::new("codex-uncertified-revert-other-binding");
-    let paths = revert_archives(&c, "a");
+    let paths = revert_archives(&c.root, ROLLOUT_DAY, "a");
     edit_revert_header(&paths[1], |header| header["ordinal"] = json!(1));
     let (account, _) = original_pair();
     let saved_account =

@@ -237,6 +237,59 @@ pub(super) fn isolated<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// Enriches `page` once and checks the evidence chunks it ran against the
+/// production packer's plan for the same slots and side-file directory. The
+/// page's families are exactly `families`, each root in `sidecars` has a
+/// positive side-file pair, the plan has `chunks` chunks and places each
+/// slot's file in exactly one. Returns each file's chunk by location key.
+pub(super) fn enrich_planned(
+    page: &mut Page,
+    c: &Corpus,
+    families: &[&str],
+    sidecars: &[&str],
+    chunks: usize,
+) -> BTreeMap<crate::snapshots::claude_money_birth_store::LocationKey, usize> {
+    let items = &page.scan.snapshots;
+    assert_eq!(
+        (e2::page_families(items).keys())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        families.iter().copied().collect::<BTreeSet<_>>(),
+        "the page's families"
+    );
+    for root in sidecars {
+        let stem = crate::claude_local_otel::telemetry_stem(root);
+        assert!(
+            matches!(
+                crate::claude_local_otel::telemetry_pair_bytes(&c.support, &stem),
+                Ok(Some(bytes)) if bytes > 0
+            ),
+            "{root}: a positive side-file pair"
+        );
+    }
+    let plan =
+        crate::snapshot_sync::telemetry_only::pack_claude_evidence_families(&c.support, items);
+    assert_eq!(plan.len(), chunks, "planned chunks");
+    let mut placed = BTreeMap::new();
+    for (chunk, planned) in plan.iter().enumerate() {
+        for &slot in &planned.slots {
+            let key = (items[slot].claude_money.as_deref())
+                .and_then(e2::FileFold::location_key)
+                .expect("each slot is a located file");
+            assert_eq!(placed.insert(key, chunk), None, "each file in one chunk");
+        }
+    }
+    assert_eq!(placed.len(), items.len(), "the plan places every slot");
+    let before = crate::snapshot_sync::evidence_chunks_for_test();
+    page.enrich(c);
+    assert_eq!(
+        crate::snapshot_sync::evidence_chunks_for_test() - before,
+        chunks,
+        "enrich runs the planned chunks"
+    );
+    placed
+}
+
 const BIG: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const SMALL: &str = "7338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const SMALLER: &str = "8338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -433,8 +486,12 @@ fn twins_beside_another_family() {
 
 /// [money] A live cross-session content twin on the same page cannot hold
 /// ROOT merely because its family is packed into another evidence chunk.
+/// The settled twin is 30/3; on the routed page M and T sit in the two
+/// planned chunks, and ROOT publishes 20/2 with an exact ACK saved on its
+/// route.
 #[test]
 fn cross_session_content_twin_in_another_chunk_does_not_hold() {
+    use crate::snapshots::claude_money_birth_store::location_key;
     with_e2(|| {
         let mut c = Corpus::new("e2-cross-session-content-twin-chunks");
         let twin = c.root(THIRD, &resumed(COPY, &[A, B, C]));
@@ -446,7 +503,8 @@ fn cross_session_content_twin_in_another_chunk_does_not_hold() {
         );
         let old = ScanIndex::default();
         let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
-        assert_eq!(body(&first, COPY).unwrap().request_count, 3);
+        let seeded = body(&first, COPY).unwrap();
+        assert_eq!((seeded.input_tokens, seeded.request_count), (30, 3));
         let mut prior = settle(&c, &old, first, &mut e2_progress());
         let record = prior
             .claude_request_census_for_test()
@@ -463,18 +521,20 @@ fn cross_session_content_twin_in_another_chunk_does_not_hold() {
         );
         assert!(prior.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
         let scanner = E2ScanFixture::default();
-        let mut page = c.raw(&scanner, prior, 100, false, &[]);
+        let mut page = c.raw(&scanner, prior, 100, true, &[]);
         assert!(scanner.paths().contains(&main) && scanner.paths().contains(&twin));
         assert!(body(&page, ROOT).is_some() && body(&page, COPY).is_some());
 
+        let mut placed = BTreeMap::new();
         let checks = streamed_checks(|| {
-            let before = crate::snapshot_sync::evidence_chunks_for_test();
-            page.enrich(&c);
-            assert!(
-                crate::snapshot_sync::evidence_chunks_for_test() - before >= 2,
-                "both nonzero family sidecars must force separate chunks"
-            );
+            // Both nonzero family sidecars force separate chunks.
+            placed = enrich_planned(&mut page, &c, &[COPY, ROOT], &[COPY, ROOT], 2);
         });
+        assert_ne!(
+            placed[&location_key(&main.to_string_lossy())],
+            placed[&location_key(&twin.to_string_lossy())],
+            "M and T run in different chunks"
+        );
         assert_eq!(
             checks.chunked, 1,
             "the target page compared both references"
@@ -491,11 +551,24 @@ fn cross_session_content_twin_in_another_chunk_does_not_hold() {
         // Before the fix ROOT was withheld here because T sat in another chunk.
         let root = body(&page, ROOT).expect("ROOT publishes its body");
         assert!(crate::snapshots::claude_request_money::is_request_owned_literal(root));
-        assert_eq!(root.request_count, 2);
+        assert_eq!((root.input_tokens, root.request_count), (20, 2));
         assert!(!page
             .disposition
             .quarantined_fingerprints(&page.scan.snapshots)
             .contains(&root.snapshot_fingerprint));
+        let (fingerprint, witness) = (
+            root.snapshot_fingerprint.clone(),
+            snapshot_upload_body_witness(root),
+        );
+        let committed = page.committed.clone();
+        let mut progress = e2_progress();
+        let settled = settle(&c, &committed, page, &mut progress);
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&fingerprint),
+            Some(&witness),
+            "ROOT's exact ACK"
+        );
+        assert!(settled.accepted_snapshot_fingerprint_recorded(&fingerprint));
     });
 }
 

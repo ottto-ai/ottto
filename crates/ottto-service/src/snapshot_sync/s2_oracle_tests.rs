@@ -78,6 +78,13 @@ fn commit_with_progress(
     mut page: Page,
 ) -> (ScanIndex, SnapshotUploadProgress) {
     page.finish();
+    commit_finished_with_progress(session, page)
+}
+
+fn commit_finished_with_progress(
+    session: &StateV2ColdSession,
+    mut page: Page,
+) -> (ScanIndex, SnapshotUploadProgress) {
     let mut progress = e2_progress();
     assert_eq!(
         upload(&page.scan.snapshots, &mut progress, ack).0.unwrap(),

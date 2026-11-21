@@ -4222,6 +4222,11 @@ mod s2_oracle_tests;
 #[cfg(unix)]
 mod codex_tail_oracle_tests;
 
+#[cfg(unix)]
+pub(in crate::snapshot_sync) use codex_tail_oracle_tests::{
+    assert_joined_ack, assert_joined_post, revert_archives,
+};
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {

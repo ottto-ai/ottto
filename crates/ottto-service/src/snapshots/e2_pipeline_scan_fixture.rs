@@ -621,6 +621,20 @@ pub(crate) fn renumber_device_for_test(index: &mut ScanIndex, key: &str) {
     );
 }
 
+/// The entity-set digest the finalizer writes on each physical file.
+#[cfg(unix)]
+pub(crate) fn file_entity_set_hex_for_test(fingerprints: &BTreeSet<String>) -> String {
+    snapshot_file_entity_set_hex(fingerprints)
+}
+
+/// Count EOFs applied by the scan steps on the calling worker.
+pub(crate) fn observe_codex_group_eofs<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    use sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED;
+    let before = GROUP_EOF_APPLIED.get();
+    let result = run();
+    (result, GROUP_EOF_APPLIED.get() - before)
+}
+
 /// The graph compared byte for byte, routed or not.
 pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     index.clone()

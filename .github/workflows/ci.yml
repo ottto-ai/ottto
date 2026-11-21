@@ -370,7 +370,7 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD
-          cargo test -p ottto-service --lib --locked --release scan_worker_stack_margin_receipt -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/stack-margin.log"
+          cargo test -p ottto-service --lib --locked --release scan_worker_stack_margin_receipt -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/stack-margin.log"
           grep -q '^SCAN_STACK_MARGIN_RECEIPT ' "$RUNNER_TEMP/stack-margin.log"
           grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/stack-margin.log"
 

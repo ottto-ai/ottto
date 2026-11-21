@@ -31,14 +31,14 @@ NATIVE_FIXTURES = frozenset({
     "quiet_sidecar_growth", "side_owner", "side_without_owner",
     "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
     "codex_v2_sticky", "codex_legacy_acked_sticky", "subagent_twin_slack_tail",
+    "once_credit_claude",
+    "once_credit_native",
 })
 # New native fixtures: the head must emit each one; the base may not have it
 # yet. A name the base does not emit is UNCOMPARED (the head's VERIFIED receipt
 # only, never a match or a diff). Once the base emits it, it is compared like
 # any other fixture and can be removed here.
 HEAD_ONLY_FIXTURES = (
-    "once_credit_claude",
-    "once_credit_native",
     "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
     "resumed_prefix_sidecar_receipt", "root_twin_scoped_family",
     "claude_status_s01_default_only",

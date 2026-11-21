@@ -362,6 +362,117 @@ fn growth_on_either_home_and_main_only() {
     });
 }
 
+/// Each accepted entity's exact head: wire input tokens and requests.
+fn heads(accepted: &BTreeMap<String, Accepted>) -> BTreeMap<String, (u64, u64)> {
+    accepted
+        .iter()
+        .map(|(id, accepted)| {
+            let field = |name: &str| accepted.body[name].as_u64().unwrap();
+            (id.clone(), (field("input_tokens"), field("request_count")))
+        })
+        .collect()
+}
+
+/// [money] One family, four exactly acknowledged entities. A main-only
+/// append changes only the main's ACK; an append to one child's later twin
+/// then changes only that child's ACK, its copied prefix counted once. Every
+/// other entity keeps its last body and witness, the new witness is saved,
+/// and the carried family matches cold, placement included.
+#[test]
+fn family_entities_keep_exact_heads_across_acks() {
+    with_e2(|| {
+        let c = twins("subagent-twin-family-heads", false, TURN, false, false);
+        let (session, index) = StateV2ColdSession::publish(
+            Source::Claude,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let first = page(&c, index, 100, true);
+        let mut carried = acked(&first);
+        let mut expected = BTreeMap::from([
+            (ROOT.to_string(), (21, 2)),
+            (child(0), (20, 1)),
+            (child(1), (20, 1)),
+            (child(2), (9, 1)),
+        ]);
+        let family = |heads: &BTreeMap<String, (u64, u64)>| {
+            (heads.values()).fold((0u64, 0u64), |(input, requests), (i, r)| {
+                (input + i, requests + r)
+            })
+        };
+        assert_eq!(heads(&carried), expected, "seed");
+        assert_eq!(family(&heads(&carried)), (70, 5));
+        let mut prior = commit(&session, first);
+        for (step, relative, twin, entity, head, total) in [
+            (
+                0,
+                format!("z/{ROOT}.jsonl"),
+                format!("a/{ROOT}.jsonl"),
+                ROOT.to_string(),
+                (29, 3),
+                (78, 6),
+            ),
+            (1, member("z", 0), member("a", 0), child(0), (28, 2), (86, 7)),
+        ] {
+            let path = c.root.join(relative);
+            let request = format!("family-head-{step}");
+            let mut turn: serde_json::Value =
+                serde_json::from_str(&line(ROOT, &request, GROW, 8)).unwrap();
+            turn["message"]["role"] = json!("assistant");
+            turn["message"]["content"] = json!([{
+                "type": "tool_use",
+                "id": format!("toolu_{request}"),
+                "name": "Read",
+                "input": {},
+            }]);
+            // Both twins carry the tool turn because the first item's list is published.
+            append(&path, &(turn.to_string() + "\n"));
+            turn["requestId"] = json!(format!("{request}-tool"));
+            turn["message"]["id"] = json!(format!("msg-{request}-tool"));
+            turn["message"]["usage"] = json!({"input_tokens":0,"output_tokens":0});
+            let twin = c.root.join(twin);
+            append(&twin, &(turn.to_string() + "\n"));
+
+            let mut warm = hinted(&c, prior, 100, true, &[path, twin]);
+            let mut actual = result(&warm, Mode::Ram);
+            actual.accepted = carried.clone();
+            money_oracle::assert_carried_equivalent(&cold(&c), &actual);
+            warm.finish();
+            if step == 0 {
+                assert_main_only(&c, &warm, &carried, Mode::Ram);
+            }
+            let now = acked(&warm);
+            for (id, accepted) in &now {
+                if *id != entity {
+                    assert_eq!(accepted.body, carried[id].body, "step {step}: {id}");
+                    assert_eq!(accepted.witness, carried[id].witness, "step {step}: {id}");
+                }
+            }
+            assert_ne!(
+                now[&entity].witness, carried[&entity].witness,
+                "step {step}"
+            );
+            let item = body(&warm, &entity).unwrap();
+            let (fingerprint, witness) = (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            );
+            carried.extend(now);
+            expected.insert(entity, head);
+            assert_eq!(heads(&carried), expected, "step {step}");
+            assert_eq!(family(&heads(&carried)), total, "step {step}");
+            let (settled, progress) = commit_finished_with_progress(&session, warm);
+            assert!(settled.accepted_snapshot_fingerprint_recorded(&fingerprint));
+            assert_eq!(
+                progress.accepted_body_witnesses.get(&fingerprint),
+                Some(&witness),
+                "step {step}: the saved exact ACK"
+            );
+            prior = settled;
+        }
+    });
+}
+
 /// [regress] Growth on only one copy of a child, beside another child's
 /// growth, then on that copy alone at a new clock: whichever copy carries the
 /// summed body, cold, RAM, disk restore and restart emit the same full body
