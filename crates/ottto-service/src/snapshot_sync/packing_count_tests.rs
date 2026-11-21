@@ -189,13 +189,13 @@ fn snapshot_packing_count_preserves_exact_byte_count_and_oversize_boundaries() {
         vec![vec![0], vec![1]]
     );
 
-    let items = (0..51)
+    let items = (0..101)
         .rev()
         .map(|n| item(n, json!("tiny"), false))
         .collect::<Vec<_>>();
     let batches = assert_previous_oracle(&items, test_upload_progress());
-    assert_eq!(batches, vec![(0..50).collect::<Vec<_>>(), vec![50]]);
-    assert_eq!(SNAPSHOT_BATCH_LIMIT, 50);
+    assert_eq!(batches, vec![(0..100).collect::<Vec<_>>(), vec![100]]);
+    assert_eq!(SNAPSHOT_BATCH_LIMIT, 100);
 }
 
 /// [behaviour] A receiver-sized 3 MiB item exceeds the packing target, passes

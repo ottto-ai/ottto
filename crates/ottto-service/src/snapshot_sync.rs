@@ -450,27 +450,30 @@ const COLLECTOR_CHECKIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const MAX_SNAPSHOT_STATUS_WINDOW_DAYS: u64 = 183;
 const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
-// Match the backend's accepted entity count while retaining a separate byte
-// bound for pathological backfill batches. Normal incremental scans are
-// usually a single small chunk; historical replay avoids count-only 50-item
-// requests that could consume the backend's full wire budget.
-const SNAPSHOT_BATCH_LIMIT: usize = 50;
+// Match the backend's accepted entity count (100 per batch) while retaining a
+// separate byte bound for pathological backfill batches. Normal incremental
+// scans are usually a single small chunk; a first import sends full pages, so
+// the count halves its requests and their fixed per-request cost.
+const SNAPSHOT_BATCH_LIMIT: usize = 100;
 // Leave half of the backend's 4 MiB uncompressed request cap for derived
 // semantic envelopes and bounded request metadata. The exact request serializer
 // is still checked immediately before network I/O by
 // `validate_snapshot_batch_request`.
 pub(crate) const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
-// A 50-item page needs at most six binary splits to isolate one poison item.
+// A 100-item page needs at most seven binary splits to isolate one poison item.
 // Cap there so broad schema drift cannot turn one five-minute cycle into dozens
 // of doomed backend calls.
-const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
+const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 7;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
-const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+// Retry and reconcile volume per cycle stays one 50-entity page, as before the
+// batch count rose to 100.
+const SNAPSHOT_RETRY_PAGE_LIMIT: usize = 50;
+const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_RETRY_PAGE_LIMIT;
 // A pre-ledger checkpoint with ambiguous settlement is re-entered through the
 // existing entity-ACK upload machine. Arm at most one normal 50-entity page per
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
 // remaining identities across restarts.
-const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_RETRY_PAGE_LIMIT;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]
