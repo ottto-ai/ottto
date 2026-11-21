@@ -118,6 +118,9 @@ const OFF_PAGE: &str =
 /// The page counts a main whose summed body a content twin carries as owned.
 const CARRIED: &str =
     "a content twin carries the main's summed body: owned for the page, not for the selector";
+/// A withheld page leaves its session owed; nothing is marked for it.
+const HELD_READ_AGAIN: &str =
+    "the page withholds the session, which stays owed and is read again with both files";
 /// The page accepts a session when any of its files is owned.
 const ANY_FILE_OWNED: &str =
     "the page accepts a session when any of its files is owned; the others ask each file";
@@ -305,7 +308,7 @@ impl Rows {
                 known.met = true;
                 (known.answers == answers, known.why)
             }
-            None => (answers.agree(), "agree"),
+            None => (answers.agree(), "must agree"),
         };
         check(format!(
             "{} / {phase} / {file}: {answers:?} ({why})",
@@ -636,6 +639,12 @@ fn copy_disclosed() -> Literal {
 }
 
 const REMOVED_A: &[(&str, &str, &[&str])] = &[("copy", "holder", &["a"])];
+/// One of a session's two paths is missing from the page.
+const ABSENT_PATH: &[(&str, u64)] = &[
+    ("absent_twin", 1),
+    ("known_twin_paths", 2),
+    ("staged_twin_paths", 1),
+];
 /// The settled carrier fixture: the copy and the content twin each removed
 /// one request on the main's proof.
 const CARRIED_GROUPS: &[(&str, &str, &[&str])] =
@@ -1085,7 +1094,6 @@ fn idless_copy(name: &'static str) -> Rows {
 
 #[derive(Clone, Copy)]
 enum SameSession {
-    RuleA,
     OnlyNewerOwned,
     HolderOffPage,
 }
@@ -1104,15 +1112,6 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
         },
     );
     match variant {
-        SameSession::RuleA => {
-            rows.differs("co-read both paths", "copy", page_only, ONLY_ON_PAGE);
-            rows.differs(
-                "co-read both paths, replayed after the save",
-                "copy",
-                selector_only,
-                STORED_REUSED,
-            );
-        }
         SameSession::OnlyNewerOwned => {
             rows.differs(
                 "holder facts save, replayed after the save",
@@ -1173,25 +1172,6 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
         });
     }
     match variant {
-        SameSession::RuleA => {
-            rows.step(
-                "co-read both paths",
-                page,
-                Ack::Exact,
-                Expected {
-                    literals: vec![literal(
-                        ROOT,
-                        &[("holder", "a"), ("copy", "c")],
-                        1,
-                        0,
-                        C.1,
-                        vec![grain(EARLY, A.1, C.1, 20, 2, false)],
-                    )],
-                    groups: REMOVED_A,
-                    ..Expected::default()
-                },
-            );
-        }
         SameSession::OnlyNewerOwned | SameSession::HolderOffPage => {
             let off_page = matches!(variant, SameSession::HolderOffPage);
             // Only the resume owns a local body in the one-owner schedule.
@@ -1236,6 +1216,201 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
                 );
             }
         }
+    }
+    rows
+}
+
+/// Ordinary passes over one session's original and its resume, where one
+/// file is owned and the other is not.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// The original is decided on a page without the resume, so the session
+    /// is held; the next pass reads both.
+    OlderHeldAlone,
+    /// Both are read and saved before any acknowledgement; `resume_first`
+    /// chooses which file carries the summed body.
+    AckPending { resume_first: bool },
+    /// Both settle with an exact acknowledgement, then the resume is read
+    /// again on a page without the original.
+    ResumeReadAgain,
+}
+
+fn same_session_pass(name: &'static str, pass: Pass) -> Rows {
+    let mut rows = Rows::new(name);
+    let holder = Some("holder");
+    let page_only = Answers::Holder {
+        selector: None,
+        page: holder,
+    };
+    let stored = Answers::Holder {
+        selector: holder,
+        page: None,
+    };
+    let reused: &[&'static str] = match pass {
+        Pass::OlderHeldAlone => {
+            // While the page withholds the session neither file is owned,
+            // so the save marks nothing. Once that hold is gone a page with
+            // both files removes the prefix: the next pass below does, with
+            // no mark. Recorded as today's answer.
+            rows.differs(
+                "original alone",
+                "copy",
+                Answers::Save {
+                    marked: false,
+                    changes: true,
+                },
+                HELD_READ_AGAIN,
+            );
+            &["next pass reads both, replayed after the save"]
+        }
+        Pass::AckPending { resume_first } => {
+            rows.differs(
+                "both read, acknowledgement pending",
+                "copy",
+                page_only,
+                ONLY_ON_PAGE,
+            );
+            if resume_first {
+                &["next pass reads both, replayed after the save"]
+            } else {
+                &[
+                    "both read, acknowledgement pending, replayed after the save",
+                    "next pass reads both",
+                    "next pass reads both, replayed after the save",
+                ]
+            }
+        }
+        Pass::ResumeReadAgain => {
+            rows.differs("both settle", "copy", page_only, ONLY_ON_PAGE);
+            &[
+                "both settle, replayed after the save",
+                "resume read again alone",
+                "resume read again alone, replayed after the save",
+            ]
+        }
+    };
+    for &phase in reused {
+        rows.differs(phase, "copy", stored.clone(), STORED_REUSED);
+    }
+    rows.write(
+        "copy",
+        &format!("resume/{}", file(ROOT)),
+        &resumed(ROOT, &[A, C]),
+        BORN,
+    );
+    let page = scan(&rows, ScanIndex::default(), &["copy"]);
+    let initial = rows.decisions("initial decision", &page.scan.snapshots, &page.index);
+    let mut counted = copy_disclosed();
+    counted.session = ROOT.into();
+    let mut index = rows.step(
+        "only resume present",
+        page,
+        Ack::Exact,
+        Expected {
+            literals: vec![counted],
+            ..Expected::default()
+        },
+    );
+    rows.write(
+        "holder",
+        &format!("origin/{}", file(ROOT)),
+        &resumed(ROOT, &[A]),
+        EARLY,
+    );
+    owe(&mut index);
+    let summed = || {
+        literal(
+            ROOT,
+            &[("holder", "a"), ("copy", "c")],
+            1,
+            0,
+            C.1,
+            vec![grain(EARLY, A.1, C.1, 20, 2, false)],
+        )
+    };
+    let mut page = scan(&rows, index, &["holder", "copy"]);
+    let both = page.scan.snapshots.clone();
+    let first = |rows: &Rows, alias: &str| {
+        let wanted = Some(rows.loc(alias));
+        move |item: &SnapshotItem| item.claude_money.as_deref().unwrap().location_key() != wanted
+    };
+    let mut index = match pass {
+        Pass::OlderHeldAlone => {
+            let holder = Some(rows.loc("holder"));
+            page.scan
+                .snapshots
+                .retain(|item| item.claude_money.as_deref().unwrap().location_key() == holder);
+            let index = rows.step(
+                "original alone",
+                page,
+                Ack::Local,
+                Expected {
+                    holds: ABSENT_PATH,
+                    ..Expected::default()
+                },
+            );
+            // What a page with both files would decide on this saved index.
+            rows.compare_save("original alone", "copy", &initial["copy"], &both, &index);
+            index
+        }
+        Pass::AckPending { resume_first } => {
+            page.scan
+                .snapshots
+                .sort_by_key(first(&rows, if resume_first { "copy" } else { "holder" }));
+            rows.step(
+                "both read, acknowledgement pending",
+                page,
+                Ack::Local,
+                Expected {
+                    literals: vec![summed()],
+                    groups: REMOVED_A,
+                    ..Expected::default()
+                },
+            )
+        }
+        Pass::ResumeReadAgain => rows.step(
+            "both settle",
+            page,
+            Ack::Exact,
+            Expected {
+                literals: vec![summed()],
+                groups: REMOVED_A,
+                ..Expected::default()
+            },
+        ),
+    };
+    // The held session is still owed: the next pass reads both files without
+    // any new cause.
+    if !matches!(pass, Pass::OlderHeldAlone) {
+        owe(&mut index);
+    }
+    if matches!(pass, Pass::ResumeReadAgain) {
+        // A read of the resume alone, as a same-bytes touch of it causes: it
+        // still excludes a request, so it cannot stand in for the original
+        // and the session is held. Today's answer, not a guard.
+        let page = scan(&rows, index, &["copy"]);
+        rows.step(
+            "resume read again alone",
+            page,
+            Ack::Local,
+            Expected {
+                groups: REMOVED_A,
+                holds: ABSENT_PATH,
+                ..Expected::default()
+            },
+        );
+    } else {
+        let page = scan(&rows, index, &["holder", "copy"]);
+        rows.step(
+            "next pass reads both",
+            page,
+            Ack::Exact,
+            Expected {
+                literals: vec![summed()],
+                groups: REMOVED_A,
+                ..Expected::default()
+            },
+        );
     }
     rows
 }
@@ -1904,14 +2079,28 @@ fn all_rows() -> Table {
     });
     table.row("summed_session_latest_clock", latest_clock);
     table.row("idless_prefix_restored_and_disclosed", idless_copy);
-    table.row("resumed_rule_a_both_paths", |name| {
-        same_session(name, SameSession::RuleA)
-    });
     table.row("own_session_acceptance_one_owned_location", |name| {
         same_session(name, SameSession::OnlyNewerOwned)
     });
     table.row("resumed_same_session_holder_off_page", |name| {
         same_session(name, SameSession::HolderOffPage)
+    });
+    table.row("original_decided_alone_then_both", |name| {
+        same_session_pass(name, Pass::OlderHeldAlone)
+    });
+    table.row("both_saved_before_ack_original_carries", |name| {
+        same_session_pass(
+            name,
+            Pass::AckPending {
+                resume_first: false,
+            },
+        )
+    });
+    table.row("both_saved_before_ack_resume_carries", |name| {
+        same_session_pass(name, Pass::AckPending { resume_first: true })
+    });
+    table.row("resume_read_again_without_original", |name| {
+        same_session_pass(name, Pass::ResumeReadAgain)
     });
     table.row("empty_main_carried_by_twin", |name| carrier(name, false));
     table.row("content_held_holder_on_page", |name| carrier(name, true));
