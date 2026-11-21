@@ -504,7 +504,7 @@ fn pi_tiered_first_read_matches_untiered_money() {
         assert_eq!(index.first_read_tier_cutoff, None);
         let (_, scan, _) = E2ScanFixture::with_identity_capture(false).scan_other_page(
             source,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &root,
             index,
             true,
