@@ -646,13 +646,12 @@ def receipt_names(left, right, head_expected, base_expected=None):
     return sorted(base & head), sorted(head - base)
 
 
-def compare_step_traces(left, right, logs, declared_changed=(), informational=False):
+def compare_step_traces(left, right, logs, declared_changed=()):
     """Verify the emitted trace manifests and compare shared receipts byte for byte.
 
-    A difference is fatal unless the row is in `declared_changed`.
-    `informational` is for a comparison between two releases: the head must
-    still emit every required trace intact, but rows added, removed or changed
-    since the base are reported instead of failing.
+    Every difference is printed, one line per trace, before the verdict. A
+    difference is fatal unless the row is in `declared_changed`; a declared row
+    must exist on both sides and must differ.
     """
     declared_changed = set(declared_changed)
     if REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES or HEAD_ONLY_STEP_TRACES & declared_changed:
@@ -662,16 +661,11 @@ def compare_step_traces(left, right, logs, declared_changed=(), informational=Fa
         lines = re.findall(r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
         digests = dict(lines)
         required = REQUIRED_STEP_TRACES | (HEAD_ONLY_STEP_TRACES if arm == "head" else set())
-        if informational and arm == "base":
-            required = set()
         files = {path.stem for path in (directory / "step-trace").glob("*.json")}
         if len(lines) != len(digests) or files != digests.keys() or not required <= files:
             raise RuntimeError(f"incomplete {arm} step-trace coverage")
         manifests[arm] = digests
     base, head = manifests["base"], manifests["head"]
-    new, removed = head.keys() - base.keys(), base.keys() - head.keys()
-    if not informational and (removed or new - HEAD_ONLY_STEP_TRACES):
-        raise RuntimeError("base/head step-trace names differ")
 
     def read(directory, name, digest):
         data = (directory / "step-trace" / f"{name}.json").read_bytes()
@@ -679,24 +673,46 @@ def compare_step_traces(left, right, logs, declared_changed=(), informational=Fa
             raise RuntimeError(f"invalid {directory.name} step-trace digest: {name}")
         return data
 
-    changed = []
-    for name in sorted(head):
-        data = read(right, name, head[name])
-        if name in base and read(left, name, base[name]) != data:
+    def parts(old, new):
+        """The top-level receipt parts that differ (schema names, never content)."""
+        try:
+            old, new = json.loads(old), json.loads(new)
+        except ValueError:
+            return ["<not JSON>"]
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return ["<whole receipt>"]
+        return sorted(key for key in old.keys() | new.keys() if old.get(key) != new.get(key)
+                      or (key in old) != (key in new))
+
+    differences, changed = {}, []
+    for name in sorted(base.keys() | head.keys()):
+        new = read(right, name, head[name]) if name in head else None
+        old = read(left, name, base[name]) if name in base else None
+        if old is None:
+            if name not in HEAD_ONLY_STEP_TRACES:
+                differences[name] = {"class": "added"}
+        elif new is None:
+            differences[name] = {"class": "removed"}
+        elif old != new:
             changed.append(name)
-    for name in sorted(removed):
-        read(left, name, base[name])
-    result = {"compared": len(base.keys() & head.keys()), "uncompared_head_only": sorted(new),
-              "changed": changed}
-    if informational:
-        return result | {"informational": True, "removed": sorted(removed)}
-    undeclared = sorted(set(changed) - declared_changed)
-    if undeclared:
-        raise RuntimeError("base/head step-trace bytes differ: " + ", ".join(undeclared))
-    unchanged = sorted(declared_changed - set(changed))
-    if unchanged:
-        raise RuntimeError("declared step-trace change not observed: " + ", ".join(unchanged))
-    return result
+            differences[name] = {"class": "changed", "declared": name in declared_changed,
+                                 "parts": parts(old, new)}
+    for name in sorted(declared_changed - set(changed)):
+        # A declared row missing on one side keeps its own class; all are fatal.
+        differences.setdefault(name, {"class": "declared_not_changed"})
+    for name in sorted(differences):
+        print(f"MONEY_EQUIVALENCE_STEP_TRACE_DIFF {name} "
+              + json.dumps(differences[name], sort_keys=True), flush=True)
+    fatal = sorted(name for name, difference in differences.items()
+                   if not difference.get("declared"))
+    if fatal:
+        counts = {}
+        for name in fatal:
+            counts[differences[name]["class"]] = counts.get(differences[name]["class"], 0) + 1
+        raise RuntimeError("base/head step traces differ: " + ", ".join(
+            f"{count} {kind}" for kind, count in sorted(counts.items())) + "; first " + fatal[0])
+    return {"compared": len(base.keys() & head.keys()),
+            "uncompared_head_only": sorted(head.keys() - base.keys()), "changed": changed}
 
 
 def require_saved_digests(directory, name):
@@ -746,9 +762,6 @@ def main():
     receipts.mkdir(parents=True)
     ref = os.environ.get("MONEY_EQUIVALENCE_BASE", "").strip()
     explicit = bool(ref)
-    release_cut = os.environ.get("MONEY_EQUIVALENCE_RELEASE_CUT", "").strip() == "true"
-    if release_cut and not explicit:
-        raise RuntimeError("a release comparison needs an explicit base")
     prs = []
     if not ref:
         # workflow_dispatch has no pull_request payload. Resolve the branch's
@@ -872,22 +885,19 @@ def main():
         if errors:
             raise RuntimeError("; ".join(errors))
         manifest["step_traces"] = compare_step_traces(
-            left, right, logs, (declarations or {}).get("step_traces", ()), release_cut)
+            left, right, logs, (declarations or {}).get("step_traces", ()))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
             manifest["uncompared_head_only"] = uncompared_records
-        print(f"MONEY_EQUIVALENCE_COUNTS compared={len(names)} uncompared={len(uncompared)}"
-              f"{' release_comparison=true' if release_cut else ''}", flush=True)
+        print(f"MONEY_EQUIVALENCE_COUNTS compared={len(names)} uncompared={len(uncompared)}", flush=True)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
             traces = manifest["step_traces"]
-            mode = (f"release comparison, informational; {len(traces['removed'])} removed"
-                    if traces.get("informational") else "declared")
             f.write(f"Step traces: {traces['compared']} compared, "
-                    f"{len(traces['changed'])} changed ({mode}); "
+                    f"{len(traces['changed'])} changed (declared); "
                     f"{len(traces['uncompared_head_only'])} head-only uncompared.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
