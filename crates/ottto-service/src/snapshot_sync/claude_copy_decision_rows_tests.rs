@@ -1,4 +1,4 @@
-//! Copy decisions on native folds, literal bodies and the saved index.
+// Copy decisions on native folds, literal bodies and the saved index.
 use super::*;
 use crate::snapshot_sync::tests::{
     claude_money_e2_pipeline_tests::money_equivalence_tests::{corpus, input_clock, ReceiptBody},
@@ -145,6 +145,8 @@ struct Rows {
     inputs: BTreeMap<String, Vec<u8>>,
     bodies: Vec<ReceiptBody>,
     failures: Vec<String>,
+    /// Every agreement check that ran, with both answers.
+    checks: Vec<String>,
 }
 
 impl Rows {
@@ -156,6 +158,7 @@ impl Rows {
             inputs: BTreeMap::new(),
             bodies: Vec::new(),
             failures: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -344,12 +347,21 @@ impl Rows {
                             e2::copied_file_holders_for_test(index, std::iter::once(key.as_str()));
                         let selected = selected.get(&key).map(|key| self.alias(location_key(key)));
                         let page = first.map(|holder| self.alias(holder));
+                        self.checks.push(format!(
+                            "{} / {phase} / {file}: selector holder {selected:?}, page holder {page:?}",
+                            self.name
+                        ));
                         self.equal(
                             phase,
                             &format!("{file} earliest holder (selector / page)"),
                             selected,
                             page,
                         );
+                    } else {
+                        self.checks.push(format!(
+                            "{} / {phase} / {file}: no selector check, the copy has no census that proves its scan",
+                            self.name
+                        ));
                     }
                 }
                 let file_groups = groups
@@ -381,13 +393,19 @@ impl Rows {
         active.activate_upload_context("e2-synthetic-destination".into());
         let redecided = self.decisions(phase, replay, &active);
         let rerun = &redecided[file];
+        let marked = active.claude_copy_removals.pending(self.loc(file));
+        let changed = original.groups != rerun.groups || original.counted != rerun.counted;
+        self.checks.push(format!(
+            "{} / {phase} / {file}: save mark {marked}, decision changes {changed}",
+            self.name
+        ));
         self.equal(
             phase,
             &format!(
                 "{file} save mark / change in decision (before: {original:?}, replay: {rerun:?})"
             ),
-            active.claude_copy_removals.pending(self.loc(file)),
-            original.groups != rerun.groups || original.counted != rerun.counted,
+            marked,
+            changed,
         );
     }
 
@@ -743,8 +761,8 @@ fn holder_loss(name: &'static str, loss: HolderLoss) -> Rows {
     rows
 }
 
-fn retired_parent() -> Rows {
-    let mut rows = Rows::new("retired_named_parent");
+fn retired_parent(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     write_holder(&mut rows);
     let holder = scan(&rows, ScanIndex::default(), &["holder"]);
     let mut index = rows.step(
@@ -773,8 +791,8 @@ fn retired_parent() -> Rows {
     rows
 }
 
-fn fresh_destination() -> Rows {
-    let mut rows = Rows::new("fresh_destination_unstored");
+fn fresh_destination(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     write_holder(&mut rows);
     let holder = scan(&rows, ScanIndex::default(), &["holder"]);
     let mut index = rows.step(
@@ -889,8 +907,8 @@ fn twins(name: &'static str, distinct: bool, absent: bool) -> Rows {
     rows
 }
 
-fn latest_clock() -> Rows {
-    let mut rows = Rows::new("summed_session_latest_clock");
+fn latest_clock(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     rows.write(
         "holder",
         &format!("first/{}", file(ROOT)),
@@ -929,8 +947,8 @@ fn latest_clock() -> Rows {
     rows
 }
 
-fn idless_copy() -> Rows {
-    let mut rows = Rows::new("idless_prefix_restored_and_disclosed");
+fn idless_copy(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     let mut old: Value = serde_json::from_str(&line(COPY, "idless", A.1, 10)).unwrap();
     old.as_object_mut().unwrap().remove("requestId");
     write_copy(&mut rows, &(old.to_string() + "\n" + &resumed(COPY, &[C])));
@@ -1126,8 +1144,10 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
     rows
 }
 
-fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
-    let (c, mut index, [holder, copy, twin]) = settled_content_carrier(true);
+/// A settled main whose summed session body a content twin carries, and a
+/// copy that removed a request on that main's proof.
+fn carried_main(name: &'static str) -> (Rows, ScanIndex) {
+    let (c, index, [holder, copy, twin]) = settled_content_carrier(true);
     let mut rows = Rows {
         corpus: c,
         name,
@@ -1135,6 +1155,7 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
         inputs: BTreeMap::new(),
         bodies: Vec::new(),
         failures: Vec::new(),
+        checks: Vec::new(),
     };
     for path in rows.paths.values() {
         let relative = path
@@ -1144,6 +1165,32 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
         rows.inputs
             .insert(format!("{name}/{relative}"), std::fs::read(path).unwrap());
     }
+    (rows, index)
+}
+
+/// The summed body moves from the twin to the main's own file. The main is
+/// read again; the copy that relies on it stays settled.
+fn carrier_transfer(name: &'static str) -> Rows {
+    let (mut rows, index) = carried_main(name);
+    rows.check_saved("carried main", &index, REMOVED_A, &[]);
+    let (holder, twin) = (rows.key("holder"), rows.key("twin"));
+    let mut next = index.clone();
+    next.confirmed_empty_files.remove(&holder);
+    next.file_snapshot_fingerprints
+        .insert(holder, BTreeSet::from(["own-body".to_owned()]));
+    e2::reconcile_carrier_images_for_test(&index, &mut next, |keys, committed| {
+        if committed && keys.contains(&twin.as_str()) {
+            BTreeMap::from([(twin.clone(), ROOT.to_owned())])
+        } else {
+            BTreeMap::new()
+        }
+    });
+    rows.check_saved("main carries its own body", &next, REMOVED_A, &["holder"]);
+    rows
+}
+
+fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
+    let (mut rows, mut index) = carried_main(name);
     index.upload_context_proof.request_contributions.clear();
     index = rows.corpus.reload(&mut index);
     index.activate_upload_context("e2-synthetic-destination".into());
@@ -1226,8 +1273,8 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
     rows
 }
 
-fn version_five() -> Rows {
-    let mut rows = Rows::new("settled_counted_copy_rule_five");
+fn version_five(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     write_copy(&mut rows, &resumed(COPY, &[A, C]));
     let page = scan(&rows, ScanIndex::default(), &["copy"]);
     let native = page.scan.snapshots.clone();
@@ -1497,8 +1544,8 @@ fn forked_agent(name: &'static str, witness: &str) -> Rows {
     rows
 }
 
-fn covered_only() -> Rows {
-    let mut rows = Rows::new("covered_only_path_has_no_body");
+fn covered_only(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     write_holder(&mut rows);
     let page = scan(&rows, ScanIndex::default(), &["holder"]);
     let mut index = rows.step(
@@ -1535,8 +1582,8 @@ fn covered_only() -> Rows {
     rows
 }
 
-fn ambiguous_duplicate() -> Rows {
-    let mut rows = Rows::new("ambiguous_copied_duplicate");
+fn ambiguous_duplicate(name: &'static str) -> Rows {
+    let mut rows = Rows::new(name);
     let mut duplicate: Value = serde_json::from_str(&line(COPY, "a", A.1, 20)).unwrap();
     duplicate["message"]["id"] = json!("independent-response");
     write_copy(
@@ -1647,6 +1694,38 @@ fn subagent_twins(name: &'static str, day: &str, after_cutoff: bool) -> Rows {
     rows
 }
 
+#[derive(Default)]
+struct Table {
+    bodies: Vec<ReceiptBody>,
+    inputs: BTreeMap<String, Vec<u8>>,
+    failures: Vec<String>,
+    checks: Vec<String>,
+}
+
+impl Table {
+    /// A row whose fixture premise fails is reported with the others; it does
+    /// not hide them.
+    fn row(&mut self, name: &'static str, build: impl FnOnce(&'static str) -> Rows) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(name))) {
+            Ok(row) => {
+                self.bodies.extend(row.bodies);
+                self.inputs.extend(row.inputs);
+                self.failures.extend(row.failures);
+                self.checks.extend(row.checks);
+            }
+            Err(panic) => {
+                let why = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("no message");
+                self.failures
+                    .push(format!("{name} / fixture premise\n  panic: {why}"));
+            }
+        }
+    }
+}
+
 #[test]
 #[serial(client_report)]
 fn full_copy_decision_rows() {
@@ -1656,60 +1735,97 @@ fn full_copy_decision_rows() {
     }
     with_e2(|| {
         with_scan_clock(nanos("2026-11-07T08:00:00Z") as u64 / 1_000_000_000, || {
-            let rows = [
-                earlier_holder("accepted_holder_before_copy", Ack::Exact),
-                earlier_holder("local_holder_before_copy", Ack::Local),
-                late_holder("accepted_holder_after_copy", Ack::Exact, true),
-                late_holder("unstored_holder_after_copy", Ack::Unstored, false),
-                late_holder(
-                    "usage_identical_holder_after_copy",
-                    Ack::UsageIdentical,
-                    true,
-                ),
-                late_holder("dominated_holder_after_copy", Ack::Dominated, true),
-                holder_loss("deleted_accepted_holder", HolderLoss::DeleteAccepted),
-                holder_loss("deleted_local_holder", HolderLoss::DeleteLocal),
-                holder_loss("retired_holder_keeps_saved_group", HolderLoss::Retire),
-                holder_loss("lossy_holder_keeps_saved_group", HolderLoss::Lossy),
-                retired_parent(),
-                fresh_destination(),
-                twins("cloned_main_requests", false, false),
-                twins("distinct_twin_requests", true, false),
-                twins("absent_path_twin_holds", true, true),
-                twins("redundant_absent_path_twin_releases", false, true),
-                latest_clock(),
-                idless_copy(),
-                same_session("resumed_rule_a_both_paths", SameSession::RuleA),
-                same_session(
-                    "own_session_acceptance_one_owned_location",
-                    SameSession::OnlyNewerOwned,
-                ),
-                same_session(
-                    "resumed_same_session_holder_off_page",
-                    SameSession::HolderOffPage,
-                ),
-                same_session("holder_already_in_accepted_sum", SameSession::AcceptedSum),
-                carrier("empty_main_carried_by_twin", false),
-                carrier("content_held_holder_on_page", true),
-                version_five(),
-                cutoff("before_copy_proof_cutoff", "2026-11-03", true),
-                cutoff("after_copy_proof_cutoff", "2026-11-04", true),
-                cutoff("no_accepted_copy_grandfather", "2026-11-03", false),
-                forked_agent("forked_agent_root_on_page", "page"),
-                forked_agent("forked_agent_root_in_census", "census"),
-                forked_agent("forked_agent_without_witness", "missing"),
-                covered_only(),
-                ambiguous_duplicate(),
-                subagent_twins("subagent_before_request_cutoff", "2026-11-04", false),
-                subagent_twins("subagent_after_request_cutoff", "2026-11-05", true),
-            ];
-            let mut bodies = Vec::new();
-            let mut inputs = BTreeMap::new();
-            let mut failures = Vec::new();
-            for row in rows {
-                bodies.extend(row.bodies);
-                inputs.extend(row.inputs);
-                failures.extend(row.failures);
+            let mut table = Table::default();
+            table.row("accepted_holder_before_copy", |name| {
+                earlier_holder(name, Ack::Exact)
+            });
+            table.row("local_holder_before_copy", |name| {
+                earlier_holder(name, Ack::Local)
+            });
+            table.row("accepted_holder_after_copy", |name| {
+                late_holder(name, Ack::Exact, true)
+            });
+            table.row("unstored_holder_after_copy", |name| {
+                late_holder(name, Ack::Unstored, false)
+            });
+            table.row("usage_identical_holder_after_copy", |name| {
+                late_holder(name, Ack::UsageIdentical, true)
+            });
+            table.row("dominated_holder_after_copy", |name| {
+                late_holder(name, Ack::Dominated, true)
+            });
+            table.row("deleted_accepted_holder", |name| {
+                holder_loss(name, HolderLoss::DeleteAccepted)
+            });
+            table.row("deleted_local_holder", |name| {
+                holder_loss(name, HolderLoss::DeleteLocal)
+            });
+            table.row("retired_holder_keeps_saved_group", |name| {
+                holder_loss(name, HolderLoss::Retire)
+            });
+            table.row("lossy_holder_keeps_saved_group", |name| {
+                holder_loss(name, HolderLoss::Lossy)
+            });
+            table.row("retired_named_parent", retired_parent);
+            table.row("fresh_destination_unstored", fresh_destination);
+            table.row("cloned_main_requests", |name| twins(name, false, false));
+            table.row("distinct_twin_requests", |name| twins(name, true, false));
+            table.row("absent_path_twin_holds", |name| twins(name, true, true));
+            table.row("redundant_absent_path_twin_releases", |name| {
+                twins(name, false, true)
+            });
+            table.row("summed_session_latest_clock", latest_clock);
+            table.row("idless_prefix_restored_and_disclosed", idless_copy);
+            table.row("resumed_rule_a_both_paths", |name| {
+                same_session(name, SameSession::RuleA)
+            });
+            table.row("own_session_acceptance_one_owned_location", |name| {
+                same_session(name, SameSession::OnlyNewerOwned)
+            });
+            table.row("resumed_same_session_holder_off_page", |name| {
+                same_session(name, SameSession::HolderOffPage)
+            });
+            table.row("holder_already_in_accepted_sum", |name| {
+                same_session(name, SameSession::AcceptedSum)
+            });
+            table.row("empty_main_carried_by_twin", |name| carrier(name, false));
+            table.row("content_held_holder_on_page", |name| carrier(name, true));
+            table.row("carrier_transfer_keeps_copy_settled", carrier_transfer);
+            table.row("settled_counted_copy_rule_five", version_five);
+            table.row("before_copy_proof_cutoff", |name| {
+                cutoff(name, "2026-11-03", true)
+            });
+            table.row("after_copy_proof_cutoff", |name| {
+                cutoff(name, "2026-11-04", true)
+            });
+            table.row("no_accepted_copy_grandfather", |name| {
+                cutoff(name, "2026-11-03", false)
+            });
+            table.row("forked_agent_root_on_page", |name| {
+                forked_agent(name, "page")
+            });
+            table.row("forked_agent_root_in_census", |name| {
+                forked_agent(name, "census")
+            });
+            table.row("forked_agent_without_witness", |name| {
+                forked_agent(name, "missing")
+            });
+            table.row("covered_only_path_has_no_body", covered_only);
+            table.row("ambiguous_copied_duplicate", ambiguous_duplicate);
+            table.row("subagent_before_request_cutoff", |name| {
+                subagent_twins(name, "2026-11-04", false)
+            });
+            table.row("subagent_after_request_cutoff", |name| {
+                subagent_twins(name, "2026-11-05", true)
+            });
+            let Table {
+                bodies,
+                inputs,
+                failures,
+                checks,
+            } = table;
+            for check in &checks {
+                println!("COPY_DECISION_CHECK {check}");
             }
             assert!(
                 failures.is_empty(),
