@@ -3060,6 +3060,41 @@ fn destination_change_requests_paced_scan_only_when_first_import_is_owed() {
     super::super::clear_cadence_state_for_test();
 }
 
+/// [regress] A destination change arms its request inside prepare, after the
+/// pass's QoS entry found nothing due. On AC the request is due at once, so
+/// the entry made again after prepare runs the pass at UTILITY.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn destination_change_request_is_entered_at_utility_in_the_same_pass() {
+    let _saved = OwnedCadences::install();
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    FAKE_QOS.with(|qos| qos.set(DEFAULT_QOS));
+    let codex = SnapshotSource::Codex;
+    let power = || PlatformState::Allowed;
+    crate::scan_clock::with_clock(1000, || {
+        with_source_cadence(codex, |c| {
+            c.record_scan_success(crate::scan_clock::now(), 0)
+        });
+        assert!(paced_source_qos(codex, power, fake_class, fake_lower).is_none());
+        assert_eq!(first_import_qos(), None, "nothing due before prepare");
+        assert!(request_on_destination_change(
+            codex,
+            "destination-switch",
+            PlatformState::Allowed,
+            || true
+        ));
+        let qos = paced_source_qos(codex, power, fake_class, fake_lower);
+        assert_eq!(fake_qos(), UTILITY);
+        assert_eq!(first_import_qos(), Some("utility"));
+        drop(qos);
+        leave_source_qos(&mut None);
+    });
+    assert_eq!(fake_qos(), DEFAULT_QOS);
+    super::super::clear_source_upload_deadlines_for_test();
+    super::super::clear_cadence_state_for_test();
+}
+
 /// [regress] A cycle that fails before rotation (credentials, machine id,
 /// witness), or skips a source, clears that source's paced request, so a
 /// past-due request cannot turn the loop into back-to-back zero waits.

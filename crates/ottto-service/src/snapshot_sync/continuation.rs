@@ -174,6 +174,18 @@ pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: Sn
         MacPlatformSignals::lowered,
     );
 }
+/// Prepare can arm this source's request itself: a destination change asks for
+/// a paced pass that is due at once on AC. When the entry before prepare found
+/// nothing to enter, enter again, so this pass's pages and finish run at its
+/// paced class.
+pub(super) fn reenter_source_qos_after_prepare(
+    slot: &mut Option<MacPlatformSignals>,
+    source: SnapshotSource,
+) {
+    if slot.is_none() && FIRST_IMPORT_QOS.get().is_none() {
+        enter_source_qos(slot, source);
+    }
+}
 /// The ordinary-owner exit seam: drop the pass's QoS and its row label.
 pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
     drop(slot.take());

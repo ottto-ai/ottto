@@ -800,7 +800,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             &self.account_witness,
             self.daemon,
         )?;
-        prepare_sync_source(
+        let frame = prepare_sync_source(
             self.client,
             self.device,
             self.device_secret,
@@ -811,7 +811,11 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.daemon,
             self.transport_cycle,
             self.account_witness,
-        )
+        )?;
+        if frame.is_some() {
+            continuation::reenter_source_qos_after_prepare(&mut self.paced_qos, source);
+        }
+        Ok(frame)
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
         ensure_snapshot_scan_authority(

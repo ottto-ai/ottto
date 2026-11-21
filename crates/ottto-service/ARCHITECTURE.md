@@ -489,7 +489,8 @@ once. Battery keeps 180 seconds at background, and steady-state AC passes keep 3
 background. A cycle that fails before rotation clears the paced requests of every source it did
 not rotate, so a past-due request cannot spin the loop. When a source first sees an
 upload destination while its first import there is owed, it requests one such paced pass at once
-instead of waiting out the tier it carried from before. The request uses the
+instead of waiting out the tier it carried from before; on AC the current pass is that pass, so
+it enters its paced class after prepare, before any page runs. The request uses the
 index after upload settlement, including a first offer's final-page conflict. Metadata-only
 retention, decode holds and unchanged held or conflicted debt grant no follow-up urgency;
 queued unblocked siblings can still advance. Terminal-unhealthy walks use the scanner's own
