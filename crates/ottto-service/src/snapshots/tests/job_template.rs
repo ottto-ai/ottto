@@ -1,6 +1,6 @@
-//! [behaviour] Synthetic vectors shared by all source readers and durable facts.
+//! [behaviour] Synthetic vectors shared by all source readers.
 use super::*;
-use crate::session_attribution::job_template;
+use crate::session_attribution::job_template::{self, JobState};
 use serde_json::{json, Value};
 
 fn apply(source: SnapshotSource, text: &str, array: bool, acc: &mut SnapshotAccumulator) {
@@ -53,12 +53,7 @@ fn job_vectors_across_readers() {
                 );
                 apply(source, v["prompt"].as_str().unwrap(), array, &mut acc);
                 acc.finish_job_template(Some(&job_template::context(7)));
-                assert_eq!(
-                    acc.job_template.as_ref().and_then(|(id, _)| id.as_deref()),
-                    v["id"].as_str(),
-                    "{}",
-                    v["name"]
-                );
+                assert_eq!(id(&acc), v["id"].as_str(), "{}", v["name"]);
                 assert!(acc.job_material.is_none());
             }
         }
@@ -77,6 +72,7 @@ fn job_rejections_and_first_task_are_terminal() {
             "# AGENTS.md instructions\n<INSTRUCTIONS>broken",
             &"a".repeat(65537),
             "short task",
+            "This session is being continued from a previous conversation with many details",
         ] {
             let mut acc = SnapshotAccumulator::new(source);
             apply(source, bad, false, &mut acc);
@@ -87,10 +83,9 @@ fn job_rejections_and_first_task_are_terminal() {
                 &mut acc,
             );
             acc.finish_job_template(Some(&job_template::context(7)));
-            assert!(acc.job_template.as_ref().unwrap().0.is_none());
+            assert_eq!(acc.job_template, Some(JobState::NoId));
         }
         for summary in [
-            "This session is being continued from a previous conversation with many details",
             "<artifact-content-authored-by-others/>",
             "[Request interrupted by user]",
             "<task-notification>task complete</task-notification>",
@@ -104,7 +99,7 @@ fn job_rejections_and_first_task_are_terminal() {
                 &mut acc,
             );
             acc.finish_job_template(Some(&job_template::context(7)));
-            assert!(acc.job_template.as_ref().unwrap().0.is_some());
+            assert!(id(&acc).is_some());
         }
     }
 }
@@ -124,15 +119,12 @@ fn job_keys_and_offline_state_do_not_reuse_another_epoch() {
     let mut rotated = SnapshotAccumulator::new(SnapshotSource::Pi);
     apply(SnapshotSource::Pi, prompt, false, &mut rotated);
     rotated.finish_job_template(Some(&job_template::context(8)));
-    assert_ne!(
-        rotated.job_template.as_ref().unwrap().0,
-        acc.job_template.as_ref().unwrap().0
-    );
+    assert_ne!(id(&rotated), id(&acc));
     let mut offline = SnapshotAccumulator::new(SnapshotSource::Pi);
     apply(SnapshotSource::Pi, prompt, false, &mut offline);
     offline.finish_job_template(None);
     offline.finish_job_template(Some(&job_template::context(7)));
-    assert!(offline.job_template.unwrap().0.is_none());
+    assert_eq!(offline.job_template, Some(JobState::NoId));
 }
 
 /// [regress] A fork's copied prompt is context; its own first task supplies the id.
@@ -156,5 +148,31 @@ fn pi_fork_uses_its_own_task() {
     acc.finish_job_template(Some(&job_template::context(7)));
     let expected = job_template::context(7)
         .opaque_id("job_template:v1", &job_template::material(prompt).unwrap());
-    assert_eq!(acc.job_template.unwrap().0, expected);
+    assert_eq!(id(&acc), expected.as_deref());
+}
+
+#[test]
+fn job_cap_measures_stripped_task_and_bounds_raw_record() {
+    let prompt = "inspect the service and explain every failure with clear evidence";
+    let wrapper = format!(
+        "<environment_context>{}</environment_context>",
+        "a".repeat(65537)
+    );
+    assert_eq!(job_template::task(&wrapper), Ok(None));
+    assert_eq!(
+        job_template::task(&format!("{wrapper}\n{prompt}")),
+        Ok(Some(prompt))
+    );
+    assert_eq!(
+        job_template::task(&format!("{wrapper}{}", "a".repeat(65537))),
+        Err("oversize")
+    );
+    assert_eq!(job_template::task(&wrapper.repeat(17)), Err("oversize"));
+}
+
+fn id(acc: &SnapshotAccumulator) -> Option<&str> {
+    match &acc.job_template {
+        Some(JobState::Id { id, .. }) => Some(id),
+        _ => None,
+    }
 }

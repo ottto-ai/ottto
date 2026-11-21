@@ -284,11 +284,6 @@ impl SnapshotAccumulator {
             attribution_facts.extend(launch_facts);
         }
         if let Some(context) = attribution_context {
-            if let Some(fact) =
-                context.job_fact(self.job_template.as_ref(), &source_session_id, collected_at)
-            {
-                attribution_facts.push(fact);
-            }
             attribution_facts.extend(
                 context.grouping_facts(
                     crate::session_attribution::SessionAttributionGroupingInput {
@@ -308,6 +303,11 @@ impl SnapshotAccumulator {
                     },
                 ),
             );
+            if let Some(fact) =
+                context.job_fact(self.job_template.as_ref(), &source_session_id, collected_at)
+            {
+                attribution_facts.push(fact);
+            }
         }
         // Unconditional: `direct_provider_facts` bounds only its own output, so
         // anything appended after it (subagent identity, grouping ids) has to be

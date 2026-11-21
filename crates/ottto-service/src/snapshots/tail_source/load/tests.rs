@@ -65,7 +65,7 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, L
         false,
     );
     let mut held = File::open(path).unwrap();
-    let fresh = super::settlement_tests::candidate(path);
+    let fresh = job_template::file_candidate(path);
     let before = counters::totals();
     let (load, records) = capture(|| {
         load::<Claude>(

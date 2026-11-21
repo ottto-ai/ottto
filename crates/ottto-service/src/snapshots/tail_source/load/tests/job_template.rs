@@ -1,47 +1,28 @@
-/// [behaviour] Save/reload keeps the derived id in its own slot, with no
-/// new prompt text. The stored head still permits an unchanged zero-byte read.
-#[test]
-fn job_survives_database_restart() {
-    use super::{loaded, read};
-    use crate::snapshots::tail_source::claude::tests::lines;
-    use crate::snapshots::tail_source::seam::tests::route;
-    let mut route = route();
-    let expected = Some((Some("hmac-sha256:v1:synthetic".into()), "epoch".into()));
-    let (tail, native) = route.complete("a.jsonl", &lines(3), None, |acc| {
-        acc.job_template = expected.clone()
-    });
-    let key = tail.key_for_test().to_owned();
-    assert!(tail.publish(&native));
-    route.save(false);
-    let (crate::snapshots::tail_source::load::Load::Reused(taken, _), _) =
-        loaded(&route, &route.dir.join("a.jsonl"), &key)
-    else {
-        panic!("head reuses");
-    };
-    assert_eq!(taken.state.finish_view().0.job_template, expected);
-    let (parser, mode, _) = read(&route, &route.dir.join("a.jsonl"), Some(taken));
-    assert!(matches!(
-        mode,
-        crate::transcript_acquisition::ReadMode::Unchanged
-    ));
-    assert_eq!(parser.reader.consumed_bytes(), 0);
-}
+use super::{loaded, read, scope, Route, NOW};
+use crate::session_attribution::job_template::{context, JobState};
+use crate::snapshots::{
+    local_index_key, state_v2,
+    tail_source::{job_update, seam::tests::route, seed_full_job_template},
+    CandidateFile, ScanIndexEntry, SnapshotAccumulator, SnapshotSource,
+};
+use std::{os::unix::fs::MetadataExt, path::Path};
 
 const TASK: &str = "inspect the service and explain every failure with clear evidence";
 
-fn job_full(
-    route: &super::Route,
-    path: &std::path::Path,
-    group_siblings: &[crate::snapshots::CandidateFile],
-) -> crate::snapshots::OwnedJsonlParser {
-    use super::super::settlement_tests::candidate;
-    use super::{scope, NOW};
-    use crate::snapshots::tail_source::seed_full_job_template;
-    use crate::transcript_acquisition::ReadMode;
-    use std::os::unix::fs::MetadataExt;
-    let mut file = candidate(path);
+pub(super) fn file_candidate(path: &Path) -> CandidateFile {
+    let mut file = super::super::settlement_tests::candidate(path);
     let metadata = std::fs::metadata(path).unwrap();
     file.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    file.fingerprint_birth_nanos = crate::transcript_acquisition::birth_unix_nanos(&metadata);
+    file
+}
+
+fn job_full(
+    route: &Route,
+    path: &Path,
+    group_siblings: &[CandidateFile],
+) -> crate::snapshots::OwnedJsonlParser {
+    use crate::transcript_acquisition::ReadMode;
     let mut parser = route.open(path);
     assert!(matches!(
         parser
@@ -49,7 +30,13 @@ fn job_full(
             .unwrap(),
         ReadMode::Full(_)
     ));
-    seed_full_job_template(&route.index, &file, group_siblings, &mut parser.accumulator);
+    seed_full_job_template(
+        &route.index,
+        &file_candidate(path),
+        group_siblings,
+        &mut parser.accumulator,
+    )
+    .unwrap();
     while !parser.step().unwrap() {}
     parser
 }
@@ -62,51 +49,79 @@ fn task_lines() -> Vec<String> {
     rows
 }
 
+fn write(path: &Path, rows: &[String]) {
+    std::fs::write(path, rows.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn job_survives_database_restart_and_unchanged_read_stages_nothing() {
+    let mut route = route();
+    let path = route.dir.join("a.jsonl");
+    write(&path, &task_lines());
+    let mut parser = job_full(&route, &path, &[]);
+    parser.accumulator.finish_job_template(Some(&context(7)));
+    let expected = parser.accumulator.job_template.clone();
+    assert!(matches!(expected, Some(JobState::Id { .. })));
+    let mut job = job_update(&file_candidate(&path), &parser.accumulator);
+    let (tail, native) = route.finish(&path, parser, None, |_| {});
+    let key = tail.key_for_test().to_owned();
+    assert!(tail.publish_with_job(&native, &mut job));
+    assert!(job.is_none());
+    route.save(false);
+    let (crate::snapshots::tail_source::load::Load::Reused(taken, _), _) =
+        loaded(&route, &path, &key)
+    else {
+        panic!("head reuses");
+    };
+    assert_eq!(taken.state.finish_view().0.job_template, expected);
+    let (parser, mode, _) = read(&route, &path, Some(taken));
+    assert!(matches!(
+        mode,
+        crate::transcript_acquisition::ReadMode::Unchanged
+    ));
+    assert_eq!(parser.reader.consumed_bytes(), 0);
+    assert!(job_update(&file_candidate(&path), &parser.accumulator).is_none());
+}
+
 #[test]
 fn indexed_legacy_run_cannot_mint_during_full() {
-    use crate::snapshots::{tail_source::seam::tests::route, ScanIndexEntry};
     let mut route = route();
     let path = route.dir.join("legacy.jsonl");
-    let (tail, native) = route.complete("legacy.jsonl", &task_lines(), None, |acc| {
-        acc.job_template = None;
-        acc.job_template_pending = false;
-    });
-    let key = tail.key_for_test().to_owned();
-    route.index.files.insert(key, ScanIndexEntry::default());
+    let (tail, native) = route.complete("legacy.jsonl", &task_lines(), None, |_| {});
+    route
+        .index
+        .files
+        .insert(tail.key_for_test().to_owned(), ScanIndexEntry::default());
     assert!(tail.publish(&native));
     route.save(false);
     let mut parser = job_full(&route, &path, &[]);
     assert!(parser.accumulator.first_prompt_material.is_some());
-    parser
-        .accumulator
-        .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
+    parser.accumulator.finish_job_template(Some(&context(7)));
     assert!(parser.accumulator.job_template.is_none());
 }
 
 #[test]
 fn terminal_offline_run_cannot_mint_during_full_after_reconnect() {
-    use crate::snapshots::{tail_source::seam::tests::route, ScanIndexEntry};
     let mut route = route();
     let path = route.dir.join("offline.jsonl");
-    let (tail, native) = route.complete("offline.jsonl", &task_lines(), None, |_| {});
-    let key = tail.key_for_test().to_owned();
-    route.index.files.insert(key, ScanIndexEntry::default());
-    assert!(tail.publish(&native));
+    write(&path, &task_lines());
+    let mut parser = job_full(&route, &path, &[]);
+    parser.accumulator.finish_job_template(None);
+    let mut job = job_update(&file_candidate(&path), &parser.accumulator);
+    let (tail, native) = route.finish(&path, parser, None, |_| {});
+    route
+        .index
+        .files
+        .insert(tail.key_for_test().to_owned(), ScanIndexEntry::default());
+    assert!(tail.publish_with_job(&native, &mut job));
     route.save(false);
     let mut parser = job_full(&route, &path, &[]);
-    parser
-        .accumulator
-        .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
-    assert_eq!(parser.accumulator.job_template, Some((None, String::new())));
+    parser.accumulator.finish_job_template(Some(&context(7)));
+    assert_eq!(parser.accumulator.job_template, Some(JobState::NoId));
 }
 
 #[test]
-fn pending_run_has_no_job_slot_and_can_mint_on_full() {
-    use crate::snapshots::{
-        state_v2::{self, Collection, JOB_TEMPLATE_PAGE},
-        tail_source::{seam::tests::route, Fact},
-        ScanIndexEntry,
-    };
+fn pending_job_keeps_waiting_across_restart() {
     let mut route = route();
     let path = route.dir.join("pending.jsonl");
     let mut rows = task_lines();
@@ -115,43 +130,38 @@ fn pending_run_has_no_job_slot_and_can_mint_on_full() {
     wrapper["message"]["content"] =
         "# AGENTS.md instructions\n<INSTRUCTIONS>rules</INSTRUCTIONS>".into();
     rows.insert(0, wrapper.to_string());
-    let (tail, native) = route.complete("pending.jsonl", &rows, None, |_| {});
+    write(&path, &rows);
+    let parser = job_full(&route, &path, &[]);
+    let mut job = job_update(&file_candidate(&path), &parser.accumulator);
+    let (tail, native) = route.finish(&path, parser, None, |_| {});
     let key = tail.key_for_test().to_owned();
     route
         .index
         .files
         .insert(key.clone(), ScanIndexEntry::default());
-    assert!(tail.publish(&native));
+    assert!(tail.publish_with_job(&native, &mut job));
     route.save(false);
-    let head = route.head(&key).unwrap();
-    assert!(head.common.job_template_pending);
-    state_v2::load_tail(&route.index, &key, &head, |collection, page, _| {
-        assert_ne!(
-            (collection, page),
-            (Collection::SessionFacts, JOB_TEMPLATE_PAGE)
-        );
-        Ok(())
-    })
-    .unwrap();
+    assert_eq!(
+        route.head(&key).unwrap().common.job.unwrap().state,
+        JobState::Pending
+    );
     rows.push(task);
-    std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+    write(&path, &rows);
     let mut parser = job_full(&route, &path, &[]);
-    parser
-        .accumulator
-        .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
-    assert!(!parser.accumulator.job_template_pending);
-    assert!(Fact::JobTemplate.present(&parser.accumulator));
-    assert!(parser.accumulator.job_template.unwrap().0.is_some());
+    parser.accumulator.finish_job_template(Some(&context(7)));
+    assert!(matches!(
+        parser.accumulator.job_template,
+        Some(JobState::Id { .. })
+    ));
 }
 
 #[test]
 fn job_binding_accepts_clamped_birth_on_the_same_inode() {
-    use super::super::settlement_tests::candidate;
     use crate::snapshots::tail_source::job_template::same_file;
-    let route = crate::snapshots::tail_source::seam::tests::route();
+    let route = route();
     let path = route.dir.join("clamped.jsonl");
     std::fs::write(&path, "").unwrap();
-    let mut file = candidate(&path);
+    let mut file = file_candidate(&path);
     file.physical_identity = Some([2, 8]);
     file.fingerprint_birth_nanos = 700;
     file.modified_unix_nanos = 700;
@@ -162,51 +172,39 @@ fn job_binding_accepts_clamped_birth_on_the_same_inode() {
 }
 
 #[test]
-fn detached_job_survives_native_full_without_a_checkpoint() {
-    use super::super::settlement_tests::candidate;
-    use crate::snapshots::{
-        state_v2,
-        tail_source::{job_template_observation, seam::tests::route},
-        ScanIndexEntry,
-    };
-    use std::os::unix::fs::MetadataExt;
+fn job_only_head_survives_full_and_checkpoint_changes_until_retirement() {
     let mut route = route();
-    let path = route.dir.join("detached.jsonl");
-    std::fs::write(&path, task_lines().join("\n") + "\n").unwrap();
-    let mut file = candidate(&path);
-    let metadata = std::fs::metadata(&path).unwrap();
-    file.physical_identity = Some([metadata.dev(), metadata.ino()]);
-    let key = crate::snapshots::local_index_key(&path);
+    let path = route.dir.join("native.jsonl");
+    write(&path, &task_lines());
+    let file = file_candidate(&path);
+    let key = local_index_key(&path);
     let mut first = job_full(&route, &path, &[]);
-    let context = crate::session_attribution::job_template::context(7);
+    let context = context(7);
     first.accumulator.finish_job_template(Some(&context));
     let expected = first.accumulator.job_template.clone().unwrap();
-    assert!(expected.0.is_some());
-    let job = job_template_observation(&file, &first.accumulator).unwrap();
-    state_v2::observe_job_template(&route.path, &key, job).unwrap();
+    assert!(matches!(expected, JobState::Id { .. }));
+    state_v2::stage_job(
+        &route.path,
+        &key,
+        job_update(&file, &first.accumulator).unwrap(),
+    )
+    .unwrap();
     route
         .index
         .files
         .insert(key.clone(), ScanIndexEntry::default());
     route.save(false);
-    assert!(route.head(&key).is_none());
+    assert!(route.head(&key).unwrap().metadata_only);
+
     let mut next = job_full(&route, &path, &[]);
     next.accumulator.finish_job_template(Some(&context));
     assert_eq!(next.accumulator.job_template, Some(expected.clone()));
-
-    // A retained checkpoint takes custody, and later dropping that checkpoint
-    // brings the decision back to the detached row.
-    let (tail, native) = route.complete("detached.jsonl", &task_lines(), None, |acc| {
-        acc.job_template = Some(expected.clone());
-        acc.job_template_pending = false;
-    });
+    assert!(job_update(&file, &next.accumulator).is_none());
+    let (tail, native) = route.finish(&path, next, None, |_| {});
     assert!(tail.publish(&native));
-    let job = job_template_observation(&file, &next.accumulator).unwrap();
-    state_v2::observe_job_template(&route.path, &key, job).unwrap();
     route.save(false);
-    assert!(state_v2::load_job_template_observation(&route.index, &key)
-        .unwrap()
-        .is_none());
+    assert!(!route.head(&key).unwrap().metadata_only);
+
     state_v2::observe_tail(
         &route.path,
         &key,
@@ -217,67 +215,118 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
     )
     .unwrap();
     route.save(false);
-    assert!(route.head(&key).is_none());
+    assert!(route.head(&key).unwrap().metadata_only);
     let mut reread = job_full(&route, &path, &[]);
     reread.accumulator.finish_job_template(Some(&context));
     assert_eq!(reread.accumulator.job_template, Some(expected));
 
-    let (heads, decisions) = state_v2::tail_custody_keys(&route.index).unwrap();
-    assert!(!heads.contains(&key));
-    assert!(decisions.contains(&key));
     route.index.files.remove(&key);
     super::super::retire_absent(
-        crate::snapshots::SnapshotSource::ClaudeCode,
+        SnapshotSource::ClaudeCode,
         &route.index,
         &Default::default(),
         &Default::default(),
     );
     route.save(false);
-    assert!(state_v2::load_job_template_observation(&route.index, &key)
-        .unwrap()
-        .is_none());
+    assert!(route.head(&key).is_none());
 }
 
 #[test]
-fn detached_pending_group_can_mint_after_its_first_task() {
-    use super::super::settlement_tests::candidate;
-    use crate::snapshots::{
-        state_v2,
-        tail_source::{job_template_observation, seam::tests::route},
-        ScanIndexEntry, SnapshotAccumulator, SnapshotSource,
-    };
-    use std::os::unix::fs::MetadataExt;
+fn job_only_pending_group_can_mint_after_its_first_task() {
     let mut route = route();
-    let path = route.dir.join("detached-pending.jsonl");
-    std::fs::write(&path, task_lines().join("\n") + "\n").unwrap();
-    let mut file = candidate(&path);
-    let metadata = std::fs::metadata(&path).unwrap();
-    file.physical_identity = Some([metadata.dev(), metadata.ino()]);
-    let key = crate::snapshots::local_index_key(&path);
+    let path = route.dir.join("pending-group.jsonl");
+    write(&path, &task_lines());
+    let key = local_index_key(&path);
     let sibling_path = route.dir.join("indexed-sibling.jsonl");
     std::fs::write(&sibling_path, "").unwrap();
-    let sibling = candidate(&sibling_path);
-    route.index.files.insert(
-        crate::snapshots::local_index_key(&sibling_path),
-        ScanIndexEntry::default(),
-    );
-    let group_siblings = [sibling];
-    let context = crate::session_attribution::job_template::context(7);
+    let group_siblings = [file_candidate(&sibling_path)];
+    route
+        .index
+        .files
+        .insert(local_index_key(&sibling_path), ScanIndexEntry::default());
+    let context = context(7);
     let mut legacy = job_full(&route, &path, &group_siblings);
     legacy.accumulator.finish_job_template(Some(&context));
     assert!(legacy.accumulator.job_template.is_none());
 
-    let pending = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    let job = job_template_observation(&file, &pending).unwrap();
-    assert!(job.fact.is_none());
-    state_v2::observe_job_template(&route.path, &key, job).unwrap();
+    let mut pending = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    pending.job_template_changed = true;
+    let job = job_update(&file_candidate(&path), &pending).unwrap();
+    state_v2::stage_job(&route.path, &key, job).unwrap();
     route
         .index
         .files
         .insert(key.clone(), ScanIndexEntry::default());
     route.save(false);
-    assert!(route.head(&key).is_none());
+    assert!(route.head(&key).unwrap().metadata_only);
     let mut parser = job_full(&route, &path, &group_siblings);
     parser.accumulator.finish_job_template(Some(&context));
-    assert!(parser.accumulator.job_template.unwrap().0.is_some());
+    assert!(matches!(
+        parser.accumulator.job_template,
+        Some(JobState::Id { .. })
+    ));
+}
+
+#[test]
+fn fresh_store_leaves_its_preexisting_history_without_jobs() {
+    let previous = route();
+    let path = previous.dir.join("history.jsonl");
+    write(&path, &task_lines());
+    let fresh = route();
+    let key = local_index_key(&path);
+    assert!(!fresh.index.files.contains_key(&key));
+    assert!(fresh.head(&key).is_none());
+    let mut parser = job_full(&fresh, &path, &[]);
+    parser.accumulator.finish_job_template(Some(&context(7)));
+    assert_eq!(parser.accumulator.job_template, Some(JobState::NoId));
+}
+
+#[test]
+fn archived_headless_codex_rollout_stays_ineligible() {
+    use crate::snapshots::scan_index_persistence::Source;
+    use crate::snapshots::tail_source::seam::tests::route_for;
+    let filesystem = route();
+    let original = filesystem.dir.join("sessions/rollout.jsonl");
+    let archive = filesystem.dir.join("archived_sessions/rollout.jsonl");
+    for path in [&original, &archive] {
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+    }
+    std::fs::write(&original, "").unwrap();
+    let born = file_candidate(&original).fingerprint_birth_nanos;
+    let mut route = route_for(Source::Codex);
+    let old = local_index_key(&original);
+    route
+        .index
+        .files
+        .insert(old.clone(), ScanIndexEntry::default());
+    route.save(false);
+    assert!(route.head(&old).is_none());
+    std::fs::rename(original, &archive).unwrap();
+    let archived = file_candidate(&archive);
+    assert_eq!(archived.fingerprint_birth_nanos, born);
+    assert!(!route.index.files.contains_key(&local_index_key(&archive)));
+
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    seed_full_job_template(&route.index, &archived, &[], &mut acc).unwrap();
+    acc.observe_job(TASK);
+    acc.finish_job_template(Some(&context(7)));
+    assert_eq!(acc.job_template, Some(JobState::NoId));
+}
+
+#[test]
+fn unavailable_job_seed_defers_an_unindexed_file() {
+    let mut route = route();
+    let path = route.dir.join("retry.jsonl");
+    write(&path, &task_lines());
+    let file = file_candidate(&path);
+    route.index.generation += 1; // no matching authenticated store generation
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    assert!(seed_full_job_template(&route.index, &file, &[], &mut acc).is_err());
+    assert!(!acc.job_pending());
+    route
+        .index
+        .files
+        .insert(local_index_key(&path), ScanIndexEntry::default());
+    seed_full_job_template(&route.index, &file, &[], &mut acc).unwrap();
+    assert!(!acc.job_pending());
 }

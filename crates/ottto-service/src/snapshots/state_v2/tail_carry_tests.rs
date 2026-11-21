@@ -26,6 +26,7 @@ fn pair(index: &mut ScanIndex) -> Result<()> {
             scan_root: PathBuf::from("/synthetic/tail"),
             head: b"rebound".to_vec(),
             inventory: facts(),
+            job: None,
         },
     )
 }

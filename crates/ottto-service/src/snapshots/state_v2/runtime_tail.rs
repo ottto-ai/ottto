@@ -1,8 +1,8 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, JobTemplateObservation, Observation, PathCarry, SetAside, SetAsideCause,
-    StagedFile, TailHead, TailStage,
+    Collection, JobUpdate, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead,
+    TailStage,
 };
 use super::*;
 
@@ -56,13 +56,9 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
-pub(in crate::snapshots) fn observe_job_template(
-    path: &Path,
-    key: &str,
-    job: JobTemplateObservation,
-) -> Result<()> {
+pub(in crate::snapshots) fn stage_job(path: &Path, key: &str, job: JobUpdate) -> Result<()> {
     with_state(path, |state| {
-        state.tail.observe_job_template(key, job);
+        state.tail.stage_job(key, job);
         Ok(())
     })
 }
@@ -184,23 +180,16 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
-pub(in crate::snapshots) fn load_job_template_observation(
-    index: &ScanIndex,
-    key: &str,
-) -> Result<Option<JobTemplateObservation>> {
-    read_txn(index, |tx| {
-        super::super::tail::load_job_template_observation(tx, key.as_bytes())
-    })
-    .map(|(job, _)| job)
-}
-
-pub(in crate::snapshots) fn load_job_template(
+/// Full admission needs no reduction pages. Bind the cutoff and common head
+/// to the same authenticated graph generation.
+pub(in crate::snapshots) fn load_job_head(
     index: &ScanIndex,
     key: &str,
     revision: u32,
-) -> Result<Option<(TailHead, Option<Vec<u8>>)>> {
+) -> Result<(Option<TailHead>, Option<u64>)> {
     read_txn_at(index, |tx, stamp| {
-        super::super::tail::load_job_template(tx, key.as_bytes(), revision, stamp.0)
+        let head = tail::load_head(tx, key.as_bytes(), revision, stamp.0)?;
+        Ok((head, kinds::job_template_since(tx)?))
     })
 }
 pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {
@@ -273,16 +262,6 @@ pub(in crate::snapshots) fn tail_route_path(
 ) -> Result<Option<std::path::PathBuf>> {
     runtime_path(index)
 }
-/// Both inventories from the same authenticated source generation.
-pub(in crate::snapshots) fn tail_custody_keys(
-    index: &ScanIndex,
-) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
-    let (keys, _) = read_txn(index, |tx| {
-        Ok((tail::head_keys(tx)?, tail::job_template_keys(tx)?))
-    })?;
-    Ok(keys)
-}
-
 /// Every key with a committed head, this route's graph generation, keys only.
 pub(in crate::snapshots) fn tail_head_keys(
     index: &ScanIndex,

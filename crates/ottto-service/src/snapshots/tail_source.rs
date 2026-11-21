@@ -53,9 +53,7 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
 }
 
 mod job_template;
-pub(in crate::snapshots) use job_template::{
-    detached_job_template, job_template_observation, seed_full_job_template,
-};
+pub(in crate::snapshots) use job_template::{job_for_carry, job_update, seed_full_job_template};
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.
@@ -843,16 +841,14 @@ enum Fact {
     AgentLabel = 4,
     /// Codex: the session-start prelude parser, with its loaded texts.
     CodexPrelude = 5,
-    JobTemplate = state_v2::JOB_TEMPLATE_PAGE as isize,
 }
-const FACTS: [Fact; 7] = [
+const FACTS: [Fact; 6] = [
     Fact::Title,
     Fact::FirstPrompt,
     Fact::Workspace,
     Fact::OpeningSettings,
     Fact::AgentLabel,
     Fact::CodexPrelude,
-    Fact::JobTemplate,
 ];
 const FACT_VERSION: u64 = 1;
 const WORKSPACE_BINDING_VERSION: u64 = 2;
@@ -868,7 +864,6 @@ crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
 impl Fact {
     fn present(self, acc: &SnapshotAccumulator) -> bool {
         match self {
-            Self::JobTemplate => acc.job_template.is_some(),
             Self::Title => acc.title.is_some(),
             Self::FirstPrompt => {
                 acc.first_prompt_material.is_some() || acc.first_prompt_title.is_some()
@@ -889,7 +884,6 @@ impl Fact {
             FACT_VERSION
         })?;
         match self {
-            Self::JobTemplate => acc.job_template.put(e),
             Self::Title => acc.title.put(e),
             Self::FirstPrompt => {
                 acc.first_prompt_material.put(e)?;
@@ -939,16 +933,6 @@ impl Fact {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
         match fact {
-            Self::JobTemplate => {
-                let job = <Option<(Option<String>, String)> as Durable>::take(&mut d)?;
-                d.finish()?;
-                let Some(job) = job else {
-                    return Err(ReconstructCause::Corrupt);
-                };
-                into.job_template = Some(job);
-                into.job_template_pending = false;
-                return Ok(());
-            }
             Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
             Self::FirstPrompt => {
                 into.first_prompt_material = <Option<String> as Durable>::take(&mut d)?;
@@ -1072,8 +1056,8 @@ head_fields! {
         N title_source: Option<String>,
         X first_prompt_title: Option<String>,
         X first_prompt_material: Option<String>,
-        I job_template: Option<(Option<String>, String)>,
-        I job_template_pending: bool,
+        I job_template: Option<crate::session_attribution::job_template::JobState>,
+        I job_template_changed: bool,
         I job_material: Option<String>,
         N provider_skills: BTreeSet<String>,
         N started_at: Option<String>,

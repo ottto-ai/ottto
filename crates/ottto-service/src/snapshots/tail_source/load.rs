@@ -157,10 +157,9 @@ pub(in crate::snapshots) fn retire_absent(
         return;
     };
     let revision = super::reduction_revision(source);
-    let Ok((mut absent, job_keys)) = state_v2::tail_custody_keys(index) else {
+    let Ok(mut absent) = state_v2::tail_head_keys(index) else {
         return;
     };
-    absent.extend(job_keys.iter().cloned());
     absent.retain(|key| {
         !observed.contains(key) && !residue.contains(key) && !index.files.contains_key(key)
     });
@@ -173,7 +172,7 @@ pub(in crate::snapshots) fn retire_absent(
                     && head.table.contains_key(&state_v2::Collection::Revisions) =>
             {
                 kept_debt += 1;
-                if job_keys.contains(&key) {
+                if head.common.job.is_some() || head.job_corrupt {
                     retire.insert(key);
                 }
             }
@@ -434,8 +433,6 @@ fn stored<S: TailSource>(
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
     let mut base = TailBase::new(&head.body);
-    base.job_template_pending = head.common.job_template_pending;
-    acc.job_template_pending = head.common.job_template_pending;
     let mut failed = None;
     let mut page_bytes = 0u64;
     let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
@@ -465,8 +462,7 @@ fn stored<S: TailSource>(
         .map(|(c, m)| (*c, m.meta))
         .collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
-    super::job_template::restore_job_template_observation(index, key, fresh, &mut acc)
-        .map_err(|_| Miss::Unreadable)?;
+    super::job_template::restore_job(&head, fresh, &mut acc);
     S::install_live(&mut acc, fresh, live).map_err(|error| match error {
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),

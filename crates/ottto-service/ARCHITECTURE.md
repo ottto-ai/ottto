@@ -763,10 +763,12 @@ titles. Balanced leading envelopes are stripped, volatile values are masked, and
 the first 30 and last 60 whitespace words are HMACed with the attribution key.
 Only tasks with eight non-placeholder words and at most 64 KiB qualify. Equal
 windows can identify different middle tasks; this is inferred grouping evidence.
-The id and key epoch, or a terminal no-id decision, are stored in SessionFacts
-kind 6. A new run waiting for its first task keeps only an eligibility bit in
-its Tail head. Publication without a retained checkpoint keeps the job decision
-or pending eligibility in a file-owned Tail row. Full reads carry that state
-forward for the same file and leave indexed legacy runs ineligible. No new prompt text is persisted for this
-id. Catalogue layout 9 fences older readers at source load before either Tail
-format extension can be published.
+A single file-bound field in the common Tail head stores pending eligibility,
+a terminal no-id decision, or the identifier and key epoch. It survives native
+Full reads and publication without a continuation checkpoint, including Codex
+archives, and follows a proven path carry. Retirement and scope erasure remove
+it. Indexed legacy runs have no eligibility. Unindexed files qualify only with
+a known file birth time at or after the store's first layout 9 write. Layout 9
+fences older readers at source load, before any head can be rewritten. The
+attribution key must be available when a qualifying task is first decided. A
+rotated key suppresses ids from the previous epoch. No new prompt text persists.

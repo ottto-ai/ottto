@@ -307,6 +307,11 @@ impl ScanIndex {
                 scan_root: candidate.scan_root.clone(),
                 head: rebound,
                 inventory,
+                job: tail_source::job_for_carry(
+                    head,
+                    stamp.parts().1,
+                    crate::transcript_acquisition::birth_unix_nanos(&metadata),
+                ),
             },
         )?;
         if let Some((cache, namespace)) = sampling {

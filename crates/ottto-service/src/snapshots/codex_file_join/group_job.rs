@@ -787,7 +787,8 @@ impl GroupBoot {
             &first,
             &members[1..],
             &mut parser.accumulator,
-        );
+        )
+        .map_err(|_| GroupEnd::Unavailable)?;
         let mut join = Box::new(if independent {
             StreamProof::independent(group.owner.clone(), members.len())
         } else {
@@ -902,7 +903,7 @@ pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) consumed_before: u64,
     pub(in crate::snapshots) independent: bool,
     pub(in crate::snapshots) contributions: Vec<SnapshotItem>,
-    pub(in crate::snapshots) job_template: Option<state_v2::JobTemplateObservation>,
+    pub(in crate::snapshots) job_template: Option<state_v2::JobUpdate>,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, lines,
@@ -1202,7 +1203,7 @@ fn independent_member_eof(
     input.close();
     let mut parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
     // The original member supplies the folded session's attribution.
-    parser.accumulator.job_template_pending = false;
+    parser.accumulator.job_template = None;
     let mut old = std::mem::replace(&mut active.parser, parser);
     active
         .parser
@@ -1213,7 +1214,7 @@ fn independent_member_eof(
     let mut job_template = None;
     let mut capture_job = |view: PreFinalization<'_>| {
         if group.current == 0 {
-            job_template = tail_source::job_template_observation(&member, view.accumulator);
+            job_template = tail_source::job_update(&member, view.accumulator);
         }
     };
     let mut parsed = old

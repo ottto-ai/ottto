@@ -592,28 +592,37 @@ fn exit_commit_moves_g_and_fences_stale_siblings() {
 }
 
 /// Layout 8 readers refuse the whole source after either publication path
-/// writes the job fact. The refused load leaves the committed rows intact.
+/// writes the new layout. The refused load leaves the committed rows intact.
 #[test]
-fn job_fact_publication_fences_layout_eight_readers() {
+fn job_publication_fences_layout_eight_readers() {
     use crate::snapshots::{scan_index_health, SnapshotSource};
     let source = SnapshotSource::ClaudeCode;
     for exit in [false, true] {
         let f = Fixture::new();
         f.published();
         let mut index = load_with(&f.path, false).unwrap().unwrap();
-        with_session_db(&index, |db| db.control("catalogue_layout", &8_u32).unwrap());
+        with_session_db(&index, |db| {
+            db.control("catalogue_layout", &8_u32).unwrap();
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            tx.delete(&RowKey::Meta("job_template_since".into()))
+                .unwrap();
+            assert!(
+                matches!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(n) if n == G + 1)
+            );
+        });
         // Load the layout-8 baseline so the graph-save case must publish its upgrade.
         index = load_with(&f.path, false).unwrap().unwrap();
-        let page = (Collection::SessionFacts, tail::JOB_TEMPLATE_PAGE);
-        let fact = b"synthetic kind-six page";
-        stage_tail(&f.path, FILE, staged(b"head", &[(page.0, page.1, fact)])).unwrap();
+        stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
         if exit {
             BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
         } else {
             save_with(&f.path, &mut index).unwrap();
         }
+        let mut since = None;
         with_session_db(&index, |db| {
             assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(9));
+            since = db.read_control::<u64>("job_template_since").unwrap();
+            assert!(since.is_some_and(|nanos| nanos > 0));
         });
         let previous = mapper::MAX_CATALOGUE_LAYOUT.replace(8);
         let refused = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support);
@@ -623,10 +632,15 @@ fn job_fact_publication_fences_layout_eight_readers() {
             .chain()
             .any(|cause| cause.downcast_ref::<Hold>() == Some(&Hold::Future)));
         assert!(scan_index_health::current(source).is_some());
-        let reloaded = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
+        let mut reloaded =
+            ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
         assert!(scan_index_health::current(source).is_none());
-        assert_eq!(reloaded.generation, G + 1);
-        assert_eq!(read(&reloaded, FILE).unwrap().1[&page], fact);
+        assert_eq!(reloaded.generation, G + 2);
+        assert_eq!(read(&reloaded, FILE).unwrap().0.unwrap().body, b"head");
+        save_with(&f.path, &mut reloaded).unwrap();
+        with_session_db(&reloaded, |db| {
+            assert_eq!(db.read_control::<u64>("job_template_since").unwrap(), since);
+        });
     }
 }
 
@@ -1001,6 +1015,48 @@ fn debt_survives_reset_and_retire_until_settled() {
         let error = tail::decode_head(&newer).err().unwrap();
         assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "{at}");
     }
+}
+
+#[test]
+fn malformed_job_state_can_be_cleared_without_replacing_the_reduction() {
+    use super::super::tail::{FileJob, JobUpdate};
+    use crate::session_attribution::job_template::JobState;
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    let body = b"existing reduction";
+    let common = Common {
+        job: Some(FileJob {
+            inode: 11,
+            birth_nanos: 12,
+            state: JobState::Pending,
+        }),
+        ..Default::default()
+    };
+    let mut head = tail::encode_head(REVISION, &Default::default(), &common, Some(body)).unwrap();
+    head[31 + 16] = 255; // invalid decision tag, inside the optional slot
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &mapper::key("tail.head", FILE, 0).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &head,
+        })
+        .unwrap();
+        assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+    });
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let loaded = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(loaded.body, body);
+    assert!(loaded.job_corrupt);
+    assert!(loaded.common.job.is_none());
+    super::tail_route::stage_job(&f.path, FILE, JobUpdate::Clear).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let cleared = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(cleared.body, body);
+    assert!(!cleared.job_corrupt);
+    assert!(cleared.common.job.is_none());
 }
 
 /// [behaviour] Only a Tail head holds a reduction: neither side of the codec

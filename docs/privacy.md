@@ -280,7 +280,8 @@ reclassified as human activity.
 
 Job grouping also uses a tenant-keyed HMAC of the masked first qualifying human
 task, separately from its display title. Only the opaque identifier is uploaded;
-the masked words are temporary local memory.
+the masked words are temporary local memory. The server issues the tenant key and
+can use it to confirm a task it already knows.
 
 Upload settings apply going forward. Turning a setting on applies to sessions
 that are active after it is turned on: a session that has already ended keeps

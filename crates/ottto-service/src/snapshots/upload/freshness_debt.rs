@@ -920,10 +920,9 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
     if walk.unavailable {
         return Report::UNAVAILABLE;
     }
-    let Ok((mut keys, job_keys)) = state_v2::tail_custody_keys(index) else {
+    let Ok(keys) = state_v2::tail_head_keys(index) else {
         return Report::UNAVAILABLE;
     };
-    keys.extend(job_keys);
     let complete = walk.started_at.filter(|_| !walk.incomplete);
     let mut report = walk.sums;
     let mut gone = Vec::new();

@@ -7,6 +7,7 @@
 //! only: a head never grants acceptance, census or Full-verification credit.
 use super::super::sampled_scan::codex_cursor::ContentStamp;
 use super::*;
+use crate::session_attribution::{job_template::JobState, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use anyhow::{bail, ensure, Context};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +19,6 @@ const HEADER_PAGE: usize = 128;
 const HEAD: &str = "tail.head";
 const FRAG: &str = "tail.frag";
 const SET_ASIDE: &str = "tail.set_aside";
-const JOB_TEMPLATE: &str = "tail.job_template";
 /// The row holds the logical value itself.
 const INLINE: u32 = 1;
 /// The row holds (length, fragment count, SHA-256); `tail.frag` holds the bytes.
@@ -127,7 +127,7 @@ pub(in crate::snapshots) enum Change {
 /// One file's staged state: its complete new head and only its changed pages.
 #[derive(Default)]
 pub(in crate::snapshots) struct StagedFile {
-    pub(in crate::snapshots) job_template_pending: bool,
+    pub(in crate::snapshots) job: Option<JobUpdate>,
     pub(in crate::snapshots) revision: u32,
     pub(in crate::snapshots) head: Vec<u8>,
     pub(in crate::snapshots) collections: BTreeMap<Collection, CollectionMeta>,
@@ -214,7 +214,7 @@ pub(in crate::snapshots) struct InventoryFacts {
 /// The versioned common head body; the source's reduction follows it, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::snapshots) struct Common {
-    pub(in crate::snapshots) job_template_pending: bool,
+    pub(in crate::snapshots) job: Option<FileJob>,
     pub(in crate::snapshots) representation: Representation,
     pub(in crate::snapshots) debt: DebtSummary,
     /// The next revision id; ids are never reused, even after deletion.
@@ -251,19 +251,35 @@ impl Observation {
                 .map_or(0, |facts| facts.owner.len() as u64)
     }
 }
-/// A published first-task decision even when acquisition retained no reduction.
-#[derive(Debug, Serialize, Deserialize)]
-pub(in crate::snapshots) struct JobTemplateObservation {
+/// A first-task decision bound to the native file, independent of its reduction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct FileJob {
     pub(in crate::snapshots) inode: u64,
     pub(in crate::snapshots) birth_nanos: u64,
-    /// The same kind-6 payload as a reduction's job slot. Absence is pending.
-    pub(in crate::snapshots) fact: Option<Vec<u8>>,
+    pub(in crate::snapshots) state: JobState,
 }
-crate::heap_layout_bound::fields!(JobTemplateObservation; inode, birth_nanos, fact);
+crate::heap_layout_bound::fields!(FileJob; inode, birth_nanos, state);
 
-enum Entry {
-    File(StagedFile),
-    Failed(SetAsideCause),
+#[derive(Clone)]
+pub(in crate::snapshots) enum JobUpdate {
+    Set(FileJob),
+    Clear,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for JobUpdate {
+    const STABLE_HEAP: bool = true;
+
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Set(job) => crate::heap_layout_bound::HeapLayoutBound::heap_bound(job, c),
+            Self::Clear => Some(()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Entry {
+    checkpoint: Option<Result<StagedFile, SetAsideCause>>,
+    job: Option<JobUpdate>,
 }
 /// This pass's unsaved Tail state for one route. It stays outside `ScanIndex`,
 /// so subset graphs and clones can neither drop nor duplicate it.
@@ -271,7 +287,6 @@ enum Entry {
 pub(super) struct TailStage {
     files: BTreeMap<Vec<u8>, Entry>,
     debt: BTreeMap<Vec<u8>, Observation>,
-    job_templates: BTreeMap<Vec<u8>, JobTemplateObservation>,
     retire: BTreeSet<Vec<u8>>,
     erase: BTreeSet<Vec<u8>>,
     peak_bytes: u64,
@@ -284,6 +299,7 @@ pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) scan_root: std::path::PathBuf,
     pub(in crate::snapshots) head: Vec<u8>,
     pub(in crate::snapshots) inventory: InventoryFacts,
+    pub(in crate::snapshots) job: Option<FileJob>,
 }
 pub(super) enum EffectiveHead {
     Removed,
@@ -295,7 +311,10 @@ impl TailStage {
         let bytes = key.as_bytes();
         if self.retire.contains(bytes)
             || self.erase.contains(bytes)
-            || matches!(self.files.get(bytes), Some(Entry::Failed(_)))
+            || self
+                .files
+                .get(bytes)
+                .is_some_and(|entry| matches!(entry.checkpoint, Some(Err(_))))
             || matches!(self.debt.get(bytes), Some(o) if o.representation != Representation::Tail)
         {
             EffectiveHead::Removed
@@ -310,7 +329,6 @@ impl TailStage {
         self.files
             .keys()
             .chain(self.debt.keys())
-            .chain(self.job_templates.keys())
             .chain(&self.retire)
             .chain(&self.erase)
     }
@@ -322,7 +340,6 @@ impl TailStage {
                 && [from, to.as_slice()]
                     .iter()
                     .all(|key| !self.files.contains_key(*key)
-                        && !self.job_templates.contains_key(*key)
                         && !self.retire.contains(*key)
                         && !self.erase.contains(*key)),
             "state_v2_tail_carry_conflict"
@@ -339,20 +356,23 @@ impl TailStage {
     }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
     pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
-        match self.files.get(key.as_bytes()) {
-            Some(Entry::File(file)) => Some((file.revision, file.head.clone())),
-            _ => None,
-        }
+        let file = self
+            .files
+            .get(key.as_bytes())?
+            .checkpoint
+            .as_ref()?
+            .as_ref()
+            .ok()?;
+        Some((file.revision, file.head.clone()))
     }
     pub(super) fn is_empty(&self) -> bool {
         self.files.is_empty()
             && self.debt.is_empty()
-            && self.job_templates.is_empty()
             && self.retire.is_empty()
             && self.erase.is_empty()
     }
-    pub(super) fn observe_job_template(&mut self, key: &str, job: JobTemplateObservation) {
-        self.job_templates.insert(key.as_bytes().to_vec(), job);
+    pub(super) fn stage_job(&mut self, key: &str, job: JobUpdate) {
+        self.files.entry(key.as_bytes().to_vec()).or_default().job = Some(job);
         self.report();
     }
     pub(super) fn observe(&mut self, key: &str, observation: Observation) {
@@ -400,7 +420,6 @@ impl TailStage {
             )
             .min();
         self.files.remove(&key);
-        self.job_templates.remove(&key);
         self.retire.remove(&key);
         (
             self.erase.insert(key) && (committed.0 || staged_debt),
@@ -414,15 +433,21 @@ impl TailStage {
         if file.change == Change::Reset {
             self.retire.remove(&key);
         }
-        if let Some(Entry::File(prior)) = self.files.remove(&key) {
+        let entry = self.files.entry(key).or_default();
+        if let Some(job) = file.job.take() {
+            entry.job = Some(job);
+        }
+        if let Some(Ok(prior)) = entry.checkpoint.take() {
             file.absorb(prior);
         }
-        self.files.insert(key, Entry::File(file));
+        entry.checkpoint = Some(Ok(file));
         self.report();
     }
     pub(super) fn set_aside(&mut self, key: &str, cause: SetAsideCause) {
         self.files
-            .insert(key.as_bytes().to_vec(), Entry::Failed(cause));
+            .entry(key.as_bytes().to_vec())
+            .or_default()
+            .checkpoint = Some(Err(cause));
         self.report();
     }
     /// `keys` must be authoritative: the files are absent, or their stored
@@ -430,48 +455,43 @@ impl TailStage {
     pub(super) fn retire(&mut self, keys: impl IntoIterator<Item = String>) {
         for key in keys.into_iter().map(String::into_bytes) {
             self.files.remove(&key);
-            self.job_templates.remove(&key);
             self.retire.insert(key);
         }
     }
     /// Drops the heads staged for `keys`; set-asides and debt stay.
     pub(super) fn unstage(&mut self, keys: impl IntoIterator<Item = String>) {
-        for key in keys.into_iter().map(String::into_bytes) {
-            self.job_templates.remove(&key);
-            if matches!(self.files.get(&key), Some(Entry::File(_))) {
-                self.files.remove(&key);
+        for key in keys {
+            if let Some(entry) = self.files.get_mut(key.as_bytes()) {
+                if matches!(entry.checkpoint, Some(Err(_))) {
+                    entry.job = None;
+                } else {
+                    self.files.remove(key.as_bytes());
+                }
             }
         }
     }
-    /// Files staged with their complete new state.
+    /// Files with a reduction or metadata staged in their graph closure.
     pub(super) fn staged(&self) -> impl Iterator<Item = &Vec<u8>> {
-        self.files
-            .iter()
-            .filter_map(|(key, entry)| matches!(entry, Entry::File(_)).then_some(key))
-            .chain(self.job_templates.keys())
+        self.files.iter().filter_map(|(key, entry)| {
+            (matches!(entry.checkpoint, Some(Ok(_))) || entry.job.is_some()).then_some(key)
+        })
     }
     pub(super) fn bytes(&self) -> u64 {
         let debt = self
             .debt
             .values()
             .fold(0, |sum, observation| sum + observation.bytes());
-        let job_bytes = self
-            .job_templates
-            .values()
-            .map(|job| {
-                size_of::<JobTemplateObservation>() as u64
-                    + job.fact.as_ref().map_or(0, |fact| fact.len() as u64)
-            })
-            .sum::<u64>();
-        self.files
-            .values()
-            .fold(debt + job_bytes, |sum, entry| match entry {
-                Entry::File(file) => sum + file.bytes(),
-                Entry::Failed(_) => sum,
-            })
+        self.files.values().fold(debt, |sum, entry| {
+            sum + entry.job.as_ref().map_or(0, |_| JOB_BYTES as u64)
+                + entry
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|c| c.as_ref().ok())
+                    .map_or(0, StagedFile::bytes)
+        })
     }
     pub(super) fn files(&self) -> usize {
-        self.files.len() + self.debt.len() + self.job_templates.len()
+        self.files.len() + self.debt.len()
     }
     fn report(&mut self) {
         let bytes = self.bytes();
@@ -650,8 +670,67 @@ const ENVELOPE: u8 = 1;
 /// The envelope's last code, before the optional parts it announces.
 const HAS_REDUCTION: u8 = 1;
 const HAS_INVENTORY: u8 = 2;
-const JOB_TEMPLATE_PENDING: u8 = 4;
-pub(in crate::snapshots) const JOB_TEMPLATE_PAGE: u64 = 6;
+const HAS_JOB: u8 = 4;
+const JOB_ID_BYTES: usize = SESSION_ATTRIBUTION_HMAC_KEY_VERSION.len() + 1 + 43;
+const JOB_EPOCH_BYTES: usize = 16;
+const JOB_BYTES: usize = 17 + JOB_ID_BYTES + JOB_EPOCH_BYTES;
+
+// The fixed extent lets a damaged optional decision be dropped without losing
+// the reduction following it. Absent job state keeps the old envelope bytes.
+fn encode_job(job: &FileJob) -> Result<[u8; JOB_BYTES]> {
+    let mut out = [0; JOB_BYTES];
+    out[..8].copy_from_slice(&job.inode.to_be_bytes());
+    out[8..16].copy_from_slice(&job.birth_nanos.to_be_bytes());
+    out[16] = match &job.state {
+        JobState::Pending => 1,
+        JobState::NoId => 2,
+        JobState::Id { id, epoch } => {
+            ensure!(
+                id.len() == JOB_ID_BYTES && epoch.len() == JOB_EPOCH_BYTES,
+                "state_v2_tail_job_shape"
+            );
+            out[17..17 + JOB_ID_BYTES].copy_from_slice(id.as_bytes());
+            out[17 + JOB_ID_BYTES..].copy_from_slice(epoch.as_bytes());
+            3
+        }
+    };
+    Ok(out)
+}
+
+fn decode_job(bytes: [u8; JOB_BYTES]) -> Option<FileJob> {
+    let inode = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    let birth_nanos = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    let state = match bytes[16] {
+        1 if bytes[17..].iter().all(|byte| *byte == 0) => JobState::Pending,
+        2 if bytes[17..].iter().all(|byte| *byte == 0) => JobState::NoId,
+        3 => {
+            let id = std::str::from_utf8(&bytes[17..17 + JOB_ID_BYTES]).ok()?;
+            let epoch = std::str::from_utf8(&bytes[17 + JOB_ID_BYTES..]).ok()?;
+            let token = id
+                .strip_prefix(SESSION_ATTRIBUTION_HMAC_KEY_VERSION)?
+                .strip_prefix(':')?;
+            if !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !epoch
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return None;
+            }
+            JobState::Id {
+                id: id.to_owned(),
+                epoch: epoch.to_owned(),
+            }
+        }
+        _ => return None,
+    };
+    Some(FileJob {
+        inode,
+        birth_nanos,
+        state,
+    })
+}
 /// Only a Tail head holds a reduction, whichever way the head is crossing.
 fn check_shape(representation: Representation, has_reduction: bool) -> Result<()> {
     ensure!(
@@ -726,10 +805,13 @@ pub(super) fn encode_head(
     out.push(debt.disposition.map_or(0, |d| d as u8));
     let parts = u8::from(reduction.is_some()) * HAS_REDUCTION
         + u8::from(common.inventory.is_some()) * HAS_INVENTORY
-        + u8::from(reduction.is_some() && common.job_template_pending) * JOB_TEMPLATE_PENDING;
+        + u8::from(common.job.is_some()) * HAS_JOB;
     out.push(parts);
     if let Some(facts) = &common.inventory {
         encode_inventory(&mut out, facts)?;
+    }
+    if let Some(job) = &common.job {
+        out.extend_from_slice(&encode_job(job)?);
     }
     out.extend_from_slice(body);
     Ok(out)
@@ -744,6 +826,7 @@ pub(in crate::snapshots) struct TailHead {
     /// The source's reduction; empty when `metadata_only`.
     pub(in crate::snapshots) body: Vec<u8>,
     pub(in crate::snapshots) common: Common,
+    pub(in crate::snapshots) job_corrupt: bool,
     /// No reduction: never loadable, no parser restore, and no Skip, floor,
     /// census or Full credit. Acquire as for a missing checkpoint.
     pub(in crate::snapshots) metadata_only: bool,
@@ -753,6 +836,7 @@ pub(super) struct Decoded {
     revision: u32,
     table: MembershipTable,
     pub(super) common: Common,
+    job_corrupt: bool,
     reduction: Option<Vec<u8>>,
 }
 /// A code above `max` was written by a newer build: hold, never default.
@@ -811,19 +895,20 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
             _ => Some(NoUploadRequired::ZeroTokens),
         },
     };
-    let parts = code(
-        &mut input,
-        HAS_REDUCTION | HAS_INVENTORY | JOB_TEMPLATE_PENDING,
-    )?;
+    let parts = code(&mut input, HAS_REDUCTION | HAS_INVENTORY | HAS_JOB)?;
     let inventory = (parts & HAS_INVENTORY != 0)
         .then(|| decode_inventory(&mut input))
         .transpose()?;
     let has_reduction = parts & HAS_REDUCTION != 0;
-    let job_template_pending = parts & JOB_TEMPLATE_PENDING != 0;
-    ensure!(
-        !job_template_pending || has_reduction,
-        "state_v2_tail_value_shape"
-    );
+    let job = if parts & HAS_JOB == 0 {
+        None
+    } else if !has_reduction && input.0.len() < JOB_BYTES {
+        input.0 = &[];
+        None
+    } else {
+        decode_job(input.take()?)
+    };
+    let job_corrupt = parts & HAS_JOB != 0 && job.is_none();
     check_shape(representation, has_reduction)?;
     let reduction = has_reduction.then(|| input.0.to_vec());
     ensure!(
@@ -834,13 +919,14 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         revision,
         table,
         common: Common {
-            job_template_pending,
+            job,
             representation,
             debt,
             next_revision_id,
             inventory,
         },
         reduction,
+        job_corrupt,
     })
 }
 fn read_head(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<Decoded>> {
@@ -869,49 +955,10 @@ pub(super) fn load_head(
         metadata_only: head.reduction.is_none(),
         body: head.reduction.unwrap_or_default(),
         common: head.common,
+        job_corrupt: head.job_corrupt,
         generation,
     }))
 }
-pub(super) fn load_job_template_observation(
-    tx: &mut dyn Transaction,
-    file: &[u8],
-) -> Result<Option<JobTemplateObservation>> {
-    let key = row(JOB_TEMPLATE, file, 0)?;
-    tx.get(&key)?
-        .map(|header| Ok(serde_json::from_slice(&read_inline(tx, &header)?)?))
-        .transpose()
-}
-
-/// Only the job slot for a Full read; the caller binds the returned head to
-/// the opened file. No display prompt or other source page is read.
-pub(super) fn load_job_template(
-    tx: &mut dyn Transaction,
-    file: &[u8],
-    revision: u32,
-    generation: u64,
-) -> Result<Option<(TailHead, Option<Vec<u8>>)>> {
-    let Some(head) = load_head(tx, file, revision, generation)? else {
-        return Ok(None);
-    };
-    if head.metadata_only {
-        return Ok(None);
-    }
-    let collection = Collection::SessionFacts;
-    let page = JOB_TEMPLATE_PAGE;
-    let key = row(collection.kind(), file, page)?;
-    let fact = tx
-        .get(&key)?
-        .map(|header| {
-            ensure!(
-                head.table.contains_key(&collection),
-                "state_v2_tail_membership"
-            );
-            read_inline(tx, &header)
-        })
-        .transpose()?;
-    Ok(Some((head, fact)))
-}
-
 /// `head`'s reduction pages in one read snapshot, one page at a time: `visit`
 /// owns each page's bytes as it goes and must discard them all on `Err`. A
 /// metadata-only head refuses before any page. A later generation is
@@ -985,13 +1032,7 @@ fn stream(
 /// Every file with a committed head, from row headers alone; no value is read.
 /// Absence authority, so any failure is an error and never a partial set.
 pub(super) fn head_keys(tx: &mut dyn Transaction) -> Result<BTreeSet<String>> {
-    file_keys(tx, HEAD)
-}
-pub(super) fn job_template_keys(tx: &mut dyn Transaction) -> Result<BTreeSet<String>> {
-    file_keys(tx, JOB_TEMPLATE)
-}
-fn file_keys(tx: &mut dyn Transaction, kind: &str) -> Result<BTreeSet<String>> {
-    let kind = RecordKind::parse(kind)?;
+    let kind = RecordKind::parse(HEAD)?;
     let (mut keys, mut after) = (BTreeSet::new(), None);
     loop {
         let rows = tx.scan_kind(&kind, after.as_ref(), HEADER_PAGE)?;
@@ -1030,9 +1071,10 @@ const REVISION: &str = "tail.revision";
 /// are removed by retirement or scope erasure, not checkpoint replacement.
 /// With `keep_debt`, revisions and their fragments also stay.
 fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result<()> {
-    for name in catalogue::TAIL_KINDS.iter().filter(|k| {
-        !(matches!(**k, SET_ASIDE | FRAG | JOB_TEMPLATE) || keep_debt && **k == REVISION)
-    }) {
+    for name in catalogue::TAIL_KINDS
+        .iter()
+        .filter(|k| !(matches!(**k, SET_ASIDE | FRAG) || keep_debt && **k == REVISION))
+    {
         let kind = RecordKind::parse(name)?;
         loop {
             let rows = tx.scan_record_key(&kind, file, None, HEADER_PAGE)?;
@@ -1182,72 +1224,15 @@ fn observe(
     }
     Ok(observation.added.len() as u64)
 }
-fn require_job_template_layout(tx: &mut dyn Transaction) -> Result<()> {
-    let layout = mapper::layout(tx)?;
-    // A Tail-only save may raise a layout-8 graph: layout 9 adds no
-    // graph roots. Older graphs need their normal graph upgrade first.
-    if layout == catalogue::JOB_TEMPLATE_LAYOUT - 1 {
-        mapper::put(
-            tx,
-            &RowKey::Meta("catalogue_layout".into()),
-            &catalogue::JOB_TEMPLATE_LAYOUT,
-        )?;
-    } else {
-        ensure!(
-            layout >= catalogue::JOB_TEMPLATE_LAYOUT,
-            "state_v2_job_template_layout"
-        );
-    }
-    Ok(())
-}
-
-fn terminal_job_slot(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<Vec<u8>>> {
-    let key = row(Collection::SessionFacts.kind(), file, JOB_TEMPLATE_PAGE)?;
-    tx.get(&key)?
-        .map(|header| read_inline(tx, &header))
-        .transpose()
-}
-
-fn write_job_template_observation(
-    tx: &mut dyn Transaction,
-    file: &[u8],
-    job: &JobTemplateObservation,
-) -> Result<()> {
-    let key = row(JOB_TEMPLATE, file, 0)?;
-    let head = read_head(tx, file)?;
-    let reduction_has_job = match head {
-        Some(head) if head.reduction.is_some() => match &job.fact {
-            None => head.common.job_template_pending,
-            Some(fact) => terminal_job_slot(tx, file)?.as_ref() == Some(fact),
-        },
-        _ => false,
-    };
-    if reduction_has_job {
-        if let Some(old) = tx.get(&key)? {
-            purge(tx, vec![old])?;
-        }
-    } else {
-        require_job_template_layout(tx)?;
-        let value = serde_json::to_vec(job)?;
-        if let Some(old) = tx.get(&key)? {
-            if read_inline(tx, &old)? == value {
-                return Ok(());
-            }
-            tx.mark_erasure(false)?;
-        }
-        put_inline(tx, &key, &value)?;
-    }
-    Ok(())
-}
-
 /// Replace one file's reduction and apply its debt changes, adjusting membership
 /// from row headers alone: no other page is read. A head with no reduction, debt
-/// or inventory goes. Only a reduction replacement clears the set-aside marker.
+/// inventory or job state goes. Only a reduction replacement clears the set-aside marker.
 fn write_file(
     tx: &mut dyn Transaction,
     file: &[u8],
     staged: Option<&StagedFile>,
     debt: Option<&Observation>,
+    job: Option<&JobUpdate>,
 ) -> Result<Applied> {
     let reset = staged.is_some_and(|staged| staged.change == Change::Reset);
     let (mut revision, mut table, mut common, mut reduction) = if reset {
@@ -1266,13 +1251,6 @@ fn write_file(
         ..Default::default()
     };
     if let Some(staged) = staged {
-        if staged.job_template_pending
-            || staged
-                .pages
-                .contains_key(&(Collection::SessionFacts, JOB_TEMPLATE_PAGE))
-        {
-            require_job_template_layout(tx)?;
-        }
         let named = staged
             .collections
             .keys()
@@ -1332,7 +1310,6 @@ fn write_file(
             );
             applied.page_bytes += value.len() as u64;
         }
-        common.job_template_pending = staged.job_template_pending;
         revision = staged.revision;
         reduction = Some(staged.head.clone());
         common.representation = Representation::Tail;
@@ -1341,19 +1318,10 @@ fn write_file(
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
     }
     // No longer a Tail file: the reduction and its pages go, the debt stays.
-    if let Some(body) = reduction.take_if(|_| common.representation != Representation::Tail) {
-        let job_key = row(JOB_TEMPLATE, file, 0)?;
-        if tx.get(&job_key)?.is_none() {
-            let fact = terminal_job_slot(tx, file)?;
-            if let Some(job) = super::super::tail_source::detached_job_template(
-                &body,
-                fact,
-                common.job_template_pending,
-            )? {
-                require_job_template_layout(tx)?;
-                put_inline(tx, &job_key, &serde_json::to_vec(&job)?)?;
-            }
-        }
+    if reduction
+        .take_if(|_| common.representation != Representation::Tail)
+        .is_some()
+    {
         table.retain(|collection, _| *collection == Collection::Revisions);
         delete_rows(tx, file, true)?;
     }
@@ -1366,9 +1334,21 @@ fn write_file(
     {
         table.remove(&Collection::Revisions);
     }
+    if let Some(job) = job {
+        // Replacing a private opaque id (including clearing it) owes erasure,
+        // just as removal of the reduction pages does.
+        if common.job.is_some() {
+            tx.mark_erasure(false)?;
+        }
+        common.job = match job {
+            JobUpdate::Set(job) => Some(job.clone()),
+            JobUpdate::Clear => None,
+        };
+    }
     if reduction.is_none()
         && !table.contains_key(&Collection::Revisions)
         && common.inventory.is_none()
+        && common.job.is_none()
     {
         applied.debt_settled_heads =
             u64::from(staged.is_none() && debt.is_some_and(|debt| !debt.resolved.is_empty()));
@@ -1401,11 +1381,9 @@ fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, Members
 /// stay under one metadata-only head. `true`: debt kept, and the set-aside
 /// marker with it, since this is no replacement.
 fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
-    let (revision, table, common) = committed_debt(tx, file)?;
+    let (revision, table, mut common) = committed_debt(tx, file)?;
     let keep = !table.is_empty();
-    if let Some(job) = tx.get(&row(JOB_TEMPLATE, file, 0)?)? {
-        purge(tx, vec![job])?;
-    }
+    common.job = None;
     delete_rows(tx, file, keep)?;
     if keep {
         let head = encode_head(revision, &table, &common, None)?;
@@ -1486,7 +1464,7 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
     let from = carry.from.as_bytes();
     let mut head = read_head(tx, from)?.context("state_v2_tail_carry_missing")?;
     ensure!(
-        tx.get(&row(HEAD, to, 0)?)?.is_none() && tx.get(&row(JOB_TEMPLATE, to, 0)?)?.is_none(),
+        tx.get(&row(HEAD, to, 0)?)?.is_none(),
         "state_v2_tail_carry_conflict"
     );
     for collection in Collection::ALL {
@@ -1534,16 +1512,8 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
     if let Some(marker) = tx.get(&set_aside_key(from)?)? {
         move_row(tx, &marker, set_aside_key(to)?)?;
     }
-    if let Some(mut job) = load_job_template_observation(tx, from)? {
-        let (_, inode, _, _) = carry.inventory.stamp.parts();
-        if job.inode != inode {
-            job.inode = inode;
-            job.birth_nanos = 0;
-        }
-        put_inline(tx, &row(JOB_TEMPLATE, to, 0)?, &serde_json::to_vec(&job)?)?;
-        tx.delete(&row(JOB_TEMPLATE, from, 0)?)?;
-    }
     head.common.inventory = Some(carry.inventory.clone());
+    head.common.job.clone_from(&carry.job);
     // A metadata-only head stays metadata-only; a reduction remains Tail.
     let reduction = head.reduction.as_ref().map(|_| carry.head.as_slice());
     let value = encode_head(head.revision, &head.table, &head.common, reduction)?;
@@ -1577,22 +1547,14 @@ pub(super) fn apply(
     let mut applied = Applied::default();
     let keys: BTreeSet<&Vec<u8>> = stage
         .into_iter()
-        .flat_map(|stage| {
-            stage
-                .files
-                .keys()
-                .chain(stage.debt.keys())
-                .chain(stage.job_templates.keys())
-        })
+        .flat_map(|stage| stage.files.keys().chain(stage.debt.keys()))
         .collect();
     for file in keys {
         let entry = stage.and_then(|stage| stage.files.get(file));
         let debt = stage.and_then(|stage| stage.debt.get(file));
-        let job = stage.and_then(|stage| stage.job_templates.get(file));
-        let staged = match entry {
-            Some(Entry::File(staged)) => Some(staged),
-            _ => None,
-        };
+        let job = entry.and_then(|entry| entry.job.as_ref());
+        let checkpoint = entry.and_then(|entry| entry.checkpoint.as_ref());
+        let staged = checkpoint.and_then(|checkpoint| checkpoint.as_ref().ok());
         // Retirement wins: this save removes the file's progress row, so its
         // stage is stale. Its graph rows write as an unstaged file's do, and the
         // retirement below drops its reduction.
@@ -1603,10 +1565,7 @@ pub(super) fn apply(
         } else {
             (staged, job)
         };
-        let mut failed = match entry {
-            Some(Entry::Failed(cause)) => Some(*cause),
-            _ => None,
-        };
+        let mut failed = checkpoint.and_then(|checkpoint| checkpoint.as_ref().err().copied());
         let owns_closure = staged.is_some() || job.is_some();
         if owns_closure || debt.is_some() {
             let closure = if owns_closure {
@@ -1617,12 +1576,7 @@ pub(super) fn apply(
             // The file's closure boundary: its graph rows, then its Tail rows.
             let result = rows.tx()?.isolated(&mut |tx| {
                 write_closure(tx, &closure)?;
-                if staged.is_some() || debt.is_some() {
-                    applied.absorb(write_file(tx, file, staged, debt)?);
-                }
-                if let Some(job) = job {
-                    write_job_template_observation(tx, file, job)?;
-                }
+                applied.absorb(write_file(tx, file, staged, debt, job)?);
                 Ok(())
             })?;
             if result.is_err() {
@@ -1660,9 +1614,6 @@ pub(super) fn apply(
     // Scope erasure is not a reset: debt goes too, and nothing vetoes it.
     for file in stage.into_iter().flat_map(|stage| &stage.erase) {
         delete_rows(tx, file, false)?;
-        if let Some(job) = tx.get(&row(JOB_TEMPLATE, file, 0)?)? {
-            purge(tx, vec![job])?;
-        }
         tx.delete(&set_aside_key(file)?)?;
         applied.erased += 1;
     }
@@ -1688,12 +1639,21 @@ pub(super) fn commit_exit(
     // lacks graph roots its next full save fills in, and recording a later layout
     // would refuse them. A staged format change can raise a complete graph
     // separately at the same boundary as the first incompatible row.
-    if mapper::layout(&mut tx)? + 1 == catalogue::TAIL_LAYOUT {
+    let layout = mapper::layout(&mut tx)?;
+    if layout + 1 == catalogue::TAIL_LAYOUT {
         put(
             &mut tx,
             &RowKey::Meta("catalogue_layout".into()),
             1,
             &serde_json::to_vec(&catalogue::TAIL_LAYOUT)?,
+        )?;
+    } else if layout == catalogue::JOB_TEMPLATE_LAYOUT - 1 {
+        // Layout 9 uses the same graph roots as layout 8.
+        kinds::initialize_job_template_since(&mut tx)?;
+        mapper::put(
+            &mut tx,
+            &RowKey::Meta("catalogue_layout".into()),
+            &catalogue::JOB_TEMPLATE_LAYOUT,
         )?;
     }
     // No graph rows here: a rolled-back file leaves nothing in RAM ahead.

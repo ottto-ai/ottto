@@ -121,7 +121,16 @@ impl PendingTail {
     /// The native verdict, then this completion's one call into the store.
     /// True when the committed head stays valid for this completion: staged,
     /// or nothing to restate.
+    #[cfg(test)]
     pub(in crate::snapshots) fn publish(self, native: &Result<ParsedJsonlFile>) -> bool {
+        self.publish_with_job(native, &mut None)
+    }
+
+    pub(in crate::snapshots) fn publish_with_job(
+        self,
+        native: &Result<ParsedJsonlFile>,
+        job: &mut Option<state_v2::JobUpdate>,
+    ) -> bool {
         let Some(encoded) = self.encoded else {
             return false; // PRE never ran: the read failed before it.
         };
@@ -140,7 +149,16 @@ impl PendingTail {
                 let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
                 false
             }
-            Ok(Some(staged)) => state_v2::stage_tail(&self.route, &self.key, staged).is_ok(),
+            Ok(Some(mut staged)) => {
+                staged.job.clone_from(job);
+                let staged = state_v2::stage_tail(&self.route, &self.key, staged).is_ok();
+                if staged {
+                    *job = None;
+                }
+                staged
+            }
+            // The caller still owns a metadata-only update if the parser's
+            // reduction bytes did not change.
             Ok(None) => true,
         }
     }
@@ -170,7 +188,6 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 #[derive(Default)]
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
-    pub(super) job_template_pending: bool,
     /// In load order: page key, then digest and encoded resident byte length.
     pages: Vec<((Collection, u64), PageStamp)>,
     logs: Vec<(Collection, LogBase)>,
@@ -277,7 +294,6 @@ impl TailBase {
             return Err(Refuse::NonEmpty(field));
         }
         let mut staged = StagedFile {
-            job_template_pending: acc.job_template_pending && acc.job_template.is_none(),
             revision: S::REDUCTION_REVISION,
             head: S::encode_head(view, certificate, id)?,
             change,
@@ -347,7 +363,6 @@ impl TailBase {
         let changed = change == Change::Reset
             || !staged.pages.is_empty()
             || !staged.obsolete.is_empty()
-            || staged.job_template_pending != self.job_template_pending
             || page_digest(&staged.head) != self.head;
         Ok(changed.then_some(staged))
     }

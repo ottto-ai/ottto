@@ -220,17 +220,12 @@ pub(super) const TAIL_KINDS: &[&str] = &[
     "tail.head",
     "tail.frag",
     "tail.set_aside",
-    "tail.job_template",
 ];
 /// The initial Tail layout. Later Tail format changes may raise a layout
 /// only when the graph already has the required roots.
 pub(super) const TAIL_LAYOUT: u32 = 4;
 /// Tail kinds added after the Tail store, each at its own layout.
-const TAIL_LATER: &[(&str, u32)] = &[
-    ("tail.revision", 5),
-    ("tail.page.session_facts", 5),
-    ("tail.job_template", JOB_TEMPLATE_LAYOUT),
-];
+const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];
 /// Owner-local upload progress: closed kinds owned by `progress.rs`, committed
 /// by their own `progress_generation`, never by the graph's. No `ScanIndex`
 /// field, never a row of `enumerate` or a graph baseline, and no private-path

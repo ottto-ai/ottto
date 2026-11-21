@@ -1,18 +1,42 @@
 //! Frozen v1 normalization. Changing these rules requires a new domain/version.
 use super::*;
+use crate::heap_layout_bound::HeapLayoutBound;
 use regex::Regex;
 
-pub(crate) const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = 64 * 1024;
+const MAX_RAW_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JobState {
+    Pending,
+    NoId,
+    Id { id: String, epoch: String },
+}
+
+impl HeapLayoutBound for JobState {
+    const STABLE_HEAP: bool = true;
+
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Pending | Self::NoId => Some(()),
+            Self::Id { id, epoch } => {
+                id.heap_bound(c)?;
+                epoch.heap_bound(c)
+            }
+        }
+    }
+}
 
 /// Leading, balanced injected envelopes only. A literal mention later in a
 /// task is content. Malformed envelopes fail closed; empty ones stay pending.
 pub(crate) fn task(raw: &str) -> Result<Option<&str>, &'static str> {
-    if raw.len() > MAX_BYTES {
+    if raw.len() > MAX_RAW_BYTES {
         return Err("oversize");
     }
+    let raw_lower = raw.to_ascii_lowercase();
     let mut text = raw.trim_start();
     loop {
-        let lower = text.to_ascii_lowercase();
+        let lower = &raw_lower[raw.len() - text.len()..];
         let envelope = if let Some(rest) = lower.strip_prefix("# agents.md instructions") {
             if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
                 break;
@@ -21,43 +45,42 @@ pub(crate) fn task(raw: &str) -> Result<Option<&str>, &'static str> {
             Some(("<instructions>", "</instructions>", start))
         } else {
             [
-                "environment_context",
-                "recommended_plugins",
-                "system_instruction",
+                ("<environment_context>", "</environment_context>"),
+                ("<recommended_plugins>", "</recommended_plugins>"),
+                ("<system_instruction>", "</system_instruction>"),
             ]
             .into_iter()
-            .find_map(|tag| {
-                let open = format!("<{tag}>");
-                lower.starts_with(&open).then_some((tag, 0))
-            })
-            .map(|(tag, start)| match tag {
-                "environment_context" => ("<environment_context>", "</environment_context>", start),
-                "recommended_plugins" => ("<recommended_plugins>", "</recommended_plugins>", start),
-                _ => ("<system_instruction>", "</system_instruction>", start),
-            })
+            .find_map(|(open, close)| lower.starts_with(open).then_some((open, close, 0)))
         };
         let Some((open, close, start)) = envelope else {
             break;
         };
-        // Match nesting too, rather than accepting the first closing tag.
+        // Scan only tag starts, once per consumed envelope. Nested wrappers
+        // must close before any following text can become a task.
         let mut depth = 1;
-        let mut at = start + open.len();
-        while depth != 0 {
-            let end = lower[at..].find(close).ok_or("malformed_wrapper")? + at;
-            if let Some(next) = lower[at..end].find(open) {
+        let start = start + open.len();
+        let mut end = None;
+        for (i, _) in lower[start..].match_indices('<') {
+            let at = start + i;
+            if lower[at..].starts_with(open) {
                 depth += 1;
-                at += next + open.len();
-            } else {
+            } else if lower[at..].starts_with(close) {
                 depth -= 1;
-                at = end + close.len();
+                if depth == 0 {
+                    end = Some(at + close.len());
+                    break;
+                }
             }
         }
+        let at = end.ok_or("malformed_wrapper")?;
         text = text[at..].trim_start();
     }
-    let lower = text.to_ascii_lowercase();
+    let lower = &raw_lower[raw.len() - text.len()..];
+    if lower.starts_with("this session is being continued") {
+        return Err("continuation");
+    }
     if text.is_empty()
         || [
-            "this session is being continued from a previous conversation",
             "<artifact-content-authored-by-others",
             "[request interrupted",
             "<command-",
@@ -81,6 +104,10 @@ pub(crate) fn task(raw: &str) -> Result<Option<&str>, &'static str> {
     .any(|p| lower.starts_with(p))
     {
         return Err("malformed_wrapper");
+    }
+    let text = text.trim_end();
+    if text.len() > MAX_BYTES {
+        return Err("oversize");
     }
     Ok(Some(text))
 }
@@ -128,12 +155,13 @@ pub(crate) fn material(task: &str) -> Option<String> {
 impl SessionAttributionContext {
     pub(crate) fn job_fact(
         &self,
-        stored: Option<&(Option<String>, String)>,
+        stored: Option<&JobState>,
         session: &str,
         observed: &str,
     ) -> Option<SessionAttributionFact> {
-        let (id, epoch) = stored?;
-        let id = id.as_deref()?;
+        let JobState::Id { id, epoch } = stored? else {
+            return None;
+        };
         if epoch != &self.checkpoint_namespace() {
             return None;
         }
