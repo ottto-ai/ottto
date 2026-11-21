@@ -80,6 +80,7 @@ pub(in crate::snapshots::tail_source) fn copy(staged: &StagedFile) -> StagedFile
         pages: staged.pages.clone(),
         obsolete: staged.obsolete.clone(),
         change: staged.change,
+        write_generation: staged.write_generation,
     }
 }
 
