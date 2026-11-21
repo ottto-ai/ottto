@@ -22,6 +22,11 @@ pub(crate) struct CodexConfigDefaults {
     pub fast_default_opt_out: bool,
     pub selector_context: BTreeMap<String, String>,
     pub selector_sources: BTreeMap<String, String>,
+    /// Top-level `model_auto_compact_token_limit` and `model_context_window`.
+    /// Read beside the other keys but never on their own: a file that saves
+    /// only these still yields no defaults record.
+    pub model_auto_compact_token_limit: Option<i64>,
+    pub model_context_window: Option<i64>,
 }
 
 impl CodexConfigDefaults {
@@ -66,6 +71,14 @@ pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaul
     let reasoning_effort =
         read_top_str("model_reasoning_effort").or_else(|| read_top_str("reasoning_effort"));
     let approval_policy = read_top_str("approval_policy");
+    let read_top_int = |key: &str| {
+        document
+            .get(key)
+            .and_then(Item::as_value)
+            .and_then(|value| value.as_integer())
+    };
+    let model_auto_compact_token_limit = read_top_int("model_auto_compact_token_limit");
+    let model_context_window = read_top_int("model_context_window");
     let fast_mode = document
         .get("features")
         .and_then(Item::as_table_like)
@@ -105,6 +118,8 @@ pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaul
         fast_default_opt_out,
         selector_context: selector.context,
         selector_sources: selector.sources,
+        model_auto_compact_token_limit,
+        model_context_window,
     })
 }
 

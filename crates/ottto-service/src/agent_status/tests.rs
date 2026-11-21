@@ -14585,6 +14585,8 @@ fn with_pi_list_probe_fixture(run: impl FnOnce(&Path)) {
 
 fn assert_pi_list_probe_model(snapshot: AgentStatusSnapshot) {
     assert_eq!(snapshot.status, AgentStatusState::Available);
+    // Pi has no saved-defaults record, so no auto-compaction values either.
+    assert_eq!(snapshot.runtime_defaults, None);
     assert_eq!(
         snapshot.collection_method,
         AgentStatusCollectionMethod::CommandProbe
@@ -15096,6 +15098,92 @@ fn claude_runtime_defaults_report_fast_off_for_readable_settings_only() {
         Some("claude_runtime_defaults_unreadable")
     );
     let _ = std::fs::remove_dir_all(missing_root);
+}
+
+/// [behaviour] Claude Code's saved auto-compaction values ride the existing
+/// defaults record as values only: the window and switch, `null` when no
+/// readable file saves them, and never the Codex keys.
+#[test]
+fn claude_runtime_defaults_carry_saved_auto_compaction_values_only() {
+    let (root, paths) = claude_settings_fixture(
+        "auto-compaction",
+        "{\"autoCompactWindow\": 400000, \"model\": \"claude-opus-5-5\"}\n",
+    );
+    let defaults = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths)
+        .defaults
+        .expect("runtime defaults present");
+    let mut snapshot = base_snapshot(
+        SourceKind::ClaudeCode,
+        AgentStatusState::Available,
+        AgentStatusCollectionMethod::CliJson,
+        "2026-07-25T10:00:00Z".to_string(),
+        "2026-07-25T10:05:00Z".to_string(),
+    );
+    snapshot.runtime_defaults = Some(defaults);
+    let wire = serde_json::to_value(snapshot.redacted_for_backend()).expect("wire");
+    assert_eq!(
+        wire["runtime_defaults"]["auto_compaction"],
+        serde_json::json!({"auto_compact_window": 400000, "auto_compact_enabled": null})
+    );
+    // The selector maps the backend hashes stay exactly as before.
+    assert!(!wire["runtime_defaults"]["selector_context"]
+        .to_string()
+        .contains("auto_compact"));
+    assert!(!wire["runtime_defaults"]["selector_sources"]
+        .to_string()
+        .contains("auto_compact"));
+    let _ = std::fs::remove_dir_all(root);
+
+    // No readable file: no defaults record, so nothing is said at all.
+    let (missing_root, missing_paths) = claude_settings_fixture("auto-compaction-none", "");
+    assert!(
+        claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &missing_paths)
+            .defaults
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(missing_root);
+}
+
+/// [behaviour] Codex's saved auto-compaction values ride only the default
+/// home's defaults record, never a managed home's, and a file that saves only
+/// these keys still uploads no defaults record.
+#[cfg(unix)]
+#[test]
+fn codex_runtime_defaults_carry_saved_auto_compaction_for_default_home_only() {
+    let home = crate::test_scratch::ScratchDir::canonical("codex-auto-compaction");
+    let config = home.join("config.toml");
+    crate::test_scratch::write_private_file(
+        &config,
+        "model = \"gpt-5.5\"\nmodel_auto_compact_token_limit = 200000\n",
+    );
+    let build = |trust| {
+        crate::agent_status::codex::collect::build_codex_runtime_defaults_at(
+            "2026-07-25T10:00:00Z",
+            &home,
+            trust,
+        )
+    };
+    let default_home = build(CodexHomeTrust::ProviderDefault).expect("defaults record");
+    assert_eq!(default_home.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        serde_json::to_value(default_home.auto_compaction).expect("wire"),
+        serde_json::json!({"model_auto_compact_token_limit": 200000, "model_context_window": null})
+    );
+    let managed = build(CodexHomeTrust::Managed).expect("defaults record");
+    assert_eq!(managed.auto_compaction, None);
+    assert_eq!(
+        managed,
+        ottto_protocol::AgentRuntimeDefaults {
+            auto_compaction: None,
+            ..default_home
+        }
+    );
+
+    crate::test_scratch::write_private_file(
+        &config,
+        "model_auto_compact_token_limit = 200000\nmodel_context_window = 400000\n",
+    );
+    assert_eq!(build(CodexHomeTrust::ProviderDefault), None);
 }
 
 #[test]

@@ -175,6 +175,7 @@ pub(in crate::agent_status) fn claude_runtime_defaults_from_paths(
                     sandbox_mode: defaults.sandbox_mode,
                     selector_context: defaults.selector_context,
                     selector_sources: defaults.selector_sources,
+                    auto_compaction: Some(defaults.auto_compaction),
                 }),
                 capability: supported_capability(
                     "runtime_defaults",

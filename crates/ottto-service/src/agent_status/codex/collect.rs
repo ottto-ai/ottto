@@ -1313,6 +1313,15 @@ pub(in crate::agent_status) fn build_codex_runtime_defaults_at(
     let raw = std::str::from_utf8(&body).ok()?;
     let defaults = crate::snapshots::parse_codex_config_defaults(raw)?;
     let fast_mode_enabled = defaults.display_fast_mode();
+    // Only the default Codex home's base config speaks for the machine; other
+    // homes keep their defaults without these values.
+    let auto_compaction = (home_trust == CodexHomeTrust::ProviderDefault).then_some(
+        ottto_protocol::AgentAutoCompaction {
+            model_auto_compact_token_limit: Some(defaults.model_auto_compact_token_limit),
+            model_context_window: Some(defaults.model_context_window),
+            ..Default::default()
+        },
+    );
     Some(AgentRuntimeDefaults {
         captured_at: Some(captured_at.to_string()),
         provenance: Some("config_file".to_string()),
@@ -1328,6 +1337,7 @@ pub(in crate::agent_status) fn build_codex_runtime_defaults_at(
         sandbox_mode: None,
         selector_context: defaults.selector_context,
         selector_sources: defaults.selector_sources,
+        auto_compaction,
     })
 }
 

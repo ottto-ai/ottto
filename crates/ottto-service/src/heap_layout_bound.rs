@@ -507,7 +507,10 @@ impl HeapLayoutBound for serde_json::Value {
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusSnapshot; source, status, collection_method, captured_at, expires_at, account, model, quota_windows, credit_balances, context, capabilities, plan_observations, diagnostics, runtime_defaults);
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured_at, provenance, machine_id, model, service_tier, speed_mode, fast_mode_enabled, priority_enabled, reasoning_effort, reasoning_effort_by_model, approval_policy, sandbox_mode, selector_context, selector_sources);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured_at, provenance, machine_id, model, service_tier, speed_mode, fast_mode_enabled, priority_enabled, reasoning_effort, reasoning_effort_by_model, approval_policy, sandbox_mode, selector_context, selector_sources, auto_compaction);
+
+// Saved auto-compaction values are inline integers and switches only.
+crate::heap_layout_bound::no_heap!(true; ottto_protocol::AgentAutoCompaction { auto_compact_window, auto_compact_enabled, model_auto_compact_token_limit, model_context_window });
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusDiagnostic; code, severity, message, observed_at, retry_after, account_identifier_hash, organization_identifier_hash, account_label, scope);
 
@@ -686,6 +689,31 @@ mod sampled_scalar_buffer_tests {
                 requirement == Some("1"),
             );
         }
+    }
+
+    /// [behaviour] Saved auto-compaction values own no heap, so a defaults
+    /// record that carries them stays parkable at the same byte charge.
+    #[test]
+    fn saved_auto_compaction_keeps_runtime_defaults_parkable() {
+        let without = ottto_protocol::AgentRuntimeDefaults {
+            model: Some(String::from("model")),
+            ..Default::default()
+        };
+        let with = ottto_protocol::AgentRuntimeDefaults {
+            auto_compaction: Some(ottto_protocol::AgentAutoCompaction {
+                model_auto_compact_token_limit: Some(Some(200_000)),
+                model_context_window: Some(None),
+                ..Default::default()
+            }),
+            ..without.clone()
+        };
+        assert!(with.stable_heap());
+        if !layout_supported() {
+            return;
+        }
+        let charged = completed_bound(&with, usize::MAX);
+        assert!(charged.is_some());
+        assert_eq!(charged, completed_bound(&without, usize::MAX));
     }
 
     #[test]

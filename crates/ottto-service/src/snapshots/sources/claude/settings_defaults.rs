@@ -59,6 +59,10 @@ const CLAUDE_LEGACY_EFFORT_MODELS: &[&str] = &[
 /// `fast_mode_enabled` is the one field with a default: Claude Code's Fast is
 /// off until `fastMode` is saved, so a readable chain without that key reports
 /// `false` with the `claude_code.default.fastMode` source.
+///
+/// `auto_compaction` carries the top-level `autoCompactWindow` and
+/// `autoCompactEnabled` values only, with no source label; a key no readable
+/// file saves is `null` on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeConfigDefaults {
     pub model: Option<String>,
@@ -70,7 +74,12 @@ pub(crate) struct ClaudeConfigDefaults {
     pub sandbox_mode: Option<String>,
     pub selector_context: BTreeMap<String, String>,
     pub selector_sources: BTreeMap<String, String>,
+    pub auto_compaction: ottto_protocol::AgentAutoCompaction,
 }
+
+/// Window sizes Claude Code accepts for `autoCompactWindow`; a value outside
+/// this range is ignored like any other malformed key.
+const CLAUDE_AUTO_COMPACT_WINDOW_TOKENS: std::ops::RangeInclusive<i64> = 100_000..=1_000_000;
 
 /// `selector_sources` label for a Fast default that no settings key sets.
 const CLAUDE_FAST_MODE_DEFAULT_SOURCE: &str = "claude_code.default.fastMode";
@@ -80,7 +89,7 @@ const CLAUDE_FAST_MODE_DEFAULT_SOURCE: &str = "claude_code.default.fastMode";
 pub(crate) enum ClaudeConfigDefaultsOutcome {
     /// At least one settings file parsed cleanly. Fast mode is always known
     /// then: a chain without `fastMode` reports Claude Code's default, off.
-    Configured(ClaudeConfigDefaults),
+    Configured(Box<ClaudeConfigDefaults>),
     /// No settings file in the chain could be read and parsed, so nothing is
     /// reported, not even the Fast default.
     Unreadable,
@@ -117,6 +126,8 @@ struct ClaudeSettingsRaw {
     fast_mode_per_session_opt_in: Option<(bool, String)>,
     sandbox_enabled: Option<(bool, String)>,
     sandbox_auto_allow_bash: Option<(bool, String)>,
+    auto_compact_window: Option<i64>,
+    auto_compact_enabled: Option<bool>,
 }
 
 /// Effort keys from one Claude Code settings file.
@@ -136,7 +147,8 @@ struct ClaudeEffortScope {
 /// so the highest-precedence file wins per key.
 /// Only specifically-named keys are ever read: `model`, `effortLevel`,
 /// `modelSettings.<model>.effortLevel`, `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
-/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`. `env`,
+/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`, and the top-level
+/// `autoCompactWindow`/`autoCompactEnabled`. `env`,
 /// `permissions.allow`/`ask`/`deny`, `apiKeyHelper`, `statusLine`,
 /// `sandbox.credentials`, and `sandbox.filesystem` are never read, so no path,
 /// environment value, token, or permission rule can ride along. Environment
@@ -224,8 +236,14 @@ pub(crate) fn load_claude_settings_defaults(
         insert(&mut defaults, "sandbox_mode", mode.to_string(), &source);
         defaults.sandbox_mode = Some(mode.to_string());
     }
+    // Values only: the files were read, so a key none of them saves is `null`.
+    defaults.auto_compaction = ottto_protocol::AgentAutoCompaction {
+        auto_compact_window: Some(raw.auto_compact_window),
+        auto_compact_enabled: Some(raw.auto_compact_enabled),
+        ..Default::default()
+    };
 
-    ClaudeConfigDefaultsOutcome::Configured(defaults)
+    ClaudeConfigDefaultsOutcome::Configured(Box::new(defaults))
 }
 
 /// Read one Claude Code settings file into JSON; `None` for any failure.
@@ -359,6 +377,17 @@ fn apply_claude_settings_scope(
                 format!("{label}.sandbox.autoAllowBashIfSandboxed"),
             ));
         }
+    }
+    // Top-level keys only: a per-model auto-compaction save is never read.
+    if let Some(window) = document
+        .get("autoCompactWindow")
+        .and_then(Value::as_i64)
+        .filter(|window| CLAUDE_AUTO_COMPACT_WINDOW_TOKENS.contains(window))
+    {
+        raw.auto_compact_window = Some(window);
+    }
+    if let Some(enabled) = document.get("autoCompactEnabled").and_then(Value::as_bool) {
+        raw.auto_compact_enabled = Some(enabled);
     }
 }
 
