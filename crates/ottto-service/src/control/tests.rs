@@ -7631,12 +7631,10 @@ fn auth_only_command_keeps_trust_and_poisoned_state_refusals() {
     }));
     assert!(poison.is_err());
     let run = |authorization| {
-        let command = command();
         handle_command(
             &daemon,
             authorization,
-            policy::policy(&command),
-            command,
+            command(),
             InstallOwner::Unknown,
             false,
         )
@@ -11053,7 +11051,6 @@ fn relay_runtime_failure_health_survives_control_and_config_intents() {
             let response = handle_command(
                 &daemon,
                 RequestAuthorization::Token("token".into()),
-                policy::policy(&command),
                 command,
                 InstallOwner::Unknown,
                 false,
@@ -13350,7 +13347,6 @@ fn daemon_internal_is_never_a_request_caller_and_is_refused_beyond_verification(
             let result = handle_command(
                 &daemon,
                 internal.clone(),
-                policy::policy(&command),
                 command,
                 InstallOwner::Unknown,
                 false,

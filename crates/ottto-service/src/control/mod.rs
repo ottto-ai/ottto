@@ -956,16 +956,20 @@ pub fn handle_request_with_peer(
         };
     }
     let authorization = request_authorization(&request, peer.as_ref());
-    let policy = policy::policy(&request.command);
-    match policy::admit(&policy, &request, &authorization, daemon).and_then(|()| {
+    let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
+    let admitted = policy::admit(
+        &policy::policy(&request.command),
+        cli_session_exec,
+        &authorization,
+        daemon,
+    );
+    match admitted.and_then(|()| {
         let client_install_owner = request
             .client_install_owner
             .unwrap_or(InstallOwner::Unknown);
-        let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
         handle_command(
             daemon,
             authorization,
-            policy,
             request.command,
             client_install_owner,
             cli_session_exec,
@@ -1039,7 +1043,6 @@ fn require_session_launch_schema(version: u16) -> Result<(), LocalApiError> {
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
-    policy: policy::CommandPolicy,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
     cli_session_exec: bool,
@@ -1056,7 +1059,7 @@ fn handle_command(
     );
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
-    if policy.changes_identity {
+    if policy::policy(&command).changes_identity {
         require_authorized_local_client(daemon, &authorization)?;
         daemon
             .session_launch

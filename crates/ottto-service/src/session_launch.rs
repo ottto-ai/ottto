@@ -27,6 +27,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 const TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING: usize = 16;
@@ -364,7 +365,7 @@ impl Registry {
         if let Some(entry) = self.entries.get_mut(id) {
             if entry.state == State::Starting
                 && entry.attempt.as_ref().is_some_and(|value| {
-                    constant_eq(value.expose_secret().as_bytes(), attempt.as_bytes())
+                    bool::from(value.expose_secret().as_bytes().ct_eq(attempt.as_bytes()))
                 })
                 && matches!(
                     reason,
@@ -453,12 +454,9 @@ fn consume_block(error: Block) -> SessionLaunchConsumeResultV1 {
     }
 }
 
-fn constant_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |result, (a, b)| result | (a ^ b)) == 0
-}
-
 fn check_entry(entry: &Entry, secret: &str) -> Result<SessionLaunchExecPlanV1, Block> {
-    if !constant_eq(&entry.secret, &Sha256::digest(secret.as_bytes())) {
+    let digest = Sha256::digest(secret.as_bytes());
+    if !bool::from(entry.secret.as_slice().ct_eq(digest.as_slice())) {
         return Err(block(Reason::LaunchUnknown));
     }
     if expired(entry, Instant::now()) {

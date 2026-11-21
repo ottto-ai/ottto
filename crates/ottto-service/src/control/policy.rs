@@ -1,7 +1,7 @@
 use super::auth::{require_authorized_local_client, require_cli_token, require_local_caller};
 use super::peer::RequestAuthorization;
 use crate::{LocalApiError, LocalDaemon};
-use ottto_protocol::{LocalClientKind, LocalControlCommand, LocalControlRequest};
+use ottto_protocol::LocalControlCommand;
 
 enum Access {
     Local,
@@ -96,7 +96,7 @@ pub(super) fn policy(command: &LocalControlCommand) -> CommandPolicy {
 
 pub(super) fn admit(
     policy: &CommandPolicy,
-    request: &LocalControlRequest,
+    cli_client: bool,
     authorization: &RequestAuthorization,
     daemon: &LocalDaemon,
 ) -> Result<(), LocalApiError> {
@@ -104,10 +104,7 @@ pub(super) fn admit(
         Access::Local => require_authorized_local_client(daemon, authorization),
         Access::LocalCli => {
             require_authorized_local_client(daemon, authorization)?;
-            require_cli_token(
-                request.client_kind == Some(LocalClientKind::Cli),
-                authorization,
-            )
+            require_cli_token(cli_client, authorization)
         }
         Access::LocalNoPoisonCheck => require_local_caller(daemon, authorization),
         Access::Public | Access::BackendToken => Ok(()),
