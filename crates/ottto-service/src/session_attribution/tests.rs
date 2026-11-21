@@ -543,8 +543,7 @@ fn attribution_budget_corpus_pins_the_near_limit_payload() {
     let over_retired = facts.clone();
     // First list the superseded 4 KiB budget refused: the band this raise
     // newly admits, and the one the deployed backend already accepts.
-    while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES
-    {
+    while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES {
         facts.push(budget_fact("skill_id"));
     }
     let over_previous = facts.clone();

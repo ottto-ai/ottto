@@ -173,11 +173,7 @@ fn forbidden_origin_body_keeps_each_message_verbatim() {
                             "identity" => {
                                 handle_whoami_request(&mut server, &test_daemon(), request)
                             }
-                            _ => handle_local_health_request(
-                                &mut server,
-                                &test_daemon(),
-                                request,
-                            ),
+                            _ => handle_local_health_request(&mut server, &test_daemon(), request),
                         })
                         .unwrap();
                     drop(server);
@@ -218,10 +214,7 @@ fn forbidden_origin_body_keeps_each_message_verbatim() {
                         assert_eq!(payload["machine_id"], "machine_test");
                         assert_eq!(payload["machine_name"], "Test Mac");
                         if noun == "health" {
-                            assert_eq!(
-                                keys(&payload),
-                                ["health", "machine_id", "machine_name"]
-                            );
+                            assert_eq!(keys(&payload), ["health", "machine_id", "machine_name"]);
                             assert_eq!(
                                 keys(&payload["health"]),
                                 [
@@ -456,8 +449,7 @@ fn read_http_request_rejects_ambiguous_or_unsupported_transfer_framing() {
         ("Origin", "https://app.ottto.net"),
         ("Authorization", "Bearer synthetic-token"),
     ] {
-        let raw =
-            format!("GET /whoami HTTP/1.1\r\n{header}: {value}\r\n{header}: {value}\r\n\r\n");
+        let raw = format!("GET /whoami HTTP/1.1\r\n{header}: {value}\r\n{header}: {value}\r\n\r\n");
         let mut reader = BufReader::new(raw.as_bytes());
         read_http_request_from(&mut reader).expect_err("duplicate request header");
     }
@@ -794,15 +786,13 @@ fn otlp_post(path: &str, content_type: &str, body: &[u8]) -> HttpRequest {
 
 /// Grant Claude to this support dir's device, as a connected install has.
 pub(super) fn grant_claude(support_dir: &Path) {
-    ottto_core::FileDeviceStore::new(
-        support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME),
-    )
-    .save(&ottto_core::LocalDeviceBinding {
-        device_id: "device".into(),
-        machine_id: Some("otm_test".into()),
-        sources: vec!["claude_code".into()],
-    })
-    .expect("save device grant");
+    ottto_core::FileDeviceStore::new(support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME))
+        .save(&ottto_core::LocalDeviceBinding {
+            device_id: "device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        })
+        .expect("save device grant");
 }
 
 /// [behaviour] Collection stops while Claude is not granted or is paused:
@@ -897,10 +887,8 @@ fn retired_forward_keeps_claude_trace_ownership_identical_to_direct_capture() {
 
     assert_export_success(&response, "application/json", b"{}");
     let session = ["retired-forward-session".to_string()];
-    let relayed = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-        &relay_dir,
-        session.clone(),
-    );
+    let relayed =
+        crate::claude_local_otel::load_claude_trace_ownership_evidence(&relay_dir, session.clone());
     let direct =
         crate::claude_local_otel::load_claude_trace_ownership_evidence(&direct_dir, session);
     assert_eq!(relayed.evidence["retired-forward-session"].len(), 1);
@@ -933,19 +921,16 @@ fn retired_forward_reports_local_failures_with_non_retryable_statuses() {
     let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-failures");
     grant_claude(&support_dir);
     let malformed = otlp_post("/v1/logs", "application/json", b"{not json");
-    let response =
-        local_otlp_export_response(SnapshotSource::ClaudeCode, &malformed, &support_dir);
+    let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &malformed, &support_dir);
     assert_eq!(response.status, 400);
 
     // A regular file where the evidence directory should be makes the
     // evidence append fail after a successful decode.
     std::fs::write(support_dir.join("local-otel"), b"").expect("write blocking file");
     let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
-    let response =
-        local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+    let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
     assert_eq!(response.status, 500);
-    let body: serde_json::Value =
-        serde_json::from_slice(&response.body).expect("JSON error body");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON error body");
     assert_eq!(body["error"], "local_capture_failed");
 }
 
@@ -955,8 +940,7 @@ fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() 
     let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
     grant_claude(&support_dir);
     let gzip_member = |bytes: &[u8]| {
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).expect("compress fixture");
         encoder.finish().expect("finish gzip")
     };
@@ -967,8 +951,7 @@ fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() 
     request
         .headers
         .insert("content-encoding".to_string(), "gzip".to_string());
-    let response =
-        local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+    let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
     assert_export_success(&response, "application/json", b"{}");
     let evidence = crate::claude_local_otel::load_claude_effort_evidence(
         &support_dir,
@@ -980,7 +963,6 @@ fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() 
     request
         .headers
         .insert("content-encoding".to_string(), "br".to_string());
-    let response =
-        local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+    let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
     assert_eq!(response.status, 400);
 }
