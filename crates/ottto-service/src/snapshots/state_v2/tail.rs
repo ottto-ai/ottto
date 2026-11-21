@@ -985,7 +985,13 @@ fn stream(
 /// Every file with a committed head, from row headers alone; no value is read.
 /// Absence authority, so any failure is an error and never a partial set.
 pub(super) fn head_keys(tx: &mut dyn Transaction) -> Result<BTreeSet<String>> {
-    let kind = RecordKind::parse(HEAD)?;
+    file_keys(tx, HEAD)
+}
+pub(super) fn job_template_keys(tx: &mut dyn Transaction) -> Result<BTreeSet<String>> {
+    file_keys(tx, JOB_TEMPLATE)
+}
+fn file_keys(tx: &mut dyn Transaction, kind: &str) -> Result<BTreeSet<String>> {
+    let kind = RecordKind::parse(kind)?;
     let (mut keys, mut after) = (BTreeSet::new(), None);
     loop {
         let rows = tx.scan_kind(&kind, after.as_ref(), HEADER_PAGE)?;

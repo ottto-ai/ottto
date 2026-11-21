@@ -273,6 +273,16 @@ pub(in crate::snapshots) fn tail_route_path(
 ) -> Result<Option<std::path::PathBuf>> {
     runtime_path(index)
 }
+/// Both inventories from the same authenticated source generation.
+pub(in crate::snapshots) fn tail_custody_keys(
+    index: &ScanIndex,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let (keys, _) = read_txn(index, |tx| {
+        Ok((tail::head_keys(tx)?, tail::job_template_keys(tx)?))
+    })?;
+    Ok(keys)
+}
+
 /// Every key with a committed head, this route's graph generation, keys only.
 pub(in crate::snapshots) fn tail_head_keys(
     index: &ScanIndex,

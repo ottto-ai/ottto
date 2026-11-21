@@ -157,9 +157,10 @@ pub(in crate::snapshots) fn retire_absent(
         return;
     };
     let revision = super::reduction_revision(source);
-    let Ok(mut absent) = state_v2::tail_head_keys(index) else {
+    let Ok((mut absent, job_keys)) = state_v2::tail_custody_keys(index) else {
         return;
     };
+    absent.extend(job_keys.iter().cloned());
     absent.retain(|key| {
         !observed.contains(key) && !residue.contains(key) && !index.files.contains_key(key)
     });
@@ -172,11 +173,13 @@ pub(in crate::snapshots) fn retire_absent(
                     && head.table.contains_key(&state_v2::Collection::Revisions) =>
             {
                 kept_debt += 1;
+                if job_keys.contains(&key) {
+                    retire.insert(key);
+                }
             }
-            Ok(Some(_)) => {
+            Ok(Some(_)) | Ok(None) => {
                 retire.insert(key);
             }
-            Ok(None) => {}
             Err(error)
                 if matches!(
                     error.downcast_ref::<Hold>(),

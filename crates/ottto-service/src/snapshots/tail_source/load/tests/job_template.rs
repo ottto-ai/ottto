@@ -217,6 +217,21 @@ fn detached_job_survives_native_full_without_a_checkpoint() {
     let mut reread = job_full(&route, &path);
     reread.accumulator.finish_job_template(Some(&context));
     assert_eq!(reread.accumulator.job_template, Some(expected));
+
+    let (heads, decisions) = state_v2::tail_custody_keys(&route.index).unwrap();
+    assert!(!heads.contains(&key));
+    assert!(decisions.contains(&key));
+    route.index.files.remove(&key);
+    super::super::retire_absent(
+        crate::snapshots::SnapshotSource::ClaudeCode,
+        &route.index,
+        &Default::default(),
+        &Default::default(),
+    );
+    route.save(false);
+    assert!(state_v2::load_job_template_observation(&route.index, &key)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
