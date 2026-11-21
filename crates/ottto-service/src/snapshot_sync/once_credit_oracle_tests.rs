@@ -3984,6 +3984,30 @@ mod walk_gate_oracle_tests {
     include!("walk_gate_oracle_tests.rs");
 }
 
+/// One line for a tier row's failure: the backfill state, the saved queue
+/// and held retries, and the cycle's finalized tokens.
+fn tier_trace(home: &OracleHome, cycle: &Cycle) -> String {
+    let state = crate::backfill::load_backfill_state(&home.support);
+    let index = serde_json::to_value(&cycle.index).unwrap();
+    let tokens = cycle
+        .finalized
+        .iter()
+        .map(|item| item.input_tokens)
+        .collect::<Vec<_>>();
+    format!(
+        "tiers={:?} anchors={:?} completed={:?} traversal={} retries={} finalized={tokens:?} \
+         debt={} batches={} statuses_ok={}",
+        state.first_read_tiers,
+        state.first_census_ends,
+        state.completed_destination_namespaces,
+        index["traversal"],
+        index["terminal_contract_retries"],
+        cycle.debt,
+        cycle.batches.len(),
+        cycle.finish.is_ok(),
+    )
+}
+
 fn pi_session(id: &str, tokens: u64) -> Vec<Value> {
     vec![
         json!({"type":"session","id":id,"timestamp":"2026-09-01T07:00:00Z"}),
@@ -4029,8 +4053,15 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
         let mut walked = Vec::new();
         let mut tokens = Vec::new();
         for _ in 0..8 {
+            let before = tier().unwrap();
             let cycle = home.cycle(&server, &recording);
-            assert!(cycle.finish.is_ok());
+            assert!(cycle.finish.is_ok(), "{}", tier_trace(&home, &cycle));
+            let read_old = cycle.finalized.iter().any(|item| item.input_tokens == 100);
+            assert!(
+                !read_old || before == crate::snapshots::FIRST_READ_WINDOW_DAYS,
+                "the old file waits for the final tier: {walked:?} {}",
+                tier_trace(&home, &cycle)
+            );
             tokens.extend(cycle.finalized.iter().map(|item| item.input_tokens));
             let first_import =
                 with_source_cadence(SnapshotSource::Pi, |cadence| cadence.paced_first_import());
@@ -4038,10 +4069,9 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
             if walked.last().map_or(1, |(days, _)| *days) != days {
                 walked.push((days, first_import));
             }
-            if days == crate::snapshots::FIRST_READ_WINDOW_DAYS && tokens.contains(&100) {
+            if read_old {
                 break;
             }
-            assert!(!tokens.contains(&100), "the old file waits for the final tier");
         }
         assert_eq!(
             walked,
@@ -4096,13 +4126,14 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
             .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
             .unwrap();
         home.write_rows(&pi_session("oracle-pi-new", 10));
-        let mut advanced = false;
+        let (mut advanced, mut trace) = (false, String::new());
         for _ in 0..3 {
             let cycle = home.cycle(&server, &recording);
-            assert!(cycle.finish.is_ok(), "{answer:?}");
+            trace = tier_trace(&home, &cycle);
+            assert!(cycle.finish.is_ok(), "{answer:?}: {trace}");
             assert!(
                 !cycle.finalized.iter().any(|item| item.input_tokens == 100),
-                "{answer:?}: the old file waits"
+                "{answer:?}: the old file waits: {trace}"
             );
             let state = crate::backfill::load_backfill_state(&home.support);
             if state.first_read_tiers[&destination].days > 1 {
@@ -4110,6 +4141,9 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
                 break;
             }
         }
-        assert!(advanced, "{answer:?}: a terminal answer never holds the tier");
+        assert!(
+            advanced,
+            "{answer:?}: a terminal answer never holds the tier: {trace}"
+        );
     }
 }
