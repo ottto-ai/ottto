@@ -334,8 +334,8 @@ impl DesktopMetadata {
             .saturating_add(other.scoped_acquisition_attempts);
     }
 }
-// The inventory restart and scoped acquisition have no production caller until
-// the full #851 re-land, so those two counters stay zero and absent.
+// The inventory restart and scoped acquisition have no production caller yet,
+// so those two counters stay zero and absent.
 #[cfg(test)]
 pub(crate) fn desktop_inventory_restart() {
     update(|counts| {

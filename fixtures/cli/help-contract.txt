@@ -14,7 +14,7 @@ Commands:
   cloud              Show cloud connector status; connect clouds on the web
   sessions           Print cloud sessions for AI agents
   recommendations    Print Advisor recommendations for AI agents
-  provider-impact    Print staff-only provider-impact events for AI agents
+  provider-impact    Print provider-impact events for AI agents
   setup              Connect this Mac through a browser claim
   login              Sign in and connect this Mac through a browser claim
   account            Show the Ottto account connected to this Mac
@@ -313,7 +313,7 @@ Options:
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
 ### ottto provider-impact --help
-Print staff-only provider-impact events for AI agents
+Print provider-impact events for AI agents
 
 Usage: ottto provider-impact [OPTIONS]
 

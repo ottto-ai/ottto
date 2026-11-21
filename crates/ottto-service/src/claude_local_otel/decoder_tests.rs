@@ -1,4 +1,4 @@
-//! Frozen a0e3e222 whole-file decisions, deliberately independent of decoder methods.
+//! Frozen whole-file decisions, deliberately independent of decoder methods.
 use super::*;
 
 fn baseline_api(bytes: &[u8]) -> ApiSidecarDecoder<'static> {

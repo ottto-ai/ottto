@@ -8,8 +8,9 @@ use notify_debouncer_full::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub const SNAPSHOT_WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -88,6 +89,10 @@ pub struct PendingSnapshotPaths {
 }
 
 fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
+    #[cfg(test)]
+    if let Some(scoped) = SCOPED_PENDING.with(std::cell::Cell::get) {
+        return scoped;
+    }
     static PENDING: OnceLock<Mutex<PendingSnapshotPathsState>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(PendingSnapshotPathsState::default()))
 }
@@ -127,6 +132,115 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
     }
 }
 
+crate::local_resource_diagnostics::process_static!(
+    fn with_sidecar_epochs: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3]
+);
+crate::local_resource_diagnostics::process_static!(
+    fn with_coverage: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None)
+);
+
+/// Edits to Claude sidecars no transcript hint names (subagent `.meta.json`,
+/// workflow records); the walk gate binds this count.
+pub(crate) fn sidecar_epoch(source: SnapshotSource) -> u64 {
+    with_sidecar_epochs(|epochs| epochs[source.slot()].load(Ordering::Relaxed))
+}
+
+fn claude_sidecar(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.ends_with(".meta.json")
+        || (name.ends_with(".json")
+            && path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("workflows")))
+}
+
+/// Publishes what a live watcher watches recursively; `None` watches nothing.
+pub(crate) fn cover(watcher: Option<&SnapshotWatcher>) {
+    let covered = watcher
+        .filter(|watcher| watcher.live.load(Ordering::Relaxed))
+        .map(|watcher| {
+            watcher
+                .watch_paths
+                .iter()
+                .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
+                .map(|(path, _)| path.clone())
+                .collect()
+        });
+    with_coverage(|coverage| {
+        *coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = covered
+    });
+}
+
+/// Test coverage without a native watcher: `Some` covers these paths.
+#[cfg(test)]
+pub(crate) fn cover_paths_for_test(paths: Option<Vec<PathBuf>>) {
+    with_coverage(|coverage| *coverage.lock().unwrap() = paths);
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCOPED_PENDING: std::cell::Cell<Option<&'static Mutex<PendingSnapshotPathsState>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` as under a live watcher of `roots`: this thread gets its own
+/// hint queue (other tests' events never reach it) and covers `roots`.
+#[cfg(test)]
+pub(crate) fn with_simulated_watch<T>(roots: &[PathBuf], run: impl FnOnce() -> T) -> T {
+    type Scoped = Option<&'static Mutex<PendingSnapshotPathsState>>;
+    struct Restore(Scoped);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED_PENDING.with(|pending| pending.set(self.0));
+            cover_paths_for_test(None);
+        }
+    }
+    let queue: &'static Mutex<PendingSnapshotPathsState> = Box::leak(Box::default());
+    let _restore = Restore(SCOPED_PENDING.with(|pending| pending.replace(Some(queue))));
+    cover_paths_for_test(Some(roots.to_vec()));
+    run()
+}
+
+/// One watcher batch that modified `paths` under `source`'s `roots`.
+#[cfg(test)]
+pub(crate) fn simulate_transcript_events(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    paths: &[PathBuf],
+) {
+    let event = paths.iter().fold(
+        notify::Event::new(EventKind::Modify(ModifyKind::Any)),
+        |event, path| event.add_path(path.clone()),
+    );
+    let events = [DebouncedEvent::new(event, std::time::Instant::now())];
+    let roots = roots
+        .iter()
+        .map(|root| (source, root.clone()))
+        .collect::<Vec<_>>();
+    let (event_tx, _) = mpsc::sync_channel(1);
+    record_watcher_events(&roots, &events, &event_tx);
+}
+
+/// A live watcher hints every existing root (creating one recreates it).
+pub(crate) fn covers(roots: &[PathBuf]) -> bool {
+    with_coverage(|coverage| {
+        coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|watched| {
+                roots
+                    .iter()
+                    .filter(|root| root.exists())
+                    .all(|root| watched.iter().any(|path| root.starts_with(path)))
+            })
+    })
+}
+
 fn record_raw_watcher_overflow() {
     lock_pending_snapshot_paths().overflowed.fill(true);
     request_listing_all(ListingTrigger::Overflow);
@@ -146,6 +260,17 @@ fn record_watcher_events(
         request_listing_all(ListingTrigger::Rescan);
     }
     for (source, root) in roots {
+        if *source == SnapshotSource::ClaudeCode
+            && events.iter().any(|event| {
+                !matches!(event.kind, EventKind::Access(_))
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| path.starts_with(root) && claude_sidecar(path))
+            })
+        {
+            with_sidecar_epochs(|epochs| epochs[source.slot()].fetch_add(1, Ordering::Relaxed));
+        }
         let paths = paths_from_events(
             *source,
             events
@@ -216,12 +341,18 @@ pub struct SnapshotWatcher {
     _debouncer: Debouncer<notify::RecommendedWatcher, NoCache>,
     roots: Vec<(SnapshotSource, PathBuf)>,
     watch_paths: BTreeMap<PathBuf, RecursiveMode>,
+    live: Arc<AtomicBool>,
     pub events: Receiver<SnapshotFileEvent>,
+    /// The worker's raw input, so a test can deliver a backend error.
+    #[cfg(test)]
+    backend_for_test: mpsc::SyncSender<DebounceEventResult>,
 }
 
 impl SnapshotWatcher {
     pub(crate) fn matches_roots(&self, roots: &[(SnapshotSource, PathBuf)]) -> bool {
-        self.roots == roots && self.watch_paths == watch_paths(roots)
+        self.live.load(Ordering::Relaxed)
+            && self.roots == roots
+            && self.watch_paths == watch_paths(roots)
     }
 
     pub(crate) fn roots(&self) -> &[(SnapshotSource, PathBuf)] {
@@ -257,6 +388,8 @@ fn watch_paths(roots: &[(SnapshotSource, PathBuf)]) -> BTreeMap<PathBuf, Recursi
 
 pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<SnapshotWatcher> {
     let (raw_tx, raw_rx) = mpsc::sync_channel::<DebounceEventResult>(SNAPSHOT_WATCH_RAW_CAPACITY);
+    #[cfg(test)]
+    let backend_for_test = raw_tx.clone();
     // Watching promotes cadence; rename file-ID reconciliation is not scan
     // authority. NoCache avoids the recommended macOS cache's synchronous,
     // symlink-following filesystem walk during watch/refresh.
@@ -282,15 +415,25 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
     let (event_tx, event_rx) =
         mpsc::sync_channel::<SnapshotFileEvent>(SNAPSHOT_WATCH_SIGNAL_CAPACITY);
     let configured_roots = roots.clone();
+    let live = Arc::new(AtomicBool::new(true));
+    let worker_live = Arc::clone(&live);
     std::thread::spawn(move || {
+        // A stopped worker no longer hints: the watcher reads as stale.
+        struct Stopped(Arc<AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        let _stopped = Stopped(worker_live);
         while let Ok(result) = raw_rx.recv() {
             let _stage = StageWindow::begin("unknown", "offpass_watcher");
             // A backend watcher error means the event stream is no longer a
             // complete witness. The periodic durable scan must finish one
             // explicitly dirty generation and then a clean generation before
-            // publishing a manifest.
+            // publishing a manifest. The worker stops: the lane re-creates it.
             let Some(events) = complete_debounce_events(result) else {
-                continue;
+                break;
             };
             record_watcher_events(&roots, &events, &event_tx);
         }
@@ -300,7 +443,10 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
         _debouncer: debouncer,
         roots: configured_roots,
         watch_paths,
+        live,
         events: event_rx,
+        #[cfg(test)]
+        backend_for_test,
     })
 }
 
@@ -474,6 +620,44 @@ mod tests {
         ] {
             assert!(take_pending_snapshot_paths(source).overflowed);
         }
+    }
+
+    /// A backend error stops the worker: the watcher is no longer live, so it
+    /// covers nothing (the walk gate never idles uncovered roots) and the lane
+    /// re-creates it.
+    #[test]
+    fn watcher_backend_error_stops_the_worker_and_its_coverage() {
+        let _guard = pending_state_test_guard();
+        let root = crate::test_scratch::canonical_private_dir("watcher-backend-error");
+        let roots = vec![(SnapshotSource::Pi, root.clone())];
+        let watcher = watch_snapshot_roots(roots.clone()).unwrap();
+        cover(Some(&watcher));
+        assert!(covers(std::slice::from_ref(&root)), "a live watcher covers");
+        watcher
+            .backend_for_test
+            .send(Err(vec![notify::Error::generic(
+                "test watcher backend failure",
+            )]))
+            .unwrap();
+        let stopped = (0..400).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            !watcher.matches_roots(&roots)
+        });
+        assert!(stopped, "the worker stops on a backend error");
+        cover(Some(&watcher));
+        assert!(
+            !covers(std::slice::from_ref(&root)),
+            "a stopped worker covers nothing"
+        );
+        drop(watcher);
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let _ = take_pending_snapshot_paths(source);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn requested(triggers: &[ListingTrigger]) -> ListingRequest {

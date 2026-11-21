@@ -10,7 +10,7 @@
 //! history files adopted only for a new body witness. `first_read_order`
 //! reorders queued history newest first while a first read is pending.
 //! `retention` holds the owed-key exemption from the discovery window that
-//! every age gate applies.
+//! every age gate applies. `walk_idle` lets a settled source skip walks.
 
 pub(super) mod candidate;
 pub(super) mod candidate_open;
@@ -20,3 +20,4 @@ pub(super) mod retention;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
 pub(super) mod traversal;
+pub(crate) mod walk_idle;

@@ -415,7 +415,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
     let (mut progress, index) = refused(&[(1, original_pair(0))]);
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
 
     // A concurrent writer saves a changed ledger and wins the CAS: the claim
     // save fails.
@@ -423,10 +423,10 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     competitor
         .accepted_cache_heads
         .insert(cache_session_key("competitor"), "c".repeat(64));
-    competitor.save(&path).unwrap();
+    competitor.save_fixture(&path).unwrap();
     let mut stale = progress.clone();
     assert!(select(&mut stale, &index, NOW));
-    assert!(stale.save(&path).is_err());
+    assert!(stale.save_fixture(&path).is_err());
     let reloaded = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -442,7 +442,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     // A successful claim, then a crash before or after POST.
     let mut claimed = reloaded;
     assert!(select(&mut claimed, &index, NOW));
-    claimed.save(&path).unwrap();
+    claimed.save_fixture(&path).unwrap();
     drop(claimed);
     let mut restarted = SnapshotUploadProgress::load(
         &path,
@@ -460,6 +460,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     assert!(select(&mut restarted, &index, NOW + DAY));
     assert_eq!(restarted.active_reason_reoffers.len(), 1);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// F2: injected wall-clock rollback keeps the record eligible after a full
@@ -596,8 +597,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     let retry = progress.quarantined_fingerprints[&fp(1)].clone();
     let root = test_dir("reoffer-newer-conflict-retirement");
     let path = root.join("progress.json");
-    progress.save(&path).unwrap();
-    progress.finish_cycle(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
+    progress.finish_cycle_fixture(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -685,6 +686,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     let (mut old_progress, mut old_index) = refused(&[(2, original_pair(NOW + DAY))]);
     let old_timer = old_index
         .quarantined_snapshot_fingerprints

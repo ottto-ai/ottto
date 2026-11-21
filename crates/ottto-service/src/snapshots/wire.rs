@@ -319,8 +319,8 @@ impl<T: Borrow<SnapshotItem>> Serialize for SnapshotBatchWireRequest<'_, T> {
 }
 
 // Hoisted onto each SnapshotModelUsage row in v6: these participate in the
-// backend's billing_hash (one of the two row-key dimensions). Names match
-// `_usage_row_key` in backend/app/schemas/agent_session_snapshots.py.
+// receiver's billing hash, one of the two row-key dimensions. Names match the
+// receiver's usage row key.
 pub(super) const ROW_BILLING_FIELDS: &[&str] = &[
     "auth_mode",
     "billing_channel",
@@ -725,16 +725,6 @@ pub struct SnapshotItem {
     /// evidence; feeds only the local active-session card.
     #[serde(skip)]
     pub(crate) claude_account_display: Option<Box<claude_request_identity::AccountDisplay>>,
-    /// `session_billing_route:v1` annotation, set only when the receiver
-    /// advertised that exact contract. Annotation only: outside every
-    /// semantic component, the content hash and the upload body witness, and
-    /// never read by pricing, placement, identity or upload decisions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_billing_route: Option<Box<super::billing_route::SessionBillingRoute>>,
-    /// Local-only Claude route evidence captured before the native request
-    /// inputs are released. Never serialized or uploaded.
-    #[serde(skip)]
-    pub(crate) claude_route_evidence: Option<Box<super::billing_route::ClaudeRouteEvidence>>,
 }
 
 /// Request evidence for this session's own billed requests names more than one
@@ -816,18 +806,6 @@ pub struct SnapshotModelUsage {
     /// identity and these exact shares instead. Omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_parts: Option<Vec<SnapshotIdentityPart>>,
-    /// Wire contract 5, bucket rows only, option (ii): defer this row's
-    /// identity to proof the server retained from an ACKed body. Never on a
-    /// tagged row; omitted unless the server advertised the capability.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub identity_retained: bool,
-    /// Wire contract 5, bucket rows only: the row's
-    /// accepted proof was copy-derived and is tombstoned; a retaining receiver
-    /// drops that proof for good. Like
-    /// `identity_retained`, only sent when the server advertised option (ii)
-    /// and hashed in the identity leaf. Omitted when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub copy_invalidated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -874,17 +852,12 @@ pub struct SnapshotRequestEvidence {
     pub identity_basis: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_workspace_hash: Option<String>,
-    /// Absent: existing provenance (own evidence or existing fills). Present under the
-    /// `session_request_account_source:v1` capability: an account carried
-    /// within one transcript to a request with no telemetry row (placement,
-    /// never per-request proof).
+    /// Absent: existing provenance (own evidence or existing fills). Present:
+    /// an account carried within one transcript to a request with no
+    /// telemetry row (placement, never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
 }
-
-/// Exact shared activity-hint capability for carried-account provenance.
-/// Missing/null/unknown keeps existing wire bytes for every source.
-pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
 
 /// How a carried account reached a request (counts only).
 /// Shared wire shape for source reducers; unmarked provenance stays absent.
@@ -961,8 +934,8 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [evidence_basis, session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, request_contributions, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display, session_billing_route, claude_route_evidence]);
-crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
+crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [evidence_basis, session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, request_contributions, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
+crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);

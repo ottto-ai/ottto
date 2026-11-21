@@ -1,5 +1,5 @@
 //! S2 c7 on real committed Tail state: a shorter file reads main's counted
-//! Full (D158), a key rotation is a counted explicit-action reconstruction
+//! Full, a key rotation is a counted explicit-action reconstruction
 //! while an attribution toggle scrubs and reuses, the legacy record directory
 //! is erased and counted before the first load, the first format round-trips
 //! the lineage clocks and the rule epoch, and the shared hour pages carry usage
@@ -15,7 +15,7 @@ use crate::snapshots::tail_source::{counters, hour_pages, read_hour_page};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
-/// [behaviour] D158: a file shorter than its committed head reads main's
+/// [behaviour] A file shorter than its committed head reads main's
 /// counted Full, `Shrunk`, with no hold.
 #[test]
 fn a_shorter_file_reads_full_and_is_counted() {
@@ -33,7 +33,7 @@ fn a_shorter_file_reads_full_and_is_counted() {
     assert_eq!(counters::total("tail_shorter_file_full", "files"), 1);
 }
 
-/// [behaviour] #1255: a head made under another attribution key is never
+/// [behaviour] A head made under another attribution key is never
 /// reused; the Full is a counted explicit-action reconstruction, apart from
 /// the release gate.
 #[test]
@@ -62,7 +62,7 @@ fn keyed_lines(responses: usize) -> Vec<String> {
     lines
 }
 
-/// [behaviour] D168-2: session attribution toggled off, then on, is a
+/// [behaviour] Session attribution toggled off, then on, is a
 /// settings change applied forward only, never a reconstruction: each load
 /// reuses the head with its context digest scrubbed, as main scrubs a
 /// retained parse's, and the continued body equals a cold read's under the
@@ -112,7 +112,7 @@ fn an_attribution_toggle_scrubs_the_digest_and_reuses_the_head() {
     assert_eq!(counters::total("tail_reconstruct", "key_epoch"), 0);
 }
 
-/// [behaviour] #1255: the pass's start removes the retired record directory,
+/// [behaviour] The pass's start removes the retired record directory,
 /// counted, before the pass's first Tail load.
 #[test]
 fn legacy_erasure_is_counted_before_the_first_load() {

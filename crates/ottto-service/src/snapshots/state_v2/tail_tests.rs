@@ -1134,7 +1134,7 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     );
 }
 
-/// The session facts S2 stores (D168-1), each seeded as `{literal}-{fact}`:
+/// The session facts S2 stores, each seeded as `{literal}-{fact}`:
 /// title, first prompt material and display title, workspace, opening
 /// instructions and an opening file path.
 pub(crate) const TAIL_FACT_LITERALS: [&str; 6] = [
@@ -1177,7 +1177,7 @@ pub(crate) fn seed_tail_literals_for_test(
         ),
     )
     .unwrap();
-    save_locked(&path, &mut index, false, true).unwrap();
+    save_locked(&path, &mut index, false).unwrap();
     let wal = fs::read(sqlite::sidecar(
         &fence::sibling(&path, ".v2.sqlite"),
         "-wal",
@@ -1221,7 +1221,7 @@ pub(crate) fn seed_tail_kinds_for_test(path: &Path, index: &mut ScanIndex, canar
     .unwrap();
     observe_tail(path, FILE, observation(&[canary.as_bytes()])).unwrap();
     set_aside_tail(path, SIBLING, SetAsideCause::Encode).unwrap();
-    save_locked(path, index, false, true).unwrap();
+    save_locked(path, index, false).unwrap();
 }
 /// Rows of each Tail kind in the store behind `index`, every file.
 pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static str, usize> {

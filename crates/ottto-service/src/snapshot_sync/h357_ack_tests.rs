@@ -27,7 +27,7 @@ fn items(count: usize) -> Vec<SnapshotItem> {
 }
 
 /// A hash-neutral change to a witnessed leaf: same entity, different body.
-fn change_witnessed_body(item: &mut SnapshotItem) {
+pub(super) fn change_witnessed_body(item: &mut SnapshotItem) {
     item.tool_usage
         .get_or_insert_with(Vec::new)
         .push(crate::snapshots::SnapshotToolUsage {
@@ -79,7 +79,6 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
-        retained_proof_missing: Vec::new(),
         cache_observations_state: None,
     }
 }
@@ -140,6 +139,27 @@ fn progress() -> SnapshotUploadProgress {
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
     )
+}
+
+/// A fresh native Codex route in `dir`: its empty committed graph owns
+/// `ledger` on the canonical progress path, as the daemon owns progress.
+fn routed_ledger(
+    dir: &Path,
+    ledger: SnapshotUploadProgress,
+) -> (ScanIndex, PathBuf, PathBuf, SnapshotUploadProgress) {
+    let index_path = dir.canonicalize().unwrap().join("codex-route-index.json");
+    let mut index = ScanIndex::default();
+    index
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
+    let (path, ledger) = super::tests::routed_progress(&index, &index_path, ledger);
+    (index, index_path, path, ledger)
+}
+
+/// The route's ledger, as a restarted daemon loads it.
+fn reload_ledger(index_path: &Path, witness: SnapshotQuarantineWitness) -> SnapshotUploadProgress {
+    let index = ScanIndex::load(index_path).unwrap();
+    super::tests::load_routed_progress(&index, index_path, &"a".repeat(64), witness)
 }
 
 #[test]
@@ -450,13 +470,12 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("progress.json");
+    let (_route, index_path, path, mut ledger) = routed_ledger(&dir, ledger);
     ledger.save(&path).unwrap();
     ledger.finish_cycle(&path).unwrap();
     let mut witness = snapshot_quarantine_witness(SnapshotSource::Codex);
     witness.collector_version = "synthetic-new-parser-release".into();
-    let mut restarted =
-        SnapshotUploadProgress::load(&path, &"a".repeat(64), witness.clone()).unwrap();
+    let mut restarted = reload_ledger(&index_path, witness.clone());
     assert!(restarted.contains_body(&fp, &body));
     restarted.prepare_historical_replay("synthetic-next-replay");
     let mut stale = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
@@ -522,7 +541,12 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     assert_eq!(accepted, 1);
     assert!(restarted.permanent_rejections.is_empty());
     // Same on-disk file cannot suppress another destination/account's candidate.
-    let another = SnapshotUploadProgress::load(&path, &"b".repeat(64), witness).unwrap();
+    let another = super::tests::load_routed_progress(
+        &ScanIndex::load(&index_path).unwrap(),
+        &index_path,
+        &"b".repeat(64),
+        witness,
+    );
     assert!(!another.contains_body(&fp, &body));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1004,9 +1028,9 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let progress_path = dir.join("progress.json");
     let mut ledger = progress();
     ledger.quarantine_retryable_body(&held_fp, &held_body, quarantine_retry_after(&held_fp));
+    let (route, index_path, progress_path, mut ledger) = routed_ledger(&dir, ledger);
     let mut calls = Vec::new();
     let deferred = bootstrap_cache_heads(
         &probes,
@@ -1101,7 +1125,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     assert_eq!(accepted, 2);
     assert!(ledger.contains_body(&held_fp, &held_body));
     // Session one's file owns both siblings; session two's file is unrelated.
-    let mut index = ScanIndex::default();
+    let mut index = route.clone();
     index
         .files
         .insert("synthetic/s1.jsonl".into(), index_entry(&"1".repeat(64)));
@@ -1116,7 +1140,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
         "synthetic/s2.jsonl".into(),
         BTreeSet::from([probes[2].snapshot_fingerprint.clone()]),
     );
-    let committed = ScanIndex::default();
+    let committed = route.clone();
     let checkpoint = checkpoint_partial_snapshot_index(
         &index,
         &committed,
@@ -1124,7 +1148,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
         &snapshots,
         None,
         &BTreeSet::new(),
-        &dir.join("index.json"),
+        &index_path,
         &progress_path,
         || Ok(()),
     )
@@ -1149,15 +1173,24 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
     // Without exact carriage only the file owning the unsettled bytes waits.
     let mut uncarried = snapshots.clone();
     uncarried[0] = with_cache(&probes[0]);
+    // Its own install: the same durable ledger over the same empty graph.
+    let other_dir = dir.join("uncarried");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let (other, other_index_path, other_progress_path, mut other_ledger) =
+        routed_ledger(&other_dir, ledger.clone());
+    other_ledger.save(&other_progress_path).unwrap();
+    let mut other_index = other.clone();
+    other_index.files = index.files.clone();
+    other_index.file_snapshot_fingerprints = index.file_snapshot_fingerprints.clone();
     let held_back = checkpoint_partial_snapshot_index(
-        &index,
-        &committed,
-        &ledger,
+        &other_index,
+        &other,
+        &other_ledger,
         &uncarried,
         None,
         &BTreeSet::new(),
-        &dir.join("uncarried-index.json"),
-        &progress_path,
+        &other_index_path,
+        &other_progress_path,
         || Ok(()),
     )
     .unwrap();
@@ -1185,8 +1218,7 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("progress.json");
-    let mut ledger = progress();
+    let (_route, index_path, path, mut ledger) = routed_ledger(&dir, progress());
     let mut calls = Vec::new();
     let deferred = bootstrap_cache_heads(
         &probes,
@@ -1224,12 +1256,10 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
     );
     assert_eq!(calls, [(2, false), (1, false), (1, true)]);
     // The self-quarantine is durable before any later cycle relies on it.
-    let mut ledger = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
+    let mut ledger = reload_ledger(
+        &index_path,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .unwrap();
+    );
     assert_eq!(
         ledger.quarantined_fingerprints[&oversize_fp]
             .upload_body_witness
@@ -1736,8 +1766,7 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("progress.json");
-    let mut ledger = progress();
+    let (_route, index_path, path, mut ledger) = routed_ledger(&dir, progress());
     let cas_stage = std::cell::Cell::new(false);
     let error = bootstrap_cache_heads(
         &probes,
@@ -1775,12 +1804,10 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         upload_failure_diagnostic(&error),
         "kind=local_state, operation=save upload checkpoint"
     );
-    let mut restarted = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
+    let mut restarted = reload_ledger(
+        &index_path,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .unwrap();
+    );
     assert!(restarted.accepted_cache_heads.is_empty());
     assert!(!cache_head_probe_held(&restarted, &probes[0]));
     assert!(
@@ -1859,15 +1886,13 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("progress.json");
+    let (_route, index_path, path, mut ledger) = routed_ledger(&dir, ledger);
     ledger.save(&path).unwrap();
     ledger.finish_cycle(&path).unwrap();
-    let mut restarted = SnapshotUploadProgress::load(
-        &path,
-        &"a".repeat(64),
+    let mut restarted = reload_ledger(
+        &index_path,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .unwrap();
+    );
     assert_eq!(restarted.pending_cache_heads.len(), 1);
     // A sibling-minted session head plus an exactly held probe is not enrichment.
     restarted
@@ -1902,14 +1927,13 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     let probes = items(1);
     let fp = probes[0].snapshot_fingerprint.clone();
     let body = snapshot_upload_body_witness(&probes[0]);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-h360-restore-{}-{}",
         std::process::id(),
         current_unix_seconds()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let index_path = dir.join("index.json");
-    let progress_path = dir.join("progress.json");
     let mut ledger = progress();
     ledger.quarantine_retryable_body(&fp, &body, quarantine_retry_after(&fp));
     // Completed-cycle commit: the index keeps the exact record, the ledger retires.
@@ -1918,7 +1942,10 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         .file_snapshot_fingerprints
         .insert("synthetic/held.jsonl".into(), BTreeSet::from([fp.clone()]));
     index.retain_quarantined_fingerprints(&ledger.quarantined_fingerprints);
-    index.save(&index_path).unwrap();
+    index
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
+    let (progress_path, mut ledger) = super::tests::routed_progress(&index, &index_path, ledger);
     ledger.save(&progress_path).unwrap();
     ledger.finish_cycle(&progress_path).unwrap();
     let loaded = ScanIndex::load(&index_path).unwrap();
@@ -1929,8 +1956,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         Some(body.as_str())
     );
     let witness = snapshot_quarantine_witness(SnapshotSource::Codex);
-    let mut restarted =
-        SnapshotUploadProgress::load(&progress_path, &"a".repeat(64), witness.clone()).unwrap();
+    let mut restarted = reload_ledger(&index_path, witness.clone());
     assert!(!restarted.contains_body(&fp, &body));
     assert!(!restarted.prepare_quarantine_retries(&loaded.quarantined_snapshot_fingerprints));
     assert!(cache_head_probe_held(&restarted, &probes[0]));
@@ -1953,7 +1979,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     // Once the committed record is due, the lease sends exactly that probe.
     let mut due = loaded.quarantined_snapshot_fingerprints.clone();
     due.get_mut(&fp).unwrap().retry_after_unix_seconds = 0;
-    let mut retry = SnapshotUploadProgress::load(&progress_path, &"a".repeat(64), witness).unwrap();
+    let mut retry = reload_ledger(&index_path, witness);
     assert!(retry.prepare_quarantine_retries(&due));
     assert!(!cache_head_probe_held(&retry, &probes[0]));
     let mut calls = Vec::new();

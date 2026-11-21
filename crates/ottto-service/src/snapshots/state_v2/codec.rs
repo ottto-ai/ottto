@@ -157,10 +157,10 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
     use std::any::type_name;
     let row = type_name::<T>();
     if row == type_name::<crate::snapshots::upload_context_receipt::ProofState>() {
-        // 0.1.215 writes it every source cycle; #1287 retired it.
+        // 0.1.215 writes it every source cycle. It is now decode-only.
         &[&["direction"]]
     } else if row == type_name::<Option<crate::snapshots::ScanTraversalCheckpoint>>() {
-        // 0.1.208-0.1.215 stored each while nonzero; #1290 retired them. The
+        // 0.1.208-0.1.215 stored these retired counters while nonzero. The
         // residue's blocked ids went with the Codex state-only fallback.
         &[
             &["counts", "listing_owed_pace_evicted"],
@@ -181,6 +181,16 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         // An older store marks a file whose census evidence was owed; that
         // census is retired, so the bit is dropped.
         &[&["evidence_owed"]]
+    } else if row
+        == type_name::<
+            crate::snapshots::ProgressPoint<
+                crate::snapshots::claude_request_identity::AcceptedSession,
+            >,
+        >()
+    {
+        // Identity hints stored while a server advertised the removed
+        // retained-identity contract; #1810 retired its proof fields.
+        &[&["accepted", "proved"], &["accepted", "missing"]]
     } else {
         &[]
     }
@@ -477,8 +487,8 @@ mod tests {
         let proof = strict_json::<ProofState>(old).unwrap();
         assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
     }
-    /// [behaviour] An older build's traversal row holding the counters #1290
-    /// retired loads, re-encodes without them, and seeds the stored bytes so
+    /// [behaviour] An older build's traversal row holding the
+    /// retired counters loads, re-encodes without them, and seeds the stored bytes so
     /// the next save rewrites the row; a live sibling counter stays.
     #[test]
     fn retired_traversal_counters_load_and_reencode_without_them() {
@@ -521,6 +531,33 @@ mod tests {
         let raw = serde_json::to_vec(&root).unwrap();
         assert_eq!(inventory(raw.as_slice()), Ok(()));
         row["future_unknown"] = 1.into();
+        assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
+    }
+    /// [format] An identity row the removed retained-identity arm stored with
+    /// `accepted.proved` and `accepted.missing` loads without them and seeds
+    /// the stored bytes, so the next save rewrites the row; a row without them
+    /// decodes and re-encodes byte-identical. An unknown sibling still refuses.
+    #[test]
+    fn retired_identity_proof_leaves_load_and_reencode_without_them() {
+        type Row = crate::snapshots::ProgressPoint<
+            crate::snapshots::claude_request_identity::AcceptedSession,
+        >;
+        let current = format!(
+            r#"{{"progress_generation":7,"accepted":{{"key_epoch":"{}","starts":[1788256800],"shares":[],"incomplete":false}}}}"#,
+            "a".repeat(64)
+        );
+        let (loaded, canonical) = exact_json::<Row>(current.as_bytes()).unwrap();
+        assert_eq!(canonical, current.as_bytes());
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), current.as_bytes());
+        let mut row: serde_json::Value = serde_json::from_str(&current).unwrap();
+        row["accepted"]["proved"] = format!("v2:{}", "A".repeat(100)).into();
+        row["accepted"]["missing"] = serde_json::json!([1_788_256_800_i64]);
+        let old = serde_json::to_vec(&row).unwrap();
+        let (loaded, seed) = exact_json::<Row>(&old).unwrap();
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), current.as_bytes());
+        assert_eq!(seed, old);
+        assert!(strict_json::<Row>(&old).is_ok());
+        row["accepted"]["future_unknown"] = 1.into();
         assert!(exact_json::<Row>(&serde_json::to_vec(&row).unwrap()).is_err());
     }
     /// [behaviour] Rows an older build wrote with the residue blocked ids the

@@ -336,6 +336,11 @@ pub(crate) mod probe {
         ADMITTED.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
+    /// Rest-heap diagnostics: admitted logins, or None while busy.
+    pub(crate) fn admitted_entries() -> Option<usize> {
+        admitted().try_lock().ok().map(|admitted| admitted.len())
+    }
+
     pub(crate) fn login_key(slot: &ClaudeConfigDirSlot) -> String {
         // Coordinate the exact credential selected by the child, without
         // changing its raw config-dir string or credential lookup paths.

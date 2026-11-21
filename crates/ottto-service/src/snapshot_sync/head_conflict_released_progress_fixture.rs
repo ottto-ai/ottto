@@ -1,4 +1,4 @@
-// Complete 0.1.205 progress serde codec from source 562a40128.
+// Complete progress serde codec from release 0.1.205.
 // Source-span SHA256 ce35679eecbdd147642ceddab4c037ade617fdcf380d102bd4ddcf1655b4bf8c
 use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

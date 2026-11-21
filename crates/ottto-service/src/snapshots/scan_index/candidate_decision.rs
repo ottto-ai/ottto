@@ -23,7 +23,7 @@ impl ScanIndex {
         audit_now: u64,
         source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_refined(candidate, audit_now, true, source_change)
+        self.candidate_decision_refined(candidate, audit_now, true, true, source_change)
     }
 
     #[cfg(test)]
@@ -93,7 +93,17 @@ impl ScanIndex {
         now: u64,
         body_witness_adoption: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_refined(candidate, now, body_witness_adoption, &mut None)
+        self.candidate_decision_refined(candidate, now, body_witness_adoption, true, &mut None)
+    }
+
+    /// The walk gate's projection: no body-witness gate (it is in the gate's
+    /// key) and no sampled audit (the backstop serves it).
+    pub(in crate::snapshots) fn candidate_walk_debt(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        self.candidate_decision_refined(candidate, now, false, false, &mut None)
     }
 
     /// The gated decision; `source_change` names the `SourceChanged` arm that
@@ -103,6 +113,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
+        audit: bool,
         source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
@@ -174,7 +185,7 @@ impl ScanIndex {
                 Some(CandidateParseReason::SourceChanged),
             );
         }
-        let audit_due = entry.audit_requires_full(now) && !withheld_unchanged;
+        let audit_due = audit && entry.audit_requires_full(now) && !withheld_unchanged;
         if audit_due {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }

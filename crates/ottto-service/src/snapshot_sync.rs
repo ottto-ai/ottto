@@ -104,6 +104,11 @@ pub use self::telemetry_only::upload_local_health_projection_now;
 use self::telemetry_only::upload_local_health_projection_reporting;
 use self::telemetry_only::LocalHealthRefreshHeld;
 mod status;
+
+/// Rest-heap diagnostics: counted poison scopes and fingerprints, or None while busy.
+pub(crate) fn counted_poison_entries() -> Option<(usize, usize)> {
+    status::counted_poison_entries()
+}
 #[cfg(test)]
 pub(crate) use self::finish::accept_account_release_for_test;
 #[cfg(test)]
@@ -241,7 +246,7 @@ pub(crate) use self::retry::start_collection_health;
 use self::retry::with_source_cadence;
 use self::retry::with_source_cadence_state;
 use self::retry::CADENCE_WAIT_SLICE;
-use self::retry::MAX_CYCLE_INTERVAL;
+pub(crate) use self::retry::MAX_CYCLE_INTERVAL;
 #[cfg(test)]
 use self::retry::SHED_BACKOFF_BASE;
 use self::upload::apply_bootstrapped_cache_heads;
@@ -319,8 +324,6 @@ pub(crate) use self::prepare::resumed_prefix_upload_context;
 use self::prepare::SourcePreparation;
 use self::prepare::SourcePreparationStep;
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan;
-#[cfg(test)]
-pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_for_test;
 #[cfg(test)]
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_with_accepted_for_test;
 use self::telemetry_only::apply_claude_local_evidence_to_scan_with_ledger_and_budget;

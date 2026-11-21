@@ -121,8 +121,6 @@ pub enum Trigger {
     Schedule,
     /// A person's Refresh (`agent_status_refresh` with `quota_refresh`).
     ExplicitRefresh,
-    /// An older companion app's status refresh, read as a Refresh.
-    OlderAppCompat,
     /// Setup, sign-in or a setup check.
     Setup,
     /// The first pass after the daemon started.
@@ -135,7 +133,6 @@ impl Trigger {
         match self {
             Self::Schedule => "schedule",
             Self::ExplicitRefresh => "explicit_refresh",
-            Self::OlderAppCompat => "older_app_compat",
             Self::Setup => "setup",
             Self::Startup => "startup",
             Self::Other => "other",

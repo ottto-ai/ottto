@@ -59,7 +59,7 @@ fn held_probe_legacy_file_rearms_once() {
     );
     assert!(kept_entry.last_snapshot_fingerprint.is_some());
     assert!(kept.confirmed_empty_files.is_empty());
-    kept.save(&legacy.index_path).unwrap();
+    kept.save_fixture(&legacy.index_path).unwrap();
     reset_held_probe_process();
     FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     let (reparsed, parsed, _) = pipeline.measured_cycle(now + 60, true);

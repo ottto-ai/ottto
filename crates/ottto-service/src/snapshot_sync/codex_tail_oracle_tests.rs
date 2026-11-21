@@ -61,7 +61,6 @@ fn page(
 /// route reads no Full, consumes no transcript byte and emits no body.
 #[test]
 fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
-    let _cutover = crate::snapshots::TestCutover::set(0);
     let mut c = Corpus::new("codex-tail-quiet-restart");
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");

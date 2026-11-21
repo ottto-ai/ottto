@@ -128,9 +128,7 @@ fn each_missing_stale_or_corrupt_map_is_unknown_and_siblings_and_metadata_surviv
                 stats.index_shard_unavailable[affected].iter().sum::<u64>(),
                 1
             );
-            assert!(store
-                .write_legacy(&witness, 8, |_| panic!("unknown maps must not publish"))
-                .is_err());
+            assert!(store.require_legacy_rebuild().is_err());
             assert_eq!(fs::read(s.root()).unwrap(), before);
         }
     }
@@ -285,7 +283,7 @@ fn unshipped_draft_never_infers_reference_generations_or_empty_inventories() {
         replace_manifest(&s, &root);
         let before = fs::read(s.root()).unwrap();
         let store = s.store();
-        let Opened::Partial(mut partial, witness) = store.open().unwrap() else {
+        let Opened::Partial(mut partial, _witness) = store.open().unwrap() else {
             panic!("unshipped draft maps must remain unknown")
         };
         let metadata: Value = serde_json::from_slice(&bytes(&mut partial.metadata)).unwrap();
@@ -309,10 +307,7 @@ fn unshipped_draft_never_infers_reference_generations_or_empty_inventories() {
             assert_eq!(counts.iter().sum::<u64>(), 1);
             assert_eq!(counts[UnavailableCause::Descriptor as usize], 1);
         }
-        assert!(store.compare(&witness).is_err());
-        assert!(store
-            .write_legacy(&witness, 8, |_| panic!("unknown maps must not export"))
-            .is_err());
+        assert!(store.require_legacy_rebuild().is_err());
         assert_eq!(fs::read(s.root()).unwrap(), before);
     }
 }

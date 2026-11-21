@@ -88,7 +88,8 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES + 1 {
         progress.quarantine_body(&item.snapshot_fingerprint, &old_body);
     }
-    progress.hold_unstored_body(&item.snapshot_fingerprint, &old_body);
+    // Even a `usage_identical` answer leaves a stale-owed body retryable.
+    progress.hold_unstored_body(&item.snapshot_fingerprint, &old_body, true);
     progress.prepare_quarantine_retries(&BTreeMap::new());
     assert_eq!(
         progress.quarantined_fingerprints[&item.snapshot_fingerprint].disposition,
@@ -98,7 +99,7 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     assert_eq!(offer(&item, source, STALE, &mut progress), 0);
     let scratch = crate::test_scratch::ScratchDir::new("stale-refusal-restart");
     let path = scratch.join("progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored =
         SnapshotUploadProgress::load(&path, &"a".repeat(64), snapshot_quarantine_witness(source))
             .unwrap();

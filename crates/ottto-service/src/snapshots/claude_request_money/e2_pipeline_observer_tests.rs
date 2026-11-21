@@ -18,10 +18,10 @@ pub(crate) fn disclosed(items: &[SnapshotItem]) -> u64 {
         .sum()
 }
 
-/// Observe the saved premise before growth, including after a cold restart.
-/// The private cutoff and acceptance predicate are the production ones. The
-/// holder witness is exactly what the counting-twin correction must reject.
-pub(crate) fn assert_counting_twin_grandfather_premise(
+/// Observe the saved premise before growth, including after a cold restart:
+/// a pre-cutoff, COPY-marked, accepted carrier whose twin's saved removal
+/// names it as the holder. Growth must still count r1 once.
+pub(crate) fn assert_counting_twin_premise(
     index: &ScanIndex,
     carrier: &Path,
     twin: &Path,

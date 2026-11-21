@@ -214,11 +214,6 @@ impl SessionAttributionContext {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn expire_launch_lookup_for_test(&self) {
-        self.launch_events.expire_for_test();
-    }
-
     pub(crate) fn launch_events(&self) -> &crate::launch_events::LaunchEventInventory {
         &self.launch_events
     }

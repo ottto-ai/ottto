@@ -449,15 +449,18 @@ pub(crate) fn claude_api_evidence_fingerprint_is_valid(
     })
 }
 
+/// Hashed once per row: the first caller fills the row's kept result.
 pub(crate) fn claude_trace_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
 ) -> bool {
-    let mut canonical = row.clone();
-    canonical.fingerprint.clear();
-    serialized_json_digest(&canonical, b"")
-        .map(|digest| format!("sha256:{:x}", digest.finalize()))
-        .as_deref()
-        == Some(row.fingerprint.as_str())
+    row.fingerprint_check.get_or_check(|| {
+        let mut canonical = row.clone();
+        canonical.fingerprint.clear();
+        serialized_json_digest(&canonical, b"")
+            .map(|digest| format!("sha256:{:x}", digest.finalize()))
+            .as_deref()
+            == Some(row.fingerprint.as_str())
+    })
 }
 
 pub(in crate::snapshots) fn claude_snapshot_request_id_hashes(
@@ -1064,26 +1067,30 @@ pub(in crate::snapshots) fn rebuild_claude_reported_usage(
             item.source_started_at = Some(first_activity_at);
         }
     }
-    if let Some(last_activity_at) = reported_activity.last_activity_at {
-        if item
-            .source_last_activity_at
-            .as_ref()
-            .map_or(true, |current| {
-                timestamp_is_after(&last_activity_at, current)
-            })
-        {
-            item.source_last_activity_at = Some(last_activity_at.clone());
-        }
-        if item
-            .source_ended_at
-            .as_ref()
-            .is_some_and(|current| timestamp_is_after(&last_activity_at, current))
-        {
-            item.source_ended_at = Some(last_activity_at);
-        }
+    if let Some(last_activity_at) = reported_activity.last_activity_at.as_deref() {
+        widen_last_activity(item, last_activity_at);
     }
     item.cost = cost;
     true
+}
+
+/// Raises the item's last-activity clock to `last` when it is missing or
+/// earlier. A present end advances with it; a missing end stays missing.
+pub(in crate::snapshots) fn widen_last_activity(item: &mut SnapshotItem, last: &str) {
+    if item
+        .source_last_activity_at
+        .as_ref()
+        .map_or(true, |current| timestamp_is_after(last, current))
+    {
+        item.source_last_activity_at = Some(last.to_owned());
+    }
+    if item
+        .source_ended_at
+        .as_ref()
+        .is_some_and(|current| timestamp_is_after(last, current))
+    {
+        item.source_ended_at = Some(last.to_owned());
+    }
 }
 
 fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {

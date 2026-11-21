@@ -908,7 +908,7 @@ fn codex_occurrences() {
     }
     write(&path, &rows);
     // Native records require the configured production counting factory.
-    let _cutover = TestCutover::set(0);
+
     let candidate = candidate(&path);
     let metadata = CodexTitleMetadata::default();
     let mut p = sampled_scan::new_source_parser(
@@ -1099,7 +1099,7 @@ fn placement() {
                 &births,
                 &[],
             );
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 &support, &mut scan, &mut index,
             );
             for item in &mut scan.snapshots {

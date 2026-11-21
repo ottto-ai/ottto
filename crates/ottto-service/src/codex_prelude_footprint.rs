@@ -546,7 +546,7 @@ crate::durable_tail_codec::durable_struct!(CodexPreludeParser {
 });
 
 impl CodexPreludeParser {
-    /// The parser as a Tail session fact (D168-1): every field, the content
+    /// The parser as a Tail session fact: every field, the content
     /// (`X`: the cwd and the AGENTS.md text) included, since a fact is stored
     /// in full. A kept skills body has no fact encoding: refused, never
     /// dropped.

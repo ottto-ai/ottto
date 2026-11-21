@@ -14,6 +14,9 @@
 
 use super::pipeline_transcript_line as history_line;
 use super::*;
+use crate::snapshots::e2_pipeline_scan_fixture::{
+    legacy_input_for_test, load_source_for_test, seed_json_for_test,
+};
 
 const HISTORY_MACHINE_ID: &str = "machine-history-upgrade";
 const HISTORY_DESTINATION: &str = "history-upgrade-destination";
@@ -38,8 +41,8 @@ struct HistoryCycle<'a> {
     upload: PipelineUpload,
     /// Another relay destination (its own index); `None` is the default one.
     destination: Option<&'a str>,
-    /// Stand in for MONEY's emitter (#699): after finalization, add one
-    /// request-owned literal copy of every item, ignoring #699's own
+    /// Stand in for the money item emitter: after finalization, add one
+    /// request-owned literal copy of every item, ignoring the emitter's own
     /// protected-root skip, so only the gate's hook can remove it.
     mint_literal: bool,
     /// Observe the contract-5 contract before the scan, as a daemon cycle
@@ -130,21 +133,18 @@ impl HistoryFixture {
     /// Corrupt the saved index, as the 0.1.188 daemon's whole-index check
     /// left it; the next load quarantines it and starts empty.
     fn corrupt_index(&self) {
-        std::fs::write(&self.index_path, b"{not json").expect("corrupt saved index");
+        legacy_input_for_test(&self.index_path, b"{not json");
     }
 
     /// Valid JSON with more damaged records than the lenient hold admission.
     /// This must take the same quarantined-origin history gate as syntax loss.
     fn exceed_decode_hold_budget(&self) {
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&self.index_path).expect("read synthetic index"))
-                .expect("decode synthetic index");
+        let mut value = serde_json::to_value(ScanIndex::load(&self.index_path).unwrap()).unwrap();
         for n in 0..4097 {
             value["files"][format!("/synthetic-damage/{n}.jsonl")] =
                 serde_json::json!({"size_bytes": []});
         }
-        std::fs::write(&self.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("write excessive record damage");
+        legacy_input_for_test(&self.index_path, &serde_json::to_vec(&value).unwrap());
     }
 
     fn index_path_for(&self, destination: Option<&str>) -> PathBuf {
@@ -186,12 +186,9 @@ impl HistoryFixture {
     ) -> HistoryOutcome {
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
-        let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
-            &index_path,
-            SnapshotSource::ClaudeCode,
-            &self.support,
-        )
-        .expect("load scan index");
+        let (mut index, origin) =
+            load_source_for_test(&index_path, SnapshotSource::ClaudeCode, &self.support)
+                .expect("load scan index");
         let loaded_fresh = origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
             || (index.generation == 0 && index.files.is_empty());
         index.activate_upload_context(cycle.upload_context.to_string());
@@ -260,7 +257,7 @@ impl HistoryFixture {
         .expect("scan Claude page");
         before_evidence(&mut scan);
         let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&self.support, &mut scan, &mut index);
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -417,7 +414,7 @@ impl HistoryFixture {
             &scan.snapshots,
             &acks,
         );
-        index.save(&index_path).expect("save scan index");
+        index.save_fixture(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
             index: ScanIndex::load(&index_path).expect("reload scan index"),
@@ -466,6 +463,7 @@ impl HistoryFixture {
 impl Drop for HistoryFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -490,7 +488,7 @@ const HISTORY_CURRENT: HistoryCycle<'static> = HistoryCycle {
 /// Primary incident shape (addendum 2) on an unverified Mac: a bootstrapped
 /// destination's index is quarantined, no list and no seen-marker, the
 /// backfill state is unreadable, the active revision is bumped. Every file
-/// comes back as a new file. On dba838f0 every body is re-sent (`uploaded`
+/// comes back as a new file. Previously every body was re-sent (`uploaded`
 /// holds all three sessions); here none is, every file is recorded locally
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
@@ -683,7 +681,7 @@ fn rearmed_unchanged_history_is_held_and_settles() {
         entry.source_file_fingerprint.clear();
     }
     baseline
-        .save(&fixture.index_path)
+        .save_fixture(&fixture.index_path)
         .expect("save re-armed index");
     fixture.corrupt_backfill_state();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
@@ -780,8 +778,7 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
     ]);
     let owner = "a".repeat(64);
     let saved = |fixture: &HistoryFixture| -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
-            .expect("decode saved index")
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap()
     };
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
@@ -791,10 +788,9 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
         value["session_account_bindings"] =
             serde_json::json!({ owner_key.clone(): {"account_identifier_hash": owner} });
         value["claude_request_identity_contract"] = serde_json::json!("prior-contract");
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("seed prior identity");
+        seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&value).unwrap());
         fixture.exceed_decode_hold_budget();
-        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        let refused = load_source_for_test(
             &fixture.index_path,
             SnapshotSource::ClaudeCode,
             &fixture.support,
@@ -869,19 +865,19 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     fixture.corrupt_backfill_state();
     fixture.corrupt_index();
     assert_eq!(
-        ScanIndex::load_for_snapshot_source_with_origin(
+        load_source_for_test(
             &fixture.index_path,
             SnapshotSource::ClaudeCode,
             &fixture.support
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+        crate::snapshots::ScanIndexLoadOrigin::Loaded
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());
     fixture.exceed_decode_hold_budget();
-    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+    let refused = load_source_for_test(
         &fixture.index_path,
         SnapshotSource::ClaudeCode,
         &fixture.support,
@@ -984,19 +980,19 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
     fixture.corrupt_backfill_state();
     fixture.corrupt_index();
     assert_eq!(
-        ScanIndex::load_for_snapshot_source_with_origin(
+        load_source_for_test(
             &fixture.index_path,
             SnapshotSource::ClaudeCode,
             &fixture.support
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+        crate::snapshots::ScanIndexLoadOrigin::Loaded
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());
     fixture.exceed_decode_hold_budget();
-    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+    let refused = load_source_for_test(
         &fixture.index_path,
         SnapshotSource::ClaudeCode,
         &fixture.support,
@@ -1138,7 +1134,7 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
 }
 
 /// Through the pipeline: a census re-owes a stored 3
-/// (as #699's selection-loss path will); the file is owed again, a listed
+/// (as the money selection-loss path will); the file is owed again, a listed
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
 fn a_re_owed_file_goes_back_through_the_gate() {
@@ -1163,7 +1159,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         }
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
         index
-            .save(&fixture.index_path)
+            .save_fixture(&fixture.index_path)
             .expect("save re-owed stamps");
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         let again = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
@@ -1182,7 +1178,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
     });
 }
 
-/// Addendum 2 item 14 (#700): with the seen-marker present, an empty load
+/// With the seen-marker present, an empty load
 /// latches; held history stays held even with an installed list, while a
 /// file born after the cutoff still ingests.
 #[test]
@@ -1206,7 +1202,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     );
     fixture.corrupt_index();
     let current_bytes = std::fs::read(&fixture.index_path).unwrap();
-    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+    let refused = load_source_for_test(
         &fixture.index_path,
         SnapshotSource::ClaudeCode,
         &fixture.support,
@@ -1325,7 +1321,8 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
         if quarantine {
             fixture.corrupt_index();
         } else {
-            std::fs::remove_file(&fixture.index_path).expect("lose the index");
+            crate::snapshots::e2_pipeline_scan_fixture::discard_store_for_test(&fixture.index_path);
+            assert!(!fixture.index_path.exists(), "lose the index");
         }
         for hour in [9, 10] {
             let outcome = fixture.cycle(
@@ -1740,16 +1737,11 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
     // As a pre-gate daemon saved it: no gate marker and no cutoff.
     let index_path = fixture.index_path_for(destination_b);
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
-            .expect("decode saved index");
+        serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap();
     let object = saved.as_object_mut().expect("index object");
     assert!(object.remove("claude_history_gate_loaded").is_some());
     object.remove("claude_history_cutoff_unix_seconds");
-    std::fs::write(
-        &index_path,
-        serde_json::to_vec(&saved).expect("encode index"),
-    )
-    .expect("write pre-gate index");
+    seed_json_for_test(&index_path, &serde_json::to_vec(&saved).unwrap());
     let newcomer = "a8888888-8888-4888-8888-888888888888";
     std::fs::write(
         fixture.root.join(format!("{newcomer}.jsonl")),
@@ -1771,8 +1763,7 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
         "the session created after the last receipt is new"
     );
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
-            .expect("decode saved index");
+        serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap();
     assert_eq!(
         saved["claude_history_cutoff_unix_seconds"], 1_785_654_000_u64,
         "2026-08-02T07:00:00Z, the newest accepted activity"
@@ -1855,16 +1846,11 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
     let fixture = HistoryFixture::new("history-upgrade-downtime");
     fixture.baseline();
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
-            .expect("decode saved index");
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
     let object = saved.as_object_mut().expect("index object");
     object.remove("claude_history_gate_loaded");
     object.remove("claude_history_cutoff_unix_seconds");
-    std::fs::write(
-        &fixture.index_path,
-        serde_json::to_vec(&saved).expect("encode index"),
-    )
-    .expect("write pre-gate index");
+    seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&saved).unwrap());
     let newcomer = "a9999999-9999-4999-8999-999999999999";
     std::fs::write(
         fixture.root.join(format!("{newcomer}.jsonl")),
@@ -1889,7 +1875,7 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
 
 /// The incident shape with the list intended: prior
 /// uploads, the list installed (one family listed) and its seen-marker
-/// written, then the index quarantined. The rebuild latches (#700): nothing
+/// written, then the index quarantined. The rebuild latches: nothing
 /// is emitted. After a restart, the listed family is never emitted and the
 /// rest is paced through the budget.
 #[test]
@@ -2431,7 +2417,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
-    // Version 2 is #825's zero-mask row, kept for version stability.
+    // Version 2 is the zero-mask row, kept for version stability.
     const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (6, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     let at_two = fixture.baseline_at(2);
@@ -2617,7 +2603,7 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// gate on: no owed file is re-read or stamped 3. [money] The pause holds
 /// adoption only: a genuine change of an unlisted family uploads the `e2`
 /// literal, as under the installed list, never withheld (G1), and its file
-/// is not stamped 3 while the list is missing (G3).
+/// is not stamped 3 while the list is missing.
 #[test]
 fn e2_missing_list_pauses_history_and_uploads_changes_as_e2() {
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
@@ -2968,7 +2954,7 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
 
 /// Contract-5 cutover, first run after upgrade:
 /// revision-3 history stamped by a permit-era build without the permit
-/// (recorded contract `""`, no capture), some carrying #825's retired
+/// (recorded contract `""`, no capture), some carrying the retired
 /// `STAMPED_WITHOUT_PERMIT` bit (64), meets the always-on contract. Nothing
 /// is re-read or re-owed: a record that never captured is not "no marker
 /// existed", and waits for real content change. The bit is decoded and kept
@@ -2990,7 +2976,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        // The permit-era record: contract `""`, and #825's bit on one file.
+        // The permit-era record: contract `""`, and the retired bit on one file.
         let mut old = ScanIndex::load(&fixture.index_path).unwrap();
         let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
         let kept = old
@@ -2998,11 +2984,10 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .money_marks(location_key(&marked));
         old.claude_money_birth_store
             .set_money_marks(&marked, kept | RETIRED_PERMIT_MARK);
-        old.save(&fixture.index_path).unwrap();
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        old.save_fixture(&fixture.index_path).unwrap();
+        let mut saved = serde_json::to_value(&old).unwrap();
         saved["claude_request_identity_contract"] = serde_json::json!("");
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&saved).unwrap());
         let witnesses = |index: &ScanIndex| {
             index
                 .files
@@ -3053,7 +3038,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
 }
 
 /// Contract 5: a real content change restamps a file's money marks from its
-/// new body. #825's retired bit is carried as stored through that restamp
+/// new body. The retired bit is carried as stored through that restamp
 /// (durable entry digests bind the raw byte), never cleared or set. The
 /// stored byte keeps only the retired bit, so the body's own marks return
 /// only if the restamp ran.
@@ -3087,7 +3072,7 @@ fn e2_restamp_carries_the_retired_permit_bit() {
             );
             old.claude_money_birth_store
                 .set_money_marks(&marked, RETIRED_PERMIT_MARK);
-            old.save(&fixture.index_path).unwrap();
+            old.save_fixture(&fixture.index_path).unwrap();
             let before = old.files[&marked].source_file_fingerprint.clone();
             fixture.append(HISTORY_SESSIONS[0], "req_0_2");
             let page = fixture.cycle("2026-08-02T09:00:00Z", cycle);

@@ -94,8 +94,8 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
     let index_path = scratch.join("index.json");
     let progress_path = scratch.join("progress.json");
     let mut index = ScanIndex::default();
-    index.save(&index_path).unwrap();
-    progress.save(&progress_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
 
     for revision in 0..20 {
         let valid = format!("{:064x}", 10_000 + revision);
@@ -106,10 +106,10 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
             .file_snapshot_fingerprints
             .insert("changing.jsonl".into(), BTreeSet::from([valid.clone()]));
         let retired = progress.retired_ack_candidates(&previous, &index);
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
         progress.retire_acks_after_index_save(&index, &retired, &BTreeSet::new());
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         let items = vec![valid.clone(), poison.clone()];
         let mut accepted = 0;
         let result = upload_resumable_batches(
@@ -132,7 +132,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
                     Ok(accepted_batch(batch.len()))
                 }
             },
-            |state| state.save(&progress_path),
+            |state| state.save_fixture(&progress_path),
         )
         .expect("held validation rejection preserves accepted siblings");
 
@@ -206,7 +206,9 @@ fn snapshot_upload_progress_resets_when_relay_device_changes() {
     let accepted = format!("{:064x}", 7);
     let mut progress = SnapshotUploadProgress::new(namespace_a, test_quarantine_witness());
     progress.record([accepted.as_str()]);
-    progress.save(&path).expect("save account A progress");
+    progress
+        .save_fixture(&path)
+        .expect("save account A progress");
 
     let rebuilt = SnapshotUploadProgress::load(&path, &namespace_b, test_quarantine_witness())
         .expect("mismatched ledger is quarantined and rebuilt");
@@ -224,6 +226,7 @@ fn snapshot_upload_progress_resets_when_relay_device_changes() {
         1
     );
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -232,7 +235,7 @@ fn snapshot_upload_progress_compare_and_swap_rejects_stale_writer() {
     let path = root.join("progress-v2.json");
     let namespace = format!("{:064x}", 42);
     let mut initial = SnapshotUploadProgress::new(namespace, test_quarantine_witness());
-    initial.save(&path).expect("initial progress");
+    initial.save_fixture(&path).expect("initial progress");
 
     let mut stale = SnapshotUploadProgress::load(
         &path,
@@ -247,10 +250,10 @@ fn snapshot_upload_progress_compare_and_swap_rejects_stale_writer() {
     )
     .expect("winner view");
     winner.record(["a".repeat(64).as_str()]);
-    winner.save(&path).expect("winner save");
+    winner.save_fixture(&path).expect("winner save");
     stale.record(["b".repeat(64).as_str()]);
     stale
-        .save(&path)
+        .save_fixture(&path)
         .expect_err("stale upload progress must not clobber winner");
     let observed = SnapshotUploadProgress::load(
         &path,
@@ -261,6 +264,7 @@ fn snapshot_upload_progress_compare_and_swap_rejects_stale_writer() {
     assert!(observed.accepted_fingerprints.contains(&"a".repeat(64)));
     assert!(!observed.accepted_fingerprints.contains(&"b".repeat(64)));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -269,7 +273,7 @@ fn snapshot_upload_progress_stale_clear_cannot_delete_winner() {
     let path = root.join("progress-v2.json");
     let namespace = format!("{:064x}", 43);
     let mut initial = SnapshotUploadProgress::new(namespace, test_quarantine_witness());
-    initial.save(&path).expect("initial progress");
+    initial.save_fixture(&path).expect("initial progress");
     let stale = SnapshotUploadProgress::load(
         &path,
         &initial.destination_namespace_hash,
@@ -278,7 +282,9 @@ fn snapshot_upload_progress_stale_clear_cannot_delete_winner() {
     .expect("stale view");
     let mut winner = stale.clone();
     winner.record(["c".repeat(64).as_str()]);
-    winner.save(&path).expect("winner advances generation");
+    winner
+        .save_fixture(&path)
+        .expect("winner advances generation");
 
     stale
         .clear(&path)
@@ -287,6 +293,7 @@ fn snapshot_upload_progress_stale_clear_cannot_delete_winner() {
     winner.clear(&path).expect("winning generation clears");
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [money] The narrow CAS decode refuses a changed schema or namespace,
@@ -299,7 +306,7 @@ fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
     let namespace = format!("{:064x}", 44);
     let mut progress = SnapshotUploadProgress::new(namespace, test_quarantine_witness());
     progress.quarantine_body(&"a".repeat(64), &"b".repeat(64));
-    progress.save(&path).expect("initial progress");
+    progress.save_fixture(&path).expect("initial progress");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let generation = progress.generation;
     for (field, value) in [
@@ -316,7 +323,7 @@ fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
         disk[field] = value;
         let bytes = serde_json::to_vec_pretty(&disk).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        progress.save(&path).expect_err(field);
+        progress.save_fixture(&path).expect_err(field);
         assert_eq!(progress.generation, generation, "{field}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "{field}");
     }
@@ -337,11 +344,12 @@ fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
         &mut expected,
         &full.quarantined_fingerprints
     ));
-    progress.save(&path).expect("same stamps save");
+    progress.save_fixture(&path).expect("same stamps save");
     let written: SnapshotUploadProgress =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(written.quarantined_fingerprints, expected);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -388,7 +396,9 @@ fn snapshot_upload_progress_quarantines_unbounded_retry_deadline() {
             disposition: SnapshotQuarantineDisposition::RetryPending,
         },
     );
-    corrupt.save(&path).expect("persist far-future deadline");
+    corrupt
+        .save_fixture(&path)
+        .expect("persist far-future deadline");
 
     let rebuilt = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness())
         .expect("far-future deadline is quarantined rather than fencing forever");
@@ -403,6 +413,7 @@ fn snapshot_upload_progress_quarantines_unbounded_retry_deadline() {
         1
     );
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [regress] Version 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
@@ -416,7 +427,7 @@ fn version_only_quarantine_witness_change_keeps_retry_after() {
     let mut progress = SnapshotUploadProgress::new(namespace.clone(), old_witness);
     progress.quarantine([fingerprint.as_str()]);
     let original = progress.quarantined_fingerprints[&fingerprint].clone();
-    progress.save(&path).expect("persist quarantine");
+    progress.save_fixture(&path).expect("persist quarantine");
 
     let mut upgraded = test_quarantine_witness();
     upgraded.collector_version.push_str("-upgrade");
@@ -436,7 +447,7 @@ fn version_only_quarantine_witness_change_keeps_retry_after() {
         retained.failed_reconstruction_count,
         original.failed_reconstruction_count
     );
-    repaired.save(&path).unwrap();
+    repaired.save_fixture(&path).unwrap();
     repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone()).unwrap();
     assert!(!repaired.prepare_quarantine_retries(&BTreeMap::new()));
     assert_eq!(
@@ -451,6 +462,7 @@ fn version_only_quarantine_witness_change_keeps_retry_after() {
     assert!(!repaired.contains(&fingerprint));
     assert!(repaired.active_quarantine_retries.contains(&fingerprint));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -653,8 +665,8 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     index = serde_json::from_value(state).unwrap();
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
-    index.save(&index_path).unwrap();
-    progress.save(&progress_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
         &progress.destination_namespace_hash,
@@ -672,9 +684,9 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     progress
         .quarantined_fingerprints
         .insert(fingerprint.clone(), terminal.clone());
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     assert!(progress.retain_current_quarantines(&index.current_snapshot_fingerprints(), &index));
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
@@ -753,7 +765,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
                 false,
             )))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     );
     assert!(unsent.is_err());
     assert_eq!(
@@ -774,7 +786,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
             require_normal_write_ack_for_legacy_reconciliation(&response, &pending, &pending)?;
             Ok(response)
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     );
     assert!(replied
         .unwrap_err()
@@ -811,7 +823,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
             assert_eq!(batch.len(), 1);
             Ok(accepted_batch(1))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .unwrap();
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -835,6 +847,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     assert!(quiet.snapshots.is_empty());
     assert_eq!((upload_calls, accepted), (1, 1));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1032,7 +1045,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
     );
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     assert!(index.prepare_snapshot_admission_reoffer(50));
-    index.save(&root.join("index.json")).unwrap();
+    index.save_fixture(&root.join("index.json")).unwrap();
     progress.active_quarantine_witness = Some(test_quarantine_witness());
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
     let before = snapshot_upload_body_witness(large);
@@ -1058,7 +1071,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
             }));
             Ok(accepted_batch(req.snapshots.len()))
         },
-        |p| p.save(&root.join("progress.json")),
+        |p| p.save_fixture(&root.join("progress.json")),
     )
     .unwrap();
     assert_eq!(accepted, 2);
@@ -1078,6 +1091,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
     );
     println!("native admission: item_bytes={large_bytes} hours=1000 accepted=2 quarantined=1 private_reads=0");
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1097,7 +1111,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
         progress.quarantine([fingerprint.as_str()]);
     }
     progress.record([sibling.as_str()]);
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut index = ScanIndex::default();
     index.file_snapshot_fingerprints.insert(
         "synthetic.jsonl".into(),
@@ -1106,12 +1120,12 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     let index_path = root.join("index.json");
     assert!(index.prepare_snapshot_admission_reoffer(50));
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
     assert!(progress.active_quarantine_retries.contains(&fingerprint));
     assert!(progress.contains(&sibling));
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     progress = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
     assert!(
         progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
@@ -1137,7 +1151,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
             )?;
             Ok(response)
         },
-        |p| p.save(&path),
+        |p| p.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(sent, vec![fingerprint.clone()]);
@@ -1156,6 +1170,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     assert!(unrelated.quarantined_fingerprints.is_empty());
     assert!(!unrelated.prepare_quarantine_retries(&BTreeMap::new()));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1441,12 +1456,13 @@ fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
     progress
         .accepted_body_contexts
         .insert(entity.clone(), context.clone());
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let loaded =
         SnapshotUploadProgress::load(&path, &destination, test_quarantine_witness()).unwrap();
     assert_eq!(loaded.accepted_body_contexts.get(&entity), Some(&context));
     assert!(loaded.accepted_fingerprints.contains(&entity));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]

@@ -34,7 +34,7 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
     counts.causes.add(RETIRED_SLOT, 2);
     counts.ownership_incomplete_file_count = 2;
     let marker = counts.causes.summary(2).1[1];
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
     let traversal = restored.traversal.as_mut().unwrap();
     let restored_start = rfc3339_unix_seconds(&traversal.census_window_end).unwrap();

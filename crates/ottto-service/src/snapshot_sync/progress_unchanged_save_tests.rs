@@ -75,20 +75,20 @@ fn file(path: &Path) -> (u64, Vec<u8>) {
 #[test]
 fn unchanged_pass_writes_no_progress_bytes() {
     let mut f = Fixture::new("unchanged");
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     // A batch persist that changed the ledger writes it.
     f.progress
         .accepted_cache_heads
         .insert(cache_session_key("s1"), "b".repeat(64));
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     let generation = f.progress.generation;
     let progress = file(&f.path);
     // Unchanged batch persist, bounded-retry persist and pass end.
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     f.progress
-        .save_with_read_limit(&f.path, Some(crate::snapshot_retry::RESPONSE_BYTES))
+        .save_fixture_with_read_limit(&f.path, Some(crate::snapshot_retry::RESPONSE_BYTES))
         .unwrap();
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, generation, "no generation claimed");
     assert_eq!(file(&f.path), progress, "progress: 0 bytes written");
     f.no_temp_files();
@@ -104,16 +104,16 @@ fn unchanged_pass_writes_no_progress_bytes() {
 #[test]
 fn changed_save_after_skip_writes_next_generation_and_keeps_cas() {
     let mut f = Fixture::new("changed");
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     let mut stale = f.load();
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 1, "skipped save claims nothing");
     let skipped = file(&f.path);
 
     f.progress
         .accepted_cache_heads
         .insert(cache_session_key("s1"), "b".repeat(64));
-    f.progress.save(&f.path).unwrap();
+    f.progress.save_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 2, "changed save after a skip");
     let (inode, bytes) = file(&f.path);
     assert_ne!(inode, skipped.0, "changed ledger is replaced");
@@ -123,24 +123,24 @@ fn changed_save_after_skip_writes_next_generation_and_keeps_cas() {
 
     // A stale writer fails its CAS whether or not it changed anything.
     stale
-        .save(&f.path)
+        .save_fixture(&f.path)
         .expect_err("unchanged stale writer is refused");
     stale
         .accepted_cache_heads
         .insert(cache_session_key("s2"), "c".repeat(64));
     stale
-        .save(&f.path)
+        .save_fixture(&f.path)
         .expect_err("changed stale writer is refused");
     assert_eq!(stale.generation, 1);
     assert_eq!(file(&f.path), (inode, bytes));
 
     // The owner keeps going: skip again, then change again.
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 2);
     f.progress
         .accepted_cache_heads
         .insert(cache_session_key("s3"), "d".repeat(64));
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 3);
     let restored = f.load();
     assert_eq!(restored.generation, 3);
@@ -168,14 +168,14 @@ fn compact_progress_decodes_across_pretty_writers() {
     );
 
     // Its next save writes compact JSON once, then skips.
-    progress.save(&f.path).unwrap();
+    progress.save_fixture(&f.path).unwrap();
     assert_eq!(progress.generation, 3);
     let compact_3 = std::fs::read(&f.path).unwrap();
     assert_eq!(compact_3, serde_json::to_vec(&progress).unwrap());
     assert!(!compact_3.contains(&b'\n'), "compact progress");
     assert!(compact_3.len() < pretty_2.len());
     let inode = std::fs::metadata(&f.path).unwrap().ino();
-    progress.save(&f.path).unwrap();
+    progress.save_fixture(&f.path).unwrap();
     assert_eq!(
         std::fs::metadata(&f.path).unwrap().ino(),
         inode,
@@ -185,7 +185,7 @@ fn compact_progress_decodes_across_pretty_writers() {
     progress
         .accepted_cache_heads
         .insert(cache_session_key("s2"), "c".repeat(64));
-    progress.save(&f.path).unwrap();
+    progress.save_fixture(&f.path).unwrap();
     let compact_4 = std::fs::read(&f.path).unwrap();
     let restored = f.load();
     assert_eq!(restored.generation, 4);
@@ -213,7 +213,7 @@ fn compact_progress_decodes_across_pretty_writers() {
     ottto_core::write_owner_only_file_atomic(&f.path, &pretty_5).unwrap();
     let mut upgraded = f.load();
     assert_eq!(upgraded.generation, 5);
-    upgraded.save(&f.path).unwrap();
+    upgraded.save_fixture(&f.path).unwrap();
     assert_eq!(upgraded.generation, 6);
     assert_eq!(
         std::fs::read(&f.path).unwrap(),

@@ -1,4 +1,4 @@
-//! Uses the real ScanIndex serializer and real #865 durable store in lib tests.
+//! Uses the real ScanIndex serializer and durable store in library tests.
 use crate::snapshots::scan_index_persistence as persistence;
 use crate::snapshots::ScanIndex;
 use persistence::*;
@@ -252,20 +252,14 @@ fn reader_missing_root_with_any_reserved_control_stalls_without_cleanup() {
 #[test]
 fn reader_no_store_allows_true_first_install_and_legacy_first_save() {
     let s = Scratch::new();
-    let mut logical = Scratch::fixture()["logical"].clone();
+    let logical = Scratch::fixture()["logical"].clone();
     let store = s.store(&logical);
     let Opened::Missing(root) = store.open().unwrap() else {
         panic!("true first install");
     };
     assert_eq!(store.take_read_stats().root_missing_reserved_only, 0);
-    logical["generation"] = serde_json::json!(1);
-    assert!(store
-        .write_legacy(&root, 1, |out| {
-            serde_json::to_writer(out, &logical)?;
-            Ok(())
-        })
-        .unwrap()
-        .is_legacy());
+    assert!(root.generation().is_none());
+    assert!(!s.root().exists());
 }
 
 #[test]
@@ -314,16 +308,17 @@ fn reader_reserved_directory_cas_refuses_intervening_repair_state() {
     let s = Scratch::new();
     let logical = Scratch::fixture()["logical"].clone();
     let store = s.store(&logical);
-    let Opened::Missing(root) = store.open().unwrap() else {
+    let Opened::Missing(_) = store.open().unwrap() else {
         panic!("fresh init");
     };
     let dir = s.0.join("scan-index.json.shards");
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     let files = future_repair_files(&s);
-    let error = store
-        .write_legacy(&root, 1, |_| panic!("CAS must refuse before encoding"))
-        .unwrap_err();
+    let error = match store.open() {
+        Err(error) => error,
+        Ok(_) => panic!("intervening repair state must refuse"),
+    };
     assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
     assert_eq!(store.take_read_stats().root_missing_reserved_only, 1);
     assert!(!s.root().exists());

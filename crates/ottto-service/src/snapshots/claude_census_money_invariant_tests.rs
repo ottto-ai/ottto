@@ -32,9 +32,7 @@ fn money_census_round_trip(census: &ClaudeRequestCensus) -> ClaudeRequestCensus 
     *index.claude_request_census_mut_for_test() = census.clone();
     let scratch = crate::test_scratch::ScratchDir::new("money-census-round-trip");
     let path = scratch.join("index.json");
-    index.save(&path).expect("save index");
-    ScanIndex::load(&path)
-        .expect("load index")
+    e2_pipeline_scan_fixture::save_reload_for_test(&mut index, &path)
         .claude_request_census_for_test()
         .clone()
 }
@@ -110,7 +108,7 @@ fn money_birth_is_carried_only_for_the_same_object() {
         Some(replaced)
     );
     assert_eq!(census.carried_birth_for_test(key, None), None);
-    // #588 restore / failed finish: the record is replaced IN PLACE by a
+    // Selected restore or failed finish: the record is replaced IN PLACE by a
     // stub (no new key) that keeps the birth for the same object only; every
     // reader skips it.
     assert_eq!(census.hash_total_for_test(), 1);

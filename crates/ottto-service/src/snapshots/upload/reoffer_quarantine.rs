@@ -225,10 +225,9 @@ impl ScanIndex {
         if self.reason_reoffer_retries.contains_key(fingerprint) {
             return true;
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
+        // The clock that writes these deadlines (`retry.rs`): wall time in
+        // production, a test's scan clock under `with_scan_clock`.
+        let now = crate::scan_clock::utc_seconds();
         self.quarantined_snapshot_fingerprints
             .get(fingerprint)
             .zip(self.active_quarantine_witness.as_ref())

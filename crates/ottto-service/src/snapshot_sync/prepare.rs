@@ -333,6 +333,8 @@ pub(super) fn exclude_held_effective_body_witness_revision(
 // crosses a collection step.
 pub(super) struct SourcePreparation {
     pub(super) source: SnapshotSource,
+    /// Walk-gate inputs, and whether the cycle's own state owed no walk.
+    pub(super) walk_idle_pass: Option<(crate::snapshots::walk_idle::Pass, bool)>,
     pub(super) claude_scan_roots: Option<Vec<PathBuf>>,
     pub(super) account_witness: [u8; 32],
     pub(super) scan_started_at: String,
@@ -772,6 +774,7 @@ pub(super) fn prepare_sync_source_inner(
     // `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
+        crate::snapshots::walk_idle::clear(source);
         withdraw_and_report_policy_stop(
             client,
             device,
@@ -1112,6 +1115,48 @@ pub(super) fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
+    // A hint or listing request is a change: this pass walks.
+    if !watcher_hints.paths.is_empty()
+        || watcher_hints.overflowed
+        || watcher_hints.list_all.requested()
+    {
+        crate::snapshots::walk_idle::clear(source);
+    }
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("after_hint_take")?;
+    let walk_idle_pass = crate::snapshots::walk_idle::Pass::new(
+        source,
+        &roots,
+        home,
+        &sampled_scope,
+        &index_path,
+        scan_window_days,
+        &replay_generation,
+        &activity_hint,
+        &policy_bytes,
+        &index,
+    );
+    let cycle_owes_nothing = !backfill_pending
+        && !admission_reoffer_pending
+        && !claude_index_loaded_fresh
+        && copy_prefix_scope.is_empty()
+        && legacy_reconciliation_pending.is_empty();
+    let now = crate::scan_clock::utc_seconds();
+    let walk_idle = crate::snapshots::walk_idle::gate(
+        source,
+        &walk_idle_pass,
+        &index,
+        cycle_owes_nothing
+            && upload_owes_nothing(
+                source,
+                &upload_progress,
+                support_dir,
+                &activity_hint,
+                &index,
+                now,
+            ),
+        now,
+    );
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_recovery_priority(
         source,
         &roots,
@@ -1126,6 +1171,7 @@ pub(super) fn prepare_sync_source_inner(
         request_identity_capture,
         &copy_prefix_scope,
         Some((daemon.transcript_cache.as_ref(), &sampled_scope)),
+        walk_idle,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_launch_events(home)
@@ -1140,6 +1186,7 @@ pub(super) fn prepare_sync_source_inner(
     }
     Ok(Some(SourcePreparation {
         source,
+        walk_idle_pass: Some((walk_idle_pass, cycle_owes_nothing)),
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
         account_witness,
         scan_started_at,
@@ -1161,6 +1208,37 @@ pub(super) fn prepare_sync_source_inner(
         active_legacy_reconciliation,
         scan: Some(scan),
     }))
+}
+
+/// The upload ledger's half of the walk gate (`walk_idle`).
+pub(super) fn upload_owes_nothing(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    support: &Path,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+    index: &ScanIndex,
+    now: u64,
+) -> bool {
+    progress.accepted_fingerprints.len() < progress.ack_capacity
+        && progress.pending_cache_heads.is_empty()
+        && !progress.context_resend.has_pending_ordinary()
+        && !progress
+            .head_conflict_challenges
+            .keys()
+            .any(|key| progress.accepted_cache_heads.contains_key(key))
+        && progress
+            .identity_503_pending
+            .as_ref()
+            .is_none_or(BTreeSet::is_empty)
+        && progress.active_quarantine_retries.is_empty()
+        && progress.active_reason_reoffers.is_empty()
+        && !progress.quarantined_fingerprints.values().any(|record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && (1..=now).contains(&record.retry_after_unix_seconds)
+        })
+        && with_source_cadence_state(source, |cadence| cadence.continuation_work().is_none())
+            .unwrap_or(false)
+        && !progress.telemetry_owes_walk(support, hint, index)
 }
 
 pub(super) fn capture_codex_recovery_evidence(
@@ -1345,8 +1423,25 @@ pub(super) fn prepare_upload_progress_for_cycle_with_reoffer(
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
     let mut progress_changed = upload_progress.prepare_historical_replay(replay_generation);
     if same_index_replay {
-        progress_changed |=
-            upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        // A terminal hold from before this replay stays in the index for its
+        // disclosure until a page parses its entity; until then it must not
+        // suppress that entity's re-entry, as it does not on the first page.
+        let parsed = index
+            .file_snapshot_fingerprints
+            .values()
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let holds = index
+            .quarantined_snapshot_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                parsed.contains(fingerprint)
+                    || record.contract_retry_claims.is_some()
+                    || record.disposition != SnapshotQuarantineDisposition::UnprovenTerminal
+            })
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        progress_changed |= upload_progress.prepare_quarantine_retries(&holds);
     }
     progress_changed
 }
