@@ -1570,7 +1570,7 @@ fn first_import_open_walk_pacing_decision_table() {
                 let requested = walk_request(&scan, index, power);
                 assert_eq!(
                     requested,
-                    (runnable && power == PlatformState::Allowed).then_some(false),
+                    (runnable && power == PlatformState::Allowed).then_some(true),
                     "{source:?} {name} {power:?}"
                 );
                 let runnable = index.runnable_walk_or_followup(
@@ -1754,7 +1754,7 @@ fn first_import_final_page_conflict_requests_followup_after_settlement() {
     assert_eq!(requested(&index, true), None);
     index.mark_bounded_sweep_unsettled_by(crate::snapshots::UnsettledUploadCause::DeferredConflict);
     let saved: ScanIndex = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
-    assert_eq!(requested(&saved, true), Some(false));
+    assert_eq!(requested(&saved, true), Some(true));
     assert_eq!(requested(&ScanIndex::default(), true), None, "clean close");
 }
 
@@ -1772,7 +1772,10 @@ fn first_import_open_walk_pacing_obeys_upload_shed_deadline_and_unplug() {
         for source in ROTATION {
             with_source_cadence(source, |cadence| cadence.record_scan_success(now, 0));
             let first_import = walk_request(&scan, &index, PlatformState::Allowed).unwrap();
-            assert!(!first_import, "new reason stays at background priority");
+            assert!(
+                first_import,
+                "every first-import request carries the import flag"
+            );
             request_resident_scan_on_power(source, first_import, PlatformState::Allowed);
             with_source_cadence(source, |cadence| {
                 assert_eq!(
@@ -2772,4 +2775,119 @@ fn first_import_default_qos_ends_when_backfill_completes() {
             });
         }
     });
+}
+
+#[test]
+fn first_import_recensus_and_no_progress_pages_take_import_qos_on_ac_only() {
+    // A routine re-census page and a page that read nothing new during the
+    // first import: no page reason asks, so only the AC bootstrap arm can.
+    for routine in [true, false] {
+        let mut scan = empty_scan();
+        scan.routine_recensus = routine;
+        scan.census_status.pending_work = true;
+        scan.first_read_progress = false;
+        scan.page_file_limit_hit = false;
+        assert!(!resident_scan_requested(&scan, true), "routine={routine}");
+        let ac = resident_scan_request_after_settlement(&scan, true, PlatformState::Allowed, true);
+        assert_eq!(ac, Some(true), "routine={routine}");
+        assert_eq!(
+            paced_pass_qos(PlatformState::Allowed, true),
+            PassQos::Default
+        );
+        assert_eq!(
+            resident_scan_request_after_settlement(&scan, true, PlatformState::Battery, true),
+            None,
+            "battery keeps its own pacing, routine={routine}"
+        );
+        assert_eq!(
+            paced_pass_qos(PlatformState::Battery, true),
+            PassQos::Background
+        );
+        assert_eq!(
+            resident_scan_request_after_settlement(&scan, false, PlatformState::Allowed, true),
+            None,
+            "steady state, routine={routine}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn destination_change_requests_paced_scan_only_when_first_import_is_owed() {
+    let _saved = OwnedCadences::install();
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    crate::scan_clock::with_clock(1000, || {
+        let now = crate::scan_clock::now();
+        for source in ROTATION {
+            with_source_cadence(source, |cadence| cadence.record_scan_success(now, 0));
+            // First import owed on the new destination, AC: paced, import flag.
+            assert!(request_on_destination_change(
+                source,
+                "destination-a",
+                PlatformState::Allowed,
+                || true
+            ));
+            with_source_cadence(source, |cadence| {
+                assert_eq!(
+                    cadence.paced_scan_due(),
+                    Some(now + Duration::from_secs(30))
+                );
+                assert!(cadence.paced_first_import());
+            });
+            // The same destination again never reads the backfill state.
+            assert!(!request_on_destination_change(
+                source,
+                "destination-a",
+                PlatformState::Allowed,
+                || panic!("unchanged destination")
+            ));
+            // A change with nothing owed leaves the cadence as it is.
+            with_source_cadence(source, SourceCadence::clear_continuation);
+            assert!(!request_on_destination_change(
+                source,
+                "destination-b",
+                PlatformState::Allowed,
+                || false
+            ));
+            assert_eq!(
+                with_source_cadence(source, |c| c.paced_scan_due()),
+                Some(None)
+            );
+            // Battery keeps its own pacing and the background flag.
+            assert!(request_on_destination_change(
+                source,
+                "destination-c",
+                PlatformState::Battery,
+                || true
+            ));
+            with_source_cadence(source, |cadence| {
+                assert_eq!(
+                    cadence.paced_scan_due(),
+                    Some(now + Duration::from_secs(180))
+                );
+                assert!(!cadence.paced_first_import());
+                cadence.clear_continuation();
+            });
+            // Refused or unknown power requests nothing.
+            for power in [PlatformState::Refused, PlatformState::Unknown] {
+                assert!(!request_on_destination_change(
+                    source,
+                    if power == PlatformState::Refused {
+                        "destination-d"
+                    } else {
+                        "destination-e"
+                    },
+                    power,
+                    || true
+                ));
+                assert_eq!(
+                    with_source_cadence(source, |c| c.paced_scan_due()),
+                    Some(None)
+                );
+            }
+        }
+    });
+    super::super::clear_source_upload_deadlines_for_test();
+    super::super::clear_cadence_state_for_test();
 }

@@ -36,19 +36,7 @@ impl AckLedger {
             crate::snapshots::snapshot_upload_body_witness,
             |batch| {
                 *posts += batch.len();
-                Ok(crate::snapshot_client::SnapshotBatchResponse {
-                    conflict_rescans: Default::default(),
-                    accepted: batch.len() as u64,
-                    sessions_reconciled: batch.len() as u64,
-                    session_ids: Vec::new(),
-                    disabled: false,
-                    disabled_reason: None,
-                    entity_ack_contract: None,
-                    accepted_entities: Vec::new(),
-                    unchanged_entities: Vec::new(),
-                    rejected_entities: Vec::new(),
-                    conflict_entities: Vec::new(),
-                })
+                super::tests::claude_money_e2_pipeline_tests::ack(batch)
             },
             |_| Ok(()),
         )

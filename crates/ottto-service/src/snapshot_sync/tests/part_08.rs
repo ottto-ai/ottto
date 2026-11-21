@@ -1275,7 +1275,7 @@ fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
     }
     progress.save_fixture(&path).unwrap();
     for snapshot in cold.snapshots.values() {
-        progress.record_stored_state(snapshot, false, None).unwrap();
+        progress.record_stored_state(snapshot, None).unwrap();
     }
     progress.save_fixture(&path).unwrap();
     let after = std::fs::read(&path).unwrap();
@@ -1876,9 +1876,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
         |items| {
             assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
             assert_eq!(snapshot_upload_body_witness(items[0]), body);
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .accepted_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1928,7 +1926,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
         snapshot_upload_body_witness,
         |_| {
             calls += 1;
-            Ok(accepted_batch(1))
+            panic!("already accepted body must not be uploaded")
         },
         |state| state.save_fixture(&path),
     )

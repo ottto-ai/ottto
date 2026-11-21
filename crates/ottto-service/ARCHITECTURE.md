@@ -213,7 +213,9 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
-  accepted, and parts the server did accept stay recorded. A revision-only move can carry a
+  accepted, and parts the server did accept stay recorded. An enabled response without the
+  entity acknowledgement contract fails the page and leaves its bodies eligible for the next
+  cycle. A revision-only move can carry a
   file's receipt when its final entities and bodies are unchanged and every entity has an
   exact stamp under the active upload context. Claude records those stamps under its resumed
   mode while unaffected file receipts use the base context. A copy-capability change therefore
@@ -480,7 +482,11 @@ Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
 While destination bootstrap is pending, AC passes also keep runnable bounded-walk work or an
-owed clean follow-up on the same 30-second pacing at background priority. The request uses the
+owed clean follow-up on the same 30-second pacing. Every request made during the first import
+carries the first-import flag, so on AC its pages keep the thread's ordinary QoS instead of
+background; battery and steady-state passes stay at background. When a source first sees an
+upload destination while its first import there is owed, it requests one such paced pass at once
+instead of waiting out the tier it carried from before. The request uses the
 index after upload settlement, including a first offer's final-page conflict. Metadata-only
 retention, decode holds and unchanged held or conflicted debt grant no follow-up urgency;
 queued unblocked siblings can still advance. Terminal-unhealthy walks use the scanner's own

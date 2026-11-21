@@ -360,9 +360,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .unchanged_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -554,7 +552,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         &mut accepted,
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
-        |items| Ok(accepted_batch(items.len())),
+        claude_money_e2_pipeline_tests::ack,
         |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
@@ -579,9 +577,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(items.len());
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(items.len() as u64);
             response.unchanged_entities = items
                 .iter()
                 .map(|item| crate::snapshot_client::SnapshotEntityRef {
@@ -626,9 +622,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(2);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(2);
             for item in batch {
                 let reference = crate::snapshot_client::SnapshotEntityRef {
                     source_session_id: item.source_session_id.clone(),
@@ -759,9 +753,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .accepted_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -873,9 +865,7 @@ fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .unchanged_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -982,9 +972,7 @@ fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evid
                 client_report: crate::client_report::ClientReport::empty(),
             };
             let item = &request.snapshots[0];
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .accepted_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1138,8 +1126,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             client_report: crate::client_report::ClientReport::empty(),
         };
         let item = &request.snapshots[0];
-        let mut ack = accepted_batch(1);
-        ack.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        let mut ack = entity_ack_response(1);
         ack.accepted_entities
             .push(crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: item.source_session_id.clone(),
@@ -1431,9 +1418,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                 client_report: crate::client_report::ClientReport::empty(),
             };
             let item = &request.snapshots[0];
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .accepted_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1513,9 +1498,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                 client_report: crate::client_report::ClientReport::empty(),
             };
             let item = &request.snapshots[0];
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .unchanged_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1564,9 +1547,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                 client_report: crate::client_report::ClientReport::empty(),
             };
             let item = &request.snapshots[0];
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             response
                 .accepted_entities
                 .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1655,9 +1636,7 @@ fn cache_bootstrap_grown_existing_usage_settles_before_exact_head_probe() {
                 upload_policy: policy,
                 client_report: crate::client_report::ClientReport::empty(),
             };
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             let reference = crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: current.source_session_id.clone(),
                 snapshot_fingerprint: current.snapshot_fingerprint.clone(),
@@ -1707,8 +1686,7 @@ fn unchanged_ack_with_usage_identical_does_not_mark_emitted() {
         item.cache_observations_state = None;
         let fingerprint = item.snapshot_fingerprint.clone();
         let body = snapshot_upload_body_witness(&item);
-        let mut response = accepted_batch(1);
-        response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        let mut response = entity_ack_response(1);
         response
             .unchanged_entities
             .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1794,9 +1772,7 @@ fn held_unchanged_body_never_blocks_a_later_different_body() {
         assert_ne!(grown.snapshot_fingerprint, held, "{case}");
         let grown_body = snapshot_upload_body_witness(&grown);
         let ack = |unchanged: bool, fingerprint: &str| {
-            let mut response = accepted_batch(1);
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            let mut response = entity_ack_response(1);
             let reference = crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: item.source_session_id.clone(),
                 snapshot_fingerprint: fingerprint.to_string(),
@@ -1881,7 +1857,7 @@ fn held_unchanged_body_never_blocks_a_later_different_body() {
 
 #[test]
 fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
-    for outcome in ["accepted", "unchanged", "legacy"] {
+    for outcome in ["accepted", "unchanged"] {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         item.cache_observations = None;
         item.cache_observations_state = None;
@@ -1903,26 +1879,22 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
             upload_policy: SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
-        let mut response = accepted_batch(1);
-        if outcome != "legacy" {
-            response.entity_ack_contract =
-                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-            let reference = crate::snapshot_client::SnapshotEntityRef {
-                source_session_id: item.source_session_id.clone(),
-                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                occurrence_count: 1,
-                body_witness_version: None,
-                body_witness_digest: None,
-                head_etag: None,
-                head_challenge: None,
-                unchanged_basis: None,
-                cache_observations_state: None,
-            };
-            if outcome == "accepted" {
-                response.accepted_entities.push(reference);
-            } else {
-                response.unchanged_entities.push(reference);
-            }
+        let mut response = entity_ack_response(1);
+        let reference = crate::snapshot_client::SnapshotEntityRef {
+            source_session_id: item.source_session_id.clone(),
+            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+            occurrence_count: 1,
+            body_witness_version: None,
+            body_witness_digest: None,
+            head_etag: None,
+            head_challenge: None,
+            unchanged_basis: None,
+            cache_observations_state: None,
+        };
+        if outcome == "accepted" {
+            response.accepted_entities.push(reference);
+        } else {
+            response.unchanged_entities.push(reference);
         }
         response.validate_entity_ack(&request).unwrap();
         let mut accepted = 0;
@@ -1957,9 +1929,7 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
             |items, enforce| {
                 stages.push(enforce);
                 assert!(enforce, "ordinary exact bytes were already acknowledged");
-                let mut response = accepted_batch(1);
-                response.entity_ack_contract =
-                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                let mut response = entity_ack_response(1);
                 response
                     .unchanged_entities
                     .push(crate::snapshot_client::SnapshotEntityRef {
@@ -2105,8 +2075,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
                 2
             );
         }
-        let mut response = accepted_batch(1);
-        response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        let mut response = entity_ack_response(1);
         response
             .accepted_entities
             .push(crate::snapshot_client::SnapshotEntityRef {
@@ -2214,12 +2183,12 @@ fn cache_overcap_byte_trim_witness_network_and_ack_use_identical_completion() {
             .len()
             <= crate::snapshots::cache_observations::MAX_STATE_BYTES
     );
-    progress.record_cache_state(&network, false).unwrap();
+    progress.record_cache_state(&network).unwrap();
     assert_eq!(
         progress.accepted_cache_states[&key], expected,
         "ACK completion applies the actual uploaded patch"
     );
-    progress.record_cache_state(&network, false).unwrap();
+    progress.record_cache_state(&network).unwrap();
     assert_eq!(
         progress.accepted_cache_states[&key], expected,
         "ACK retry is idempotent"

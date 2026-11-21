@@ -29,6 +29,7 @@ use super::snapshot_v2_index_path;
 use super::snapshot_v3_index_path;
 use super::source_cadence_wait;
 use super::source_kind;
+use super::source_paced_due;
 use super::source_upload_backoff_remaining;
 use super::stale_owed;
 #[cfg(test)]
@@ -796,17 +797,44 @@ pub(super) fn prepare_sync_source_inner(
     // active-session projection are all cheap and all product-visible. The
     // negotiated cadence gates what is actually expensive — the local transcript
     // scan below, which re-reads every changed transcript on this machine.
+    let power = continuation::MacPlatformSignals::default().power();
+    let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    let destination_switch = continuation::request_on_destination_change(
+        source,
+        &upload_destination_namespace,
+        power,
+        || {
+            backfill_replay_pending(
+                source,
+                &load_backfill_state(support_dir),
+                &upload_destination_namespace,
+            )
+        },
+    );
+    let paced_due = source_paced_due(source).is_some_and(|due| due <= crate::scan_clock::now());
+    let mut due = crate::local_resource_diagnostics::PrepareDue {
+        due: if paced_due {
+            "due_paced"
+        } else {
+            "due_ordinary"
+        },
+        destination_switch,
+        power: continuation::power_label(power),
+    };
     if let Some(remaining) = source_cadence_wait(source) {
+        due.due = "due_deferred";
+        crate::local_resource_diagnostics::prepare_due(due);
         eprintln!(
             "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence; power={:?} effective_interval={}s",
             source.api_slug(),
             remaining.as_secs(),
-            continuation::MacPlatformSignals::default().power(),
+            power,
             with_source_cadence(source, |cadence| cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL))
                 .unwrap_or(SNAPSHOT_SYNC_INTERVAL).as_secs()
         );
         return Ok(None);
     }
+    crate::local_resource_diagnostics::prepare_due(due);
 
     let roots = crate::snapshot_roots::scan_roots(
         source,
@@ -835,7 +863,6 @@ pub(super) fn prepare_sync_source_inner(
         );
     }
     let upload_policy = SnapshotUploadPolicy::from_hint(&activity_hint);
-    let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     let receipt_client = client
         .clone()
         .with_receipt_destination_namespace(upload_destination_namespace.clone());

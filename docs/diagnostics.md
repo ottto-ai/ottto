@@ -453,6 +453,21 @@ The pass reports each of the following outcome counts even when it is zero.
 - `progress_committed` counts state-v2 progress pages that committed.
 - `progress_unchanged` counts state-v2 progress pages that already matched the saved rows.
 - `progress_not_published` counts state-v2 progress pages that returned `NotPublished`.
+- `paced_request_existing` and `paced_request_bootstrap_runnable` are 1 when
+  this finish asked for a paced scan: from a page reason (file limit, byte
+  budget, first-read progress or deferred charge), or from the first-import AC
+  arm for a runnable walk. `paced_first_import` is 1 when that request carries
+  the first-import flag, and `paced_power_allowed` or `paced_power_battery`
+  records the power state it saw. All are 0 when no request was made.
+
+`source_prepare` counts say why the pass ran or stopped. Exactly one of
+`due_paced` (a paced request was due), `due_ordinary` (the ordinary cadence
+tier) or `due_deferred` (the cadence gate stopped the pass) is 1, together with
+one power key (`power_allowed`, `power_battery`, `power_refused` or
+`power_unknown`). `destination_switch` is 1 when the source first saw this
+upload destination while its first import there was still owed, and so asked
+for a paced scan. A prepare stopped earlier, by a backend backoff or a policy
+stop, reports no counts.
 
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
@@ -2386,6 +2401,27 @@ The default classifier always uses `differs`: a local starting login, creator
 hint or display cannot prove the backend's parent binding. Zero
 `same_as_parent` is explicit when this object is present. Counts describe tagging
 attempts, including retries, rather than distinct sessions.
+
+`native_collection_page.counts.request_identity_refusal` names why usage was
+left untagged with a refusal, as sparse page counts of refusal events under
+closed, append-only labels. Per request whose own identity evidence was
+refused, by classifier reason: `conflicting_duplicate`, `foreign_owner`,
+`invalid_evidence`, `contradictory_org`, `bad_clock`, `untrusted_flip`,
+`incomplete_evidence`. Per request (or request-owned grain) refused while
+grouping: `invalid_login` (a login that is not 8 to 128 lowercase hex
+characters) and `row_authority_cap` (a row already carrying its maximum
+authority keys). `cost_missing_collapse` counts bucket rows left untagged
+because app-reported money could not be split per request; `over_cap_strip`
+counts bodies for which the full-strip fallback was selected, before delivery.
+Like `identity_cap`, counts describe tagging attempts, including retries and
+held bodies; one attempt can count several labels, so their sum need not equal
+the body's `request_identity_refusals`. A request-owned body is grouped after
+its account fold has already placed each request or left it unknown, so it
+never counts the classifier labels, and an over-cap request-owned body is held
+rather than stripped. Partial cap recovery (`refused_new_buckets`,
+`accepted_overflow`) and the `accepted_share_changed` and
+`unpriced_part_untagged` routes are counted in `identity_cap` above, not here.
+No id, key, path or session text is recorded.
 
 Within the existing item caps, acknowledged tagged buckets have priority over
 never-acknowledged buckets. If those accepted buckets overflow, a fitting open

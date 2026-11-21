@@ -81,7 +81,7 @@ pub(super) fn upload_families(
 pub(super) fn accept_all(
     batch: &[&FamilyItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
-    Ok(accepted_batch(batch.len()))
+    Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn e2_gate_off_batches_equal_the_plain_packer() {
                     .map(|item| item.session.clone())
                     .collect::<Vec<_>>(),
             );
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
         },
         |_| Ok(()),
     )
@@ -208,7 +208,7 @@ fn e2_malformed_literal_is_isolated_and_siblings_settle() {
                 reason: format!("snapshot[{position}] violates the wire contract"),
             }));
         }
-        Ok(accepted_batch(batch.len()))
+        Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(batches.len(), 2, "one failed attempt, one sibling retry");
@@ -240,7 +240,7 @@ fn e2_literal_batch_validation_error_holds_entity_and_settles_siblings() {
                 batch.len(),
             )));
         }
-        Ok(accepted_batch(batch.len()))
+        Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
     });
     assert_eq!(
         result.unwrap(),
@@ -330,7 +330,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
                 if attempt == 0 {
                     Err(anyhow!("transient transport failure"))
                 } else {
-                    Ok(accepted_batch(batch.len()))
+                    claude_money_e2_pipeline_tests::ack(batch)
                 }
             },
             |_| Ok(()),

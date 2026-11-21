@@ -16,7 +16,7 @@ fn item_specific_422_isolates_poison_and_checkpoints_valid_siblings() {
                     serde_json::json!({"errors":[{"loc":["body","snapshots",index,"compaction_timestamps"]}]}).to_string().as_bytes(), batch.len())));
             }
             uploaded_capture.lock().expect("capture lock").extend(batch.iter().copied().cloned());
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         }, |_| Ok(()),
     ).expect("indexed rejection holds only the refused entity");
     assert_eq!(
@@ -129,7 +129,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
                         batch.len(),
                     )))
                 } else {
-                    Ok(accepted_batch(batch.len()))
+                    Ok(accept_fingerprints(batch))
                 }
             },
             |state| state.save_fixture(&progress_path),
@@ -493,9 +493,9 @@ fn unchanged_quarantine_waits_without_hot_loop_then_retries_backend_recovery() {
         &mut progress,
         &mut accepted,
         String::as_str,
-        |_| {
+        |batch| {
             attempts += 1;
-            Ok(accepted_batch(1))
+            Ok(accept_fingerprints(batch))
         },
         |_| Ok(()),
     )
@@ -524,9 +524,9 @@ fn unchanged_quarantine_waits_without_hot_loop_then_retries_backend_recovery() {
         &mut failed,
         &mut accepted,
         String::as_str,
-        |_| {
+        |batch| {
             attempts += 1;
-            Ok(accepted_batch(1))
+            Ok(accept_fingerprints(batch))
         },
         |_| Ok(()),
     )
@@ -545,9 +545,9 @@ fn unchanged_quarantine_waits_without_hot_loop_then_retries_backend_recovery() {
         &mut progress,
         &mut accepted,
         String::as_str,
-        |_| {
+        |batch| {
             attempts += 1;
-            Ok(accepted_batch(1))
+            Ok(accept_fingerprints(batch))
         },
         |_| Ok(()),
     )
@@ -646,7 +646,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         |item| item.snapshot_fingerprint.as_str(),
         |_| {
             upload_calls += 1;
-            Ok(accepted_batch(0))
+            panic!("held body must not be uploaded")
         },
         |_| Ok(()),
     )
@@ -781,7 +781,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
         0
     );
-    // Theoretical: a rejected HTTP reply remains a real send.
+    // An invalid ACK still proves the retry reached the backend.
     let replied = upload_resumable_batches(
         &retry.snapshots,
         &unique_poison_scope(),
@@ -789,9 +789,10 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         &mut accepted,
         |item| item.snapshot_fingerprint.as_str(),
         |_| {
-            Err(anyhow::Error::new(SnapshotAckRejected {
-                reason: "snapshot ACK validation failed",
-            }))
+            let mut response = entity_ack_response(1);
+            response.entity_ack_contract = None;
+            response.require_entity_ack_contract()?;
+            Ok(response)
         },
         |state| state.save_fixture(&progress_path),
     );
@@ -828,7 +829,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         |batch| {
             upload_calls += 1;
             assert_eq!(batch.len(), 1);
-            Ok(accepted_batch(1))
+            claude_money_e2_pipeline_tests::ack(batch)
         },
         |state| state.save_fixture(&progress_path),
     )
@@ -1000,7 +1001,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
                     item.usage_buckets.len(),
                 )
             }));
-            Ok(accepted_batch(req.snapshots.len()))
+            claude_money_e2_pipeline_tests::ack(&req.items().collect::<Vec<_>>())
         },
         |p| p.save_fixture(&root.join("progress.json")),
     )

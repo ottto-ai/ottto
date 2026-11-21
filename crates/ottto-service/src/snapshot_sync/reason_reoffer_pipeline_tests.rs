@@ -1390,9 +1390,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
                         code: None,
                     }));
                 }
-                let mut response = accepted_batch(0);
-                response.entity_ack_contract =
-                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                let mut response = entity_ack_response(0);
                 response
                     .rejected_entities
                     .push(crate::snapshot_client::SnapshotEntityRejection {
