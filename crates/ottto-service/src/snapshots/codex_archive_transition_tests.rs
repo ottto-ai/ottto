@@ -1104,8 +1104,8 @@ fn observed_pass(
 /// [regress] 0.1.219 left a never-read archived rollout as a metadata-only
 /// head owing the whole archive, unread. Its ordinary counted Full and exact
 /// ACK settle that debt: the file leaves the outstanding set, counts once
-/// (equivalent to a cold run) and keeps no metadata-only head. Later passes
-/// in the same process (one process-lifetime cache, as the daemon keeps) are
+/// (equivalent to a cold run) and keeps only its archive inventory and job
+/// decision in the head. Later passes in the same process (one process-lifetime cache, as the daemon keeps) are
 /// quiet. After a restart (a fresh cache and a reloaded index) the archive
 /// has its header decoded at most once, within the header bound, with no
 /// identity sample, Full or POST; the next same-process pass is quiet. The
@@ -1114,6 +1114,7 @@ fn observed_pass(
 /// so it cannot poison other decoder rows.
 #[test]
 fn archive_whole_unread_debt_settles_after_one_counted_full() {
+    use crate::session_attribution::job_template::JobState;
     use crate::snapshots::upload::freshness_debt::tests as g7;
     const CONTEXT: &str = "g7-archive-whole-context";
     struct Arm {
@@ -1126,6 +1127,7 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         restart: PassFacts,
         settled: Value,
         head: Option<(bool, state_v2::Representation, state_v2::DebtSummary)>,
+        job: Option<JobState>,
         revisions: usize,
         after: Value,
         facts: String,
@@ -1203,12 +1205,13 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
                 head.common.debt,
             )
         });
+        let job = loaded.and_then(|head| head.common.job.map(|job| job.state));
         index.activate_file_upload_context(SnapshotSource::Codex, context.into());
         let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
         let facts = format!(
             "{} arm: compressed={} decoded={}\nseeded head: {seeded_head:?} owed: {owed}\n\
              pass 1: {first:?}\nrestart pass 4: {restart:?}\nsettled: {settled}\n\
-             head: {head:?} revisions={revisions}\nafter: {after}",
+             head: {head:?} job: {job:?} revisions={revisions}\nafter: {after}",
             if seeded { "seeded" } else { "control" },
             encoded.len(),
             rollout(MAIN, Some("a")).len(),
@@ -1224,6 +1227,7 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
             restart,
             settled,
             head,
+            job,
             revisions,
             after,
             facts,
@@ -1281,11 +1285,16 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         assert_eq!(arm.settled["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["over_6h_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["unread_bytes"], 0, "{label}\n{all}");
-        if let Some((metadata_only, representation, debt)) = arm.head {
-            assert!(!metadata_only, "{label}: no metadata-only head\n{all}");
-            assert_eq!(representation, state_v2::Representation::Tail, "{all}");
-            assert_eq!(debt, Default::default(), "{all}");
-        }
+        assert_eq!(
+            arm.head,
+            Some((true, state_v2::Representation::Archive, Default::default())),
+            "{label}: archive metadata with no debt or reduction\n{all}"
+        );
+        assert_eq!(
+            arm.job,
+            Some(JobState::NoId),
+            "{label}: archive predates cutoff"
+        );
         assert_eq!(arm.revisions, 0, "{label}\n{all}");
         assert_eq!(arm.after["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.after["over_6h_files"], 0, "{label}\n{all}");
