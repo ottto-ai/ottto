@@ -589,7 +589,7 @@ impl ReofferPipeline {
     }
 
     /// Committed Tail heads in the saved index's state database.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(debug_assertions)))]
     fn durable_records(&self) -> usize {
         let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
             &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
