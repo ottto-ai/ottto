@@ -1400,6 +1400,70 @@ fn relist(source: SnapshotSource, index: &mut ScanIndex) {
         .is_empty());
 }
 
+/// [money] Body-witness revision debt is owed when re-listing. An unchanged
+/// Claude file saved below the active revision (revision 0, a snapshot
+/// fingerprint, no entity: never offered) is queued once per six hours and
+/// its offer reads it. Files at the active revision stay seen, and so does
+/// the owed file while the list names it or the list is paused.
+#[test]
+fn claude_revision_debt_is_requeued_by_the_relist_once_per_six_hours() {
+    let source = SnapshotSource::ClaudeCode;
+    let mut f = Fixture::new();
+    let mut base = kept_generation(&f, source, false);
+    base.activate_effective_upload_body_witness_revision(3);
+    base.adopt_effective_upload_body_witness_revision_monotonically();
+    for entry in base.files.values_mut() {
+        entry.effective_upload_body_witness_revision = 3;
+    }
+    let owed = f.root.join(format!("{REARMED}.jsonl"));
+    let key = local_index_key(&owed);
+    let entry = base.files.get_mut(&key).unwrap();
+    entry.effective_upload_body_witness_revision = 0;
+    assert!(entry.last_snapshot_fingerprint.is_some());
+    base.file_snapshot_fingerprints.remove(&key);
+    let queued = |index: &ScanIndex| {
+        let traversal = index.traversal.as_ref().unwrap();
+        (
+            traversal
+                .pending_candidates
+                .iter()
+                .map(|pending| pending.path.clone())
+                .collect::<Vec<_>>(),
+            traversal.counts.listing_owed_requeued,
+        )
+    };
+
+    let digest = format!(
+        "{:x}\n",
+        <sha2::Sha256 as sha2::Digest>::digest(REARMED.as_bytes())
+    );
+    for list in [digest.as_str(), "not-a-digest\n"] {
+        let mut held = base.clone();
+        held.claude_reemission_exclusions =
+            super::claude_reemission_exclusions::ReemissionExclusions::parse(list.as_bytes());
+        relist(source, &mut held);
+        assert_eq!(queued(&held), (Vec::new(), 0), "held by {list:?}");
+    }
+
+    let mut index = base;
+    relist(source, &mut index);
+    assert_eq!(queued(&index), (vec![owed.clone()], 1), "debt only");
+    let offer = index.clone();
+    for _ in 0..2 {
+        index.traversal.as_mut().unwrap().pending_candidates.clear();
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (Vec::new(), 1), "paced");
+    }
+
+    f.cache = Arc::new(sampled_scan::SharedCache::default());
+    let (_, scan, _, _) = f.page(source, offer);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == REARMED));
+}
+
 /// [money] A known Codex rollout append with no directory move or watcher
 /// hint is queued once by the re-listing pass, Tail-read once, and emits the
 /// same whole money body as a cold Full.

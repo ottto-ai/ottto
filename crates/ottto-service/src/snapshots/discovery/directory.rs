@@ -505,7 +505,10 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                 {
                     true
                 } else if indexed {
-                    stamp_matches && !index.owes_verification(&path)
+                    stamp_matches
+                        && !index.owes_verification(&path)
+                        && !(source == SnapshotSource::ClaudeCode
+                            && index.claude_history_relist_owed(&path))
                 } else {
                     traversal.observed_index_keys.contains(&key)
                 };

@@ -1783,6 +1783,16 @@ impl ScanIndex {
             })
     }
 
+    /// Indexed Claude history whose stored body-witness revision is below the
+    /// active one, under a gated revision, not held by the list or a paused
+    /// list: the re-listing pass owes it a paced offer.
+    pub(in crate::snapshots) fn claude_history_relist_owed(&self, path: &Path) -> bool {
+        revision_policy(self.active_effective_upload_body_witness_revision).is_some()
+            && self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(path))
+            && !self.claude_reemission_exclusions.pauses_adoption()
+            && !self.claude_family_listed(path)
+    }
+
     /// Finalize a held history file without its new bodies: an existing entry
     /// keeps its upload tuple (revision, semantic group, body witness,
     /// membership); a new one gets the semantic group of its local bodies, an
