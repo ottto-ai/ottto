@@ -135,6 +135,8 @@ struct OracleServer {
     acknowledged: Arc<Mutex<Vec<Vec<Value>>>>,
     /// Every collector status body, in arrival order.
     statuses: Arc<Mutex<Vec<Value>>>,
+    /// While set, the terminal status endpoint answers 500.
+    status_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 impl OracleServer {
     fn new(source: SnapshotSource, handle: Handle) -> Self {
@@ -156,6 +158,8 @@ impl OracleServer {
         let proved = acknowledged.clone();
         let statuses = Arc::new(Mutex::new(Vec::new()));
         let reported = statuses.clone();
+        let status_fails = Arc::new(AtomicBool::new(false));
+        let failing = status_fails.clone();
         let worker = std::thread::spawn(move || {
             let _entered = handle.enter();
             while !done.load(Ordering::Relaxed) {
@@ -297,7 +301,13 @@ impl OracleServer {
                 } else {
                     json!({"accepted":true,"source":source.api_slug(),"machine_id":"otm_test","disabled":false})
                 };
-                bounded_native_response(&mut stream, "200 OK", &response.to_string());
+                let status =
+                    if value["report_kind"] == "scan_status" && failing.load(Ordering::Relaxed) {
+                        "500 Internal Server Error"
+                    } else {
+                        "200 OK"
+                    };
+                bounded_native_response(&mut stream, status, &response.to_string());
             }
         });
         Self {
@@ -310,6 +320,7 @@ impl OracleServer {
             placement,
             acknowledged,
             statuses,
+            status_fails,
         }
     }
 }
@@ -3982,4 +3993,9 @@ mod money_equivalence_tests {
 // The walk gate on this runner: idle passes, wakes, the backstop and hint loss.
 mod walk_gate_oracle_tests {
     include!("walk_gate_oracle_tests.rs");
+}
+
+// Every way one finish can end, on the scripted and oracle fixtures above.
+mod finish_outcome_tests {
+    include!("finish_outcome_tests.rs");
 }
