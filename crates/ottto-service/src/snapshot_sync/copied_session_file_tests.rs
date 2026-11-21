@@ -885,11 +885,20 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
 /// [money] A main deferred before acquisition cannot let its pulled content
 /// twin replace the session. Growth pacing, then audit-cap pacing, both hold
 /// until a later complete page matches the native Full union after restart.
+/// ROOT's exact heads per phase: 20/2, then 30/3, no body while held, then
+/// exactly one 70/7 body.
 #[test]
 fn deferred_main_with_read_content_twin_holds_until_complete() {
     use crate::snapshots::e2_pipeline_scan_fixture::{
         indexed_size, owe_claimed_growth, pace_cap_for_test,
     };
+    // A page's ROOT bodies: wire input tokens and requests.
+    fn heads(page: &Page) -> Vec<(u64, u64)> {
+        (page.scan.snapshots.iter())
+            .filter(|item| item.source_session_id == ROOT)
+            .map(|item| (item.input_tokens, item.request_count))
+            .collect()
+    }
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -902,13 +911,16 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
             let mut prior = ScanIndex::default();
             let mut original = c.raw(&owner, prior.clone(), 100, true, &[]);
             original.enrich(&c);
-            prior = accept_monotone_page(&c, &prior, original, &mut accepted);
+            let holds = original.finish();
+            assert_eq!(heads(&original), [(20, 2)], "M(A, B)");
+            prior = accept_finished_monotone_page(&c, &prior, original, &mut accepted, holds);
             let twin = c.write_at(&file(COPY), &resumed(ROOT, &[A, B, C]), BORN);
             owe(&mut prior);
             let mut both = c.raw(&owner, prior.clone(), 100, true, &[]);
             both.enrich(&c);
-            assert_eq!(body(&both, ROOT).unwrap().request_count, 3);
-            prior = accept_monotone_page(&c, &prior, both, &mut accepted);
+            let holds = both.finish();
+            assert_eq!(heads(&both), [(30, 3)], "M+T(A, B, C)");
+            prior = accept_finished_monotone_page(&c, &prior, both, &mut accepted, holds);
             assert_eq!(accepted[ROOT], 3);
             let main_key = main.to_string_lossy().into_owned();
             let twin_key = twin.to_string_lossy().into_owned();
@@ -931,8 +943,12 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
             full.enrich(&c);
             let expected = body(&full, ROOT).unwrap();
             assert_eq!(
-                (expected.request_count, expected.removed_request_count),
-                (7, Some(2))
+                (
+                    expected.input_tokens,
+                    expected.request_count,
+                    expected.removed_request_count
+                ),
+                (70, 7, Some(2))
             );
             let mut reference = sent_money(&full);
             reference.mode = Mode::ColdFull;
@@ -993,7 +1009,7 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
                 );
                 let holds = held.finish();
                 assert!(holds.progress_blocking);
-                assert!(body(&held, ROOT).is_none(), "T alone cannot publish S");
+                assert!(heads(&held).is_empty(), "T alone cannot publish S");
                 prior = accept_finished_monotone_page(&c, &selected, held, &mut accepted, holds);
                 assert_eq!(
                     accepted[ROOT], 3,
@@ -1024,8 +1040,12 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
                 .contains_key("absent_content_twin"));
             let expected = body(&recovered, ROOT).unwrap();
             assert_eq!(
-                (expected.request_count, expected.removed_request_count),
-                (7, Some(2))
+                (
+                    expected.input_tokens,
+                    expected.request_count,
+                    expected.removed_request_count
+                ),
+                (70, 7, Some(2))
             );
             assert_eq!(
                 expected.source_file_fingerprint.as_ref(),
@@ -1033,7 +1053,10 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
                 "M carries the complete union; T has no separate wire item"
             );
             money_oracle::assert_equivalent(&reference, &sent_money(&recovered));
-            prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
+            let holds = recovered.finish();
+            assert!(!holds.progress_blocking);
+            assert_eq!(heads(&recovered), [(70, 7)], "exactly one ROOT body");
+            prior = accept_finished_monotone_page(&c, &prior, recovered, &mut accepted, holds);
             assert_eq!(accepted[ROOT], 7);
             // Reload drops the runtime context; observe the durable proofs
             // under the same destination that received this page's exact ACKs.
