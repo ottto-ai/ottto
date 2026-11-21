@@ -414,7 +414,18 @@ fn family_entities_keep_exact_heads_across_acks() {
             (1, member("z", 0), child(0), (28, 2), (86, 7)),
         ] {
             let path = c.root.join(relative);
-            append(&path, &line(ROOT, &format!("family-head-{step}"), GROW, 8));
+            let request = format!("family-head-{step}");
+            let mut turn: serde_json::Value =
+                serde_json::from_str(&line(ROOT, &request, GROW, 8)).unwrap();
+            // The exact body witness covers additive evidence such as tool use.
+            turn["message"]["role"] = json!("assistant");
+            turn["message"]["content"] = json!([{
+                "type": "tool_use",
+                "id": format!("toolu_{request}"),
+                "name": "Read",
+                "input": {},
+            }]);
+            append(&path, &(turn.to_string() + "\n"));
             let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
             if step == 0 {
                 assert_main_only(&c, &warm, &carried, Mode::Ram);
