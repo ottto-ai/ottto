@@ -41,9 +41,8 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         codex_home_bindings: Vec::new(),
         setup_snapshot_index: None,
     };
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     // One cycle in a fresh daemon and client: what it offered and where.
-    let mut cycle = |device: &LocalDeviceBinding, secret: &str| {
+    let cycle = |device: &LocalDeviceBinding, secret: &str| {
         cadence.next_due_cycle();
         server.offered.lock().unwrap().clear();
         let reports = server.terminal.lock().unwrap().len();
@@ -62,7 +61,6 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -86,7 +84,6 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         })
         .unwrap();
@@ -113,7 +110,9 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         .accepted_snapshot_fingerprint_recorded(&accepted));
     let namespace = snapshot_upload_destination_namespace(&device_a, "secret-a");
     let ledger = || {
-        SnapshotUploadProgress::load(
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &namespace,
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -329,13 +328,12 @@ fn owner_return_preserves_all_source_carry() {
             }))
             .unwrap(),
         );
-        legacy.save(&cx_path).unwrap();
+        legacy.save_fixture(&cx_path).unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
-        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         // A claim switch keeps the daemon alive. Keep its physical-header cache
         // while reloading account/index state on each ordinary source pass.
         let daemon_owner = test_daemon("machine_test");
-        let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
+        let cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
             cadence.next_due_cycle();
             source_cadences().lock().unwrap().remove(source.api_slug());
             source_upload_deadlines()
@@ -382,7 +380,6 @@ fn owner_return_preserves_all_source_carry() {
                                 &daemon,
                                 &mut transport,
                                 daemon.snapshot_scan_account_witness().unwrap(),
-                                false,
                             )
                         })
                         .unwrap()
@@ -414,7 +411,6 @@ fn owner_return_preserves_all_source_carry() {
                             &support,
                             &daemon,
                             &mut transport,
-                            &mut retry,
                         )
                     })
                     .unwrap();
@@ -459,7 +455,7 @@ fn owner_return_preserves_all_source_carry() {
         });
         let saved = ScanIndex::load(&cx_path).unwrap();
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-        assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+        assert!(entry.codex_counting_v2, "new Codex reads retain V2");
         assert!(saved.historical_replay_generation_matches(&generation));
         // The disposable progress ledger can clear after ACK handoff. Its
         // destination/replay proof survives in the authoritative index.
@@ -515,7 +511,7 @@ fn owner_return_preserves_all_source_carry() {
             let source = SnapshotSource::Pi;
             let mut old = ScanIndex::load(&index_path(&namespace_a, source)).unwrap();
             old.prepare_historical_replay(format!("pi:old-revision:{namespace_a}"));
-            old.save(&index_path(&namespace_a, source)).unwrap();
+            old.save_fixture(&index_path(&namespace_a, source)).unwrap();
             crate::backfill::update_backfill_state(&support, |state| {
                 state
                     .completed_destination_replays
@@ -642,7 +638,7 @@ fn owner_return_preserves_all_source_carry() {
             }
             let saved = ScanIndex::load(&cx_path).unwrap();
             let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-            assert!(!entry.codex_counting_v2);
+            assert!(entry.codex_counting_v2);
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
                 tier
@@ -845,7 +841,7 @@ fn account_return_history_row(recorded_a: bool) {
         }))
         .unwrap(),
     );
-    legacy.save(&cx_path).unwrap();
+    legacy.save_fixture(&cx_path).unwrap();
     // Like install_legacy_active: A already completed its initial Codex backfill.
     crate::backfill::update_backfill_state(&support, |state| {
         crate::backfill::mark_backfill_complete_for_destination(
@@ -856,10 +852,9 @@ fn account_return_history_row(recorded_a: bool) {
     })
     .unwrap();
     crate::snapshots::older_build_logs_priority("return-turn");
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let daemon_owner = test_daemon("machine_test");
     // Existing prepare/finish scaffold, now table-driven across the three sources.
-    let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
+    let cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
         cadence.next_due_cycle();
         source_cadences().lock().unwrap().remove(source.api_slug());
         source_upload_deadlines()
@@ -905,7 +900,6 @@ fn account_return_history_row(recorded_a: bool) {
                         &daemon,
                         &mut transport,
                         daemon.snapshot_scan_account_witness().unwrap(),
-                        false,
                     )
                 })
                 .unwrap()
@@ -937,7 +931,6 @@ fn account_return_history_row(recorded_a: bool) {
                         &support,
                         &daemon,
                         &mut transport,
-                        &mut retry,
                     )
                 })
                 .unwrap();
@@ -978,7 +971,7 @@ fn account_return_history_row(recorded_a: bool) {
     }
     let saved = ScanIndex::load(&cx_path).unwrap();
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-    assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+    assert!(entry.codex_counting_v2, "new Codex reads retain V2");
     assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
     let original_store = std::fs::read(&cx_path).unwrap();
     let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
@@ -1059,7 +1052,7 @@ fn account_return_history_row(recorded_a: bool) {
         }
         let returned_cx = ScanIndex::load(&index_path(&namespace, SnapshotSource::Codex)).unwrap();
         let entry = &returned_cx.files[&codex.to_string_lossy().into_owned()];
-        assert_eq!(entry.codex_counting_v2, !reattached);
+        assert!(entry.codex_counting_v2);
         if reattached {
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
@@ -1094,15 +1087,7 @@ fn account_return_history_row(recorded_a: bool) {
         })
     };
     for (source, session, expected) in [
-        (
-            1,
-            CX,
-            Some(if recorded_a {
-                [2000, 200, 0, 0, 0, 0, 0, 1]
-            } else {
-                [1000, 100, 0, 0, 0, 0, 0, 1]
-            }),
-        ),
+        (1, CX, Some([1000, 100, 0, 0, 0, 0, 0, 1])),
         (0, OLD, recorded_a.then_some([30, 3, 0, 0, 0, 0, 0, 1])),
         (0, IDENTITY_PIPELINE_ROOT, Some([30, 3, 0, 0, 0, 0, 0, 1])),
         (2, "return-pi", Some([12, 4, 0, 0, 0, 0, 0, 1])),
@@ -1145,7 +1130,7 @@ fn account_return_history_row(recorded_a: bool) {
                 );
             }
             if source == 1 {
-                assert_eq!(counts(prior), [2000, 200, 0, 0, 0, 0, 0, 1]);
+                assert_eq!(counts(prior), [1000, 100, 0, 0, 0, 0, 0, 1]);
                 assert_eq!(counts(&prior["model_usage"][0]), counts(prior));
                 assert_eq!(counts(&after["model_usage"][0]), expected);
                 assert_eq!(

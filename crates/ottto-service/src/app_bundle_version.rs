@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
+pub(crate) const COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
 const APP_BUNDLE_NAME: &str = "Ottto.app";
 // A packaged Ottto Info.plist is a few KiB and a few collections deep.
 const MAX_INFO_PLIST_BYTES: u64 = 64 * 1024;

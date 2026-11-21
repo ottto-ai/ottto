@@ -2,7 +2,8 @@
 use super::*;
 use crate::snapshots::claude_money_birth_store::location_key;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    accepted_file_for_test, origin_accepted_for_test, upload_context_proof_is_current_for_test,
+    accepted_file_for_test, origin_accepted_for_test, own_install_for_test,
+    upload_context_proof_is_current_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle, observe_consumed, Mode, RouteResult,
@@ -247,6 +248,7 @@ fn holder_only_page_brings_its_content_twin() {
             append(&holder, &resumed(ROOT, &[D]));
             let expected = 3 + u64::from(own);
             let scanner = E2ScanFixture::default();
+            let mut again = own_install_for_test(&prior, &c.base);
             let seeded = ready(&c, &scanner, prior.clone(), 100, false);
             assert_eq!(
                 body(&seeded, ROOT).unwrap().request_count,
@@ -255,7 +257,6 @@ fn holder_only_page_brings_its_content_twin() {
             );
             // Reference: the owed copy is read first and its pull brings the
             // original, the composition of a copy-seeded page.
-            let mut again = prior.clone();
             again.activate_effective_upload_body_witness_revision(3);
             assert!(again.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
             let reference = ready(&c, &E2ScanFixture::default(), again, 100, false);
@@ -637,6 +638,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             );
             append(&main, &resumed(ROOT, &[D]));
             let scanner = E2ScanFixture::default();
+            let mut all = own_install_for_test(&prior, &c.base);
             let mut complete = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
             assert!(
                 scanner.paths().contains(&twin),
@@ -664,7 +666,6 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             complete.enrich(&c);
             assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
             // Q's selected recovery offers both sessions, as does the all-owed oracle.
-            let mut all = prior.clone();
             owe(&mut all);
             let full = ready(&c, &E2ScanFixture::default(), all, 100, sampled);
             assert_eq!(body(&full, ROOT).unwrap().request_count, 4);
@@ -686,7 +687,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                         &twin,
                         &resumed(ROOT, &[("e", "2026-08-02T07:07:10Z", RESUME_WRITER)]),
                     );
-                    let mut full_index = prior.clone();
+                    let mut full_index = own_install_for_test(&prior, &c.base);
                     // Rebuild S's complete membership; Q stays accepted on both
                     // routes and is pulled only as unchanged counting evidence.
                     full_index.activate_effective_upload_body_witness_revision(3);
@@ -2187,13 +2188,14 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unrouted JSON save retains exact accepted counted rows
-/// without granting head-backed authority or relocking a v2 session.
+/// [regress] Its saves retain exact accepted counted rows, grant no new
+/// head-backed authority and never relock a v2 session. Every save is native
+/// now, so the JSON-era unrouted checks are the only ones this case no longer
+/// makes.
 #[test]
-fn legacy_content_carrier_save_stays_unrouted() {
+fn unsampled_content_carrier_keeps_accepted_rows_and_removals() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
-        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
         assert!(!index.upload_context_proof.request_contributions.is_empty());
         let rows = index.upload_context_proof.request_contributions.clone();
         let copy = c.root.join(file(COPY));
@@ -2201,14 +2203,13 @@ fn legacy_content_carrier_save_stays_unrouted() {
         for _ in 0..3 {
             let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
             index = settle(&c, &index, page, &mut e2_progress());
-            assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
             assert_eq!(index.upload_context_proof.request_contributions, rows);
             assert_eq!(removed_hashes(&index, &copy), removals);
             assert!(
                 !index
                     .claude_copy_removals
                     .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
-                "fresh accepted rows settle ownership without a head route"
+                "fresh accepted rows settle ownership without a sampled head"
             );
         }
     });
@@ -2429,6 +2430,10 @@ fn committed_content_carrier_requires_bound_receipt_after_reload() {
 
 mod accepted_holder_row_tests {
     include!("accepted_holder_row_tests.rs");
+}
+
+mod entity_last_clock_tests {
+    include!("entity_last_clock_tests.rs");
 }
 
 /// [money] A current carrier keeps the main's Local proof for both a stored

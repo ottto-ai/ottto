@@ -21,10 +21,6 @@ fn route(arm: Settled, mode: Mode, page: &Page) -> RouteResult {
 enum Settled {
     /// The delivered holder proves the prefix again by request ids.
     Holders,
-    /// What an earlier build left: the copy settled before the cutoff with
-    /// its prefix removed and accepted, and nothing saved. The holder family
-    /// is then listed for re-emission, so no holder proves the prefix anew.
-    Grandfathered,
     /// The removal is saved, then the holder family is listed: listing
     /// pauses new removals only.
     ListedHolder,
@@ -34,17 +30,8 @@ impl Settled {
     fn name(self) -> &'static str {
         match self {
             Settled::Holders => "resumed_copy_prefix_dedupe",
-            Settled::Grandfathered => "resumed_copy_prefix_dedupe_grandfathered",
             Settled::ListedHolder => "resumed_copy_prefix_dedupe_listed_holder",
         }
-    }
-
-    /// The committed index every route of the next page reads.
-    fn prior(self, mut prior: ScanIndex) -> ScanIndex {
-        if self == Settled::Grandfathered {
-            prior.claude_copy_removals = Default::default();
-        }
-        prior
     }
 }
 
@@ -245,16 +232,11 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// older release left (pending usage evidence and owed bits on every file);
 /// no grown body is smaller than the accepted one, and a restart after the
 /// last delivered page parses and sends nothing. The prefix stays removed when
-/// the delivered holder proves it, when an earlier build's accepted removal
-/// has nothing saved and no holder proves it anew, and when the holder
-/// family of a saved removal is listed.
+/// the delivered holder proves it and when the holder family of a saved
+/// removal is listed.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
-    for arm in [
-        Settled::Holders,
-        Settled::Grandfathered,
-        Settled::ListedHolder,
-    ] {
+    for arm in [Settled::Holders, Settled::ListedHolder] {
         if !supported(arm.name()) {
             return;
         }
@@ -298,8 +280,7 @@ fn copy_prefix_routes(arm: Settled) {
     if arm != Settled::Holders {
         crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT]);
     }
-    let mut prior =
-        arm.prior(disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index));
+    let mut prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
     // A deleted session beside the holder is still indexed in the committed
     // prior. Every route's complete read of that directory proves it absent
     // and retires it; no body, total or placement moves.
@@ -334,10 +315,12 @@ fn copy_prefix_routes(arm: Settled) {
                 "{arm:?} page {request}: the {owner} prior owes the holder again"
             );
         }
-        // The committed prior as an older release's store holds it, loaded
-        // by this build.
-        let upgraded =
-            upgrade_from_legacy_store(&priors[2], &c.base.join("legacy-scan-index.json"));
+        // The committed prior as an older release's store holds it, imported
+        // by this build; each page's store is its own scratch path.
+        let upgraded = upgrade_from_legacy_store(
+            &priors[2],
+            &c.base.join(format!("legacy-scan-index-{request}.json")),
+        );
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
         finish_claude_pages(&c, &mut pages);
@@ -377,11 +360,11 @@ fn copy_prefix_routes(arm: Settled) {
         // new route, holds a growth claim bound to the old one (as
         // `restart_between_pages`).
         deliver(&mut disk_page);
-        let next = arm.prior(disk.commit(
+        let next = disk.commit(
             &disk_page.cache,
             SnapshotSource::ClaudeCode,
             &mut disk_page.index,
-        ));
+        );
         priors = [next.clone(), next.clone(), next];
         accepted = cold;
     }
@@ -906,7 +889,9 @@ fn local_copy_refusal_deletion_and_progress_first_restart() {
                 // A later revision may be refused even after this body earned
                 // its durable file receipt. Neither refusal nor deletion erases it.
                 refuse_original(&page.scan.snapshots, &mut progress);
-                progress.save(&c.base.join("progress.json")).unwrap();
+                progress
+                    .save_fixture(&c.base.join("progress.json"))
+                    .unwrap();
                 assert_eq!(shared(&ledger), (if accepted_before { 2 } else { 0 }, 0));
                 let holds = LocalHoldSettlement::classify(
                     SnapshotSource::ClaudeCode,
@@ -1100,7 +1085,9 @@ fn failed_same_page_holder_drops_provisional_groups_before_deletion() {
         .0
         .is_err());
         progress.hold_outage_bodies(&page.scan.snapshots, u64::MAX);
-        progress.save(&c.base.join("progress.json")).unwrap();
+        progress
+            .save_fixture(&c.base.join("progress.json"))
+            .unwrap();
         let mut selected = page.index.committable_subset_for_upload(
             &page.committed,
             &progress.accepted_fingerprints,
@@ -1282,7 +1269,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             "2026-08-02T07:03:00Z",
         );
         let index_path = c.base.join("scan-index.json");
-        ScanIndex::default().save(&index_path).unwrap();
+        ScanIndex::default().save_fixture(&index_path).unwrap();
         let mut ledger = Ledger::new();
         let progress_path = c.base.join("progress.json");
         {
@@ -1313,7 +1300,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             .0
             .unwrap();
             refuse_original(&page.scan.snapshots, &mut progress);
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
             // Crash here: page, committed baseline, scanner and progress drop.
             // No index save or settlement occurs after the progress publication.
         }

@@ -1017,24 +1017,8 @@ where
             .context_resend
             .note_attempt(fingerprint(item), bytes);
     }
-    let mut replaced_retained_proof = false;
     if !progress.accepted_identity_scope.is_unset() {
         progress.load_identity(batch.iter().copied().filter_map(session_id))?;
-    }
-    // Only proof the ledger holds can be replaced, whatever the capability.
-    if progress.accepted_identity_buckets.has_retained() {
-        for item in &batch {
-            let value = serde_json::to_value(item)?;
-            replaced_retained_proof |= progress
-                .accepted_identity_buckets
-                .invalidate_replaced(&value);
-        }
-    }
-    // Option (ii): the server may store a replacement proof even if this
-    // reply is lost; drop the superseded one durably so no later marker can
-    // preserve the replacement in its place.
-    if replaced_retained_proof {
-        persist(progress)?;
     }
     // This page's attempt rows are written once its progress save returns.
     let attempt_history = crate::upload_receipts::defer();
@@ -1175,6 +1159,12 @@ where
             .filter(|entity| entity.unchanged_basis.is_some())
             .map(|entity| entity.snapshot_fingerprint.as_str())
             .collect::<BTreeSet<_>>();
+        let usage_identical = response
+            .unchanged_entities
+            .iter()
+            .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
+            .map(|entity| entity.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
         let settled = response
             .accepted_entities
             .iter()
@@ -1238,7 +1228,11 @@ where
                         .map(|entity| (*entity, witness.as_str())),
                 )?;
             } else if not_stored.contains(item_fingerprint) {
-                progress.hold_unstored_body(item_fingerprint, &body_witness(item));
+                progress.hold_unstored_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    usage_identical.contains(item_fingerprint),
+                );
                 progress
                     .context_resend
                     .not_stored
@@ -1246,11 +1240,7 @@ where
             }
         }
         if !not_stored.is_empty() {
-            let usage_identical = response
-                .unchanged_entities
-                .iter()
-                .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
-                .count();
+            let usage_identical = usage_identical.len();
             eprintln!(
                 "local snapshot unchanged not stored for {poison_scope}: count={} \
                  usage_identical={usage_identical} other={}; exact bodies held, not marked emitted",

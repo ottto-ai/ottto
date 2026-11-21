@@ -36,7 +36,8 @@ fn actual_decoder_missing_renamed_syntax_and_future_version_behaviour() {
     let s = Scratch::new();
     assert_eq!(ScanIndex::load(&s.root()).unwrap().generation, 0);
     let mut original = ScanIndex::default();
-    original.save(&s.root()).unwrap();
+    original.generation = 1;
+    fs::write(s.root(), serde_json::to_vec(&original).unwrap()).unwrap();
     let renamed = s.0.join("renamed-index.json");
     fs::rename(s.root(), &renamed).unwrap();
     assert_eq!(ScanIndex::load(&s.root()).unwrap().generation, 0);
@@ -47,9 +48,11 @@ fn actual_decoder_missing_renamed_syntax_and_future_version_behaviour() {
         b"{\"files\":{},\"schema_version\":2,\"generation\":\"unterminated",
     )
     .unwrap();
-    assert_eq!(ScanIndex::load(&s.root()).unwrap().generation, 0);
-    assert!(!s.root().exists());
-    assert!(fs::read_dir(&s.0).unwrap().any(|entry| entry
+    let before = fs::read(s.root()).unwrap();
+    let error = ScanIndex::load(&s.root()).unwrap_err();
+    assert!(format!("{error:#}").contains("state_v2_foreign_binding"));
+    assert_eq!(fs::read(s.root()).unwrap(), before);
+    assert!(!fs::read_dir(&s.0).unwrap().any(|entry| entry
         .unwrap()
         .file_name()
         .to_string_lossy()
@@ -140,8 +143,9 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
         assert!(source.contains("LoadOrigin::Missing,"));
     } else if frozen.contains("let quarantine_path = unique_checkpoint_sibling") {
         assert!(source.contains("fs::rename(path, &quarantine_path).context(\"quarantine invalid local snapshot scan index\")?;"));
-        assert!(source.contains("persistence_legacy_recovery: persistence_recovery,"));
-        assert!(source.contains("..ScanIndex::default()"));
+        assert!(source.contains("state_v2::publish_rebuilt_locked(path, &ScanIndex::default())?;"));
+        assert!(source.contains(".require_legacy_rebuild()?;"));
+        assert!(source.contains("Err(state_v2::Hold::ReloadRequired.into())"));
     } else {
         panic!("unchanged historical control drifted: {frozen}");
     }

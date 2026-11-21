@@ -85,8 +85,8 @@ jobs:
     # skip) can be reverted on its own at any time.
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
-    # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
-    # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
+    # The main merge queue usually takes about 38 minutes. A previous 40-minute limit
+    # cut off a run, so keep extra time for slower runs.
     timeout-minutes: 55
     runs-on: macos-15
     env: &rust-contract-env
@@ -239,8 +239,49 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
           persist-credentials: false
-          # The PR merge commit plus its base parent, for the move checks.
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Check public commit identities and root
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          PUBLIC_REPO_ROOT: ${{ vars.PUBLIC_REPO_ROOT }}
+        run: |
+          set -euo pipefail
+          fail() {
+            local sha="$1"
+            [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || sha=------------
+            printf '%.12s %s\n' "$sha" "$2" >&2
+            exit 1
+          }
+          case "${GITHUB_EVENT_NAME:-}" in
+            pull_request) args=(--base "$PR_BASE" --head "$PR_HEAD") ;;
+            merge_group)
+              checkout_head="$(git rev-parse --verify HEAD 2>/dev/null)" ||
+                fail "$QUEUE_HEAD" 'cannot resolve checkout commit'
+              [[ "$checkout_head" == "$QUEUE_HEAD" && "${GITHUB_SHA:-}" == "$QUEUE_HEAD" ]] ||
+                fail "$QUEUE_HEAD" 'merge group head does not match checkout'
+              args=(--base "$QUEUE_BASE" --head "$QUEUE_HEAD" --require-ancestor)
+              ;;
+            push)
+              if [[ "$PUSH_BEFORE" == 0000000000000000000000000000000000000000 ]]; then
+                args=(--root-only --head "$PUSH_AFTER")
+              else
+                args=(--base "$PUSH_BEFORE" --head "$PUSH_AFTER" --require-ancestor)
+              fi
+              ;;
+            schedule|workflow_dispatch)
+              checkout_head="$(git rev-parse --verify HEAD 2>/dev/null)" ||
+                fail '' 'cannot resolve checkout commit'
+              args=(--root-only --head "$checkout_head")
+              ;;
+            *) fail '' 'unsupported workflow event' ;;
+          esac
+          python3 scripts/public_repo_commit_guards.py "${args[@]}"
 
       # Pinned binary with the action's per-version SHA-256; no unverified
       # cargo-install fallback.

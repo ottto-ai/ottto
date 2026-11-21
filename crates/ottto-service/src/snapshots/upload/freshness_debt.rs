@@ -135,7 +135,8 @@ fn summary(owed: &[Revision], disposition: Option<NoUploadRequired>) -> DebtSumm
 struct Live {
     len: u64,
     representation: Representation,
-    /// `[0, accepted)` of the live object has a matched exact receipt.
+    /// `[0, accepted)` of the live object has a matched exact receipt, or
+    /// this process's `usage_identical` note for its exact body set.
     exact: bool,
     accepted: u64,
     /// `[0, read)` of the live object was read into the index.
@@ -701,7 +702,8 @@ impl<'a> Page<'a> {
         let same_object = entry.opened_birth_nanos == 0 || birth == Some(entry.opened_birth_nanos);
         let grown = !compressed && !unchanged && same_object && len > entry.size_bytes;
         live.exact = index.file_upload_context_enabled()
-            && !index.file_upload_context_requires_adoption(key)
+            && (!index.file_upload_context_requires_adoption(key)
+                || usage_identical_covers(index, self.route.as_deref(), key, entry))
             && (unchanged || grown);
         // The stored size, never the live one: a matching Codex fragment's
         // entry records only its certified prefix.
@@ -852,6 +854,52 @@ impl<'a> Page<'a> {
             None => None,
         }
     }
+}
+
+/// The server's `usage_identical` answer for a one-entity file's exact read
+/// body, given in this process to the destination the walk's Tail route is
+/// bound to, under the index's upload context and replay generation, while
+/// the index still holds that body terminally. It stands in for the receipt no
+/// stored body can earn. A file of several entities, or a walk with no bound
+/// route, stays held.
+fn usage_identical_covers(
+    index: &ScanIndex,
+    route: Option<&Path>,
+    key: &str,
+    entry: &ScanIndexEntry,
+) -> bool {
+    let Some(destination) = route
+        .and_then(crate::snapshots::scan_index_integration::scan_index_storage_binding)
+        .map(|binding| binding.namespace_hash)
+    else {
+        return false;
+    };
+    let mut entities = index
+        .file_snapshot_fingerprints
+        .get(key)
+        .into_iter()
+        .flatten();
+    let (Some(entity), None, Some(context)) = (
+        entities.next(),
+        entities.next(),
+        index.active_upload_context_fingerprint.as_deref(),
+    ) else {
+        return false;
+    };
+    let replay = index.historical_replay_generation.as_deref();
+    money_freshness::usage_identical_body(entity, &destination, context, replay).is_some_and(
+        |body| {
+            index
+                .quarantined_snapshot_fingerprints
+                .get(entity)
+                .is_some_and(|hold| {
+                    hold.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                        && hold.upload_body_witness.as_ref() == Some(&body)
+                })
+                && entry.last_upload_body_witness.as_ref()
+                    == Some(&snapshot_file_upload_body_set_hex([&body]))
+        },
+    )
 }
 
 /// Claude history the gate holds as Listed (`decide` or stricter), not refused.

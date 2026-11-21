@@ -6,7 +6,7 @@
 // legacy witness inference, as an absent `archived_sessions` does, and a
 // known root that goes missing for one generation forces an unrelated red
 // walk.
-use crate::snapshots::sources::codex::counting::version::{proven_owner, AckEvidence};
+use crate::snapshots::sources::codex::counting::version::proven_owner;
 
 const REMOVED_FRESH: &str = "019e5a00-0000-7000-8000-00000000000e";
 const REMOVED_OLD: &str = "019e5a00-0000-7000-8000-00000000000f";
@@ -97,20 +97,6 @@ impl Homes {
             .iter()
             .all(|key| index.files.contains_key(key))
     }
-    /// Each removed session's proven owner, else its protected owner.
-    fn removed_owners(&self, index: &ScanIndex) -> BTreeMap<&'static str, String> {
-        [REMOVED_FRESH, REMOVED_OLD]
-            .into_iter()
-            .map(|id| {
-                let entry = &index.files[&local_index_key(&self.path(id))];
-                let owner = proven_owner(entry).map_or_else(
-                    || crate::snapshots::codex_protected_owner(id),
-                    str::to_owned,
-                );
-                (id, owner)
-            })
-            .collect()
-    }
     fn scan(
         &self,
         with_removed: bool,
@@ -198,7 +184,10 @@ impl Homes {
 
 /// No Codex counting tombstone is kept.
 fn no_tombstones(index: &ScanIndex) -> bool {
-    index.codex_counting_tombstones.values().next().is_none()
+    serde_json::to_value(index)
+        .unwrap()
+        .get("codex_counting_tombstones")
+        .is_none()
 }
 
 /// No legacy unresolved-root witness is persisted.
@@ -266,11 +255,7 @@ fn accepted_generation(
             !entry.codex_history_is_protected(),
             "{row}: an ordinary entry"
         );
-        assert_ne!(
-            AckEvidence::of_view(Some(entry)),
-            AckEvidence::None,
-            "{row}"
-        );
+        assert!(entry.last_snapshot_fingerprint.is_some(), "{row}");
     }
     (first, accepted, acked)
 }
@@ -359,7 +344,6 @@ struct Drained {
     session: StateV2ColdSession,
     gen1: RouteResult,
     gen1_acked: RouteResult,
-    owners: BTreeMap<&'static str, String>,
     bytes: [(&'static str, Vec<u8>); 2],
     index: ScanIndex,
     accepted: BTreeMap<String, Accepted>,
@@ -375,7 +359,6 @@ fn drain(row: &str, arm: Arm) -> Drained {
     let mut cache = Arc::new(sampled_scan::SharedCache::default());
     let (first, gen1, gen1_acked) = accepted_generation(row, &h, prior, &cache);
     let removed_keys = h.removed_keys();
-    let owners = h.removed_owners(&first.index);
     let kept_owners = [MAIN, OTHER, SIDE, GAP]
         .map(|id| local_index_key(&h.c.path(id)))
         .into_iter()
@@ -499,22 +482,7 @@ fn drain(row: &str, arm: Arm) -> Drained {
         assert!(!index.files.contains_key(key), "{row}: retired");
         assert!(index.file_snapshot_fingerprints.get(key).is_none(), "{row}");
     }
-    assert_eq!(
-        index
-            .codex_counting_tombstones
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        owners.values().cloned().collect::<BTreeSet<_>>(),
-        "{row}: tombstones under the removed entries' proven owners only"
-    );
-    assert!(
-        index
-            .codex_counting_tombstones
-            .values()
-            .all(|tombstone| tombstone.retired_in == NOW),
-        "{row}: same-generation tombstones kept"
-    );
+    assert!(no_tombstones(index), "{row}: counting history is retired");
     for (key, owner) in &kept_owners {
         assert_eq!(
             &proven_owner(&index.files[key]).map(str::to_owned),
@@ -605,7 +573,6 @@ fn drain(row: &str, arm: Arm) -> Drained {
         session,
         gen1,
         gen1_acked,
-        owners,
         bytes,
         index,
         accepted,
@@ -708,18 +675,16 @@ fn without_file_revision(mut route: RouteResult) -> RouteResult {
         body.remove("source_file_fingerprint");
         body.remove("collected_at");
         let envelope = body["semantic_envelope"].as_object_mut().unwrap();
-        envelope.remove("revision_hash");
         envelope.remove("revision_v2_hash");
     }
     route
 }
 
 /// [money] O6b: the same path restored after retirement, while its
-/// tombstones survive and after a later generation collected them. Only the
+/// state is freshly retired and after a later complete generation. Only the
 /// in-window file is read, once; its body keeps its destination key and
 /// replaces one head with the original accepted totals and placement, and
-/// equals a cold Full with equivalent historical evidence. The restored owner
-/// is a post-cutover Legacy-acknowledged owner.
+/// equals a cold V2 Full. Every restored file starts with V2.
 #[test]
 fn removed_account_readded_after_retirement_counts_once() {
     let _lock = DECODER_TEST_LOCK
@@ -743,14 +708,7 @@ fn removed_account_readded_after_retirement_counts_once() {
             index = later.index;
             at = LATEST;
         } else {
-            assert_eq!(
-                index
-                    .codex_counting_tombstones
-                    .get(&d.owners[REMOVED_FRESH])
-                    .map(|tombstone| tombstone.evidence),
-                Some(AckEvidence::LegacyAcked),
-                "{row}"
-            );
+            assert!(no_tombstones(&index));
         }
         // Aged files are never first reads. A head that absence kept (its
         // debt never clears by absence) is the noted exception: read once.
@@ -766,10 +724,6 @@ fn removed_account_readded_after_retirement_counts_once() {
             fs::write(d.h.path(id), bytes).unwrap();
         }
         aged_mtime(&d.h.path(REMOVED_OLD));
-        // Equivalent historical evidence: Legacy while the tombstone
-        // survives, none (a fresh V2 owner) once it was collected.
-        let historical = (!collected).then(|| d.h.cold(true, at));
-        let _cutover = crate::snapshots::TestCutover::set(0);
         let readded = d.h.step(true, index, d.cache.clone(), 100, at);
         assert_eq!(
             readded.reads,
@@ -787,12 +741,10 @@ fn removed_account_readded_after_retirement_counts_once() {
             "{row}: emitted {emitted:?}, read {read:?}"
         );
         assert!(readded.index.traversal.is_none(), "{row}: healthy");
-        if !collected {
-            assert!(
-                !readded.index.files[&local_index_key(&d.h.path(REMOVED_FRESH))].codex_counting_v2,
-                "{row}: the surviving tombstone keeps Legacy counting"
-            );
-        }
+        assert!(
+            readded.index.files[&local_index_key(&d.h.path(REMOVED_FRESH))].codex_counting_v2,
+            "{row}: a restored file uses V2"
+        );
         let replay = crate::snapshot_sync::codex_transition_acked_route(
             &readded.index,
             &readded.scan,
@@ -824,7 +776,7 @@ fn removed_account_readded_after_retirement_counts_once() {
                 "{row}: {id} {field}: the original accepted total, never a sum"
             );
         }
-        let mut cold = historical.unwrap_or_else(|| d.h.cold(true, at));
+        let mut cold = d.h.cold(true, at);
         cold.snapshots
             .retain(|item| item.source_session_id == REMOVED_FRESH);
         // A cold Full never reads the aged file; it compares the in-window one.
@@ -1027,10 +979,6 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
             h.removed_indexed(&first.index),
             "{arm}: keys under the canonical root"
         );
-        let owners = h
-            .removed_owners(&first.index)
-            .into_values()
-            .collect::<BTreeSet<_>>();
         let roots = if arm == "configured-missing" {
             fs::rename(&h.removed, &h.parked).unwrap();
             &with
@@ -1148,15 +1096,7 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
                     .all(|key| !index.files.contains_key(key)),
                 "{arm}"
             );
-            assert_eq!(
-                index
-                    .codex_counting_tombstones
-                    .keys()
-                    .cloned()
-                    .collect::<BTreeSet<_>>(),
-                owners,
-                "{arm}"
-            );
+            assert!(no_tombstones(&index));
         } else {
             let walk = index.traversal.as_ref().expect("still red");
             assert!(

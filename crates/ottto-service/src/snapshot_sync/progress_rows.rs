@@ -57,7 +57,7 @@ pub(super) fn valid_cache_head(key: &str, head: &str) -> bool {
 
 impl SnapshotUploadProgress {
     /// A pass's progress for its loaded index: the route's rows when the
-    /// source is routed, else the JSON ledger.
+    /// source has native custody. Legacy JSON is read only by import_rows.
     pub(super) fn load_for_index(
         index: &ScanIndex,
         index_path: &Path,
@@ -66,7 +66,7 @@ impl SnapshotUploadProgress {
         witness: SnapshotQuarantineWitness,
     ) -> Result<Self> {
         if !crate::snapshots::state_v2_growth_retention_active(index) {
-            return Self::load(path, namespace, witness);
+            return Err(crate::snapshots::state_v2::Hold::ReloadRequired.into());
         }
         let owner = SnapshotProgressLock::acquire(path)?.for_v2(path);
         let read = crate::snapshots::read_progress_rows(index_path, &owner)?;
@@ -143,9 +143,6 @@ impl SnapshotUploadProgress {
         progress.accepted_cache_heads = heads;
         if progress.destination_namespace_hash != namespace {
             // Another destination's progress, as the JSON load clears it.
-            progress
-                .accepted_identity_buckets
-                .count_retained_cleared_if_any();
             progress = Self::new(namespace.to_owned(), witness.clone());
             progress.generation = rows.generation();
         } else {
@@ -194,9 +191,6 @@ impl SnapshotUploadProgress {
             generation: progress.generation,
         };
         if progress.destination_namespace_hash != namespace {
-            progress
-                .accepted_identity_buckets
-                .count_retained_cleared_if_any();
             progress = Self::new(namespace.to_owned(), witness.clone());
         }
         anyhow::ensure!(
@@ -317,8 +311,7 @@ impl SnapshotUploadProgress {
             point.progress_generation >= discard_before && hints.admissible(&point.accepted)
         })?;
         for (name, point) in points {
-            let retained_reset = point.progress_generation < scope.retained_before;
-            hints.admit(name, point.accepted, retained_reset);
+            hints.admit(name, point.accepted);
         }
         Ok(())
     }
@@ -585,6 +578,7 @@ fn decode_identity_503_pending<'de, D: serde::Deserializer<'de>>(
 
 /// What a save's compare-and-swap reads from the on-disk progress: the writer
 /// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
+#[cfg(test)]
 #[derive(Deserialize)]
 pub(super) struct SnapshotUploadProgressCas {
     pub(super) schema_version: u16,
@@ -649,6 +643,7 @@ impl SnapshotUploadProgress {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn load(
         path: &Path,
         expected_destination_namespace_hash: &str,
@@ -667,14 +662,6 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice::<Self>(&bytes)
                     .context("parse v3 local snapshot upload progress")
             });
-        // Option (ii) proof is scoped to the namespace that ACKed it.
-        if let Ok(progress) = &parsed {
-            if progress.destination_namespace_hash != expected_destination_namespace_hash {
-                progress
-                    .accepted_identity_buckets
-                    .count_retained_cleared_if_any();
-            }
-        }
         let mut progress = match parsed {
             Ok(progress)
                 if progress.valid(expected_destination_namespace_hash)
@@ -788,7 +775,8 @@ impl SnapshotUploadProgress {
             return false;
         }
         self.historical_replay_generation = Some(generation.to_string());
-        self.accepted_identity_buckets.clear_retained();
+        // The removed retained-identity barrier: still written so the stored
+        // scope keeps its bytes; nothing reads it.
         if self.rows.is_some() && !self.accepted_identity_scope.is_unset() {
             self.accepted_identity_scope.retained_before = self.generation.saturating_add(1);
         }
@@ -824,6 +812,50 @@ impl SnapshotUploadProgress {
     }
 
     pub(super) fn save_with_read_limit(
+        &mut self,
+        path: &Path,
+        _read_limit: Option<usize>,
+    ) -> Result<()> {
+        if self.rows.is_none() {
+            return Err(crate::snapshots::state_v2::Hold::ReloadRequired.into());
+        }
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+        self.save_rows(path)
+    }
+
+    /// Fixture persistence is explicit; native owners still use the real saver.
+    #[cfg(test)]
+    pub(super) fn save_fixture(&mut self, path: &Path) -> Result<()> {
+        self.save_legacy_fixture(path, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn save_fixture_with_read_limit(
+        &mut self,
+        path: &Path,
+        cap: Option<usize>,
+    ) -> Result<()> {
+        self.save_legacy_fixture(path, cap)
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_cycle_fixture(&mut self, path: &Path) -> Result<()> {
+        match self.finish_cycle(path) {
+            Err(error)
+                if self.rows.is_none()
+                    && error.downcast_ref::<crate::snapshots::state_v2::Hold>()
+                        == Some(&crate::snapshots::state_v2::Hold::ReloadRequired) =>
+            {
+                self.save_fixture(path)
+            }
+            result => result,
+        }
+    }
+
+    /// Explicit old-release input export for decoder and ACK-import fixtures.
+    #[cfg(test)]
+    pub(super) fn save_legacy_fixture(
         &mut self,
         path: &Path,
         read_limit: Option<usize>,
@@ -1016,6 +1048,7 @@ pub(super) fn unique_progress_sibling(path: &Path, kind: &str) -> PathBuf {
 
 /// Whether `value` serializes to exactly `bytes` (compact JSON). Streams into
 /// the comparison and stops at the first differing byte; nothing is buffered.
+#[cfg(test)]
 pub(super) fn serializes_to(value: &impl Serialize, bytes: &[u8]) -> bool {
     struct Same<'a>(&'a [u8]);
     impl Write for Same<'_> {
@@ -1040,6 +1073,7 @@ pub(super) fn sync_progress_parent(path: &Path) -> Result<()> {
         .context("sync snapshot upload progress directory")
 }
 
+#[cfg(test)]
 pub(super) fn quarantine_invalid_progress(path: &Path) -> Result<()> {
     let quarantine_path = unique_progress_sibling(path, "corrupt");
     std::fs::rename(path, quarantine_path)

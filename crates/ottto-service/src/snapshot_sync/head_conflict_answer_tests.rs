@@ -67,7 +67,6 @@ pub(super) fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
-        retained_proof_missing: Vec::new(),
         cache_observations_state: None,
     }
 }
@@ -173,12 +172,23 @@ fn selected_page(
     replacement: bool,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
-    let path = root.join("progress.json");
-    // Each call starts from this view, then saves at the real page boundary.
+    let native_index = progress
+        .rows
+        .as_ref()
+        .map(|rows| rows.index_path_for_test().to_owned());
+    let path = native_index
+        .as_deref()
+        .map(snapshot_upload_progress_path)
+        .unwrap_or_else(|| root.join("progress.json"));
+    // A bound ledger keeps its actual native baseline. An isolated fixture
+    // still starts from this view, then saves at the real page boundary.
     let mut durable = progress.clone();
-    durable.generation = 0;
-    durable.save(&path).unwrap();
+    if native_index.is_none() {
+        durable.generation = 0;
+    }
+    durable.save_fixture(&path).unwrap();
     progress.generation = durable.generation;
+    progress.rows = durable.rows;
     let mut items = items.to_vec();
     for item in &mut items {
         item.cache_base_head_etag = progress
@@ -214,14 +224,23 @@ fn selected_page(
             response.bind_conflict_rescans(&request);
             Ok(response)
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     );
     if result.is_ok() {
-        let restored = SnapshotUploadProgress::load(
-            &path,
-            &progress.destination_namespace_hash,
-            snapshot_quarantine_witness(SnapshotSource::Codex),
-        )
+        let restored = match native_index {
+            Some(index_path) => SnapshotUploadProgress::load_for_index(
+                &ScanIndex::load(&index_path).unwrap(),
+                &index_path,
+                &path,
+                &progress.destination_namespace_hash,
+                progress.active_quarantine_witness.clone().unwrap(),
+            ),
+            None => SnapshotUploadProgress::load(
+                &path,
+                &progress.destination_namespace_hash,
+                snapshot_quarantine_witness(SnapshotSource::Codex),
+            ),
+        }
         .unwrap();
         assert_eq!(
             restored.head_conflict_challenges,
@@ -300,7 +319,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     let path = root.join("upload-progress.json");
     // This is a copy into a new ledger, not a CAS update of cycle's file.
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -408,7 +427,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         conflict(item, &challenge(0xc))
     });
     other.generation = 0;
-    other.save(&path).unwrap();
+    other.save_fixture(&path).unwrap();
     let foreign = SnapshotUploadProgress::load(
         &path,
         &"b".repeat(64),
@@ -1073,7 +1092,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         "preflight reserves the complete challenge framing"
     );
-    // The estimate is the upload's own wire at its largest policy framing.
+    // The budget covers the largest policy framing plus the admission headroom.
     let largest = SnapshotUploadPolicy {
         session_titles_enabled: false,
         workspace_labels_enabled: false,
@@ -1082,6 +1101,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         crate::snapshots::snapshot_item_wire_size(SnapshotSource::ClaudeCode, &projected, largest)
+            + 134
     );
     let mut no_answer = projected.clone();
     no_answer.cache_conflict_answer = None;
@@ -1172,9 +1192,6 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
             "model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64),
             "input_tokens":10,"cost_usd":"1.00"}]}]});
     progress.accepted_identity_buckets.record(&identity);
-    progress
-        .accepted_identity_buckets
-        .record_proved(&identity, true, &[]);
     assert!(!progress.accepted_identity_buckets.is_empty());
     let bytes = serde_json::to_vec(&progress).unwrap();
     let old: head_conflict_released_progress_fixture::SnapshotUploadProgress =
@@ -1266,13 +1283,13 @@ fn assert_rescan_claim(wire: &Value, answered: bool) {
     if answered {
         assert_eq!(envelope["forced_full_rescan"], true);
         assert!(envelope["rescan_from_revision_hash"].is_string());
-        assert!(envelope["revision_hash"].is_string());
+        assert!(envelope["revision_v2_hash"].is_string());
         assert!(wire["head_cas_contract"].is_string(), "enforced head CAS");
         assert!(envelope.get("base_head_etag").is_none(), "no expected head");
     }
 }
 
-/// [money] D142(a) on the POSTed envelope: only the upload of a session that
+/// [money] On the POSTed envelope: only the upload of a session that
 /// owes an answer carries the rescan claim, and that session is mirrored
 /// into the scan index, so the body was read by a native Full. Before the
 /// conflict and after the answer the session is not mirrored, so its files
@@ -1392,7 +1409,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     let progress_path = root.join("upload-progress.json");
     let index_path = root.join("scan-index.json");
     progress.generation = 0;
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let mut index = ScanIndex::default();
     activate_source_upload_context(
         SnapshotSource::Codex,
@@ -1402,7 +1419,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     );
     assert!(index.head_conflict_owed(&key));
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
 
     let namespace = crate::snapshot_sync::relogin_namespace(&"a".repeat(64), 2);
     let mut restarted = SnapshotUploadProgress::load(
@@ -1584,7 +1601,7 @@ fn negotiated_answer_without_cache_state_marks_a_full_replacement() {
     let root = crate::test_scratch::ScratchDir::new("cache-replacement-restore");
     let path = root.join("progress.json");
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -1928,7 +1945,7 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     let root = crate::test_scratch::ScratchDir::new("cache-state-echo-restart");
     let path = root.join("upload-progress.json");
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),

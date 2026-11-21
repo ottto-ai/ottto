@@ -100,6 +100,7 @@ impl FinishServer {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "session_request_account_source_contract":"session_request_account_source:v1",
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"});
@@ -300,7 +301,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -327,7 +327,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -377,7 +376,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         assert_eq!(
@@ -418,7 +416,9 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         assert!(saved
             .quarantined_snapshot_fingerprints
             .contains_key(fingerprint));
-        let progress = SnapshotUploadProgress::load(
+        let progress = SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &snapshot_upload_destination_namespace(&device, "device-secret"),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -684,7 +684,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -706,7 +705,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -729,7 +727,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         assert!(result.is_ok(), "cycle {cycle}: {result:?}");
@@ -741,7 +738,9 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 .unwrap()
                 .to_string()
         };
-        let progress = SnapshotUploadProgress::load(
+        let progress = SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &snapshot_upload_destination_namespace(&device, "device-secret"),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -769,7 +768,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
             record.failed_reconstruction_count = 1;
             record.disposition = SnapshotQuarantineDisposition::RetryPending;
             record.retry_after_unix_seconds = quarantine_retry_after(&fingerprint);
-            saved.save(&index_path).unwrap();
+            saved.save_fixture(&index_path).unwrap();
         } else {
             assert_eq!(
                 saved.quarantined_snapshot_fingerprints[&fingerprint].disposition,
@@ -840,7 +839,7 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
     Ok(())
 }
 
-/// #794: one scripted response per snapshot POST; an empty script accepts.
+/// One scripted response per snapshot POST; an empty script accepts.
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
@@ -851,6 +850,8 @@ enum AckScriptedPost {
     Identity(&'static str),
 }
 
+type CheckpointRace = (PathBuf, Arc<Mutex<Option<Vec<u8>>>>);
+
 struct AckScriptedServer {
     url: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -858,6 +859,7 @@ struct AckScriptedServer {
     /// Every snapshot offered, accepted or not.
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
     script: Arc<Mutex<VecDeque<AckScriptedPost>>>,
+    advance_before_ack: Arc<Mutex<Option<CheckpointRace>>>,
 }
 
 impl AckScriptedServer {
@@ -872,6 +874,8 @@ impl AckScriptedServer {
         let bodies = offered.clone();
         let script = Arc::new(Mutex::new(VecDeque::new()));
         let posts = script.clone();
+        let advance_before_ack = Arc::new(Mutex::new(None::<CheckpointRace>));
+        let checkpoint_race = advance_before_ack.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -896,6 +900,7 @@ impl AckScriptedServer {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "session_request_account_source_contract":"session_request_account_source:v1",
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"})
@@ -904,6 +909,12 @@ impl AckScriptedServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    if let Some((path, saved)) = checkpoint_race.lock().unwrap().take() {
+                        let mut concurrent = ScanIndex::load(&path).unwrap();
+                        concurrent.save(&path).unwrap();
+                        *saved.lock().unwrap() =
+                            Some(serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap());
+                    }
                     let post = posts
                         .lock()
                         .unwrap()
@@ -974,6 +985,7 @@ impl AckScriptedServer {
             worker: Some(worker),
             offered,
             script,
+            advance_before_ack,
         }
     }
 }
@@ -995,7 +1007,6 @@ struct AckFinishHome {
     client: SnapshotApiClient,
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _env: [EnvVarGuard; 3],
 }
 
@@ -1032,7 +1043,6 @@ impl AckFinishHome {
             client: SnapshotApiClient::new(server.url.clone()),
             daemon: test_daemon("otm_test"),
             transport: crate::net_resilience::TransportCycleOutcome::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _env: env,
         }
     }
@@ -1074,7 +1084,6 @@ impl AckFinishHome {
                 &self.daemon,
                 &mut self.transport,
                 self.daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -1102,7 +1111,6 @@ impl AckFinishHome {
                 &self.support,
                 &self.daemon,
                 &mut self.transport,
-                &mut self.retry,
             )
         })
     }
@@ -1129,10 +1137,12 @@ fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], p
             .accepted_fingerprints
             .retain(|fp| !debt.contains(fp));
     }
-    progress.save(&preparation.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&preparation.upload_progress_path)
+        .unwrap();
 }
 
-/// #794 F3: incomplete-census capacity stop, then a Disabled finish, then
+/// Incomplete-census capacity stop, then a Disabled finish, then
 /// another incomplete-census capacity stop. The Disabled exit resets the
 /// consecutive count, so the second stop reports 1, not 2.
 #[test]
@@ -1195,11 +1205,6 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
     const UNREAD: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    let newer_index = || {
-        let mut newer = serde_json::to_value(ScanIndex::default()).unwrap();
-        newer["generation"] = 7.into();
-        newer
-    };
     for arm in ["save_fails", "deferred", "completed"] {
         let server = AckScriptedServer::new();
         let mut home = AckFinishHome::new(&server);
@@ -1223,12 +1228,13 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             Some((u64::MAX / 2, BTreeMap::new())),
         );
         crate::snapshots::claude_telemetry_retention::take_runs_for_test();
+        let competing_bytes = Arc::new(Mutex::new(None));
         match arm {
             "save_fails" => {
-                // Another writer advanced the saved index: the selected
-                // save's compare-and-swap refuses.
-                std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-                std::fs::write(&index_path, serde_json::to_vec(&newer_index()).unwrap()).unwrap();
+                // Advance after the request reaches the server. A race before
+                // POST correctly trips the native side-effect guard earlier.
+                *server.advance_before_ack.lock().unwrap() =
+                    Some((index_path.clone(), competing_bytes.clone()));
             }
             "deferred" => server
                 .script
@@ -1249,8 +1255,8 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             "save_fails" => {
                 assert!(result.is_err(), "{arm}");
                 assert_eq!(
-                    std::fs::read(&index_path).unwrap(),
-                    serde_json::to_vec(&newer_index()).unwrap(),
+                    serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap(),
+                    competing_bytes.lock().unwrap().take().unwrap(),
                     "{arm}: the selected save never committed"
                 );
                 assert_eq!(runs, 0, "{arm}");

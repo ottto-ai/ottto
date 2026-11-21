@@ -82,6 +82,12 @@ pub(super) fn counted_poison_fingerprints() -> &'static Mutex<BTreeMap<String, B
     COUNTED_POISON_FINGERPRINTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Rest-heap diagnostics: scopes and fingerprints held, or None while busy.
+pub(super) fn counted_poison_entries() -> Option<(usize, usize)> {
+    let ledger = counted_poison_fingerprints().try_lock().ok()?;
+    Some((ledger.len(), ledger.values().map(BTreeSet::len).sum()))
+}
+
 pub(super) fn retain_counted_poison_fingerprints(scope: &str, current: &BTreeSet<String>) {
     if let Ok(mut counted) = counted_poison_fingerprints().lock() {
         if let Some(ledger) = counted.get_mut(scope) {
@@ -122,6 +128,8 @@ pub(super) fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<Stri
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SyncCounts {
     pub(super) census_status: crate::snapshots::CensusStatus,
+    /// The walk gate held this pass: no census was taken, and none is lost.
+    pub(super) walk_idle: bool,
     pub(super) backfill_window_days: u64,
     pub(super) backfill_file_limit: u64,
     pub(super) discovered_file_count: u64,
@@ -200,6 +208,18 @@ impl SyncCounts {
             || self.dropped_usage_record_count > 0
     }
 
+    /// This walk's own loss. Standing terminal holds are disclosed again by
+    /// every receipt, idle ones included, so they do not count.
+    pub(super) fn has_walk_loss(&self, index: &ScanIndex) -> bool {
+        let standing = self.snapshot_unproven_terminal_count
+            + index.claude_usage_authority_terminal_entity_count() as u64;
+        self.ownership_incomplete_file_count
+            .saturating_sub(standing)
+            > 0
+            || self.zero_snapshot_usage_evidence_count > 0
+            || self.dropped_usage_record_count > 0
+    }
+
     pub(super) fn disclosed_loss(&self) -> DisclosedLoss {
         // A partial census is itself unsettled evidence even when it has not
         // yet populated one of the public loss counters. In particular,
@@ -207,6 +227,9 @@ impl SyncCounts {
         // `census_complete` and raise the scan-cap latch without inventing a
         // per-file loss. Letting the zero-loss fast path win here would emit a
         // clean success that the backend classifies as terminal.
+        if self.walk_idle {
+            return DisclosedLoss::None;
+        }
         if !self.census_complete {
             return DisclosedLoss::Unsettled;
         }
@@ -247,6 +270,7 @@ impl SyncCounts {
             // semantic activity window.
             backfill_window_days: receipt_window_days,
             census_status: scan_result.census_status,
+            walk_idle: scan_result.walk_idle,
             backfill_file_limit: scan_result.backfill_file_limit as u64,
             discovered_file_count: scan_result.discovered_file_count as u64,
             skipped_file_count_due_to_limit: scan_result.skipped_file_count_due_to_limit as u64,
@@ -338,6 +362,9 @@ impl SyncCounts {
                 }
             }
         }
+        if self.walk_idle {
+            line.push_str(" walk_idle=true");
+        }
         line
     }
 
@@ -345,7 +372,7 @@ impl SyncCounts {
         self.cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
-        // Mirror #389's disclosed-loss convention: terminal unproven entities
+        // Follow the existing disclosed-loss convention: terminal unproven entities
         // also contribute to the established incomplete-evidence health scalar.
         self.ownership_incomplete_file_count = self
             .ownership_incomplete_file_count
@@ -708,8 +735,9 @@ pub(super) fn collector_status_request(
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let disclosed_loss = status.counts.disclosed_loss();
-    let census_status_active =
-        matches!(&status.state, CollectorState::Success) && !status.counts.census_complete;
+    let census_status_active = matches!(&status.state, CollectorState::Success)
+        && !status.counts.census_complete
+        && !status.counts.walk_idle;
     let (
         enabled,
         disabled_reason,

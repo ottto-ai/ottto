@@ -716,7 +716,7 @@ impl SessionStartState {
             || self.calls.values().any(|call| !call.files.is_empty())
     }
 
-    /// The opening-settings session fact (D168-1): that content, beside the
+    /// The opening-settings session fact: that content, beside the
     /// record body that keeps its keys (blob and call ids, in key order).
     pub(in crate::snapshots) fn put_opening_fact(
         &self,
@@ -749,7 +749,7 @@ impl SessionStartState {
         self.codex_prelude.is_some()
     }
 
-    /// The Codex prelude session fact (D168-1): the held parser, in full.
+    /// The Codex prelude session fact: the held parser, in full.
     pub(in crate::snapshots) fn put_codex_prelude_fact(
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
@@ -2402,6 +2402,7 @@ mod tests {
                 json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c2", "output": "0123456789"}}),
                 codex_token_count((2100, 1800, 80), (1100, 1000, 30)),
                 codex_token_count((3300, 2900, 100), (1200, 1100, 20)),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
             ],
         );
         let items =

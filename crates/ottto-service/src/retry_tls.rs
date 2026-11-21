@@ -829,7 +829,6 @@ mod tests {
         Production,
         TestModule,
         // A file compiled only inside a test module through `include!`.
-        IncludedTestFile,
     }
     /// One permitted line holding a guarded token: exact file, exact trimmed
     /// line, scope and occurrence count. `{u}` stands for `ureq::` and `{x}`
@@ -908,13 +907,6 @@ mod tests {
             scope: Scope::TestModule,
             count: 2,
             chain: Some(".tls_connector(connector(Instant::now() + Duration::from_"),
-        },
-        Allowed {
-            file: "src/retry_allocation_native_tests.rs",
-            line: ".with_root_{x}certificates(roots)",
-            scope: Scope::IncludedTestFile,
-            count: 1,
-            chain: None,
         },
     ];
     // Constructors and shortcuts that would install ureq's own TLS default.
@@ -1028,7 +1020,6 @@ mod tests {
                         && match allowed.scope {
                             Scope::Production => !in_tests,
                             Scope::TestModule => in_tests,
-                            Scope::IncludedTestFile => true,
                         }
                         && match allowed.chain {
                             None => true,
@@ -1054,7 +1045,7 @@ mod tests {
             );
         }
         let read = |file: &str| std::fs::read_to_string(root.join(file)).unwrap();
-        // The bounded snapshot agent's `connector` is the deadline connector.
+        // The bounded health agent's `connector` is the deadline connector.
         let snapshot = read("src/snapshot_client.rs");
         assert_eq!(snapshot.matches("let connector =").count(), 1);
         assert_eq!(
@@ -1063,22 +1054,6 @@ mod tests {
                 .count(),
             1
         );
-        // The included fixture file compiles only inside a test module.
-        let sync = read("src/snapshot_sync.rs");
-        if let Some(include) = sync.find("include!(\"retry_live_native_tests.rs\");") {
-            assert!(sync
-                .find("\n#[cfg(test)]\nmod tests {")
-                .is_some_and(|tests| tests < include));
-        } else {
-            assert!(
-                sync.contains("\n#[cfg(test)]\nmod tests;")
-                    || sync.contains("\n#[cfg(test)]\n#[rustfmt::skip]\nmod tests;")
-            );
-            let tests = read("src/snapshot_sync/tests.rs");
-            assert!(tests.contains("include!(\"../retry_live_native_tests.rs\");"));
-        }
-        assert!(read("src/retry_live_native_tests.rs")
-            .contains("include!(\"retry_allocation_native_tests.rs\");"));
     }
 
     type LockedPackage = (String, String, Vec<String>);

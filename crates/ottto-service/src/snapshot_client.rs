@@ -752,12 +752,16 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ActivityHintResponse {
     pub source: String,
+    #[serde(skip_serializing)]
     pub server_time: String,
+    #[serde(skip_serializing)]
     pub last_data_at: Option<String>,
+    #[serde(skip_serializing)]
     pub record_count_15m: u64,
+    #[serde(skip_serializing)]
     pub record_count_24h: u64,
     pub local_usage_reconciliation_enabled: bool,
     pub backfill_window_days: u64,
@@ -768,7 +772,7 @@ pub struct ActivityHintResponse {
     /// `workspace_labels_enabled` exactly as sent; `None` when the response
     /// omitted it (the field above then defaults to on). Set only by
     /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub workspace_labels_explicit: Option<bool>,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
@@ -793,7 +797,7 @@ pub struct ActivityHintResponse {
     /// `session_titles_enabled` privacy choice; it is not a second consent.
     #[serde(default)]
     pub session_attribution_labels_enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
@@ -807,29 +811,14 @@ pub struct ActivityHintResponse {
     /// Provisional class-N copy disclosure contract. Missing/null/unknown OFF.
     #[serde(default)]
     pub copy_unproven_contract: Option<String>,
-    /// Option (ii) server capability: the accept path retains per-row proof
-    /// and admits `identity_retained` bucket rows. Missing/null/unknown keeps
-    /// the field off, so older servers never receive it.
-    #[serde(default)]
-    pub session_request_identity_retained_contract: Option<String>,
-    /// Server capability for `request_evidence.account_source` (carried
-    /// accounts as placement, never proof). Missing/null/unknown keeps it off,
-    /// so older servers never receive the field.
-    #[serde(default)]
-    pub session_request_account_source_contract: Option<String>,
-    /// Server capability for the `session_billing_route` annotation.
-    /// Missing/null/unknown keeps it off, so older servers never receive it.
-    /// Producer off, the key is skipped like any unknown one (no copy).
-    #[serde(default, deserialize_with = "deserialize_route_contract")]
-    pub session_billing_route_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub max_snapshot_item_bytes: Option<u64>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_sessions_contract: Option<String>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_pairing_floor: Option<String>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_pairing_ceiling: Option<String>,
     /// Additive head-CAS capability; absent stays disabled.
     #[serde(default)]
@@ -858,23 +847,13 @@ pub struct ActivityHintResponse {
     /// server resolves it. An older server omits it, which means off. This
     /// and the next one are set only by `decode_activity_hint`, tolerantly:
     /// a missing or malformed value is off and never fails the hint.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub codex_cloud_tasks_enabled: bool,
     /// Codex only: the task-list contract the server accepts.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub codex_cloud_tasks_contract: Option<String>,
+    #[serde(skip_serializing)]
     pub recommended_scan_after: String,
-}
-
-/// `session_billing_route_contract`: producer off, skipped unread.
-pub(crate) fn deserialize_route_contract<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error> {
-    if !crate::snapshots::billing_route::PRODUCER_ENABLED {
-        serde::de::IgnoredAny::deserialize(deserializer)?;
-        return Ok(None);
-    }
-    Option::<String>::deserialize(deserializer)
 }
 
 /// Decodes an activity hint and records whether `workspace_labels_enabled`
@@ -960,11 +939,6 @@ pub struct SnapshotEntityRef {
     /// body-scoped state may be recorded as stored. Read, never persisted.
     #[serde(default)]
     pub unchanged_basis: Option<String>,
-    /// Option (ii), stored-body refs only: bucket starts whose
-    /// `identity_retained` rows had no server-retained proof. Optional and
-    /// default-empty; older servers never send it. Read, never persisted.
-    #[serde(default)]
-    pub retained_proof_missing: Vec<String>,
     /// `cache_state_ack:v1`, stored-body refs only: the server-completed
     /// cache state behind this ref's witness. Adopted only after it
     /// reproduces that witness with this body's own parts. Older servers
@@ -1427,7 +1401,6 @@ impl SnapshotBatchResponse {
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             };
             validate_snapshot_entity_ref(&reference)?;
@@ -2198,8 +2171,6 @@ type NicknameGenerations = std::sync::Arc<
 pub struct SnapshotApiClient {
     nickname_generations: NicknameGenerations,
     api_base_url: String,
-    #[cfg(test)]
-    bounded_retry_loopback_http_for_test: bool,
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
     receipt_state_dir: Option<PathBuf>,
@@ -2217,10 +2188,6 @@ impl SnapshotApiClient {
         crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
-    pub(crate) fn api_base_seal(&self) -> [u8; 32] {
-        use sha2::Digest;
-        sha2::Sha256::digest(self.api_base_url.as_bytes()).into()
-    }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -2235,44 +2202,12 @@ impl SnapshotApiClient {
         Self {
             nickname_generations: Default::default(),
             api_base_url: api_base_url.into(),
-            #[cfg(test)]
-            bounded_retry_loopback_http_for_test: false,
             agent,
             batch_agent,
             receipt_state_dir: None,
             receipt_destination_namespace: None,
             receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
         }
-    }
-
-    fn require_bounded_snapshot_https(&self) -> Result<()> {
-        if self
-            .api_base_url
-            .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        {
-            return Ok(());
-        }
-        #[cfg(test)]
-        if self.bounded_retry_loopback_http_for_test {
-            return Ok(());
-        }
-        // Pinned ureq bounds plain HTTP response reads, but successive body
-        // writes can each use a fresh socket timeout. Only HTTPS passes through
-        // our absolute DeadlineIo wrapper, so optional production retries must
-        // decline plaintext before acquiring a token or consuming a batch POST.
-        Err(anyhow!("optional snapshot retry requires HTTPS"))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_bounded_retry_loopback_http_for_test(mut self) -> Self {
-        assert!(self
-            .api_base_url
-            .strip_prefix("http://")
-            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-            .is_some_and(|address| address.ip().is_loopback()));
-        self.bounded_retry_loopback_http_for_test = true;
-        self
     }
 
     /// Enable privacy-safe local receipts for snapshot batch attempts.
@@ -2457,59 +2392,6 @@ impl SnapshotApiClient {
         Ok(response.token)
     }
 
-    pub(crate) fn issue_relay_token_bounded(
-        &self,
-        device: &LocalDeviceBinding,
-        device_secret: &str,
-        source: SnapshotSource,
-        budget: &crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<String> {
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        if budget.posts_left() == 0 {
-            return Err(anyhow!(
-                "optional snapshot retry POST allowance exhausted before token"
-            ));
-        }
-        let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let token = self.issue_relay_token_with_agent(
-            &agent,
-            device,
-            device_secret,
-            source,
-            timeout,
-            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
-        )?;
-        budget.remaining(Instant::now())?;
-        validate()?;
-        Ok(token)
-    }
-
-    pub(crate) fn get_activity_hint_bounded(
-        &self,
-        relay_token: &str,
-        budget: &crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<ActivityHintResponse> {
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let response = relay_sent(
-            relay_token,
-            self.activity_hint_request(&agent, relay_token)
-                .timeout(timeout)
-                .call(),
-        )
-        .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?;
-        // A policy response never needs a body-sized allowance or raw key
-        // retention. Decode only after this cap and drop the fresh hint in-turn.
-        let hint = bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
-        budget.remaining(Instant::now())?;
-        validate()?;
-        Ok(hint)
-    }
-
     /// The one activity-hint GET every caller sends.
     fn activity_hint_request(&self, agent: &ureq::Agent, relay_token: &str) -> ureq::Request {
         agent
@@ -2554,64 +2436,16 @@ impl SnapshotApiClient {
         enforce_head_cas: bool,
         item_cap: usize,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, item_cap, None)
-    }
-
-    /// Optional retry transport: fresh authority at every physical POST, one
-    /// shared deadline/counter across identity fallback and caller auth replay.
-    pub(crate) fn upload_batch_bounded(
-        &self,
-        relay_token: &str,
-        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
-        enforce_head_cas: bool,
-        budget: &mut crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<SnapshotBatchResponse> {
-        budget.remaining(Instant::now())?;
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        self.upload_batch_inner(
-            relay_token,
-            request,
-            enforce_head_cas,
-            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
-            Some((budget, validate)),
-        )
-    }
-
-    fn upload_batch_inner(
-        &self,
-        relay_token: &str,
-        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
-        enforce_head_cas: bool,
-        item_cap: usize,
-        mut retry: Option<(
-            &mut crate::snapshot_retry::RetryBudget,
-            &mut dyn FnMut() -> Result<()>,
-        )>,
-    ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
-        let body = if retry.is_some() && enforce_head_cas {
-            crate::snapshot_retry::encode_json(
-                &request.wire_with_head_cas(),
-                crate::snapshot_retry::REQUEST_BYTES,
-            )
-        } else if retry.is_some() {
-            crate::snapshot_retry::encode_json(request, crate::snapshot_retry::REQUEST_BYTES)
-        } else if enforce_head_cas {
+        let body = if enforce_head_cas {
             serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
         } else {
             serde_json::to_vec(request).map_err(anyhow::Error::from)
         }
         .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
         resources.serialized(body.len());
-        let default_gzip = snapshot_upload_gzip_enabled();
-        let gzip_enabled = retry
-            .as_ref()
-            .map(|(budget, _)| budget.gzip_enabled(default_gzip))
-            .unwrap_or(default_gzip);
-        let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
+        let compressed = gzip_snapshot_batch(&body, snapshot_upload_gzip_enabled(), item_cap);
         // Counts only for the server's logs: why each item is sent.
         let version = crate::snapshots::collector_version();
         let reasons = crate::local_resource_diagnostics::change_reason::request_header(
@@ -2620,42 +2454,31 @@ impl SnapshotApiClient {
                 .items()
                 .map(|item| item.snapshot_fingerprint.as_str()),
         );
-        let mut request_builder = || -> Result<ureq::Request> {
-            let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
-                validate()?;
-                budget.batch_post(Instant::now())?;
-                let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-                (agent, Some(timeout))
-            } else {
-                (self.batch_agent.clone(), None)
-            };
-            let request = agent
+        let request_builder = || {
+            let request = self
+                .batch_agent
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
                 .set("Accept", "application/json")
                 .set("Content-Type", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
                 .set("X-Ottto-Daemon-Version", &version);
-            let request = if reasons.is_empty() {
+            if reasons.is_empty() {
                 request
             } else {
                 request.set("X-Ottto-Upload-Reason", &reasons)
-            };
-            Ok(match timeout {
-                Some(timeout) => request.timeout(timeout),
-                None => request,
-            })
+            }
         };
         // Sent inline rather than through a closure: a closure returning
         // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
         // the duplication here is two lines.
         let mut outcome = match compressed.as_ref() {
             Some(encoded) => {
-                let post = request_builder()?.set("Content-Encoding", "gzip");
+                let post = request_builder().set("Content-Encoding", "gzip");
                 resources.attempt(encoded.len(), true);
                 relay_sent(relay_token, post.send_bytes(encoded))
             }
             None => {
-                let post = request_builder()?;
+                let post = request_builder();
                 resources.attempt(body.len(), false);
                 relay_sent(relay_token, post.send_bytes(&body))
             }
@@ -2667,27 +2490,15 @@ impl SnapshotApiClient {
         let refused_gzip = compressed.is_some() && encoding_was_refused(&outcome);
         if refused_gzip {
             disable_snapshot_upload_gzip();
-            let post = request_builder()?;
+            let post = request_builder();
             resources.attempt(body.len(), false);
             outcome = relay_sent(relay_token, post.send_bytes(&body));
-        }
-        if refused_gzip {
-            if let Some((budget, _)) = retry.as_mut() {
-                budget.gzip_refused();
-            }
         }
         match outcome {
             Ok(response) => {
                 let status = response.status();
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let decoded = if retry.is_some() {
-                    bounded_response_json(response, crate::snapshot_retry::RESPONSE_BYTES)
-                } else {
-                    response
-                        .into_json::<SnapshotBatchResponse>()
-                        .map_err(anyhow::Error::from)
-                };
-                match decoded {
+                match response.into_json::<SnapshotBatchResponse>() {
                     Ok(response) => {
                         self.record_batch_success(
                             request,
@@ -3459,8 +3270,8 @@ fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -
         // to bound stale-socket reuse short of rebuilding the agent: every
         // request opens a fresh connect and can never reuse a socket bound to a
         // dead local IP. Intentional tradeoff: this forfeits the shared pool's
-        // warm-socket survival that #234 relied on, but DNS-incident coverage is
-        // retained independently by the FallbackDnsResolver below, and the cost
+        // ability to keep a warm socket through DNS outages. The FallbackDnsResolver
+        // below still handles DNS outages. The cost
         // is one extra TCP+TLS handshake per request at the 5-min/60-s upload
         // cadence (bounded by the 5-s connect timeout) — negligible. Do NOT
         // apply this to the OTLP UPSTREAM_HTTP_AGENT, whose warm pool is
@@ -3951,28 +3762,17 @@ mod tests {
         );
     }
 
+    /// The daemon no longer reads the retained-identity capability; a server
+    /// that still sends it decodes as before.
     #[test]
-    fn identity_retained_capability_defaults_off_and_requires_exact_contract() {
+    fn removed_identity_retained_capability_still_decodes() {
         for extra in [
             "",
             r#", "session_request_identity_retained_contract":null"#,
-            r#", "session_request_identity_retained_contract":"session_request_identity_retained:v2""#,
-        ] {
-            let hint: ActivityHintResponse =
-                serde_json::from_str(&activity_hint_json(extra)).unwrap();
-            assert_ne!(
-                hint.session_request_identity_retained_contract.as_deref(),
-                Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
-            );
-        }
-        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
             r#", "session_request_identity_retained_contract":"session_request_identity_retained:v1""#,
-        ))
-        .unwrap();
-        assert_eq!(
-            hint.session_request_identity_retained_contract.as_deref(),
-            Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT)
-        );
+        ] {
+            serde_json::from_str::<ActivityHintResponse>(&activity_hint_json(extra)).unwrap();
+        }
     }
 
     #[test]
@@ -4952,7 +4752,6 @@ mod tests {
             head_etag: None,
             head_challenge: None,
             unchanged_basis: None,
-            retained_proof_missing: Vec::new(),
             cache_observations_state: None,
         }
     }
@@ -5275,7 +5074,6 @@ mod tests {
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             }],
         );
@@ -5747,15 +5545,13 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, session_billing_route_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
             nickname_generations,
             api_base_url,
-            #[cfg(test)]
-                bounded_retry_loopback_http_for_test: _,
             agent: _,
             batch_agent: _,
             receipt_state_dir,

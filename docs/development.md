@@ -19,6 +19,11 @@ working in this repository also follow the execution rules in
 - `jq` for schema and registry checks, `python3` for repository scripts, and
   `shellcheck` 0.11.0 if you change shell scripts.
 
+Full macOS packaging (`scripts/macos_package.sh`: the app, DMG and release
+archives) needs the Mac app's source, which isn't in this repository, so it is
+maintainer-only. Developer ID-signed release artifacts also need signing
+credentials. Contributors build and test the runtime crates with Cargo.
+
 ## Two Workspaces
 
 - The root `Cargo.toml` workspace holds the runtime: `ottto-cli`,

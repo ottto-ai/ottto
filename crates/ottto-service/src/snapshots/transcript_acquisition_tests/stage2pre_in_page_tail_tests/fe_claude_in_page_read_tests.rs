@@ -9,17 +9,17 @@
 //! their doc comment (the "acquisition exceeds stable source" failure,
 //! recorded as `OpenRead`, or `ScopeObject` at revalidation). Tests marked
 //! GREEN assert main's behavior, which FE must keep, and pass on main.
-//! Uses the EOF fixture seam from #670; production FE lives in snapshots.rs.
+//! Uses the EOF fixture seam; production FE lives in snapshots.rs.
 //!
-//! Conditions pinned here (d680b524):
+//! Conditions for an in-page read:
 //! - publish only when `s` is at least the last committed size;
 //! - a prefix never backs proof, v1, a family witness, or a verified
 //!   request-census record;
 //! - FE2: the sample-preserving-rewrite residual is accepted (SP-5 residual).
 //!
-//! Not added: #660 side reads (SP-11; #660 is not on main). Stage2-pre's
-//! former `sp11_claude_in_page_tail_with_append_keeps_main_failure` now
-//! asserts the FE prefix publication.
+//! This suite leaves out the Codex parent side-record reads. The
+//! former `sp11_claude_in_page_tail_with_append_keeps_main_failure`
+//! case now asserts the FE prefix publication.
 use super::*;
 use crate::claude_local_otel::{ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport};
 use crate::snapshots::claude_request_census::claude_request_hash;

@@ -667,7 +667,7 @@ fn query_plans_use_the_rowid_and_named_indexes() {
 }
 
 /// The receipt schema released builds (up to 0.1.244) create, verbatim from
-/// history.rs at b10c4e9d2 (lines 26-42).
+/// the released history.rs (lines 26-42).
 const OLD_SCHEMA: &str = "
 CREATE TABLE upload_history(
  seq INTEGER PRIMARY KEY,
@@ -685,12 +685,12 @@ CREATE TABLE ring_imported(
  value_digest BLOB PRIMARY KEY CHECK(length(value_digest)=16)
 ) STRICT, WITHOUT ROWID;
 PRAGMA user_version=1;";
-/// Released builds' append statements, verbatim from history.rs at b10c4e9d2
+/// Released builds' append statements, verbatim from the historical history.rs
 /// (lines 43 and 46).
 const OLD_INSERT: &str = "INSERT INTO upload_history(uploaded_at_ns,source,entity_count,value_version,value_digest,row_checksum,value) VALUES(?1,?2,?3,?4,?5,?6,?7)";
 const OLD_EXPIRE: &str = "DELETE FROM upload_history INDEXED BY upload_history_at WHERE uploaded_at_ns < ?1 AND seq < (SELECT MAX(h.seq) FROM upload_history AS h INDEXED BY upload_history_src WHERE h.source = upload_history.source)";
 
-/// Released builds' open predicate, copied from history.rs at b10c4e9d2
+/// Released builds' open predicate, copied from the historical history.rs
 /// (lines 192-200): `match version { 0 => create, USER_VERSION (1) => {},
 /// _ => bail!("upload_history_schema_refused") }`. It never checks tables.
 fn old_build_accepts(version: i64) -> bool {

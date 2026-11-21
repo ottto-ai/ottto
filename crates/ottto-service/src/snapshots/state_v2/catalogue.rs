@@ -70,9 +70,9 @@ macro_rules! scan_index_fields {
             accepted_rebuild_incidence => Misc (misc check_field Map) ["accepted.rebuild_incidence" => 1] side,
             accepted_rebuild_pending_since_unix_seconds => Misc (misc check_field Field) ["v1_field.accepted_rebuild_pending_since_unix_seconds" => 1] side,
             accepted_rebuild_last_alarm_unix_seconds => Misc (misc check_field Field) ["v1_field.accepted_rebuild_last_alarm_unix_seconds" => 1] side,
-            codex_counting_tombstones => Misc (misc check_field Map) ["v1_field.codex_counting_tombstones" => 1] side,
-            codex_counting_evicted_legacy => Misc (misc check_field Field) ["v1_field.codex_counting_evicted_legacy" => 1] side,
             upload_ack_retirement_handoff => Misc (misc check_field Field) ["accepted.ack_handoff" => 1] side,
+            retired_codex_counting_tombstones => Misc (retired none) ["v1_field.codex_counting_tombstones" => 1] side,
+            retired_codex_counting_evicted_legacy => Misc (retired none) ["v1_field.codex_counting_evicted_legacy" => 1] side,
             retired_held_audit_progress => Misc (retired none) ["scan_state.held_audit_progress" => 1] side,
             claude_money_birth_store => Misc (misc check_field Field) ["v1_field.birth_store" => 1] side,
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
@@ -80,7 +80,7 @@ macro_rules! scan_index_fields {
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             // Its stamps are one row per entity, as accepted.entity (layout 6).
             upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6, "proof.request_contribution" => 8] side,
-            // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
+            // Accepted for retirement by the next committed graph save.
             retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
             retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,
@@ -113,9 +113,7 @@ macro_rules! scan_index_fields {
             persistence_root => Misc (runtime none) [] side,
             persistence_unavailable => Misc (runtime none) [] side,
             persistence_controls => Misc (runtime none) [] side,
-            persistence_legacy_recovery => Misc (runtime none) [] side,
             withheld_memo => Accounts (runtime none) [] side,
-            codex_counting_moved_evidence => Misc (runtime none) [] side,
             active_quarantine_witness => Misc (runtime none) [] side,
             active_upload_context_fingerprint => Files (runtime none) [] side,
             context_read_counts => Files (runtime none) [] side,
@@ -143,7 +141,6 @@ macro_rules! scan_index_fields {
             retired_codex_state_only_blocked_unattributed => Misc (retired none) ["v1_field.codex_state_only_blocked_unattributed" => 1] side,
             retired_codex_state_only_blocked_legacy => Misc (retired none) ["v1_field.codex_state_only_blocked_legacy" => 1] side,
             retired_codex_state_only_blocked_attributed => Misc (retired none) ["v1_field.codex_state_only_blocked_attributed" => 1] side,
-            codex_counting_evictions => Misc (runtime none) [] side,
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
             first_read_pending => Misc (runtime none) [] side,

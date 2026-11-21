@@ -20,12 +20,22 @@ pub(crate) fn configure(support: &Path, active: bool) -> Result<()> {
     }
     Ok(())
 }
+/// Rest-heap diagnostics: support dirs tracked and roots awaiting a save.
+pub(crate) fn rest_entries() -> Option<(usize, usize)> {
+    let all = notices().try_lock().ok()?;
+    Some((all.len(), all.values().map(|state| state.roots.len()).sum()))
+}
 pub(super) fn appended(support: &Path, root: &str) {
     if let Ok(mut all) = notices().lock() {
         if let Some(state) = all.get_mut(support).filter(|state| state.active) {
             state.roots.insert(root.to_owned());
         }
     }
+}
+/// One appended row's notice, as the relay records it.
+#[cfg(test)]
+pub(crate) fn appended_for_test(support: &Path, root: &str) {
+    appended(support, root);
 }
 pub(crate) fn pending(support: &Path) -> Result<BTreeSet<String>> {
     Ok(notices()

@@ -1108,6 +1108,14 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
             items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
             expected.insert("request_owned_held", 1);
         }
+        // The other path's later clock would move the carrier's last.
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.source_last_activity_at.clone())
+                .collect::<Vec<_>>(),
+            [Some(at(1)), Some(at(2))]
+        );
         let before = canonical(&items);
         let mut reasons = BTreeMap::new();
         let withheld = finish_page(
@@ -1149,6 +1157,85 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
+    assert_eq!(
+        (
+            items[0].source_last_activity_at.as_deref(),
+            items[0].source_ended_at.as_deref()
+        ),
+        (Some(at(2).as_str()), None)
+    );
+    cleanup(&[&first, &copy]);
+}
+
+/// [money] [regress] One body summed from two path twins keeps the latest
+/// last clock of either file, whichever carries it, and the carrier's own
+/// start. The span moves no total, hour or row. A side call later than every
+/// file's last record still ends the body at its clock.
+#[test]
+fn e2_summed_twins_keep_the_latest_file_clock_and_a_later_side_call_ends_them() {
+    let first = root_file("span-a");
+    let copy = root_file("span-b");
+    let index = ScanIndex::default();
+    let tail = at(30);
+    let note = json!({"type":"user","sessionId":ROOT,"timestamp":tail,
+        "message":{"role":"user","content":"later"}});
+    let money = |item: &SnapshotItem| {
+        json!([
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cost,
+            item.model_usage,
+            item.usage_buckets
+        ])
+    };
+    for side in [false, true] {
+        let mut sums = Vec::new();
+        for (noted, reverse) in [(false, false), (true, false), (true, true)] {
+            let mut lines = vec![line("r", &at(1), 10)];
+            if noted {
+                lines.push(note.clone());
+            }
+            let mut items = vec![
+                parse(&first, Some(t0()), &index, &lines),
+                parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
+            ];
+            if reverse {
+                items.reverse();
+            }
+            let start = items[0].source_started_at.clone();
+            let read = side.then(|| sidecar(&[row("r", 1, 10), row("o", 2, 20), row("s", 40, 5)]));
+            let got = publish(items, read.as_ref(), TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            let item = &got[0];
+            assert_eq!(item.request_count, 2 + u64::from(side));
+            assert_eq!(
+                item.source_started_at, start,
+                "the carrier keeps its own start"
+            );
+            let last = if noted { tail.clone() } else { at(2) };
+            let expected = if side {
+                // The side call's clock (07:00:40) is after every file's.
+                let clock = Some("2026-08-02T07:00:40Z".to_owned());
+                (clock.clone(), clock)
+            } else {
+                (Some(last), None)
+            };
+            assert_eq!(
+                (
+                    item.source_last_activity_at.clone(),
+                    item.source_ended_at.clone()
+                ),
+                expected,
+                "noted={noted} reverse={reverse} side={side}"
+            );
+            sums.push(money(item));
+        }
+        assert!(
+            sums.windows(2).all(|pair| pair[0] == pair[1]),
+            "the clock span moves no money"
+        );
+    }
     cleanup(&[&first, &copy]);
 }
 
@@ -1708,12 +1795,12 @@ fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
 fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
-    tag_owned_with_fallbacks(items, index, 0)
+    tag_owned_with_held(items, index, 0)
 }
-fn tag_owned_with_fallbacks(
+fn tag_owned_with_held(
     mut items: Vec<SnapshotItem>,
     index: &ScanIndex,
-    expected_fallbacks: usize,
+    expected_held: usize,
 ) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
@@ -1730,6 +1817,8 @@ fn tag_owned_with_fallbacks(
         .collect();
     let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
+    // Production's side pass lends root starts before reconcile (`side_calls_page`).
+    claude_request_identity::inherit_root_accounts(&mut items, false);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let activity = claude_request_identity::stage_request_owned_activity(
         &items,
@@ -1749,9 +1838,10 @@ fn tag_owned_with_fallbacks(
     );
     let outcome = claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert!(expected_fallbacks <= items.len());
-    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
-    assert_eq!(outcome.fallback, expected_fallbacks);
+    assert!(expected_held <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_held);
+    assert_eq!(outcome.held.len(), expected_held);
+    assert_eq!(outcome.fallback, 0);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2566,9 +2656,11 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.0002")
         );
+        // b's own row names a conflicting account: invalid telemetry blocks b,
+        // so its own marker's org is not used and b's share stays untagged.
         assert_eq!(
             org_amounts(&item),
-            BTreeMap::from([(org_hash(ORG_A), (10, 1)), (org_hash(ORG_B), (20, 1)),])
+            BTreeMap::from([(org_hash(ORG_A), (10, 1))])
         );
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
@@ -2608,18 +2700,21 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
+        // Over the cap a request-owned item is held, never stripped to a fallback.
+        let item = tag_owned_with_held(items, &index, 1).remove(0);
         let requests = (first + second + 2) as u64;
         assert_eq!(
             (item.request_count, item.input_tokens),
             (requests, requests)
         );
-        // Overflowing proof cannot be replaced by the starting org.
-        // The old uniform-retry expectation would manufacture that identity.
-        assert!(item.request_evidence.is_empty());
-        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
-            && row.evidence_ref.is_none()
-            && row.account_identifier_hash.is_none()));
+        // Overflowing proof is never replaced by the starting org: the item
+        // is held under the account-limit reason and never uploads.
+        assert_eq!(
+            item.claude_account_withheld_reason,
+            Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+        );
+        // Grouping already folded the keys past the row limit and refused
+        // that bucket row; the hold keeps that count and strips nothing more.
         assert_eq!(
             item.request_identity_refusals, 1,
             "the bucket row lost proof"
@@ -2891,17 +2986,20 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                     markerless.source_started_at = Some(at(1));
                 }
                 assert!(crate::snapshots::exact_session_account_hash(&markerless).is_none());
-                let mut items = if reverse {
+                let items = if reverse {
                     vec![markerless, known]
                 } else {
                     vec![known, markerless]
                 };
-                claude_request_identity::inherit_root_accounts(&mut items, false);
-                assert!(items
+                // Probe both inherit passes on a copy: `tag_owned` runs them in
+                // production order (side pass, reconcile, settled finish).
+                let mut probe = items.clone();
+                claude_request_identity::inherit_root_accounts(&mut probe, false);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-                claude_request_identity::inherit_root_accounts(&mut items, true);
-                assert!(items
+                claude_request_identity::inherit_root_accounts(&mut probe, true);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 let item = tag_owned(items, &index).remove(0);
@@ -4435,6 +4533,40 @@ fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
         let want = reference_fingerprint_ok(trace, &trace.fingerprint, |r| r.fingerprint.clear());
         assert_eq!(claude_trace_evidence_fingerprint_is_valid(trace), want);
     }
+    // A trace row keeps its first outcome, which is never serialized, ignored
+    // by `==`, and cleared on Clone and on decode.
+    let fresh = complete_trace_row(ROOT, "req-a", "7");
+    let bytes = serde_json::to_vec(&fresh).unwrap();
+    let checked = fresh.clone();
+    assert!(claude_trace_evidence_fingerprint_is_valid(&checked));
+    assert!(claude_trace_evidence_fingerprint_is_valid(&checked));
+    assert!(checked
+        .fingerprint_check
+        .get_or_check(|| unreachable!("the valid outcome is kept")));
+    assert_eq!(serde_json::to_vec(&checked).unwrap(), bytes);
+    assert_eq!(checked, fresh);
+    let mut moved = checked.clone();
+    moved.agent_id = "8".into();
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&moved));
+    let mut tampered = fresh.clone();
+    tampered.request_id = "req-b".into();
+    let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+    let unchecked = tampered.clone();
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&tampered));
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&tampered));
+    assert!(!tampered
+        .fingerprint_check
+        .get_or_check(|| unreachable!("the invalid outcome is kept")));
+    assert_eq!(serde_json::to_vec(&tampered).unwrap(), tampered_bytes);
+    assert_eq!(tampered, unchecked);
+    let decoded: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
+        serde_json::from_slice(&serde_json::to_vec(&checked).unwrap()).unwrap();
+    let mut ran = false;
+    assert!(decoded.fingerprint_check.get_or_check(|| {
+        ran = true;
+        true
+    }));
+    assert!(ran, "a decoded row starts with an empty memo");
 }
 
 #[test]

@@ -405,12 +405,8 @@ impl SnapshotUploadProgress {
     }
 
     /// `stored` is the item's stored-body entity ACK (fingerprint-exact, no
-    /// `unchanged_basis`) and this body's local witness. Option (ii) admits
-    /// positive tags only while the server advertises retention and the ref
-    /// carries a versioned witness equal to the local one on a body with a
-    /// public witness version, so the entity-ACK validator also checked the
-    /// exact version. Count-only and legacy ACKs pass `None`.
-    /// `retained_proof_missing` only removes, so it is always applied.
+    /// `unchanged_basis`) and this body's local witness. Count-only and
+    /// legacy ACKs pass `None`.
     pub(super) fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
@@ -452,24 +448,6 @@ impl SnapshotUploadProgress {
             if let Some(digest) = &entity.body_witness_digest {
                 self.accepted_body_witnesses
                     .insert(entity.snapshot_fingerprint.clone(), digest.clone());
-            }
-        }
-        if let Some((entity, local_witness)) = stored {
-            // Mirrors `snapshot_ack_body_witness_version`'s public domains.
-            let versioned_body = ["session_account_evidence", "cache_observations"]
-                .iter()
-                .any(|field| value.get(field).is_some_and(|leaf| !leaf.is_null()));
-            let witnessed = self.accepted_identity_buckets.retained_enabled()
-                && versioned_body
-                && entity.body_witness_version.is_some()
-                && (entity.body_witness_digest.as_deref() == Some(local_witness)
-                    || echoed_cache_state.is_some());
-            if witnessed || !entity.retained_proof_missing.is_empty() {
-                self.accepted_identity_buckets.record_proved(
-                    &value,
-                    witnessed,
-                    &entity.retained_proof_missing,
-                );
             }
         }
         let key = cache_session_key(session);

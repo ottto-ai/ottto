@@ -242,7 +242,7 @@ jobs:
              | .quality_gates.stable_candidate_rc = {
                  status: "waived",
                  checked_at: $checked_at,
-                 reason: "Operator-approved M4 fast lane; M1 unavailable"
+                 reason: "Operator-approved manual release lane"
                }
              | .quality_gates.stable_clean_machine_qa = {
                  status: "waived",

@@ -100,18 +100,28 @@ pub(in crate::snapshots) fn stored_usage(
     index: &ScanIndex,
     key: &str,
 ) -> Option<(u64, u64)> {
-    with_codec!(source, S => stored_usage_of::<S>(index, key))
+    with_codec!(source, S => stored_usage_of::<S>(index, key)).map(|acc| {
+        let totals = acc.accepted_usage_totals;
+        (totals.request_count, totals.total_tokens())
+    })
 }
 
-fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, u64)> {
+fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<SnapshotAccumulator> {
     if !S::USAGE_BEFORE_FINISH {
         return None;
     }
     let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     S::decode_head(head.revision, &head.body, &mut acc).ok()?;
-    let totals = &acc.accepted_usage_totals;
-    Some((totals.request_count, totals.total_tokens()))
+    Some(acc)
+}
+
+pub(in crate::snapshots) fn stored_codex_legacy_totals(
+    index: &ScanIndex,
+    key: &str,
+) -> Option<UsageTotals> {
+    let acc = stored_usage_of::<codex::Codex>(index, key)?;
+    (!acc.codex_counting_v2()).then_some(acc.accepted_usage_totals)
 }
 
 /// `source`'s pending Tail write for one completion, through its codec.
@@ -354,7 +364,7 @@ impl HeadIdentity {
     /// field: another route is `Identity`, another capture mode
     /// `Incompatible`, another key `KeyEpoch`. `Ok(true)`: a key on one side
     /// only, so session attribution was toggled since. That is a settings
-    /// change, applied forward only (D168-2): the head is reused with its
+    /// change, applied forward only: the head is reused with its
     /// keyed fields scrubbed, as a retained parse's are, never re-read.
     pub(in crate::snapshots) fn check(&self, head: &[u8]) -> Result<bool, ReconstructCause> {
         let stored = Self::take(&mut Dec::new(head))?;
@@ -811,7 +821,7 @@ fn read_shared_page(
     }
 }
 
-/// The session facts (D168-1): content the head never carries, one element
+/// The session facts: content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. An unknown kind or version holds its file
 /// as future state. Workspace accepts path-only v1 and v2 with a Git or non-Git
@@ -1027,8 +1037,8 @@ macro_rules! head_fields {
 // and requests, usage buckets and totals), live fields (Desktop identity and
 // spawn lineage, account hash). The Pi ledger and Codex's `I` fields are
 // written only by those sources' parsers (Codex's by
-// `apply_codex_owned_line`), so a Claude parse leaves them empty (D62).
-// D203: retired entries retain only the original byte walk and shape descriptors.
+// `apply_codex_owned_line`), so a Claude parse leaves them empty.
+// Retired entries retain only the original byte walk and shape descriptors.
 head_fields! {
     {
         N source: SnapshotSource,
@@ -1286,3 +1296,6 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     edited.extend_from_slice(&body[body.len() - decoder.remaining()..]);
     edited
 }
+
+#[cfg(test)]
+pub(in crate::snapshots) mod historical_codex;

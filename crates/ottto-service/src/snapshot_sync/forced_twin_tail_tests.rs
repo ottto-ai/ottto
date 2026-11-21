@@ -514,6 +514,61 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
     });
 }
 
+/// [money] [regress] The twin's later record (no usage) is the body's last
+/// clock while the holder carries the session: identical on the Tail-read
+/// RAM arm, the cold Full arm and the disk restart, with no end set.
+#[test]
+fn forced_twin_last_clock_is_equal_on_tail_full_and_restart() {
+    if !supported("forced_twin_last_clock") {
+        return;
+    }
+    with_e2(|| {
+        const LATER: &str = "2026-08-02T07:09:00Z";
+        let f = Twin::new("forced-twin-last-clock", false);
+        diag::round(0);
+        let sealed =
+            continuation_for_test(SnapshotSource::ClaudeCode, &f.owner.cache, &f.prior, &f.key)
+                .unwrap()
+                .sealed_offset();
+        let note = json!({"type":"user","sessionId":ROOT,"timestamp":LATER,
+            "message":{"role":"user","content":"later"}})
+        .to_string()
+            + "\n";
+        append(&f.twin, &note);
+        input_clock(&f.twin);
+        f.force("holder-later");
+        let restart = f.restart();
+        let tail = f.page(&f.owner);
+        let native = forced_needs_native_for_test(&f.prior, &f.twin);
+        let (mode, start) = if native {
+            (ReadMode::Full(FullReason::StateMissing), 0)
+        } else {
+            (ReadMode::Tail, sealed)
+        };
+        f.assert_read(&f.owner, "RAM", mode, start);
+        let cold = E2ScanFixture::capturing_identity();
+        let pages = f.pages(&cold, &restart, tail);
+        let pages = f.compare(&cold, &restart, pages);
+        for page in &pages {
+            let item = body(page, ROOT).unwrap();
+            assert_eq!(
+                item.source_file_fingerprint.as_ref(),
+                Some(
+                    &page.index.files[f.holder.to_string_lossy().as_ref()].source_file_fingerprint
+                ),
+                "the holder carries"
+            );
+            assert_eq!(
+                (
+                    item.source_last_activity_at.as_deref(),
+                    item.source_ended_at.as_deref()
+                ),
+                (Some(LATER), None)
+            );
+        }
+    });
+}
+
 /// [money] Each newly reachable delay falls back to native on the same page:
 /// (a) cap pacing, (b) an unfunded completion, (c) a future-head hold.
 /// A restart without audit capacity holds the session until its holder joins.

@@ -224,7 +224,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) codex_join_groups: VecDeque<codex_file_join::Group>,
     pub(in crate::snapshots) codex_join_active: Option<Box<codex_file_join::GroupBoot>>,
     pub(in crate::snapshots) codex_join_completed: Vec<codex_file_join::Group>,
-    pub(in crate::snapshots) codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
     /// Decoded bytes this page consumed; the cursor job and ordinary Codex
     /// singleton reads have separate budgets.
     pub(in crate::snapshots) codex_page: sampled_scan::codex_cursor::PageBudget,
@@ -241,6 +240,8 @@ pub(crate) struct OwnedSourceScan {
     /// Launch evidence for the source fingerprint when no attribution context
     /// supplies it: a file's identity does not depend on the toggle.
     pub(in crate::snapshots) launch_events: Option<Arc<crate::launch_events::LaunchEventInventory>>,
+    /// The walk gate held this pass (`walk_idle`): the step lists nothing.
+    pub(in crate::snapshots) walk_idle: bool,
 }
 pub(in crate::snapshots) struct OwnedActiveFile {
     pub(in crate::snapshots) first_read: Option<crate::local_resource_diagnostics::FirstRead>,
@@ -278,14 +279,6 @@ pub(crate) enum OwnedSourceScanStep {
 }
 
 impl OwnedSourceScan {
-    #[cfg(test)]
-    pub(crate) fn test_active_physical_lines(&self) -> usize {
-        self.active_file
-            .as_ref()
-            .map(|file| file.parser.reader.report.physical_line_count)
-            .unwrap_or(0)
-    }
-
     #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(crate) fn new(
         source: SnapshotSource,
@@ -342,11 +335,13 @@ impl OwnedSourceScan {
             claude_request_identity_capture,
             &[],
             None,
+            false,
         )
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
+    /// `walk_idle_allowed`: the walk gate's verdict (`walk_idle`).
+    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -364,6 +359,7 @@ impl OwnedSourceScan {
             &sampled_scan::SharedCache,
             &crate::transcript_acquisition::Scope,
         )>,
+        walk_idle_allowed: bool,
     ) -> Self {
         Self::new_selecting(
             source,
@@ -379,6 +375,7 @@ impl OwnedSourceScan {
             claude_request_identity_capture,
             recovery_priority,
             carry_cache,
+            walk_idle_allowed,
         )
     }
 
@@ -450,13 +447,13 @@ impl OwnedSourceScan {
             codex_join_groups: Default::default(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
-            codex_legacy_join_baselines: Vec::new(),
             codex_page,
             selected_flags: Default::default(),
             continuation_ticket: None,
             line_delivery: None,
             launch_events: None,
             codex_versions: None,
+            walk_idle: false,
         }
     }
 
@@ -477,7 +474,7 @@ impl OwnedSourceScan {
         self
     }
 
-    #[expect(clippy::too_many_arguments, reason = "14 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "15 args; no options struct yet")]
     pub(in crate::snapshots) fn new_selecting(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -497,6 +494,7 @@ impl OwnedSourceScan {
             &sampled_scan::SharedCache,
             &crate::transcript_acquisition::Scope,
         )>,
+        walk_idle_allowed: bool,
     ) -> Self {
         let _jsonl_scope =
             crate::local_resource_diagnostics::jsonl::Scope::begin(source.api_slug());
@@ -587,11 +585,32 @@ impl OwnedSourceScan {
             SnapshotSource::ClaudeCode => !claude_title_metadata.sidecar_census_incomplete,
             SnapshotSource::Pi => true,
         };
-        if (claude_sidecar_was_incomplete && sidecar_census_complete)
+        let sidecar_restart = (claude_sidecar_was_incomplete && sidecar_census_complete)
             || (source == SnapshotSource::ClaudeCode
                 && claude_identity_census_was_complete
-                && claude_title_metadata.original_identity_census_incomplete)
+                && claude_title_metadata.original_identity_census_incomplete);
+        if walk_idle_allowed
+            && index.traversal.is_none()
+            && !sidecar_restart
+            && !claude_sidecar_was_incomplete
+            && state_census_complete
+            && sidecar_census_complete
+            && !claude_title_metadata.original_identity_census_incomplete
         {
+            let mut idle = Self::new_continuation(
+                &[],
+                owned_index,
+                collected_at,
+                requested_backfill_window_days,
+                file_limit,
+                None,
+                None,
+            );
+            idle.source = source;
+            idle.walk_idle = true;
+            return idle;
+        }
+        if sidecar_restart {
             // The prior transcript generation was intentionally held red while
             // title discovery was partial. Start a fresh bounded transcript walk
             // now so sidecar additions/removals are folded into each affected
@@ -1414,7 +1433,6 @@ impl OwnedSourceScan {
             codex_join_groups: VecDeque::new(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
-            codex_legacy_join_baselines: Vec::new(),
             codex_page: sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(
                 next_generation_hints,
             ),
@@ -1423,6 +1441,7 @@ impl OwnedSourceScan {
             line_delivery: None,
             launch_events: None,
             codex_versions: None,
+            walk_idle: false,
         }
     }
     pub(crate) fn with_launch_events(mut self, home: &Path) -> Self {
