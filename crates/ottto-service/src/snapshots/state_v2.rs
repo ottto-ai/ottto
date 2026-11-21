@@ -91,7 +91,7 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 pub(in crate::snapshots) use tail::{
     CarryContents, Change, Collection, CollectionMeta, Common, DebtSummary, FileJob,
     InventoryFacts, JobUpdate, NoUploadRequired, Observation, PathCarry, Representation, SetAside,
-    SetAsideCause, Shape, StagedFile, TailHead,
+    SetAsideCause, Shape, StagedFile, TailHead, UnreadableHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's
@@ -646,6 +646,25 @@ pub(super) fn growth_claim_refused(reason: &'static str) {
 pub(crate) fn seed_job_fixture_cutoff(index: &ScanIndex) {
     runtime::with_session_db(index, |db| {
         db.control("job_template_since", &1_u64).unwrap();
+    });
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &mapper::key("tail.head", key, 0).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &[0],
+        })
+        .unwrap();
+        let next = index.generation + 1;
+        assert_eq!(
+            tx.commit(index.generation, next),
+            DurableCommitOutcome::Committed(next)
+        );
     });
 }
 

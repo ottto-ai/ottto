@@ -943,11 +943,37 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         job_corrupt,
     })
 }
-fn read_head(tx: &mut dyn Transaction, file: &[u8]) -> Result<Option<Decoded>> {
+#[derive(Debug)]
+pub(in crate::snapshots) struct UnreadableHead;
+
+impl std::fmt::Display for UnreadableHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("state_v2_tail_head_unreadable")
+    }
+}
+
+fn read_head(tx: &mut dyn Transaction, file: &[u8], max_revision: u32) -> Result<Option<Decoded>> {
     let Some(header) = tx.get(&row(HEAD, file, 0)?)? else {
         return Ok(None);
     };
-    decode_head(&read_value(tx, file, HEAD_OWNER, 0, &header)?).map(Some)
+    read_value(tx, file, HEAD_OWNER, 0, &header)
+        .and_then(|bytes| {
+            let revision = u32::from_be_bytes(Reader(&bytes).take()?);
+            ensure!(revision <= max_revision, Hold::Future);
+            decode_head(&bytes)
+        })
+        .map(Some)
+        .map_err(|error| {
+            if error.is::<Hold>()
+                || error
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(|error| error.sqlite_error_code().is_some())
+            {
+                error
+            } else {
+                error.context(UnreadableHead)
+            }
+        })
 }
 
 /// The file's committed head and nothing else; no page is visited. A future
@@ -959,10 +985,9 @@ pub(super) fn load_head(
     revision: u32,
     generation: u64,
 ) -> Result<Option<TailHead>> {
-    let Some(head) = read_head(tx, file)? else {
+    let Some(head) = read_head(tx, file, revision)? else {
         return Ok(None);
     };
-    ensure!(head.revision <= revision, Hold::Future);
     Ok(Some(TailHead {
         revision: head.revision,
         table: head.table,
@@ -1081,8 +1106,8 @@ fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
     Ok(true)
 }
 const REVISION: &str = "tail.revision";
-/// The reduction and inventory rows. Its marker and detached job decision
-/// are removed by retirement or scope erasure, not checkpoint replacement.
+/// Delete the head and its reduction rows. The caller decides which common
+/// metadata to write back. The set-aside marker is managed separately.
 /// With `keep_debt`, revisions and their fragments also stay.
 fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result<()> {
     for name in catalogue::TAIL_KINDS
@@ -1139,7 +1164,7 @@ fn revision_rows(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<Header>> {
 pub(super) fn erasure_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(bool, Option<u64>)> {
     let kind = RecordKind::parse(REVISION)?;
     let owed = !tx.scan_record_key(&kind, file, None, 1)?.is_empty();
-    let oldest = read_head(tx, file)
+    let oldest = read_head(tx, file, u32::MAX)
         .ok()
         .flatten()
         .and_then(|head| head.common.debt.earliest_unacked_change_at);
@@ -1248,14 +1273,14 @@ fn write_file(
     debt: Option<&Observation>,
     job: Option<&JobUpdate>,
 ) -> Result<Applied> {
-    let reset = staged.is_some_and(|staged| staged.change == Change::Reset);
-    let (mut revision, mut table, mut common, mut reduction) = if reset {
+    let reset = staged.filter(|staged| staged.change == Change::Reset);
+    let (mut revision, mut table, mut common, mut reduction) = if let Some(reset) = reset {
         // Acquisition state only: committed debt stays and merges.
-        let (revision, table, common) = committed_debt(tx, file)?;
+        let (revision, table, common) = committed_debt(tx, file, Some(reset.revision))?;
         delete_rows(tx, file, true)?;
         (revision, table, common, None)
     } else {
-        match read_head(tx, file)? {
+        match read_head(tx, file, u32::MAX)? {
             Some(head) => (head.revision, head.table, head.common, head.reduction),
             None => Default::default(),
         }
@@ -1327,7 +1352,7 @@ fn write_file(
         revision = staged.revision;
         reduction = Some(staged.head.clone());
         common.representation = Representation::Tail;
-        if reset
+        if reset.is_some()
             && job.is_none()
             && common.job.as_ref().is_some_and(|saved| {
                 !super::super::tail_source::job_matches_checkpoint(saved, &staged.head)
@@ -1382,14 +1407,36 @@ fn write_file(
     applied.head_bytes = head.len() as u64;
     Ok(applied)
 }
-/// The file's debt alone, its membership rebuilt from revision row headers. An
-/// unreadable or future head is an error, never default state.
-fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, MembershipTable, Common)> {
-    let prior = read_head(tx, file)?;
+/// The file's debt alone, its membership rebuilt from revision row headers.
+/// A Full reset can recover from a damaged head using the surviving revisions.
+fn committed_debt(
+    tx: &mut dyn Transaction,
+    file: &[u8],
+    reset_revision: Option<u32>,
+) -> Result<(u32, MembershipTable, Common)> {
+    let (prior, damaged) = match read_head(tx, file, reset_revision.unwrap_or(u32::MAX)) {
+        Ok(prior) => (prior, false),
+        Err(error) if reset_revision.is_some() && error.is::<UnreadableHead>() => (None, true),
+        Err(error) => return Err(error),
+    };
     let (revision, mut common) =
         prior.map_or((0, Common::default()), |head| (head.revision, head.common));
     let mut table = MembershipTable::new();
-    for header in revision_rows(tx, file)? {
+    let rows = revision_rows(tx, file)?;
+    if damaged {
+        common.debt = super::super::upload::freshness_debt::summarize_stored_revisions(
+            rows.iter().map(|header| {
+                read_value(
+                    tx,
+                    file,
+                    Collection::Revisions.owner(),
+                    position(header)?,
+                    header,
+                )
+            }),
+        )?;
+    }
+    for header in rows {
         let id = position(&header)?;
         let entry = debt_member(&mut table);
         toggle(&mut entry.commit, &term(REVISION, id, &header.digest));
@@ -1403,7 +1450,7 @@ fn committed_debt(tx: &mut dyn Transaction, file: &[u8]) -> Result<(u32, Members
 /// stay under one metadata-only head. `true`: debt kept, and the set-aside
 /// marker with it, since this is no replacement.
 fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
-    let (revision, table, mut common) = committed_debt(tx, file)?;
+    let (revision, table, mut common) = committed_debt(tx, file, None)?;
     let keep = !table.is_empty();
     common.job = None;
     delete_rows(tx, file, keep)?;
@@ -1484,7 +1531,7 @@ fn move_row(tx: &mut dyn Transaction, old: &Header, new: RowKey) -> Result<()> {
 }
 pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<()> {
     let from = carry.from.as_bytes();
-    let mut head = read_head(tx, from)?.context("state_v2_tail_carry_missing")?;
+    let mut head = read_head(tx, from, u32::MAX)?.context("state_v2_tail_carry_missing")?;
     let (rebound, inventory, job) = match &carry.contents {
         CarryContents::File {
             head,
@@ -1497,7 +1544,7 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
             ensure!(
                 head.reduction.is_none()
                     && head.common.job.is_some()
-                    && read_head(tx, to)?.is_none_or(|head| head.common.job.is_none()),
+                    && read_head(tx, to, u32::MAX)?.is_none_or(|head| head.common.job.is_none()),
                 "state_v2_tail_carry_conflict"
             );
             write_file(tx, to, None, None, Some(&JobUpdate::Set(job.clone())))?;

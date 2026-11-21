@@ -234,10 +234,14 @@ impl ScanIndex {
                 continue;
             };
             let job = tail_source::job_for_carry(&head, &metadata, compression);
-            // A metadata-only head can prove job custody by file identity.
-            // It cannot confer the separate authority to rekey graph progress.
+            // A settled metadata-only head can prove job custody by file
+            // identity. Outstanding revisions keep the existing owner hold.
             let contents = match job {
-                Some(job) if head.metadata_only && !compression => {
+                Some(job)
+                    if head.metadata_only
+                        && !compression
+                        && !head.table.contains_key(&state_v2::Collection::Revisions) =>
+                {
                     state_v2::CarryContents::Job(job)
                 }
                 job if !head.metadata_only

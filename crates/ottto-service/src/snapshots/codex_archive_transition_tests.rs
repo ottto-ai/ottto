@@ -1302,29 +1302,35 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
     }
 }
 
-/// A first decision made in an archive has file custody without a reduction.
-#[test]
-fn same_object_archive_rename_carries_terminal_job_without_progress() {
-    use crate::session_attribution::job_template::{context, JobState};
-    use std::os::unix::fs::MetadataExt;
+const ARCHIVE_JOB_TASK: &str = "Inspect the service and explain every failure with clear evidence";
 
-    const TASK: &str = "Inspect the service and explain every failure with clear evidence";
+fn archive_with_terminal_job() -> (Corpus, StateV2ColdSession, ScanIndex, PathBuf) {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let c = Corpus::new();
     let (session, prior) = c.publish();
     let original = c.path(MAIN).with_extension("jsonl.zst");
-    let prompt = json!({"type": "event_msg", "payload": {"type": "user_message", "message": TASK}});
+    let prompt = json!({"type": "event_msg", "payload": {"type": "user_message", "message": ARCHIVE_JOB_TASK}});
     let bytes = header(MAIN, Some("a")) + &format!("{prompt}\n") + &turn(1);
     fs::write(
         &original,
         zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
     )
     .unwrap();
-    let (mut index, _, first) =
+    let (index, _, first) =
         observed_pass(&c, &original, prior, "archive-job-context", &Arc::default());
     assert_eq!(first.posts, 1);
+    (c, session, index, original)
+}
+
+/// A first decision made in an archive has file custody without a reduction.
+#[test]
+fn same_object_archive_rename_carries_terminal_job_without_progress() {
+    use crate::session_attribution::job_template::{context, JobState};
+    use std::os::unix::fs::MetadataExt;
+
+    let (c, session, mut index, original) = archive_with_terminal_job();
     let from = local_index_key(&original);
     let progress = serde_json::to_value(&index.files[&from]).unwrap();
     let head = state_v2::load_head(&index, &from, REVISION)
@@ -1369,9 +1375,67 @@ fn same_object_archive_rename_carries_terminal_job_without_progress() {
 
     let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
     tail_source::seed_full_job_template(&index, &candidate, &[], &mut acc).unwrap();
-    acc.observe_job(TASK);
+    acc.observe_job(ARCHIVE_JOB_TASK);
     acc.finish_job_template(Some(&context(7)));
     assert_eq!(acc.job_template, Some(JobState::NoId));
+}
+
+#[test]
+fn same_object_archive_rename_with_job_and_owed_debt_defers_and_holds_owner() {
+    use crate::snapshots::upload::freshness_debt::tests::seed_archive_whole_unread;
+
+    let (c, session, mut index, original) = archive_with_terminal_job();
+    seed_archive_whole_unread(&index, &original);
+    index.save(session.path()).unwrap();
+    let from = local_index_key(&original);
+    let progress = serde_json::to_value(&index.files[&from]).unwrap();
+    let before = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert!(before.metadata_only);
+    assert!(before.common.job.is_some());
+    assert_eq!(before.table[&state_v2::Collection::Revisions].pages, 1);
+
+    let archived = c.archived.join(original.file_name().unwrap());
+    fs::rename(&original, &archived).unwrap();
+    let to = local_index_key(&archived);
+    assert!(codex_rollout_carry::physical_matches(
+        &before,
+        &fs::metadata(&archived).unwrap()
+    ));
+    index.traversal = None;
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &c.roots(),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .codex_rollout_paths
+        .insert(to.clone());
+    let (deferred, held) = index.prepare_codex_carries(None);
+    assert_eq!(deferred, BTreeSet::from([to.clone()]));
+    assert_eq!(held, BTreeSet::from([codex_protected_owner(MAIN)]));
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&from));
+    assert_eq!(serde_json::to_value(&index.files[&from]).unwrap(), progress);
+    assert!(!index.files.contains_key(&to));
+    assert!(state_v2::load_head(&index, &to, REVISION)
+        .unwrap()
+        .is_none());
+    let after = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.common, before.common);
+    assert!(after.table == before.table);
 }
 
 /// [regress] A provider archive moves a rollout to another path, keeping its

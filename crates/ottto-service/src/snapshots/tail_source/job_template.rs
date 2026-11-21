@@ -24,6 +24,10 @@ pub(in crate::snapshots) fn seed_full_job_template(
     };
     let (head, since) = match load() {
         Ok(loaded) => loaded,
+        Err(error) if error.is::<state_v2::UnreadableHead>() => {
+            counters::bump(acc.source, "job_template_skipped", "stored_state");
+            return Ok(());
+        }
         Err(_) if indexed => return Ok(()),
         Err(error) => return Err(error),
     };

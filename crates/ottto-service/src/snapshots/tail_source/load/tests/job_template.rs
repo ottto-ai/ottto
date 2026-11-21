@@ -314,6 +314,57 @@ fn archived_headless_codex_rollout_stays_ineligible() {
 }
 
 #[test]
+fn unindexed_file_with_unreadable_head_is_read_and_healed() {
+    use crate::snapshots::{
+        tail_source::counters, upload::freshness_debt::tests::seed_raw_unread, ScanIndex,
+    };
+    let mut route = route();
+    let path = route.dir.join("unreadable-head.jsonl");
+    write(&path, &task_lines());
+    let key = local_index_key(&path);
+    seed_raw_unread(&route.index, &path);
+    route.save(false);
+    let before = route.head(&key).unwrap();
+    assert_eq!(before.table[&state_v2::Collection::Revisions].pages, 1);
+    state_v2::seed_unreadable_tail_head_for_test(&route.index, &key);
+    route.index = ScanIndex::load(&route.path).unwrap();
+    assert!(!route.index.files.contains_key(&key));
+    assert!(matches!(
+        loaded(&route, &path, &key).0,
+        super::Load::Cold(_)
+    ));
+
+    let skipped = counters::total("job_template_skipped", "stored_state");
+    let mut parser = job_full(&route, &path, &[]);
+    assert_eq!(
+        counters::total("job_template_skipped", "stored_state"),
+        skipped + 1
+    );
+    assert_eq!(
+        parser.reader.consumed_bytes(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    assert!(parser.accumulator.first_prompt_material.is_some());
+    parser.accumulator.finish_job_template(Some(&context(7)));
+    assert!(parser.accumulator.job_template.is_none());
+    assert!(job_update(&file_candidate(&path), &parser.accumulator).is_none());
+    let (tail, native) = route.finish(&path, parser, None, |_| {});
+    assert!(tail.publish(&native));
+    route.save(false);
+    let after = route.head(&key).unwrap();
+    assert!(after.common.job.is_none());
+    assert_eq!(after.common.debt, before.common.debt);
+    assert!(
+        after.table[&state_v2::Collection::Revisions]
+            == before.table[&state_v2::Collection::Revisions]
+    );
+    assert!(matches!(
+        loaded(&route, &path, &key).0,
+        super::Load::Reused(..)
+    ));
+}
+
+#[test]
 fn unavailable_job_seed_defers_an_unindexed_file() {
     let mut route = route();
     let path = route.dir.join("retry.jsonl");

@@ -192,7 +192,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (8, "accepted request contributions per session slot"),
     (
         JOB_TEMPLATE_LAYOUT,
-        "job template session fact and eligibility",
+        "job decision in the Tail head and eligibility cutoff",
     ),
 ];
 pub(super) const JOB_TEMPLATE_LAYOUT: u32 = 9;
