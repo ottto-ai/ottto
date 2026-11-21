@@ -1,10 +1,12 @@
 # Resource regression checks
 
-**Resource regression (advisory)** runs on `ubuntu-latest` for pull requests
-that touch `crates/ottto-service/**`, nightly, and manual dispatch. It has no
+**Resource regression (advisory)** runs on `ubuntu-latest` when a PR touching
+`crates/ottto-service/**` is marked ready for review, nightly on main, and on
+manual dispatch. It has no
 merge-group trigger, required-check dependency or required-check ruleset entry.
 A daemon PR includes a nonblank `Resource:` body line describing its evidence
-and limitations. That line never waives a failing budget.
+and limitations; it may cite the id of a dispatched run on the PR branch. That
+line never waives a failing budget.
 
 The generated fixed-seed corpus has 12,000 Claude, 5,500 Codex and 500 Pi
 transcripts, eight Codex homes and five homes with synthetic SQLite sidecars.

@@ -3,8 +3,11 @@ name: Resource regression
 # Advisory calibration only. Keep this name out of required status checks,
 # merge groups and aggregate test jobs until calibration has been reviewed.
 on:
+  # Once per PR, when it is marked ready, not on every push: each run holds a
+  # hosted runner for about 50 minutes. Other heads: the daily main run, or
+  # `gh workflow run resource-regression.yml --ref <branch>`.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [ready_for_review]
     paths:
       - 'crates/ottto-service/**'
   schedule:
