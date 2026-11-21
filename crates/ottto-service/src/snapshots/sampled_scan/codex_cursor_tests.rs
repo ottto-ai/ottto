@@ -8626,3 +8626,177 @@ fn open_stamp_round_trips_as_content_free_scalars() {
     malformed["changed"] = serde_json::json!([1, 2, 3]);
     assert!(serde_json::from_value::<OpenStamp>(malformed).is_err());
 }
+
+/// [behaviour] A first-import selecting page reads `PAGE_TOTAL_FACTOR` times
+/// the singleton threshold in aggregate. The threshold that routes a file to
+/// the cursor and the cursor allowance stay as they are: exactly the
+/// threshold is a singleton and one byte more is cursor work on both pages.
+/// A memo lookup's sample pair charges the same singleton counter on both
+/// pages and earns no credit; a following singleton then fits only on the
+/// first-import page.
+#[test]
+fn first_import_page_scales_the_singleton_aggregate_not_the_threshold() {
+    let limits = limits(100, 50, 8);
+    let (numerator, denominator) = PAGE_TOTAL_FACTOR;
+    assert!(numerator > denominator, "a larger first-import aggregate");
+    assert_eq!(limits.page_singleton(false), 50);
+    assert_eq!(limits.page_singleton(true), 50 * numerator / denominator);
+    assert!(!PageBudget::default().first_import(), "ordinary by default");
+    for first_import in [false, true] {
+        let total = limits.page_singleton(first_import);
+        let mut page = PageBudget::with_next_generation_hints(0, first_import);
+        assert_eq!(page.first_import(), first_import);
+        assert_eq!(page.singleton_remaining(limits), total);
+        assert_eq!(page.plan(limits, 50, true, true), StartPlan::Singleton);
+        assert_eq!(page.plan(limits, 51, true, true), StartPlan::Cursor);
+        // Exactly the page total fits; one byte more waits.
+        page.charge(false, total - 50);
+        assert_eq!(page.plan(limits, 50, true, true), StartPlan::Singleton);
+        assert_eq!(page.plan(limits, 51, true, true), StartPlan::Cursor);
+        page.charge(false, 50);
+        assert_eq!(page.singleton_remaining(limits), 0);
+        assert_eq!(page.plan(limits, 1, true, true), StartPlan::Defer);
+        assert!(page.budget_spent(limits, 1));
+        // The cursor allowance is unchanged.
+        assert!(!page.cursor_exhausted(limits));
+        page.charge(true, 100);
+        assert!(page.cursor_exhausted(limits));
+        // A paid archive continues on a fresh page total of the same size.
+        page.continue_singleton();
+        assert_eq!(page.singleton_remaining(limits), total);
+    }
+    let sample = SAMPLE_READ_BYTES;
+    let limits = Limits {
+        cursor: 1 << 30,
+        singleton: 4 * sample,
+    };
+    for first_import in [false, true] {
+        let mut page = PageBudget::with_next_generation_hints(0, first_import);
+        page.charge(false, 3 * sample);
+        // The memo hit's sample pair: the same counter, no credit back.
+        page.charge(false, sample);
+        assert_eq!(
+            page.singleton_remaining(limits),
+            limits.page_singleton(first_import) - 4 * sample
+        );
+        let next = page.plan(limits, sample, true, true);
+        assert_eq!(
+            next == StartPlan::Singleton,
+            first_import,
+            "a following singleton fits only on the first-import page"
+        );
+    }
+    // A continuation page never takes the first-import total.
+    let mut continuation = PageBudget::default();
+    continuation.set_continuation(None);
+    assert!(!continuation.first_import());
+}
+
+/// [behaviour] The first-import flag binds the selecting page's singleton
+/// aggregate before selection: two singletons that take two ordinary pages
+/// share one first-import page. A continuation page over the same flagged
+/// index stays ordinary.
+#[test]
+fn first_import_selecting_page_reads_more_singletons_continuation_stays_ordinary() {
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 8), (SESSION_B, 8)]);
+    let size = fixture.len(SESSION).max(fixture.len(SESSION_B));
+    let paths = [fixture.file(SESSION), fixture.file(SESSION_B)];
+    let walked = |first_import: bool| {
+        let mut index = ScanIndex {
+            first_import_pending: first_import,
+            ..ScanIndex::default()
+        };
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&fixture.root),
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        advance_bounded_directory_traversal(
+            SnapshotSource::Codex,
+            &mut index,
+            BACKFILL_WINDOW_DAYS,
+            None,
+        );
+        index
+    };
+    for first_import in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let (index, scan, _) = with_test_limits(1 << 20, size + size / 2, 64, || {
+            assert!(Limits::current().page_singleton(true) >= 2 * size);
+            page_with(
+                &fixture,
+                walked(first_import),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                |scan| assert_eq!(scan.codex_page.first_import(), first_import),
+            )
+        });
+        let waiting = paths
+            .iter()
+            .filter(|path| pending_hint(&index, path).is_some())
+            .count();
+        let deferred = counter(&cache, |c| c.deferred);
+        assert_eq!(counter(&cache, |c| c.jobs_started), 0, "{first_import}");
+        if first_import {
+            assert_eq!((waiting, deferred), (0, 0), "both read on one page");
+            assert_eq!(published_ids(&scan).len(), 2);
+        } else {
+            assert_eq!((waiting, deferred), (1, 1), "one waits for the next page");
+            assert_eq!(published_ids(&scan).len(), 1);
+        }
+    }
+    let continuation = OwnedSourceScan::new_continuation(
+        std::slice::from_ref(&fixture.root),
+        walked(true),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        None,
+    );
+    assert!(continuation.codex_page.continuation());
+    assert!(!continuation.codex_page.first_import());
+}
+
+/// [behaviour] The freshness estimate sums the queued singletons against
+/// the page total the page's reads use; its per-file cursor skip stays at
+/// the threshold, so a file above it counts toward neither total.
+#[test]
+fn freshness_estimate_sums_against_the_page_total() {
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 8), (SESSION_B, 9)]);
+    let (a, b) = (fixture.len(SESSION), fixture.len(SESSION_B));
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        &mut index,
+        BACKFILL_WINDOW_DAYS,
+        None,
+    );
+    let traversal = index.traversal.as_ref().unwrap();
+    assert_eq!(traversal.pending_candidates.len(), 2);
+    let exhausts =
+        |total: u64| codex_selection_may_exhaust_page(traversal, 100, &index.files, total);
+    with_test_limits(1 << 20, a.max(b), 64, || {
+        let limits = Limits::current();
+        assert!(exhausts(limits.page_singleton(false)));
+        assert_eq!(
+            exhausts(limits.page_singleton(true)),
+            limits.page_singleton(true) < a + b
+        );
+        assert!(!exhausts(a + b), "exactly the page total fits");
+        assert!(exhausts(a + b - 1));
+    });
+    with_test_limits(1 << 20, a.min(b) - 1, 64, || {
+        assert!(!exhausts(0), "cursor work spends neither total");
+    });
+}

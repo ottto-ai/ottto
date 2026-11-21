@@ -2773,3 +2773,70 @@ fn first_import_default_qos_ends_when_backfill_completes() {
         }
     });
 }
+
+/// [behaviour] A Codex selecting page takes the first-import page total only
+/// while Codex's first import for the destination is pending and no other
+/// granted source is importing for it. Every source bootstrapping a new
+/// destination keeps the ordinary total; once the other sources complete
+/// (here mid-walk), the next page takes the larger total; Codex's own
+/// completion returns the next page to the ordinary total; a Full replay of
+/// a completed destination is not a first import. A source the device does
+/// not grant never syncs, so it never counts as importing.
+#[test]
+fn first_import_page_total_binds_only_while_codex_alone_imports() {
+    use super::super::backfill_replay_pending;
+    use super::super::prepare::first_import_alone;
+    use crate::backfill::{mark_backfill_complete_for_destination, BackfillState};
+    const DESTINATION: &str = "first-import-total-destination";
+    let codex = SnapshotSource::Codex;
+    let device = |sources: &[&str]| LocalDeviceBinding {
+        device_id: "device".to_string(),
+        machine_id: Some("machine".to_string()),
+        sources: sources.iter().map(|source| source.to_string()).collect(),
+    };
+    let all = device(&["claude_code", "codex", "pi"]);
+    // What prepare sets on the index before the page is built.
+    let first_import = |state: &BackfillState, device: &LocalDeviceBinding| {
+        backfill_replay_pending(codex, state, DESTINATION)
+            && first_import_alone(codex, device, state, DESTINATION)
+    };
+    for (other, last) in [
+        (SnapshotSource::ClaudeCode, SnapshotSource::Pi),
+        (SnapshotSource::Pi, SnapshotSource::ClaudeCode),
+    ] {
+        let mut state = BackfillState::default();
+        assert!(!first_import(&state, &all), "every source bootstrapping");
+        assert!(
+            first_import(&state, &device(&["codex"])),
+            "Codex alone granted"
+        );
+        mark_backfill_complete_for_destination(&mut state, other, DESTINATION);
+        assert!(!first_import(&state, &all), "{last:?} still bootstrapping");
+        let without_last = device(&[other.api_slug(), "codex"]);
+        assert!(first_import(&state, &without_last), "{last:?} not granted");
+        mark_backfill_complete_for_destination(&mut state, last, DESTINATION);
+        assert!(first_import(&state, &all), "Codex alone imports");
+        // Only Codex reads the flag; another source's own first import is
+        // not "alone" while Codex still imports.
+        assert!(!first_import_alone(other, &all, &state, DESTINATION));
+        // A new destination: every source bootstraps again.
+        assert!(!first_import_alone(
+            codex,
+            &all,
+            &state,
+            "first-import-total-other"
+        ));
+        mark_backfill_complete_for_destination(&mut state, codex, DESTINATION);
+        assert!(!first_import(&state, &all), "Codex completed: ordinary");
+        state
+            .completed_destination_replays
+            .get_mut("codex")
+            .unwrap()
+            .insert(DESTINATION.into(), "codex_replay:v0".into());
+        assert!(backfill_replay_pending(codex, &state, DESTINATION));
+        assert!(
+            !first_import(&state, &all),
+            "a replay keeps the ordinary total"
+        );
+    }
+}

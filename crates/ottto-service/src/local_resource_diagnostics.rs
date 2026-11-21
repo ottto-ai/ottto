@@ -4651,6 +4651,48 @@ mod tests {
         assert_eq!(rising.process_lifetime_max_rss_before_bytes, Some(4096));
         assert_eq!(rising.process_lifetime_max_rss_bytes, Some(8192));
     }
+    /// [behaviour] The first-import page-total key rides only a page that
+    /// read the larger total; a worst-case page row with the whole page
+    /// schedule stays under its size bound.
+    #[test]
+    fn first_import_page_total_key_is_set_only_and_within_the_page_bound() {
+        for first_import in [false, true] {
+            let (_, records) = capture(|| {
+                let mut probe = Probe::page();
+                probe.page_schedule = BTreeMap::from([
+                    ("routine_recensus", false),
+                    ("page_file_limit_hit", false),
+                    ("pending_work", false),
+                    ("first_read_progress", false),
+                    ("first_import_default_qos", false),
+                ]);
+                if first_import {
+                    probe
+                        .page_schedule
+                        .insert("codex_first_import_page_total", true);
+                }
+                probe.collection(
+                    "codex",
+                    CollectionCounts {
+                        scanned_files: usize::MAX,
+                        semantic_noops: usize::MAX,
+                        sampled_acquisition: Some(max_read_counts()),
+                        full_causes: Default::default(),
+                    },
+                );
+            });
+            let page = records
+                .iter()
+                .find(|record| record["stage"] == "native_collection_page")
+                .unwrap();
+            assert_eq!(
+                page["counts"].get("codex_first_import_page_total"),
+                first_import.then_some(&serde_json::Value::Bool(true))
+            );
+            let text = serde_json::to_string(page).unwrap();
+            assert!(text.len() < NATIVE_PAGE_RECORD_TEST_LIMIT, "{}", text.len());
+        }
+    }
     #[test]
     fn resource_attempts_count_fallback_and_presend_refusal_without_content() {
         let (_, records) = capture(|| {

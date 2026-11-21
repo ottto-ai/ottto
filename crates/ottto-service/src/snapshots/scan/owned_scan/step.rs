@@ -3798,6 +3798,13 @@ impl OwnedSourceScan {
                         crate::snapshot_sync::continuation::first_import_default_qos(),
                     ),
                 ]);
+                // Only a page that read the larger singleton aggregate carries
+                // the key, so ordinary rows keep their size.
+                if codex_page.first_import() {
+                    resource_probe
+                        .page_schedule
+                        .insert("codex_first_import_page_total", true);
+                }
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {

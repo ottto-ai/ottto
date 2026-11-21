@@ -2050,6 +2050,16 @@ Low Power Mode and unknown power behave as before, and paced passes requested
 after the first import stay at background QoS. The reason is held in memory
 only; it changes priority, never selection or money.
 
+A Codex selecting page may read more decoded singleton bytes than an ordinary
+page (`PAGE_TOTAL_FACTOR`, currently twice) while Codex's first import for the destination is pending and no
+other granted source is importing for it (a Full replay of a completed
+destination is not a first import). The 64 MiB per-file threshold that sends a
+file to the resumable cursor, the cursor's own allowance and the context-read
+room do not change, and continuation pages stay ordinary. Such a page carries
+`codex_first_import_page_total: true` on its `native_collection_page` line; the
+key is absent otherwise. The flag is held in memory only; it changes which page
+reads a file, never money.
+
 ## Claude OTLP spans and relay requests: stored and not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude

@@ -97,6 +97,25 @@ fn append(path: &Path, text: &str) {
         .unwrap();
 }
 
+thread_local! {
+    /// Set while a row also runs at the first-import page total: every page
+    /// carries the flag, as prepare sets it before each page.
+    static FIRST_IMPORT_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `rows` with every page of this fixture flagged as a first-import page.
+fn with_first_import_pages(rows: impl FnOnce()) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIRST_IMPORT_PAGES.with(|flag| flag.set(false));
+        }
+    }
+    FIRST_IMPORT_PAGES.with(|flag| flag.set(true));
+    let _reset = Reset;
+    rows();
+}
+
 // The ordinary scan/policy/checkpoint route; no carry helper is invoked here.
 fn page(
     c: &Corpus,
@@ -188,6 +207,8 @@ fn page_observed_hinted_at(
     at: &str,
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    let mut index = index;
+    index.first_import_pending |= FIRST_IMPORT_PAGES.with(std::cell::Cell::get);
     let delivered = Delivered::default();
     let ((answer, consumed), logs) = crate::local_resource_diagnostics::capture(|| {
         oracle::observe_consumed(|| {
@@ -2844,6 +2865,285 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
         serde_json::to_value(&index.session_account_bindings).unwrap()
     );
     assert_quiet(&c, index, &paged);
+}
+
+/// [money] The first-import page total moves only which page reads a file.
+/// One corpus (two accounts, a mid-session switch, a spawned side call, an
+/// evidence gap and tagged rows, plus small sessions: two exactly at the
+/// singleton threshold, one a byte above it) drains under scaled limits on
+/// four routes: ordinary pages, first-import pages, the crossing (two
+/// first-import pages, a restart from the durable store, then ordinary
+/// pages) and the resume (two ordinary pages saved as an older process
+/// would, a restart from the durable store, then first-import pages). Each
+/// route posts every body once, its exact ACK ledger covers
+/// them, and its bodies equal cold Full in totals and placement (swapped
+/// accounts fail the comparator). The first-import route takes fewer pages;
+/// the threshold-exact files stay singletons and the threshold+1 file is
+/// cursor work on every route. A quiet restart reads no byte and a later
+/// append re-emits no smaller body.
+#[test]
+fn first_import_page_total_moves_pages_not_money() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // A failure is caught inside the guard and resumed after it is dropped,
+    // so it never poisons the decoder lock for other tests.
+    let outcome = {
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::panic::catch_unwind(first_import_page_total_rows)
+    };
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn first_import_page_total_rows() {
+    const LATER_PASS: &str = "2026-10-07T13:00:00Z";
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    append(&c.path(MAIN), &header(MAIN, Some("switched")));
+    append(&c.path(MAIN), &turn(3));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("b"));
+    c.write(GAP, None);
+    let small = |n: u32| format!("019e5a00-0000-7000-8000-0000000001{n:02x}");
+    let sized = |id: &str, account: &str, last: u64| {
+        fs::write(c.path(id), header(id, Some(account)) + &turn(1) + &turn(last)).unwrap();
+    };
+    let (exact_a, exact_b, above) = (small(1), small(2), small(3));
+    sized(&exact_a, "a", 10);
+    sized(&exact_b, "b", 10);
+    sized(&above, "a", 20);
+    let fillers = (4..=6).map(small).collect::<Vec<_>>();
+    for (n, id) in fillers.iter().enumerate() {
+        c.write(id, Some(if n % 2 == 0 { "a" } else { "b" }));
+    }
+    let len = |id: &str| fs::metadata(c.path(id)).unwrap().len();
+    let threshold = len(&exact_a);
+    assert_eq!(len(&exact_b), threshold, "two reads exactly at the threshold");
+    assert_eq!(len(&above), threshold + 1, "one a byte above it");
+    let ids = [MAIN, OTHER, SIDE, GAP]
+        .map(str::to_owned)
+        .into_iter()
+        .chain([exact_a.clone(), exact_b.clone(), above.clone()])
+        .chain(fillers.iter().cloned())
+        .collect::<Vec<_>>();
+    let cursor_files = ids.iter().filter(|id| len(id) > threshold).count() as u64;
+    assert!(ids.len() as u64 - cursor_files >= 5, "a small-file tail");
+    let account = |id: &str| match id {
+        MAIN | GAP => None,
+        OTHER | SIDE => Some("b"),
+        id if id == exact_b || id == fillers[1] => Some("b"),
+        _ => Some("a"),
+    };
+    let hash = |kind: &str, account: &str| {
+        let prefix = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{prefix}-{account}"))
+            .unwrap()
+    };
+    let slots = named_creator_slots();
+    let (cold_index, cold_scan, ..) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        Arc::default(),
+        100,
+        &slots,
+        |_| {},
+    );
+    assert_eq!(cold_scan.snapshots.len(), ids.len());
+    let cold = emitted(&cold_index, &cold_scan);
+    let position = |id: &str| {
+        cold_scan
+            .snapshots
+            .iter()
+            .position(|item| item.source_session_id == id)
+            .unwrap()
+    };
+    let mut page_counts = BTreeMap::new();
+    // (route, switch page, upgraded). Not upgraded: the first `switch` pages
+    // read the first-import total and the rest the ordinary one (MAX: every
+    // page). Upgraded: the first `switch` pages are ordinary, as saved by a
+    // process without the larger total, and the rest resume at it. The
+    // first-import route runs last: its later append grows the shared corpus.
+    for (arm, switch, upgraded) in [
+        ("ordinary", 0, false),
+        ("crossing", 2, false),
+        ("resume", 2, true),
+        ("first-import", usize::MAX, false),
+    ] {
+        assert_eq!(len(&exact_a), threshold, "{arm}: the corpus cold read");
+        let store = crate::test_scratch::ScratchDir::canonical(&format!("first-import-{arm}"));
+        let dir = fs::canonicalize(store.as_ref()).unwrap().join("state");
+        crate::test_scratch::create_private_dir(&dir).unwrap();
+        let (session, index) =
+            StateV2ColdSession::publish(Source::Codex, &ScanIndex::default(), &dir);
+        let (index, mut scans, posts, pages, started) =
+            crate::snapshots::with_test_limits_for_test(1 << 20, threshold, 64, || {
+                let mut index = index;
+                let mut cache = Arc::new(sampled_scan::SharedCache::default());
+                let (mut scans, mut posts, mut started) = (Vec::new(), Vec::new(), 0);
+                let mut emitted_ids = BTreeMap::<String, usize>::new();
+                let mut pages = 0;
+                while emitted_ids.len() < ids.len() {
+                    pages += 1;
+                    assert!(pages <= 48, "{arm}: the corpus drains: {emitted_ids:?}");
+                    if switch == 2 && pages == 3 {
+                        // A restart between pages: the durable store, a new
+                        // process cache, and the flag prepare sets again.
+                        // Resumed, the progress saved at the ordinary total
+                        // continues at the first-import total.
+                        started += cache.counters_for_test().jobs_started;
+                        index = ScanIndex::load(session.path()).unwrap();
+                        assert!(!index.first_import_pending, "{arm}: never saved");
+                        cache = Arc::default();
+                    }
+                    let first_import = if upgraded {
+                        pages > switch
+                    } else {
+                        pages <= switch
+                    };
+                    index.first_import_pending = first_import;
+                    let before = index.clone();
+                    let (working, scan, ..) = page_observed_with_limit(
+                        &c.roots(),
+                        index,
+                        cache.clone(),
+                        100,
+                        &slots,
+                        |page| assert_eq!(page.codex_page.first_import(), first_import, "{arm}"),
+                    );
+                    let (next, page_posts) =
+                        working.checkpoint_with_captured_posts(&scan, &before, "accept");
+                    index = next;
+                    posts.extend(page_posts);
+                    for item in &scan.snapshots {
+                        *emitted_ids
+                            .entry(item.source_session_id.clone())
+                            .or_default() += 1;
+                    }
+                    scans.push(scan);
+                }
+                assert!(
+                    emitted_ids.values().all(|count| *count == 1),
+                    "{arm}: every session emitted once: {emitted_ids:?}"
+                );
+                started += cache.counters_for_test().jobs_started;
+                (index, scans, posts, pages, started)
+            });
+        page_counts.insert(arm, pages);
+        if !matches!(arm, "crossing" | "resume") {
+            assert_eq!(
+                started, cursor_files,
+                "{arm}: only the files above the threshold are cursor work"
+            );
+        }
+        let mut drained = scans.remove(0);
+        for scan in scans {
+            drained.snapshots.extend(scan.snapshots);
+        }
+        drained
+            .snapshots
+            .sort_by_key(|item| position(&item.source_session_id));
+        // The actual POSTs carry every body once, each exactly ACKed.
+        let actual = route(&index, &drained, posts);
+        assert_eq!(actual.accepted.len(), ids.len(), "{arm}: exact ACK ledger");
+        let mut paged = emitted(&index, &drained);
+        paged.accepted = actual.accepted.clone();
+        money_oracle::assert_equivalent(&cold, &paged);
+        assert_eq!(
+            serde_json::to_value(&index.session_account_bindings).unwrap(),
+            serde_json::to_value(&cold_index.session_account_bindings).unwrap(),
+            "{arm}: saved session bindings"
+        );
+        for item in &drained.snapshots {
+            let expected = account(&item.source_session_id).map(|name| hash("account", name));
+            assert!(!item.model_usage.is_empty(), "{arm}");
+            for row in item.model_usage.iter().chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter()),
+            ) {
+                assert_eq!(row.account_identifier_hash, expected, "{arm}: row placement");
+            }
+        }
+        let mut wrong = paged.clone();
+        wrong.snapshots.get_mut(OTHER).unwrap()["model_usage"][0]["account_identifier_hash"] =
+            json!(hash("account", "a"));
+        assert!(
+            std::panic::catch_unwind(|| money_oracle::assert_placement_equivalent(&cold, &wrong))
+                .is_err(),
+            "{arm}: the comparator sees a swapped account"
+        );
+        if arm != "first-import" {
+            continue;
+        }
+        // A quiet restart while Codex still imports: no byte, no body.
+        let mut restored = ScanIndex::load(session.path()).unwrap();
+        restored.first_import_pending = true;
+        let (restored, _) = assert_quiet(&c, restored, &paged);
+        // A later append: the Tail re-emits no smaller body than cold Full.
+        append(&c.path(&exact_a), &turn(3));
+        let mut index = restored;
+        let mut grown = None;
+        for _ in 0..8 {
+            index.first_import_pending = true;
+            let before = index.clone();
+            let (working, scan, ..) = page_observed_hinted_at(
+                &c.roots(),
+                index,
+                Arc::default(),
+                100,
+                &slots,
+                &[c.path(&exact_a)],
+                LATER_PASS,
+                |_| {},
+            );
+            index = working
+                .checkpoint_with_captured_posts(&scan, &before, "accept")
+                .0;
+            assert!(
+                scan.snapshots
+                    .iter()
+                    .all(|item| item.source_session_id == exact_a),
+                "only the grown session"
+            );
+            if !scan.snapshots.is_empty() {
+                grown = Some(scan);
+                break;
+            }
+        }
+        let after = grown.expect("the append is read");
+        assert_eq!(after.snapshots.len(), 1, "one Tail body");
+        let (_, mut cold_after, ..) = page_observed_at(
+            &c.roots(),
+            ScanIndex::default(),
+            Arc::default(),
+            100,
+            &slots,
+            LATER_PASS,
+            |_| {},
+        );
+        cold_after
+            .snapshots
+            .retain(|item| item.source_session_id == exact_a);
+        money_oracle::assert_no_smaller_reemit(
+            &exact_a,
+            &paged,
+            &emitted(&index, &after),
+            &emitted(&index, &cold_after),
+            false,
+        );
+    }
+    assert!(
+        page_counts["first-import"] < page_counts["ordinary"],
+        "{page_counts:?}"
+    );
 }
 
 mod sidecar_reuse_transition {

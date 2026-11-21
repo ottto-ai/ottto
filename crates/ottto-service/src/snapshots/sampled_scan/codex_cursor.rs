@@ -1,7 +1,9 @@
 //! Resumable Codex reads. One RAM job slot is shared by background and manual
-//! scans: a Codex singleton larger than the per-page budget is read across
-//! pages by pausing its native parser here between scan objects. Per-page
-//! byte budgets bound both that cursor job and the ordinary singleton reads.
+//! scans: a Codex singleton larger than the per-file singleton threshold is
+//! read across pages by pausing its native parser here between scan objects.
+//! Per-page byte budgets bound both that cursor job and the ordinary
+//! singleton reads; the singleton aggregate equals the threshold except on a
+//! selecting page while Codex alone imports (`Limits::page_singleton`).
 //! A finished job commits only through its sealed-prefix certificate
 //! (`ReadPlan::commit_sealed_prefix`); a job that cannot pause within the
 //! state budget ends as strict `JoinStateBound` debt, never as an unbounded
@@ -29,9 +31,15 @@ use std::os::unix::fs::FileExt;
 
 /// Decoded bytes one cursor job may consume per page (B).
 const CURSOR_PASS_BYTES: u64 = 64 * 1024 * 1024;
-/// Aggregate decoded bytes per page for ordinary Codex singleton reads
-/// (B_s = B; no further constant).
+/// The per-file singleton threshold (T = B): a file whose expected read is
+/// larger is cursor work. On an ordinary page it is also the aggregate of
+/// decoded singleton bytes the page may read (B_s = T).
 const SINGLETON_PASS_BYTES: u64 = CURSOR_PASS_BYTES;
+/// A selecting page while Codex alone imports its history for the
+/// destination reads `numerator / denominator` times the threshold in
+/// aggregate (B_s = factor x T). The threshold, the cursor allowance and
+/// the context-read room stay T, so no file changes acquisition path.
+const PAGE_TOTAL_FACTOR: (u64, u64) = (2, 1);
 /// The most one group member swap adds to its group's input position
 /// (`swap_charge`).
 pub(in crate::snapshots) const CHARGE_REFRESH_BYTES: u64 = 4 * 1024 * 1024;
@@ -87,6 +95,18 @@ impl Limits {
     /// Files above this size are read by the cursor, never as one pass.
     pub(in crate::snapshots) fn singleton(&self) -> u64 {
         self.singleton
+    }
+
+    /// Aggregate decoded singleton bytes one page may read: the threshold,
+    /// or `PAGE_TOTAL_FACTOR` times it on a first-import selecting page.
+    /// Derived from the threshold, so scaled test limits scale it too.
+    pub(in crate::snapshots) fn page_singleton(&self, first_import: bool) -> u64 {
+        if first_import {
+            let (numerator, denominator) = PAGE_TOTAL_FACTOR;
+            self.singleton.saturating_mul(numerator) / denominator
+        } else {
+            self.singleton
+        }
     }
 }
 
@@ -188,10 +208,15 @@ pub(in crate::snapshots) struct PageBudget {
     next_generation_hints: u64,
     /// A file was deferred because a byte budget is spent (`budget_spent`).
     budget_deferred: bool,
+    /// A selecting page while Codex alone imports for its destination: the
+    /// singleton aggregate is `Limits::page_singleton(true)`. Fixed before
+    /// selection; never set on a continuation page.
+    first_import: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, window_start, continuation,
-    ordinary_equivalent, deadline, next_generation_hints, budget_deferred);
+    ordinary_equivalent, deadline, next_generation_hints, budget_deferred,
+    first_import);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -201,7 +226,7 @@ pub(in crate::snapshots) enum StartPlan {
     Cursor,
     /// Back to `pending_candidates` with its original selection flags.
     Defer,
-    /// Larger than the singleton budget on a build without the cursor:
+    /// Larger than the singleton threshold on a build without the cursor:
     /// today's in-page read (C4).
     Unpaged,
     /// This file's cursor attempt already completed in this census
@@ -233,11 +258,19 @@ pub(in crate::snapshots) enum StartRefusal {
 impl PageBudget {
     /// A page whose start enqueued `hints` watcher hints as next-generation
     /// evidence (G1).
-    pub(in crate::snapshots) fn with_next_generation_hints(hints: u64) -> Self {
+    /// `first_import` selects the larger singleton aggregate
+    /// (`Limits::page_singleton`); a continuation page never takes it.
+    pub(in crate::snapshots) fn with_next_generation_hints(hints: u64, first_import: bool) -> Self {
         Self {
             next_generation_hints: hints,
+            first_import,
             ..Self::default()
         }
+    }
+
+    /// This page reads the first-import singleton aggregate.
+    pub(in crate::snapshots) fn first_import(&self) -> bool {
+        self.first_import
     }
 
     pub(in crate::snapshots) fn charge(&mut self, cursor: bool, bytes: u64) {
@@ -271,17 +304,24 @@ impl PageBudget {
         self.singleton_decoded = 0;
     }
 
-    /// Singleton-budget bytes this page may still read (group probes, R2-N2).
+    /// Singleton-budget bytes this page may still read (group probes, R2-N2):
+    /// the page aggregate, not the per-file threshold.
     pub(in crate::snapshots) fn singleton_remaining(&self, limits: Limits) -> u64 {
-        limits.singleton.saturating_sub(self.singleton_decoded)
+        limits
+            .page_singleton(self.first_import)
+            .saturating_sub(self.singleton_decoded)
     }
 
     /// The cursor or singleton budget `expected` would be charged to is spent.
+    /// The threshold picks the budget; the singleton sum compares with the
+    /// page aggregate.
     fn budget_spent(&self, limits: Limits, expected: u64) -> bool {
         if expected > limits.singleton {
             self.cursor_exhausted(limits)
         } else {
-            expected != 0 && self.singleton_decoded.saturating_add(expected) > limits.singleton
+            expected != 0
+                && self.singleton_decoded.saturating_add(expected)
+                    > limits.page_singleton(self.first_import)
         }
     }
 
@@ -3303,7 +3343,7 @@ impl SharedCache {
     }
 
     /// The page plan with slot rotation and the census fence (K7). Only a
-    /// file larger than the singleton budget on a cursor build is affected:
+    /// file larger than the singleton threshold on a cursor build is affected:
     /// a file whose attempt completed in this generation is `Fenced`; a
     /// file another waiter is ahead of is deferred; every deferred large
     /// file is recorded as waiting. `census_member`: the read holds this
@@ -3337,7 +3377,7 @@ impl SharedCache {
 
     /// `cursor_plan` with the Stage 1 guard (§6) for a singleton: on an
     /// ordinary page, a large start that rotation would grant (`Cursor`,
-    /// `expected` above the singleton budget) is deferred while its key's
+    /// `expected` above the singleton threshold) is deferred while its key's
     /// last attempt's ordinary-equivalent eligibility is ahead
     /// (`PaceTable::verdict`). A paced deferral is an ordinary `Defer`: the
     /// caller requeues the file, owed. It is never recorded as a waiter (it

@@ -407,8 +407,10 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
 /// Keep fitting pages together. Dedicated scheduling is only useful when
 /// the queued population could spend the file or singleton byte allowance.
 /// The estimate mirrors `PageBudget::plan`: a file larger than the singleton
-/// allowance is cursor work with its own per-page budget, so it cannot spend
-/// this one. Each indexed singleton also counts one sample pair for its memo
+/// threshold is cursor work with its own per-page budget, so it cannot spend
+/// this one; the rest sum against `page_total`, the page's singleton
+/// aggregate (`Limits::page_singleton`, the same value the page's reads use).
+/// Each indexed singleton also counts one sample pair for its memo
 /// check. It never grants a read or increases a budget; an underestimate
 /// only defers a file to the next page. Metadata failure keeps the ordinary
 /// path and its existing error handling.
@@ -416,17 +418,18 @@ pub(in crate::snapshots) fn codex_selection_may_exhaust_page(
     traversal: &ScanTraversalCheckpoint,
     file_limit: usize,
     files: &SharedMap<String, ScanIndexEntry>,
+    page_total: u64,
 ) -> bool {
     if traversal.pending_candidates.len() > file_limit {
         return true;
     }
-    let byte_limit = sampled_scan::codex_cursor::Limits::current().singleton();
+    let threshold = sampled_scan::codex_cursor::Limits::current().singleton();
     let mut expected = 0_u64;
     for candidate in &traversal.pending_candidates {
         let Ok(metadata) = fs::symlink_metadata(&candidate.path) else {
             continue;
         };
-        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > byte_limit {
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > threshold {
             continue;
         }
         let samples = if files.contains_key(&local_index_key(&candidate.path)) {
@@ -437,7 +440,7 @@ pub(in crate::snapshots) fn codex_selection_may_exhaust_page(
         expected = expected
             .saturating_add(metadata.len())
             .saturating_add(samples);
-        if expected > byte_limit {
+        if expected > page_total {
             return true;
         }
     }
