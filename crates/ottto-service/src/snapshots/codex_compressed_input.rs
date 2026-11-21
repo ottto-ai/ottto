@@ -405,5 +405,4 @@ impl BufRead for OpenedInput {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 pub(in crate::snapshots) mod tests;

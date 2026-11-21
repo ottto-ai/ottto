@@ -4,9 +4,7 @@
 use super::*;
 use crate::codex_prelude_footprint;
 use crate::composition_kinds::shell::is_plain_path;
-use crate::session_attribution::{
-    SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
-};
+use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
     parse_claude_code_jsonl_file_with_title_metadata_and_attribution, parse_codex_jsonl_file,
     ClaudeTitleMetadata, SnapshotItem, SnapshotSource,
@@ -63,10 +61,7 @@ fn attribution_context(dir: &Path) -> SessionAttributionContext {
     .expect("attribution context")
 }
 
-fn parse_claude(
-    path: &Path,
-    attribution: Option<&SessionAttributionContext>,
-) -> Vec<SnapshotItem> {
+fn parse_claude(path: &Path, attribution: Option<&SessionAttributionContext>) -> Vec<SnapshotItem> {
     parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
         path,
         "2026-10-18T10:05:00Z",
@@ -399,9 +394,8 @@ fn codex_fixture_yields_exact_session_start() {
             json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
         ],
     );
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
-            .expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
+        .expect("parse");
     assert_start_verdict(&items[0], StartVerdict::Measured);
     let mut start = items[0].session_start.clone().expect("session_start");
     start.apply_upload_policy(true, false);
@@ -481,8 +475,8 @@ fn codex_prelude_parity_between_reader_and_decoded_lines() {
         ];
         if malformed {
             let mut row = codex_message("user", &[("user.text", "x")]);
-            row["payload"]["internal_chat_message_metadata_passthrough"]
-                ["content_item_kinds"] = json!([7]);
+            row["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+                json!([7]);
             rows.insert(6, row);
         }
         rows
@@ -520,8 +514,7 @@ fn codex_prelude_parity_between_reader_and_decoded_lines() {
         }
     );
     let path = write_codex(&dir, CODEX_SESSION, rows(false));
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
     let mut start = items[0].session_start.clone().expect("session_start");
     assert_eq!(start.start_chars_system, Some(read.base_instructions_chars));
     assert_eq!(
@@ -549,8 +542,7 @@ fn codex_prelude_parity_between_reader_and_decoded_lines() {
     assert!(read.blocks_incomplete);
     assert!(decoded(&rows(true)).blocks_incomplete);
     let path = write_codex(&dir, "019e253c-7777-7000-9000-bbbbbbbbbbbb", rows(true));
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
     let start = items[0].session_start.clone().expect("session_start");
     assert_eq!(start.start_parts_method, None);
     assert_eq!(start.opening_request_count, Some(2));
@@ -656,8 +648,7 @@ fn full_parser_forks_keep_only_client_version() {
             .collect::<String>(),
     )
     .expect("write fork fixture");
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "fp".into()).expect("parse");
     assert!(!items.is_empty());
     for item in items {
         assert_eq!(
@@ -739,9 +730,8 @@ fn copied_codex_prelude_keeps_only_client_version() {
             codex_token_count((1000, 800, 50), (1000, 800, 50)),
         ],
     );
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
-            .expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
+        .expect("parse");
     assert!(!items.is_empty());
     for item in items {
         assert_eq!(
@@ -775,9 +765,8 @@ fn codex_first_turn_without_cumulative_usage_omits_first_request_parts() {
                 "model": "gpt-5.5"}}}),
         ],
     );
-    let items =
-        parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
-            .expect("parse");
+    let items = parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
+        .expect("parse");
     assert_eq!(items[0].first_turn_context_tokens, Some(100));
     let start = items[0].session_start.clone().expect("session_start");
     assert_eq!(start.opening_request_count, Some(1));
@@ -905,8 +894,7 @@ fn held_state_stays_within_its_capacity_budget() {
     let frozen = crate::heap_layout_bound::bound(&state, usize::MAX).expect("layout");
     assert!(
         frozen
-            <= MAX_HELD_COLLECTION_BYTES + MAX_HELD_INSTRUCTION_BYTES
-                - MAX_CODEX_AGENTS_MD_BYTES,
+            <= MAX_HELD_COLLECTION_BYTES + MAX_HELD_INSTRUCTION_BYTES - MAX_CODEX_AGENTS_MD_BYTES,
         "frozen {frozen}"
     );
 }
@@ -989,9 +977,7 @@ fn relative_shell_paths_without_a_proven_base_stay_private() {
             {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}})
     };
     let mut state = SessionStartState {
-        instructions: Some(
-            "Notes live in customer-plan.md, plan.md and docs/guide.md".to_string(),
-        ),
+        instructions: Some("Notes live in customer-plan.md, plan.md and docs/guide.md".to_string()),
         ..SessionStartState::default()
     };
     state.observe_claude_line(&bash("t1", "cat docs/guide.md"), 1, Some(cwd));
@@ -1184,8 +1170,7 @@ fn session_start_cost_receipt() {
             }
             total.shadow += started.elapsed();
             if !shadow.frozen {
-                peak =
-                    peak.max(crate::heap_layout_bound::bound(&shadow, usize::MAX).unwrap_or(0));
+                peak = peak.max(crate::heap_layout_bound::bound(&shadow, usize::MAX).unwrap_or(0));
             }
         }
         if source == SnapshotSource::ClaudeCode {
@@ -1196,9 +1181,10 @@ fn session_start_cost_receipt() {
                 .cloned()
                 .collect::<Vec<_>>();
             responses.sort_by_key(|response| response.sequence);
-            for response in responses.into_iter().filter_map(|response| {
-                response.resolve_with(&parser.claude_responses.selectors)
-            }) {
+            for response in responses
+                .into_iter()
+                .filter_map(|response| response.resolve_with(&parser.claude_responses.selectors))
+            {
                 shadow.note_claude_response(
                     response.sequence,
                     &response.usage,
@@ -1275,9 +1261,7 @@ fn opening_call_ids_are_the_only_l_span_and_request_keys_are_digests() {
     assert!(state.calls.contains_key("call_CANARYSPLITcx"));
     state.claude_blob(&json!({"hash": "blob-RAWKEY", "message": {"role": "user",
         "content": [{"type": "text", "text": "hello"}]}}));
-    state.claude_shape(
-        &json!({"shapeHash": "shape-RAWKEY", "shape": {"system": [], "tools": []}}),
-    );
+    state.claude_shape(&json!({"shapeHash": "shape-RAWKEY", "shape": {"system": [], "tools": []}}));
     assert!(state
         .claude_blobs
         .contains_key(&ClaudeRequestKey::blob("blob-RAWKEY")));
@@ -1381,13 +1365,11 @@ fn config_digest_is_content_and_never_reaches_a_record_body() {
             // The prelude is its own session fact: it round-trips in full.
             assert!(state.has_codex_prelude(), "{name}");
             assert!(decoded.codex_prelude.is_none(), "{name}: the body drops it");
-            let prelude =
-                Enc::count_write(1 << 20, |e| state.put_codex_prelude_fact(e)).unwrap();
+            let prelude = Enc::count_write(1 << 20, |e| state.put_codex_prelude_fact(e)).unwrap();
             let mut d = Dec::new(&prelude);
             decoded.take_codex_prelude_fact(&mut d).unwrap();
             d.finish().unwrap();
-            let again =
-                Enc::count_write(1 << 20, |e| decoded.put_codex_prelude_fact(e)).unwrap();
+            let again = Enc::count_write(1 << 20, |e| decoded.put_codex_prelude_fact(e)).unwrap();
             assert_eq!(again, prelude, "{name}");
         }
         assert!(state.has_opening_fact(), "{name}");

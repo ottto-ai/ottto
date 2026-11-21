@@ -33,8 +33,7 @@ fn parent_probe_boolean_and_each_refusal_class_are_unchanged() {
             .and_then(|p| fs::symlink_metadata(p).ok())
             .is_some_and(|p| p.is_dir() && !p.file_type().is_symlink());
         let scope = Scope::begin(true);
-        let result =
-            claude_absence_is_removal(SnapshotSource::ClaudeCode, &path).is_removal(&path);
+        let result = claude_absence_is_removal(SnapshotSource::ClaudeCode, &path).is_removal(&path);
         assert_eq!(result, original);
         assert_eq!(result, expected);
         let actual = counts(scope);
@@ -77,10 +76,7 @@ fn candidate_sites_count_once_and_live_parent_still_removes() {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             let removal = suffix != "symlink";
@@ -144,10 +140,7 @@ fn parent_races_count_file_and_metadata_error_once_per_not_found() {
                     &mut census,
                     None,
                     BACKFILL_WINDOW_DAYS,
-                    &mut crate::snapshots::CandidateDiscovery::new(
-                        &mut ScanIndex::default(),
-                        None,
-                    ),
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
                 )
             });
             assert!(candidate.is_none());

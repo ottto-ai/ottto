@@ -14,9 +14,7 @@ pub(super) fn note_read(path: &Path) {
     });
 }
 
-pub(in crate::snapshots) fn observe_read_paths<T>(
-    run: impl FnOnce() -> T,
-) -> (T, Vec<PathBuf>) {
+pub(in crate::snapshots) fn observe_read_paths<T>(run: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

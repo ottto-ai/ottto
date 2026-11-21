@@ -2006,5 +2006,4 @@ pub(crate) fn uploaded_start_verdict(item: &crate::snapshots::SnapshotItem) -> S
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;

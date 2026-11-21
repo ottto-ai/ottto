@@ -2,10 +2,10 @@
 //! transcript or folder can be counted under.
 
 use super::super::{
-    advance_bounded_directory_traversal, candidate_from_traversal_path,
-    ensure_bounded_traversal, local_index_key, open_and_identify_scan_candidate,
-    scan_source_roots_with_limit_and_attribution, OwnedSourceScan, OwnedSourceScanStep,
-    ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult, BACKFILL_WINDOW_DAYS,
+    advance_bounded_directory_traversal, candidate_from_traversal_path, ensure_bounded_traversal,
+    local_index_key, open_and_identify_scan_candidate,
+    scan_source_roots_with_limit_and_attribution, OwnedSourceScan, OwnedSourceScanStep, ScanCensus,
+    ScanIndex, ScanTraversalPath, SourceScanResult, BACKFILL_WINDOW_DAYS,
 };
 use super::*;
 use std::{
@@ -76,9 +76,7 @@ fn claude_generation(
 }
 
 /// Raw scan completion, without carry effects or post-policy finalization.
-pub(in crate::snapshots) fn finish(
-    mut state: OwnedSourceScan,
-) -> (ScanIndex, SourceScanResult) {
+pub(in crate::snapshots) fn finish(mut state: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
     for _ in 0..1024 {
         match state.step(None) {
             OwnedSourceScanStep::Pending(next) => state = next,
@@ -170,12 +168,7 @@ fn real_queued_directory_absence_records_once_without_root_fallback() {
                 fs::remove_dir(&root).unwrap();
             }
             let (_, sites) = observe_sites(|| {
-                advance_bounded_directory_traversal(
-                    source,
-                    &mut index,
-                    BACKFILL_WINDOW_DAYS,
-                    None,
-                )
+                advance_bounded_directory_traversal(source, &mut index, BACKFILL_WINDOW_DAYS, None)
             });
             let removal = cfg!(unix) && source == SnapshotSource::ClaudeCode && !root_itself;
             let mut expected = [[[0; OUTCOMES]; SITES]; 3];
@@ -357,8 +350,7 @@ fn removed_root_witnesses_drain_only_with_proof() {
         // target, which is not lexically under the removed link.
         let link = dir.join("removed-link");
         let target_key = dir.join("canonical-target").join("rollout.jsonl");
-        let (witness, unresolved, _) =
-            removed_root_retry(source, &roots, &link, &target_key, true);
+        let (witness, unresolved, _) = removed_root_retry(source, &roots, &link, &target_key, true);
         assert_eq!((witness, unresolved), (true, 1), "{source:?}");
     }
 }
@@ -1057,8 +1049,7 @@ fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
         "precondition: the real parse recorded the member's census"
     );
     fs::remove_file(&second_path).unwrap();
-    let (pages, vanished) =
-        observe_vanished(|| claude_generation(&mut index, &dir, LATER, 1, &[]));
+    let (pages, vanished) = observe_vanished(|| claude_generation(&mut index, &dir, LATER, 1, &[]));
     assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
     assert!(!index.files.contains_key(&second_key));
     assert!(index

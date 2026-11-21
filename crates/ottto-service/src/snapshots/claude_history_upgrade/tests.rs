@@ -319,8 +319,7 @@ fn literal_guard_ignores_this_cycles_decisions() {
         let item = |file: Option<&str>, literal: bool| {
             let mut item = crate::snapshots::tests::sample_session_artifact_item();
             item.source_file_fingerprint = file.map(Into::into);
-            item.usage_accounting_contract =
-                literal.then(|| REQUEST_OWNED_USAGE_CONTRACT.into());
+            item.usage_accounting_contract = literal.then(|| REQUEST_OWNED_USAGE_CONTRACT.into());
             item
         };
         let items = [item(Some("open"), true), item(Some("listed"), true)];
@@ -366,9 +365,8 @@ fn literal_guard_ignores_this_cycles_decisions() {
             LiteralGuard::Only(BTreeSet::new()),
             "a source any listed key carries is denied, an alias included"
         );
-        let only_open = LiteralGuard::for_items(&items, 3, &populated, files(), |key| {
-            key == "listed.jsonl"
-        });
+        let only_open =
+            LiteralGuard::for_items(&items, 3, &populated, files(), |key| key == "listed.jsonl");
         assert!(only_open.permits(&item(Some("open"), true)));
         assert!(!only_open.permits(&item(Some("listed"), true)));
         assert!(!only_open.permits(&item(Some("unindexed"), true)));

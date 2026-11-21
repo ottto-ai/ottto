@@ -43,9 +43,7 @@ fn decoder_credit_preserves_the_platform_receipt_and_margin() {
     #[cfg(target_os = "macos")]
     {
         let measured_peak = 16_285_728_usize; // Measured on macOS with zstd 1.5.7.
-        assert!(
-            compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10)
-        );
+        assert!(compressed_input_credit().unwrap() >= measured_peak + measured_peak.div_ceil(10));
         assert_eq!(compressed_input_credit().unwrap(), 19_595_264);
     }
     #[cfg(not(target_os = "macos"))]
@@ -523,7 +521,9 @@ fn compressed_equals_plain_money_oracle() {
     archive_over_the_former_file_limit_reaches_opened_identity();
     eprintln!("compressed_equals_plain_money_oracle::archive_over_the_former_file_limit_reaches_opened_identity ... ok");
     archive_empty_requires_zero_usage_evidence();
-    eprintln!("compressed_equals_plain_money_oracle::archive_empty_requires_zero_usage_evidence ... ok");
+    eprintln!(
+        "compressed_equals_plain_money_oracle::archive_empty_requires_zero_usage_evidence ... ok"
+    );
 }
 
 fn archive_native_placement_preserves_resolved_evidence_and_untagged_remainder() {
@@ -561,8 +561,7 @@ fn archive_native_placement_preserves_resolved_evidence_and_untagged_remainder()
             let mut file = File::open(path).unwrap();
             let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
             let input = if compressed {
-                OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap())
-                    .unwrap()
+                OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap()).unwrap()
             } else {
                 OpenedInput::plain(file)
             };
@@ -626,9 +625,8 @@ fn selector_scan(
         .iter()
         .map(|c| local_index_key(&c.path))
         .collect();
-    candidates.retain(|candidate| {
-        !codex_file_join::shadowed_compressed_path(&candidate.path, &paths)
-    });
+    candidates
+        .retain(|candidate| !codex_file_join::shadowed_compressed_path(&candidate.path, &paths));
     let mut directories = codex_file_join::DirectoryCensus::new();
     directories.observe(&root, &fs::metadata(&root).unwrap());
     let inventory = codex_file_join::HeaderInventory::new(
@@ -797,8 +795,7 @@ fn archive_nonledger_children_resume_through_shared_ownership() {
             .iter()
             .map(|row| format!("{row}\n"))
             .collect::<String>();
-        let mut f =
-            ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+        let mut f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
         let path =
             f.0.parent()
                 .unwrap()
@@ -886,8 +883,7 @@ fn archive_exact_body_receipt_is_required_for_settlement_and_quiet_restart() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f =
-        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let previous = ScanIndex::default();
     let (working, result, _) = run_archive(
         &f,
@@ -1009,9 +1005,7 @@ fn archive_transient_denial_recovers_next_pass_and_pages_to_eof() {
             true,
         );
         let ((actual_index, actual), funded_logs) =
-            crate::local_resource_diagnostics::capture(|| {
-                finish_selector(restart, &checkpoint.0)
-            });
+            crate::local_resource_diagnostics::capture(|| finish_selector(restart, &checkpoint.0));
         assert_eq!(full_decodes(&funded_logs), 1, "one ordinary funded Full");
         assert_eq!(cache.cursor_reserved(), 0);
         assert_eq!(actual.snapshots.len(), 1);
@@ -1092,9 +1086,8 @@ fn archive_unstored_body_restarts_from_committable_and_accepts_retry() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for outcome in ["shed", "partial"] {
-        let f = ArchiveFixture::new(
-            &zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap(),
-        );
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let previous = ScanIndex::default();
         let (working, result, _) = run_archive(
             &f,
@@ -1112,9 +1105,8 @@ fn archive_unstored_body_restarts_from_committable_and_accepts_retry() {
                 .into_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
         let key = local_index_key(&f.0);
         assert!(!reverted.files.contains_key(&key));
-        let committed = crate::snapshot_sync::archive_upload_checkpoint(
-            working, &result, &previous, outcome,
-        );
+        let committed =
+            crate::snapshot_sync::archive_upload_checkpoint(working, &result, &previous, outcome);
         assert!(!committed.files.contains_key(&key));
         assert!(!committed.file_snapshot_fingerprints.contains_key(&key));
         let (working, retry, _) = run_archive(
@@ -1127,9 +1119,8 @@ fn archive_unstored_body_restarts_from_committable_and_accepts_retry() {
             snapshot_upload_body_witness(&retry.snapshots[0]),
             snapshot_upload_body_witness(&result.snapshots[0])
         );
-        let accepted = crate::snapshot_sync::archive_upload_checkpoint(
-            working, &retry, &committed, "accept",
-        );
+        let accepted =
+            crate::snapshot_sync::archive_upload_checkpoint(working, &retry, &committed, "accept");
         assert!(accepted
             .accepted_snapshot_fingerprints
             .contains(&retry.snapshots[0].snapshot_fingerprint));
@@ -1147,8 +1138,7 @@ fn archive_debt_preserves_replay_and_plain_reoffers() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f =
-        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let (working, scan, _) = run_archive(
         &f,
         ScanIndex::default(),
@@ -1190,9 +1180,8 @@ fn archive_open_and_receipt_refusals_preserve_plain_work() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for refusal in ["body", "receipt", "launch", "parsed-launch"] {
-        let mut f = ArchiveFixture::new(
-            &zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap(),
-        );
+        let mut f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let launch_home = crate::test_scratch::ScratchDir::new("archive-launch-refusal");
         let context = if matches!(refusal, "launch" | "parsed-launch") {
             use base64::Engine;
@@ -1356,8 +1345,7 @@ fn archive_held_replay_equals_seeded() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f =
-        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let (working, emitted, _) = run_archive(
         &f,
         ScanIndex::default(),
@@ -1397,8 +1385,7 @@ fn archive_nonwitness_custody_survives_partial_and_local_hold() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f =
-        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let (working, result, _) = run_archive(
         &f,
         ScanIndex::default(),
@@ -1438,14 +1425,13 @@ fn archive_nonwitness_custody_survives_partial_and_local_hold() {
             committed.accepted_snapshot_fingerprints,
             accepted.accepted_snapshot_fingerprints
         );
-        let ((_, quiet, _), consumed) =
-            sampled_scan::transition_fixture::observe_consumed(|| {
-                run_archive(
-                    &f,
-                    saved(&committed),
-                    Arc::new(sampled_scan::SharedCache::default()),
-                )
-            });
+        let ((_, quiet, _), consumed) = sampled_scan::transition_fixture::observe_consumed(|| {
+            run_archive(
+                &f,
+                saved(&committed),
+                Arc::new(sampled_scan::SharedCache::default()),
+            )
+        });
         assert_eq!(consumed, 0);
         assert!(quiet.snapshots.is_empty());
     }
@@ -1458,8 +1444,7 @@ fn archive_context_is_per_marker_before_source_context_promotion() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f =
-        ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let plain = f.0.parent().unwrap().join("rollout-plain-pending.jsonl");
     fs::write(
         &plain,
@@ -1520,9 +1505,8 @@ fn archive_context_is_per_marker_before_source_context_promotion() {
             .files
             .get(&plain_key)
             .map_or(true, |e| e.upload_context_receipt.is_none()));
-        let accepted = crate::snapshot_sync::archive_upload_checkpoint(
-            working, &result, &previous, "accept",
-        );
+        let accepted =
+            crate::snapshot_sync::archive_upload_checkpoint(working, &result, &previous, "accept");
         let checkpoint = fixture(&serde_json::to_vec(&accepted).unwrap(), ".json");
         index = ScanIndex::load(&checkpoint.0).unwrap();
         assert!(serde_json::to_value(&accepted)
@@ -1694,8 +1678,7 @@ fn write_codex_zst_downgrade_fixture() {
 /// accepted incidence; re-upgrade preserves those exact accepted heads.
 #[test]
 fn verify_codex_zst_downgrade_roundtrip() {
-    let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from)
-    else {
+    let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from) else {
         return;
     };
     let expected = ScanIndex::load(&root.join("as-today.json")).unwrap();
@@ -1722,8 +1705,7 @@ fn verify_codex_zst_downgrade_roundtrip() {
 /// discovery schedules it again after re-upgrade, without fabricating ACKs.
 #[test]
 fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
-    let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from)
-    else {
+    let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from) else {
         return;
     };
     let key = fs::read_to_string(root.join("activation-key.txt")).unwrap();
@@ -1789,14 +1771,13 @@ fn archive_empty_requires_zero_usage_evidence() {
                 .replace("2026-10-07T10:00:00Z", "not-a-time")
                 .into_bytes()
         } else {
-            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n"
-                .to_vec()
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n".to_vec()
         };
         let f = ArchiveFixture::new(&zstd::stream::encode_all(&data[..], 1).unwrap());
         let mut file = File::open(&f.0).unwrap();
         let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-        let input = OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap())
-            .unwrap();
+        let input =
+            OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap()).unwrap();
         let mut parser = codex_parser(input, &f.0);
         while !parser.step().unwrap() {}
         let parsed = parser
@@ -1862,8 +1843,8 @@ fn archive_prefix_only_subagent_is_empty_and_any_doubt_holds() {
         let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
         let mut file = File::open(&f.0).unwrap();
         let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
-        let input = OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap())
-            .unwrap();
+        let input =
+            OpenedInput::compressed(file, u64::MAX, compressed_input_credit().unwrap()).unwrap();
         let mut parser = codex_parser(input, &f.0);
         while !parser.step().unwrap() {}
         let parsed = parser
@@ -1929,8 +1910,7 @@ fn archive_confirmed_empty_walk_owes_nothing() {
         .unwrap();
     let roots = [g7.root.clone()];
     let key = local_index_key(&path);
-    let debt =
-        |index: &mut ScanIndex| walk(SnapshotSource::Codex, &roots, index)["debt"].clone();
+    let debt = |index: &mut ScanIndex| walk(SnapshotSource::Codex, &roots, index)["debt"].clone();
     let revisions = |index: &ScanIndex| {
         let mut count = 0;
         if let Some(head) = state_v2::load_head(index, &key, u32::MAX).unwrap() {

@@ -270,7 +270,6 @@ impl Totals {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 pub(super) mod tests;
 
 #[cfg(test)]
@@ -296,5 +295,4 @@ pub(super) fn before_absence_parent_probe() {
 }
 
 #[cfg(all(test, unix))]
-#[rustfmt::skip]
 mod absence_parent_counts_tests;

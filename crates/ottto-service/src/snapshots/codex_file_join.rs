@@ -2295,11 +2295,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for ContentDigest {
 crate::heap_layout_bound::no_heap!(false; Tokens);
 
 #[cfg(test)]
-#[rustfmt::skip]
 pub(super) mod tests;
 
 #[cfg(all(test, unix))]
-#[rustfmt::skip]
 pub(in crate::snapshots) mod header_cache_tests;
 
 #[cfg(all(test, unix))]
