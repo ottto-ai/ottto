@@ -245,11 +245,12 @@ fn slot(id: &str) -> ClaudeOAuthUsageCaller {
     ClaudeOAuthUsageCaller::RegisteredSlot(id.to_string())
 }
 
-fn grant_upkeep_consent() {
+// An unchosen setting counts as on, so the off row chooses off explicitly.
+fn choose_upkeep_consent(consent: bool) {
     FileClaudeConfigSlotSettingsStore::default()
         .set_upkeep_consent(
             ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-            true,
+            consent,
         )
         .unwrap();
 }
@@ -603,9 +604,7 @@ mod money_equivalence_tests {
             ),
         ] {
             let collection = Collection::new(&format!("s26-{variant}"), vec![]);
-            if consent {
-                grant_upkeep_consent();
-            }
+            choose_upkeep_consent(consent);
             let steps = [collection.step(T, "default", AX, || {
                 with_claude_pass(saved_only, T, || collect(AX, &default, TOKEN_EXPIRY))
             })];
@@ -626,7 +625,7 @@ mod money_equivalence_tests {
     #[serial]
     fn s26_consented_pass_anchor() {
         let collection = Collection::new("s26-consented", vec![Ok(body(12, 34))]);
-        grant_upkeep_consent();
+        choose_upkeep_consent(true);
         let default = ClaudeOAuthUsageCaller::Default;
         let steps = [collection.step(T, "default", AX, || {
             with_claude_pass(false, T - 30, || collect(AX, &default, TOKEN_EXPIRY))
