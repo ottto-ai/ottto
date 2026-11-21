@@ -935,16 +935,18 @@ pub(in crate::snapshots) fn first_read_aged(
     }) {
         return false;
     }
-    !has_read_evidence(index, path)
+    !has_read_evidence(index, path, true)
 }
 
-fn has_read_evidence(index: &ScanIndex, path: &Path) -> bool {
+/// `unknown`: what an unreadable Tail route or head counts as. Aging keeps
+/// such a file (true); a tier defers it (false), still queued and owed.
+fn has_read_evidence(index: &ScanIndex, path: &Path, unknown: bool) -> bool {
     let key = local_index_key(path);
     index.files.contains_key(&key)
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
-        || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)))
+        || (state_v2::tail_route_path(index).map_or(unknown, |route| route.is_some())
+            && state_v2::load_head(index, &key, u32::MAX).map_or(unknown, |head| head.is_some()))
 }
 
 /// Recency tier (`backfill::FIRST_READ_TIER_DAYS`) for one look at the queue:
@@ -985,7 +987,7 @@ impl TierGate {
                     .and_then(|metadata| metadata.modified().ok())
                     .and_then(unix_seconds)
                     .is_some_and(|modified| modified < cutoff)
-                    && !has_read_evidence(index, &candidate.path)
+                    && !has_read_evidence(index, &candidate.path, false)
             })
             .map(|candidate| candidate.path.clone())
             .collect();

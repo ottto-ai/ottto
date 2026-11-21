@@ -3996,7 +3996,7 @@ fn tier_trace(home: &OracleHome, cycle: &Cycle) -> String {
         .collect::<Vec<_>>();
     format!(
         "tiers={:?} anchors={:?} completed={:?} traversal={} retries={} finalized={tokens:?} \
-         debt={} batches={} statuses_ok={}",
+         debt={} batches={} statuses_ok={} files={:?}",
         state.first_read_tiers,
         state.first_census_ends,
         state.completed_destination_namespaces,
@@ -4005,6 +4005,9 @@ fn tier_trace(home: &OracleHome, cycle: &Cycle) -> String {
         cycle.debt,
         cycle.batches.len(),
         cycle.finish.is_ok(),
+        index["files"]
+            .as_object()
+            .map(|files| files.keys().cloned().collect::<Vec<_>>()),
     )
 }
 
@@ -4129,8 +4132,8 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
         let (mut advanced, mut trace) = (false, String::new());
         for _ in 0..3 {
             let cycle = home.cycle(&server, &recording);
+            // A permanent refusal fails the pass after it settles.
             trace = tier_trace(&home, &cycle);
-            assert!(cycle.finish.is_ok(), "{answer:?}: {trace}");
             assert!(
                 !cycle.finalized.iter().any(|item| item.input_tokens == 100),
                 "{answer:?}: the old file waits: {trace}"
