@@ -4003,6 +4003,7 @@ impl OwnedSourceScan {
             // family, audit, authority, a rebuilt or replayed index) still
             // parses for its local work, but none of its bodies
             // is emitted and its upload tuple stays (`veto_claude_history_emission`).
+            // A new Claude file held only by this page's budget is skipped too.
             // A skipped Claude file held only by this page's budget is queued
             // again as a re-read for the next page of the walk. Codex and Pi
             // keep the adoption-only page budget.
@@ -4050,10 +4051,18 @@ impl OwnedSourceScan {
                 let correction_only = parse_reason
                     == Some(CandidateParseReason::AuthorityQuarantine)
                     && index.claude_authority_correction_only(&candidate);
+                // A new Claude file held only by this page's budget is not
+                // read now: a vetoed read would save it unoffered. It waits
+                // in the queue, keeping its census membership.
+                let budget_held_new = source == SnapshotSource::ClaudeCode
+                    && parse_reason == Some(CandidateParseReason::NewFile)
+                    && history == HistoryDecision::Held(HistoryHold::Budget);
                 // A listed genuine change is never held (it is literal-only
                 // denied), so a held correction-only member is unchanged.
                 match history {
-                    HistoryDecision::Held(hold) if adoption_only || correction_only => {
+                    HistoryDecision::Held(hold)
+                        if adoption_only || correction_only || budget_held_new =>
+                    {
                         if source == SnapshotSource::ClaudeCode {
                             let carried = index
                                 .accepted_rebuild_incidence
@@ -4078,7 +4087,10 @@ impl OwnedSourceScan {
                                     traversal.pending_candidates.push_back(ScanTraversalPath {
                                         scan_root: candidate.scan_root.clone(),
                                         path: candidate.path.clone(),
-                                        census_member: false,
+                                        census_member: budget_held_new
+                                            && selected_flags
+                                                .get(&local_index_key(&candidate.path))
+                                                .is_some_and(|&(member, _)| member),
                                         watcher_hint: false,
                                     });
                                 }

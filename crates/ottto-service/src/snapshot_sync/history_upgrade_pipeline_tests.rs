@@ -578,11 +578,12 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     let mut sent = Vec::new();
     crate::snapshots::with_body_witness_adoption_page_budget(1, || {
         let replayed = fixture.cycle("2026-08-02T09:00:00Z", replay);
-        assert_eq!(replayed.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        // Only the admitted file is read. A budget-held new file waits in the
+        // walk unread, never saved unoffered at revision 0.
+        assert_eq!(replayed.scan.scanned_file_count, 1);
         assert_eq!(replayed.corrections, 0);
         assert!(replayed.index.generation > baseline.generation, "no reset");
-        assert_eq!(replayed.index.files.len(), HISTORY_SESSIONS.len());
-        assert_eq!(HistoryFixture::census_keys(&replayed.index), 3);
+        assert_eq!(replayed.index.files.len(), 1);
         sent.push(replayed.uploaded.len());
         for hour in 10..13 {
             sent.push(
@@ -3102,5 +3103,148 @@ fn e2_restamp_carries_the_retired_permit_bit() {
                 "and keeps the retired bit: {state}"
             );
         })
+    });
+}
+
+/// A replayed history import with more pre-cutoff new files than the page
+/// budget (one file here). An overflow file is never saved unoffered at
+/// revision 0 with no entity: it stays a census member of the same walk and
+/// is offered, ACKed and stamped there, each file exactly once.
+#[test]
+fn budget_held_new_history_is_offered_in_the_same_walk_once() {
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    let fixture = HistoryFixture::new("history-upgrade-budget-held-new");
+    fixture.baseline();
+    let replay = HistoryCycle {
+        replay_generation: Some("history-replay-budget-held"),
+        ..HISTORY_CURRENT
+    };
+    let mut offered = BTreeMap::<String, usize>::new();
+    crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+        for (page, hour) in (9..12).enumerate() {
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), replay);
+            assert_eq!(outcome.uploaded.len(), 1, "page {page}: one file per page");
+            assert_eq!(
+                outcome.scan.scanned_file_count, 1,
+                "page {page}: a budget-held file is not read"
+            );
+            assert_eq!(
+                outcome.scan.census_complete,
+                page == 2,
+                "page {page}: the walk stays open until every held file is read"
+            );
+            for session in &outcome.uploaded {
+                let body = outcome
+                    .scan
+                    .snapshots
+                    .iter()
+                    .find(|item| &item.source_session_id == session)
+                    .expect("sent body");
+                assert_eq!(body.request_count, 1, "{session}: whole body");
+                assert_eq!(body.input_tokens + body.output_tokens, 20, "{session}");
+                *offered.entry(session.clone()).or_default() += 1;
+            }
+            // Every saved file was offered and ACKed: no unoffered entry.
+            assert_eq!(outcome.index.files.len(), page + 1, "page {page}");
+            for (key, entry) in &outcome.index.files {
+                assert_eq!(entry.effective_upload_body_witness_revision, 3, "{key}");
+                assert!(entry.last_snapshot_fingerprint.is_some(), "{key}");
+                assert!(entry.last_upload_body_witness.is_some(), "{key}");
+                assert!(entry.upload_context_receipt.is_some(), "{key}: ACK");
+                assert!(
+                    outcome
+                        .index
+                        .file_snapshot_fingerprints
+                        .get(key)
+                        .is_some_and(|entities| !entities.is_empty()),
+                    "{key}: entity"
+                );
+            }
+        }
+        let idle = fixture.cycle("2026-08-02T12:00:00Z", replay);
+        assert!(idle.uploaded.is_empty(), "{:?}", idle.uploaded);
+        assert_eq!(idle.scan.scanned_file_count, 0, "no second read");
+    });
+    assert_eq!(
+        offered,
+        HISTORY_SESSIONS
+            .iter()
+            .map(|session| (session.to_string(), 1))
+            .collect::<BTreeMap<_, _>>()
+    );
+}
+
+/// Listed and paused-list holds keep their behaviour under a small page
+/// budget. A new listed file keeps its held local entry (revision 0, no body
+/// witness), is never offered and is not read again; the unlisted files are
+/// paced, each offered once. A paused list offers nothing and reads nothing
+/// after its first page.
+#[test]
+fn listed_and_paused_holds_are_unchanged_by_budget_held_new_history() {
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    let replay = HistoryCycle {
+        replay_generation: Some("history-replay-held"),
+        ..HISTORY_CURRENT
+    };
+    let listed = HISTORY_SESSIONS[0];
+    let fixture = HistoryFixture::new("history-upgrade-budget-listed");
+    fixture.baseline();
+    fixture.install_list(&[listed]);
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
+    let mut offered = BTreeMap::<String, usize>::new();
+    let (mut sent, mut reads) = (Vec::new(), Vec::new());
+    crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+        for hour in 9..13 {
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), replay);
+            assert!(!outcome.uploaded.contains(listed), "hour {hour}");
+            for session in &outcome.uploaded {
+                *offered.entry(session.clone()).or_default() += 1;
+            }
+            let key = PipelineFixture::key(&outcome.index, listed);
+            let entry = &outcome.index.files[&key];
+            assert_eq!(entry.effective_upload_body_witness_revision, 0);
+            assert!(entry.last_upload_body_witness.is_none());
+            sent.push(outcome.uploaded.len());
+            reads.push(outcome.scan.scanned_file_count);
+        }
+    });
+    assert_eq!(sent, vec![1, 1, 0, 0]);
+    assert_eq!(
+        reads,
+        vec![2, 1, 0, 0],
+        "the listed file is read once, held"
+    );
+    assert_eq!(
+        offered,
+        HISTORY_SESSIONS[1..]
+            .iter()
+            .map(|session| (session.to_string(), 1))
+            .collect::<BTreeMap<_, _>>()
+    );
+
+    let fixture = HistoryFixture::new("history-upgrade-budget-paused");
+    fixture.baseline();
+    fixture.install_list(&[]);
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
+    std::fs::remove_file(
+        fixture
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+    )
+    .unwrap();
+    crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+        for hour in 9..12 {
+            let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), replay);
+            assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
+            assert!(outcome
+                .index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 0));
+            if hour > 9 {
+                assert_eq!(outcome.scan.scanned_file_count, 0, "hour {hour}");
+            }
+            crate::snapshots::restart_claude_reemission_stop_for_test();
+        }
     });
 }
