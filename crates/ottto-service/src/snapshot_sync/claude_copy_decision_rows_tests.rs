@@ -1859,6 +1859,91 @@ impl Table {
     }
 }
 
+/// Every row of the table, in order.
+fn all_rows() -> Table {
+    let mut table = Table::default();
+    table.row("accepted_holder_before_copy", |name| {
+        earlier_holder(name, Ack::Exact)
+    });
+    table.row("local_holder_before_copy", |name| {
+        earlier_holder(name, Ack::Local)
+    });
+    table.row("accepted_holder_after_copy", |name| {
+        late_holder(name, Ack::Exact)
+    });
+    table.row("unstored_holder_after_copy", |name| {
+        late_holder(name, Ack::Unstored)
+    });
+    table.row("usage_identical_holder_after_copy", |name| {
+        late_holder(name, Ack::UsageIdentical)
+    });
+    table.row("dominated_holder_after_copy", |name| {
+        late_holder(name, Ack::Dominated)
+    });
+    table.row("deleted_accepted_holder", |name| {
+        holder_loss(name, HolderLoss::DeleteAccepted)
+    });
+    table.row("deleted_local_holder", |name| {
+        holder_loss(name, HolderLoss::DeleteLocal)
+    });
+    table.row("retired_holder_keeps_saved_group", |name| {
+        holder_loss(name, HolderLoss::Retire)
+    });
+    table.row("lossy_holder_keeps_saved_group", |name| {
+        holder_loss(name, HolderLoss::Lossy)
+    });
+    table.row("retired_named_parent", retired_parent);
+    table.row("fresh_destination_unstored", fresh_destination);
+    table.row("cloned_main_requests", |name| twins(name, false, false));
+    table.row("distinct_twin_requests", |name| twins(name, true, false));
+    table.row("absent_path_twin_holds", |name| twins(name, true, true));
+    table.row("redundant_absent_path_twin_releases", |name| {
+        twins(name, false, true)
+    });
+    table.row("summed_session_latest_clock", latest_clock);
+    table.row("idless_prefix_restored_and_disclosed", idless_copy);
+    table.row("resumed_rule_a_both_paths", |name| {
+        same_session(name, SameSession::RuleA)
+    });
+    table.row("own_session_acceptance_one_owned_location", |name| {
+        same_session(name, SameSession::OnlyNewerOwned)
+    });
+    table.row("resumed_same_session_holder_off_page", |name| {
+        same_session(name, SameSession::HolderOffPage)
+    });
+    table.row("empty_main_carried_by_twin", |name| carrier(name, false));
+    table.row("content_held_holder_on_page", |name| carrier(name, true));
+    table.row("carrier_transfer_keeps_copy_settled", carrier_transfer);
+    table.row("settled_counted_copy_rule_five", version_five);
+    table.row("before_copy_proof_cutoff", |name| {
+        cutoff(name, "2026-11-03", true)
+    });
+    table.row("after_copy_proof_cutoff", |name| {
+        cutoff(name, "2026-11-04", true)
+    });
+    table.row("no_accepted_copy_grandfather", |name| {
+        cutoff(name, "2026-11-03", false)
+    });
+    table.row("forked_agent_root_on_page", |name| {
+        forked_agent(name, "page")
+    });
+    table.row("forked_agent_root_in_census", |name| {
+        forked_agent(name, "census")
+    });
+    table.row("forked_agent_without_witness", |name| {
+        forked_agent(name, "missing")
+    });
+    table.row("covered_only_path_has_no_body", covered_only);
+    table.row("ambiguous_copied_duplicate", ambiguous_duplicate);
+    table.row("subagent_before_request_cutoff", |name| {
+        subagent_twins(name, "2026-11-04", false)
+    });
+    table.row("subagent_after_request_cutoff", |name| {
+        subagent_twins(name, "2026-11-05", true)
+    });
+    table
+}
+
 #[test]
 #[serial(client_report)]
 fn full_copy_decision_rows() {
@@ -1868,86 +1953,7 @@ fn full_copy_decision_rows() {
     }
     with_e2(|| {
         with_scan_clock(nanos("2026-11-07T08:00:00Z") as u64 / 1_000_000_000, || {
-            let mut table = Table::default();
-            table.row("accepted_holder_before_copy", |name| {
-                earlier_holder(name, Ack::Exact)
-            });
-            table.row("local_holder_before_copy", |name| {
-                earlier_holder(name, Ack::Local)
-            });
-            table.row("accepted_holder_after_copy", |name| {
-                late_holder(name, Ack::Exact)
-            });
-            table.row("unstored_holder_after_copy", |name| {
-                late_holder(name, Ack::Unstored)
-            });
-            table.row("usage_identical_holder_after_copy", |name| {
-                late_holder(name, Ack::UsageIdentical)
-            });
-            table.row("dominated_holder_after_copy", |name| {
-                late_holder(name, Ack::Dominated)
-            });
-            table.row("deleted_accepted_holder", |name| {
-                holder_loss(name, HolderLoss::DeleteAccepted)
-            });
-            table.row("deleted_local_holder", |name| {
-                holder_loss(name, HolderLoss::DeleteLocal)
-            });
-            table.row("retired_holder_keeps_saved_group", |name| {
-                holder_loss(name, HolderLoss::Retire)
-            });
-            table.row("lossy_holder_keeps_saved_group", |name| {
-                holder_loss(name, HolderLoss::Lossy)
-            });
-            table.row("retired_named_parent", retired_parent);
-            table.row("fresh_destination_unstored", fresh_destination);
-            table.row("cloned_main_requests", |name| twins(name, false, false));
-            table.row("distinct_twin_requests", |name| twins(name, true, false));
-            table.row("absent_path_twin_holds", |name| twins(name, true, true));
-            table.row("redundant_absent_path_twin_releases", |name| {
-                twins(name, false, true)
-            });
-            table.row("summed_session_latest_clock", latest_clock);
-            table.row("idless_prefix_restored_and_disclosed", idless_copy);
-            table.row("resumed_rule_a_both_paths", |name| {
-                same_session(name, SameSession::RuleA)
-            });
-            table.row("own_session_acceptance_one_owned_location", |name| {
-                same_session(name, SameSession::OnlyNewerOwned)
-            });
-            table.row("resumed_same_session_holder_off_page", |name| {
-                same_session(name, SameSession::HolderOffPage)
-            });
-            table.row("empty_main_carried_by_twin", |name| carrier(name, false));
-            table.row("content_held_holder_on_page", |name| carrier(name, true));
-            table.row("carrier_transfer_keeps_copy_settled", carrier_transfer);
-            table.row("settled_counted_copy_rule_five", version_five);
-            table.row("before_copy_proof_cutoff", |name| {
-                cutoff(name, "2026-11-03", true)
-            });
-            table.row("after_copy_proof_cutoff", |name| {
-                cutoff(name, "2026-11-04", true)
-            });
-            table.row("no_accepted_copy_grandfather", |name| {
-                cutoff(name, "2026-11-03", false)
-            });
-            table.row("forked_agent_root_on_page", |name| {
-                forked_agent(name, "page")
-            });
-            table.row("forked_agent_root_in_census", |name| {
-                forked_agent(name, "census")
-            });
-            table.row("forked_agent_without_witness", |name| {
-                forked_agent(name, "missing")
-            });
-            table.row("covered_only_path_has_no_body", covered_only);
-            table.row("ambiguous_copied_duplicate", ambiguous_duplicate);
-            table.row("subagent_before_request_cutoff", |name| {
-                subagent_twins(name, "2026-11-04", false)
-            });
-            table.row("subagent_after_request_cutoff", |name| {
-                subagent_twins(name, "2026-11-05", true)
-            });
+            let table = all_rows();
             let Table {
                 bodies,
                 inputs,
