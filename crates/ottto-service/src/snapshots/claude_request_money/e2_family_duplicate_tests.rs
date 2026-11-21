@@ -220,3 +220,127 @@ fn family_duplicate_cold_full_matches_tail_route() {
         );
     });
 }
+
+/// A session that sorts before the root: the page's first history file.
+const FILLER: &str = "00000000-0000-4000-8000-000000000001";
+
+/// [money] A new history import (a history cutoff, an installed empty list,
+/// a page byte budget): the large root is held by the budget while its small
+/// fork is read before it, on the same page or on the next one. The fork's
+/// body still drops the copied parent response, and every session's totals
+/// equal a cold Full of the same files.
+#[test]
+fn budget_held_new_root_keeps_its_fork_copy_counted_once() {
+    with_max_gated_claude_revision(3, || {
+        for next_page in [false, true] {
+            let home = ScratchDir::canonical("e2-family-duplicate-budget-held");
+            let (project, support) = (home.join("project"), home.join("support"));
+            fixture::write_exclusions(&support, &[]);
+            let filler = project.join(format!("{FILLER}.jsonl"));
+            let mut filler_line = line("filler-1", "2026-08-02T07:00:05Z", 5);
+            filler_line["sessionId"] = json!(FILLER);
+            write(&filler, &[filler_line], MODIFIED);
+            let mut lines = root_lines();
+            lines[0]["pad"] = json!("x".repeat(16_384));
+            let root = root_path(&project);
+            write(&root, &lines, MODIFIED);
+            let fork = fork_path(&project, "agent-a1");
+            write(&fork, &fork_lines("agent-a1", true, 2), MODIFIED);
+            let size = |path: &Path| fs::metadata(path).unwrap().len();
+            // The filler and the fork fit; the root never fits after either.
+            let budget = size(&filler) + size(&fork);
+            assert!(size(&root) > budget);
+            let births = BTreeMap::from([(root.clone(), rfc3339_unix_nanos(BIRTH).unwrap())]);
+            let member = format!("{ROOT}_agent-a1");
+            let scan = |scanner: &E2ScanFixture, mut index: ScanIndex, limit| {
+                index.activate_effective_upload_body_witness_revision(3);
+                index.adopt_effective_upload_body_witness_revision_monotonically();
+                index.activate_upload_context("family-duplicate-budget-context".into());
+                index.load_claude_reemission_exclusions(&support);
+                let roots = std::slice::from_ref(&project);
+                let (mut index, mut scan, _) =
+                    scanner.scan(roots, &support, index, limit, false, &births, &[]);
+                let _ = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                    &support, &mut scan, &mut index,
+                );
+                index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
+                let policy = SnapshotUploadPolicy::default();
+                apply_upload_policy(SnapshotSource::ClaudeCode, &mut scan.snapshots, policy);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+                let accepted = scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone());
+                index.record_accepted_snapshot_fingerprints(&accepted.collect());
+                let acks = fixture::exact_acks_for_test(&scan.snapshots);
+                fixture::accept_upload_context_acks_for_test(&mut index, &scan.snapshots, &acks);
+                (index, scan)
+            };
+            let totals = |s: &crate::snapshots::SnapshotItem| {
+                (
+                    s.request_count,
+                    s.removed_request_count.unwrap_or(0),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cost.as_ref().and_then(|cost| cost.total_cost_usd.clone()),
+                )
+            };
+            // Paced: born before the cutoff, so every file is owed history.
+            let scanner = E2ScanFixture::default();
+            let mut index = ScanIndex::default();
+            index.claude_history_cutoff_unix_seconds = Some(
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+            let limit = if next_page {
+                2
+            } else {
+                MAX_BACKFILL_FILES_PER_SOURCE
+            };
+            let mut delivered = BTreeMap::new();
+            let mut pages = Vec::new();
+            fixture::with_history_byte_limit(budget, || {
+                for _ in 0..6 {
+                    let (next, page) = scan(&scanner, index.clone(), limit);
+                    index = next;
+                    if page.scanned_file_count == 0 {
+                        break;
+                    }
+                    let sent = page
+                        .snapshots
+                        .iter()
+                        .map(|s| s.source_session_id.clone())
+                        .collect::<BTreeSet<_>>();
+                    for s in &page.snapshots {
+                        delivered.insert(s.source_session_id.clone(), totals(s));
+                    }
+                    pages.push(sent);
+                }
+            });
+            // The fork is sent before the root on every route.
+            let fork_page = pages.iter().position(|sent| sent.contains(&member));
+            let root_page = pages.iter().position(|sent| sent.contains(ROOT));
+            assert!(fork_page < root_page, "next_page {next_page}: {pages:?}");
+            assert_eq!(fork_page, Some(usize::from(next_page)), "{pages:?}");
+            assert_eq!(
+                (delivered[&member].0, delivered[&member].1),
+                (2, 1),
+                "next_page {next_page}: the fork drops the copied parent response"
+            );
+            let (_, cold) = scan(
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                MAX_BACKFILL_FILES_PER_SOURCE,
+            );
+            let cold = cold
+                .snapshots
+                .iter()
+                .map(|s| (s.source_session_id.clone(), totals(s)))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(cold.len(), 3);
+            assert_eq!(delivered, cold, "next_page {next_page}: equals a cold Full");
+        }
+    });
+}
