@@ -1289,7 +1289,9 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
 }
 
 /// [money] A content twin acquired in another evidence chunk cannot hold
-/// its overlapping holder or re-arm an ACKed copy on unchanged saves.
+/// its overlapping holder or re-arm an ACKed copy on unchanged saves. H and
+/// T run in the two planned chunks; the ACKed heads are ROOT 10/1, COPY
+/// 20/2 and THIRD 10/1.
 #[test]
 fn content_twin_in_another_chunk_counts_and_settles() {
     fn removed(index: &ScanIndex, key: &str) -> BTreeSet<u64> {
@@ -1382,11 +1384,18 @@ fn content_twin_in_another_chunk_counts_and_settles() {
                 reference
             })
         });
-        let before = crate::snapshot_sync::evidence_chunks_for_test();
-        first.enrich(&c);
-        assert!(
-            crate::snapshot_sync::evidence_chunks_for_test() - before >= 2,
-            "ROOT and THIRD's nonzero sidecars force different evidence chunks"
+        // ROOT and THIRD's nonzero sidecars force different evidence chunks.
+        let placed = evidence_chunk_tests::enrich_planned(
+            &mut first,
+            &c,
+            &[ROOT, COPY, THIRD],
+            &[ROOT, THIRD],
+            2,
+        );
+        assert_ne!(
+            placed[&location_key(&main_key)],
+            placed[&location_key(&twin_key)],
+            "H and T run in different chunks"
         );
         assert_eq!(
             first
@@ -1404,13 +1413,6 @@ fn content_twin_in_another_chunk_counts_and_settles() {
             .disposition
             .quarantined_fingerprints(&first.scan.snapshots)
             .contains(&root.snapshot_fingerprint));
-        assert_eq!(root.request_count, 1, "H counts A");
-        assert_eq!(
-            body(&first, COPY).unwrap().request_count,
-            2,
-            "C counts B and D"
-        );
-        assert_eq!(body(&first, THIRD).unwrap().request_count, 1, "S counts B");
         assert_eq!(removed(&first.index, &copy_key), BTreeSet::from([a]));
         assert_eq!(removed(&first.index, &twin_key), BTreeSet::from([a, b]));
         assert!(first
@@ -1421,17 +1423,36 @@ fn content_twin_in_another_chunk_counts_and_settles() {
             .any(|(holder, ids)| *holder == location_key(&main_key) && ids.contains(&a)));
         money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&first));
 
-        let mut accepted = BTreeMap::new();
-        prior = accept_monotone_page(&c, &prior, first, &mut accepted);
-        assert_eq!((accepted[ROOT], accepted[COPY], accepted[THIRD]), (1, 2, 1));
+        let holds = first.finish();
+        let heads = (first.scan.snapshots.iter())
+            .map(|item| {
+                let head = (item.input_tokens, item.request_count);
+                (item.source_session_id.as_str(), head)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(first.scan.snapshots.len(), 3, "one body per session");
+        // H counts A, C counts B and D, S counts B.
         assert_eq!(
-            accepted.values().sum::<u64>(),
-            4,
+            heads,
+            BTreeMap::from([(ROOT, (10, 1)), (COPY, (20, 2)), (THIRD, (10, 1))])
+        );
+        assert_eq!(
+            (heads.values()).fold((0u64, 0u64), |(input, requests), (i, r)| {
+                (input + i, requests + r)
+            }),
+            (40, 4),
             "A once, B in P and Q, D once"
         );
+        let mut accepted = BTreeMap::new();
+        prior = accept_finished_monotone_page(&c, &prior, first, &mut accepted, holds);
+        assert_eq!((accepted[ROOT], accepted[COPY], accepted[THIRD]), (1, 2, 1));
+        // Reload drops the runtime context; observe H's receipt under the
+        // destination that received this page's exact ACKs.
+        let mut context = prior.clone();
+        context.activate_upload_context("e2-synthetic-destination".into());
         assert!(
-            prior.files[&main_key].upload_context_receipt.is_some(),
-            "H's counted body was ACKed"
+            upload_context_receipt_earned_for_test(&context, &main),
+            "H's counted body earned its ACK receipt"
         );
         assert_eq!(removed(&prior, &copy_key), BTreeSet::from([a]));
         assert_eq!(removed(&prior, &twin_key), BTreeSet::from([a, b]));
