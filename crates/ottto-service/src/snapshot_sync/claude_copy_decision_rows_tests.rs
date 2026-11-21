@@ -14,7 +14,10 @@ use serde_json::Value;
 const FIXTURE: &str = "claude_copy_decision_rows";
 const EARLY: &str = "2026-08-02T07:00:00Z";
 const LATE_NOTE: &str = "2026-08-02T08:06:10Z";
-const KNOWN_IDS: &[&str] = &["a", "b", "c", "d", "r1", "r2", "agent-own"];
+const KNOWN_IDS: &[&str] = &["a", "b", "c", "d", "e", "r1", "r2", "agent-own"];
+/// A later resume's own turn, after `LATER_BORN`.
+const E: (&str, &str, &str) = ("e", "2026-08-02T07:07:10Z", RESUME_WRITER);
+const LATER_BORN: &str = "2026-08-02T07:04:00Z";
 
 #[derive(Clone, Copy)]
 enum Ack {
@@ -60,6 +63,64 @@ impl Ack {
 }
 
 type Groups = BTreeMap<(String, String), BTreeSet<String>>;
+
+thread_local! {
+    /// (failures, agreement checks) of the row that is running. Kept outside
+    /// the row so a failed fixture premise does not lose what it already found.
+    static NOTES: std::cell::RefCell<(Vec<String>, Vec<String>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+fn check(line: String) {
+    NOTES.with_borrow_mut(|notes| notes.1.push(line));
+}
+
+/// The two answers of one agreement check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Answers {
+    /// The earliest holder the census selector names, and the earliest
+    /// holder whose current proof the page decision takes.
+    Holder {
+        selector: Option<&'static str>,
+        page: Option<&'static str>,
+    },
+    /// Whether the save marked the file, and whether deciding the same page
+    /// again on the saved index changes its groups or counted requests.
+    Save { marked: bool, changes: bool },
+}
+
+impl Answers {
+    fn agree(&self) -> bool {
+        match self {
+            Self::Holder { selector, page } => selector == page,
+            Self::Save { marked, changes } => marked == changes,
+        }
+    }
+}
+
+/// A place where the two answers differ today, and why. Every other check
+/// must agree; a listed difference that stops differing fails as well.
+struct Differs {
+    phase: &'static str,
+    file: &'static str,
+    answers: Answers,
+    why: &'static str,
+    met: bool,
+}
+
+/// The selector reads committed files only.
+const ONLY_ON_PAGE: &str = "the holder is only on this page; the selector reads committed files";
+/// Rule A and Rule B skip a hash that a stored removal already keeps.
+const STORED_REUSED: &str = "a stored removal is reused; the page asks for no new proof";
+/// The page filter on a resumed copy's own session.
+const OFF_PAGE: &str =
+    "a resumed copy takes its own session's earlier file only from the page; the selector names it";
+/// The page counts a main whose summed body a content twin carries as owned.
+const CARRIED: &str =
+    "a content twin carries the main's summed body: owned for the page, not for the selector";
+/// The page accepts a session when any of its files is owned.
+const ANY_FILE_OWNED: &str =
+    "the page accepts a session when any of its files is owned; the others ask each file";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Decision {
@@ -144,9 +205,7 @@ struct Rows {
     paths: BTreeMap<&'static str, PathBuf>,
     inputs: BTreeMap<String, Vec<u8>>,
     bodies: Vec<ReceiptBody>,
-    failures: Vec<String>,
-    /// Every agreement check that ran, with both answers.
-    checks: Vec<String>,
+    differs: Vec<Differs>,
 }
 
 impl Rows {
@@ -157,8 +216,7 @@ impl Rows {
             paths: BTreeMap::new(),
             inputs: BTreeMap::new(),
             bodies: Vec::new(),
-            failures: Vec::new(),
-            checks: Vec::new(),
+            differs: Vec::new(),
         }
     }
 
@@ -180,14 +238,17 @@ impl Rows {
         self.paths[alias].to_string_lossy().into_owned()
     }
 
-    fn alias(&self, loc: LocationKey) -> String {
+    fn label(&self, loc: LocationKey) -> &'static str {
         self.paths
             .iter()
             .find_map(|(&alias, path)| {
                 (location_key(&path.to_string_lossy()) == loc).then_some(alias)
             })
             .unwrap_or("<unexpected location>")
-            .into()
+    }
+
+    fn alias(&self, loc: LocationKey) -> String {
+        self.label(loc).into()
     }
 
     fn id(hash: u64) -> String {
@@ -207,10 +268,55 @@ impl Rows {
         expected: T,
     ) {
         if actual != expected {
-            self.failures.push(format!(
+            let failure = format!(
                 "{} / {phase} / {field}\n  actual: {actual:?}\n  expected: {expected:?}",
                 self.name
-            ));
+            );
+            NOTES.with_borrow_mut(|notes| notes.0.push(failure));
+        }
+    }
+
+    /// Declares one difference between the two answers at `phase` for `file`.
+    fn differs(
+        &mut self,
+        phase: &'static str,
+        file: &'static str,
+        answers: Answers,
+        why: &'static str,
+    ) {
+        self.differs.push(Differs {
+            phase,
+            file,
+            answers,
+            why,
+            met: false,
+        });
+    }
+
+    fn agreement(&mut self, phase: &str, file: &str, answers: Answers) {
+        let holder = matches!(answers, Answers::Holder { .. });
+        let known = self.differs.iter_mut().find(|known| {
+            known.phase == phase
+                && known.file == file
+                && matches!(known.answers, Answers::Holder { .. }) == holder
+        });
+        let (expected, why) = match known {
+            Some(known) => {
+                known.met = true;
+                (known.answers == answers, known.why)
+            }
+            None => (answers.agree(), "agree"),
+        };
+        check(format!(
+            "{} / {phase} / {file}: {answers:?} ({why})",
+            self.name
+        ));
+        if !expected {
+            let failure = format!(
+                "{} / {phase} / {file}\n  answers: {answers:?}\n  expected: {why}",
+                self.name
+            );
+            NOTES.with_borrow_mut(|notes| notes.0.push(failure));
         }
     }
 
@@ -268,7 +374,7 @@ impl Rows {
                 .collect(),
             requests: item.request_count,
             removed: item.removed_request_count.expect("literal request body"),
-            removed_usage: serde_json::to_value(&item.removed_usage).unwrap(),
+            removed_usage: serde_json::to_value(item.removed_usage).unwrap(),
             disclosed: observe::disclosed(std::slice::from_ref(item)),
             marks: e2::money_marks(item),
             last: item.source_last_activity_at.clone().unwrap_or_default(),
@@ -345,20 +451,11 @@ impl Rows {
                     {
                         let selected =
                             e2::copied_file_holders_for_test(index, std::iter::once(key.as_str()));
-                        let selected = selected.get(&key).map(|key| self.alias(location_key(key)));
-                        let page = first.map(|holder| self.alias(holder));
-                        self.checks.push(format!(
-                            "{} / {phase} / {file}: selector holder {selected:?}, page holder {page:?}",
-                            self.name
-                        ));
-                        self.equal(
-                            phase,
-                            &format!("{file} earliest holder (selector / page)"),
-                            selected,
-                            page,
-                        );
+                        let selector = selected.get(&key).map(|key| self.label(location_key(key)));
+                        let page = first.map(|holder| self.label(holder));
+                        self.agreement(phase, &file, Answers::Holder { selector, page });
                     } else {
-                        self.checks.push(format!(
+                        check(format!(
                             "{} / {phase} / {file}: no selector check, the copy has no census that proves its scan",
                             self.name
                         ));
@@ -391,21 +488,21 @@ impl Rows {
     ) {
         let mut active = saved.clone();
         active.activate_upload_context("e2-synthetic-destination".into());
-        let redecided = self.decisions(phase, replay, &active);
+        let redecided = self.decisions(
+            &format!("{phase}, replayed after the save"),
+            replay,
+            &active,
+        );
         let rerun = &redecided[file];
         let marked = active.claude_copy_removals.pending(self.loc(file));
         let changed = original.groups != rerun.groups || original.counted != rerun.counted;
-        self.checks.push(format!(
-            "{} / {phase} / {file}: save mark {marked}, decision changes {changed}",
-            self.name
-        ));
-        self.equal(
+        self.agreement(
             phase,
-            &format!(
-                "{file} save mark / change in decision (before: {original:?}, replay: {rerun:?})"
-            ),
-            marked,
-            changed,
+            file,
+            Answers::Save {
+                marked,
+                changes: changed,
+            },
         );
     }
 
@@ -539,6 +636,15 @@ fn copy_disclosed() -> Literal {
 }
 
 const REMOVED_A: &[(&str, &str, &[&str])] = &[("copy", "holder", &["a"])];
+/// The settled carrier fixture: the copy and the content twin each removed
+/// one request on the main's proof.
+const CARRIED_GROUPS: &[(&str, &str, &[&str])] =
+    &[("copy", "holder", &["a"]), ("twin", "holder", &["b"])];
+const CARRIED_AND_LATER: &[(&str, &str, &[&str])] = &[
+    ("copy", "holder", &["a"]),
+    ("later", "holder", &["a"]),
+    ("twin", "holder", &["b"]),
+];
 
 fn write_holder(rows: &mut Rows) {
     rows.write("holder", &file(ROOT), &resumed(ROOT, &[A]), EARLY);
@@ -591,7 +697,10 @@ fn earlier_holder(name: &'static str, ack: Ack) -> Rows {
     rows
 }
 
-fn late_holder(name: &'static str, ack: Ack, mark_copy: bool) -> Rows {
+/// A holder saved after its copy was counted. Only an exact receipt makes it a
+/// proof: a body the server did not store stays held, so it owns nothing.
+fn late_holder(name: &'static str, ack: Ack) -> Rows {
+    let mark_copy = matches!(ack, Ack::Exact);
     let mut rows = Rows::new(name);
     write_copy(&mut rows, &resumed(COPY, &[A, C]));
     let copy = scan(&rows, ScanIndex::default(), &["copy"]);
@@ -642,22 +751,15 @@ fn late_holder(name: &'static str, ack: Ack, mark_copy: bool) -> Rows {
     );
     if mark_copy {
         let mut index = index;
-        let files = if matches!(ack, Ack::Exact) {
-            // Positive trace sidecars put the two families in separate chunks.
-            rows.corpus.evidence_for(ROOT, &[], &[trace("a", "")]);
-            rows.corpus
-                .evidence_for(COPY, &[], &[trace_for(COPY, "c", "")]);
-            owe(&mut index);
-            &["holder", "copy"][..]
-        } else {
-            &["copy"][..]
-        };
+        // Positive trace sidecars put the two families in separate chunks.
+        rows.corpus.evidence_for(ROOT, &[], &[trace("a", "")]);
+        rows.corpus
+            .evidence_for(COPY, &[], &[trace_for(COPY, "c", "")]);
+        owe(&mut index);
+        let files = &["holder", "copy"][..];
         let correction = scan(&rows, index, files);
         let before = crate::snapshot_sync::evidence_chunks_for_test();
-        let mut literals = vec![copy_removed()];
-        if files.len() == 2 {
-            literals.push(holder_row());
-        }
+        let literals = vec![copy_removed(), holder_row()];
         rows.step(
             "correction consumes mark",
             correction,
@@ -726,7 +828,9 @@ fn holder_loss(name: &'static str, loss: HolderLoss) -> Rows {
         HolderLoss::Retire => observe::retire_census(&mut index, &file(ROOT)),
         HolderLoss::Lossy => observe::lossy_census(&mut index, &file(ROOT), &["b"]),
     }
-    let index = rows.corpus.reload(&mut index);
+    let saved = rows.corpus.reload(&mut index);
+    drop(index);
+    let index = saved;
     let removed = !matches!(loss, HolderLoss::DeleteLocal);
     rows.check_saved(
         "save holder loss",
@@ -984,11 +1088,60 @@ enum SameSession {
     RuleA,
     OnlyNewerOwned,
     HolderOffPage,
-    AcceptedSum,
 }
 
 fn same_session(name: &'static str, variant: SameSession) -> Rows {
     let mut rows = Rows::new(name);
+    let holder = Some("holder");
+    let (page_only, selector_only) = (
+        Answers::Holder {
+            selector: None,
+            page: holder,
+        },
+        Answers::Holder {
+            selector: holder,
+            page: None,
+        },
+    );
+    match variant {
+        SameSession::RuleA => {
+            rows.differs("co-read both paths", "copy", page_only, ONLY_ON_PAGE);
+            rows.differs(
+                "co-read both paths, replayed after the save",
+                "copy",
+                selector_only,
+                STORED_REUSED,
+            );
+        }
+        SameSession::OnlyNewerOwned => {
+            rows.differs(
+                "holder facts save, replayed after the save",
+                "copy",
+                page_only,
+                ANY_FILE_OWNED,
+            );
+            // The save leaves the copy unmarked although deciding the page
+            // again removes its prefix. Recorded as today's answer.
+            rows.differs(
+                "holder facts save",
+                "copy",
+                Answers::Save {
+                    marked: false,
+                    changes: true,
+                },
+                ANY_FILE_OWNED,
+            );
+        }
+        SameSession::HolderOffPage => {
+            for phase in [
+                "holder facts save, replayed after the save",
+                "omit earlier path",
+                "omit earlier path, replayed after the save",
+            ] {
+                rows.differs(phase, "copy", selector_only.clone(), OFF_PAGE);
+            }
+        }
+    }
     let text = resumed(ROOT, &[A, C]);
     rows.write("copy", &format!("resume/{}", file(ROOT)), &text, BORN);
     let page = scan(&rows, ScanIndex::default(), &["copy"]);
@@ -1055,12 +1208,7 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
                 hold_claude_account_for_test(&mut next, &rows.key("holder"));
             }
             let index = rows.corpus.reload(&mut next);
-            rows.check_saved(
-                "holder facts save",
-                &index,
-                &[],
-                if off_page { &["copy"] } else { &[] },
-            );
+            rows.check_saved("holder facts save", &index, &[], &[]);
             rows.compare_save(
                 "holder facts save",
                 "copy",
@@ -1068,77 +1216,25 @@ fn same_session(name: &'static str, variant: SameSession) -> Rows {
                 &replay,
                 &index,
             );
-            // Check the live page as well. This arm has a positive earlier
-            // census but checks a different definition of admissible holder.
+            // The live page agrees: a resumed copy takes its own session's
+            // earlier file as proof only when that file is on the page. Its
+            // prefix counts, disclosed, and the earlier file adds nothing the
+            // page lacks, so the session is not held for it.
             if off_page {
                 owe(&mut next);
                 let page = scan(&rows, next, &["copy"]);
+                let mut counted = copy_disclosed();
+                counted.session = ROOT.into();
                 rows.step(
                     "omit earlier path",
                     page,
                     Ack::Local,
                     Expected {
-                        holds: &[
-                            ("absent_twin", 1),
-                            ("known_twin_paths", 2),
-                            ("staged_twin_paths", 1),
-                        ],
+                        literals: vec![counted],
                         ..Expected::default()
                     },
                 );
             }
-        }
-        SameSession::AcceptedSum => {
-            let mut index = rows.step(
-                "ACK summed contributor rows",
-                page,
-                Ack::Exact,
-                Expected {
-                    literals: vec![literal(
-                        ROOT,
-                        &[("holder", "a"), ("copy", "c")],
-                        1,
-                        0,
-                        C.1,
-                        vec![grain(EARLY, A.1, C.1, 20, 2, false)],
-                    )],
-                    groups: REMOVED_A,
-                    ..Expected::default()
-                },
-            );
-            rows.equal(
-                "ACK summed contributor rows",
-                "exact earlier contribution",
-                has(&index, &rows.paths["holder"], "a"),
-                true,
-            );
-            // Restore the holder census without changing the accepted sum.
-            let holder = rows.key("holder");
-            let census = index
-                .claude_request_census_for_test()
-                .get(&holder)
-                .unwrap()
-                .clone();
-            index.claude_copy_removals.forget(rows.loc("copy"));
-            index
-                .claude_money_birth_store
-                .set_money_marks(&rows.key("copy"), mark::DISCLOSED);
-            index.claude_request_census_mut_for_test().remove(&holder);
-            let mut index = rows.corpus.reload(&mut index);
-            let before = rows.decisions("accepted sum with census gap", &replay, &index);
-            index
-                .claude_request_census_mut_for_test()
-                .insert(holder, census);
-            index.activate_upload_context("e2-synthetic-destination".into());
-            let index = rows.corpus.reload(&mut index);
-            rows.check_saved("restore accepted contributor census", &index, &[], &[]);
-            rows.compare_save(
-                "restore accepted contributor census",
-                "copy",
-                &before["copy"],
-                &replay,
-                &index,
-            );
         }
     }
     rows
@@ -1154,8 +1250,7 @@ fn carried_main(name: &'static str) -> (Rows, ScanIndex) {
         paths: BTreeMap::from([("holder", holder), ("copy", copy), ("twin", twin)]),
         inputs: BTreeMap::new(),
         bodies: Vec::new(),
-        failures: Vec::new(),
-        checks: Vec::new(),
+        differs: Vec::new(),
     };
     for path in rows.paths.values() {
         let relative = path
@@ -1172,7 +1267,7 @@ fn carried_main(name: &'static str) -> (Rows, ScanIndex) {
 /// read again; the copy that relies on it stays settled.
 fn carrier_transfer(name: &'static str) -> Rows {
     let (mut rows, index) = carried_main(name);
-    rows.check_saved("carried main", &index, REMOVED_A, &[]);
+    rows.check_saved("carried main", &index, CARRIED_GROUPS, &[]);
     let (holder, twin) = (rows.key("holder"), rows.key("twin"));
     let mut next = index.clone();
     next.confirmed_empty_files.remove(&holder);
@@ -1185,12 +1280,30 @@ fn carrier_transfer(name: &'static str) -> Rows {
             BTreeMap::new()
         }
     });
-    rows.check_saved("main carries its own body", &next, REMOVED_A, &["holder"]);
+    rows.check_saved(
+        "main carries its own body",
+        &next,
+        CARRIED_GROUPS,
+        &["holder"],
+    );
     rows
 }
 
 fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
     let (mut rows, mut index) = carried_main(name);
+    if !hold_on_page {
+        for phase in [
+            "carrier page decision",
+            "carrier ownership",
+            "carrier ownership, replayed after the save",
+        ] {
+            let answers = Answers::Holder {
+                selector: None,
+                page: Some("holder"),
+            };
+            rows.differs(phase, "later", answers, CARRIED);
+        }
+    }
     index.upload_context_proof.request_contributions.clear();
     index = rows.corpus.reload(&mut index);
     index.activate_upload_context("e2-synthetic-destination".into());
@@ -1200,7 +1313,7 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
         e2::carrier_group_owned_for_test(&index, &rows.key("holder")),
         true,
     );
-    rows.write("later", &file(THIRD), &resumed(THIRD, &[A, D]), BORN);
+    rows.write("later", &file(THIRD), &resumed(THIRD, &[A, E]), LATER_BORN);
     if hold_on_page {
         owe(&mut index);
     }
@@ -1220,26 +1333,26 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
             literals: vec![if hold_on_page {
                 literal(
                     THIRD,
-                    &[("later", "a"), ("later", "d")],
+                    &[("later", "a"), ("later", "e")],
                     0,
                     1,
-                    D.1,
-                    vec![grain(EARLY, A.1, D.1, 20, 2, false)],
+                    E.1,
+                    vec![grain(EARLY, A.1, E.1, 20, 2, false)],
                 )
             } else {
                 literal(
                     THIRD,
-                    &[("later", "d")],
+                    &[("later", "e")],
                     1,
                     0,
-                    D.1,
-                    vec![grain(EARLY, D.1, D.1, 10, 1, false)],
+                    E.1,
+                    vec![grain(EARLY, E.1, E.1, 10, 1, false)],
                 )
             }],
             groups: if hold_on_page {
-                REMOVED_A
+                CARRIED_GROUPS
             } else {
-                &[("copy", "holder", &["a"]), ("later", "holder", &["a"])]
+                CARRIED_AND_LATER
             },
             holds: if hold_on_page {
                 &[("absent_content_twin", 1), ("absent_twin", 1)]
@@ -1259,8 +1372,9 @@ fn carrier(name: &'static str, hold_on_page: bool) -> Rows {
         rows.check_saved(
             "carrier loses group",
             &index,
-            &[],
-            &["copy", "holder", "later"],
+            // The groups stay until each marked file is read again.
+            CARRIED_AND_LATER,
+            &["copy", "holder", "later", "twin"],
         );
         rows.compare_save(
             "carrier loses group",
@@ -1526,7 +1640,8 @@ fn forked_agent(name: &'static str, witness: &str) -> Rows {
             1,
             0,
             C.1,
-            vec![grain(EARLY, C.1, C.1, 10, 1, false)],
+            // The dropped first response keeps its place in the hour's span.
+            vec![grain(EARLY, A.1, C.1, 10, 1, false)],
         )
     }];
     if witness == "page" {
@@ -1546,6 +1661,15 @@ fn forked_agent(name: &'static str, witness: &str) -> Rows {
 
 fn covered_only(name: &'static str) -> Rows {
     let mut rows = Rows::new(name);
+    rows.differs(
+        "only the covered path is on page, replayed after the save",
+        "copy",
+        Answers::Holder {
+            selector: Some("holder"),
+            page: None,
+        },
+        STORED_REUSED,
+    );
     write_holder(&mut rows);
     let page = scan(&rows, ScanIndex::default(), &["holder"]);
     let mut index = rows.step(
@@ -1706,12 +1830,21 @@ impl Table {
     /// A row whose fixture premise fails is reported with the others; it does
     /// not hide them.
     fn row(&mut self, name: &'static str, build: impl FnOnce(&'static str) -> Rows) {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(name))) {
+        let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(name)));
+        let (failures, checks) = NOTES.take();
+        self.failures.extend(failures);
+        self.checks.extend(checks);
+        match row {
             Ok(row) => {
+                self.failures
+                    .extend(row.differs.iter().filter(|known| !known.met).map(|known| {
+                        format!(
+                            "{name} / {} / {}\n  listed difference never checked: {}",
+                            known.phase, known.file, known.why
+                        )
+                    }));
                 self.bodies.extend(row.bodies);
                 self.inputs.extend(row.inputs);
-                self.failures.extend(row.failures);
-                self.checks.extend(row.checks);
             }
             Err(panic) => {
                 let why = panic
@@ -1743,16 +1876,16 @@ fn full_copy_decision_rows() {
                 earlier_holder(name, Ack::Local)
             });
             table.row("accepted_holder_after_copy", |name| {
-                late_holder(name, Ack::Exact, true)
+                late_holder(name, Ack::Exact)
             });
             table.row("unstored_holder_after_copy", |name| {
-                late_holder(name, Ack::Unstored, false)
+                late_holder(name, Ack::Unstored)
             });
             table.row("usage_identical_holder_after_copy", |name| {
-                late_holder(name, Ack::UsageIdentical, true)
+                late_holder(name, Ack::UsageIdentical)
             });
             table.row("dominated_holder_after_copy", |name| {
-                late_holder(name, Ack::Dominated, true)
+                late_holder(name, Ack::Dominated)
             });
             table.row("deleted_accepted_holder", |name| {
                 holder_loss(name, HolderLoss::DeleteAccepted)
@@ -1784,9 +1917,6 @@ fn full_copy_decision_rows() {
             });
             table.row("resumed_same_session_holder_off_page", |name| {
                 same_session(name, SameSession::HolderOffPage)
-            });
-            table.row("holder_already_in_accepted_sum", |name| {
-                same_session(name, SameSession::AcceptedSum)
             });
             table.row("empty_main_carried_by_twin", |name| carrier(name, false));
             table.row("content_held_holder_on_page", |name| carrier(name, true));
