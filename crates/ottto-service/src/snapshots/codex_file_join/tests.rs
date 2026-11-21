@@ -967,8 +967,7 @@ fn owner_scoped_unshadowed_roster_archive_fences_only_page_owners() {
         for directory in [&sessions, &other] {
             directories.observe(directory, &fs::metadata(directory).unwrap());
         }
-        let mut inventory =
-            HeaderInventory::new(&[sessions, other], &paths, Some(&directories));
+        let mut inventory = HeaderInventory::new(&[sessions, other], &paths, Some(&directories));
         while !inventory.step(&CodexTitleMetadata::default()) {}
         assert!(
             inventory.owner_for_path(&archive).is_none(),
@@ -1046,9 +1045,9 @@ pub(in crate::snapshots) fn older_build_logs_tier(
     selector: &mut SelectorCapture,
     turn: Option<&str>,
 ) {
-    if turn.is_some_and(|turn| {
-        OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow().contains(turn))
-    }) {
+    if turn
+        .is_some_and(|turn| OLDER_BUILD_LOGS_PRIORITY.with(|turns| turns.borrow().contains(turn)))
+    {
         selector.insert("service_tier", "priority".into(), "derived_from_logs_2");
     }
 }
@@ -1077,11 +1076,7 @@ pub(crate) fn native_join_fixture_root(priority: bool) -> PathBuf {
     }
     root
 }
-pub(crate) fn scan(
-    root: &Path,
-    index: ScanIndex,
-    limit: usize,
-) -> (ScanIndex, SourceScanResult) {
+pub(crate) fn scan(root: &Path, index: ScanIndex, limit: usize) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
@@ -1118,8 +1113,7 @@ fn logs_priority_request_fixture(turn: &str, tier: Option<&str>, inherited: bool
             }
         }
     }
-    let mut context =
-        json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}});
+    let mut context = json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}});
     if let Some(tier) = tier.filter(|_| inherited) {
         // An earlier non-usage line's tier, carried by the running selector.
         context["payload"]["service_tier"] = json!(tier);
@@ -1167,8 +1161,7 @@ fn logs_priority_request_fixture(turn: &str, tier: Option<&str>, inherited: bool
 /// new turn, with no tier receipt, leaves every row at the default tier.
 #[test]
 fn codex_logs_priority_request_no_longer_prices_a_new_turn() {
-    let root =
-        logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None, false);
+    let root = logs_priority_request_fixture("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", None, false);
     let (_, result) = scan(&root, ScanIndex::default(), 2);
     assert_eq!(result.snapshots.len(), 2, "one alias per group member");
     for item in &result.snapshots {
@@ -1316,9 +1309,7 @@ fn accepted_logs_priority_over_an_explicit_tier_replays_or_holds() {
         );
         let below_priority = tiers
             .iter()
-            .filter(|((tier, _), _)| {
-                tier.as_deref() == Some(explicit) && explicit != "priority"
-            })
+            .filter(|((tier, _), _)| tier.as_deref() == Some(explicit) && explicit != "priority")
             .map(|(_, tokens)| *tokens)
             .sum::<u64>();
         assert_eq!(below_priority, 0, "{explicit}: no smaller re-emit");
@@ -2354,8 +2345,7 @@ fn repaired_header_releases_the_held_page_and_a_still_unreadable_one_does_not() 
     // The blocker changes but still proves no owner: the owed candidates
     // are tried again once, held again, and nothing is emitted.
     fs::write(&unreadable, "still not a header\n").unwrap();
-    let (still_index, still) =
-        retained_page(&root, held_index, std::slice::from_ref(&unreadable));
+    let (still_index, still) = retained_page(&root, held_index, std::slice::from_ref(&unreadable));
     assert!(still.snapshots.is_empty(), "{:?}", still.snapshots);
     // The release does not clear the still-refused header: it counts
     // again, and the hold keeps the generation red.
@@ -2539,8 +2529,7 @@ fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
-    let previous =
-        working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+    let previous = working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
     assert_eq!(previous.files.len(), 2);
     assert!(previous
         .files
@@ -2728,10 +2717,7 @@ fn malformed_or_missing_captured_metadata_holds_without_resetting_index() {
             .clone();
         let mut value = serde_json::to_value(&captured).unwrap();
         value["files"][&key]["codex_captured_tier_receipt"] = malformed;
-        e2_pipeline_scan_fixture::seed_json_for_test(
-            &path,
-            &serde_json::to_vec(&value).unwrap(),
-        );
+        e2_pipeline_scan_fixture::seed_json_for_test(&path, &serde_json::to_vec(&value).unwrap());
         let loaded = ScanIndex::load(&path).unwrap();
         assert_eq!(
             loaded.files.len(),
@@ -2784,8 +2770,7 @@ fn capture_past_former_receipt_aggregate_stages_owner_without_hold() {
             .files
             .insert(format!("synthetic-existing-{n}"), full.clone());
     }
-    let (captured, changed) =
-        working.stage_codex_recovery_capture(&previous, &result.snapshots);
+    let (captured, changed) = working.stage_codex_recovery_capture(&previous, &result.snapshots);
     assert_eq!(changed.len(), 1, "the owner stages");
     assert_eq!(captured.files.len(), previous.files.len() + 2);
     assert_eq!(
@@ -2916,8 +2901,7 @@ fn joined_group_past_former_tier_cap_uploads_and_replays_without_downgrade() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
-    let previous =
-        working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+    let previous = working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
     let path = root.join("sessions/b.jsonl");
     let key = local_index_key(&path);
     let tiers = |index: &ScanIndex| {
@@ -3093,8 +3077,7 @@ fn older_body_acceptance_or_rollback_cannot_discard_new_captured_facts() {
     older_build_logs_priority("r-c");
     let (mut working, mut result) = scan(&root, previous.clone(), 2);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
-    let (captured, changed) =
-        working.stage_codex_recovery_capture(&previous, &result.snapshots);
+    let (captured, changed) = working.stage_codex_recovery_capture(&previous, &result.snapshots);
     assert_eq!(changed.len(), 1);
     let key = local_index_key(&path);
     assert_eq!(
@@ -3157,8 +3140,7 @@ fn pending_membership_expansion_loss_stale_ack_and_supported_correction() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
-    let (pending, _) =
-        first.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
+    let (pending, _) = first.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
     assert_eq!(pending.files.len(), 2);
     assert!(pending.current_snapshot_fingerprints().is_empty());
     let text = member(owner, "r-c", 100, 400)
@@ -3169,8 +3151,7 @@ fn pending_membership_expansion_loss_stale_ack_and_supported_correction() {
     let (mut expanded, mut result) = scan(&root, pending.clone(), 3);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut expanded);
     assert_eq!(result.snapshots.len(), 3);
-    let (new_pending, changed) =
-        expanded.stage_codex_recovery_capture(&pending, &result.snapshots);
+    let (new_pending, changed) = expanded.stage_codex_recovery_capture(&pending, &result.snapshots);
     assert_eq!(changed.len(), 1);
     assert_eq!(new_pending.files.len(), 3);
     let mut stale = first.clone();
@@ -3216,11 +3197,12 @@ fn pending_membership_expansion_loss_stale_ack_and_supported_correction() {
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     let settled = corrected.committable_subset(&capture, &accepted, &BTreeMap::new());
-    assert!(settled.files.values().all(|entry| entry
-        .codex_captured_joined_member_set
-        .is_none()
-        && !entry.codex_captured_uncommitted
-        && entry.codex_joined_member_set.is_some()));
+    assert!(settled
+        .files
+        .values()
+        .all(|entry| entry.codex_captured_joined_member_set.is_none()
+            && !entry.codex_captured_uncommitted
+            && entry.codex_joined_member_set.is_some()));
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -3261,8 +3243,7 @@ fn pending_correction_return_to_old_accepted_body_is_not_a_noop() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect::<BTreeSet<_>>();
-    let previous =
-        index.committable_subset(&ScanIndex::default(), &old_accepted, &BTreeMap::new());
+    let previous = index.committable_subset(&ScanIndex::default(), &old_accepted, &BTreeMap::new());
     let rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 400, 500);
     fs::write(
         &path,
@@ -3286,8 +3267,7 @@ fn pending_correction_return_to_old_accepted_body_is_not_a_noop() {
         "pending capture must not suppress a correction to an older body"
     );
     assert!(result.snapshots.iter().all(|item| item.input_tokens == 300));
-    let (capture, changed) =
-        corrected.stage_codex_recovery_capture(&pending, &result.snapshots);
+    let (capture, changed) = corrected.stage_codex_recovery_capture(&pending, &result.snapshots);
     assert_eq!(changed.len(), 1);
     result.finish_codex_capture_boundary(&mut corrected);
     let settled = corrected.committable_subset(&capture, &old_accepted, &BTreeMap::new());

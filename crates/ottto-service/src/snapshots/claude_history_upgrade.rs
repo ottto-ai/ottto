@@ -1911,7 +1911,6 @@ impl ScanIndex {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
 
 #[cfg(test)]
