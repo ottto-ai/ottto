@@ -2625,13 +2625,6 @@ pub(super) fn finish_sync_source(
     // advances under the backfill-state lock when every configured
     // participant has. Order only: a failed save retries on a later pass.
     let tier_finished = upload_fully_settled && index.first_read_tier_finished(source);
-    #[cfg(test)]
-    crate::backfill::tier_trace(format!(
-        "finish {source:?} settled={upload_fully_settled} cutoff={:?} finished={} queue={}",
-        index.first_read_tier_cutoff,
-        index.first_read_tier_finished(source),
-        serde_json::to_value(&index).unwrap()["traversal"]
-    ));
     let pulled = std::mem::take(&mut index.first_read_tier_pulled);
     crate::local_resource_diagnostics::pass_outcomes(|outcomes| {
         outcomes.first_read_tier_pulled = pulled;

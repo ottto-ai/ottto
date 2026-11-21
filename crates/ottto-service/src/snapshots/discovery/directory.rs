@@ -935,18 +935,21 @@ pub(in crate::snapshots) fn first_read_aged(
     }) {
         return false;
     }
-    !has_read_evidence(index, path, true)
+    !has_read_evidence(index, path, false)
 }
 
-/// `unknown`: what an unreadable Tail route or head counts as. Aging keeps
-/// such a file (true); a tier defers it (false), still queued and owed.
-fn has_read_evidence(index: &ScanIndex, path: &Path, unknown: bool) -> bool {
+/// Aging counts any Tail head, or an unreadable route or head, as read. A
+/// tier (`tier`) needs proof: the census's metadata-only head for an owed
+/// file, or an unreadable one, is no read, so the file waits, still owed.
+fn has_read_evidence(index: &ScanIndex, path: &Path, tier: bool) -> bool {
     let key = local_index_key(path);
     index.files.contains_key(&key)
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
-        || (state_v2::tail_route_path(index).map_or(unknown, |route| route.is_some())
-            && state_v2::load_head(index, &key, u32::MAX).map_or(unknown, |head| head.is_some()))
+        || (state_v2::tail_route_path(index).map_or(!tier, |route| route.is_some())
+            && state_v2::load_head(index, &key, u32::MAX).map_or(!tier, |head| {
+                head.is_some_and(|head| !(tier && head.metadata_only))
+            }))
 }
 
 /// Recency tier (`backfill::FIRST_READ_TIER_DAYS`) for one look at the queue:
@@ -987,25 +990,10 @@ impl TierGate {
                     .and_then(|metadata| metadata.modified().ok())
                     .and_then(unix_seconds)
                     .is_some_and(|modified| modified < cutoff)
-                    && !has_read_evidence(index, &candidate.path, false)
+                    && !has_read_evidence(index, &candidate.path, true)
             })
             .map(|candidate| candidate.path.clone())
             .collect();
-        #[cfg(test)]
-        for candidate in &walk.pending_candidates {
-            let key = local_index_key(&candidate.path);
-            crate::backfill::tier_trace(format!(
-                "gate {source:?} {:?} entry={:?} empty={} route={:?} head={:?}",
-                candidate.path.file_name(),
-                index
-                    .files
-                    .get(&key)
-                    .map(|entry| serde_json::to_string(&*entry).unwrap()),
-                index.confirmed_empty_files.contains(&key),
-                state_v2::tail_route_path(index).map(|route| route.is_some()),
-                state_v2::load_head(index, &key, u32::MAX).map(|head| head.is_some()),
-            ));
-        }
         if source != SnapshotSource::ClaudeCode || gate.deferred.is_empty() {
             return gate;
         }

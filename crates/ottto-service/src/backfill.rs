@@ -144,14 +144,6 @@ pub struct BackfillState {
     pub(crate) claude_history_list_intent: ClaudeHistoryListIntent,
 }
 
-/// Test-only tier trace (temporary diagnosis).
-#[cfg(test)]
-pub(crate) static TIER_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-#[cfg(test)]
-pub(crate) fn tier_trace(line: String) {
-    TIER_TRACE.lock().unwrap().push(line);
-}
-
 /// First-read recency tiers in days. The last is the whole first-read window.
 pub(crate) const FIRST_READ_TIER_DAYS: [u64; 6] =
     [1, 3, 7, 14, 30, crate::snapshots::FIRST_READ_WINDOW_DAYS];
