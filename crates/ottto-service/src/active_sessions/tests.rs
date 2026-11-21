@@ -4,8 +4,7 @@
 use super::*;
 use crate::snapshots::SnapshotUploadPolicy;
 use ottto_protocol::{
-    AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation,
-    AgentStatusState,
+    AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation, AgentStatusState,
 };
 
 fn usage_row(model: &str, effort: Option<&str>, tokens: u64) -> SnapshotModelUsage {
@@ -550,8 +549,7 @@ mod tracking_confirmation_tests {
                 std::time::Duration::from_secs(300),
                 crate::agent_status::claude_session_registrations,
                 Some(&mut |new, prev, within_ceiling| {
-                    witness =
-                        witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
+                    witness = witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
                 }),
             )
             .unwrap();
@@ -570,8 +568,7 @@ mod tracking_confirmation_tests {
                 std::time::Duration::from_secs(300),
                 crate::agent_status::claude_session_registrations,
                 Some(&mut |new, prev, within_ceiling| {
-                    witness =
-                        witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
+                    witness = witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
                 }),
             )
             .unwrap();
@@ -580,8 +577,7 @@ mod tracking_confirmation_tests {
                 Some("2026-11-15T10:01:00Z")
             );
             assert_eq!(
-                read_cache(&active_session_cache_path(&dir, source)).watermarks
-                    ["existing-session"],
+                read_cache(&active_session_cache_path(&dir, source)).watermarks["existing-session"],
                 "2026-11-16T10:00:00Z"
             );
             let mut cache = read_cache(&active_session_cache_path(&dir, source));
@@ -604,8 +600,7 @@ mod tracking_confirmation_tests {
                 std::time::Duration::from_secs(300),
                 crate::agent_status::claude_session_registrations,
                 Some(&mut |new, prev, within_ceiling| {
-                    witness =
-                        witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
+                    witness = witness.max(parsed_activity_witness(since, new, prev, within_ceiling))
                 }),
             )
             .unwrap();
@@ -1378,8 +1373,7 @@ fn explains_withheld_accounts_without_widening_attribution() {
         .attribution_facts
         .push(direct_fact("parent_session_ref", "parent"));
     mixed.claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &mixed, Some(&status));
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
     assert_eq!(
@@ -1445,8 +1439,7 @@ fn explains_withheld_accounts_without_widening_attribution() {
         cache_creation_cost_usd: None,
     };
     let mut tagged = test_snapshot("tagged", "2026-07-19T10:04:00Z");
-    tagged.provenance.collector =
-        crate::snapshots::claude_request_identity::COLLECTOR.to_string();
+    tagged.provenance.collector = crate::snapshots::claude_request_identity::COLLECTOR.to_string();
     tagged
         .attribution_facts
         .push(direct_fact("parent_session_ref", "parent"));
@@ -1463,8 +1456,7 @@ fn explains_withheld_accounts_without_widening_attribution() {
         bucket.model_usage[0].account_identifier_hash = Some(login.to_string());
         bucket.model_usage[0].evidence_ref = Some(0);
     }
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &tagged, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &tagged, Some(&status));
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
     assert_eq!(
@@ -1476,8 +1468,7 @@ fn explains_withheld_accounts_without_widening_attribution() {
     // parsed) is not the request's own telemetry.
     let mut census = tagged.clone();
     census.request_evidence[0].identity_basis = "transcript_sole_login".to_string();
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &census, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &census, Some(&status));
     assert_eq!(active.account_attribution_source, None);
     assert_eq!(active.account_withheld_reason, None);
 
@@ -1494,11 +1485,8 @@ fn explains_withheld_accounts_without_widening_attribution() {
     let untagged = &mut one_and_untagged.usage_buckets[1].model_usage[0];
     untagged.account_identifier_hash = None;
     untagged.evidence_ref = None;
-    let active = active_session_from_snapshot(
-        SnapshotSource::ClaudeCode,
-        &one_and_untagged,
-        Some(&status),
-    );
+    let active =
+        active_session_from_snapshot(SnapshotSource::ClaudeCode, &one_and_untagged, Some(&status));
     assert_eq!(active.account_attribution_source, None);
     assert_eq!(active.account_withheld_reason, None);
 
@@ -1507,10 +1495,8 @@ fn explains_withheld_accounts_without_widening_attribution() {
     single.model_usage[0].identity_parts = None;
     single.model_usage[0].account_identifier_hash = Some("login_a".to_string());
     single.model_usage[0].evidence_ref = Some(0);
-    single.usage_buckets[1].model_usage[0].account_identifier_hash =
-        Some("login_a".to_string());
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &single, Some(&status));
+    single.usage_buckets[1].model_usage[0].account_identifier_hash = Some("login_a".to_string());
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &single, Some(&status));
     assert_eq!(active.account_identifier_hash.as_deref(), Some("login_a"));
     assert_eq!(
         active.account_attribution_source.as_deref(),
@@ -1584,8 +1570,7 @@ fn attributes_from_exact_snapshot_account_identity() {
         AgentStatusConfidence::High,
     ));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(
         active.account_identifier_hash.as_deref(),
@@ -1721,8 +1706,7 @@ fn changed_login_keeps_proven_session_account_and_withholds_only_fallback() {
     assert!(retained.account.is_none());
     let mut proven = test_snapshot("proven", "2026-07-19T10:04:00Z");
     proven.model_usage[0].account_identifier_hash = Some("session-owner".into());
-    proven.usage_buckets[0].model_usage[0].account_identifier_hash =
-        Some("session-owner".into());
+    proven.usage_buckets[0].model_usage[0].account_identifier_hash = Some("session-owner".into());
     let active = active_session_from_snapshot(SnapshotSource::Codex, &proven, Some(&retained));
     assert_eq!(
         active.account_identifier_hash.as_deref(),
@@ -1739,8 +1723,7 @@ fn changed_login_keeps_proven_session_account_and_withholds_only_fallback() {
         unsafe_fallback.account_identifier_hash.as_deref(),
         Some("old-login")
     );
-    let withheld =
-        active_session_from_snapshot(SnapshotSource::Codex, &unbound, Some(&retained));
+    let withheld = active_session_from_snapshot(SnapshotSource::Codex, &unbound, Some(&retained));
     assert!(withheld.account_identifier_hash.is_none());
     let stable_home = crate::agent_status::CodexHomeBinding {
         home: std::path::PathBuf::from("/synthetic/stable-home"),
@@ -1777,8 +1760,7 @@ fn inherits_high_confidence_account_from_direct_root_lineage() {
         AgentStatusConfidence::High,
     ));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(
         active.account_identifier_hash.as_deref(),
@@ -1812,8 +1794,7 @@ fn refuses_conflicting_direct_lineage_accounts() {
     ));
     status.account = Some(test_current_account("second_hash"));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
@@ -1900,8 +1881,7 @@ fn refuses_conflict_between_exact_observation_and_snapshot_identity() {
         AgentStatusConfidence::High,
     ));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
@@ -1922,8 +1902,7 @@ fn refuses_conflicting_exact_session_observations() {
         AgentStatusConfidence::High,
     ));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
@@ -1937,11 +1916,8 @@ fn refuses_partial_snapshot_account_identity() {
     second_row.account_identifier_hash = None;
     snapshot.model_usage.push(second_row);
 
-    let active = active_session_from_snapshot(
-        SnapshotSource::ClaudeCode,
-        &snapshot,
-        Some(&test_status()),
-    );
+    let active =
+        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&test_status()));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
@@ -1956,8 +1932,7 @@ fn refuses_conflicting_bucket_snapshot_account_identity() {
     let mut status = test_status();
     status.account = Some(test_current_account("bucket_hash"));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);
@@ -2083,8 +2058,7 @@ fn own_request_parts_gate_account_fallbacks() {
         status
     };
     let attribution = |item: &SnapshotItem, status: &AgentStatusSnapshot| {
-        let active =
-            active_session_from_snapshot(SnapshotSource::ClaudeCode, item, Some(status));
+        let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, item, Some(status));
         (
             active.account_identifier_hash,
             active.account_attribution_source,
@@ -2176,8 +2150,7 @@ fn refuses_indirect_or_low_confidence_lineage() {
         AgentStatusConfidence::Low,
     ));
 
-    let active =
-        active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+    let active = active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
 
     assert_eq!(active.account_identifier_hash, None);
     assert_eq!(active.account_attribution_source, None);

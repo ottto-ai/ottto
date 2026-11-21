@@ -294,10 +294,7 @@ fn grants_unavailable_cause_appears_on_no_other_shape() {
                 "{balance:?}"
             );
             if blind {
-                assert_reader_unavailable(
-                    balance,
-                    balance.ineligible_reason.as_deref().unwrap(),
-                );
+                assert_reader_unavailable(balance, balance.ineligible_reason.as_deref().unwrap());
             }
         }
     }
@@ -481,8 +478,7 @@ fn sections_stay_stable_across_alternation_restart_and_account_switch() {
         } else {
             &variant
         };
-        stored =
-            claude_merge_credit_sections("a", &restored, &claude_credit_read(body, read, at));
+        stored = claude_merge_credit_sections("a", &restored, &claude_credit_read(body, read, at));
         assert_eq!(presence(&stored), expected);
         timeline.push(stored.clone());
     }
@@ -636,8 +632,7 @@ fn eligible_only_cedar_keeps_the_stored_grant_list() {
 fn refused_codename_pools_are_skipped_with_the_model_refusal() {
     let mut body = plain_max_body();
     body["Bad Pool"] = json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
-    body["sk-synthetic"] =
-        json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
+    body["sk-synthetic"] = json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
     let read = claude_credit_read(&body, ClaudeUsageRead::Plain, READ_AT);
     let pools = read.one_time_credits.unwrap();
     assert_eq!(
@@ -651,8 +646,7 @@ fn refused_codename_pools_are_skipped_with_the_model_refusal() {
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            **diagnostic
-                == crate::quota_credit_model::OneTimeCreditRefusal::LimitId.diagnostic()
+            **diagnostic == crate::quota_credit_model::OneTimeCreditRefusal::LimitId.diagnostic()
         })
         .count();
     assert_eq!(limit_id_refusals, 2);
@@ -730,12 +724,7 @@ fn legacy_cached_usage_credit_row_is_its_section() {
     );
 }
 
-fn passive_config(
-    cache_account: &str,
-    oauth_account: &str,
-    org: &str,
-    fetched_ms: u64,
-) -> Value {
+fn passive_config(cache_account: &str, oauth_account: &str, org: &str, fetched_ms: u64) -> Value {
     json!({
         "oauthAccount": {"accountUuid": oauth_account, "organizationUuid": org},
         "cachedUsageUtilization": {
@@ -1706,9 +1695,7 @@ impl VariantHarness {
             &ottto_core::ClaudeStatusLineRateLimitCache {
                 schema_version: ottto_core::CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
                 observed_under_account_identifier_hash: self.account.to_string(),
-                observed_under_organization_identifier_hash: Some(
-                    self.organization.to_string(),
-                ),
+                observed_under_organization_identifier_hash: Some(self.organization.to_string()),
                 observed_under_account_method: "config_dir".to_string(),
                 observed_at_epoch_seconds: observed_at,
                 windows: vec![ottto_core::ClaudeStatusLineRateLimitWindow {
@@ -1955,8 +1942,7 @@ fn an_app_status_read_serves_the_stored_reading_and_never_calls_anthropic() {
     assert!(app(respond_recognized).result.is_err());
     assert_eq!(harness.requests(), 0);
     // The daemon's pass reads it.
-    let daemon =
-        super::super::with_claude_pass(false, now, || harness.collect(respond_recognized));
+    let daemon = super::super::with_claude_pass(false, now, || harness.collect(respond_recognized));
     assert!(daemon.result.is_ok());
     assert_eq!(harness.requests(), 1);
     // Due again: the app is served the stored reading, no request.
@@ -2287,11 +2273,10 @@ fn unusable_variant_without_a_stored_reading_waits_for_the_next_slot() {
     ] {
         let harness = VariantHarness::new("no-stored-reading");
         harness.due(ClaudeReadSchedule::default());
-        assert!(super::super::read_claude_oauth_usage_cache(
-            harness.account,
-            harness.organization
-        )
-        .is_none());
+        assert!(
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .is_none()
+        );
         harness.collect(respond);
         assert_eq!(
             REQUESTED.lock().unwrap().as_slice(),

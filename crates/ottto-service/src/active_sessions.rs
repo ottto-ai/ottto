@@ -1145,5 +1145,4 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;

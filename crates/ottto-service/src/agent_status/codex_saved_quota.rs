@@ -2021,5 +2021,4 @@ fn run_scheduler(scheduler: &Scheduler) {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
