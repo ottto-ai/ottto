@@ -113,7 +113,7 @@ fn selection_rows(
     })
 }
 
-fn emit(name: &str, inputs: Value, actual: Value, expected: Value) {
+pub(super) fn emit(name: &str, inputs: Value, actual: Value, expected: Value) {
     assert_eq!(actual, expected, "{name}: complete receipt");
     let root = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
         .map(PathBuf::from)
@@ -159,12 +159,12 @@ fn plan(account: &str, organization: Option<&str>) -> AgentStatusPlanObservation
 
 // Every changed hook is restored on unwind. HOME also redirects the existing
 // effective-user-home guard; these fixtures never acquire a credential.
-struct OAuthGuard {
+pub(super) struct OAuthGuard {
     _environment: Vec<EnvVarGuard>,
     responder: Option<ClaudeOAuthTestResponder>,
     before_send: Option<fn()>,
     forbidden: bool,
-    calls: usize,
+    pub(super) calls: usize,
     callers: BTreeMap<String, claude_credit_pools::ClaudeCallerBinding>,
     passes: (usize, BTreeSet<String>),
     transient_failures: Vec<ClaudeBindingTime>,
@@ -174,7 +174,7 @@ struct OAuthGuard {
 }
 
 impl OAuthGuard {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         use std::sync::atomic::Ordering::SeqCst;
         let root = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
             .map(PathBuf::from)
@@ -194,7 +194,6 @@ impl OAuthGuard {
                 EnvVarGuard::set_os("HOME", home.into_os_string()),
                 EnvVarGuard::set_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.into_os_string()),
                 EnvVarGuard::set_os("PATH", bin.into_os_string()),
-                EnvVarGuard::set_os("OTTTO_DISABLE_CLAUDE_OAUTH_USAGE", OsString::from("0")),
             ],
             responder: CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap().take(),
             before_send: CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap().take(),
@@ -248,7 +247,7 @@ fn usage_value(usage: &ClaudeOAuthUsage) -> Value {
         "account_weekly_not_offered":usage.account_weekly_not_offered,"account_session_not_offered":usage.account_session_not_offered})
 }
 
-fn outcome_value(outcome: &ClaudeOAuthUsageOutcome) -> Value {
+pub(super) fn outcome_value(outcome: &ClaudeOAuthUsageOutcome) -> Value {
     json!({"result":match &outcome.result {Ok(usage)=>json!({"ok":usage_value(usage)}),Err(error)=>json!({"error":error})},
         "diagnostics":outcome.diagnostics})
 }

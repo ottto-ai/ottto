@@ -107,6 +107,16 @@ HEAD_ONLY_FIXTURES = (
     "claude_status_s19_legacy_method",
     "claude_status_s21_carriers",
     "claude_status_s24_boundaries",
+    "claude_status_s01_due_success",
+    "claude_status_s01_due_boundary",
+    "claude_status_s01_expiry_boundary",
+    "claude_status_s05_pair_callers",
+    "claude_status_s09_managed_due",
+    "claude_status_s12_auth_other_success",
+    "claude_status_s12_reverse_cache",
+    "claude_status_s26_background_off",
+    "claude_status_s26_saved_only",
+    "claude_status_s26_consented_pass",
 )
 
 

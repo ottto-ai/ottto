@@ -138,7 +138,7 @@ pub(super) fn file_modified_epoch_seconds(path: &Path) -> Option<i64> {
 }
 
 pub(super) fn current_unix_seconds() -> u64 {
-    OffsetDateTime::now_utc().unix_timestamp().max(0) as u64
+    crate::scan_clock::utc_seconds()
 }
 
 pub(super) fn rfc3339_from_unix_seconds(seconds: u64) -> Option<String> {
