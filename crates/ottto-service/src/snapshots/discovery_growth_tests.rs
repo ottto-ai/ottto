@@ -1412,6 +1412,8 @@ fn claude_revision_debt_is_requeued_by_the_relist_once_per_six_hours() {
     let mut base = kept_generation(&f, source, false);
     base.activate_effective_upload_body_witness_revision(3);
     base.adopt_effective_upload_body_witness_revision_monotonically();
+    // The walk context does not bind the delivery context: the walk is kept.
+    base.activate_upload_context("relist-debt-context".into());
     for entry in base.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
@@ -1456,12 +1458,26 @@ fn claude_revision_debt_is_requeued_by_the_relist_once_per_six_hours() {
     }
 
     f.cache = Arc::new(sampled_scan::SharedCache::default());
-    let (_, scan, _, _) = f.page(source, offer);
+    let (mut offered, scan, _, _) = f.page(source, offer);
     assert_eq!(scan.scanned_file_count, 1);
     assert!(scan
         .snapshots
         .iter()
         .any(|item| item.source_session_id == REARMED));
+    // The service finish: the exact ACK earns the file receipt.
+    let acks = crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots);
+    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+        &mut offered,
+        &scan.snapshots,
+        &acks,
+    );
+    let entry = &offered.files[&key];
+    assert_eq!(entry.effective_upload_body_witness_revision, 3);
+    assert!(entry.upload_context_receipt.is_some(), "ACK receipt");
+    assert!(offered
+        .file_snapshot_fingerprints
+        .get(&key)
+        .is_some_and(|entities| !entities.is_empty()));
 }
 
 /// [money] A known Codex rollout append with no directory move or watcher

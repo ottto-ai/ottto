@@ -586,12 +586,11 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
         assert_eq!(replayed.index.files.len(), 1);
         sent.push(replayed.uploaded.len());
         for hour in 10..13 {
-            sent.push(
-                fixture
-                    .cycle(&format!("2026-08-02T{hour:02}:00:00Z"), replay)
-                    .uploaded
-                    .len(),
-            );
+            let paced = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), replay);
+            sent.push(paced.uploaded.len());
+            if hour == 12 {
+                assert_eq!(HistoryFixture::census_keys(&paced.index), 3);
+            }
         }
     });
     assert_eq!(sent, vec![1, 1, 1, 0], "paced, one history file per page");
