@@ -55,18 +55,13 @@ checked; adding, deleting or retyping one of them is checked as usual.
     of times (cfg-duplicated bindings are compared one to one); attributes
     preserve original string, char and raw literal bytes, normalizing only
     whitespace between tokens;
-  - one exception, listed as `re-pathed`: a single binding whose path starts
-    with `self`, `super` or `crate` may name a new module when the ledger shows
-    every module-level item of that name moving from the old module to the new
-    one, and its visibility, attributes and alias stay the same;
   - an added binding matching removed target/attribute twins in other modules
     fails if every candidate would reach further than before;
   - every added glob in an existing module or a module with moved items fails;
   - every added explicit binding beside an item-level macro call in a module
     with moved items fails (a macro can expand to `use` items this check cannot
-    see), except exact `thread_local!`, `crate::heap_layout_bound::fields!` and
-    `crate::heap_layout_bound::no_heap!` calls, whose expansions cannot
-    introduce module-level imports;
+    see), except exact `thread_local!` and `crate::heap_layout_bound::fields!`
+    calls, whose expansions cannot introduce module-level imports;
   - other added and removed bindings are glue; a `use` item this check cannot
     read fails.
 
@@ -103,7 +98,7 @@ import rust_source_tree as rst
 GLUE = {"use", "mod-decl", "include", "inner-doc"}
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 # Exact lexer names at the audited call sites; aliases and other paths stay guarded.
-IMPORT_FREE_MACROS = {"thread_local!", "crate::heap_layout_bound::fields!", "crate::heap_layout_bound::no_heap!"}
+IMPORT_FREE_MACROS = {"thread_local!", "crate::heap_layout_bound::fields!"}
 REPORT_LIMIT = 50
 # Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
 # by path or text, so their edits are listed as validator edits and never checked as moves.
@@ -843,38 +838,6 @@ def shown(bindings: list[Binding]) -> str:
     return "; ".join(" ".join(filter(None, (*attrs, vis, "use", path))) for path, vis, attrs in bindings) or "none"
 
 
-def binding_item(path: str, module: Module) -> tuple[Module, str] | None:
-    """The (module, item name) a `self::`, `super::` or `crate::` binding path names; None for any other path."""
-    parts = path.partition(" as ")[0].split("::")
-    if parts[0] not in ("self", "super", "crate") or len(parts) < 2 or parts[-1] == "*":
-        return None
-    here = list(module[:1] if parts[0] == "crate" else module)
-    named = False
-    for part in parts[:-1] if parts[0] != "crate" else parts[1:-1]:
-        if part in ("self", "super", "crate"):
-            if named or part == "crate" or (part == "super" and len(here) < 2):
-                return None
-            if part == "super":
-                here.pop()
-        else:
-            named = True
-            here.append(part)
-    return tuple(here), parts[-1]
-
-
-def repathed(before: list[Binding], after: list[Binding], module: Module, pairs: list[tuple[Unit, Unit]]) -> bool:
-    """One binding that follows its item: every module-level item of that name moved from the old to the new module."""
-    if len(before) != 1 or len(after) != 1 or before[0][1:] != after[0][1:]:
-        return False
-    old_path, new_path = before[0][0], after[0][0]
-    old, new = binding_item(old_path, module), binding_item(new_path, module)
-    if old is None or new is None or old[1] != new[1] or old_path.partition(" as ")[2] != new_path.partition(" as ")[2]:
-        return False
-    went = [(was.module, now.module, now.name) for was, now in pairs
-            if was.container == "" and was.name == old[1] and was.module == old[0]]
-    return bool(went) and all(target == (old[0], new[0], new[1]) for target in went)
-
-
 def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module], head_units: list[Unit],
                moves: dict) -> None:
     """Class (b) for `use` items (see the module docs)."""
@@ -899,10 +862,7 @@ def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module]
             after = sorted(binding for binding, _ in entries)
             if name in before_names:
                 before = sorted(binding for binding, _ in before_names[name])
-                if before != after and repathed(before, after, module, ledger.pairs):
-                    ledger.notes.append(f"re-pathed: use {name} in {show(module)} ({where}): "
-                                        f"{shown(before)} -> {shown(after)}")
-                elif before != after:
+                if before != after:
                     ledger.failures.append(f"use binding changed: {name} in {show(module)} ({where}): "
                                            f"{shown(before)} -> {shown(after)}")
                 continue

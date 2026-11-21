@@ -271,7 +271,7 @@ def names_of(files: list[str], dirs: list[str]) -> list[tuple[str, str]]:
     named = [(path, posixpath.basename(path)[:-3]) for path in files if path.endswith(".rs")]
     named += [(directory, posixpath.basename(directory)) for directory in dirs
               if directory != SCOPE_DIR and not is_fixture(f"{directory}/x")
-              and "/tests/fixtures" not in f"/{inside(directory)}"]
+              and "/tests/fixtures/" not in f"/{inside(directory)}/"]
     return named
 
 
@@ -381,7 +381,8 @@ def check_flat(root: Path, ceilings: dict[str, int], base_ceilings: dict[str, in
         if not (root / directory).is_dir():
             out.append(Finding("flat", directory, f"row in {FLAT} for a directory that does not exist"))
             continue
-        count = sum(1 for name in os.listdir(root / directory) if name.endswith(".rs"))
+        count = sum(1 for name in os.listdir(root / directory)
+                    if name.endswith(".rs") and (root / directory / name).is_file())
         if count > ceiling:
             out.append(Finding("flat", directory, f"{count} .rs files directly in it, over its ceiling of {ceiling} "
                                                   f"in {FLAT}; put a new file in the folder of its feature"))

@@ -15,11 +15,11 @@
   protections, and checkpoint/receipt/retry/recovery semantics unless the task
   explicitly changes them. Keep manifests and lockfiles unchanged unless needed.
 - Daemon file layout (see "Module map: `src/`" and "Layout and naming rules" in its
-  ARCHITECTURE.md): put a new module in the folder of its feature, never directly in
-  `src/`, `snapshots/` or `snapshot_sync/`. Name a file for what it does now (no ticket,
-  phase or version codes) and start it with a `//!` line. Use `foo.rs` + `foo/`; no
+  ARCHITECTURE.md): put new code under the existing module it belongs to, never as a
+  new file directly in `src/`, `snapshots/` or `snapshot_sync/`. Name a file for what it does
+  now (no ticket or phase codes) and start a production file with a `//!` line. Use `foo.rs` + `foo/`; no
   `mod.rs`, no new `#[path]` or `include!`. Tests go in `foo/tests.rs` or
-  `foo/tests/<topic>.rs`. No new glob imports outside test modules. A move is its own PR
+  `foo/tests/<topic>.rs` (a short inline `mod tests` is fine). No new glob imports outside test modules. A move is its own PR
   (`Move-only:` or `File-move:`), never mixed with a logic change.
 - Before consolidating similar code, compare preconditions and failure handling.
   Repeated boundary checks and distinct settlement outcomes may be intentional.

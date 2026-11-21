@@ -214,7 +214,7 @@ class LayoutTests(unittest.TestCase):
             f'{SRC}/lib.rs': '//! Demo.\n\npub mod snapshots;\nmod relay;\nmod e2_probe;\n',
             f'{SRC}/relay.rs': 'mod sender_tests;\n',
             f'{SRC}/relay/sender_tests.rs': '#[test]\nfn t() {}\n',
-            f'{SRC}/relay/old/mod.rs': '//! Old style.\n',
+            f'{SRC}/relay/legacy/mod.rs': '//! Old style.\n',
             f'{SRC}/e2_probe.rs': '//! Coded.\n',
             f'{SRC}/shim.c': 'int x;\n',
             f'{SRC}/relay/notes.txt': 'x\n',
@@ -225,10 +225,10 @@ class LayoutTests(unittest.TestCase):
             'names: e2_probe.rs: coded stem e2',
             'test-stem: relay/sender_tests.rs: stem ends in _tests; use tests.rs or tests/<topic>.rs',
             'tests: relay/sender_tests.rs: 1 #[test] outside tests.rs, tests/ and an inline mod tests',
+            'tree: relay/legacy/mod.rs: mod.rs; name the module file after its directory',
+            'tree: relay/legacy/mod.rs: not reachable by mod from the crate root',
+            'tree: relay/legacy: module directory without legacy.rs',
             'tree: relay/notes.txt: not a .rs file outside tests/fixtures/ and state_v2/sqlite/migrations/*.sql',
-            'tree: relay/old/mod.rs: mod.rs; name the module file after its directory',
-            'tree: relay/old/mod.rs: not reachable by mod from the crate root',
-            'tree: relay/old: module directory without old.rs',
         ])
 
     def test_isolation_keeps_each_source_to_its_own_paths(self):
