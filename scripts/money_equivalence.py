@@ -137,11 +137,12 @@ REQUIRED_STEP_TRACES = {
 # A new row is required on the head and can be uncompared only when absent
 # from the base. Once present on both sides its receipt must match.
 HEAD_ONLY_STEP_TRACES = frozenset()
-# Rows whose receipt this change means to alter (a declared addition, a signed
-# money diff or an intended scan behaviour change). Each listed row must exist
-# on both sides and must differ; every other shared row must match exactly.
-# The list belongs to one change and is emptied when it lands.
-CHANGED_STEP_TRACES = frozenset()
+# A change that means to alter a row's receipt (a declared addition, a signed
+# money diff or an intended scan behaviour change) lists the row under
+# "step_traces" in its PR-body declaration block (see parse_declarations).
+# Each listed row must exist on both sides and must differ; every other shared
+# row must match exactly. The list is read from that PR only.
+_TRACE_NAME = re.compile(r"[\w-]+")
 
 
 # Base and head bodies must match exactly. The only accepted difference is a
@@ -240,8 +241,9 @@ def parse_declarations(body):
     """Return the PR body's declared additions, or None without a block.
 
     The block is one fenced code block with the info string above, holding
-    {"envelope": {key: value}, "snapshot": {key: value}, "money": {...}}; any
-    part may be omitted. Anything else fails closed.
+    {"envelope": {key: value}, "snapshot": {key: value}, "money": {...},
+    "step_traces": [name, ...]}; any part may be omitted. Anything else fails
+    closed.
     """
     # Follow fences like CommonMark: nothing inside a fence opens another, and a
     # fence closes only with the same character, at least as long, and no info.
@@ -270,10 +272,17 @@ def parse_declarations(body):
                             object_pairs_hook=_json_object)
     except ValueError as error:
         raise RuntimeError(f"declared additions: invalid JSON ({error})") from None
-    if not isinstance(parsed, dict) or not parsed.keys() <= {"envelope", "snapshot", "money"}:
-        raise RuntimeError("declared additions: expected an object with envelope/snapshot/money parts")
+    if (not isinstance(parsed, dict)
+            or not parsed.keys() <= {"envelope", "snapshot", "money", "step_traces"}):
+        raise RuntimeError(
+            "declared additions: expected an object with envelope/snapshot/money/step_traces parts")
     snapshot_vocabulary = _schema_keys(_SNAPSHOT_DIFF_SCHEMA)
     for part, declared in parsed.items():
+        if part == "step_traces":
+            if (type(declared) is not list or not declared or len(set(map(str, declared))) != len(declared)
+                    or not all(type(name) is str and _TRACE_NAME.fullmatch(name) for name in declared)):
+                raise RuntimeError("declared additions: step_traces must list distinct trace names")
+            continue
         if not isinstance(declared, dict):
             raise RuntimeError(f"declared additions: {part} must be an object")
         if part == "money":
@@ -637,16 +646,16 @@ def receipt_names(left, right, head_expected, base_expected=None):
     return sorted(base & head), sorted(head - base)
 
 
-def compare_step_traces(left, right, logs, informational=False):
+def compare_step_traces(left, right, logs, declared_changed=(), informational=False):
     """Verify the emitted trace manifests and compare shared receipts byte for byte.
 
-    A difference is fatal unless the row is declared in CHANGED_STEP_TRACES.
+    A difference is fatal unless the row is in `declared_changed`.
     `informational` is for a comparison between two releases: the head must
     still emit every required trace intact, but rows added, removed or changed
     since the base are reported instead of failing.
     """
-    if (REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES
-            or HEAD_ONLY_STEP_TRACES & CHANGED_STEP_TRACES):
+    declared_changed = set(declared_changed)
+    if REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES or HEAD_ONLY_STEP_TRACES & declared_changed:
         raise RuntimeError("step-trace declarations overlap")
     manifests = {}
     for arm, directory in (("base", left), ("head", right)):
@@ -681,10 +690,10 @@ def compare_step_traces(left, right, logs, informational=False):
               "changed": changed}
     if informational:
         return result | {"informational": True, "removed": sorted(removed)}
-    undeclared = sorted(set(changed) - CHANGED_STEP_TRACES)
+    undeclared = sorted(set(changed) - declared_changed)
     if undeclared:
         raise RuntimeError("base/head step-trace bytes differ: " + ", ".join(undeclared))
-    unchanged = sorted(CHANGED_STEP_TRACES - set(changed))
+    unchanged = sorted(declared_changed - set(changed))
     if unchanged:
         raise RuntimeError("declared step-trace change not observed: " + ", ".join(unchanged))
     return result
@@ -737,6 +746,9 @@ def main():
     receipts.mkdir(parents=True)
     ref = os.environ.get("MONEY_EQUIVALENCE_BASE", "").strip()
     explicit = bool(ref)
+    release_cut = os.environ.get("MONEY_EQUIVALENCE_RELEASE_CUT", "").strip() == "true"
+    if release_cut and not explicit:
+        raise RuntimeError("a release comparison needs an explicit base")
     prs = []
     if not ref:
         # workflow_dispatch has no pull_request payload. Resolve the branch's
@@ -860,19 +872,20 @@ def main():
         if errors:
             raise RuntimeError("; ".join(errors))
         manifest["step_traces"] = compare_step_traces(
-            left, right, logs,
-            informational=os.environ.get("MONEY_EQUIVALENCE_RELEASE_CUT", "").strip() == "true")
+            left, right, logs, (declarations or {}).get("step_traces", ()), release_cut)
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
             manifest["uncompared_head_only"] = uncompared_records
-        print(f"MONEY_EQUIVALENCE_COUNTS compared={len(names)} uncompared={len(uncompared)}", flush=True)
+        print(f"MONEY_EQUIVALENCE_COUNTS compared={len(names)} uncompared={len(uncompared)}"
+              f"{' release_comparison=true' if release_cut else ''}", flush=True)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
             traces = manifest["step_traces"]
-            mode = "release comparison, informational" if traces.get("informational") else "declared"
+            mode = (f"release comparison, informational; {len(traces['removed'])} removed"
+                    if traces.get("informational") else "declared")
             f.write(f"Step traces: {traces['compared']} compared, "
                     f"{len(traces['changed'])} changed ({mode}); "
                     f"{len(traces['uncompared_head_only'])} head-only uncompared.\n")

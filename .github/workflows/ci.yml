@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       money_equivalence_release_cut:
-        description: With money_equivalence against a previous release; step-trace differences are reported, not fatal
+        description: With money_equivalence and an explicit previous-release base; step-trace differences are reported, not fatal
         type: boolean
         default: false
       scan_stack_margin:

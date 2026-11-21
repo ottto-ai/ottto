@@ -993,7 +993,8 @@ def receipt_dirs(testcase, base, head, bodies=None):
 
 @mock.patch.object(money_equivalence, "REQUIRED_STEP_TRACES", {"existing-0"})
 class StepTraceTests(unittest.TestCase):
-    def compare(self, base, head, missing_file=None, log=None, on_disk=None, informational=False):
+    def compare(self, base, head, missing_file=None, log=None, on_disk=None, informational=False,
+                declared=()):
         left, right = receipt_dirs(self, [], [])
         logs = {}
         for arm, directory, traces in (("base", left, base), ("head", right, head)):
@@ -1006,7 +1007,7 @@ class StepTraceTests(unittest.TestCase):
                     (trace_dir / f"{name}.json").write_bytes(stored)
                 lines.append(f"STEP_TRACE {name} sha256={hashlib.sha256(data).hexdigest()}")
             logs[arm] = "\n".join(lines) if log is None or arm == "base" else log(lines)
-        return money_equivalence.compare_step_traces(left, right, logs, informational)
+        return money_equivalence.compare_step_traces(left, right, logs, declared, informational)
 
     def test_equal_traces_and_byte_difference(self):
         base = {"existing-0": b"[]"}
@@ -1057,16 +1058,20 @@ class StepTraceTests(unittest.TestCase):
         head = base | {"other-0": b"[1]"}
         with self.assertRaisesRegex(RuntimeError, "step-trace bytes differ: other-0"):
             self.compare(base, head)
-        with mock.patch.object(money_equivalence, "CHANGED_STEP_TRACES", {"other-0"}):
-            self.assertEqual(self.compare(base, head)["changed"], ["other-0"])
-            with self.assertRaisesRegex(RuntimeError, "step-trace bytes differ: existing-0"):
-                self.compare(base, head | {"existing-0": b"[2]"})
-            with self.assertRaisesRegex(RuntimeError, "declared step-trace change not observed"):
-                self.compare(base, base)
-        with mock.patch.object(money_equivalence, "HEAD_ONLY_STEP_TRACES", {"other-0"}), \
-                mock.patch.object(money_equivalence, "CHANGED_STEP_TRACES", {"other-0"}):
+        declared = parse_declarations(pr_body('{"step_traces": ["other-0"]}'))["step_traces"]
+        self.assertEqual(self.compare(base, head, declared=declared)["changed"], ["other-0"])
+        with self.assertRaisesRegex(RuntimeError, "step-trace bytes differ: existing-0"):
+            self.compare(base, head | {"existing-0": b"[2]"}, declared=declared)
+        with self.assertRaisesRegex(RuntimeError, "declared step-trace change not observed"):
+            self.compare(base, base, declared=declared)
+        with mock.patch.object(money_equivalence, "HEAD_ONLY_STEP_TRACES", {"other-0"}):
             with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
-                self.compare(base, head)
+                self.compare(base, head, declared=declared)
+        for block in ('{"step_traces": []}', '{"step_traces": ["a", "a"]}',
+                      '{"step_traces": ["a b"]}', '{"step_traces": {"a": 1}}'):
+            with self.subTest(block=block):
+                with self.assertRaisesRegex(RuntimeError, "step_traces must list"):
+                    parse_declarations(pr_body(block))
 
     def test_a_release_comparison_reports_differences_but_keeps_head_coverage(self):
         base = {"existing-0": b"[]", "gone-0": b"[]"}
@@ -1079,6 +1084,9 @@ class StepTraceTests(unittest.TestCase):
             self.compare(base, {"new-0": b"[]"}, informational=True)
         with self.assertRaisesRegex(RuntimeError, "step-trace digest"):
             self.compare(base, head, on_disk=b"", informational=True)
+        # A declaration cannot excuse anything in a release comparison: it is not consulted.
+        self.assertEqual(self.compare(base, head, informational=True, declared={"gone-0"})["changed"],
+                         ["existing-0"])
 
 
 class HeadOnlyFixtureTests(unittest.TestCase):
