@@ -886,7 +886,22 @@ fn last_reconciling_release_rows_survive_a_save_byte_identical() {
         assert_eq!(restored.legacy_settlement_reconcile_after_fingerprint, None);
         let previous = restored.clone();
         super::save_graph(&mut db, &identity, &previous, &mut restored, &mut cx).unwrap();
-        assert_eq!(rows(&dump(&mut db).unwrap()), before);
+        // The retired Codex counting history is the one change: a save keeps
+        // only the empty roots that older readers require.
+        let expected: Vec<_> = before
+            .iter()
+            .filter_map(|row| match (row.0.as_str(), row.2) {
+                ("v1_field.codex_counting_tombstones", 0) => {
+                    Some((row.0.clone(), row.1.clone(), 0, "0".to_owned()))
+                }
+                ("v1_field.codex_counting_tombstones", _) => None,
+                ("v1_field.codex_counting_evicted_legacy", _) => {
+                    Some((row.0.clone(), row.1.clone(), 0, "[]".to_owned()))
+                }
+                _ => Some(row.clone()),
+            })
+            .collect();
+        assert_eq!(rows(&dump(&mut db).unwrap()), expected);
     });
 }
 
