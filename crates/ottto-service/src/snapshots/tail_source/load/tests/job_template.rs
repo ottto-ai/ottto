@@ -139,3 +139,115 @@ fn pending_run_has_no_job_slot_and_can_mint_on_full() {
     assert!(Fact::JobTemplate.present(&parser.accumulator));
     assert!(parser.accumulator.job_template.unwrap().0.is_some());
 }
+
+#[test]
+fn job_binding_accepts_clamped_birth_on_the_same_inode() {
+    use super::super::settlement_tests::candidate;
+    use crate::snapshots::tail_source::job_template::same_file;
+    let route = crate::snapshots::tail_source::seam::tests::route();
+    let path = route.dir.join("clamped.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let mut file = candidate(&path);
+    file.physical_identity = Some([2, 8]);
+    file.fingerprint_birth_nanos = 700;
+    file.modified_unix_nanos = 700;
+    assert!(same_file(&file, 8, 900));
+    assert!(!same_file(&file, 9, 900));
+    file.modified_unix_nanos = 701;
+    assert!(!same_file(&file, 8, 900));
+}
+
+#[test]
+fn detached_job_survives_native_full_without_a_checkpoint() {
+    use super::super::settlement_tests::candidate;
+    use crate::snapshots::{
+        state_v2,
+        tail_source::{job_template_observation, seam::tests::route},
+        ScanIndexEntry,
+    };
+    use std::os::unix::fs::MetadataExt;
+    let mut route = route();
+    let path = route.dir.join("detached.jsonl");
+    std::fs::write(&path, task_lines().join("\n") + "\n").unwrap();
+    let mut file = candidate(&path);
+    let metadata = std::fs::metadata(&path).unwrap();
+    file.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    let key = crate::snapshots::local_index_key(&path);
+    let mut first = job_full(&route, &path);
+    let context = crate::session_attribution::job_template::context(7);
+    first.accumulator.finish_job_template(Some(&context));
+    let expected = first.accumulator.job_template.clone().unwrap();
+    assert!(expected.0.is_some());
+    let job = job_template_observation(&file, &first.accumulator).unwrap();
+    state_v2::observe_job_template(&route.path, &key, job).unwrap();
+    route
+        .index
+        .files
+        .insert(key.clone(), ScanIndexEntry::default());
+    route.save(false);
+    assert!(route.head(&key).is_none());
+    let mut next = job_full(&route, &path);
+    next.accumulator.finish_job_template(Some(&context));
+    assert_eq!(next.accumulator.job_template, Some(expected.clone()));
+
+    // A retained checkpoint takes custody, and later dropping that checkpoint
+    // brings the decision back to the detached row.
+    let (tail, native) = route.complete("detached.jsonl", &task_lines(), None, |acc| {
+        acc.job_template = Some(expected.clone());
+        acc.job_template_pending = false;
+    });
+    assert!(tail.publish(&native));
+    let job = job_template_observation(&file, &next.accumulator).unwrap();
+    state_v2::observe_job_template(&route.path, &key, job).unwrap();
+    route.save(false);
+    assert!(state_v2::load_job_template_observation(&route.index, &key)
+        .unwrap()
+        .is_none());
+    state_v2::observe_tail(
+        &route.path,
+        &key,
+        state_v2::Observation {
+            representation: state_v2::Representation::NonTail,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    route.save(false);
+    assert!(route.head(&key).is_none());
+    let mut reread = job_full(&route, &path);
+    reread.accumulator.finish_job_template(Some(&context));
+    assert_eq!(reread.accumulator.job_template, Some(expected));
+}
+
+#[test]
+fn detached_pending_run_can_mint_after_its_first_task() {
+    use super::super::settlement_tests::candidate;
+    use crate::snapshots::{
+        state_v2,
+        tail_source::{job_template_observation, seam::tests::route},
+        ScanIndexEntry, SnapshotAccumulator, SnapshotSource,
+    };
+    use std::os::unix::fs::MetadataExt;
+    let mut route = route();
+    let path = route.dir.join("detached-pending.jsonl");
+    std::fs::write(&path, task_lines().join("\n") + "\n").unwrap();
+    let mut file = candidate(&path);
+    let metadata = std::fs::metadata(&path).unwrap();
+    file.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    let key = crate::snapshots::local_index_key(&path);
+    let pending = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    let job = job_template_observation(&file, &pending).unwrap();
+    assert!(job.fact.is_none());
+    state_v2::observe_job_template(&route.path, &key, job).unwrap();
+    route
+        .index
+        .files
+        .insert(key.clone(), ScanIndexEntry::default());
+    route.save(false);
+    assert!(route.head(&key).is_none());
+    let mut parser = job_full(&route, &path);
+    parser
+        .accumulator
+        .finish_job_template(Some(&crate::session_attribution::job_template::context(7)));
+    assert!(parser.accumulator.job_template.unwrap().0.is_some());
+}

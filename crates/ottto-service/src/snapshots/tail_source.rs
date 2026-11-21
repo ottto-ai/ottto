@@ -52,70 +52,10 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
     with_codec!(source, S => S::REDUCTION_REVISION)
 }
 
-/// A native Full starts at byte zero, but job attribution belongs to the
-/// run's first observation. Restore its durable decision independently of
-/// the transcript checkpoint, which may have been invalidated by an edit.
-pub(in crate::snapshots) fn seed_full_job_template(
-    index: &ScanIndex,
-    candidate: &CandidateFile,
-    acc: &mut SnapshotAccumulator,
-) {
-    let key = local_index_key(&candidate.path);
-    acc.job_template_pending = !index.files.contains_key(&key) && !load::held_new(index, &key);
-    // A route error gives no first-read authority. Other snapshot fields
-    // still use the existing native recovery path.
-    let route = match state_v2::tail_route_path(index) {
-        Ok(Some(route)) => route,
-        Ok(None) => return,
-        Err(_) => {
-            acc.job_template_pending = false;
-            return;
-        }
-    };
-    let (head, fact) =
-        match state_v2::load_job_template(index, &key, reduction_revision(acc.source)) {
-            Ok(Some(saved)) => saved,
-            Ok(None) => return,
-            Err(_) => {
-                acc.job_template_pending = false;
-                return;
-            }
-        };
-    acc.job_template_pending = false;
-    let id = HeadIdentity::new(
-        &route,
-        acc.source,
-        &candidate.scan_root,
-        &candidate.path,
-        acc.claude_request_identity_capture,
-    );
-    let mut decoder = Dec::new(&head.body);
-    let Ok(saved) = HeadIdentity::take(&mut decoder) else {
-        return;
-    };
-    // Key changes affect upload policy, not the saved decision. Device
-    // numbers can change across boots; the inode and known birth bind it.
-    if saved.binding != id.binding {
-        return;
-    }
-    let Ok(certificate) = DurableCertificate::take(&mut decoder) else {
-        return;
-    };
-    if !candidate
-        .physical_identity
-        .is_some_and(|[_, inode]| inode == certificate.inode)
-        || (certificate.birth_nanos != 0
-            && candidate.fingerprint_birth_nanos != 0
-            && certificate.birth_nanos != candidate.fingerprint_birth_nanos)
-    {
-        return;
-    }
-    if let Some(bytes) = fact {
-        let _ = Fact::take(state_v2::JOB_TEMPLATE_PAGE, &bytes, acc);
-    } else {
-        acc.job_template_pending = head.common.job_template_pending;
-    }
-}
+mod job_template;
+pub(in crate::snapshots) use job_template::{
+    detached_job_template, job_template_observation, seed_full_job_template,
+};
 
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.

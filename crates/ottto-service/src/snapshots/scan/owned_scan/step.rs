@@ -2261,7 +2261,17 @@ impl OwnedSourceScan {
                         None => tail,
                     });
                 let mut resident_bytes = 0;
+                let mut job_template = group.as_mut().and_then(|group| group.job_template.take());
+                let job_template_file = group
+                    .as_deref()
+                    .map_or(&candidate, |group| &group.members[0]);
                 let mut encode = |live: PreFinalization<'_>| {
+                    if !independent_group {
+                        job_template = tail_source::job_template_observation(
+                            job_template_file,
+                            live.accumulator,
+                        );
+                    }
                     #[cfg(unix)]
                     if let Some(tail) = tail.as_mut() {
                         tail.encode(&live);
@@ -2533,6 +2543,18 @@ impl OwnedSourceScan {
                     sampled_audit::queue_cap_retry(index, &candidate);
                     census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                     pending!();
+                }
+                if let Some(job) = job_template.filter(|_| parse_complete) {
+                    let key = local_index_key(&job_template_file.path);
+                    let saved = state_v2::tail_route_path(index).and_then(|route| {
+                        route.map_or(Ok(()), |route| {
+                            state_v2::observe_job_template(&route, &key, job)
+                        })
+                    });
+                    if saved.is_err() {
+                        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                        pending!();
+                    }
                 }
                 // Debt-free after quiet retirement is scheduling state, not
                 // Full authority, including a later forced Unchanged read.

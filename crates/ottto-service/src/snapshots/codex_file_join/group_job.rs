@@ -852,6 +852,7 @@ impl GroupBoot {
                 consumed_before: 0,
                 independent,
                 contributions: Vec::new(),
+                job_template: None,
             })),
         }))
     }
@@ -905,11 +906,12 @@ pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) consumed_before: u64,
     pub(in crate::snapshots) independent: bool,
     pub(in crate::snapshots) contributions: Vec<SnapshotItem>,
+    pub(in crate::snapshots) job_template: Option<state_v2::JobTemplateObservation>,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
-    consumed_before, independent, contributions);
+    consumed_before, independent, contributions, job_template);
 
 /// Bytes the group consumed outside the current reader (completed members,
 /// header rechecks) since the last call.
@@ -1212,6 +1214,12 @@ fn independent_member_eof(
         .merge_session_features(&mut old.accumulator)
         .ok_or(GroupEnd::Strict)?;
     let end = old.reader.consumed_bytes();
+    let mut job_template = None;
+    let mut capture_job = |view: PreFinalization<'_>| {
+        if group.current == 0 {
+            job_template = tail_source::job_template_observation(&member, view.accumulator);
+        }
+    };
     let mut parsed = old
         .finish_boxed_native(
             FinishRequest {
@@ -1225,7 +1233,7 @@ fn independent_member_eof(
                 repository_identity: None,
                 money_context: None,
             },
-            None,
+            Some(&mut capture_job),
         )
         .map_err(|_| GroupEnd::Strict)?;
     if !parsed.progress_complete() {
@@ -1233,6 +1241,9 @@ fn independent_member_eof(
     }
     for item in &mut parsed.snapshots {
         apply_codex_state_evidence(item, inputs.metadata, &member.path);
+    }
+    if group.current == 0 {
+        group.job_template = job_template;
     }
     group.contributions.extend(parsed.snapshots);
     group.charge = group

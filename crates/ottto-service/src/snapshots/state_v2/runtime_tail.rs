@@ -1,7 +1,8 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
+    Collection, JobTemplateObservation, Observation, PathCarry, SetAside, SetAsideCause,
+    StagedFile, TailHead, TailStage,
 };
 use super::*;
 
@@ -55,6 +56,17 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
+pub(in crate::snapshots) fn observe_job_template(
+    path: &Path,
+    key: &str,
+    job: JobTemplateObservation,
+) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.observe_job_template(key, job);
+        Ok(())
+    })
+}
+
 /// Files a save does not keep: their staged heads go, the committed ones stay.
 pub(in crate::snapshots) fn unstage_tail(
     path: &Path,
@@ -172,6 +184,16 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
+pub(in crate::snapshots) fn load_job_template_observation(
+    index: &ScanIndex,
+    key: &str,
+) -> Result<Option<JobTemplateObservation>> {
+    read_txn(index, |tx| {
+        super::super::tail::load_job_template_observation(tx, key.as_bytes())
+    })
+    .map(|(job, _)| job)
+}
+
 pub(in crate::snapshots) fn load_job_template(
     index: &ScanIndex,
     key: &str,

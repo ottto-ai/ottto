@@ -462,6 +462,8 @@ fn stored<S: TailSource>(
         .map(|(c, m)| (*c, m.meta))
         .collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
+    super::job_template::restore_job_template_observation(index, key, fresh, &mut acc)
+        .map_err(|_| Miss::Unreadable)?;
     S::install_live(&mut acc, fresh, live).map_err(|error| match error {
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),

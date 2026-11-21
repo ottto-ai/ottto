@@ -765,7 +765,8 @@ Only tasks with eight non-placeholder words and at most 64 KiB qualify. Equal
 windows can identify different middle tasks; this is inferred grouping evidence.
 The id and key epoch, or a terminal no-id decision, are stored in SessionFacts
 kind 6. A new run waiting for its first task keeps only an eligibility bit in
-its Tail head. Full reads carry that decision forward for the same file and
-leave indexed legacy runs ineligible. No new prompt text is persisted for this
+its Tail head. Publication without a retained checkpoint keeps the job decision
+or pending eligibility in a file-owned Tail row. Full reads carry that state
+forward for the same file and leave indexed legacy runs ineligible. No new prompt text is persisted for this
 id. Catalogue layout 9 fences older readers at source load before either Tail
 format extension can be published.
