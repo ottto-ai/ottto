@@ -12,15 +12,17 @@ const SOURCE: SnapshotSource = SnapshotSource::Codex;
 const A: &str = "019e5a00-0000-7000-8000-00000000000a";
 const B: &str = "019e5a00-0000-7000-8000-00000000000b";
 
-fn rollout(c: &Corpus, id: &str, account: &str, turns: u64) {
-    let mut body = json!({"timestamp": "2026-10-27T07:00:00Z", "type": "session_meta",
-        "payload": {"id": id, "timestamp": "2026-10-27T06:59:00Z",
+const ROLLOUT_DAY: &str = "2026-10-27";
+
+fn rollout_body(day: &str, id: &str, account: &str, turns: u64) -> String {
+    let mut body = json!({"timestamp": format!("{day}T07:00:00Z"), "type": "session_meta",
+        "payload": {"id": id, "timestamp": format!("{day}T06:59:00Z"),
         "creator_user_id": format!("synthetic-user-{account}"),
         "creator_account_id": format!("synthetic-workspace-{account}")}})
     .to_string()
         + "\n";
     for n in 1..=turns {
-        body += &(json!({"timestamp": "2026-10-27T07:30:00Z", "type": "event_msg",
+        body += &(json!({"timestamp": format!("{day}T07:30:00Z"), "type": "event_msg",
             "payload": {"type": "token_count", "info": {"model": "gpt-5.2",
             "total_token_usage": {"input_tokens": n * 100, "cached_input_tokens": n * 50,
                 "output_tokens": n * 10},
@@ -29,10 +31,14 @@ fn rollout(c: &Corpus, id: &str, account: &str, turns: u64) {
         .to_string()
             + "\n");
     }
+    body
+}
+
+fn rollout(c: &Corpus, id: &str, account: &str, turns: u64) {
     std::fs::write(
         c.root
-            .join(format!("rollout-2026-10-27T07-00-00-{id}.jsonl")),
-        body,
+            .join(format!("rollout-{ROLLOUT_DAY}T07-00-00-{id}.jsonl")),
+        rollout_body(ROLLOUT_DAY, id, account, turns),
     )
     .unwrap();
 }
@@ -99,3 +105,7 @@ mod independent {
     use super::*;
     include!("codex_sameid_oracle_tests.rs");
 }
+
+pub(in crate::snapshot_sync) use independent::{
+    assert_joined_ack, assert_joined_post, revert_archives,
+};

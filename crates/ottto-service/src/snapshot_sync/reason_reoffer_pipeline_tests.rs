@@ -1639,21 +1639,17 @@ fn refused_then_conflicted_holding(
 /// Margin receipt for the scan workers' stack. The real prepare,
 /// rotation and finish cycle (a full scan, then a restart that restores the
 /// durable copy) completes in the optimized build on a thread with the
-/// 2 MiB spawn default, so the workers' larger explicit stack is headroom.
+/// 2 MiB spawn default, as do the Codex join ACK and refusal paths.
 /// An overflow aborts the test process. Release only: the debug build's
 /// frames are far larger. Run by the dispatch-only `scan-stack-margin` job
 /// in `.github/workflows/ci.yml`.
-#[cfg(unix)]
+#[cfg(all(unix, not(debug_assertions)))]
 #[test]
-#[ignore = "release-mode receipt; run by the ci.yml scan-stack-margin dispatch"]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn scan_worker_stack_margin_receipt() {
     const STACK_BYTES: usize = 2 * 1024 * 1024;
-    if cfg!(debug_assertions) {
-        panic!("the margin receipt measures the release build: run with --release");
-    }
     assert!(
         crate::heap_layout_bound::layout_supported(),
         "the durable restore needs a supported layout"
@@ -1685,9 +1681,22 @@ fn scan_worker_stack_margin_receipt() {
         .unwrap()
         .join()
         .unwrap();
+    let ((ack_boots, ack_eofs), (refusal_boots, refusal_eofs, refusal_files)) =
+        run_on_scan_worker_stack_with_size(STACK_BYTES, || {
+            use super::once_credit_oracle_tests::{
+                codex_join_ack_on_worker_stack, codex_join_refusal_on_worker_stack,
+            };
+            (
+                codex_join_ack_on_worker_stack(STACK_BYTES),
+                codex_join_refusal_on_worker_stack(STACK_BYTES),
+            )
+        });
+    let codex_boots = ack_boots + refusal_boots;
+    let codex_eofs = ack_eofs + refusal_eofs;
     eprintln!(
         "SCAN_STACK_MARGIN_RECEIPT stack_bytes={STACK_BYTES} profile=release cycles=3 \
-         restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored}"
+         restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored} \
+         codex_boots={codex_boots} codex_eofs={codex_eofs} codex_refusal_files={refusal_files}"
     );
 }
 

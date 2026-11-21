@@ -2,6 +2,11 @@
 // Uses real preparation, owned scan steps, finish, upload, and checkpoint reload.
 // Every expected decision is hand-written; server placement replaces, never adds.
 use super::*;
+#[cfg(unix)]
+use crate::snapshot_sync::tests::claude_money_e2_pipeline_tests::{
+    assert_joined_ack, assert_joined_post, revert_archives,
+};
+use crate::snapshots::e2_pipeline_scan_fixture::observe_codex_group_eofs;
 use crate::snapshots::sampled_scan::transition_fixture::{self as transition, with_scan_clock};
 use crate::test_effects::{self, Handle, Recording, Scalar};
 use serde_json::{json, Value};
@@ -393,6 +398,8 @@ struct Cycle {
     gate: Value,
     finalized: Vec<SnapshotItem>,
     steps: Vec<Value>,
+    #[cfg(unix)]
+    group_eofs: usize,
     consumed: u64,
     io: transition::IoBytes,
     quiet_anchor_window: u64,
@@ -609,14 +616,27 @@ impl OracleHome {
         index.save_fixture(&self.index_path()).unwrap();
     }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
+        self.cycle_on_worker_stack(server, recording, SNAPSHOT_SYNC_WORKER_STACK_BYTES)
+    }
+    fn cycle_on_worker_stack(
+        &mut self,
+        server: &OracleServer,
+        recording: &Recording,
+        stack_bytes: usize,
+    ) -> Cycle {
         let schedule = self.schedule.map(|s| (s.limit, s.reverse));
         crate::snapshots::OwnedSourceScan::with_oracle_schedule(schedule, || {
             crate::snapshots::OwnedSourceScan::with_oracle_births(self.births.clone(), || {
-                self.cycle_inner(server, recording)
+                self.cycle_inner(server, recording, stack_bytes)
             })
         })
     }
-    fn cycle_inner(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
+    fn cycle_inner(
+        &mut self,
+        server: &OracleServer,
+        recording: &Recording,
+        stack_bytes: usize,
+    ) -> Cycle {
         self.cadence.due();
         let now = self.now;
         let small_page = self.small_page;
@@ -683,7 +703,7 @@ impl OracleHome {
         // The page rows the scan worker emits.
         let pages = Mutex::new(Vec::new());
         let worker_pages = &pages;
-        let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
+        let observed = run_on_scan_worker_stack_with_size(stack_bytes, move || {
             let _entered = handle.enter();
 
             let read = move || {
@@ -729,17 +749,24 @@ impl OracleHome {
             let read =
                 || crate::snapshots::OwnedSourceScan::with_oracle_births(worker_births, read);
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-                if small_page {
-                    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
-                        crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
-                    })
-                } else {
-                    read()
-                }
+                observe_codex_group_eofs(|| {
+                    if small_page {
+                        crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+                            crate::snapshots::OwnedSourceScan::with_oracle_state_budget(
+                                budget, read,
+                            )
+                        })
+                    } else {
+                        read()
+                    }
+                })
             });
             *worker_pages.lock().unwrap() = rows;
             result
         });
+        let ((preparation, index, scan, steps, mut io), group_eofs) = observed;
+        #[cfg(not(unix))]
+        let _ = group_eofs;
         let mut unacked_lost = BTreeMap::<String, u64>::new();
         for page in pages.into_inner().unwrap() {
             if page["stage"] != "native_collection_page" {
@@ -854,6 +881,8 @@ impl OracleHome {
             gate,
             finalized,
             steps,
+            #[cfg(unix)]
+            group_eofs,
             consumed: io.consumed,
             io,
             quiet_anchor_window,
@@ -2197,6 +2226,152 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
         &quiet_route,
         quiet.quiet_anchor_window,
     );
+}
+
+#[cfg(unix)]
+fn assert_codex_join_boot_and_eofs(cycle: &Cycle) -> (usize, usize) {
+    assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+    assert!(cycle.consumed > 0, "the group read both archives");
+    assert_eq!(cycle.steps[0]["before"]["join_active"], false);
+    assert_eq!(cycle.steps.last().unwrap()["before"]["join_active"], false);
+    let boots = cycle
+        .steps
+        .iter()
+        .filter(|step| {
+            step["before"]["join_active"].as_bool() == Some(false)
+                && step["after"]["join_active"].as_bool() == Some(true)
+        })
+        .count();
+    assert_eq!(boots, 1, "one contiguous active join boot");
+    assert_eq!(cycle.group_eofs, 2, "both member EOFs before finish");
+    (boots, cycle.group_eofs)
+}
+
+#[cfg(unix)]
+fn install_revert_archives(home: &OracleHome, second_account: &str) -> Vec<PathBuf> {
+    let root = &home.source.default_roots(&home.fixture.home)[0];
+    revert_archives(root, "2026-10-25", second_account)
+}
+
+#[cfg(unix)]
+pub(super) fn codex_join_ack_on_worker_stack(stack_bytes: usize) -> (usize, usize) {
+    let _decoder = transition::codex_decoder_test_lock();
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "codex_join_ack";
+    let paths = install_revert_archives(&home, "a");
+
+    let cold = home.cycle_on_worker_stack(&server, &recording, stack_bytes);
+    let counts = assert_codex_join_boot_and_eofs(&cold);
+    assert_eq!(cold.before.len(), 1);
+    assert_eq!(cold.finalized.len(), 1);
+    let item = &cold.finalized[0];
+    let fingerprint = &item.snapshot_fingerprint;
+    let batches = cold
+        .batches
+        .iter()
+        .map(|batch| serde_json::from_slice(batch).unwrap())
+        .collect::<Vec<_>>();
+    let wire = assert_joined_post(&batches, fingerprint);
+    assert_eq!(wire["input_tokens"], 9_600);
+    assert_eq!(wire["cache_read_tokens"], 4_800);
+    assert_eq!(wire["provenance"]["input_token_scope"], "inclusive_cached");
+    assert_eq!(cold.acknowledged, [vec![wire.clone()]]);
+    assert_durable(&cold);
+    assert_joined_ack(&cold.index, fingerprint);
+
+    assert_eq!(cold.index.files.len(), 2);
+    let original = &cold.index.files[&index_key(&paths[0])];
+    let revert = &cold.index.files[&index_key(&paths[1])];
+    let member_set = original
+        .codex_joined_member_set
+        .as_ref()
+        .expect("saved member set");
+    assert_ne!(
+        original.source_file_fingerprint,
+        revert.source_file_fingerprint
+    );
+    for entry in [original, revert] {
+        assert!(!entry.source_file_fingerprint.is_empty());
+        assert_eq!(entry.last_snapshot_fingerprint.as_ref(), Some(fingerprint));
+        assert_eq!(entry.codex_joined_member_set.as_ref(), Some(member_set));
+        assert!(entry.codex_captured_joined_member_set.is_none());
+    }
+
+    let placed = server.placement.lock().unwrap().clone();
+    drop(cold);
+    home.cold_restart();
+    let quiet = home.cycle_on_worker_stack(&server, &recording, stack_bytes);
+    assert!(quiet.finish.is_ok(), "{:?}", quiet.finish);
+    assert_eq!(quiet.consumed, 0, "cold reload reads no parser bytes");
+    assert_eq!(quiet.group_eofs, 0);
+    assert!(quiet.batches.is_empty(), "cold reload sends no POST");
+    assert_eq!(*server.placement.lock().unwrap(), placed);
+    counts
+}
+
+#[cfg(unix)]
+pub(super) fn codex_join_refusal_on_worker_stack(stack_bytes: usize) -> (usize, usize, u64) {
+    let _decoder = transition::codex_decoder_test_lock();
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "codex_join_refusal";
+    let paths = install_revert_archives(&home, "b");
+
+    let held = home.cycle_on_worker_stack(&server, &recording, stack_bytes);
+    let (boots, eofs) = assert_codex_join_boot_and_eofs(&held);
+    let incomplete = held.gate["ownership_incomplete_file_count"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(incomplete, 2);
+    assert_eq!(held.gate["residue_count"], 2);
+    let pending = held.gate["pending_finalization"].as_array().unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending
+        .iter()
+        .all(|row| row["parse_complete"].as_bool() == Some(false)));
+    let pending_keys = pending
+        .iter()
+        .map(|row| row["key"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        pending_keys,
+        paths
+            .iter()
+            .map(|path| format!("root-0/{}", path.file_name().unwrap().to_string_lossy()))
+            .collect()
+    );
+
+    assert!(held.before.is_empty() && held.finalized.is_empty());
+    assert!(held.batches.is_empty() && held.acknowledged.is_empty());
+    assert!(server.placement.lock().unwrap().is_empty());
+    assert!(held
+        .index
+        .accepted_snapshot_fingerprints_for_test()
+        .is_empty());
+    assert!(held.progress.accepted_body_witnesses.is_empty());
+    assert!(held.index.files.values().all(|entry| {
+        entry.last_snapshot_fingerprint.is_none() && entry.codex_joined_member_set.is_none()
+    }));
+    (boots, eofs, incomplete)
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_join_boot_and_both_eofs_before_exact_ack() {
+    codex_join_ack_on_worker_stack(SNAPSHOT_SYNC_WORKER_STACK_BYTES);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_join_boot_and_both_eofs_before_ownership_refusal() {
+    codex_join_refusal_on_worker_stack(SNAPSHOT_SYNC_WORKER_STACK_BYTES);
 }
 
 fn codex_member(
