@@ -1217,7 +1217,7 @@ pub(super) fn report_checkin_status(
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
         manifest,
-        // Local control-plane health rides every check-in (public ottto#440):
+        // Local control-plane health rides every check-in:
         // the beat proves uploads are alive, this says whether the socket/XPC
         // plane Setup, Repair, Verify and the Companion use is too. `None`
         // outside a serving daemon process.

@@ -189,7 +189,7 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
         >()
     {
         // Identity hints stored while a server advertised the removed
-        // retained-identity contract; #1810 retired its proof fields.
+        // retained-identity contract; that contract's removal retired its proof fields.
         &[&["accepted", "proved"], &["accepted", "missing"]]
     } else {
         &[]

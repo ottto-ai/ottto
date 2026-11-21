@@ -6,7 +6,7 @@
 //! installs, which run `serve`) or XPC plus its debug socket (`serve-xpc`).
 //! This module keeps a few process-wide counters for that plane, and
 //! [`snapshot`] turns them into the optional `control_plane` block of the
-//! check-in body (public ottto#440).
+//! check-in body.
 //!
 //! `listener_draining` reads XNU's `SOI_S_DRAINING` bit off the unix listener.
 //! A descriptor for the listener closed while another thread is blocked on it
