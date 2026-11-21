@@ -1621,7 +1621,9 @@ fn forked_agent(name: &'static str, witness: &str) -> Rows {
         },
         &scanner,
     );
-    if witness == "missing" {
+    // Only one witness at a time: the root's fold on the page, or its
+    // census record, or neither.
+    if witness != "census" {
         observe::forget_census(&mut page.index, &file(ROOT));
     }
     let mut bodies = vec![if witness == "missing" {
