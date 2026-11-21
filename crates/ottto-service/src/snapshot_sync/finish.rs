@@ -1133,7 +1133,6 @@ pub(super) fn clear_source_manifests_for_test() {
 /// and the caller's handles. Built once, after the preparation is unpacked.
 /// The working state (index, scan, upload progress) is passed beside it.
 #[derive(Clone, Copy)]
-#[expect(dead_code, reason = "read by the stage functions")]
 struct FinishEnv<'a> {
     source: SnapshotSource,
     claude_scan_roots: &'a Option<Vec<PathBuf>>,
@@ -1156,6 +1155,28 @@ struct FinishEnv<'a> {
     daemon: &'a LocalDaemon,
     cache_full_replacement: bool,
     identity_item_cap: usize,
+}
+
+/// What the final progress retirement consumes.
+struct ProgressRetirement<'a> {
+    local_holds: &'a LocalHoldSettlement,
+    projected_pending_head_file_witnesses: &'a BTreeMap<String, Option<String>>,
+    current_entities: &'a BTreeSet<String>,
+    upload_fully_settled: bool,
+    retired_upload_acks: ack_retention::AckRetirementPlan,
+    walk_retired: bool,
+    identity_503_this_pass: Option<BTreeSet<String>>,
+}
+
+/// What the terminal report says about the pass.
+struct PassEnd<'a> {
+    deferred_entity_count: Option<usize>,
+    resolved_permanent_rejections: bool,
+    permanent_refusals: PermanentRefusalCounts,
+    upload_fully_settled: bool,
+    isolated_only: bool,
+    accepted: u64,
+    terminal_scan_started_at: &'a str,
 }
 
 #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
@@ -1221,7 +1242,7 @@ pub(super) fn finish_sync_source(
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     let client = &receipt_client;
-    let _env = FinishEnv {
+    let env = FinishEnv {
         source,
         claude_scan_roots: &claude_scan_roots,
         scan_started_at: &scan_started_at,
@@ -2496,7 +2517,7 @@ pub(super) fn finish_sync_source(
             }),
         },
     );
-    let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
+    let retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
         &ack_scan_referenced,
@@ -2605,6 +2626,66 @@ pub(super) fn finish_sync_source(
     {
         eprintln!("local state maintenance deferred for {}", source.api_slug());
     }
+    record_settled_pass(
+        &env,
+        &scan_result,
+        &index,
+        &local_holds,
+        accepted,
+        fresh_offer,
+    );
+    write_backfill_markers(&env, &scan_result, upload_fully_settled, backfill_succeeded)?;
+    retire_upload_progress(
+        &env,
+        &mut upload_progress,
+        &index,
+        &scan_result,
+        ProgressRetirement {
+            local_holds: &local_holds,
+            projected_pending_head_file_witnesses: &projected_pending_head_file_witnesses,
+            current_entities: &current_entities,
+            upload_fully_settled,
+            retired_upload_acks,
+            walk_retired,
+            identity_503_this_pass,
+        },
+    )?;
+    report_and_arm(
+        &env,
+        &upload_progress,
+        &index,
+        &scan_result,
+        walk_idle_pass,
+        PassEnd {
+            deferred_entity_count,
+            resolved_permanent_rejections,
+            permanent_refusals,
+            upload_fully_settled,
+            isolated_only,
+            accepted,
+            terminal_scan_started_at,
+        },
+    )
+}
+
+/// After the selected save: the source's cadence, the next resident scan and
+/// the detected-uses cache. Nothing here can fail the pass.
+fn record_settled_pass(
+    env: &FinishEnv<'_>,
+    scan_result: &SourceScanResult,
+    index: &ScanIndex,
+    local_holds: &LocalHoldSettlement,
+    accepted: u64,
+    fresh_offer: bool,
+) {
+    let FinishEnv {
+        source,
+        backfill_pending,
+        backfill_state,
+        upload_destination_namespace,
+        support_dir,
+        ..
+    } = *env;
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass durably
     // committed its accepted siblings and each held entity waits on its own
@@ -2616,17 +2697,17 @@ pub(super) fn finish_sync_source(
     });
     let first_read_bootstrap = backfill_pending
         && crate::backfill::bootstrap_pending_for_destination(
-            &backfill_state,
+            backfill_state,
             source,
-            &upload_destination_namespace,
+            upload_destination_namespace,
         );
     let power = continuation::MacPlatformSignals::default().power();
     if let Some(first_import) = continuation::resident_scan_request_after_settlement(
-        &scan_result,
+        scan_result,
         first_read_bootstrap,
         power,
         index.runnable_walk_or_followup(
-            &scan_result,
+            scan_result,
             &local_holds.held_fingerprints,
             local_holds.progress_blocking,
             fresh_offer,
@@ -2647,14 +2728,32 @@ pub(super) fn finish_sync_source(
             source.api_slug()
         );
     }
+}
 
+/// The two durable backfill markers, in order, each under its own condition:
+/// first the Claude unverified-history marker, then destination completion.
+/// Either write can fail the pass before upload progress is retired.
+fn write_backfill_markers(
+    env: &FinishEnv<'_>,
+    scan_result: &SourceScanResult,
+    upload_fully_settled: bool,
+    backfill_succeeded: bool,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        scan_started_at,
+        upload_destination_namespace,
+        backfill_state,
+        support_dir,
+        ..
+    } = *env;
     // StateMissing N2: a Claude census completed and settled under the
     // history gate clears the unverified marker. A fresh index recorded its
     // cutoff this cycle and an intact one keeps its entries, so the rebuilt
     // history stays gated; Claude's bootstrap and replays may then run.
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
-    if claude_replay_suppressed(source, &backfill_state)
+    if claude_replay_suppressed(source, backfill_state)
         && scan_result.census_complete
         && upload_fully_settled
     {
@@ -2677,7 +2776,7 @@ pub(super) fn finish_sync_source(
             mark_backfill_complete_for_destination(
                 backfill_state,
                 source,
-                &upload_destination_namespace,
+                upload_destination_namespace,
             );
             backfill_state.last_completed_at = Some(scan_started_at.clone());
         }) {
@@ -2689,16 +2788,43 @@ pub(super) fn finish_sync_source(
             return Err(anyhow!("local snapshot backfill state save failed"));
         }
     }
+    Ok(())
+}
 
+/// Retires this pass's upload progress, after the index and both markers are
+/// durable.
+fn retire_upload_progress(
+    env: &FinishEnv<'_>,
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    scan_result: &SourceScanResult,
+    retirement: ProgressRetirement<'_>,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        upload_progress_path,
+        daemon,
+        ..
+    } = *env;
+    let ProgressRetirement {
+        local_holds,
+        projected_pending_head_file_witnesses,
+        current_entities,
+        upload_fully_settled,
+        mut retired_upload_acks,
+        walk_retired,
+        identity_503_this_pass,
+    } = retirement;
+    let locally_held_fingerprints = &local_holds.held_fingerprints;
     // Final scan/backfill markers are durable before page progress is retired.
     // Accepted cache evidence and head tokens remain in this same ACK-owned
     // ledger across successful cycles so later corrections can retract safely.
     upload_progress.retire_pending_cache_heads(
-        &index,
+        index,
         &scan_result.snapshots,
         locally_held_fingerprints,
         scan_result.census_complete,
-        &projected_pending_head_file_witnesses,
+        projected_pending_head_file_witnesses,
     );
     upload_progress
         .permanent_rejections
@@ -2706,17 +2832,17 @@ pub(super) fn finish_sync_source(
             refusal.has_stale_debt() || current_entities.contains(fingerprint)
         });
     // Before `finish_cycle` retires this cycle's quarantine records.
-    let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
-    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
+    let retained_refusals = PermanentRefusalCounts::of(upload_progress);
+    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(upload_progress);
     log_retained_permanent_refusals(
         source,
         retained_refusals,
         retained_downgrades,
         upload_fully_settled,
     );
-    upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, &index);
+    upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, index);
     upload_progress.retire_planned_acks_after_index_save(
-        &index,
+        index,
         &retired_upload_acks,
         locally_held_fingerprints,
     );
@@ -2728,11 +2854,45 @@ pub(super) fn finish_sync_source(
     }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
-    upload_progress.finish_cycle(&upload_progress_path)?;
+    upload_progress.finish_cycle(upload_progress_path)?;
     crate::local_resource_diagnostics::pass_retained(source.api_slug(), || {
-        daemon.transcript_cache.retained_heap_bytes(&index)
+        daemon.transcript_cache.retained_heap_bytes(index)
     });
+    Ok(())
+}
 
+/// The terminal receipt and what follows it. Refusals are disclosed without
+/// failing the pass on a send error; a success receipt that cannot be sent
+/// fails the pass before the walk gate is armed.
+fn report_and_arm(
+    env: &FinishEnv<'_>,
+    upload_progress: &SnapshotUploadProgress,
+    index: &ScanIndex,
+    scan_result: &SourceScanResult,
+    walk_idle_pass: Option<(crate::snapshots::walk_idle::Pass, bool)>,
+    end: PassEnd<'_>,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        activity_hint,
+        receipt_window_days,
+        client,
+        index_path,
+        device,
+        device_secret,
+        machine_id,
+        support_dir,
+        ..
+    } = *env;
+    let PassEnd {
+        deferred_entity_count,
+        resolved_permanent_rejections,
+        permanent_refusals,
+        upload_fully_settled,
+        isolated_only,
+        accepted,
+        terminal_scan_started_at,
+    } = end;
     if let Some(count) = deferred_entity_count {
         let state = refused_entity_state(
             resolved_permanent_rejections,
@@ -2752,7 +2912,7 @@ pub(super) fn finish_sync_source(
             support_dir,
             source,
             if scan_result.census_complete {
-                TerminalManifestSource::CompleteCensus(&index)
+                TerminalManifestSource::CompleteCensus(index)
             } else {
                 TerminalManifestSource::Withdraw
             },
@@ -2760,8 +2920,8 @@ pub(super) fn finish_sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-                    .with_snapshot_terminal_counts(&index),
+                counts: SyncCounts::from_scan_result(scan_result, accepted, receipt_window_days)
+                    .with_snapshot_terminal_counts(index),
                 state,
             },
         );
@@ -2780,9 +2940,9 @@ pub(super) fn finish_sync_source(
         return Ok(());
     } else {
         // This walk's loss blocks arming; standing terminal holds do not.
-        let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-            .with_snapshot_terminal_counts(&index);
-        let loss_free = !counts.has_walk_loss(&index);
+        let counts = SyncCounts::from_scan_result(scan_result, accepted, receipt_window_days)
+            .with_snapshot_terminal_counts(index);
+        let loss_free = !counts.has_walk_loss(index);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -2790,7 +2950,7 @@ pub(super) fn finish_sync_source(
             support_dir,
             source,
             if scan_result.census_complete {
-                TerminalManifestSource::CompleteCensus(&index)
+                TerminalManifestSource::CompleteCensus(index)
             } else {
                 TerminalManifestSource::Withdraw
             },
@@ -2809,17 +2969,17 @@ pub(super) fn finish_sync_source(
                 && upload_fully_settled
                 && super::prepare::upload_owes_nothing(
                     source,
-                    &upload_progress,
+                    upload_progress,
                     support_dir,
-                    &activity_hint,
-                    &index,
+                    activity_hint,
+                    index,
                     now,
                 );
             crate::snapshots::walk_idle::arm_after_finish(
                 pass,
-                &index,
-                &index_path,
-                &scan_result,
+                index,
+                index_path,
+                scan_result,
                 outside,
             );
         }
