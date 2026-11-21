@@ -97,7 +97,7 @@ fn upload_attempt_matches_cloned_batch_bytes() {
                     crate::client_report::ClientReport::empty(),
                 );
                 assert_eq!(payloads(&request), expected);
-                Ok(accepted_batch(items.len()))
+                claude_money_e2_pipeline_tests::ack(batch)
             },
             &mut |_| Ok(()),
         )
@@ -180,7 +180,7 @@ fn upload_split_reoffer_matches_cloned_batch_bytes() {
                     "local snapshot upload", "snapshot_batch", 504, true,
                 )));
             }
-            Ok(accepted_batch(batch.len()))
+            claude_money_e2_pipeline_tests::ack(batch)
         }, |_| Ok(()),
     ).unwrap();
     assert_eq!(result, ResumableUploadResult::Completed);

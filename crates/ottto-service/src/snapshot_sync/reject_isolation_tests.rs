@@ -786,7 +786,7 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
                     .as_bytes(),
                 batch.len(),
             ))),
-            None => Ok(accepted_batch(batch.len())),
+            None => Ok(accept_fingerprints(batch)),
         },
         |_| Ok(()),
     )

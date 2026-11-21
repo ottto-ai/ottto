@@ -357,7 +357,7 @@ impl HistoryFixture {
                         })
                         .map(|item| item.source_session_id.clone()),
                 );
-                Ok(accepted_batch(items.len()))
+                claude_money_e2_pipeline_tests::ack(items)
             },
             |_| Ok(()),
         )

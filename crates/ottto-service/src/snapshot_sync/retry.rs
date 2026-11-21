@@ -28,7 +28,6 @@ use super::Command;
 use super::LocalHealthRefreshHeld;
 use super::SnapshotAckRejected;
 use super::SnapshotBatchPreflightRejected;
-use super::SnapshotBatchResponseRejected;
 use super::SnapshotEntityDeferred;
 use super::SnapshotLocalStateRejected;
 use super::SnapshotUploadErrorClass;
@@ -592,12 +591,6 @@ pub(super) fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
         return format!(
             "endpoint=snapshot_batch, kind=daemon_contract_preflight, detail={}",
             rejected.reason,
-        );
-    }
-    if let Some(rejected) = error.downcast_ref::<SnapshotBatchResponseRejected>() {
-        return format!(
-            "endpoint=snapshot_batch, kind=response_count_mismatch, expected={}, accepted={}",
-            rejected.expected, rejected.accepted,
         );
     }
     if let Some(rejected) = error.downcast_ref::<SnapshotLocalStateRejected>() {

@@ -665,7 +665,7 @@ impl ApcFixture {
                 match upload {
                     ApcUpload::Accept | ApcUpload::Crash => {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        Ok(accepted_batch(items.len()))
+                        claude_money_e2_pipeline_tests::ack(items)
                     }
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
@@ -832,11 +832,8 @@ impl ApcFixture {
             },
         );
         self.trace_stage(collected_at, "after_selected_settlement", &index);
-        // As the service finish, after the selected settlement: this page's
-        // exact ACKs earn their file receipts. The synthetic responder answers
-        // count ACKs, which the service never takes as receipt evidence; under
-        // this fixture's one context its exact equivalent is each page body the
-        // upload ledger accepted.
+        // After settlement, match each scan body's exact witness to the
+        // upload ledger before recording its file receipt.
         let acks: BTreeMap<_, _> =
             crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots)
                 .into_iter()

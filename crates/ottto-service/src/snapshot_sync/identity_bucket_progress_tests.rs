@@ -21,7 +21,7 @@ fn body() -> Value {
 fn acknowledged_bucket_keys_survive_progress_restart_and_older_decoder_drops_only_hint() {
     let mut progress = progress();
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
-    progress.record_cache_state(&body(), false).unwrap();
+    progress.record_cache_state(&body()).unwrap();
     let bytes = serde_json::to_vec(&progress).unwrap();
     let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
     restored
@@ -247,11 +247,7 @@ fn stored_state_follows_a_validated_cache_state_echo() {
     let local_witness = "d".repeat(64);
     let mut echoed = progress();
     echoed
-        .record_stored_state(
-            &item,
-            false,
-            Some((&entity(Some(&state)), local_witness.as_str())),
-        )
+        .record_stored_state(&item, Some((&entity(Some(&state)), local_witness.as_str())))
         .unwrap();
     assert_eq!(
         echoed.accepted_cache_states[&cache_session_key("synthetic-sticky-session")],

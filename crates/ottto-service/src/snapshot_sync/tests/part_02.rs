@@ -36,8 +36,6 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
     response.validate_entity_ack(&request).unwrap();
     response.accepted_entities[0].body_witness_digest = None;
     assert!(response.validate_entity_ack(&request).is_err());
-    let legacy = accepted_batch(1);
-    assert!(legacy.validate_entity_ack(&request).is_err());
     response.accepted_entities[0].body_witness_digest = Some(snapshot_upload_body_witness(&item));
     let mut progress = test_upload_progress();
     let mut accepted = 0;
@@ -305,7 +303,7 @@ fn collision_suppressed_codex_rollout_is_not_upload_reachable() {
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
         |batch| {
             upload_calls += 1;
-            Ok(accepted_batch(batch.len()))
+            claude_money_e2_pipeline_tests::ack(batch)
         },
         |_| Ok(()),
     )
@@ -522,7 +520,7 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
         snapshot_upload_body_witness,
         |_| {
             noop_calls += 1;
-            Ok(accepted_batch(1))
+            panic!("already accepted body must not be uploaded")
         },
         |_| Ok(()),
     )
@@ -606,7 +604,7 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
         |batch| {
             upload_calls += 1;
             assert_eq!(batch, items.iter().collect::<Vec<_>>());
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         },
         |state| state.save_fixture(&path),
     )
@@ -631,7 +629,7 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
         String::as_str,
         |_| {
             resumed_upload_calls += 1;
-            Ok(accepted_batch(0))
+            panic!("already accepted replay must not be uploaded")
         },
         |state| state.save_fixture(&path),
     )
@@ -789,7 +787,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         String::as_str,
         |batch| {
             retry_uploads += 1;
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         },
         |_| Ok(()),
     )
@@ -829,7 +827,9 @@ fn resumable_progress_tracks_hash_neutral_body_corrections() {
                 |item| format!("{:064x}", if item.body_revision == "a" { 10 } else { 11 }),
                 |batch| {
                     uploads.push(batch[0].body_revision.clone());
-                    Ok(accepted_batch(batch.len()))
+                    Ok(accept_batch_with(batch, |item| {
+                        item.snapshot_fingerprint.as_str()
+                    }))
                 },
                 |_| Ok(()),
             )
@@ -883,7 +883,9 @@ fn resumable_progress_tracks_hash_neutral_body_corrections() {
         |_| witness_b.clone(),
         |batch| {
             corrected_uploads += 1;
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| {
+                item.snapshot_fingerprint.as_str()
+            }))
         },
         |_| Ok(()),
     )
@@ -916,7 +918,9 @@ fn resumable_progress_rejects_conflicting_bodies_for_one_semantic_entity() {
         |item| format!("{:064x}", if item.body_revision == "a" { 10 } else { 11 }),
         |batch| {
             uploads += 1;
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| {
+                item.snapshot_fingerprint.as_str()
+            }))
         },
         |_| Ok(()),
     )
@@ -1069,20 +1073,36 @@ fn test_quarantine_witness() -> SnapshotQuarantineWitness {
     snapshot_quarantine_witness(SnapshotSource::Codex)
 }
 
-fn accepted_batch(count: usize) -> crate::snapshot_client::SnapshotBatchResponse {
+fn entity_ack_response(count: u64) -> crate::snapshot_client::SnapshotBatchResponse {
     crate::snapshot_client::SnapshotBatchResponse {
         conflict_rescans: Default::default(),
-        accepted: count as u64,
-        sessions_reconciled: count as u64,
+        accepted: count,
+        sessions_reconciled: count,
         session_ids: Vec::new(),
         disabled: false,
         disabled_reason: None,
-        entity_ack_contract: None,
+        entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
         accepted_entities: Vec::new(),
         unchanged_entities: Vec::new(),
         rejected_entities: Vec::new(),
         conflict_entities: Vec::new(),
     }
+}
+
+fn accept_fingerprints(batch: &[&String]) -> crate::snapshot_client::SnapshotBatchResponse {
+    accept_batch_with(batch, String::as_str)
+}
+
+fn accept_batch_with<T>(
+    batch: &[&T],
+    fingerprint: impl Fn(&T) -> &str,
+) -> crate::snapshot_client::SnapshotBatchResponse {
+    let mut response = entity_ack_response(batch.len() as u64);
+    response.accepted_entities = batch
+        .iter()
+        .map(|item| entity_ack_ref(fingerprint(item)))
+        .collect();
+    response
 }
 
 fn entity_ack_ref(fingerprint: &str) -> crate::snapshot_client::SnapshotEntityRef {
@@ -1105,13 +1125,6 @@ fn entity_ack_batch<T: AsRef<str>>(
     conflicted: &[T],
 ) -> crate::snapshot_client::SnapshotBatchResponse {
     crate::snapshot_client::SnapshotBatchResponse {
-        conflict_rescans: Default::default(),
-        accepted: accepted.len().saturating_add(unchanged.len()) as u64,
-        sessions_reconciled: accepted.len().saturating_add(unchanged.len()) as u64,
-        session_ids: Vec::new(),
-        disabled: false,
-        disabled_reason: None,
-        entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
         accepted_entities: accepted
             .iter()
             .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
@@ -1120,12 +1133,87 @@ fn entity_ack_batch<T: AsRef<str>>(
             .iter()
             .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
             .collect(),
-        rejected_entities: Vec::new(),
         conflict_entities: conflicted
             .iter()
             .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
             .collect(),
+        ..entity_ack_response(accepted.len().saturating_add(unchanged.len()) as u64)
     }
+}
+
+#[test]
+fn resumable_upload_rejects_missing_ack_contract_and_reoffers_the_page() {
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.cache_observations = None;
+    item.session_account_evidence = None;
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "codex".into(),
+        machine_id: "synthetic-machine".into(),
+        collector_version: None,
+        snapshots: vec![item],
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let response: crate::snapshot_client::SnapshotBatchResponse =
+        serde_json::from_value(serde_json::json!({
+            "accepted": 1,
+            "sessions_reconciled": 1,
+            "session_ids": [],
+            "disabled": false
+        }))
+        .unwrap();
+    let detail = "snapshot response lacks the entity ACK contract";
+    assert_eq!(
+        response
+            .validate_entity_ack(&request)
+            .unwrap_err()
+            .to_string(),
+        detail
+    );
+
+    let scope = unique_poison_scope();
+    let mut progress = test_upload_progress();
+    let mut accepted = 0;
+    let fingerprint = &request.snapshots[0].snapshot_fingerprint;
+    let error = upload_resumable_batches_with_body_witness(
+        &request.snapshots,
+        &scope,
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |_| Ok(response.clone()),
+        |_| panic!("a failed page must not save a settlement"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), detail);
+    assert_eq!(
+        snapshot_upload_error_class(&error),
+        Some(SnapshotUploadErrorClass::BackendResponse)
+    );
+    assert_eq!(accepted, 0);
+    assert!(progress.accepted_fingerprints.is_empty());
+    assert!(progress.accepted_body_witnesses.is_empty());
+    assert!(progress.fresh_context_body_acks.is_empty());
+
+    upload_resumable_batches_with_body_witness(
+        &request.snapshots,
+        &scope,
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            assert_eq!(batch.len(), 1);
+            assert_eq!(&batch[0].snapshot_fingerprint, fingerprint);
+            claude_money_e2_pipeline_tests::ack(batch)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(accepted, 1);
+    assert!(progress.accepted_fingerprints.contains(fingerprint));
 }
 
 #[test]
@@ -1140,7 +1228,7 @@ fn resumable_upload_rejects_unknown_ack_contract_before_progress_advances() {
         &mut accepted,
         String::as_str,
         |batch| {
-            let mut response = accepted_batch(batch.len());
+            let mut response = entity_ack_response(batch.len() as u64);
             response.entity_ack_contract = Some("snapshot_entity_ack:v999".to_string());
             Ok(response)
         },
@@ -1554,7 +1642,7 @@ fn snapshot_upload_coalesces_duplicate_semantics_with_distinct_observation_metad
         |item| item.fingerprint.as_str(),
         |batch| {
             uploaded.extend(batch.iter().map(|item| item.fingerprint.clone()));
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
         },
         |_| Ok(()),
     )
@@ -1592,7 +1680,7 @@ fn snapshot_upload_byte_bound_closes_mixed_size_batches_early() {
         |item| item.fingerprint.as_str(),
         |batch| {
             observed_batches.push((batch.len(), serde_json::to_vec(batch).unwrap().len()));
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
         },
         |_| Ok(()),
     )
@@ -1634,7 +1722,7 @@ fn snapshot_upload_single_oversize_entity_ships_alone() {
         |item| item.fingerprint.as_str(),
         |batch| {
             observed_batches.push((batch.len(), serde_json::to_vec(batch).unwrap().len()));
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
         },
         |_| Ok(()),
     )
@@ -1782,7 +1870,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
                     .iter()
                     .map(|snapshot| snapshot.snapshot_fingerprint.clone()),
             );
-            Ok(accepted_batch(request.snapshots.len()))
+            claude_money_e2_pipeline_tests::ack(&request.items().collect::<Vec<_>>())
         },
         |state| state.save_fixture(&progress_path),
     )
@@ -1855,7 +1943,11 @@ fn metadata_only_snapshot_still_uploads_and_settles_after_manifest_omission() {
         |batch| {
             attempts += 1;
             assert_eq!(batch, &[&fingerprint]);
-            Ok(accepted_batch(expected_occurrences as usize))
+            let mut response = entity_ack_response(expected_occurrences);
+            let mut entity = entity_ack_ref(&fingerprint);
+            entity.occurrence_count = expected_occurrences;
+            response.accepted_entities.push(entity);
+            Ok(response)
         },
         |_| Ok(()),
     )
@@ -1912,7 +2004,7 @@ fn a_permanently_poisoned_item_is_counted_once_not_once_per_cycle() {
         &mut progress,
         &mut accepted,
         String::as_str,
-        |batch| Ok(accepted_batch(batch.len())),
+        |batch| Ok(accept_fingerprints(batch)),
         |_| Ok(()),
     )
     .expect("valid scan succeeds");
@@ -1941,7 +2033,7 @@ fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
         |batch| {
             attempts += 1;
             if batch == first_page.iter().collect::<Vec<_>>() {
-                Ok(accepted_batch(batch.len()))
+                Ok(accept_fingerprints(batch))
             } else {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
@@ -2209,7 +2301,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
         String::as_str,
         |batch| {
             if batch == first_page.iter().collect::<Vec<_>>() {
-                Ok(accepted_batch(batch.len()))
+                Ok(accept_fingerprints(batch))
             } else {
                 Err(anyhow::Error::new(UploadFailureDiagnostics::for_test(
                     "local snapshot upload",
@@ -2244,7 +2336,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
         String::as_str,
         |batch| {
             resumed_items.extend(batch.iter().copied().cloned());
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         },
         |state| state.save_fixture(&path),
     )
@@ -2297,7 +2389,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
                     "a smaller retry may revisit a held entity but cannot mint a second one"
                 );
             }
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         },
         |state| state.save_fixture(&path),
     )
@@ -2332,7 +2424,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
         String::as_str,
         |_| {
             resumed_upload_calls += 1;
-            Ok(accepted_batch(0))
+            panic!("already accepted page must not be uploaded")
         },
         |state| state.save_fixture(&path),
     )
@@ -2393,7 +2485,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
         String::as_str,
         |_| {
             upload_calls += 1;
-            Ok(accepted_batch(1))
+            panic!("already accepted replay must not be uploaded")
         },
         |state| state.save_fixture(&progress_path),
     )

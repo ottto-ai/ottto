@@ -396,21 +396,16 @@ impl SnapshotUploadProgress {
         Some((answer_attempts, owed_now))
     }
 
-    pub(super) fn record_cache_state<T: Serialize>(
-        &mut self,
-        item: &T,
-        head_changed_without_proof: bool,
-    ) -> Result<()> {
-        self.record_stored_state(item, head_changed_without_proof, None)
+    #[cfg(test)]
+    pub(super) fn record_cache_state<T: Serialize>(&mut self, item: &T) -> Result<()> {
+        self.record_stored_state(item, None)
     }
 
     /// `stored` is the item's stored-body entity ACK (fingerprint-exact, no
-    /// `unchanged_basis`) and this body's local witness. Count-only and
-    /// legacy ACKs pass `None`.
+    /// `unchanged_basis`) and this body's local witness.
     pub(super) fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
-        head_changed_without_proof: bool,
         stored: Option<(&crate::snapshot_client::SnapshotEntityRef, &str)>,
     ) -> Result<()> {
         let value = serde_json::to_value(item)?;
@@ -451,12 +446,6 @@ impl SnapshotUploadProgress {
             }
         }
         let key = cache_session_key(session);
-        // Count-only legacy ACKs cannot distinguish changed from unchanged.
-        // Recover authority through the same bootstrap rather than retaining
-        // a token whose continued validity the response cannot certify.
-        if head_changed_without_proof {
-            self.accepted_cache_heads.remove(&key);
-        }
         let Some(patch) = value.get("cache_observations") else {
             return Ok(());
         };

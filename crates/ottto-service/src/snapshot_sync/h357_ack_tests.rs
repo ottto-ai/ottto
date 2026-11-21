@@ -1645,55 +1645,6 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_legacy_count_only_cas_ack_still_fails_closed_without_head() {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    // A count-only response can acknowledge only evidence-free bodies.
-    let mut probe = items(1).remove(0);
-    probe.session_account_evidence = None;
-    probe.snapshot_fingerprint =
-        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &probe);
-    let mut ledger = progress();
-    let mut calls = Vec::new();
-    let deferred = bootstrap_cache_heads(
-        std::slice::from_ref(&probe),
-        "h360-legacy",
-        &mut ledger,
-        |batch, cas| {
-            calls.push((batch.len(), cas));
-            let mut ack = response(batch, 0);
-            if cas {
-                ack.entity_ack_contract = None;
-                ack.accepted_entities.clear();
-                ack.unchanged_entities.clear();
-            }
-            ack.validate_entity_ack_with_head_cas(&request(batch.to_vec()), cas)?;
-            Ok(ack)
-        },
-        |_| Ok(()),
-    )
-    .unwrap();
-    assert_eq!(deferred, 0);
-    assert_eq!(calls, [(1, false), (1, true)]);
-    assert!(ledger.accepted_cache_heads.is_empty());
-    assert!(!cache_head_probe_held(&ledger, &probe));
-    let mut snapshots = vec![with_cache(&probe)];
-    let error = apply_bootstrapped_cache_heads("codex", &mut snapshots, &ledger).unwrap_err();
-    assert_eq!(
-        snapshot_upload_error_class(&error),
-        Some(SnapshotUploadErrorClass::BackendResponse)
-    );
-    assert_eq!(
-        upload_failure_diagnostic(&error),
-        "kind=backend_response, detail=cache head probe lacks accepted predecessor token"
-    );
-    assert!(snapshots[0].cache_observations.is_some());
-}
-
-#[test]
-#[serial_test::serial(client_report)]
 fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))

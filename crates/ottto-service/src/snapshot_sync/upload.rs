@@ -40,8 +40,6 @@ impl std::error::Error for SnapshotBatchPreflightRejected {}
 
 impl std::error::Error for SnapshotLocalStateRejected {}
 
-impl std::error::Error for SnapshotBatchResponseRejected {}
-
 impl std::error::Error for SourcesFailed {}
 
 impl std::error::Error for SnapshotEntityDeferred {}
@@ -722,22 +720,6 @@ impl std::fmt::Display for SnapshotLocalStateRejected {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct SnapshotBatchResponseRejected {
-    pub(super) expected: u64,
-    pub(super) accepted: u64,
-}
-
-impl std::fmt::Display for SnapshotBatchResponseRejected {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "snapshot batch accepted-count mismatch: expected {}, received {}",
-            self.expected, self.accepted
-        )
-    }
-}
-
 /// Legacy ambiguity is resolved by the normal upload/quarantine machine. The
 /// deployed handler's exact-repeat contract is deliberately truthful: it
 /// commits the source-freshness acceptance UPSERT, but skips the
@@ -816,11 +798,7 @@ pub(super) fn snapshot_upload_error_class(
 ) -> Option<SnapshotUploadErrorClass> {
     if error.downcast_ref::<SnapshotLocalStateRejected>().is_some() {
         Some(SnapshotUploadErrorClass::LocalState)
-    } else if error.downcast_ref::<SnapshotAckRejected>().is_some()
-        || error
-            .downcast_ref::<SnapshotBatchResponseRejected>()
-            .is_some()
-    {
+    } else if error.downcast_ref::<SnapshotAckRejected>().is_some() {
         Some(SnapshotUploadErrorClass::BackendResponse)
     } else {
         None
@@ -1057,296 +1035,267 @@ where
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
-    let mut conflicted_entities = 0usize;
-    let mut isolated_entities = 0usize;
+    response.require_entity_ack_contract()?;
     let mut head_conflicts_recovered = Vec::new();
     let mut head_conflicts_recorded = Vec::new();
-    let entity_ack = match response.entity_ack_contract.as_deref() {
-        None => false,
-        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT) => true,
-        Some(_) => {
-            return Err(anyhow!(
-                "snapshot response uses an unsupported entity ACK contract"
+    // An ordinary changed write may omit CAS/head proof while
+    // cache is disabled. Its old predecessor no longer grants
+    // authority; the existing bootstrap must recover it later.
+    // An unchanged ACK leaves the saved head valid.
+    for entity in &response.accepted_entities {
+        if entity.head_etag.is_none() {
+            progress
+                .accepted_cache_heads
+                .remove(&cache_session_key(&entity.source_session_id));
+        }
+    }
+    for entity in response
+        .accepted_entities
+        .iter()
+        .chain(&response.unchanged_entities)
+    {
+        if let Some(head) = &entity.head_etag {
+            progress
+                .accepted_cache_heads
+                .insert(cache_session_key(&entity.source_session_id), head.clone());
+        }
+    }
+    // Only a settled ref with a head resolves the session's owed
+    // challenge: a headless ref (a stripped base without CAS) proves no
+    // head. A conflict in the same page for a session so settled records
+    // nothing.
+    let mut settled_sessions = BTreeSet::new();
+    for entity in response
+        .accepted_entities
+        .iter()
+        .chain(&response.unchanged_entities)
+        .filter(|entity| entity.head_etag.is_some())
+    {
+        let key = cache_session_key(&entity.source_session_id);
+        if let Some(record) = progress.head_conflict_challenges.remove(&key) {
+            head_conflicts_recovered.push((
+                SessionHash::of(&entity.source_session_id),
+                record.answer_attempts,
             ));
         }
-    };
-    if !entity_ack && response.accepted != indices.len() as u64 {
-        return Err(anyhow::Error::new(SnapshotBatchResponseRejected {
-            expected: indices.len() as u64,
-            accepted: response.accepted,
-        }));
+        settled_sessions.insert(key);
     }
-    if entity_ack {
-        // An ordinary changed write may omit CAS/head proof while
-        // cache is disabled. Its old predecessor no longer grants
-        // authority; the existing bootstrap must recover it later.
-        // An unchanged ACK leaves the saved head valid.
-        for entity in &response.accepted_entities {
-            if entity.head_etag.is_none() {
-                progress
-                    .accepted_cache_heads
-                    .remove(&cache_session_key(&entity.source_session_id));
-            }
+    let now = current_unix_seconds();
+    // Conflicted bodies whose new challenge answer is owed on the next page.
+    let mut answer_owed_now = BTreeSet::new();
+    for entity in &response.conflict_entities {
+        let key = cache_session_key(&entity.source_session_id);
+        if settled_sessions.contains(&key) {
+            continue;
         }
-        for entity in response
-            .accepted_entities
-            .iter()
-            .chain(&response.unchanged_entities)
-        {
-            if let Some(head) = &entity.head_etag {
-                progress
-                    .accepted_cache_heads
-                    .insert(cache_session_key(&entity.source_session_id), head.clone());
+        let (Some(challenge), Some(rescan)) = (
+            entity.head_challenge.as_deref(),
+            response.conflict_rescans.get(&entity.snapshot_fingerprint),
+        ) else {
+            continue;
+        };
+        if let Some((attempts, owed_now)) = progress.record_head_conflict_challenge(
+            &entity.source_session_id,
+            challenge,
+            rescan,
+            now,
+        ) {
+            if owed_now {
+                answer_owed_now.insert(entity.snapshot_fingerprint.as_str());
             }
+            head_conflicts_recorded.push((
+                SessionHash::of(&entity.source_session_id),
+                attempts,
+                rescan.answered,
+            ));
         }
-        // Only a settled ref with a head resolves the session's owed
-        // challenge: a headless ref (a stripped base without CAS) proves no
-        // head. A conflict in the same page for a session so settled records
-        // nothing.
-        let mut settled_sessions = BTreeSet::new();
-        for entity in response
-            .accepted_entities
-            .iter()
-            .chain(&response.unchanged_entities)
-            .filter(|entity| entity.head_etag.is_some())
-        {
-            let key = cache_session_key(&entity.source_session_id);
-            if let Some(record) = progress.head_conflict_challenges.remove(&key) {
-                head_conflicts_recovered.push((
-                    SessionHash::of(&entity.source_session_id),
-                    record.answer_attempts,
-                ));
-            }
-            settled_sessions.insert(key);
-        }
-        let now = current_unix_seconds();
-        // Conflicted bodies whose new challenge answer is owed on the next page.
-        let mut answer_owed_now = BTreeSet::new();
-        for entity in &response.conflict_entities {
-            let key = cache_session_key(&entity.source_session_id);
-            if settled_sessions.contains(&key) {
-                continue;
-            }
-            let (Some(challenge), Some(rescan)) = (
-                entity.head_challenge.as_deref(),
-                response.conflict_rescans.get(&entity.snapshot_fingerprint),
-            ) else {
-                continue;
-            };
-            if let Some((attempts, owed_now)) = progress.record_head_conflict_challenge(
-                &entity.source_session_id,
-                challenge,
-                rescan,
-                now,
+    }
+    // An unchanged ref with `unchanged_basis` means the server did not
+    // store this body (its head already covers the usage). Nothing
+    // body-scoped is recorded as stored: the exact body is held instead,
+    // so it is offered once per change and never marked emitted.
+    let not_stored = response
+        .unchanged_entities
+        .iter()
+        .filter(|entity| entity.unchanged_basis.is_some())
+        .map(|entity| entity.snapshot_fingerprint.as_str())
+        .collect::<BTreeSet<_>>();
+    let usage_identical = response
+        .unchanged_entities
+        .iter()
+        .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
+        .map(|entity| entity.snapshot_fingerprint.as_str())
+        .collect::<BTreeSet<_>>();
+    let settled = response
+        .accepted_entities
+        .iter()
+        .chain(&response.unchanged_entities)
+        .map(|entity| entity.snapshot_fingerprint.as_str())
+        .filter(|fingerprint| !not_stored.contains(fingerprint))
+        .collect::<BTreeSet<_>>();
+    let stored_refs = response
+        .accepted_entities
+        .iter()
+        .chain(&response.unchanged_entities)
+        .filter(|entity| entity.unchanged_basis.is_none())
+        .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    for (entity, unchanged) in response
+        .accepted_entities
+        .iter()
+        .map(|entity| (entity, false))
+        .chain(
+            response
+                .unchanged_entities
+                .iter()
+                .map(|entity| (entity, true)),
+        )
+    {
+        crate::local_resource_diagnostics::change_reason::settled(
+            poison_scope,
+            &entity.snapshot_fingerprint,
+            ack_usage_identical(unchanged, entity.unchanged_basis.as_deref()),
+        );
+    }
+    for index in indices {
+        let item = &items[*index];
+        let item_fingerprint = fingerprint(item);
+        if settled.contains(item_fingerprint) {
+            let witness = body_witness(item);
+            progress.record_body(item_fingerprint, &witness);
+            // A main-upload ACK of the session's current body pays its
+            // identity-503 debt, in this same checkpoint.
+            if let (Some(_), Some(pending), Some(session)) = (
+                &progress.identity_503_pass,
+                progress.identity_503_pending.as_mut(),
+                session_id(item),
             ) {
-                if owed_now {
-                    answer_owed_now.insert(entity.snapshot_fingerprint.as_str());
-                }
-                head_conflicts_recorded.push((
-                    SessionHash::of(&entity.source_session_id),
-                    attempts,
-                    rescan.answered,
-                ));
+                pending.remove(&cache_session_key(session));
             }
-        }
-        // An unchanged ref with `unchanged_basis` means the server did not
-        // store this body (its head already covers the usage). Nothing
-        // body-scoped is recorded as stored: the exact body is held instead,
-        // so it is offered once per change and never marked emitted.
-        let not_stored = response
-            .unchanged_entities
-            .iter()
-            .filter(|entity| entity.unchanged_basis.is_some())
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
-        let usage_identical = response
-            .unchanged_entities
-            .iter()
-            .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
-        let settled = response
-            .accepted_entities
-            .iter()
-            .chain(&response.unchanged_entities)
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .filter(|fingerprint| !not_stored.contains(fingerprint))
-            .collect::<BTreeSet<_>>();
-        let stored_refs = response
-            .accepted_entities
-            .iter()
-            .chain(&response.unchanged_entities)
-            .filter(|entity| entity.unchanged_basis.is_none())
-            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
-            .collect::<BTreeMap<_, _>>();
-        for (entity, unchanged) in response
-            .accepted_entities
-            .iter()
-            .map(|entity| (entity, false))
-            .chain(
-                response
-                    .unchanged_entities
-                    .iter()
-                    .map(|entity| (entity, true)),
-            )
-        {
-            crate::local_resource_diagnostics::change_reason::settled(
-                poison_scope,
-                &entity.snapshot_fingerprint,
-                ack_usage_identical(unchanged, entity.unchanged_basis.as_deref()),
-            );
-        }
-        for index in indices {
-            let item = &items[*index];
-            let item_fingerprint = fingerprint(item);
-            if settled.contains(item_fingerprint) {
-                let witness = body_witness(item);
-                progress.record_body(item_fingerprint, &witness);
-                // A main-upload ACK of the session's current body pays its
-                // identity-503 debt, in this same checkpoint.
-                if let (Some(_), Some(pending), Some(session)) = (
-                    &progress.identity_503_pass,
-                    progress.identity_503_pending.as_mut(),
-                    session_id(item),
-                ) {
-                    pending.remove(&cache_session_key(session));
-                }
 
-                if let Some(context) = &progress.context_resend.active {
-                    progress
-                        .accepted_body_contexts
-                        .insert(item_fingerprint.to_string(), context.clone());
-                }
+            if let Some(context) = &progress.context_resend.active {
                 progress
-                    .fresh_context_body_acks
-                    .insert(item_fingerprint.to_string(), witness.clone());
-                progress.record_stored_state(
-                    item,
-                    false,
-                    stored_refs
-                        .get(item_fingerprint)
-                        .map(|entity| (*entity, witness.as_str())),
-                )?;
-            } else if not_stored.contains(item_fingerprint) {
-                progress.hold_unstored_body(
+                    .accepted_body_contexts
+                    .insert(item_fingerprint.to_string(), context.clone());
+            }
+            progress
+                .fresh_context_body_acks
+                .insert(item_fingerprint.to_string(), witness.clone());
+            progress.record_stored_state(
+                item,
+                stored_refs
+                    .get(item_fingerprint)
+                    .map(|entity| (*entity, witness.as_str())),
+            )?;
+        } else if not_stored.contains(item_fingerprint) {
+            progress.hold_unstored_body(
+                item_fingerprint,
+                &body_witness(item),
+                usage_identical.contains(item_fingerprint),
+            );
+            progress
+                .context_resend
+                .not_stored
+                .insert(item_fingerprint.to_string());
+        }
+    }
+    if !not_stored.is_empty() {
+        let usage_identical = usage_identical.len();
+        eprintln!(
+            "local snapshot unchanged not stored for {poison_scope}: count={} \
+             usage_identical={usage_identical} other={}; exact bodies held, not marked emitted",
+            not_stored.len(),
+            not_stored.len().saturating_sub(usage_identical),
+        );
+    }
+    let rejected = response
+        .rejected_entities
+        .iter()
+        .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let conflicted = response
+        .conflict_entities
+        .iter()
+        .map(|entity| entity.snapshot_fingerprint.as_str())
+        .collect::<BTreeSet<_>>();
+    for index in indices {
+        let item = &items[*index];
+        let item_fingerprint = fingerprint(item);
+        if let Some(rejection) = rejected.get(item_fingerprint) {
+            if rejection.permanent {
+                progress
+                    .head_conflict_challenges
+                    .remove(&cache_session_key(&rejection.source_session_id));
+                progress.quarantine_permanent_body(
                     item_fingerprint,
                     &body_witness(item),
-                    usage_identical.contains(item_fingerprint),
+                    rejection.safe_reason(),
                 );
-                progress
-                    .context_resend
-                    .not_stored
-                    .insert(item_fingerprint.to_string());
-            }
-        }
-        if !not_stored.is_empty() {
-            let usage_identical = usage_identical.len();
-            eprintln!(
-                "local snapshot unchanged not stored for {poison_scope}: count={} \
-                 usage_identical={usage_identical} other={}; exact bodies held, not marked emitted",
-                not_stored.len(),
-                not_stored.len().saturating_sub(usage_identical),
-            );
-        }
-        let rejected = response
-            .rejected_entities
-            .iter()
-            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
-            .collect::<BTreeMap<_, _>>();
-        let conflicted = response
-            .conflict_entities
-            .iter()
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
-        for index in indices {
-            let item = &items[*index];
-            let item_fingerprint = fingerprint(item);
-            if let Some(rejection) = rejected.get(item_fingerprint) {
-                if rejection.permanent {
-                    progress
-                        .head_conflict_challenges
-                        .remove(&cache_session_key(&rejection.source_session_id));
-                    progress.quarantine_permanent_body(
-                        item_fingerprint,
-                        &body_witness(item),
-                        rejection.safe_reason(),
-                    );
-                    progress.note_refused_exposure(item_fingerprint, item);
-                    progress.settle_telemetry_root(&rejection.source_session_id);
-                } else {
-                    // Any validated non-permanent answer keeps only this
-                    // entity owed. Accepted siblings settle independently.
-                    progress.quarantine_retryable_body(
-                        item_fingerprint,
-                        &body_witness(item),
-                        quarantine_retry_after(item_fingerprint),
-                    );
-                }
-            } else if conflicted.contains(item_fingerprint) {
-                // An owed new answer rides the next selecting page; any other
-                // conflict gets its mandatory probe within one hour.
-                // Terminal-contract re-arm: main's 6-12 h cadence, unchanged (separate timer).
-                let contract_rearm = progress
-                    .quarantined_fingerprints
-                    .get(item_fingerprint)
-                    .is_some_and(|record| record.contract_retry_claims.is_some());
-                let retry_after = if contract_rearm {
-                    quarantine_retry_after(item_fingerprint)
-                } else if answer_owed_now.contains(item_fingerprint) {
-                    now
-                } else {
-                    conflict_probe_after(item_fingerprint, now)
-                };
+                progress.note_refused_exposure(item_fingerprint, item);
+                progress.settle_telemetry_root(&rejection.source_session_id);
+            } else {
+                // Any validated non-permanent answer keeps only this
+                // entity owed. Accepted siblings settle independently.
                 progress.quarantine_retryable_body(
                     item_fingerprint,
                     &body_witness(item),
-                    retry_after,
-                );
-                crate::local_resource_diagnostics::traversal_point(
-                    "quarantine_retry_body",
-                    poison_scope,
-                    &serde_json::json!({"origin": "conflict",
-                        "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
-                        "body_witness_hash8": body_witness(item).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+                    quarantine_retry_after(item_fingerprint),
                 );
             }
-        }
-        // A conflict is not a settlement, but it IS retryable: the
-        // backend is asking for this entity again later, not never.
-        // It therefore uses the quarantine ledger's bounded backoff, but
-        // never consumes the permanent reconstruction-failure budget.
-        // A transient conflict remains retryable.
-        //
-        // Returning the whole page as an error here (the previous
-        // behaviour) discarded the entities the backend had ALREADY
-        // written in this same response, so nothing was ever
-        // checkpointed: the identical page replayed every cycle,
-        // the scan index could never commit, and the "fresh
-        // complete scan" that recovery waited on could never
-        // happen. One conflicting entity deadlocked its whole
-        // source permanently, across restarts.
-        // A held body is pending the same way.
-        conflicted_entities = response.conflict_entities.len().saturating_add(
-            response
-                .rejected_entities
-                .iter()
-                .filter(|entity| !entity.permanent)
-                .count(),
-        );
-        isolated_entities = response
-            .rejected_entities
-            .iter()
-            .filter(|entity| !entity.permanent && entity.ordinary_retryable())
-            .count()
-            .saturating_add(response.conflict_entities.len());
-        progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
-    } else {
-        for index in indices {
-            let item = &items[*index];
-            progress.record_body(fingerprint(item), &body_witness(item));
-            progress.record_cache_state(item, true)?;
+        } else if conflicted.contains(item_fingerprint) {
+            // An owed new answer rides the next selecting page; any other
+            // conflict gets its mandatory probe within one hour.
+            // Terminal-contract re-arm: main's 6-12 h cadence, unchanged (separate timer).
+            let contract_rearm = progress
+                .quarantined_fingerprints
+                .get(item_fingerprint)
+                .is_some_and(|record| record.contract_retry_claims.is_some());
+            let retry_after = if contract_rearm {
+                quarantine_retry_after(item_fingerprint)
+            } else if answer_owed_now.contains(item_fingerprint) {
+                now
+            } else {
+                conflict_probe_after(item_fingerprint, now)
+            };
+            progress.quarantine_retryable_body(item_fingerprint, &body_witness(item), retry_after);
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry_body",
+                poison_scope,
+                &serde_json::json!({"origin": "conflict",
+                    "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
+                    "body_witness_hash8": body_witness(item).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
+            );
         }
     }
+    // A conflict is not a settlement, but it IS retryable: the
+    // backend is asking for this entity again later, not never.
+    // It therefore uses the quarantine ledger's bounded backoff, but
+    // never consumes the permanent reconstruction-failure budget.
+    // A transient conflict remains retryable.
+    //
+    // Returning the whole page as an error here (the previous
+    // behaviour) discarded the entities the backend had ALREADY
+    // written in this same response, so nothing was ever
+    // checkpointed: the identical page replayed every cycle,
+    // the scan index could never commit, and the "fresh
+    // complete scan" that recovery waited on could never
+    // happen. One conflicting entity deadlocked its whole
+    // source permanently, across restarts.
+    // A held body is pending the same way.
+    let conflicted_entities = response.conflict_entities.len().saturating_add(
+        response
+            .rejected_entities
+            .iter()
+            .filter(|entity| !entity.permanent)
+            .count(),
+    );
+    let isolated_entities = response
+        .rejected_entities
+        .iter()
+        .filter(|entity| !entity.permanent && entity.ordinary_retryable())
+        .count()
+        .saturating_add(response.conflict_entities.len());
+    progress.context_resend.counts.server_conflicts += conflicted_entities as u64;
     // The remote write happened first. If this local atomic save
     // fails, stop: at most this one idempotent page can replay.
     let saved = persist(progress);
@@ -1368,21 +1317,19 @@ where
              refused_answers={answer_attempts}; challenge saved, the next eligible upload answers it",
         );
     }
-    if entity_ack {
-        for entity in &response.rejected_entities {
-            if entity.permanent {
-                record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
-            }
-            eprintln!(
-                "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
-                 accepted siblings checkpointed, rejected body retained in bounded quarantine",
-                entity.safe_reason(),
-                entity.permanent,
-                rejection_log::rejected_session_hash(
-                    items, indices, &entity.snapshot_fingerprint, fingerprint, session_id,
-                ),
-            );
+    for entity in &response.rejected_entities {
+        if entity.permanent {
+            record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
         }
+        eprintln!(
+            "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
+             accepted siblings checkpointed, rejected body retained in bounded quarantine",
+            entity.safe_reason(),
+            entity.permanent,
+            rejection_log::rejected_session_hash(
+                items, indices, &entity.snapshot_fingerprint, fingerprint, session_id,
+            ),
+        );
     }
     *accepted = accepted.saturating_add(response.accepted);
 

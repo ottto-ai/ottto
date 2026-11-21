@@ -461,7 +461,7 @@ fn seed_money_maps(progress: &mut SnapshotUploadProgress) {
         ],
     );
     for body in [switch, side] {
-        progress.record_cache_state(&body, false).unwrap();
+        progress.record_cache_state(&body).unwrap();
     }
 }
 

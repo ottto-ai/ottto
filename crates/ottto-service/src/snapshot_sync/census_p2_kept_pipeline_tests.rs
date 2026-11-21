@@ -481,9 +481,7 @@ impl PipelineFixture {
                     _ => {}
                 }
                 if let PipelineUpload::EntityAckRejected { session, reason } = upload {
-                    let mut response = accepted_batch(0);
-                    response.entity_ack_contract =
-                        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string());
+                    let mut response = entity_ack_response(0);
                     for item in items {
                         if item.source_session_id == session {
                             response.rejected_entities.push(
@@ -505,7 +503,7 @@ impl PipelineFixture {
                     }
                     Ok(response)
                 } else {
-                    Ok(accepted_batch(items.len()))
+                    claude_money_e2_pipeline_tests::ack(items)
                 }
             },
             |checkpoint| {
