@@ -1029,5 +1029,4 @@ pub(super) fn claude_passive_reading_usable(
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;

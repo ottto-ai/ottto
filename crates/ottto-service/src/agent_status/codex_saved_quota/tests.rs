@@ -481,8 +481,7 @@ fn an_unwritable_saved_file_still_spaces_the_reads() {
     )
     .is_some());
     assert_eq!(reads.get(), 2);
-    let explicit =
-        |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
+    let explicit = |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
     assert!(read_and_save_at(
         &root,
         &home,
