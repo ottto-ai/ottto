@@ -1,13 +1,15 @@
 //! Full synthetic receipts at the Claude usage-collection entry.
 //! Each step runs the production usage collector with the production clock
 //! function under one fixed test scan clock, then pins the complete outcome,
-//! the ordered provider requests and every saved state the step left behind.
+//! the ordered provider requests and the raw saved files the step left behind.
 //! Boundary rows step the clock explicitly between collection calls.
+use super::claude_selection_oracle_tests::{emit, outcome_value, OAuthGuard};
 use super::*;
 use crate::test_effects::{Recording, Scalar};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::PoisonError;
 
 /// 2026-08-05T01:00:00Z. Every clock below is written relative to it.
 const T: u64 = 1_785_891_600;
@@ -16,20 +18,26 @@ const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const SUCCEEDED: &str = "A supported Claude OAuth quota response was collected successfully.";
 const REUSED: &str = "Locally cached quota evidence was reused; no provider check was made.";
 
-// One scripted provider answer per request, consumed in request order. A
-// missing answer fails the row: no request may reach a real endpoint.
+// One scripted provider answer per request, consumed in request order. The
+// production call site holds the shared responder lock while it calls the
+// responder, so a missing answer never panics there: it is counted, answered
+// with a synthetic 503, and the step fails after the collection call returns.
 static SCRIPT: Mutex<VecDeque<Result<Value, u16>>> = Mutex::new(VecDeque::new());
+static SCRIPT_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
 
 fn scripted_provider(endpoint: &str) -> Result<Value, u16> {
     crate::test_effects::record(
         "provider_request",
         vec![("endpoint", Scalar::Text(endpoint.to_string()))],
     );
-    SCRIPT
+    let answer = SCRIPT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pop_front()
-        .expect("one scripted provider answer per request")
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop_front();
+    answer.unwrap_or_else(|| {
+        SCRIPT_EXHAUSTED.fetch_add(1, SeqCst);
+        Err(503)
+    })
 }
 
 fn body(session: u8, weekly: u8) -> Value {
@@ -90,12 +98,25 @@ fn stored(observed: u64, next: u64, windows: Vec<Value>, pair: (&str, &str)) -> 
         "next_refresh_after_epoch_seconds": next, "windows": windows, "credit_balances": []})
 }
 
+/// A saved file as it is on disk: absent, or present with its exact JSON.
+fn absent() -> Value {
+    json!({"present": false})
+}
+
+fn present(json: Value) -> Value {
+    json!({"present": true, "json": json})
+}
+
 fn saved(cache: Value, schedule: Value, breaker: Value) -> Value {
     json!({"cache": cache, "schedule": schedule, "breaker": breaker})
 }
 
+fn nothing_saved() -> Value {
+    saved(absent(), absent(), absent())
+}
+
 fn plain_read(at: u64) -> Value {
-    json!({"last_plain_read_at": at, "tracked_since": at})
+    present(json!({"last_plain_read_at": at, "tracked_since": at}))
 }
 
 fn step(clock: u64, caller: &str, outcome: Value, requests: usize, saved: Value) -> Value {
@@ -105,104 +126,69 @@ fn step(clock: u64, caller: &str, outcome: Value, requests: usize, saved: Value)
         "saved": saved})
 }
 
-fn emit(name: &str, inputs: Value, actual: Value, expected: Value) {
-    assert_eq!(actual, expected, "{name}: complete receipt");
-    let root = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ottto-claude-collection-oracle"));
-    fs::create_dir_all(&root).unwrap();
-    let inputs = serde_json::to_vec(&inputs).unwrap();
-    fs::write(root.join(format!("{name}.inputs")), &inputs).unwrap();
-    let bytes = serde_json::to_vec(&json!({"kind":"plain_json_v1","value":actual})).unwrap();
-    let digest = format!("{:x}", Sha256::digest(&bytes));
-    if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
-        let out = PathBuf::from(out);
-        fs::create_dir_all(&out).unwrap();
-        fs::write(out.join(format!("{name}.inputs")), &inputs).unwrap();
-        for suffix in ["json", "cross-build.json"] {
-            fs::write(out.join(format!("{name}.{suffix}")), &bytes).unwrap();
-        }
-        for suffix in ["sha256", "cross-build.sha256"] {
-            fs::write(out.join(format!("{name}.{suffix}")), &digest).unwrap();
-        }
+/// Read one saved file directly, never through the eligibility readers: they
+/// collapse a wrong-identity, wrong-fingerprint or unparseable file to
+/// "nothing" and can migrate keys while probing.
+fn raw_file(path: &Path) -> Value {
+    match fs::read(path) {
+        Ok(bytes) => present(
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"unparseable": String::from_utf8_lossy(&bytes)})),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent(),
+        Err(error) => json!({"unreadable": error.to_string()}),
     }
-    println!(
-        "MONEY_EQUIVALENCE {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={digest}",
-        bytes.len()
-    );
 }
 
-/// Synthetic homes, the scripted provider and an effect recording. Every
-/// replaced hook, process-wide usage state and variable is restored on drop,
-/// including on unwind. No credential is read and no request leaves the test.
+/// The exact pair's three saved files.
+fn saved_files(pair: (&str, &str)) -> Value {
+    let mut breaker = raw_file(&claude_oauth_usage_breaker_path(pair.0, pair.1));
+    // The configuration fingerprint embeds the build's user agent; pin that
+    // it is the current one rather than one build's text. Any other value
+    // stays verbatim, so a stale-fingerprint file differs from a removed one.
+    if breaker["json"]["config_fingerprint"] == json!(claude_oauth_usage_config_fingerprint()) {
+        breaker["json"]["config_fingerprint"] = json!("current");
+    }
+    saved(
+        raw_file(&claude_oauth_usage_cache_path(pair.0, pair.1)),
+        raw_file(
+            &claude_oauth_usage_account_state_dir(pair.0, pair.1)
+                .join(claude_credit_pools::CLAUDE_READ_SCHEDULE_FILE),
+        ),
+        breaker,
+    )
+}
+
+/// Synthetic homes, the scripted provider and an effect recording. The
+/// shared OAuth guard owns the environment, hook, call counter, caller/pass
+/// and hold-state cleanup, including on unwind; this fixture only swaps in
+/// the scripted responder and clears its own script. No credential is read
+/// and no request leaves the test.
 struct Collection {
     recording: Recording,
-    calls: usize,
-    _environment: Vec<EnvVarGuard>,
-    responder: Option<ClaudeOAuthTestResponder>,
-    before_send: Option<fn()>,
-    forbidden: bool,
-    callers: BTreeMap<String, claude_credit_pools::ClaudeCallerBinding>,
-    passes: (usize, BTreeSet<String>),
-    transient_failures: Vec<ClaudeBindingTime>,
-    rate_limit_holds: Vec<ClaudeBindingTime>,
-    explicit_attempts: Vec<ClaudeBindingTime>,
-    explicit_request: ClaudeExplicitRefreshRequest,
+    oauth: OAuthGuard,
 }
 
 impl Collection {
     fn new(name: &str, answers: Vec<Result<Value, u16>>) -> Self {
-        use std::sync::atomic::Ordering::SeqCst;
-        let root = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("ottto-claude-collection-oracle"))
-            .join("collection-state")
-            .join(name);
-        if root.exists() {
-            fs::remove_dir_all(&root).unwrap();
-        }
-        let (home, support, bin) = (root.join("home"), root.join("support"), root.join("bin"));
-        for dir in [&home, &support, &bin] {
-            fs::create_dir_all(dir).unwrap();
-        }
-        let environment = vec![
-            EnvVarGuard::set_os("HOME", home.into_os_string()),
-            EnvVarGuard::set_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.into_os_string()),
-            EnvVarGuard::set_os("PATH", bin.into_os_string()),
-            EnvVarGuard::set_os("OTTTO_DISABLE_CLAUDE_OAUTH_USAGE", OsString::from("0")),
-        ];
-        *SCRIPT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = answers.into();
+        let oauth = OAuthGuard::new(&format!("collection-{name}"));
+        *SCRIPT.lock().unwrap_or_else(PoisonError::into_inner) = answers.into();
+        SCRIPT_EXHAUSTED.store(0, SeqCst);
         let responder: ClaudeOAuthTestResponder = scripted_provider;
+        // The guard saved and cleared the previous responder and forbade
+        // requests; the scripted responder answers every request instead.
+        *CLAUDE_OAUTH_TEST_RESPONSE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(responder);
+        CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(false, SeqCst);
         Self {
             recording: Recording::start(),
-            calls: CLAUDE_OAUTH_PROVIDER_CALLS.load(SeqCst),
-            _environment: environment,
-            responder: CLAUDE_OAUTH_TEST_RESPONSE
-                .lock()
-                .unwrap()
-                .replace(responder),
-            before_send: CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap().take(),
-            // The scripted responder answers every request; nothing is sent.
-            forbidden: CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.swap(false, SeqCst),
-            callers: std::mem::take(&mut *CLAUDE_OAUTH_CALLER_BINDINGS.lock().unwrap()),
-            passes: std::mem::take(&mut *CLAUDE_OAUTH_PASS_CALLERS.lock().unwrap()),
-            transient_failures: std::mem::take(&mut *claude_transient_failures()),
-            rate_limit_holds: std::mem::take(&mut *claude_rate_limit_holds()),
-            explicit_attempts: std::mem::take(&mut *claude_explicit_refresh_attempts()),
-            explicit_request: std::mem::replace(
-                &mut *claude_explicit_refresh_request(),
-                ClaudeExplicitRefreshRequest {
-                    at: 0,
-                    trigger: crate::provider_calls::Trigger::ExplicitRefresh,
-                },
-            ),
+            oauth,
         }
     }
 
     /// One collection call at `clock`: the full outcome, the provider
-    /// requests it made in order, and the exact pair's saved state after it.
+    /// requests it made in order, and the exact pair's saved files after it.
     fn step(
         &self,
         clock: u64,
@@ -211,62 +197,30 @@ impl Collection {
         collect: impl FnOnce() -> ClaudeOAuthUsageOutcome,
     ) -> Value {
         let outcome = crate::scan_clock::with_clock(clock, collect);
-        let result = match &outcome.result {
-            Ok(usage) => json!({"ok": {"windows": usage.windows, "credits": usage.credit_balances,
-                "account_weekly_not_offered": usage.account_weekly_not_offered,
-                "account_session_not_offered": usage.account_session_not_offered}}),
-            Err(error) => json!({"error": error}),
-        };
-        let current = claude_oauth_usage_config_fingerprint();
-        let mut breaker = json!(read_claude_oauth_usage_breaker(pair.0, pair.1, &current));
-        // The configuration fingerprint embeds the build's user agent; pin
-        // that it is the current one rather than one build's text.
-        if breaker["config_fingerprint"] == json!(current) {
-            breaker["config_fingerprint"] = json!("current");
-        }
+        // Outside every lock: a request with no scripted answer fails here.
+        assert_eq!(
+            SCRIPT_EXHAUSTED.swap(0, SeqCst),
+            0,
+            "a provider request at clock {clock} had no scripted answer"
+        );
         json!({"clock": clock, "caller": caller,
-            "outcome": {"result": result, "diagnostics": outcome.diagnostics},
+            "outcome": outcome_value(&outcome),
             "effects": self.recording.take(),
-            "saved": {
-                "cache": read_claude_oauth_usage_cache(pair.0, pair.1),
-                "schedule": claude_credit_pools::read_claude_read_schedule(
-                    &claude_oauth_usage_account_state_dir(pair.0, pair.1)),
-                "breaker": breaker}})
+            "saved": saved_files(pair)})
     }
 
     fn provider_calls(&self) -> usize {
-        CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst) - self.calls
+        CLAUDE_OAUTH_PROVIDER_CALLS.load(SeqCst) - self.oauth.calls
     }
 }
 
 impl Drop for Collection {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        use std::sync::PoisonError;
         SCRIPT
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        *CLAUDE_OAUTH_TEST_RESPONSE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = self.responder;
-        *CLAUDE_OAUTH_BEFORE_SEND_HOOK
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = self.before_send;
-        *CLAUDE_OAUTH_CALLER_BINDINGS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut self.callers);
-        *CLAUDE_OAUTH_PASS_CALLERS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut self.passes);
-        *claude_transient_failures() = std::mem::take(&mut self.transient_failures);
-        *claude_rate_limit_holds() = std::mem::take(&mut self.rate_limit_holds);
-        *claude_explicit_refresh_attempts() = std::mem::take(&mut self.explicit_attempts);
-        std::mem::swap(
-            &mut *claude_explicit_refresh_request(),
-            &mut self.explicit_request,
-        );
-        CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(self.forbidden, SeqCst);
+        SCRIPT_EXHAUSTED.store(0, SeqCst);
     }
 }
 
@@ -319,9 +273,9 @@ mod money_equivalence_tests {
         ];
         let reading = windows((12, 34), "2026-08-05T01:00:00Z", AX, true);
         let after = saved(
-            stored(T, T + 300, reading.clone(), AX),
+            present(stored(T, T + 300, reading.clone(), AX)),
             plain_read(T),
-            Value::Null,
+            absent(),
         );
         emit(
             "claude_status_s01_due_success",
@@ -366,10 +320,10 @@ mod money_equivalence_tests {
                 step(T - 1, "default", json!({
                     "result": ok(windows((12, 34), "2026-08-05T00:10:00Z", AX, false)),
                     "diagnostics": [diagnostic("claude_oauth_usage_cache_reused", "info", REUSED, Some("2026-08-05T00:59:59Z"), AX)]}),
-                    0, saved(seed.clone(), json!({}), Value::Null)),
+                    0, saved(present(seed.clone()), absent(), absent())),
                 step(T, "default", json!({"result": ok(reading.clone()), "diagnostics": [
                     diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some("2026-08-05T01:00:00Z"), AX)]}),
-                    1, saved(stored(T, T + 300, reading, AX), plain_read(T), Value::Null))],
+                    1, saved(present(stored(T, T + 300, reading, AX)), plain_read(T), absent()))],
                 "provider_calls": 1}),
         );
     }
@@ -395,19 +349,21 @@ mod money_equivalence_tests {
             json!({"steps": [
                 step(T - 1, "default", json!({"result": ok(reading.clone()), "diagnostics": [
                     diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some("2026-08-05T00:59:59Z"), ay)]}),
-                    1, saved(stored(T - 1, T + 299, reading, ay), plain_read(T - 1), Value::Null)),
+                    1, saved(present(stored(T - 1, T + 299, reading, ay)), plain_read(T - 1), absent())),
                 step(T, "default", json!({
                     "result": {"error": "Claude Code has not refreshed this login since its access token expired."},
                     "diagnostics": [diagnostic("claude_oauth_usage_check_suppressed", "info",
                         "This Claude login's access token has expired locally and Claude Code has not refreshed it yet; no provider request was made, and any served readings are last-known local readings.",
                         Some("2026-08-05T01:00:00Z"), AX)]}),
-                    0, saved(Value::Null, json!({}), Value::Null))],
+                    0, nothing_saved())],
                 "provider_calls": 1}),
         );
     }
 
     /// [money] Three exact pairs sharing an account or an organization are
-    /// read by their own callers into three separate saved readings.
+    /// read by their own callers into three separate saved readings. After
+    /// the last write all three pairs' files are read again, so an earlier
+    /// pair's files overwritten or shared by a later pair fail the row.
     #[test]
     #[serial]
     fn s05_pair_callers() {
@@ -430,6 +386,10 @@ mod money_equivalence_tests {
                 })
             })
             .collect::<Vec<_>>();
+        let final_files = pairs
+            .iter()
+            .map(|(id, pair, _)| json!({"caller": id, "pair": pair, "saved": saved_files(*pair)}))
+            .collect::<Vec<_>>();
         let expected = pairs
             .iter()
             .enumerate()
@@ -439,7 +399,7 @@ mod money_equivalence_tests {
                 let reading = windows(*used, observed, *pair, true);
                 step(at, id, json!({"result": ok(reading.clone()), "diagnostics": [
                     diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some(observed), *pair)]}),
-                    1, saved(stored(at, at + 300, reading, *pair), plain_read(at), Value::Null))
+                    1, saved(present(stored(at, at + 300, reading, *pair)), plain_read(at), absent()))
             })
             .collect::<Vec<_>>();
         emit(
@@ -447,8 +407,23 @@ mod money_equivalence_tests {
             json!({"pairs": [["claude_slot_a", AX], ["claude_slot_b", ["account-a", "org-y"]],
                 ["claude_slot_c", ["account-b", "org-x"]]], "clocks": [T, T + 1, T + 2],
                 "answers": [body(12, 34), body(23, 45), body(45, 56)]}),
-            json!({"steps": steps, "provider_calls": collection.provider_calls()}),
-            json!({"steps": expected, "provider_calls": 3}),
+            json!({"steps": steps, "final_files": final_files,
+                "provider_calls": collection.provider_calls()}),
+            json!({"steps": expected, "final_files": [
+                {"caller": "claude_slot_a", "pair": ["account-a", "org-x"], "saved": saved(
+                    present(stored(T, T + 300, windows((12, 34), "2026-08-05T01:00:00Z", AX, true), AX)),
+                    plain_read(T), absent())},
+                {"caller": "claude_slot_b", "pair": ["account-a", "org-y"], "saved": saved(
+                    present(stored(T + 1, T + 301,
+                        windows((23, 45), "2026-08-05T01:00:01Z", ("account-a", "org-y"), true),
+                        ("account-a", "org-y"))),
+                    plain_read(T + 1), absent())},
+                {"caller": "claude_slot_c", "pair": ["account-b", "org-x"], "saved": saved(
+                    present(stored(T + 2, T + 302,
+                        windows((45, 56), "2026-08-05T01:00:02Z", ("account-b", "org-x"), true),
+                        ("account-b", "org-x"))),
+                    plain_read(T + 2), absent())}],
+                "provider_calls": 3}),
         );
     }
 
@@ -470,9 +445,9 @@ mod money_equivalence_tests {
         ];
         let reading = windows((12, 34), "2026-08-05T01:00:00Z", AX, true);
         let after = saved(
-            stored(T, T + 300, reading.clone(), AX),
+            present(stored(T, T + 300, reading.clone(), AX)),
             plain_read(T),
-            Value::Null,
+            absent(),
         );
         emit(
             "claude_status_s09_managed_due",
@@ -493,9 +468,10 @@ mod money_equivalence_tests {
         );
     }
 
-    /// [money] The default's 401 holds only the default: the registered
-    /// slot's success is collected and settled while the default's streak is
-    /// kept, and the default then serves the slot's reading without a request.
+    /// [money] The default's 401 holds only the default: its next attempt
+    /// makes no request and has no reading to serve, the registered slot's
+    /// success is collected and settled while the default's streak is kept,
+    /// and the default then serves the slot's reading without a request.
     #[test]
     #[serial]
     fn s12_auth_then_other_success() {
@@ -504,29 +480,33 @@ mod money_equivalence_tests {
         let other = slot("claude_slot_b");
         let steps = [
             collection.step(T, "default", AX, || collect(AX, &default, TOKEN_EXPIRY)),
-            collection.step(T + 1, "claude_slot_b", AX, || {
+            collection.step(T + 1, "default", AX, || collect(AX, &default, TOKEN_EXPIRY)),
+            collection.step(T + 2, "claude_slot_b", AX, || {
                 collect(AX, &other, TOKEN_EXPIRY)
             }),
-            collection.step(T + 2, "default", AX, || collect(AX, &default, TOKEN_EXPIRY)),
+            collection.step(T + 3, "default", AX, || collect(AX, &default, TOKEN_EXPIRY)),
         ];
-        let held = json!({"schema_version": 1, "account_identifier_hash": "account-a",
+        let held = present(
+            json!({"schema_version": 1, "account_identifier_hash": "account-a",
             "organization_identifier_hash": "org-x", "config_fingerprint": "current",
             "auth_failures": 0, "shape_failures": 0, "rate_limit_failures": 0,
             "opened_at_epoch_seconds": 0, "reopen_after_epoch_seconds": 0, "opened_by": "",
             "auth_callers": {"default": {"consecutive_failures": 1, "last_status": 401,
                 "last_failure_at_epoch_seconds": T, "backoff_until_epoch_seconds": T + 900,
                 "credential_expires_at": TOKEN_EXPIRY}},
-            "last_auth_failure": {"caller": "default", "status": 401, "at_epoch_seconds": T}});
-        let reading = windows((12, 34), "2026-08-05T01:00:01Z", AX, true);
+            "last_auth_failure": {"caller": "default", "status": 401, "at_epoch_seconds": T}}),
+        );
+        let reading = windows((12, 34), "2026-08-05T01:00:02Z", AX, true);
         let after = saved(
-            stored(T + 1, T + 301, reading.clone(), AX),
-            plain_read(T + 1),
+            present(stored(T + 2, T + 302, reading.clone(), AX)),
+            plain_read(T + 2),
             held.clone(),
         );
         emit(
             "claude_status_s12_auth_other_success",
-            json!({"pair": AX, "clocks": [T, T + 1, T + 2],
-                "callers": ["default", "claude_slot_b", "default"], "answers": [401, body(12, 34)]}),
+            json!({"pair": AX, "clocks": [T, T + 1, T + 2, T + 3],
+                "callers": ["default", "default", "claude_slot_b", "default"],
+                "answers": [401, body(12, 34)]}),
             json!({"steps": steps, "provider_calls": collection.provider_calls()}),
             json!({"steps": [
                 step(T, "default", json!({
@@ -538,12 +518,22 @@ mod money_equivalence_tests {
                         diagnostic("claude_oauth_usage_check_failed", "info",
                             "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.",
                             Some("2026-08-05T01:00:00Z"), AX)]}),
-                    1, saved(Value::Null, json!({}), held)),
-                step(T + 1, "claude_slot_b", json!({"result": ok(reading.clone()), "diagnostics": [
-                    diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some("2026-08-05T01:00:01Z"), AX)]}),
+                    1, saved(absent(), absent(), held.clone())),
+                step(T + 1, "default", json!({
+                    "result": {"error": "Claude OAuth usage is backing off after this credential was rejected."},
+                    "diagnostics": [
+                        diagnostic("claude_oauth_usage_auth_backoff", "info",
+                            "The default Claude Code login credential was rejected with HTTP 401 at 2026-08-05T01:00:00Z; it is not retried for the next 14 minute(s).",
+                            Some("2026-08-05T01:00:01Z"), AX),
+                        diagnostic("claude_oauth_usage_check_suppressed", "info",
+                            "The local quota breaker suppressed this provider request after this credential was rejected.",
+                            Some("2026-08-05T01:00:01Z"), AX)]}),
+                    0, saved(absent(), absent(), held)),
+                step(T + 2, "claude_slot_b", json!({"result": ok(reading.clone()), "diagnostics": [
+                    diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some("2026-08-05T01:00:02Z"), AX)]}),
                     1, after.clone()),
-                step(T + 2, "default", json!({"result": ok(reading), "diagnostics": [
-                    diagnostic("claude_oauth_usage_cache_reused", "info", REUSED, Some("2026-08-05T01:00:02Z"), AX)]}),
+                step(T + 3, "default", json!({"result": ok(reading), "diagnostics": [
+                    diagnostic("claude_oauth_usage_cache_reused", "info", REUSED, Some("2026-08-05T01:00:03Z"), AX)]}),
                     0, after)],
                 "provider_calls": 2}),
         );
@@ -565,9 +555,9 @@ mod money_equivalence_tests {
         ];
         let reading = windows((12, 34), "2026-08-05T01:00:00Z", AX, true);
         let after = saved(
-            stored(T, T + 300, reading.clone(), AX),
+            present(stored(T, T + 300, reading.clone(), AX)),
             plain_read(T),
-            Value::Null,
+            absent(),
         );
         emit(
             "claude_status_s12_reverse_cache",
@@ -624,7 +614,7 @@ mod money_equivalence_tests {
                 json!({"pair": AX, "clock": T, "pass": {"saved_only": saved_only, "started_at": T},
                     "upkeep_consent": consent, "answers": []}),
                 json!({"steps": steps, "provider_calls": collection.provider_calls()}),
-                json!({"steps": [step(T, "default", expected, 0, saved(Value::Null, json!({}), Value::Null))],
+                json!({"steps": [step(T, "default", expected, 0, nothing_saved())],
                     "provider_calls": 0}),
             );
         }
@@ -649,7 +639,7 @@ mod money_equivalence_tests {
             json!({"steps": steps, "provider_calls": collection.provider_calls()}),
             json!({"steps": [step(T, "default", json!({"result": ok(reading.clone()), "diagnostics": [
                     diagnostic("claude_oauth_usage_check_succeeded", "info", SUCCEEDED, Some("2026-08-05T01:00:00Z"), AX)]}),
-                    1, saved(stored(T, T + 270, reading, AX), plain_read(T), Value::Null))],
+                    1, saved(present(stored(T, T + 270, reading, AX)), plain_read(T), absent()))],
                 "provider_calls": 1}),
         );
     }
