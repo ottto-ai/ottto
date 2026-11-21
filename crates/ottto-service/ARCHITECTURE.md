@@ -368,7 +368,8 @@ participant: a policy stop (disabled by an admin, a zero receipt window) records
 source in the tier's `stopped` set, so it stops holding the tier at once, and its
 next collecting pass rejoins it. Prepare sets the runtime `first_read_tier_cutoff`.
 `TierGate` looks at the queue once per selection: a queued file never read (no index
-entry, confirmed empty, account hold or committed Tail head) older than the bound
+entry, confirmed empty, account hold or a Tail head with a reduction; the census's
+metadata-only head for an owed file is no read) older than the bound
 sits out page selection; it stays queued, so the census, freshness debt,
 disappearance diagnostics and completion keep owing it, and it never asks for a
 paced pass. A Codex join group is read whole once any member is selected, so it takes
@@ -386,9 +387,9 @@ matches an untiered read. Chains follow one read at a time. Pulled files are cou
 for diagnostics only.
 
 Finish records a participant's tier done when its walk ended, no selectable census
-member is left, no terminal retry is held and its upload settled; terminal outcomes
-(unproven, refused, gone, usage-identical or dominated answers) settle, a pending
-retry does not. Under the backfill-state lock the tier advances once every
+member is left, no terminal retry is held and its upload settled; an unchanged
+answer that stores nothing settles, a pending retry does not. A permanently refused
+file keeps no index entry and is queued again each pass, so it holds the tier. Under the backfill-state lock the tier advances once every
 participant is done, and every participant is asked for a paced pass. The census
 cannot complete while deferred files are queued, so bootstrap completion follows the
 final tier. While the destination is in the final tier, paced requests carry
