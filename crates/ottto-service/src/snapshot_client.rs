@@ -1663,6 +1663,11 @@ pub struct SnapshotStatusRequest {
     /// First census end minus the fixed first-read window; terminal status only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_read_cutoff: Option<String>,
+    /// First census end minus the highest completed first-read recency tier;
+    /// terminal status only, absent before the first tier completes and
+    /// after the import completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_ready_cutoff: Option<String>,
     pub last_backfill_file_limit: u64,
     pub last_discovered_file_count: u64,
     pub last_skipped_file_count_due_to_limit: u64,
@@ -1793,6 +1798,7 @@ impl SnapshotStatusRequest {
             // reports back the hint the server just gave it.
             last_backfill_window_days: _,
             first_read_cutoff,
+            tier_ready_cutoff,
             last_backfill_file_limit,
             last_discovered_file_count,
             last_skipped_file_count_due_to_limit,
@@ -1854,6 +1860,9 @@ impl SnapshotStatusRequest {
         }
         if first_read_cutoff.is_some() {
             return Some("first_read_cutoff");
+        }
+        if tier_ready_cutoff.is_some() {
+            return Some("tier_ready_cutoff");
         }
         if last_census_pending_file_count.is_some() {
             return Some("last_census_pending_file_count");
@@ -4231,6 +4240,7 @@ mod tests {
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: 183,
             first_read_cutoff: None,
+            tier_ready_cutoff: None,
             last_backfill_file_limit: 0,
             last_discovered_file_count: 0,
             last_skipped_file_count_due_to_limit: 0,
@@ -4286,8 +4296,13 @@ mod tests {
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
         assert!(value.get("first_read").is_none());
+        assert!(value.get("tier_ready_cutoff").is_none());
+        status.tier_ready_cutoff = Some("2026-11-05T12:00:00.000Z".to_owned());
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["tier_ready_cutoff"], "2026-11-05T12:00:00.000Z");
         let restored: SnapshotStatusRequest = serde_json::from_value(value).unwrap();
         assert_eq!(restored.first_read_cutoff, status.first_read_cutoff);
+        assert_eq!(restored.tier_ready_cutoff, status.tier_ready_cutoff);
         restored.validate_declared_report_kind().unwrap();
     }
 
@@ -4308,6 +4323,10 @@ mod tests {
             (
                 "first_read_cutoff",
                 Box::new(|r| r.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned())),
+            ),
+            (
+                "tier_ready_cutoff",
+                Box::new(|r| r.tier_ready_cutoff = Some("2026-11-05T12:00:00.000Z".to_owned())),
             ),
             ("enabled=false", Box::new(|r| r.enabled = false)),
             (
@@ -4546,6 +4565,7 @@ mod tests {
             last_scanned_file_count: 0,
             last_backfill_window_days: 183,
             first_read_cutoff: None,
+            tier_ready_cutoff: None,
             last_backfill_file_limit: 1_000,
             last_discovered_file_count: 1_100,
             last_skipped_file_count_due_to_limit: 100,
@@ -4626,6 +4646,7 @@ mod tests {
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: window_days as u64,
             first_read_cutoff: None,
+            tier_ready_cutoff: None,
             last_backfill_file_limit: 10_000,
             last_discovered_file_count: 1,
             last_skipped_file_count_due_to_limit: 0,

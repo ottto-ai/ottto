@@ -50,6 +50,10 @@ pub struct ScanIndex {
     /// the first read is pending. Set at prepare; never saved.
     #[serde(skip)]
     pub(crate) first_read_pending: bool,
+    /// This pass's first-read recency tier bound (UTC seconds) while a tiered
+    /// destination bootstrap gates the source. Set at prepare; never saved.
+    #[serde(skip)]
+    pub(crate) first_read_tier_cutoff: Option<u64>,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -604,6 +608,7 @@ impl Default for ScanIndex {
             decode_holds: lenient_decode::Holds::default(),
             withheld_memo: Default::default(),
             first_read_pending: false,
+            first_read_tier_cutoff: None,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
@@ -994,9 +999,12 @@ impl ScanIndex {
             if terminal {
                 return due;
             }
+            // A tier-deferred first read waits for the tier advance, not a pass.
             let queued = !t.pending_directories.is_empty()
                 || t.pending_candidates.iter().any(|candidate| {
-                    candidate.census_member && eligible(&local_index_key(&candidate.path))
+                    candidate.census_member
+                        && eligible(&local_index_key(&candidate.path))
+                        && !first_read_tier_deferred(self, &candidate.path)
                 });
             if queued
                 || (unblocked
@@ -1015,6 +1023,19 @@ impl ScanIndex {
             && self.decode_holds.is_empty()
             && (fresh_offer
                 || (quarantined.is_empty() && self.files.keys().any(|key| eligible(key))))
+    }
+    /// The current first-read tier is finished here: the walk ended, no
+    /// census member left in the queue is selectable in this tier, and no
+    /// terminal retry is held. The caller adds exact upload settlement.
+    pub(crate) fn first_read_tier_finished(&self) -> bool {
+        self.first_read_tier_cutoff.is_some()
+            && self.terminal_contract_retries.is_empty()
+            && self.traversal.as_ref().is_some_and(|walk| {
+                walk.pending_directories.is_empty()
+                    && walk.pending_candidates.iter().all(|candidate| {
+                        !candidate.census_member || first_read_tier_deferred(self, &candidate.path)
+                    })
+            })
     }
     /// Census members still queued at page end, exactly what
     /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,

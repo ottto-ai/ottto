@@ -357,6 +357,27 @@ child CPU totals; arguments, paths and command output are never included.
 
 ## Stores
 
+**First-read recency tiers.** A destination's first census anchor starts its tier
+at 7 days in `BackfillState.first_read_tiers`; the tiers are 7, 14, 30, then the
+60-day first-read window. An absent entry is the final tier, so a daemon upgraded
+mid-import keeps its untiered order. Sources opt in through the durable source table:
+Codex and Pi are tiered; Claude is not, because a copied or forked file's holder is
+known only from the request census after a read, so a tier could read a child before
+its holder. A tiered source with an anchor whose bootstrap is incomplete is a
+participant. Prepare sets the runtime `first_read_tier_cutoff` (anchor minus the
+tier's days). A queued file never read (no index entry, confirmed empty, account
+hold or committed Tail head) older than that bound sits out page selection; it stays
+queued, so the census, freshness debt, disappearance diagnostics and completion keep
+owing it, and it never asks for a paced pass. A Codex join group is read whole once
+any member is selected, so it takes its newest member's tier; within a tier the
+newest-first order is unchanged. Finish records a participant's tier done when its
+walk ended, no selectable census member is left, no terminal retry is held and its
+upload settled exactly; under the backfill-state lock the tier advances once every
+participant is done, and every participant is asked for a paced pass. The census
+cannot complete while deferred files are queued, so bootstrap completion, first-import
+pacing and QoS follow the final tier. `first_read_cutoff` keeps meaning 60 days;
+`tier_ready_cutoff` reports the highest completed tier.
+
 Terminal scan status optionally reports `first_read_cutoff`, the destination/source's
 first census end minus the fixed 60-day first-read window, as UTC milliseconds.
 The first census end is saved once in `BackfillState.first_census_ends` before

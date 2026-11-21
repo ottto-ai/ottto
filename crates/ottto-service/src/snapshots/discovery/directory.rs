@@ -935,13 +935,36 @@ pub(in crate::snapshots) fn first_read_aged(
     }) {
         return false;
     }
+    !has_read_evidence(index, path)
+}
+
+fn has_read_evidence(index: &ScanIndex, path: &Path) -> bool {
     let key = local_index_key(path);
-    let read = index.files.contains_key(&key)
+    index.files.contains_key(&key)
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
         || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
-    !read
+            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)))
+}
+
+/// Recency tier (`backfill::FIRST_READ_TIER_DAYS`): while a tiered
+/// destination bootstrap gates the source, a queued file never read whose
+/// mtime is before the current tier's bound is not selectable yet. It stays
+/// queued and owed (census, freshness debt, completion); only the page
+/// selection skips it. The same read evidence as `first_read_aged` keeps it
+/// selectable. An unknown mtime (vanished) stays selectable for its removal
+/// route. A Codex join group is read whole once any member is selected, so it
+/// takes the tier of its newest member.
+pub(in crate::snapshots) fn first_read_tier_deferred(index: &ScanIndex, path: &Path) -> bool {
+    let Some(cutoff) = index.first_read_tier_cutoff else {
+        return false;
+    };
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(unix_seconds)
+        .is_some_and(|modified| modified < cutoff)
+        && !has_read_evidence(index, path)
 }
 
 pub(in crate::snapshots) fn opened_candidate_is_within_frozen_window(

@@ -1581,6 +1581,12 @@ pub(crate) fn source_prepare<T>(
     if source == "claude_code" && v2_active(&result) {
         crate::snapshots::state_v2_prepare_observed();
     }
+    let mut counts = BTreeMap::<&str, u64>::new();
+    pass_outcomes(|outcomes| {
+        if let Some(days) = outcomes.first_read_tier_days {
+            counts.insert("first_read_tier_days", days);
+        }
+    });
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -1593,7 +1599,7 @@ pub(crate) fn source_prepare<T>(
             cli_children: cli_children::snapshot(),
             ..probe.stage_observation(footprint.as_ref())
         },
-        counts: BTreeMap::<&str, u64>::new(),
+        counts,
     });
     result
 }
@@ -1724,6 +1730,9 @@ pub(crate) struct PassOutcomes {
     pub(crate) progress_committed: u64,
     pub(crate) progress_unchanged: u64,
     pub(crate) progress_not_published: u64,
+    /// The destination's current first-read recency tier, while it gates this source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_read_tier_days: Option<u64>,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.
@@ -2430,6 +2439,18 @@ pub fn log_startup_resources() {
     }
     #[cfg(unix)]
     shutdown::install();
+}
+
+/// One point when a destination's first-read recency tier advances: the
+/// finished and next tier in days, and seconds since the source's first
+/// census end. Counts only.
+pub(crate) fn first_read_tier_advanced(source: &str, from: u64, to: u64, since_first_census: u64) {
+    let counts = BTreeMap::from([
+        ("from_days", from),
+        ("to_days", to),
+        ("seconds_since_first_census_end", since_first_census),
+    ]);
+    traversal_point("first_read_tier_advanced", source, &counts);
 }
 
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {

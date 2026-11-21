@@ -1653,6 +1653,28 @@ files are all skipped waits the ordinary cadence. These observations add no
 timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
+## First-read recency tiers
+
+During a new destination's first import, Codex and Pi read their history in
+recency tiers: files active in the last 7 days first, then 14, then 30, then
+the rest of the 60-day first-read window. Claude reads one untiered first-read
+FIFO. Report-only fields:
+
+- `source_prepare` rows carry `counts.first_read_tier_days` and the
+  `source_finish` pass carries `first_read_tier_days` while a tier gates the
+  source. Both are absent at the final tier and when the source is untiered.
+- One `stage: first_read_tier_advanced` point when a tier advances, with
+  `from_days`, `to_days` and `seconds_since_first_census_end` (from the
+  advancing source's first census end).
+- Terminal scan status carries the optional `tier_ready_cutoff` next to
+  `first_read_cutoff`: the source's first census end minus the days of the
+  highest completed tier, as UTC milliseconds. It is absent before the 7-day
+  tier completes, after the source's import completes and for untiered
+  sources. Check-ins omit it.
+
+A deferred file stays queued and owed; it is counted in pending and skipped
+census counts like any queued file. None of these fields enters uploads.
+
 ## Idle passes of a settled source
 
 A pass the walk gate held logs `walk_idle=true` at the end of its

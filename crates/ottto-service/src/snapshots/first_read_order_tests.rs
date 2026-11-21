@@ -203,15 +203,61 @@ struct FirstRead {
 }
 
 fn first_read_other(source: SnapshotSource, root: &Path, limit: usize, pending: bool) -> FirstRead {
+    first_read_tiered(source, root, limit, pending, &[], Interrupt::None).0
+}
+
+/// A break in a tiered first read, taken on the page after the first tier
+/// advance: a daemon restart from the saved store, or lost continuations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Interrupt {
+    None,
+    Restart,
+    Restore,
+}
+
+/// `first_read_other` under recency tiers: each bound in `tiers` (UTC
+/// seconds) gates first reads until the tier is finished, as the daemon's
+/// finish records it once every participant has; then the next applies, and
+/// none after the last. Also returns the files read before the first advance.
+fn first_read_tiered(
+    source: SnapshotSource,
+    root: &Path,
+    limit: usize,
+    pending: bool,
+    tiers: &[u64],
+    interrupt: Interrupt,
+) -> (FirstRead, BTreeSet<String>) {
     let fixture = E2ScanFixture::with_identity_capture(false);
+    let mut tiers = tiers.iter().copied();
     let mut index = ScanIndex {
         first_read_pending: pending,
+        first_read_tier_cutoff: tiers.next(),
         ..ScanIndex::default()
     };
+    let mut first_tier = None;
+    let mut interrupt_at = None;
     let mut latest = BTreeMap::new();
     let mut last = None;
     let mut settle = 0;
-    for _ in 0..64 {
+    for page in 0..64 {
+        if interrupt_at == Some(page) {
+            let runtime = (index.first_read_pending, index.first_read_tier_cutoff);
+            match interrupt {
+                Interrupt::None => {}
+                Interrupt::Restore => fixture.evict(&index),
+                Interrupt::Restart => {
+                    let state = root.with_extension("state").join("index.json");
+                    fs::create_dir_all(state.parent().unwrap()).unwrap();
+                    index.save_fixture_for_source(&state, source).unwrap();
+                    drop(index);
+                    state_v2::cold_close_for_test(&state).unwrap();
+                    index = ScanIndex::load(&state).unwrap();
+                    assert!(index.traversal.is_some(), "the queue survives a restart");
+                }
+            }
+            // Prepare re-arms the runtime flags from the durable tier.
+            (index.first_read_pending, index.first_read_tier_cutoff) = runtime;
+        }
         let prior = index.clone();
         let (mut next, mut scan, _) =
             fixture.scan_other_page(source, &[root.to_owned()], root, index, true, limit, &[]);
@@ -230,6 +276,14 @@ fn first_read_other(source: SnapshotSource, root: &Path, limit: usize, pending: 
         );
         next = next.committable_subset(&prior, &accepted, &BTreeMap::new());
         assert_eq!(next.first_read_pending, pending, "runtime flag carried");
+        assert_eq!(next.first_read_tier_cutoff, prior.first_read_tier_cutoff);
+        if next.first_read_tier_finished() {
+            if first_tier.is_none() {
+                first_tier = Some(next.files.keys().cloned().collect::<BTreeSet<_>>());
+                interrupt_at = Some(page + 1);
+            }
+            next.first_read_tier_cutoff = tiers.next();
+        }
         let emitted = !scan.snapshots.is_empty();
         for item in std::mem::take(&mut scan.snapshots) {
             latest.insert(item.source_session_id.clone(), item);
@@ -253,11 +307,15 @@ fn first_read_other(source: SnapshotSource, root: &Path, limit: usize, pending: 
         .into_values()
         .filter(|item| bodies.insert(item.snapshot_fingerprint.clone()))
         .collect();
-    FirstRead {
-        index,
-        scan,
-        order: fixture.paths(),
-    }
+    assert_eq!(tiers.next(), None, "every tier finished before the census");
+    (
+        FirstRead {
+            index,
+            scan,
+            order: fixture.paths(),
+        },
+        first_tier.unwrap_or_default(),
+    )
 }
 
 fn assert_same_money(source: SnapshotSource, fifo: &FirstRead, newest: &FirstRead) {
@@ -339,5 +397,171 @@ fn pi_newest_first_read_matches_fifo_money() {
     assert_same_money(source, &fifo, &newest);
     assert_eq!(fifo.order.first(), Some(&root.join("pi-0.jsonl")));
     assert_eq!(newest.order.first(), Some(&root.join("pi-4.jsonl")));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// The fixture's census end, and a first-read tier bound `days` before it.
+const TIER_CENSUS: &str = "2026-10-27T08:00:00Z";
+
+fn tier_bound(days: u64) -> u64 {
+    seconds(TIER_CENSUS) - days * DAY
+}
+
+fn tier_bounds() -> [u64; 3] {
+    [7, 14, 30].map(tier_bound)
+}
+
+fn key(path: &Path) -> String {
+    local_index_key(path)
+}
+
+/// [behaviour] Tier admission: a never-read file before the current tier's
+/// bound is deferred; one inside it, one with read evidence, an unknown
+/// (vanished) file and any file without a tier stay selectable.
+#[test]
+fn tier_admission_defers_only_unread_files_before_the_bound() {
+    let root = crate::test_scratch::unique_path("first-read-tier-admission");
+    let [inside, outside, read] =
+        ["inside", "outside", "read"].map(|n| root.join(format!("{n}.jsonl")));
+    write_at(&inside, tier_bound(7) + DAY);
+    write_at(&outside, tier_bound(7) - DAY);
+    write_at(&read, tier_bound(7) - DAY);
+    let mut index = ScanIndex {
+        first_read_tier_cutoff: Some(tier_bound(7)),
+        ..ScanIndex::default()
+    };
+    index.confirmed_empty_files.insert(key(&read));
+    assert!(!first_read_tier_deferred(&index, &inside));
+    assert!(first_read_tier_deferred(&index, &outside));
+    assert!(
+        !first_read_tier_deferred(&index, &read),
+        "read evidence keeps the walk window"
+    );
+    assert!(!first_read_tier_deferred(&index, &root.join("gone.jsonl")));
+    index.first_read_tier_cutoff = Some(tier_bound(14));
+    assert!(
+        !first_read_tier_deferred(&index, &outside),
+        "the next tier admits it"
+    );
+    index.first_read_tier_cutoff = None;
+    assert!(
+        !first_read_tier_deferred(&index, &outside),
+        "final tier: untiered"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+fn write_pi(root: &Path, ages: &[u64]) -> Vec<PathBuf> {
+    fs::create_dir_all(root).unwrap();
+    ages.iter()
+        .enumerate()
+        .map(|(n, age)| {
+            let path = root.join(format!("pi-{n}.jsonl"));
+            fs::write(&path, format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1793088001000,\"usage\":{{\"input\":{},\"output\":1}}}}}}\n", n + 1)).unwrap();
+            set_mtime(&path, seconds(TIER_CENSUS) - age * DAY);
+            path
+        })
+        .collect()
+}
+
+/// [money] Pi under recency tiers, cold, restarted and restored after the
+/// first tier: the 7-day file is read first and alone in its tier, and the
+/// emitted money, placement and exact ACKs match the untiered first read.
+/// A quiet restart after the final tier emits nothing.
+#[test]
+fn pi_tiered_first_read_matches_untiered_money() {
+    let source = SnapshotSource::Pi;
+    for interrupt in [Interrupt::None, Interrupt::Restart, Interrupt::Restore] {
+        let root = crate::test_scratch::unique_path("first-read-tier-pi");
+        // Names oppose ages, so FIFO alone would read the oldest first.
+        let files = write_pi(&root, &[50, 40, 20, 10, 1]);
+        let untiered = first_read_other(source, &root, 1, true);
+        let (tiered, first_tier) =
+            first_read_tiered(source, &root, 1, true, &tier_bounds(), interrupt);
+        assert_same_money(source, &untiered, &tiered);
+        assert_eq!(
+            first_tier,
+            BTreeSet::from([key(&files[4])]),
+            "{interrupt:?}: the 7-day tier holds only the newest file"
+        );
+        assert_eq!(tiered.order.first(), Some(&files[4]), "{interrupt:?}");
+        for file in &files {
+            assert!(
+                tiered.index.files.contains_key(&key(file)),
+                "nothing dropped"
+            );
+        }
+
+        // Quiet restart after the final tier: no tier, nothing changed.
+        let mut index = tiered.index;
+        let state = root.with_extension("quiet").join("index.json");
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        index.save_fixture_for_source(&state, source).unwrap();
+        drop(index);
+        state_v2::cold_close_for_test(&state).unwrap();
+        let index = ScanIndex::load(&state).unwrap();
+        assert_eq!(index.first_read_tier_cutoff, None);
+        let (_, scan, _) = E2ScanFixture::with_identity_capture(false).scan_other_page(
+            source,
+            &[root.clone()],
+            &root,
+            index,
+            true,
+            1,
+            &[],
+        );
+        assert!(
+            scan.snapshots.is_empty(),
+            "{interrupt:?}: quiet restart uploads nothing"
+        );
+        let _ = fs::remove_dir_all(root.with_extension("state"));
+        let _ = fs::remove_dir_all(root.with_extension("quiet"));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// [money] Codex: a join group straddling tiers (one member 3 days old, one
+/// 40) is read whole in the 7-day tier, by its newest member; groups wholly
+/// in later tiers wait. Money and placement match the untiered first read.
+#[test]
+fn codex_tiered_first_read_reads_a_straddling_group_by_its_newest_member() {
+    let source = SnapshotSource::Codex;
+    let root = crate::test_scratch::unique_path("first-read-tier-codex");
+    fs::create_dir_all(&root).unwrap();
+    for (owner, prefix, ages) in [
+        ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "a", [40, 3]),
+        ("ffffffff-1111-4111-8111-ffffffffffff", "b", [21, 20]),
+        ("12121212-3434-4565-8787-909090909090", "c", [51, 50]),
+    ] {
+        for ((member, input, cumulative), age) in
+            [("0", 100, 100), ("1", 200, 300)].into_iter().zip(ages)
+        {
+            let rows = codex_file_join::tests::member(
+                owner,
+                &format!("{prefix}{member}"),
+                input,
+                cumulative,
+            );
+            let path = root.join(format!("{prefix}{member}.jsonl"));
+            fs::write(
+                &path,
+                rows.iter()
+                    .map(|v| v.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            set_mtime(&path, seconds(TIER_CENSUS) - age * DAY);
+        }
+    }
+    let untiered = first_read_other(source, &root, 1, true);
+    let (tiered, first_tier) =
+        first_read_tiered(source, &root, 1, true, &tier_bounds(), Interrupt::None);
+    assert_same_money(source, &untiered, &tiered);
+    assert_eq!(
+        first_tier,
+        BTreeSet::from([key(&root.join("a0.jsonl")), key(&root.join("a1.jsonl"))]),
+        "the straddling group is read whole in the 7-day tier"
+    );
     let _ = fs::remove_dir_all(root);
 }

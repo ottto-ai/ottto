@@ -1428,7 +1428,7 @@ use discovery::directory::{
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
     directory_entries_per_tick, effective_backfill_window_days, first_read_aged,
-    is_recent_enough_at, opened_candidate_is_within_frozen_window,
+    first_read_tier_deferred, is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
 #[cfg(test)]

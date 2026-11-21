@@ -14,6 +14,10 @@ pub(crate) struct Properties {
     pub(crate) snapshot: SnapshotSource,
     /// Queue order during the source's first read (`first_read_order.rs`).
     pub(crate) first_read_newest_first: bool,
+    /// First reads of a destination bootstrap go in recency tiers
+    /// (`backfill::FIRST_READ_TIER_DAYS`). Claude keeps one untiered FIFO
+    /// read: a copied or forked file's holder is known only after a read.
+    pub(crate) first_read_recency_tiers: bool,
 }
 
 // Enum ordinals index this table and Stores' slots.
@@ -22,16 +26,19 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         first_read_newest_first: false,
+        first_read_recency_tiers: false,
     },
     Properties {
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         first_read_newest_first: true,
+        first_read_recency_tiers: true,
     },
     Properties {
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         first_read_newest_first: true,
+        first_read_recency_tiers: true,
     },
 ];
 

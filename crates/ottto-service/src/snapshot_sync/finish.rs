@@ -2616,6 +2616,41 @@ pub(super) fn finish_sync_source(
         }
     }
 
+    // Recency tier: this source finished the current tier once its walk
+    // ended, nothing selectable is left in the tier and the upload settled
+    // exactly. The tier advances under the backfill-state lock when every
+    // participant has. Order only: a failed save retries on a later pass.
+    if upload_fully_settled && index.first_read_tier_finished() {
+        match crate::backfill::record_first_read_tier_done(
+            support_dir,
+            source,
+            &upload_destination_namespace,
+        ) {
+            Ok(Some(advance)) => {
+                crate::local_resource_diagnostics::first_read_tier_advanced(
+                    source.api_slug(),
+                    advance.from,
+                    advance.to,
+                    advance.since_first_census_seconds,
+                );
+                // Every participant reads the next tier without waiting for
+                // its routine cadence.
+                for participant in crate::backfill::first_read_tier_participants(
+                    &crate::backfill::load_backfill_state(support_dir),
+                    &upload_destination_namespace,
+                ) {
+                    continuation::request_resident_scan_on_power(participant, true, power);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "local snapshot backfill tier save deferred for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            ),
+        }
+    }
+
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
     if backfill_succeeded {

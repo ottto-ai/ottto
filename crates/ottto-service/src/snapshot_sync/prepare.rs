@@ -1002,6 +1002,16 @@ pub(super) fn prepare_sync_source_inner(
     let backfill_pending =
         backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
     index.first_read_pending = backfill_pending;
+    // Recency tier: the current tier gates this pass's first reads (order only).
+    index.first_read_tier_cutoff = backfill_pending
+        .then(|| backfill_state.first_read_tier_cutoff(&upload_destination_namespace, source))
+        .flatten();
+    if index.first_read_tier_cutoff.is_some() {
+        let days = backfill_state.first_read_tier_days(&upload_destination_namespace, source);
+        crate::local_resource_diagnostics::pass_outcomes(|outcomes| {
+            outcomes.first_read_tier_days = days;
+        });
+    }
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
