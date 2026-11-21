@@ -1280,10 +1280,11 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     let mut file = std::fs::File::open(key).unwrap();
     assert!(
         certificate
-            .restore_grown(
+            .restore_grown_counted(
                 &mut file,
                 crate::transcript_acquisition::Scope("e2-pipeline".into()),
-                None
+                None,
+                None,
             )
             .is_ok(),
         "a renumbered device keeps the certificate"

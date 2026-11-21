@@ -1956,21 +1956,23 @@ impl CertificateRefusal {
     }
 }
 
+/// What `admit_samples` returns: the admission, head and boundary samples, the
+/// checked stamp and the observed write generation count.
+#[cfg(unix)]
+type AdmittedSamples = (
+    DurableAdmission,
+    Vec<u8>,
+    Vec<u8>,
+    FileStamp,
+    ObservedGeneration,
+);
+
 #[cfg(unix)]
 impl DurableCertificate {
-    /// The native engine's grown path permits concurrent appends outside the certified prefix.
-    pub(crate) fn restore_grown(
-        &self,
-        file: &mut File,
-        scope: Scope,
-        read_changed_nanos: Option<u64>,
-    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        self.restore_grown_counted(file, scope, read_changed_nanos, None)
-    }
-
-    /// `restore_grown` with the write generation count stored beside this
-    /// certificate, if any: at an unchanged length it also admits a moved
-    /// mtime the count proves a touch (`checked_stamp`).
+    /// The native engine's grown path permits concurrent appends outside the
+    /// certified prefix. With the write generation count stored beside this
+    /// certificate, if any, an unchanged length also admits a moved mtime the
+    /// count proves a touch (`checked_stamp`).
     pub(crate) fn restore_grown_counted(
         &self,
         file: &mut File,
@@ -2095,16 +2097,7 @@ impl DurableCertificate {
         allow_append: bool,
         read_changed_nanos: Option<u64>,
         stored: Option<WriteGeneration>,
-    ) -> Result<
-        (
-            DurableAdmission,
-            Vec<u8>,
-            Vec<u8>,
-            FileStamp,
-            ObservedGeneration,
-        ),
-        CertificateRefusal,
-    > {
+    ) -> Result<AdmittedSamples, CertificateRefusal> {
         let (stamp, mut observed) = self.checked_stamp(file, read_changed_nanos, stored)?;
         let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
@@ -3865,7 +3858,7 @@ mod tests {
             "APFS clamps birth to mtime"
         );
         let (restored, admission) = certificate
-            .restore_grown(&mut f.open(), scope(), None)
+            .restore_grown_counted(&mut f.open(), scope(), None, None)
             .expect("the certified object continues");
         assert!(!admission.unchanged);
         assert_eq!(
@@ -3876,7 +3869,9 @@ mod tests {
             let mut later = certificate.clone();
             later.birth_nanos = now_birth - 1;
             assert_eq!(
-                later.restore_grown(&mut f.open(), scope(), None).err(),
+                later
+                    .restore_grown_counted(&mut f.open(), scope(), None, None)
+                    .err(),
                 Some(CertificateRefusal::Changed(FullReason::Replaced)),
                 "a birth after the certified one is another object"
             );
@@ -3884,7 +3879,7 @@ mod tests {
             unclamped.birth_nanos = now_birth + 1;
             assert_eq!(
                 unclamped
-                    .restore_grown(&mut f.open(), scope(), None)
+                    .restore_grown_counted(&mut f.open(), scope(), None, None)
                     .map(|_| ()),
                 if cfg!(target_os = "macos") {
                     Ok(())

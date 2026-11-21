@@ -581,9 +581,10 @@ pub(crate) fn claude_certificate_restore_for_test(
     let certificate = head_certificate::<tail_source::claude::Claude>(index, key).unwrap();
     let mut file = std::fs::File::open(key).unwrap();
     certificate
-        .restore_grown(
+        .restore_grown_counted(
             &mut file,
             crate::transcript_acquisition::Scope("e2-pipeline".into()),
+            None,
             None,
         )
         .map(|_| ())

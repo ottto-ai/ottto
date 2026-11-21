@@ -171,7 +171,7 @@ mod tests {
         let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
         db.control("minimum_writer_capability", &6_u64).unwrap();
         let conn = db.conn().unwrap();
-        assert!(WRITER_CAPABILITY >= 6);
+        const { assert!(WRITER_CAPABILITY >= 6) };
         assert_eq!(revision(conn).unwrap(), 1);
         assert!(writer_supported(conn).is_ok());
         let error = writer_supported_at(conn, 5).unwrap_err();

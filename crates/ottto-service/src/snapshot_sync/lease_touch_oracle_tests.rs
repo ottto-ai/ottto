@@ -406,7 +406,8 @@ fn uncounted_touch_reads_full_until_a_read_stores_a_count() {
         assert_eq!(first.modes, (1, 0, 0), "the stored head has no count");
         assert_eq!(same_size_edits(&upgraded), 1);
         against_cold(&s, &mut first, &s.index, Mode::DiskRestore);
-        accept_page(&mut first);
+        // Committed undelivered, as the seed is: a cold Full of an accepted
+        // body re-emits nothing, so it would be no control for the restore.
         let index = s
             .disk
             .commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
@@ -450,12 +451,23 @@ fn recycled_inode_with_an_equal_count_and_another_birth_reads_full() {
             assert_eq!(restored.modes, (1, 0, 0), "unknown={unknown}");
             against_cold(&s, &mut restored, &s.index, Mode::DiskRestore);
 
+            // This pass reloads the stored head too, whose certificate check
+            // refuses a known other birth as another object and, with the
+            // birth unknown, the moved mtime no count proves as an edit.
+            let reason = if unknown {
+                FullReason::SameSizeEdit
+            } else {
+                FullReason::Replaced
+            };
             let guard = recycled();
-            let edits = same_size_edits(&s.owner);
             let mut retained = s.c.raw(&s.owner, s.index.clone(), 100, true, &[]);
             drop(guard);
             assert_eq!(retained.modes, (1, 0, 0), "unknown={unknown}");
-            assert_eq!(same_size_edits(&s.owner), edits + 1, "unknown={unknown}");
+            assert_eq!(
+                s.owner.full_reasons()[reason.slot()],
+                1,
+                "unknown={unknown}: {reason:?}"
+            );
             against_cold(&s, &mut retained, &s.index, Mode::Ram);
 
             let (_, mut control, consumed) = restart_pass(&s, &s.index);

@@ -192,13 +192,21 @@ impl Route {
             .unwrap()
             .expect("a clean fixture is certified");
         at_pre(&mut parser.accumulator);
+        // As `PendingTail::new`, under a count source: the certificate names
+        // the file's birth and the head carries the read's count. Without a
+        // count, birth 0 and no count, as before counts.
+        let birth = crate::transcript_acquisition::birth_unix_nanos(
+            &File::open(path).unwrap().metadata().unwrap(),
+        );
+        let write_generation = completed.checkpoint.write_generation_for(birth);
+        let birth = if write_generation.is_some() { birth } else { 0 };
         let mut tail = PendingTail {
             source: S::SOURCE,
             route: self.path.clone(),
             key: local_index_key(path),
             id: HeadIdentity::new(&self.path, S::SOURCE, &self.dir, path, false),
-            certificate: completed.checkpoint.durable_certificate(0).unwrap(),
-            write_generation: None,
+            certificate: completed.checkpoint.durable_certificate(birth).unwrap(),
+            write_generation,
             unsealed: completed.unsealed,
             full: base.is_none(),
             base,

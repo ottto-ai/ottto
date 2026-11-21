@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Verify pinned prior sources refuse the current layout without changing custody."""
+import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
 
+# Tag: (commit, the state v2 writer capability that release writes).
 PINS = {
-    "v0.1.239": "4157e768d0a45046a0225e2d61f2ac8cf65c50be",
-    "v0.1.244": "b10c4e9d2acd649dbd09e901000e1f44f891a641",
-    "v0.1.256": "be32ecee30407cd66cacf193248446fd29d5a1be",
+    "v0.1.239": ("4157e768d0a45046a0225e2d61f2ac8cf65c50be", 6),
+    "v0.1.244": ("b10c4e9d2acd649dbd09e901000e1f44f891a641", 6),
+    "v0.1.256": ("be32ecee30407cd66cacf193248446fd29d5a1be", 6),
 }
 PROBE = r'''
 #[cfg(test)]
@@ -48,7 +51,8 @@ mod telemetry_only_previous_release_probe {
             Ok(_) => panic!("older reader opened a newer catalogue layout"),
             Err(error) => error,
         };
-        assert!(format!("{error:#}").contains("scan_index_representation_refused"), "{error:#}");
+        let refusal = std::env::var("OTTTO_OTEL_CARRY_REFUSAL").unwrap();
+        assert!(format!("{error:#}").contains(&refusal), "{refusal}: {error:#}");
         assert_eq!(before, rows(&path), "refused open changed stored rows");
         std::fs::write(path.with_extension("old-verified"),b"TELEMETRY_ONLY_OLD_LAYOUT_REFUSED").unwrap();
         println!("TELEMETRY_ONLY_OLD_LAYOUT_REFUSED");
@@ -61,7 +65,23 @@ def main():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise SystemExit("CI Linux only")
     tag, index = sys.argv[1:]
-    pin = PINS[tag]
+    pin, capability = PINS[tag]
+    # A store whose minimum writer capability is above the release's own is
+    # refused at the writer fence on open; otherwise the release must refuse
+    # the newer row representation.
+    store = sqlite3.connect(f"file:{index}.v2.sqlite?mode=ro", uri=True)
+    try:
+        row = store.execute(
+            "SELECT value FROM control WHERE name = 'minimum_writer_capability'"
+        ).fetchone()
+    finally:
+        store.close()
+    minimum = json.loads(row[0]) if row else 0
+    refusal = (
+        "state_v2_newer_schema_refused"
+        if minimum > capability
+        else "scan_index_representation_refused"
+    )
     repo = Path(__file__).resolve().parents[1]
     def run(args, **kwargs):
         return subprocess.run(args, cwd=repo, check=True, **kwargs)
@@ -75,7 +95,8 @@ def main():
         run(["tar", "-xf", str(archive), "-C", str(tree)])
         with (tree / "crates/ottto-service/src/snapshot_sync.rs").open("a") as stream:
             stream.write(PROBE)
-        env = dict(os.environ, OTTTO_OTEL_CARRY_INDEX=index, CARGO_TARGET_DIR=str(tree / "old-target"))
+        env = dict(os.environ, OTTTO_OTEL_CARRY_INDEX=index, OTTTO_OTEL_CARRY_REFUSAL=refusal,
+            CARGO_TARGET_DIR=str(tree / "old-target"))
         marker = Path(index).with_suffix(".old-verified")
         marker.unlink(missing_ok=True)
         result = subprocess.run(["cargo", "test", "--locked", "-p", "ottto-service", "--lib", "-j", "2",
