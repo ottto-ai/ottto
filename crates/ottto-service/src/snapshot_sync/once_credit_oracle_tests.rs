@@ -80,6 +80,16 @@ enum Answer {
     LostAck,
     Dropped,
     Shed,
+    /// A non-permanent `other` rejection: a valid answer that keeps only this
+    /// entity owed.
+    Retry,
+    /// No reference at all for this entity: the reply no longer covers the
+    /// request exactly.
+    Omit,
+    /// The whole POST answers the identity-unavailable 503 naming this entity.
+    Identity,
+    /// The whole POST answers an unnamed 503 with a short Retry-After.
+    Transient,
 }
 
 fn exact_ack(item: &Value) -> Value {
@@ -129,6 +139,9 @@ struct OracleServer {
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     script: Arc<Mutex<VecDeque<Vec<Answer>>>>,
+    /// Answers for the next offers of the entity whose session id contains
+    /// the key, used when no per-POST script is queued.
+    by_session: Arc<Mutex<BTreeMap<String, VecDeque<Answer>>>>,
     fallback: Arc<Mutex<Answer>>,
     batches: Arc<Mutex<Vec<Vec<u8>>>>,
     placement: Arc<Mutex<BTreeMap<String, Value>>>,
@@ -146,6 +159,8 @@ impl OracleServer {
         let done = stop.clone();
         let script = Arc::new(Mutex::new(VecDeque::<Vec<Answer>>::new()));
         let script_worker = script.clone();
+        let by_session = Arc::new(Mutex::new(BTreeMap::<String, VecDeque<Answer>>::new()));
+        let by_session_worker = by_session.clone();
         let fallback = Arc::new(Mutex::new(Answer::Accept));
         let fallback_worker = fallback.clone();
         let batches = Arc::new(Mutex::new(Vec::new()));
@@ -202,11 +217,21 @@ impl OracleServer {
                         "post",
                         vec![("entities", Scalar::U64(items.len() as u64))],
                     );
-                    let answers = script_worker
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or_else(|| vec![*fallback_worker.lock().unwrap(); items.len()]);
+                    let answers = script_worker.lock().unwrap().pop_front().unwrap_or_else(|| {
+                        let fallback = *fallback_worker.lock().unwrap();
+                        let mut keyed = by_session_worker.lock().unwrap();
+                        items
+                            .iter()
+                            .map(|item| {
+                                let session = item["source_session_id"].as_str().unwrap_or("");
+                                keyed
+                                    .iter_mut()
+                                    .find(|(key, _)| session.contains(key.as_str()))
+                                    .and_then(|(_, queued)| queued.pop_front())
+                                    .unwrap_or(fallback)
+                            })
+                            .collect()
+                    });
                     assert_eq!(answers.len(), items.len(), "one answer per offered entity");
                     if answers.iter().any(|a| matches!(a, Answer::Dropped)) {
                         drop(stream);
@@ -214,6 +239,24 @@ impl OracleServer {
                     }
                     if answers.iter().any(|a| matches!(a, Answer::Shed)) {
                         bounded_native_response(&mut stream, "503 Service Unavailable", "{}");
+                        continue;
+                    }
+                    if answers.iter().any(|a| matches!(a, Answer::Transient)) {
+                        let body = "{}";
+                        write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        continue;
+                    }
+                    if answers.iter().any(|a| matches!(a, Answer::Identity)) {
+                        let errors = answers
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, answer)| matches!(answer, Answer::Identity))
+                            .map(|(index, _)| json!({"loc":["body","snapshots",index]}))
+                            .collect::<Vec<_>>();
+                        let body = json!({"code":"snapshot_original_identity_unavailable",
+                            "errors":errors})
+                        .to_string();
+                        write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                         continue;
                     }
                     let mut reply = json!({"accepted":0,"sessions_reconciled":0,
@@ -280,7 +323,19 @@ impl OracleServer {
                                     .unwrap()
                                     .push(reference);
                             }
-                            Answer::Dropped | Answer::Shed => unreachable!("handled per POST"),
+                            Answer::Retry => {
+                                reference["reason"] = "other".into();
+                                reference["permanent"] = false.into();
+                                reply["rejected_entities"]
+                                    .as_array_mut()
+                                    .unwrap()
+                                    .push(reference);
+                            }
+                            Answer::Omit => {}
+                            Answer::Dropped
+                            | Answer::Shed
+                            | Answer::Identity
+                            | Answer::Transient => unreachable!("handled per POST"),
                             Answer::ByHead => unreachable!("resolved against the head above"),
                         }
                     }
@@ -305,6 +360,7 @@ impl OracleServer {
             stop,
             worker: Some(worker),
             script,
+            by_session,
             fallback,
             batches,
             placement,
@@ -372,6 +428,8 @@ struct OracleHome {
     cadence: Cadence,
     now: u64,
     small_page: bool,
+    /// Scaled (cursor, singleton threshold) limits for every page, if set.
+    page_limits: Option<(u64, u64)>,
     state_budget: Option<usize>,
     row: &'static str,
     cycle_number: usize,
@@ -407,6 +465,8 @@ struct Cycle {
     debt: Value,
     /// The scan's `unacked_usage_lost_to_deletion` counts, summed over its pages.
     unacked_lost: BTreeMap<String, u64>,
+    /// Pages of this pass that read the Codex first-import page total.
+    first_import_pages: usize,
 }
 
 impl Cycle {
@@ -516,6 +576,7 @@ impl OracleHome {
             cadence,
             now: NOW,
             small_page: false,
+            page_limits: None,
             state_budget: None,
             row: "c00",
             cycle_number: 0,
@@ -620,6 +681,7 @@ impl OracleHome {
         self.cadence.due();
         let now = self.now;
         let small_page = self.small_page;
+        let page_limits = self.page_limits;
         let budget = self.state_budget;
 
         let at = OffsetDateTime::from_unix_timestamp(now as i64)
@@ -729,7 +791,11 @@ impl OracleHome {
             let read =
                 || crate::snapshots::OwnedSourceScan::with_oracle_births(worker_births, read);
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-                if small_page {
+                if let Some((cursor, singleton)) = page_limits {
+                    crate::snapshots::with_test_limits_for_test(cursor, singleton, 64, || {
+                        crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
+                    })
+                } else if small_page {
                     crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
                         crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
                     })
@@ -741,9 +807,13 @@ impl OracleHome {
             result
         });
         let mut unacked_lost = BTreeMap::<String, u64>::new();
+        let mut first_import_pages = 0;
         for page in pages.into_inner().unwrap() {
             if page["stage"] != "native_collection_page" {
                 continue;
+            }
+            if page["counts"]["codex_first_import_page_total"] == true {
+                first_import_pages += 1;
             }
             if let Some(lost) = page["counts"]["unacked_usage_lost_to_deletion"].as_object() {
                 for (name, count) in lost {
@@ -867,6 +937,7 @@ impl OracleHome {
             evidence_chunks,
             debt,
             unacked_lost,
+            first_import_pages,
         };
         let mut expected = Vec::new();
         if self.restarted {
@@ -3687,6 +3758,455 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
             }
         );
     }
+}
+
+// Codex first-import page total: ACK and retry rows. Transport packs a pass's
+// offered set by entity count, wire bytes and class only; the page total never
+// enters packing. The larger total therefore changes only which entities one
+// pass offers together: A and B share a pass, and so one POST, only at the
+// first-import total, while C stays pending past that page.
+
+const TRIO: [&str; 3] = [
+    "7338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    "8338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    "9338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+];
+const TRIO_A: usize = 0;
+const TRIO_B: usize = 1;
+const TRIO_C: usize = 2;
+
+fn trio_role(session: &str) -> Option<usize> {
+    TRIO.iter().position(|thread| session.contains(thread))
+}
+
+/// Three equal Codex singletons. A is newest and first by name, then B, then
+/// C, so the walk order and the first-read order both read A, B, C. The
+/// threshold is 1.25 files: an ordinary page reads one file, the first-import
+/// page total (2.5 files) reads two, and no page reads three. Without
+/// `first_import` the device also grants Claude, which is still importing, so
+/// Codex keeps the ordinary total.
+fn trio_home(
+    row: &'static str,
+    first_import: bool,
+) -> (Recording, OracleServer, OracleHome, [PathBuf; 3]) {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = row;
+    if !first_import {
+        home.device
+            .sources
+            .push(SnapshotSource::ClaudeCode.api_slug().into());
+        FileDeviceStore::default().save(&home.device).unwrap();
+    }
+    let root = home.source.default_roots(&home.fixture.home)[0].clone();
+    let paths: [PathBuf; 3] = std::array::from_fn(|n| {
+        let path = root.join(format!("{n}-trio/{}.jsonl", TRIO[n]));
+        let (tokens, age) = (100 + n as u64, 3000 + 300 * n as u64);
+        write_jsonl(
+            &path,
+            &codex_member(
+                TRIO[n],
+                &format!("trio-{n}"),
+                tokens,
+                tokens,
+                "2026-11-01T07:00:00Z",
+            ),
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - age))
+            .unwrap();
+        path
+    });
+    let file = paths
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .max()
+        .unwrap();
+    home.page_limits = Some((1 << 20, file + file / 4));
+    (recording, server, home, paths)
+}
+
+/// Each POST of `cycle`, as the trio entities it offered.
+fn trio_posts(cycle: &Cycle) -> Vec<BTreeSet<usize>> {
+    cycle
+        .batches
+        .iter()
+        .map(|batch| {
+            let wire: Value = serde_json::from_slice(batch).unwrap();
+            wire["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| trio_role(item["source_session_id"].as_str().unwrap()))
+                .collect::<Option<BTreeSet<_>>>()
+                .expect("trio entities only")
+        })
+        .collect()
+}
+
+fn trio_item(cycle: &Cycle, role: usize) -> &SnapshotItem {
+    cycle
+        .finalized
+        .iter()
+        .find(|item| trio_role(&item.source_session_id) == Some(role))
+        .expect("finalized trio entity")
+}
+
+/// The trio entities whose finalized body in `cycle` holds an exact stored ACK.
+fn trio_credited(cycle: &Cycle) -> BTreeSet<usize> {
+    cycle
+        .finalized
+        .iter()
+        .filter(|item| cycle.accepted_body(item))
+        .filter_map(|item| trio_role(&item.source_session_id))
+        .collect()
+}
+
+/// Exact stored ACKs the server sent, per trio entity.
+fn trio_acks(server: &OracleServer) -> [usize; 3] {
+    let mut acks = [0; 3];
+    for row in server.acknowledged.lock().unwrap().iter().flatten() {
+        let role = trio_role(row["source_session_id"].as_str().unwrap());
+        acks[role.expect("a trio entity")] += 1;
+    }
+    acks
+}
+
+fn codex_import_pending(home: &OracleHome) -> bool {
+    crate::backfill::bootstrap_pending_for_destination(
+        &crate::backfill::load_backfill_state(&home.support),
+        SnapshotSource::Codex,
+        &snapshot_upload_destination_namespace(&home.device, "device-secret"),
+    )
+}
+
+/// Passes until A, B and C each hold an exact stored ACK (at most six), the
+/// clock `step` seconds later before each pass after the first.
+fn settle_trio(
+    home: &mut OracleHome,
+    server: &OracleServer,
+    recording: &Recording,
+    mut credited: BTreeSet<usize>,
+    step: u64,
+) -> Vec<Cycle> {
+    let mut cycles = Vec::new();
+    while credited.len() < TRIO.len() {
+        assert!(cycles.len() < 6, "A, B and C settle: {credited:?}");
+        if !cycles.is_empty() {
+            home.now += step;
+        }
+        let cycle = home.cycle(server, recording);
+        credited.extend(trio_credited(&cycle));
+        cycles.push(cycle);
+    }
+    cycles
+}
+
+/// [money] With Codex alone importing, the first page reads A and B at the
+/// first-import total and offers them in one POST, with C pending past it.
+/// With Claude also importing, each ordinary page offers one entity. Either
+/// way each entity earns one exact ACK, and the placed bodies, money and
+/// identity, are equal.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_total_offers_a_and_b_together_and_places_like_ordinary_pages() {
+    let mut placed = Vec::new();
+    for first_import in [false, true] {
+        let (recording, server, mut home, _) = trio_home("fi01", first_import);
+        let cycles = settle_trio(&mut home, &server, &recording, BTreeSet::new(), 0);
+        let posts = cycles.iter().map(trio_posts).collect::<Vec<_>>();
+        if first_import {
+            assert!(cycles[0].first_import_pages > 0, "read at the larger total");
+            assert_eq!(
+                posts[0],
+                [BTreeSet::from([TRIO_A, TRIO_B])],
+                "A and B share one POST"
+            );
+            assert!(
+                cycles[0]
+                    .before
+                    .iter()
+                    .all(|item| trio_role(&item.source_session_id) != Some(TRIO_C)),
+                "C is pending past the first page"
+            );
+            assert_eq!(posts[1], [BTreeSet::from([TRIO_C])]);
+        } else {
+            assert!(cycles.iter().all(|cycle| cycle.first_import_pages == 0));
+            assert_eq!(
+                posts[0],
+                [BTreeSet::from([TRIO_A])],
+                "an ordinary page offers A alone"
+            );
+            assert!(posts.iter().flatten().all(|post| post.len() == 1));
+        }
+        assert!(cycles.iter().all(|cycle| cycle.finish.is_ok()));
+        assert_eq!(trio_acks(&server), [1, 1, 1], "one exact ACK per entity");
+        placed.push(placed_bodies(&server));
+    }
+    assert_eq!(placed[0], placed[1], "placed money and identity are equal");
+}
+
+/// [money] A and B share one first-import POST. A is ACKed exactly while B
+/// gets a valid retryable answer, and the index save then fails. B stays
+/// owed, C is pending and the import is not complete. After recovery from the
+/// durable ACK ledger with the pre-pass index, A is never offered or credited
+/// again; B and C each settle once later and A's placement is unchanged.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_pair_acks_a_exactly_while_b_stays_owed() {
+    let (recording, server, mut home, _) = trio_home("fi02", true);
+    server
+        .by_session
+        .lock()
+        .unwrap()
+        .insert(TRIO[TRIO_B].into(), VecDeque::from([Answer::Retry]));
+    let failure = SaveFailure::at("selected_save");
+    let first = home.cycle(&server, &recording);
+    drop(failure);
+    assert!(first.first_import_pages > 0);
+    assert_eq!(trio_posts(&first), [BTreeSet::from([TRIO_A, TRIO_B])]);
+    assert!(
+        first.finish.is_err(),
+        "the index save fails after the ACK checkpoint"
+    );
+    assert!(
+        first.accepted_body(trio_item(&first, TRIO_A)),
+        "A's ACK is durable"
+    );
+    let b = trio_item(&first, TRIO_B);
+    assert!(!first.accepted_body(b));
+    assert!(
+        first
+            .progress
+            .quarantined_fingerprints
+            .contains_key(&b.snapshot_fingerprint),
+        "B stays owed in retry custody"
+    );
+    assert_eq!(trio_acks(&server), [1, 0, 0]);
+    assert!(codex_import_pending(&home), "no early completion");
+    let a_placed = placed_bodies(&server);
+    assert_eq!(a_placed.len(), 1);
+    home.restore_pre_cycle_index(&first);
+    let later = settle_trio(
+        &mut home,
+        &server,
+        &recording,
+        BTreeSet::from([TRIO_A]),
+        86_400,
+    );
+    assert!(
+        later
+            .iter()
+            .flat_map(trio_posts)
+            .all(|post| !post.contains(&TRIO_A)),
+        "A is never offered again"
+    );
+    assert_eq!(trio_acks(&server), [1, 1, 1], "A once; B and C once");
+    let placed = placed_bodies(&server);
+    for (entity, body) in &a_placed {
+        assert_eq!(&placed[entity], body, "A's placement is unchanged");
+    }
+}
+
+/// [money] B's `not_stored` answer (dominated by the server's head) in the
+/// shared first-import POST grants B no stored-body credit and no receipt,
+/// while A's exact ACK settles A.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_pair_b_not_stored_gets_no_receipt() {
+    let (recording, server, mut home, paths) = trio_home("fi03", true);
+    server
+        .by_session
+        .lock()
+        .unwrap()
+        .insert(TRIO[TRIO_B].into(), VecDeque::from([Answer::Dominated]));
+    let first = home.cycle(&server, &recording);
+    assert!(first.first_import_pages > 0);
+    assert_eq!(trio_posts(&first), [BTreeSet::from([TRIO_A, TRIO_B])]);
+    assert!(first.accepted_body(trio_item(&first, TRIO_A)));
+    let b = trio_item(&first, TRIO_B);
+    assert!(!first.accepted_body(b), "not_stored proves no body");
+    assert!(!first
+        .progress
+        .accepted_body_witnesses
+        .contains_key(&b.snapshot_fingerprint));
+    assert_eq!(receipt(&first, &paths[TRIO_B]), None, "no receipt for B");
+    assert!(!server
+        .placement
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|entity| trio_role(entity) == Some(TRIO_B)));
+    assert_eq!(trio_credited(&first), BTreeSet::from([TRIO_A]));
+    assert!(codex_import_pending(&home));
+}
+
+/// [money] A reply that omits B from the shared first-import POST fails exact
+/// response validation: neither A nor B gets credit from it, though the
+/// server stored A. Both are offered again and each settles from its own
+/// exact ACK.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_pair_omitting_b_fails_exact_validation() {
+    let (recording, server, mut home, _) = trio_home("fi04", true);
+    server
+        .by_session
+        .lock()
+        .unwrap()
+        .insert(TRIO[TRIO_B].into(), VecDeque::from([Answer::Omit]));
+    let first = home.cycle(&server, &recording);
+    assert!(first.first_import_pages > 0);
+    assert_eq!(trio_posts(&first), [BTreeSet::from([TRIO_A, TRIO_B])]);
+    assert!(trio_credited(&first).is_empty(), "credits neither");
+    for role in [TRIO_A, TRIO_B] {
+        assert!(!first
+            .progress
+            .accepted_body_witnesses
+            .contains_key(&trio_item(&first, role).snapshot_fingerprint));
+    }
+    assert!(codex_import_pending(&home));
+    let later = settle_trio(&mut home, &server, &recording, BTreeSet::new(), 86_400);
+    for role in [TRIO_A, TRIO_B] {
+        assert!(
+            later
+                .iter()
+                .flat_map(trio_posts)
+                .any(|post| post.contains(&role)),
+            "entity {role} is offered again"
+        );
+    }
+}
+
+/// [money] The identity-unavailable 503 names B in the shared first-import
+/// POST. B is held with its identity debt; its sibling A is resent alone in
+/// the same pass and settles from its own exact ACK. C, on a later page, and
+/// B, once due, each settle once, B's ACK pays its identity debt and A is
+/// never offered again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_pair_identity_503_on_b_resends_a_and_keeps_b_owed() {
+    let (recording, server, mut home, _) = trio_home("fi05", true);
+    server
+        .by_session
+        .lock()
+        .unwrap()
+        .insert(TRIO[TRIO_B].into(), VecDeque::from([Answer::Identity]));
+    let first = home.cycle(&server, &recording);
+    assert!(first.first_import_pages > 0);
+    assert_eq!(
+        trio_posts(&first),
+        [BTreeSet::from([TRIO_A, TRIO_B]), BTreeSet::from([TRIO_A])],
+        "the named 503 holds B; A is resent alone in the same pass"
+    );
+    assert!(first.accepted_body(trio_item(&first, TRIO_A)));
+    let b = trio_item(&first, TRIO_B);
+    assert!(!first.accepted_body(b));
+    assert!(first
+        .progress
+        .quarantined_fingerprints
+        .contains_key(&b.snapshot_fingerprint));
+    assert_eq!(
+        first
+            .progress
+            .identity_503_pending
+            .as_ref()
+            .map(BTreeSet::len),
+        Some(1),
+        "B owes its identity ACK"
+    );
+    assert_eq!(trio_acks(&server), [1, 0, 0]);
+    assert!(codex_import_pending(&home));
+    let later = settle_trio(
+        &mut home,
+        &server,
+        &recording,
+        BTreeSet::from([TRIO_A]),
+        86_400,
+    );
+    assert!(later
+        .iter()
+        .flat_map(trio_posts)
+        .all(|post| !post.contains(&TRIO_A)));
+    assert_eq!(trio_acks(&server), [1, 1, 1]);
+    assert!(
+        later
+            .last()
+            .unwrap()
+            .progress
+            .identity_503_pending
+            .as_ref()
+            .is_none_or(BTreeSet::is_empty),
+        "B's exact ACK pays its identity debt"
+    );
+}
+
+/// [money] After A's exact ACK and B's retryable answer on the shared
+/// first-import POST, the next pass meets an unnamed 503 with a short
+/// Retry-After on every POST. It resends the exact same set in place twice,
+/// the page's whole shared budget, then takes the third 503 as a shed and
+/// stops. A's earlier ACK stands and A is never offered again; B keeps its
+/// debt and the import is not complete until B and C settle.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn first_import_short_transient_503_then_shed_keeps_prior_acks_and_b_owed() {
+    let (recording, server, mut home, _) = trio_home("fi06", true);
+    server
+        .by_session
+        .lock()
+        .unwrap()
+        .insert(TRIO[TRIO_B].into(), VecDeque::from([Answer::Retry]));
+    let first = home.cycle(&server, &recording);
+    assert!(first.first_import_pages > 0);
+    assert_eq!(trio_posts(&first), [BTreeSet::from([TRIO_A, TRIO_B])]);
+    assert_eq!(trio_credited(&first), BTreeSet::from([TRIO_A]));
+    let b = trio_item(&first, TRIO_B).snapshot_fingerprint.clone();
+    home.now += 86_400;
+    *server.fallback.lock().unwrap() = Answer::Transient;
+    let (second, waits) = crate::snapshot_sync::retry::with_inplace_retry_test_clock(None, || {
+        home.cycle(&server, &recording)
+    });
+    let posts = trio_posts(&second);
+    assert_eq!(posts.len(), 3, "a POST and two in-place resends");
+    assert!(
+        posts.iter().all(|post| *post == posts[0]),
+        "each resend offers the exact same set"
+    );
+    assert!(!posts[0].is_empty() && !posts[0].contains(&TRIO_A));
+    assert_eq!(waits.len(), 2, "the shared page budget allows two resends");
+    for wait in &waits {
+        assert!((1..=5).contains(&wait.as_secs()), "{wait:?}");
+    }
+    assert_eq!(trio_acks(&server), [1, 0, 0], "only the prior ACK exists");
+    assert!(trio_credited(&second).iter().all(|role| *role == TRIO_A));
+    assert!(
+        second.progress.quarantined_fingerprints.contains_key(&b),
+        "B keeps its debt"
+    );
+    assert!(codex_import_pending(&home), "no early completion");
+    *server.fallback.lock().unwrap() = Answer::Accept;
+    let later = settle_trio(
+        &mut home,
+        &server,
+        &recording,
+        BTreeSet::from([TRIO_A]),
+        86_400,
+    );
+    assert!(later
+        .iter()
+        .chain(std::iter::once(&second))
+        .flat_map(trio_posts)
+        .all(|post| !post.contains(&TRIO_A)));
+    assert_eq!(trio_acks(&server), [1, 1, 1]);
 }
 
 mod money_equivalence_tests {

@@ -2871,9 +2871,11 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
 /// One corpus (two accounts, a mid-session switch, a spawned side call, an
 /// evidence gap and tagged rows, plus small sessions: two exactly at the
 /// singleton threshold, one a byte above it) drains under scaled limits on
-/// three routes: ordinary pages, first-import pages, and the crossing (two
+/// four routes: ordinary pages, first-import pages, the crossing (two
 /// first-import pages, a restart from the durable store, then ordinary
-/// pages). Each route posts every body once, its exact ACK ledger covers
+/// pages) and the resume (two ordinary pages saved as an older process
+/// would, a restart from the durable store, then first-import pages). Each
+/// route posts every body once, its exact ACK ledger covers
 /// them, and its bodies equal cold Full in totals and placement (swapped
 /// accounts fail the comparator). The first-import route takes fewer pages;
 /// the threshold-exact files stay singletons and the threshold+1 file is
@@ -2953,9 +2955,16 @@ fn first_import_page_total_moves_pages_not_money() {
             .unwrap()
     };
     let mut page_counts = BTreeMap::new();
-    // (route, first-import pages before the ordinary ones; MAX: every page)
-    for (arm, first_import_pages) in [("ordinary", 0), ("first-import", usize::MAX), ("crossing", 2)]
-    {
+    // (route, switch page, upgraded). Not upgraded: the first `switch` pages
+    // read the first-import total and the rest the ordinary one (MAX: every
+    // page). Upgraded: the first `switch` pages are ordinary, as saved by a
+    // process without the larger total, and the rest resume at it.
+    for (arm, switch, upgraded) in [
+        ("ordinary", 0, false),
+        ("first-import", usize::MAX, false),
+        ("crossing", 2, false),
+        ("resume", 2, true),
+    ] {
         let store = crate::test_scratch::ScratchDir::canonical(&format!("first-import-{arm}"));
         let dir = fs::canonicalize(store.as_ref()).unwrap().join("state");
         crate::test_scratch::create_private_dir(&dir).unwrap();
@@ -2971,15 +2980,21 @@ fn first_import_page_total_moves_pages_not_money() {
                 while emitted_ids.len() < ids.len() {
                     pages += 1;
                     assert!(pages <= 48, "{arm}: the corpus drains: {emitted_ids:?}");
-                    if first_import_pages == 2 && pages == 3 {
+                    if switch == 2 && pages == 3 {
                         // A restart between pages: the durable store, a new
                         // process cache, and the flag prepare sets again.
+                        // Resumed, the progress saved at the ordinary total
+                        // continues at the first-import total.
                         started += cache.counters_for_test().jobs_started;
                         index = ScanIndex::load(session.path()).unwrap();
                         assert!(!index.first_import_pending, "{arm}: never saved");
                         cache = Arc::default();
                     }
-                    let first_import = pages <= first_import_pages;
+                    let first_import = if upgraded {
+                        pages > switch
+                    } else {
+                        pages <= switch
+                    };
                     index.first_import_pending = first_import;
                     let before = index.clone();
                     let (working, scan, ..) = page_observed_with_limit(
@@ -3009,7 +3024,7 @@ fn first_import_page_total_moves_pages_not_money() {
                 (index, scans, posts, pages, started)
             });
         page_counts.insert(arm, pages);
-        if arm != "crossing" {
+        if !matches!(arm, "crossing" | "resume") {
             assert_eq!(
                 started, cursor_files,
                 "{arm}: only the files above the threshold are cursor work"

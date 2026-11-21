@@ -1729,6 +1729,165 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// An owner whose group sorts before `owner`'s in page selection order. Group
+/// keys hash the home path, which differs every run, so it is searched for.
+fn owner_sorting_before(root: &Path, owner: &str) -> String {
+    let home = inventory_groups(root)
+        .into_iter()
+        .find(|group| group.owner == owner)
+        .expect("the group")
+        .home;
+    let key = super::super::group_key(&home, owner);
+    (0..u64::from(u32::MAX))
+        .map(|i| format!("aaaaaaaa-bbbb-4ccc-8ddd-{i:012x}"))
+        .find(|candidate| super::super::group_key(&home, candidate) < key)
+        .expect("an owner whose group sorts first")
+}
+
+/// Control: a probe cut by `PROBE_BYTES` itself, not by the page's
+/// remainder, is the same at both page totals. The group keeps chronological
+/// order, is refused strict, asks for no page of its own and parks; the next
+/// generation is a parked hit that publishes nothing.
+#[test]
+fn probe_bytes_bound_order_parks_at_both_page_totals() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("probe-bytes-park");
+    // About 1.2 MiB of padding before `c`'s first native: its probe passes
+    // `PROBE_BYTES` (1 MiB) whatever room the page has.
+    write_probe_order(&root, OTHER, ["c", "d"], 300, 0);
+    let group = inventory_groups(&root)
+        .into_iter()
+        .find(|group| group.owner == OTHER)
+        .expect("the group");
+    let own_page_asked = |cache: &SharedCache| {
+        cache.group_own_page(&Scope("group-fixture".into()), &job_key(&group), None)
+    };
+    // The remainder after the two header reads covers a whole `PROBE_BYTES`
+    // probe at both totals, and the group is still larger than the
+    // threshold (a paged group).
+    let singleton = (1 << 20) + 64 * 1024;
+    assert!(corpus_bytes(&root) > singleton, "a paged group");
+    for first_import in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(8 << 20, singleton, 64, || {
+            let index = ScanIndex {
+                first_import_pending: first_import,
+                ..ScanIndex::default()
+            };
+            let (index, first) = sampled(&root, index, 10, &cache);
+            assert!(
+                first
+                    .snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.source_session_id != OTHER),
+                "strict in chronological order (first import {first_import})"
+            );
+            assert!(
+                !own_page_asked(&cache),
+                "a PROBE_BYTES order never asks for its own page"
+            );
+            let parked = counters(&cache).parked_hits;
+            let (_, quiet) = next_generation(&root, index, &cache, 1);
+            let after = counters(&cache);
+            assert_eq!(after.parked_hits, parked + 1, "parked: {after:?}");
+            assert!(quiet
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id != OTHER));
+            assert!(!own_page_asked(&cache));
+        });
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A group within the threshold whose body does not fit the page's remainder
+/// after a group read first waits whole for a later page at the ordinary
+/// total: a requeue with no page of its own. At the first-import total the
+/// same body fits the first page. Either way it is counted once, as unpaged.
+#[test]
+fn whole_group_body_defers_at_the_ordinary_total_and_fits_the_first_import_total() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = temp_root("group-body-defer");
+    // Trailing padding makes each member large next to its header charge.
+    let padded = |mut rows: Vec<Value>| {
+        rows.extend((0..8).map(|i| {
+            json!({"type": "event_msg", "timestamp": "2026-10-01T10:59:00Z", "payload": {
+                "type": "agent_message", "message": format!("{i}:{}", "p".repeat(4096))}})
+        }));
+        rows
+    };
+    write_rows(
+        &root.join("sessions/c.jsonl"),
+        &padded(member(OTHER, "r-c", 100, 100)),
+    );
+    write_rows(
+        &root.join("sessions/d.jsonl"),
+        &padded(member(OTHER, "r-d", 200, 300)),
+    );
+    let group_bytes = corpus_bytes(&root);
+    let filler = owner_sorting_before(&root, OTHER);
+    write_rows(
+        &root.join("sessions/f1.jsonl"),
+        &padded(member(&filler, "f-1", 100, 100)),
+    );
+    write_rows(
+        &root.join("sessions/f2.jsonl"),
+        &padded(member(&filler, "f-2", 200, 300)),
+    );
+    assert_eq!(first_group_owner(&root), filler, "the filler is read first");
+    let group = inventory_groups(&root)
+        .into_iter()
+        .find(|group| group.owner == OTHER)
+        .expect("the group");
+    let own_page_asked = |cache: &SharedCache| {
+        cache.group_own_page(&Scope("group-fixture".into()), &job_key(&group), None)
+    };
+    // Both equal groups are within the threshold, so each is read whole. One
+    // fits an ordinary page; both fit the first-import total (2.5 groups).
+    let singleton = group_bytes + group_bytes / 4 + 8 * 1024;
+    let other = |scan: &SourceScanResult| {
+        let snapshots = scan
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == OTHER)
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect::<Vec<_>>();
+        (
+            snapshots.len(),
+            snapshots.into_iter().collect::<BTreeSet<_>>(),
+        )
+    };
+    let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+    let expected = other(&unpaged);
+    assert!(expected.0 > 0, "the group joins unpaged");
+    for first_import in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(8 << 20, singleton, 64, || {
+            let index = ScanIndex {
+                first_import_pending: first_import,
+                ..ScanIndex::default()
+            };
+            let (index, first) = sampled(&root, index, 10, &cache);
+            let after = counters(&cache);
+            if first_import {
+                assert_eq!(other(&first), expected, "the body fits the larger page");
+                assert_eq!(after.deferred, 0, "{after:?}");
+            } else {
+                assert_eq!(other(&first).0, 0, "the whole group waits");
+                assert!(after.deferred >= 1, "{after:?}");
+                assert!(!own_page_asked(&cache), "a requeue, not an own page");
+                let (_, second) = sampled(&root, index, 10, &cache);
+                assert_eq!(other(&second), expected, "counted once, as unpaged");
+            }
+        });
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// A memoized group larger than the singleton budget
 /// reaches its memo hit without the cursor slot while a singleton's job
 /// holds it: no deferral, no rotation waiter, no group job; the singleton
