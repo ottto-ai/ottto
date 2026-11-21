@@ -1719,3 +1719,154 @@ fn progress_rows_codex_continuation_loads_the_route_rows() {
         assert_leftovers_purged(path);
     });
 }
+
+/// Stored-format carry for the retired one-time `other` re-offer. The
+/// committed refusals are ledger members in the previous release's encoding:
+/// one carries the retired `legacy_other_reclassification` token, its sibling
+/// an exact daily re-offer. They are committed into the route's native ledger
+/// rows and read back through the native reader. Both refusals survive and
+/// nothing else changes. The retired token decodes to the done marker and is
+/// never selected, while the sibling is. The rewritten ledger stores the
+/// retired one as `classified`, which the previous decoder also reads as done.
+#[test]
+#[serial]
+fn progress_rows_retired_reoffer_token_hydrates_as_done_beside_its_sibling() {
+    use reason_reoffer::RefusalReoffer;
+    with_e2(|| {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/state_v2/progress-ledger-retired-reoffer.json"
+        ))
+        .unwrap();
+        let fixture = fixture["permanent_rejections"].as_object().unwrap().clone();
+        let (retired, sibling) = ("d0".repeat(32), "d1".repeat(32));
+        let (c, _) = native_corpus_in(corpus("progress-rows-retired-reoffer"), SOURCE, &SESSIONS);
+        let (session, _, _) = published_with_json_ledger(SOURCE, &c, None);
+        let path = session.path();
+        let (index, imported) = load(SOURCE, &c, path).unwrap();
+        let before = durable(&imported);
+        drop(imported);
+        v2::edit_progress_rows_for_test(path, &index, |_, _, ledger| {
+            let refusals = ledger
+                .as_object_mut()
+                .unwrap()
+                .entry("permanent_rejections")
+                .or_insert_with(|| json!({}));
+            for (fingerprint, record) in &fixture {
+                refusals[fingerprint.as_str()] = record.clone();
+            }
+        });
+        drop(index);
+
+        let (_, mut progress) = load(SOURCE, &c, path).unwrap();
+        let other = crate::upload_receipts::RejectedUsageReason::Other;
+        let record = &progress.permanent_rejections[&retired];
+        assert_eq!(
+            (record.reason, record.body_witness.as_str(), record.reoffer),
+            (
+                other,
+                "b0".repeat(32).as_str(),
+                Some(RefusalReoffer::Classified)
+            ),
+            "the retired token hydrates as the done marker"
+        );
+        let record = &progress.permanent_rejections[&sibling];
+        assert_eq!(
+            (record.reason, record.body_witness.as_str(), record.reoffer),
+            (
+                other,
+                "b1".repeat(32).as_str(),
+                Some(RefusalReoffer::OriginalPair {
+                    retry_after_unix_seconds: 1
+                })
+            ),
+            "the sibling keeps its schedule"
+        );
+        let unchanged = |value: Value| {
+            let mut value = without_generation(value);
+            let refusals = value
+                .as_object_mut()
+                .unwrap()
+                .remove("permanent_rejections");
+            (value, refusals.unwrap_or_else(|| json!({})))
+        };
+        let (rest, refusals) = unchanged(durable(&progress));
+        let (rest_before, refusals_before) = unchanged(before);
+        assert_eq!(rest, rest_before, "no other ledger member moves");
+        for (fingerprint, record) in refusals_before.as_object().unwrap() {
+            assert_eq!(&refusals[fingerprint], record, "existing refusal kept");
+        }
+
+        // Both refusals are current and bound to their exact terminal bodies.
+        let mut scope_index = ScanIndex::default();
+        scope_index.generation = 7;
+        for (n, fingerprint) in [&retired, &sibling].into_iter().enumerate() {
+            let body = progress.permanent_rejections[fingerprint]
+                .body_witness
+                .clone();
+            scope_index.file_snapshot_fingerprints.insert(
+                format!("/opaque/{n}.jsonl"),
+                BTreeSet::from([fingerprint.clone()]),
+            );
+            scope_index.quarantined_snapshot_fingerprints.insert(
+                fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    contract_retry_claims: None,
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
+                    witness: snapshot_quarantine_witness(SOURCE),
+                    retry_after_unix_seconds: 0,
+                    upload_body_witness: Some(body),
+                    failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+                    disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+                },
+            );
+        }
+        let now = reason_reoffer::now_unix_seconds();
+        let scope = reason_reoffer::Scope {
+            index: &scope_index,
+            now,
+            window_start_unix_seconds: 0,
+        };
+        progress.prepare_quarantine_and_reason_retries(
+            &scope_index.quarantined_snapshot_fingerprints,
+            Some(&scope),
+        );
+        assert!(progress.active_reason_reoffers.contains_key(&sibling));
+        assert!(
+            !progress.active_reason_reoffers.contains_key(&retired),
+            "the retired token is never re-offered"
+        );
+        assert_eq!(progress.reason_reoffer_counts.due, 1);
+        progress.save(&progress_path(path)).unwrap();
+        drop(progress);
+
+        let stored = crate::snapshot_sync::with_state_v2_progress_owner(path, None, |owner, _| {
+            crate::snapshots::read_progress_rows(path, owner)
+        })
+        .unwrap()
+        .ledger
+        .unwrap();
+        let refusals = &stored["permanent_rejections"];
+        assert_eq!(refusals[&retired]["reason"], "other");
+        assert_eq!(
+            refusals[&retired]["reoffer"],
+            json!({"version": 1, "reason": "classified"}),
+            "the previous decoder reads this as done"
+        );
+        assert_eq!(
+            refusals[&sibling]["reoffer"]["reason"],
+            "original_pair_candidate_unproved"
+        );
+        let (_, reloaded) = load(SOURCE, &c, path).unwrap();
+        assert_eq!(
+            reloaded.permanent_rejections[&retired].reoffer,
+            Some(RefusalReoffer::Classified)
+        );
+        assert_eq!(
+            reloaded.permanent_rejections[&sibling].reoffer,
+            Some(RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: reason_reoffer::next_offer_after(now)
+            })
+        );
+    });
+}

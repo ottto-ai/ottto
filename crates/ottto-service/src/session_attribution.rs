@@ -180,23 +180,6 @@ impl SessionAttributionContext {
         format!("{:x}", hasher.finalize())[..16].to_string()
     }
 
-    /// Pre-v2 namespace retained only to adopt the exact current legacy index
-    /// during upgrade without forcing a one-time historical replay.
-    pub fn legacy_cache_namespace(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"session-attribution-context:v1");
-        hasher.update(self.key.as_slice());
-        for definition in &self.provider_schedules.definitions {
-            hasher.update([0]);
-            hasher.update(definition.opaque_id.as_bytes());
-            hasher.update([0]);
-            hasher.update(definition.prompt_signature.as_bytes());
-        }
-        hasher.update([0]);
-        hasher.update(self.external_schedulers.cache_fingerprint().as_bytes());
-        format!("{:x}", hasher.finalize())[..16].to_string()
-    }
-
     pub fn from_activity_hint(
         source: SnapshotSource,
         home: &Path,

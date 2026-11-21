@@ -181,24 +181,10 @@ fn grammar_accepts_only_proven_artifacts() {
             None,
         ),
         (
-            "codex-scan-index-v3.json.7.migrate",
-            "codex-scan-index-v3",
-            ArtifactKind::Migrate,
-            7,
-            None,
-        ),
-        (
             "pi-scan-index-v3-upload-progress.json.2147483647.tmp",
             "pi-scan-index-v3-upload-progress",
             ArtifactKind::PidTemp,
             i32::MAX,
-            None,
-        ),
-        (
-            "codex-scan-index-v3-upload-progress.json.9.migrate",
-            "codex-scan-index-v3-upload-progress",
-            ArtifactKind::Migrate,
-            9,
             None,
         ),
         (
@@ -256,6 +242,9 @@ fn grammar_accepts_only_proven_artifacts() {
         "claude_code-scan-index-v3.tmp.12.34.json",
         "pi-terminal-status-v1.json.12.tmp",
         "pi-terminal-status-v1.json.12.migrate",
+        // The retired checkpoint-adoption temp has no writer any more.
+        "codex-scan-index-v3.json.7.migrate",
+        "codex-scan-index-v3-upload-progress.json.9.migrate",
         "pi-terminal-status-v1.tmp.12.json",
         "pi-terminal-status-v1.tmp.12.034.json",
         "pi-terminal-status-v1.tmp.12.123456789012345678901.json",
@@ -706,18 +695,8 @@ fn each_artifact_uses_its_own_base_lock() {
     let cases = [
         (INDEX, pid_temp(INDEX, DEAD_PID), index_progress),
         (
-            INDEX,
-            format!("{INDEX}.json.{DEAD_PID}.migrate"),
-            index_progress,
-        ),
-        (
             PROGRESS,
             pid_temp(PROGRESS, DEAD_PID),
-            "codex-scan-index-v3",
-        ),
-        (
-            PROGRESS,
-            format!("{PROGRESS}.json.{DEAD_PID}.migrate"),
             "codex-scan-index-v3",
         ),
         (

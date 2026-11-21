@@ -171,21 +171,6 @@ fn snapshot_upload_progress_path_stays_policy_scoped() {
 }
 
 #[test]
-fn snapshot_v2_index_isolated_from_old_daemon_path() {
-    let v1 = Path::new("/support/snapshots/destinations/hash/codex-scan-index-attribution.json");
-    assert_eq!(
-        snapshot_v2_index_path(v1),
-        PathBuf::from("/support/snapshots/destinations/hash/codex-scan-index-attribution-v2.json")
-    );
-    assert_eq!(
-        snapshot_upload_progress_path(&snapshot_v2_index_path(v1)),
-        PathBuf::from(
-            "/support/snapshots/destinations/hash/codex-scan-index-attribution-v2-upload-progress.json"
-        )
-    );
-}
-
-#[test]
 fn snapshot_scan_index_is_relay_destination_scoped() {
     let policy_index = Path::new("/support/snapshots/codex-scan-index-attribution-labels.json");
     let destination = format!("{:064x}", 42);
@@ -1449,103 +1434,6 @@ fn snapshot_index_path_is_source_scoped() {
 }
 
 #[test]
-fn legacy_policy_paths_remain_available_for_one_time_adoption() {
-    let root = Path::new("/support");
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::Codex,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                workspace_labels_enabled: true,
-                session_artifacts_enabled: false,
-                session_attribution_enabled: false,
-                session_attribution_labels_enabled: false,
-            },
-            None,
-        ),
-        PathBuf::from("/support/snapshots/codex-scan-index-no-titles.json")
-    );
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::Codex,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                workspace_labels_enabled: false,
-                session_artifacts_enabled: false,
-                session_attribution_enabled: false,
-                session_attribution_labels_enabled: false,
-            },
-            None,
-        ),
-        PathBuf::from("/support/snapshots/codex-scan-index-no-titles-no-labels.json")
-    );
-    // Opt-in artifacts get a distinct path so toggling the flag re-scans
-    // unchanged transcripts.
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::ClaudeCode,
-            SnapshotUploadPolicy {
-                session_titles_enabled: true,
-                workspace_labels_enabled: true,
-                session_artifacts_enabled: true,
-                session_attribution_enabled: false,
-                session_attribution_labels_enabled: false,
-            },
-            None,
-        ),
-        PathBuf::from("/support/snapshots/claude_code-scan-index-artifacts.json")
-    );
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::Codex,
-            SnapshotUploadPolicy {
-                session_titles_enabled: false,
-                workspace_labels_enabled: true,
-                session_artifacts_enabled: true,
-                session_attribution_enabled: false,
-                session_attribution_labels_enabled: false,
-            },
-            None,
-        ),
-        PathBuf::from("/support/snapshots/codex-scan-index-no-titles-artifacts.json")
-    );
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::Codex,
-            SnapshotUploadPolicy {
-                session_titles_enabled: true,
-                workspace_labels_enabled: true,
-                session_artifacts_enabled: false,
-                session_attribution_enabled: true,
-                session_attribution_labels_enabled: false,
-            },
-            None,
-        ),
-        PathBuf::from("/support/snapshots/codex-scan-index-attribution-pending.json")
-    );
-    assert_eq!(
-        legacy_policy_scoped_snapshot_index_path(
-            root,
-            SnapshotSource::Codex,
-            SnapshotUploadPolicy {
-                session_attribution_enabled: true,
-                session_attribution_labels_enabled: true,
-                ..SnapshotUploadPolicy::default()
-            },
-            None,
-        ),
-        PathBuf::from(
-            "/support/snapshots/codex-scan-index-attribution-pending-attribution-labels.json"
-        )
-    );
-}
-
-#[test]
 fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
     let base = cycle_upload_context(SnapshotUploadPolicy::default(), None, false);
     assert_eq!(copy_unproven_upload_context(base.clone(), false), base);
@@ -1631,36 +1519,6 @@ fn upload_context_formula_is_pinned() {
         copy_unproven_upload_context(resumed_prefix_upload_context(cached, true), true),
         "ca93839676f7beb9078f01550cb3f0b77fca81c318f222f39ffabda0095302d7"
     );
-}
-
-#[test]
-fn exact_legacy_checkpoint_is_adopted_once_without_overwrite() {
-    let root = test_dir("snapshot-index-legacy-adoption");
-    let legacy = root.join("legacy.json");
-    let stable = root.join("stable").join("index.json");
-    std::fs::create_dir_all(&root).expect("create root");
-    std::fs::write(&legacy, br#"{"files":{"legacy":{"size_bytes":1,"modified_unix_seconds":2,"source_file_fingerprint":"source","last_snapshot_fingerprint":"snapshot"}}}"#)
-        .expect("write legacy index");
-
-    let held = SnapshotProgressLock::acquire(&stable).expect("hold destination lock");
-    adopt_legacy_checkpoint_file(&legacy, &stable)
-        .expect_err("overlapping adopter must not copy outside the destination lock");
-    assert!(!stable.exists());
-    drop(held);
-
-    adopt_legacy_checkpoint_file(&legacy, &stable).expect("adopt exact legacy checkpoint");
-    assert_eq!(
-        std::fs::read(&stable).expect("read stable index"),
-        std::fs::read(&legacy).expect("read legacy index"),
-    );
-
-    std::fs::write(&legacy, b"newer legacy bytes").expect("replace legacy index");
-    adopt_legacy_checkpoint_file(&legacy, &stable).expect("keep stable checkpoint");
-    assert_ne!(
-        std::fs::read(&stable).expect("read stable index"),
-        std::fs::read(&legacy).expect("read replaced legacy index"),
-    );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

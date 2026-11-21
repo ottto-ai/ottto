@@ -1,6 +1,5 @@
 //! move snapshot prepare into prepare.
 
-use super::adopt_legacy_checkpoint_file;
 use super::anyhow;
 
 use super::claude_contract;
@@ -10,7 +9,6 @@ use super::current_historical_replay;
 use super::current_rfc3339;
 use super::current_unix_seconds;
 
-use super::legacy_policy_scoped_snapshot_index_path;
 use super::load_backfill_state;
 
 use super::reason_reoffer;
@@ -25,7 +23,6 @@ use super::snapshot_index_path;
 use super::snapshot_upload_context_fingerprint;
 use super::snapshot_upload_destination_namespace;
 use super::snapshot_upload_progress_path;
-use super::snapshot_v2_index_path;
 use super::snapshot_v3_index_path;
 use super::source_cadence_wait;
 use super::source_kind;
@@ -884,50 +881,12 @@ pub(super) fn prepare_sync_source_inner(
     // Context adoption invalidates stale pending pages on capability downgrade.
     let upload_context = resumed_prefix_upload_context(upload_context, claude);
     let upload_context = copy_unproven_upload_context(upload_context, copy_unproven_enabled);
-    let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
-        support_dir,
-        source,
-        upload_policy,
-        checkpoint_namespace.as_deref(),
-    );
-    let v1_index_path = snapshot_destination_scoped_index_path(
-        &legacy_policy_index_path,
-        &upload_destination_namespace,
-    );
-    // Adopt both the scan checkpoint and any in-flight accepted-page ledger
-    // from the exact pre-v2 namespace. This keeps a normal upgrade—and an
-    // upgrade after a partially acknowledged batch—from replaying history.
-    if let Some(legacy_namespace) = attribution_context
-        .as_ref()
-        .map(SessionAttributionContext::legacy_cache_namespace)
-    {
-        let legacy_policy_index_path = legacy_policy_scoped_snapshot_index_path(
-            support_dir,
-            source,
-            upload_policy,
-            Some(&legacy_namespace),
-        );
-        let legacy_index_path = snapshot_destination_scoped_index_path(
-            &legacy_policy_index_path,
-            &upload_destination_namespace,
-        );
-        adopt_legacy_checkpoint_file(&legacy_index_path, &v1_index_path)?;
-    }
-    // State schema, resumable cursor, and CAS generation are v2-only. Keep the
-    // old daemon's path immutable so an overlapping downgrade cannot clobber
-    // a new daemon's proof or progress. Adopt the v1 scan checkpoint once, but
-    // never adopt v1 upload progress: it lacks entity-grain ACK/quarantine.
-    let v2_index_path = snapshot_v2_index_path(&v1_index_path);
-    adopt_legacy_checkpoint_file(&v1_index_path, &v2_index_path)?;
     let destination_index_path = snapshot_destination_scoped_index_path(
         &snapshot_index_path(support_dir, source),
         &upload_destination_namespace,
     );
     let index_path = snapshot_v3_index_path(&destination_index_path);
-    adopt_legacy_checkpoint_file(&v2_index_path, &index_path)?;
-    let legacy_upload_progress_path = snapshot_upload_progress_path(&v2_index_path);
     let upload_progress_path = snapshot_upload_progress_path(&index_path);
-    adopt_legacy_checkpoint_file(&legacy_upload_progress_path, &upload_progress_path)?;
     let (mut index, load_origin, mut upload_progress) = load_source_checkpoints(
         &index_path,
         &upload_progress_path,
