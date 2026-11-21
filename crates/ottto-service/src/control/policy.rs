@@ -35,6 +35,8 @@ pub(super) fn policy(command: &LocalControlCommand) -> CommandPolicy {
         }
         Command::AgentStatusCached { .. } => (Access::LocalNoPoisonCheck, false),
         Command::UpdateCheck => (Access::Public, false),
+        // Admission does nothing for these two: their handlers' backend-token,
+        // binding and replay checks are the only layer. Never remove them.
         Command::TelemetryControl { .. } | Command::ProviderDailyReferenceControl { .. } => {
             (Access::BackendToken, false)
         }
