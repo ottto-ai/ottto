@@ -2931,10 +2931,10 @@ fn portable_body(page: &Page, base: &Path) -> serde_json::Value {
         .unwrap()
         .replace(&*base.to_string_lossy(), "<corpus>");
     let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    value
-        .as_object_mut()
-        .unwrap()
-        .remove("snapshot_fingerprint");
+    // Both name the physical carrier file, not money.
+    let object = value.as_object_mut().unwrap();
+    object.remove("snapshot_fingerprint");
+    object.remove("source_file_fingerprint");
     value
 }
 /// The copy's stored removal groups: (holder is the original, removed hashes).
@@ -3066,15 +3066,22 @@ fn unowned_original_twins(copy_first: bool, cold: bool) {
         assert!(!prior
             .claude_copy_removals
             .pending(location_key(&original_key)));
-        let corrected = if cold {
-            cold_ready(&c, prior.clone(), 100, false)
+        // A cold restart closes the persisted route, so it takes the prior itself.
+        let (prior, corrected) = if cold {
+            let restored = cold_restart(prior);
+            let cold_scanner = E2ScanFixture::default();
+            cold_scanner.on_committed_route(
+                &crate::snapshots::e2_pipeline_scan_fixture::route_of(&restored).unwrap(),
+            );
+            let corrected = ready(&c, &cold_scanner, restored.clone(), 100, false);
+            (restored, corrected)
         } else {
             let corrected = ready(&c, &scanner, prior.clone(), 100, false);
             assert!(
                 scanner.paths().contains(&copy),
                 "the correction reads the marked copy"
             );
-            corrected
+            (prior, corrected)
         };
         literal(&corrected);
         assert_eq!(
@@ -3093,6 +3100,7 @@ fn unowned_original_twins(copy_first: bool, cold: bool) {
             !settled.claude_copy_removals.pending(copy_location),
             "one correction settles the copy"
         );
+        drop(prior);
         let again = if cold {
             cold_ready(&c, settled, 100, false)
         } else {
