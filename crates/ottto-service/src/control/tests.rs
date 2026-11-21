@@ -13349,7 +13349,6 @@ fn daemon_internal_is_never_a_request_caller_and_is_refused_beyond_verification(
                 internal.clone(),
                 command,
                 InstallOwner::Unknown,
-                None,
                 false,
             );
             assert_eq!(result, refused);
