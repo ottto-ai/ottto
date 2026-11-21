@@ -1531,7 +1531,6 @@ fn evidence_ref(source_session_id: &str, field: &str, value: &str) -> String {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod tests;
 
 // Closed owned-field inventory for optional scan overlap admission.

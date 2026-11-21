@@ -1809,5 +1809,4 @@ pub(crate) fn capture_sample_reads<T>(read: impl FnOnce() -> T) -> (T, Vec<Sampl
 }
 
 #[cfg(all(test, unix))]
-#[rustfmt::skip]
 mod tests;

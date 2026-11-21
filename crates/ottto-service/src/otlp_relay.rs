@@ -1687,5 +1687,4 @@ fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-#[rustfmt::skip]
 pub(crate) mod tests;

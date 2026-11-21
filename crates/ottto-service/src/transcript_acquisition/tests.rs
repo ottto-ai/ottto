@@ -702,9 +702,7 @@ fn lossy_or_rescoped_prefix_is_not_certified_and_slow_read_stays_due() {
 fn wide_rows(tag: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     for row in 0..3 {
-        bytes.extend_from_slice(
-            format!("{{\"row\":{row},\"tag\":\"{tag}\",\"pad\":\"").as_bytes(),
-        );
+        bytes.extend_from_slice(format!("{{\"row\":{row},\"tag\":\"{tag}\",\"pad\":\"").as_bytes());
         bytes.extend_from_slice(&[b'a'; SAMPLE_BYTES]);
         bytes.extend_from_slice(b"\"}\n");
     }
@@ -712,12 +710,7 @@ fn wide_rows(tag: &str) -> Vec<u8> {
 }
 
 /// `prepare`'s outcome as an admission: the guard bytes it read on reuse.
-fn prepared(
-    f: &Fixture,
-    cp: &Checkpoint,
-    scope: &Scope,
-    now: u64,
-) -> Result<usize, FullReason> {
+fn prepared(f: &Fixture, cp: &Checkpoint, scope: &Scope, now: u64) -> Result<usize, FullReason> {
     let plan = ReadPlan::prepare(&mut f.open(), Some(cp), scope, None, now).unwrap();
     match plan.mode() {
         ReadMode::Tail | ReadMode::Unchanged => Ok(plan.guard_bytes_read()),
