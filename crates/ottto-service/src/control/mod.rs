@@ -566,6 +566,8 @@ use setup::actions::verification::pi_route_passive_result;
 #[cfg(test)]
 use setup::actions::verification::pi_route_result_from_backend_error;
 #[cfg(test)]
+use setup::actions::verification::pi_route_result_from_smoke;
+#[cfg(test)]
 use setup::actions::verification::pi_route_result_from_verification;
 pub(crate) use setup::actions::verification::reverify_failed_source;
 #[cfg(test)]

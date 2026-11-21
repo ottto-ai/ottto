@@ -97,6 +97,7 @@ use crate::control::SETUP_VERIFICATION_HTTP_TIMEOUT;
 use crate::control::SOURCE_NOT_INSTALLED_CODE;
 use crate::control::UNIX_EPOCH;
 use crate::control::VERIFICATION_POLL_INTERVAL;
+use crate::PI_DEFAULT_MODEL_TEXT;
 
 /// Status, message and backend result of a setup action, plus the
 /// verification result a verify_source action computed.
@@ -1222,7 +1223,29 @@ pub(in crate::control) fn pi_route_has_local_verification_evidence(
         || identity.credential_fingerprint_hash.is_some()
 }
 
-fn pi_route_result_from_smoke(
+/// One checked route is Pi's saved default model: name it, and say so plainly
+/// when its provider answered that the model does not exist for the account.
+fn pi_route_failed_text(route_results: &[SourceRouteVerificationResult]) -> String {
+    let [route] = route_results else {
+        return "No Pi model routes passed smoke verification.".to_string();
+    };
+    let (Some(provider), Some(model)) = (route.provider.as_deref(), route.model.as_deref()) else {
+        return "No Pi model routes passed smoke verification.".to_string();
+    };
+    let provider_not_found = route.diagnostic.as_deref().is_some_and(|diagnostic| {
+        let diagnostic = diagnostic.to_ascii_lowercase();
+        diagnostic.contains("404") && diagnostic.contains("not found")
+    });
+    if provider_not_found {
+        format!(
+            "The provider couldn't find {PI_DEFAULT_MODEL_TEXT}, {provider} / {model}. Choose another default model in Pi, or ignore this; usage collection is not affected."
+        )
+    } else {
+        format!("Ottto's check of {PI_DEFAULT_MODEL_TEXT}, {provider} / {model}, failed.")
+    }
+}
+
+pub(in crate::control) fn pi_route_result_from_smoke(
     route: &PiModelRoute,
     smoke: &SmokeResult,
     smoke_after: Option<String>,
@@ -1438,10 +1461,7 @@ pub(in crate::control) fn pi_route_aggregate_result(
             "telemetry_disabled_by_admin",
             telemetry_disabled_by_admin_message(&SourceKind::Pi),
         ),
-        _ => (
-            "pi_route_smoke_failed",
-            "No Pi model routes passed smoke verification.".to_string(),
-        ),
+        _ => ("pi_route_smoke_failed", pi_route_failed_text(&route_results)),
     };
     let last_route = route_results
         .iter()

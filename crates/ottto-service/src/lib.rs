@@ -162,6 +162,7 @@ use daemon::verification::verification_result_records_success;
 pub(crate) use daemon::verification::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
 pub(crate) use daemon::verification::CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE;
 use daemon::verification::CODEX_USAGE_READ_RETRYING_TITLE;
+pub(crate) use daemon::verification::PI_DEFAULT_MODEL_TEXT;
 #[cfg(test)]
 use daemon::verification::PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE;
 pub(crate) use daemon::verification::SOURCE_NOT_INSTALLED_VERIFICATION_CODE;

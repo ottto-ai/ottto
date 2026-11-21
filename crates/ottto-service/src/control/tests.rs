@@ -1487,6 +1487,49 @@ fn subscription_oauth_local_evidence_accepts_recent_session_or_identity() {
 }
 
 #[test]
+fn pi_single_route_failure_names_the_default_model() {
+    let failed_smoke = |diagnostic: &str| SmokeResult {
+        command_found: true,
+        succeeded: false,
+        exit_status: Some(1),
+        duration_ms: 9_000,
+        message: "Pi smoke session failed.".to_string(),
+        diagnostic: Some(diagnostic.to_string()),
+        error_code: None,
+        local_session_observed: None,
+    };
+    let route = live_pi_route();
+    let label = format!("{} / {}", route.provider, route.model);
+    let failed =
+        |diagnostic: &str| pi_route_result_from_smoke(&route, &failed_smoke(diagnostic), None);
+
+    let not_found = pi_route_aggregate_result(vec![failed(
+        r#"Error: 404 {"error":{"code":404,"message":"Publisher Model was not found or your project does not have access to it."}}"#,
+    )]);
+    assert_eq!(not_found.status, SourceVerificationStatus::Failed);
+    assert_eq!(not_found.message.code, "pi_route_smoke_failed");
+    assert_eq!(
+        not_found.message.text,
+        format!(
+            "The provider couldn't find Pi's default model, {label}. Choose another default model in Pi, or ignore this; usage collection is not affected."
+        )
+    );
+
+    let other = pi_route_aggregate_result(vec![failed("connection reset by peer")]);
+    assert_eq!(other.message.code, "pi_route_smoke_failed");
+    assert_eq!(
+        other.message.text,
+        format!("Ottto's check of Pi's default model, {label}, failed.")
+    );
+
+    let two_routes = pi_route_aggregate_result(vec![failed("a"), failed("b")]);
+    assert_eq!(
+        two_routes.message.text,
+        "No Pi model routes passed smoke verification."
+    );
+}
+
+#[test]
 fn pi_reauth_pending_route_aggregates_to_warning_not_failed() {
     let route = subscription_oauth_route();
     let reauth = pi_route_passive_result(
