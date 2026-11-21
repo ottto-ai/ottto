@@ -4053,10 +4053,13 @@ impl OwnedSourceScan {
                     && index.claude_authority_correction_only(&candidate);
                 // A new Claude file held only by this page's budget is not
                 // read now: a vetoed read would save it unoffered. It waits
-                // in the queue, keeping its census membership.
+                // in the queue, keeping its census membership. A family root
+                // (a `<root>/subagents` directory) still takes the held read:
+                // its census record lets a fork read first drop its copy.
                 let budget_held_new = source == SnapshotSource::ClaudeCode
                     && parse_reason == Some(CandidateParseReason::NewFile)
-                    && history == HistoryDecision::Held(HistoryHold::Budget);
+                    && history == HistoryDecision::Held(HistoryHold::Budget)
+                    && !candidate.path.with_extension("").join("subagents").is_dir();
                 // A listed genuine change is never held (it is literal-only
                 // denied), so a held correction-only member is unchanged.
                 match history {
