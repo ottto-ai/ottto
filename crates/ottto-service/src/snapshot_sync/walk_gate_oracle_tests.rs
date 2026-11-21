@@ -787,8 +787,8 @@ fn settled_loss_never_arms_and_the_next_pass_rediscloses_it() {
     });
 }
 
-/// Arming needs a fully settled upload: a walk whose body the server keeps
-/// unstored completes its census, yet does not arm, and the next pass walks.
+/// Arming needs a fully settled upload: a walk whose upload the backend sheds
+/// completes its census, yet does not arm, and the next pass walks.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -805,7 +805,10 @@ fn unsettled_upload_never_arms() {
     let watched = roots(&home);
     with_simulated_watch(&watched, || {
         settle_idle(&mut home, &server, &recording);
-        *server.fallback.lock().unwrap() = Answer::Unstored;
+        // The backend sheds the upload (503): the pass does not settle, and its
+        // finish returns before arming. (An unchanged, unstored answer is a
+        // scheduled quarantine retry, which owes nothing until it is due.)
+        *server.fallback.lock().unwrap() = Answer::Shed;
         change(&home);
         hint(&home);
         let unsettled = pass(&mut home, &server, &recording, STEP);
