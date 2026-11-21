@@ -2194,6 +2194,72 @@ fn a_touch_during_an_in_flight_full_earns_the_credit_it_earns_without_counts() {
     assert_eq!(outcome(Generations::Simulated), without);
 }
 
+/// [money] A cursor job's head whose seal stops before an invalid EOF fragment
+/// it withheld, touched at its size: under an unchanged write generation
+/// count the next read continues from that head as a Tail past the seal (no
+/// Full); without counts the touch is the same-size edit it was.
+#[test]
+fn a_touched_cursor_head_before_a_withheld_fragment_tails_under_an_equal_count() {
+    use crate::transcript_acquisition::{FullReason, Generations, UseGenerations};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for generations in [Generations::Simulated, Generations::Off] {
+        let _counts = UseGenerations::new(generations);
+        let clock = TestClock;
+        let fixture = ScanRoot::new(40);
+        fixture.append(
+            SESSION,
+            br#"{"timestamp":"2026-10-07T10:30:00Z","type":"event_msg","payload":"#,
+        );
+        let path = fixture.file(SESSION);
+        let key = local_index_key(&path);
+        let mut now = 1_900_000_000_u64;
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 8192, 64, || {
+            let mut page_number = 0;
+            let (index, ..) = certify_job_with(
+                &fixture,
+                &cache,
+                ScanIndex::default(),
+                &clock,
+                &mut now,
+                &mut page_number,
+                |_| {},
+            );
+            assert_eq!(counter(&cache, |c| c.sealed_fragment_withheld), 1);
+            let sealed = head(&index, &key).expect("a certified head").sealed_offset;
+            assert!(sealed < fixture.len(SESSION), "the seal stops before it");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified + std::time::Duration::from_secs(2))
+                .unwrap();
+            now += 10;
+            clock.set(now);
+            page_number += 1;
+            let (_, _, selections) = page_selections(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page_number),
+                |_| {},
+                10_000,
+            );
+            if generations == Generations::Simulated {
+                assert_eq!(selections.full_reasons, [0; 11], "no Full");
+                assert_eq!(selections.modes.1, 1, "a Tail past the seal");
+            } else {
+                let edits = selections.full_reasons[FullReason::SameSizeEdit.slot()];
+                assert_eq!(edits, 1);
+            }
+        });
+    }
+}
+
 /// The candidate an unchanged file presents to the scheduler: its own index
 /// entry's facts.
 fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {

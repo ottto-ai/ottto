@@ -273,6 +273,7 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(consumed, 0, "a proven touch rereads no transcript byte");
         assert_eq!(same_size_edits(&restart), 0);
         assert_eq!(restored.modes, (0, 0, 1));
+        assert_eq!(restart.touches_proven(), 1, "the count proved the touch");
         against_cold(&s, &mut restored, &s.index, Mode::DiskRestore);
 
         let edits = same_size_edits(&s.owner);
@@ -281,6 +282,7 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(consumed, 0, "samples only");
         assert_eq!(same_size_edits(&s.owner), edits);
         assert_eq!(retained.modes, (0, 0, 1));
+        assert_eq!(s.owner.touches_proven(), 1);
         against_cold(&s, &mut retained, &s.index, Mode::Ram);
 
         // Committed undelivered, as the seed is: a cold Full of an accepted
@@ -307,6 +309,11 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(consumed, 0);
         assert_eq!(same_size_edits(&other), 0);
         assert_eq!(renewed.modes, (0, 0, 1));
+        assert_eq!(
+            other.touches_proven(),
+            0,
+            "a lease renewal is no count proof"
+        );
         against_cold(&s, &mut renewed, &index, Mode::DiskRestore);
 
         // Delivered, the next pass is Skip.
@@ -320,6 +327,32 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(consumed, 0, "the next pass is Skip");
         assert_eq!(quiet.scan.scanned_file_count, 0);
         assert!(quiet.scan.snapshots.is_empty(), "no re-emission");
+        assert_eq!(restart.touches_proven(), 0);
+        let index = s
+            .disk
+            .commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
+
+        // Delivered, then touched: the proven restore re-offers nothing, and
+        // the next pass is Skip again.
+        set_mtime(&s.root, SystemTime::now());
+        let (again, mut touched, consumed) = restart_pass(&s, &index);
+        assert_eq!(consumed, 0);
+        assert_eq!(touched.modes, (0, 0, 1));
+        assert_eq!(again.touches_proven(), 1);
+        touched.enrich(&s.c);
+        touched.finish();
+        assert!(touched.scan.snapshots.is_empty(), "nothing re-offered");
+        let index = s.disk.commit(
+            &touched.cache,
+            SnapshotSource::ClaudeCode,
+            &mut touched.index,
+        );
+        let (mut still, consumed) = observe_consumed(|| s.c.raw(&again, index, 100, true, &[]));
+        still.enrich(&s.c);
+        still.finish();
+        assert_eq!(consumed, 0);
+        assert_eq!(still.scan.scanned_file_count, 0);
+        assert!(still.scan.snapshots.is_empty());
     });
 }
 
@@ -351,6 +384,7 @@ fn touch_then_same_size_edit_reads_full() {
         let (restart, mut restored, _) = restart_pass(&s, &s.index);
         assert_eq!(restored.modes, (1, 0, 0));
         assert_eq!(same_size_edits(&restart), 1);
+        assert_eq!(restart.touches_proven(), 0);
         against_cold(&s, &mut restored, &s.index, Mode::DiskRestore);
 
         let edits = same_size_edits(&s.owner);
@@ -396,6 +430,7 @@ fn uncounted_touch_reads_full_until_a_read_stores_a_count() {
         let (restart, mut restored, _) = restart_pass(&s, &s.index);
         assert_eq!(restored.modes, (1, 0, 0));
         assert_eq!(same_size_edits(&restart), 1);
+        assert_eq!(restart.touches_proven(), 0);
         against_cold(&s, &mut restored, &s.index, Mode::DiskRestore);
         let edits = same_size_edits(&s.owner);
         let mut retained = s.c.raw(&s.owner, s.index.clone(), 100, true, &[]);
@@ -410,6 +445,7 @@ fn uncounted_touch_reads_full_until_a_read_stores_a_count() {
         let (upgraded, mut first, _) = restart_pass(&s, &s.index);
         assert_eq!(first.modes, (1, 0, 0), "the stored head has no count");
         assert_eq!(same_size_edits(&upgraded), 1);
+        assert_eq!(upgraded.touches_proven(), 0);
         against_cold(&s, &mut first, &s.index, Mode::DiskRestore);
         // Committed undelivered, as the seed is: a cold Full of an accepted
         // body re-emits nothing, so it would be no control for the restore.
@@ -422,6 +458,7 @@ fn uncounted_touch_reads_full_until_a_read_stores_a_count() {
         assert_eq!(consumed, 0);
         assert_eq!(same_size_edits(&later), 0);
         assert_eq!(restored.modes, (0, 0, 1));
+        assert_eq!(later.touches_proven(), 1);
         against_cold(&s, &mut restored, &index, Mode::DiskRestore);
     });
 }

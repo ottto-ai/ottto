@@ -1010,6 +1010,24 @@ fn write_generation_count_is_envelope_two_and_version_one_has_none() {
     );
 }
 
+/// The version 1 Tail head 0.1.261 writes for the counted-head test's file:
+/// revision 1; a `Responses` page (slot, 8 per page, 24 elements, 1 page) and
+/// two debt revisions (slot, 1 per page, 2 elements, 2 pages), each with a
+/// zeroed 32-byte membership commit; envelope 1, Tail, next revision id 2,
+/// debt (earliest unacked 7000, lower bound, reasons 0b101, no disposition),
+/// a reduction and no inventory; then the reduction `head`. That release's
+/// encoder is unchanged from v0.1.260 to the base of this change.
+#[rustfmt::skip]
+const V1_HEAD_0_1_261: [u8; 143] = [
+    0, 0, 0, 1, 2,
+    0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    13, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0x1b, 0x58, 1, 0, 0, 0, 5, 0, 1,
+    b'h', b'e', b'a', b'd',
+];
+
 /// [format] Through real saves and loads: a count roundtrips and survives a
 /// reload and a debt-only rewrite; version 1 bytes of the same head (the
 /// previous release's) load with no count and their pages and debt intact; an
@@ -1050,9 +1068,11 @@ fn write_generation_count_travels_with_its_reduction_through_saves() {
     save_with(&f.path, &mut index).unwrap();
     assert_eq!(count_of(&index), NonZeroU32::new(7), "debt-only rewrite");
 
-    // The same head as version 1 bytes, committed in place.
+    // The same head as the version 1 bytes 0.1.261 writes, committed in
+    // place. Frozen: only the two membership commits, digests of the stored
+    // rows rather than envelope format, come from this store.
     let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
-    let old = tail::encode_head(
+    let today = tail::encode_head(
         head.revision,
         &head.table,
         &head.common,
@@ -1060,7 +1080,13 @@ fn write_generation_count_travels_with_its_reduction_through_saves() {
         None,
     )
     .unwrap();
-    assert_eq!(old[5 + 54 * usize::from(old[4])], 1, "version 1 envelope");
+    let mut old = V1_HEAD_0_1_261.to_vec();
+    for entry in 0..2 {
+        let commit = 5 + 54 * entry + 22;
+        old[commit..commit + 32].copy_from_slice(&today[commit..commit + 32]);
+    }
+    assert_eq!(old[5 + 54 * 2], 1, "version 1 envelope");
+    assert_eq!(today, old, "this build's uncounted head is 0.1.261's");
     with_session_db(&index, |db| {
         let g = db.stamp().unwrap().0;
         let mut tx = db.begin(TxnMode::Write).unwrap();
@@ -1069,9 +1095,17 @@ fn write_generation_count_travels_with_its_reduction_through_saves() {
     });
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     let (head, pages) = read(&index, FILE).unwrap();
-    assert_eq!(head.unwrap().write_generation, None);
+    let head = head.unwrap();
+    assert_eq!(head.write_generation, None);
+    assert_eq!(head.body, b"head");
+    assert!(!head.metadata_only);
+    assert_eq!(head.common.debt, observation(&[]).summary, "debt summary");
     assert_eq!(pages[&(Collection::Responses, 0)], b"page");
-    assert_eq!(revisions(&index, FILE).len(), 2, "debt intact");
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec()), (1, b"r1".to_vec())]),
+        "debt intact"
+    );
 
     stage_tail(&f.path, FILE, counted(b"head-2", 9)).unwrap();
     save_with(&f.path, &mut index).unwrap();

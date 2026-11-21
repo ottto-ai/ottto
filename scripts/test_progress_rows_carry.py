@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux CI-only carry check for upload progress rows (writer capability 6).
+"""Linux CI-only carry check for upload progress rows (writer capability 6 or later).
 
 1. This branch writes a published route whose store holds progress rows.
 2. The v0.1.234 source, with only the probe below appended, opens that route:
@@ -90,7 +90,7 @@ mod progress_rows_carry_probe {
             load_locked(&path, false, published(&path).unwrap())
         };
         let error = match opened {
-            Ok(_) => panic!("an older writer opened a capability-6 store"),
+            Ok(_) => panic!("an older writer opened a newer-capability store"),
             Err(error) => error,
         };
         assert!(

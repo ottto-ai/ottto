@@ -361,8 +361,9 @@ fn touch_same_size(path: &Path) {
 /// A committed file under `hold`, then touched at its size, read for
 /// `reason` with and without write generation counts. Every read sends a
 /// fresh native read's wire bodies byte for byte (what a build without counts
-/// sends for the touch); returns whether each continued from stored state,
-/// without counts first.
+/// sends for the touch), and leaves the withheld-account holds and copy
+/// removals as `hold` set them; returns whether each continued from stored
+/// state, without counts first.
 fn touched_under_hold(
     hold: impl Fn(&mut Route, &Path, &str),
     reason: Option<CandidateParseReason>,
@@ -373,12 +374,19 @@ fn touched_under_hold(
         let mut route = route();
         let (path, key) = committed(&mut route, "a.jsonl", 3);
         hold(&mut route, &path, &key);
+        let holds = |index: &ScanIndex| {
+            format!(
+                "{:?} {:?}",
+                index.claude_account_deferred_holds, index.claude_copy_removals
+            )
+        };
+        let held = holds(&route.index);
         touch_same_size(&path);
         let native = wire(&fresh(&route, &path));
         if !reuses_stored(&route.index, &key, reason, false, false) {
             return false;
         }
-        match loaded(&route, &path, &key).0 {
+        let continued = match loaded(&route, &path, &key).0 {
             Load::Reused(..) => {
                 let (items, native_bytes) = stored_finish(&route, &path, &key);
                 assert_eq!(native_bytes, 0, "{generations:?}");
@@ -387,7 +395,9 @@ fn touched_under_hold(
             }
             Load::Cold(_) => false,
             Load::Held => panic!("{generations:?}: a touch never holds"),
-        }
+        };
+        assert_eq!(holds(&route.index), held, "{generations:?}: the hold stays");
+        continued
     })
 }
 

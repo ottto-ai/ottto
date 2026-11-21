@@ -855,6 +855,7 @@ pub(crate) struct E2ScanFixture {
     pub(crate) acquisitions: Mutex<Vec<Acquisition>>,
     audit_slots: Option<usize>,
     full_reasons: Mutex<[usize; 11]>,
+    touches_proven: Mutex<usize>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
     collection_clock: bool,
@@ -928,6 +929,12 @@ impl E2ScanFixture {
 
     pub(crate) fn full_reasons(&self) -> [usize; 11] {
         *self.full_reasons.lock().unwrap()
+    }
+
+    /// The last pass's `same_size_touch_proven` counter: reads a write
+    /// generation count proved a same-size touch.
+    pub(crate) fn touches_proven(&self) -> usize {
+        *self.touches_proven.lock().unwrap()
     }
 
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
@@ -1146,6 +1153,10 @@ impl E2ScanFixture {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
             let reasons = scan.sampling.as_ref().map_or([0; 11], |s| s.full_reasons);
+            let touches = scan
+                .sampling
+                .as_ref()
+                .map_or(0, |s| s.same_size_touch_proven);
             let attribution = self.attribution.lock().unwrap();
             let step = scan.step(attribution.as_ref());
             drop(attribution);
@@ -1153,6 +1164,7 @@ impl E2ScanFixture {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => {
                     *self.full_reasons.lock().unwrap() = reasons;
+                    *self.touches_proven.lock().unwrap() = touches;
                     twin_diagnostics::folds(&scan.snapshots);
                     return (index, scan, modes);
                 }

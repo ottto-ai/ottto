@@ -195,7 +195,7 @@ jobs:
 
   progress-rows-carry:
     # Dispatch-only, never on pull requests or the schedule: this branch writes
-    # a capability-6 store, the v0.1.234 source must refuse it unchanged, and
+    # a store at capability 6 or later, the v0.1.234 source must refuse it unchanged, and
     # this branch then reads back exactly what it wrote.
     name: Progress rows carry (v0.1.234)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.progress_rows_carry }}

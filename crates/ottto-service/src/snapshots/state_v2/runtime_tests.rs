@@ -2041,7 +2041,8 @@ mod progress_rows {
     }
 
     /// [format] Carry fixture for an older binary: a published route holding
-    /// progress rows at writer capability 6, checkpointed and kept on disk.
+    /// progress rows (which need writer capability 6; this build writes 7),
+    /// checkpointed and kept on disk.
     /// Run only by scripts/test_progress_rows_carry.py.
     #[test]
     #[ignore = "run by scripts/test_progress_rows_carry.py"]
