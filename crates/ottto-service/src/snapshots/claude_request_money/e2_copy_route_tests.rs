@@ -399,6 +399,100 @@ fn save_marks_copy_when_holder_session_gains_an_owner_in_another_folder() {
     }
 }
 
+/// One indexed main of `session` in `dir`, born `birth`, whose census holds
+/// `copy-a`. No body of its own unless it carries the summed session body.
+fn main_in(index: &mut ScanIndex, dir: &Path, session: &str, birth: i128, carries: bool) -> String {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{session}.jsonl"));
+    fs::write(&path, b"fixture\n").unwrap();
+    let key = local_index_key(&path);
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(json!({"size_bytes":8,"modified_unix_seconds":1,
+            "source_file_fingerprint":"a".repeat(64)}))
+        .unwrap(),
+    );
+    // The synthetic accepted slot's body fingerprint.
+    let bodies = if carries {
+        BTreeSet::from(["c".repeat(64)])
+    } else {
+        BTreeSet::new()
+    };
+    index.file_snapshot_fingerprints.insert(key.clone(), bodies);
+    index
+        .claude_money_birth_store
+        .record_observation(session, &key, birth);
+    index.claude_request_census_mut_for_test().insert_for_test(
+        &key,
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![claude_request_hash("copy-a")],
+        ),
+    );
+    key
+}
+
+/// [money] A same-session path twin decided while its earlier twin was not
+/// yet owned counts the copied request at its own location. The summed
+/// body's mark sits on whichever twin carries it, so the counting copy may
+/// have no mark. Once the earlier twin's row is accepted, a save selects
+/// the copy once, whichever twin carries the body. A copy of another
+/// session with the same rows and no mark stays unselected, and a repeated
+/// save adds no second mark.
+#[test]
+fn save_marks_a_counted_path_twin_without_its_own_mark() {
+    let hash = claude_request_hash("copy-a");
+    // (the copy carries the summed body, the earlier main is the same session)
+    for (copy_carries, twins) in [(false, true), (true, true), (false, false)] {
+        let dir = scratch();
+        let mut next = ScanIndex::default();
+        let (original_dir, session) = if twins {
+            (dir.join("a-original"), ROOT)
+        } else {
+            (dir.join("z-copy"), HOLDER)
+        };
+        let original = main_in(&mut next, &original_dir, session, t0(), !copy_carries);
+        let copy = main_in(
+            &mut next,
+            &dir.join("z-copy"),
+            ROOT,
+            t0() + 100_000_000_000,
+            copy_carries,
+        );
+        let carrier = if copy_carries { &copy } else { &original };
+        next.claude_money_birth_store
+            .set_money_marks(carrier, money_mark::DISCLOSED);
+        let previous = next.clone();
+        // The ACK accepts the summed body: the copied request counts at both.
+        for (key, session) in [(&original, session), (&copy, ROOT)] {
+            crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+                &mut next,
+                key,
+                session,
+                &[hash],
+            );
+        }
+        let location = location_key(&copy);
+        let case = format!("copy carries {copy_carries}, twins {twins}");
+        reconcile_copy_ownership(&previous, &mut next);
+        assert_eq!(next.claude_copy_removals.pending(location), twins, "{case}");
+        assert!(
+            !next.claude_copy_removals.pending(location_key(&original)),
+            "{case}: the earlier main owes nothing"
+        );
+        next.claude_copy_removals.clear_hold(location);
+        let unchanged = CopyOwnership::capture(&next);
+        unchanged.reconcile(&mut next, &mut |_| BTreeMap::new());
+        assert!(
+            !next.claude_copy_removals.pending(location),
+            "{case}: a repeated save adds no second mark"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 /// [money] A resume whose first own response (provider time) is before
 /// `COPY_PROOF_FROM`, settled with its copies removed and accepted, takes
 /// the request-id proof like any other copy: with no holder it counts,

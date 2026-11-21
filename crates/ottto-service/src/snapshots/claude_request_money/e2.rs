@@ -2431,6 +2431,11 @@ fn changed_copy_decisions(
         let copy = index.claude_money_birth_store.money_marks(location)
             & (money_mark::COPY | money_mark::DISCLOSED)
             != 0;
+        // A path twin's own location can count a request without any mark of its own.
+        let twin = index
+            .claude_money_birth_store
+            .observations(member.root)
+            .any(|(other, _)| other != location && live.contains_key(&other));
         let locations = live;
         let contributions = &index.upload_context_proof.request_contributions;
         let bodies = index.file_snapshot_fingerprints.get(key);
@@ -2445,6 +2450,7 @@ fn changed_copy_decisions(
                 .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
             let keep = saved_removal_applies(index, live, key, hash)
                 && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
+            let twin_counted = twin && live.accepts(location, hash);
             // Skip a family duplicate already removed inside this accepted sum.
             let covered = holders
                 .get(&hash)
@@ -2468,13 +2474,14 @@ fn changed_copy_decisions(
                 .min()
                 .is_some_and(|holder| {
                     holder < order
-                        && !rows
-                            .iter()
-                            .any(|(loc, h)| *loc == holder.1 && h.binary_search(&hash).is_ok())
+                        && (twin_counted
+                            || !rows
+                                .iter()
+                                .any(|(loc, h)| *loc == holder.1 && h.binary_search(&hash).is_ok()))
                 });
             // An invalid old holder must be replaced in the saved
             // groups even if another holder proves the same removal.
-            (removed && !keep) || (!removed && copy && covered)
+            (removed && !keep) || (!removed && (copy || twin_counted) && covered)
         }) {
             marks.push(location);
         }

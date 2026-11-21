@@ -2901,6 +2901,222 @@ fn e2_pipeline_restored_twins_equal_birth_reverse_pinned_ties() {
     restored_twins_pinned(true, true, Some(false));
 }
 
+/// Path twins of `ROOT`: the original's and the copy's folder. The copy's
+/// folder sorts first when the copy must be discovered first.
+fn twin_dirs(copy_first: bool) -> (&'static str, &'static str) {
+    if copy_first {
+        ("z-original", "a-copy")
+    } else {
+        ("a-original", "z-copy")
+    }
+}
+/// The original (born first) and its later copy, each with only `r1`,
+/// written before either birth: every line of the copy is a copied request.
+fn write_twin(c: &mut Corpus, dir: &str, copy: bool) -> PathBuf {
+    c.write_at(
+        &format!("{dir}/{ROOT}.jsonl"),
+        &line(ROOT, "r1", AT, 10),
+        if copy {
+            "2026-08-02T07:03:00Z"
+        } else {
+            "2026-08-02T07:02:00Z"
+        },
+    )
+}
+/// The emitted body as the wire sends it, whole, minus its fingerprint, with
+/// the corpus directory made relative: two corpora's bodies compare whole.
+fn portable_body(page: &Page, base: &Path) -> serde_json::Value {
+    let item = body(page, ROOT).expect("the twin session is emitted");
+    let text = serde_json::to_string(item)
+        .unwrap()
+        .replace(&*base.to_string_lossy(), "<corpus>");
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("snapshot_fingerprint");
+    value
+}
+/// The copy's stored removal groups: (holder is the original, removed hashes).
+fn twin_groups(index: &ScanIndex, copy: &Path, original: &Path) -> Vec<(bool, Vec<u64>)> {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let original = location_key(&original.to_string_lossy());
+    index
+        .claude_copy_removals
+        .get(location_key(&copy.to_string_lossy()))
+        .iter()
+        .map(|(holder, hashes)| (*holder == original, hashes.to_vec()))
+        .collect()
+}
+/// (request_count, removed_request_count, input_tokens, output_tokens)
+fn twin_counts(page: &Page) -> (u64, Option<u64>, u64, u64) {
+    let item = body(page, ROOT).expect("the twin session is emitted");
+    (
+        item.request_count,
+        item.removed_request_count,
+        item.input_tokens,
+        item.output_tokens,
+    )
+}
+
+/// The original-first order: the original alone is accepted, then its copy
+/// appears and its copied request is removed under the accepted original.
+/// Returns that page's whole body and the copy's stored groups.
+fn original_accepted_first(copy_first: bool) -> (serde_json::Value, Vec<(bool, Vec<u64>)>) {
+    let mut c = Corpus::new(&format!("e2-pipeline-original-first-{copy_first}"));
+    let (original_dir, copy_dir) = twin_dirs(copy_first);
+    let original = write_twin(&mut c, original_dir, false);
+    let scanner = E2ScanFixture::default();
+    let empty = ScanIndex::default();
+    let alone = ready(&c, &scanner, empty.clone(), 100, false);
+    assert_eq!(twin_counts(&alone).0, 1, "the original counts r1 once");
+    let prior = settle(&c, &empty, alone, &mut e2_progress());
+    let copy = write_twin(&mut c, copy_dir, true);
+    let page = ready(&c, &scanner, prior.clone(), 100, false);
+    literal(&page);
+    assert_eq!(
+        twin_counts(&page),
+        (1, Some(1), 10, 10),
+        "the accepted original removes the copy's r1"
+    );
+    let sent = portable_body(&page, &c.base);
+    let settled = settle(&c, &prior, page, &mut e2_progress());
+    let groups = twin_groups(&settled, &copy, &original);
+    assert!(settled
+        .files
+        .keys()
+        .all(|key| !settled.claude_copy_removals.pending(
+            crate::snapshots::claude_money_birth_store::location_key(key)
+        )));
+    (sent, groups)
+}
+
+/// [money] Path twins, every line before the copy's birth. The copy is
+/// decided while the original is not yet owned (its census is absent for
+/// that decision only), so the first accepted body counts r1 at both
+/// locations. The summed body's disclosure mark goes to the carrier, so
+/// when the original carries it the copy has no mark of its own. The ACKed
+/// save must still select the copy once; its ordinary correction read
+/// removes r1 under the original, and the final body and groups equal the
+/// original-first order. A repeated page reads and sends nothing.
+fn unowned_original_twins(copy_first: bool, cold: bool) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let (expected_body, expected_groups) = with_e2(|| original_accepted_first(copy_first));
+    assert_eq!(
+        expected_groups,
+        vec![(
+            true,
+            vec![crate::snapshots::claude_request_census::claude_request_hash("r1")]
+        )],
+        "original-first: one group, r1 under the original"
+    );
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-unowned-original-{copy_first}-{cold}"));
+        let (original_dir, copy_dir) = twin_dirs(copy_first);
+        let original = write_twin(&mut c, original_dir, false);
+        let copy = write_twin(&mut c, copy_dir, true);
+        let original_key = original.to_string_lossy().into_owned();
+        let copy_location = location_key(&copy.to_string_lossy());
+        let scanner = E2ScanFixture::default();
+        let empty = ScanIndex::default();
+        let mut page = c.raw(&scanner, empty.clone(), 100, false, &[]);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 2, "both twins are read on the first page");
+        assert!(
+            opened[0].ends_with(format!(
+                "{}/{ROOT}.jsonl",
+                if copy_first { copy_dir } else { original_dir }
+            )),
+            "actual discovery order"
+        );
+        let census = page
+            .index
+            .claude_request_census_for_test()
+            .get(&original_key)
+            .cloned()
+            .expect("the page builds the original's census");
+        page.index
+            .claude_request_census_mut_for_test()
+            .remove(&original_key);
+        page.enrich(&c);
+        page.index
+            .claude_request_census_mut_for_test()
+            .insert(original_key.clone(), census);
+        let page = deliver_page(page);
+        literal(&page);
+        assert_eq!(
+            twin_counts(&page).0,
+            2,
+            "premise: an unowned original leaves the copy's r1 counted too"
+        );
+        assert_eq!(twin_counts(&page).2, 20);
+        let prior = settle(&c, &empty, page, &mut e2_progress());
+        if !copy_first {
+            assert_eq!(
+                prior.claude_money_birth_store.money_marks(copy_location),
+                0,
+                "premise: the original carries the body, the copy has no mark"
+            );
+        }
+        assert!(twin_groups(&prior, &copy, &original).is_empty());
+        assert!(
+            prior.claude_copy_removals.pending(copy_location),
+            "the ACKed save selects the counted copy"
+        );
+        assert!(!prior
+            .claude_copy_removals
+            .pending(location_key(&original_key)));
+        let corrected = if cold {
+            cold_ready(&c, prior.clone(), 100, false)
+        } else {
+            let corrected = ready(&c, &scanner, prior.clone(), 100, false);
+            assert!(
+                scanner.paths().contains(&copy),
+                "the correction reads the marked copy"
+            );
+            corrected
+        };
+        literal(&corrected);
+        assert_eq!(
+            twin_counts(&corrected),
+            (1, Some(1), 10, 10),
+            "the correction removes the copy's r1 under the original"
+        );
+        assert_eq!(
+            portable_body(&corrected, &c.base),
+            expected_body,
+            "the corrected body equals the original-first body"
+        );
+        let settled = settle(&c, &prior, corrected, &mut e2_progress());
+        assert_eq!(twin_groups(&settled, &copy, &original), expected_groups);
+        assert!(
+            !settled.claude_copy_removals.pending(copy_location),
+            "one correction settles the copy"
+        );
+        let again = if cold {
+            cold_ready(&c, settled, 100, false)
+        } else {
+            ready(&c, &scanner, settled, 100, false)
+        };
+        assert!(
+            again.scan.snapshots.is_empty(),
+            "the settled twins are not read or sent again"
+        );
+    });
+}
+#[test]
+fn e2_pipeline_unowned_original_twin_copy_is_redecided() {
+    unowned_original_twins(false, false);
+}
+#[test]
+fn e2_pipeline_unowned_original_twin_copy_is_redecided_after_cold_restart() {
+    unowned_original_twins(false, true);
+}
+#[test]
+fn e2_pipeline_unowned_original_twin_copy_discovered_first_is_redecided() {
+    unowned_original_twins(true, false);
+}
+
 // Input-only usage makes the dominance fixtures' expected sums explicit.
 fn uncopied_rows(rows: &[(&str, u64)]) -> String {
     rows.iter()
