@@ -2001,6 +2001,39 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             }
             index = next;
         }
+        let key = local_index_key(&f.file.0);
+        let due = sampled_scan::now_seconds();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            sampled_scan::transition_fixture::with_scan_clock(due + 7, || {
+                production_scan_at_with_setup(
+                    &f,
+                    source,
+                    index,
+                    Some(cache.clone()),
+                    "resource-fixture",
+                    NOW,
+                    |scan| {
+                        // The entry is observed, but its next read is outside
+                        // this page. Only the close-time clock sees it overdue.
+                        scan.identified_candidates.clear();
+                        scan.census.observed_index_keys.insert(key.clone());
+                        scan.audit_now = due - 1;
+                        let entry = scan.index.files.get_mut(&key).unwrap();
+                        entry.set_unverified_deadline(due);
+                        assert!(!entry.audit_requires_full(scan.audit_now));
+                    },
+                );
+            });
+        });
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        let gauges = &page["counts"]["sampled_acquisition"]["index_state_at_page_end"];
+        assert_eq!(gauges["pending_audits"], 1);
+        assert_eq!(gauges["overdue_audits"], 1);
+        assert_eq!(gauges["oldest_due_age_seconds"], 7);
+
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
         });
