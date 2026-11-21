@@ -991,6 +991,21 @@ impl TierGate {
             })
             .map(|candidate| candidate.path.clone())
             .collect();
+        #[cfg(test)]
+        for candidate in &walk.pending_candidates {
+            let key = local_index_key(&candidate.path);
+            crate::backfill::tier_trace(format!(
+                "gate {source:?} {:?} entry={:?} empty={} route={:?} head={:?}",
+                candidate.path.file_name(),
+                index
+                    .files
+                    .get(&key)
+                    .map(|entry| serde_json::to_string(&*entry).unwrap()),
+                index.confirmed_empty_files.contains(&key),
+                state_v2::tail_route_path(index).map(|route| route.is_some()),
+                state_v2::load_head(index, &key, u32::MAX).map(|head| head.is_some()),
+            ));
+        }
         if source != SnapshotSource::ClaudeCode || gate.deferred.is_empty() {
             return gate;
         }
