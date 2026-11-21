@@ -549,9 +549,11 @@ pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
 /// Test bound on one serialized `native_collection_page` record. Fixed page
 /// gate totals, the Full/Tail byte split and the Codex header lookup counts
 /// extend this local diagnostic record only; upload/finish records and all
-/// runtime resource caps stay unchanged.
+/// runtime resource caps stay unchanged. The bound covers a Codex page with
+/// every read counter at its maximum, the full page schedule and the macOS
+/// process sample fields (about 4.4 KB measured).
 #[cfg(test)]
-pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4320;
+pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4608;
 /// Test bound on one `native_full_prior_stamp` record with every cell at
 /// `u64::MAX`; kept off the page line so that line keeps its bound.
 #[cfg(test)]
@@ -4656,6 +4658,7 @@ mod tests {
     /// schedule stays under its size bound.
     #[test]
     fn first_import_page_total_key_is_set_only_and_within_the_page_bound() {
+        let mut lengths = Vec::new();
         for first_import in [false, true] {
             let (_, records) = capture(|| {
                 let mut probe = Probe::page();
@@ -4691,7 +4694,13 @@ mod tests {
             );
             let text = serde_json::to_string(page).unwrap();
             assert!(text.len() < NATIVE_PAGE_RECORD_TEST_LIMIT, "{}", text.len());
+            lengths.push(text.len());
         }
+        // The key adds only its own bytes; each record takes its own process
+        // sample, so the two lengths can also differ by a few digits.
+        let key = r#","codex_first_import_page_total":true"#.len();
+        let grown = lengths[1].abs_diff(lengths[0] + key);
+        assert!(grown <= 16, "{lengths:?}");
     }
     #[test]
     fn resource_attempts_count_fallback_and_presend_refusal_without_content() {
