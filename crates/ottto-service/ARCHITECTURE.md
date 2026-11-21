@@ -766,9 +766,12 @@ windows can identify different middle tasks; this is inferred grouping evidence.
 A single file-bound field in the common Tail head stores pending eligibility,
 a terminal no-id decision, or the identifier and key epoch. It survives native
 Full reads and publication without a continuation checkpoint, including Codex
-archives, and follows a proven path carry. A same-object rename can move a
-metadata-only decision by itself. Progress and debt follow their usual
-publication rules. Retirement and scope erasure remove the decision. Indexed legacy runs have no eligibility. Unindexed files qualify only with
+archives. A proven Codex path carry rebinds the decision. A same-object rename
+can move a settled metadata-only decision by itself. Outstanding revisions keep
+the existing carry hold. An unreadable head leaves the Full read without a job
+decision. A certified checkpoint reset can restore the head from the read and
+preserve surviving debt. Retirement and scope erasure remove the decision.
+Indexed legacy runs have no eligibility. Unindexed files qualify only with
 a known file birth time at or after the store's first layout 9 write. Layout 9
 fences older readers at source load, before any head can be rewritten. The
 attribution key must be available when a qualifying task is first decided. A

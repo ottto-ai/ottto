@@ -1305,6 +1305,8 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
 const ARCHIVE_JOB_TASK: &str = "Inspect the service and explain every failure with clear evidence";
 
 fn archive_with_terminal_job() -> (Corpus, StateV2ColdSession, ScanIndex, PathBuf) {
+    use crate::snapshots::upload::freshness_debt::tests as g7;
+    const CONTEXT: &str = "archive-job-context";
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1318,9 +1320,16 @@ fn archive_with_terminal_job() -> (Corpus, StateV2ColdSession, ScanIndex, PathBu
         zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
     )
     .unwrap();
-    let (index, _, first) =
-        observed_pass(&c, &original, prior, "archive-job-context", &Arc::default());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut index, read, first) = observed_pass(&c, &original, prior, CONTEXT, &cache);
     assert_eq!(first.posts, 1);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let (mut index, _) = assert_quiet_on(&c, index, &read, cache);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index);
+    assert_eq!(settled["debt"]["outstanding_files"], 0, "{settled}");
+    index.save(session.path()).unwrap();
     (c, session, index, original)
 }
 
@@ -1337,6 +1346,7 @@ fn same_object_archive_rename_carries_terminal_job_without_progress() {
         .unwrap()
         .unwrap();
     assert!(head.metadata_only);
+    assert!(!head.table.contains_key(&state_v2::Collection::Revisions));
     let job = head.common.job.unwrap();
     assert_eq!(job.state, JobState::NoId);
     assert_ne!(job.birth_nanos, 0);
@@ -1385,6 +1395,13 @@ fn same_object_archive_rename_with_job_and_owed_debt_defers_and_holds_owner() {
     use crate::snapshots::upload::freshness_debt::tests::seed_archive_whole_unread;
 
     let (c, session, mut index, original) = archive_with_terminal_job();
+    let candidate = codex_file_join::header_candidate(
+        c.sessions.clone(),
+        original.clone(),
+        &fs::metadata(&original).unwrap(),
+    );
+    codex_file_join::stage_independent_inventory(&index, &[candidate], MAIN).unwrap();
+    index.save(session.path()).unwrap();
     seed_archive_whole_unread(&index, &original);
     index.save(session.path()).unwrap();
     let from = local_index_key(&original);

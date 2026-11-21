@@ -957,10 +957,15 @@ fn read_head(tx: &mut dyn Transaction, file: &[u8], max_revision: u32) -> Result
         return Ok(None);
     };
     read_value(tx, file, HEAD_OWNER, 0, &header)
-        .and_then(|bytes| {
-            let revision = u32::from_be_bytes(Reader(&bytes).take()?);
-            ensure!(revision <= max_revision, Hold::Future);
-            decode_head(&bytes)
+        .and_then(|bytes| match decode_head(&bytes) {
+            Err(_)
+                if Reader(&bytes)
+                    .take()
+                    .is_ok_and(|prefix| u32::from_be_bytes(prefix) > max_revision) =>
+            {
+                Err(Hold::Future.into())
+            }
+            decoded => decoded,
         })
         .map(Some)
         .map_err(|error| {
@@ -988,6 +993,7 @@ pub(super) fn load_head(
     let Some(head) = read_head(tx, file, revision)? else {
         return Ok(None);
     };
+    ensure!(head.revision <= revision, Hold::Future);
     Ok(Some(TailHead {
         revision: head.revision,
         table: head.table,
