@@ -47,6 +47,12 @@ release manifest. Do not self-overwrite a Homebrew-managed install; use
 `brew services restart ottto` after upgrades so launchd points at the updated
 Homebrew opt path.
 
+System Settings → General → Login Items lists the Homebrew service under the
+name on its signing certificate, not under Ottto. Homebrew writes the
+LaunchAgent from the formula's `service` block, which has no setting for the
+app a background item belongs to (`AssociatedBundleIdentifiers`). The app and
+hosted installs write that key themselves.
+
 ## Verified Native DMG Helper
 
 When a stable release advertises a verified native installer helper, the
