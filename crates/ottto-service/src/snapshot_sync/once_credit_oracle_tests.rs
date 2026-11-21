@@ -4008,6 +4008,14 @@ fn tier_trace(home: &OracleHome, cycle: &Cycle) -> String {
         index["files"]
             .as_object()
             .map(|files| files.keys().cloned().collect::<Vec<_>>()),
+    ) + &format!(
+        " TRACE {:?}",
+        crate::backfill::TIER_TRACE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(" Pi "))
+            .collect::<Vec<_>>()
     )
 }
 
@@ -4044,6 +4052,7 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
         .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
         .unwrap();
     home.write_rows(&pi_session("oracle-pi-new", 10));
+    crate::backfill::TIER_TRACE.lock().unwrap().clear();
     super::resource_schedule::with_power("ac", || {
         let support = home.support.clone();
         let tier = || {
@@ -4129,6 +4138,7 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
             .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
             .unwrap();
         home.write_rows(&pi_session("oracle-pi-new", 10));
+    crate::backfill::TIER_TRACE.lock().unwrap().clear();
         let (mut advanced, mut trace) = (false, String::new());
         for _ in 0..3 {
             let cycle = home.cycle(&server, &recording);

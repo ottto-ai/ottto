@@ -1013,6 +1013,11 @@ pub(super) fn prepare_sync_source_inner(
     index.first_read_tier_cutoff = backfill_pending
         .then(|| backfill_state.first_read_tier_cutoff(&upload_destination_namespace, source))
         .flatten();
+    #[cfg(test)]
+    crate::backfill::tier_trace(format!(
+        "prepare {source:?} pending={backfill_pending} cutoff={:?}",
+        index.first_read_tier_cutoff
+    ));
     if index.first_read_tier_cutoff.is_some() {
         let days = backfill_state.first_read_tier_days(&upload_destination_namespace, source);
         crate::local_resource_diagnostics::pass_outcomes(|outcomes| {

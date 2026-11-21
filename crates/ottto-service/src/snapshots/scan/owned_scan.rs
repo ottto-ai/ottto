@@ -719,6 +719,20 @@ impl OwnedSourceScan {
         } else {
             VecDeque::new()
         };
+        #[cfg(test)]
+        crate::backfill::tier_trace(format!(
+            "select {source:?} cutoff={:?} deferred={:?} selectable={:?}",
+            index.first_read_tier_cutoff,
+            tier_deferred
+                .iter()
+                .map(|c| c.path.file_name())
+                .collect::<Vec<_>>(),
+            traversal
+                .pending_candidates
+                .iter()
+                .map(|c| c.path.file_name())
+                .collect::<Vec<_>>(),
+        ));
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
         let mut pending_paths = scoped_prefix_paths;
