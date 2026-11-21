@@ -137,6 +137,11 @@ REQUIRED_STEP_TRACES = {
 # A new row is required on the head and can be uncompared only when absent
 # from the base. Once present on both sides its receipt must match.
 HEAD_ONLY_STEP_TRACES = frozenset()
+# Rows whose receipt this change means to alter (a declared addition, a signed
+# money diff or an intended scan behaviour change). Each listed row must exist
+# on both sides and must differ; every other shared row must match exactly.
+# The list belongs to one change and is emptied when it lands.
+CHANGED_STEP_TRACES = frozenset()
 
 
 # Base and head bodies must match exactly. The only accepted difference is a
@@ -632,22 +637,31 @@ def receipt_names(left, right, head_expected, base_expected=None):
     return sorted(base & head), sorted(head - base)
 
 
-def compare_step_traces(left, right, logs):
-    """Verify the emitted trace manifests and compare shared receipts byte for byte."""
-    if REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES:
-        raise RuntimeError("head-only step traces overlap required traces")
+def compare_step_traces(left, right, logs, informational=False):
+    """Verify the emitted trace manifests and compare shared receipts byte for byte.
+
+    A difference is fatal unless the row is declared in CHANGED_STEP_TRACES.
+    `informational` is for a comparison between two releases: the head must
+    still emit every required trace intact, but rows added, removed or changed
+    since the base are reported instead of failing.
+    """
+    if (REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES
+            or HEAD_ONLY_STEP_TRACES & CHANGED_STEP_TRACES):
+        raise RuntimeError("step-trace declarations overlap")
     manifests = {}
     for arm, directory in (("base", left), ("head", right)):
         lines = re.findall(r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
         digests = dict(lines)
         required = REQUIRED_STEP_TRACES | (HEAD_ONLY_STEP_TRACES if arm == "head" else set())
+        if informational and arm == "base":
+            required = set()
         files = {path.stem for path in (directory / "step-trace").glob("*.json")}
         if len(lines) != len(digests) or files != digests.keys() or not required <= files:
             raise RuntimeError(f"incomplete {arm} step-trace coverage")
         manifests[arm] = digests
     base, head = manifests["base"], manifests["head"]
-    new = head.keys() - base.keys()
-    if base.keys() - head.keys() or new - HEAD_ONLY_STEP_TRACES:
+    new, removed = head.keys() - base.keys(), base.keys() - head.keys()
+    if not informational and (removed or new - HEAD_ONLY_STEP_TRACES):
         raise RuntimeError("base/head step-trace names differ")
 
     def read(directory, name, digest):
@@ -661,9 +675,19 @@ def compare_step_traces(left, right, logs):
         data = read(right, name, head[name])
         if name in base and read(left, name, base[name]) != data:
             changed.append(name)
-    if changed:
-        raise RuntimeError("base/head step-trace bytes differ: " + ", ".join(changed))
-    return {"compared": len(base), "uncompared_head_only": sorted(new)}
+    for name in sorted(removed):
+        read(left, name, base[name])
+    result = {"compared": len(base.keys() & head.keys()), "uncompared_head_only": sorted(new),
+              "changed": changed}
+    if informational:
+        return result | {"informational": True, "removed": sorted(removed)}
+    undeclared = sorted(set(changed) - CHANGED_STEP_TRACES)
+    if undeclared:
+        raise RuntimeError("base/head step-trace bytes differ: " + ", ".join(undeclared))
+    unchanged = sorted(CHANGED_STEP_TRACES - set(changed))
+    if unchanged:
+        raise RuntimeError("declared step-trace change not observed: " + ", ".join(unchanged))
+    return result
 
 
 def require_saved_digests(directory, name):
@@ -835,7 +859,9 @@ def main():
                           "nothing to match): " + ", ".join(signed_uncompared))
         if errors:
             raise RuntimeError("; ".join(errors))
-        manifest["step_traces"] = compare_step_traces(left, right, logs)
+        manifest["step_traces"] = compare_step_traces(
+            left, right, logs,
+            informational=os.environ.get("MONEY_EQUIVALENCE_RELEASE_CUT", "").strip() == "true")
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
@@ -846,7 +872,9 @@ def main():
         with summary.open("a") as f:
             f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
             traces = manifest["step_traces"]
-            f.write(f"Step traces: {traces['compared']} byte-equal; "
+            mode = "release comparison, informational" if traces.get("informational") else "declared"
+            f.write(f"Step traces: {traces['compared']} compared, "
+                    f"{len(traces['changed'])} changed ({mode}); "
                     f"{len(traces['uncompared_head_only'])} head-only uncompared.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
