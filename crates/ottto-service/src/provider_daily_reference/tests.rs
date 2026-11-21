@@ -2004,6 +2004,34 @@ fn the_account_scope_falls_back_to_the_id_token_claim() {
 
 // -- posture -----------------------------------------------------------
 
+/// The module's production source: its root file and every file under its
+/// folder. The tests are left out because they name the forbidden routes.
+fn production_sources() -> Vec<String> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![src.join("provider_daily_reference.rs")];
+    let mut folders = vec![src.join("provider_daily_reference")];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).expect("module folder") {
+            let path = entry.expect("module entry").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if name != "tests" {
+                    folders.push(path);
+                }
+            } else if name.ends_with(".rs") && name != "tests.rs" {
+                files.push(path);
+            }
+        }
+    }
+    files
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("module source"))
+        .collect()
+}
+
 #[test]
 fn the_capability_reaches_exactly_one_provider_route() {
     assert_eq!(
@@ -2011,15 +2039,19 @@ fn the_capability_reaches_exactly_one_provider_route() {
         "https://chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts"
     );
     // Content endpoints are permanently out of scope for this capability.
-    // Scan production code only, with comments stripped, so the exclusion
-    // can be documented in prose without defeating its own guard.
-    let source = include_str!("../provider_daily_reference.rs");
-    let production = source
-        .split("\nmod tests {")
-        .next()
-        .expect("production source");
-    let code_only = production
-        .lines()
+    // Scan every production file of the module, with comments stripped, so
+    // the exclusion can be documented in prose without defeating its own
+    // guard.
+    let sources = production_sources();
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.contains(PROVIDER_ENDPOINT)),
+        "the scan must reach the file that names the provider route"
+    );
+    let code_only = sources
+        .iter()
+        .flat_map(|source| source.lines())
         .filter(|line| {
             let trimmed = line.trim_start();
             !trimmed.starts_with("//") && !trimmed.starts_with('*')
