@@ -2914,6 +2914,52 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// [regress] A census-complete page that read a joined group leaves its
+    /// walk to the capture boundary. The boundary logs the retiring row and
+    /// arms the next walk as a routine re-census.
+    #[test]
+    fn capture_boundary_retires_a_deferred_walk_and_arms_routine_recensus() {
+        use crate::local_resource_diagnostics::capture;
+        fn transitions(rows: &[Value]) -> Vec<&Value> {
+            rows.iter()
+                .filter(|row| row["stage"] == "bounded_traversal_transition")
+                .map(|row| &row["counts"])
+                .collect()
+        }
+        let (root, _) = fixture();
+        let ((mut index, mut result), rows) = capture(|| scan(&root, ScanIndex::default(), 100));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        // Precondition: the joined page completed the census and kept its walk.
+        let started = transitions(&rows);
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0]["event"], "starting");
+        assert!(result.census_complete);
+        assert!(index.traversal.is_some());
+        assert!(index
+            .files
+            .values()
+            .any(|entry| entry.codex_joined_member_set.is_some()));
+
+        let ((), rows) = capture(|| result.finish_codex_capture_boundary(&mut index));
+        let retired = transitions(&rows);
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(retired[0]["event"], "retiring");
+        assert_eq!(retired[0]["reason"], "complete");
+        assert_eq!(retired[0]["recensus_armed"], true);
+        assert!(index.traversal.is_none());
+        // A second boundary on the same pass has no walk left to retire.
+        let ((), rows) = capture(|| result.finish_codex_capture_boundary(&mut index));
+        assert!(transitions(&rows).is_empty());
+
+        let ((_, next), rows) = capture(|| scan(&root, index, 100));
+        let restarted = transitions(&rows);
+        assert_eq!(restarted[0]["event"], "starting", "{restarted:?}");
+        assert_eq!(restarted[0]["reason"], "no_retained_traversal");
+        assert_eq!(restarted[0]["recensus_armed"], true);
+        assert!(next.routine_recensus);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// [money] A midnight directory defers without losing its read obligation.
     #[test]
     fn owner_scoped_midnight_directory_deferred_then_read_money_oracle() {

@@ -1638,7 +1638,9 @@ include `recensus_armed` (boolean) and `context_fingerprint` (only the first
 matching context, subject to truncated-hash collisions; they are not identity proof.
 On starting rows, `recensus_armed` means the new census window is routine. On
 retiring rows, it means the next walk in that context is armed as routine.
-Complete and clean-follow-up retirements arm that next walk. Terminal-unhealthy
+Complete and clean-follow-up retirements arm that next walk. When a Codex walk's
+census-complete page read a joined or tiered file, its complete retiring row is
+written at the end of the pass, after the group capture. Terminal-unhealthy
 retry starts become routine only for file-level problems: `walk_loss` must be false
 (no metadata/directory loss or unattributed unreadables), with no directory cap,
 rejected symlink or watcher overflow. Open/read failures and disappeared files remain

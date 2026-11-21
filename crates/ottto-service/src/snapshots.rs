@@ -767,7 +767,29 @@ impl SourceScanResult {
     }
     pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
         if self.census_complete {
-            index.traversal = None;
+            // A census-complete page that read a joined or tiered Codex file
+            // leaves its walk to this boundary. Retire it as the step would:
+            // log the row and arm the next walk as a routine re-census.
+            // A complete census implies every gate held and no clean follow-up.
+            if let Some(traversal) = index.traversal.take() {
+                traversal_transition::retiring(
+                    self.source,
+                    index.generation,
+                    &traversal,
+                    true,
+                    index.unsettled_cause_bits(),
+                    CensusGates {
+                        discovery_done: true,
+                        traversal_healthy: true,
+                        frozen_generation: true,
+                        state_complete: true,
+                        sidecar_complete: true,
+                        reconciliation_complete: true,
+                        clean_followup: false,
+                        census_complete: true,
+                    },
+                );
+            }
             index.resume_after_path = None;
             index.resume_upper_bound_path = None;
             index.resume_census_window_end = None;
