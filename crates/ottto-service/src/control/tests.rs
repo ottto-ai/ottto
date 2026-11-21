@@ -13211,15 +13211,19 @@ fn daemon_internal_verification_leaves_a_paused_index_for_the_companion() {
     // Syntax damage quarantines once; recoverable hold-budget damage inside
     // 24 hours then pauses the source.
     let path = root.join("codex-scan-index.json");
-    fs::write(&path, b"{").expect("first damage");
-    let (_, origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(&path, SnapshotSource::Codex, &root)
-            .expect("first incident rebuilds");
-    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+    crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::Codex);
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
+    let (_, origin) = crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(
+        &path,
+        SnapshotSource::Codex,
+        &root,
+    )
+    .expect("first incident publishes and then adopts fresh native custody");
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
     damage["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
     let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
-    fs::write(&path, &damage).expect("second damage");
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
     let error =
         ScanIndex::load_for_snapshot_source_with_origin(&path, SnapshotSource::Codex, &root)
             .expect_err("the guard refuses");
@@ -13269,6 +13273,7 @@ fn daemon_internal_verification_leaves_a_paused_index_for_the_companion() {
     );
     assert!(companion.actions.is_empty());
     let _ = fs::remove_dir_all(&root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
