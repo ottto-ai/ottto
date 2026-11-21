@@ -965,6 +965,13 @@ pub(super) fn prepare_sync_source_inner(
         ),
         upload_policy,
     );
+    // A source collecting again rejoins its destination's tiers.
+    crate::backfill::record_first_read_tier_stop(
+        support_dir,
+        source,
+        &upload_destination_namespace,
+        false,
+    )?;
     let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.

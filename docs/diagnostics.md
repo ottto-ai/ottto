@@ -1655,22 +1655,27 @@ No full fingerprint, path or key is emitted, and none of these fields enters upl
 
 ## First-read recency tiers
 
-During a new destination's first import, Codex and Pi read their history in
-recency tiers: files active in the last 7 days first, then 14, then 30, then
-the rest of the 60-day first-read window. Claude reads one untiered first-read
-FIFO. Report-only fields:
+During a new destination's first import, Claude, Codex and Pi read their
+history in recency tiers: files active in the last day (24 hours before the
+first census end) first, then 3, 7, 14 and 30 days, then the rest of the
+60-day first-read window (the final tier). The final tier's paced passes run
+at background QoS at the same pace. Report-only fields:
 
 - `source_prepare` rows carry `counts.first_read_tier_days` and the
   `source_finish` pass carries `first_read_tier_days` while a tier gates the
   source. Both are absent at the final tier and when the source is untiered.
+- The `source_finish` pass carries `first_read_tier_pulled` when its pages
+  read files older than the tier because a Claude path family or a copy's
+  folder pulled them in.
 - One `stage: first_read_tier_advanced` point when a tier advances, with
-  `from_days`, `to_days` and `seconds_since_first_census_end` (from the
-  advancing source's first census end).
+  `from_days`, `to_days`, `seconds_since_first_census_end` (from the
+  advancing source's first census end) and `pulled_files` (files pulled into
+  the finished tier).
 - Terminal scan status carries the optional `tier_ready_cutoff` next to
   `first_read_cutoff`: the source's first census end minus the days of the
-  highest completed tier, as UTC milliseconds. It is absent before the 7-day
+  highest completed tier, as UTC milliseconds. It is absent before the 1-day
   tier completes, after the source's import completes and for untiered
-  sources. Check-ins omit it.
+  sources, and never sent without `first_read_cutoff`. Check-ins omit it.
 
 A deferred file stays queued and owed; it is counted in pending and skipped
 census counts like any queued file. None of these fields enters uploads.

@@ -277,7 +277,7 @@ fn first_read_tiered(
         next = next.committable_subset(&prior, &accepted, &BTreeMap::new());
         assert_eq!(next.first_read_pending, pending, "runtime flag carried");
         assert_eq!(next.first_read_tier_cutoff, prior.first_read_tier_cutoff);
-        if next.first_read_tier_finished() {
+        if next.first_read_tier_finished(source) {
             if first_tier.is_none() {
                 first_tier = Some(next.files.keys().cloned().collect::<BTreeSet<_>>());
                 interrupt_at = Some(page + 1);
@@ -407,12 +407,30 @@ fn tier_bound(days: u64) -> u64 {
     seconds(TIER_CENSUS) - days * DAY
 }
 
-fn tier_bounds() -> [u64; 3] {
-    [7, 14, 30].map(tier_bound)
+fn tier_bounds() -> [u64; 5] {
+    [1, 3, 7, 14, 30].map(tier_bound)
 }
 
 fn key(path: &Path) -> String {
     local_index_key(path)
+}
+
+/// An index whose queue holds `paths` under `cutoff`.
+fn gated(source: SnapshotSource, root: &Path, paths: &[&Path], cutoff: u64) -> ScanIndex {
+    let mut index = ScanIndex {
+        first_read_tier_cutoff: Some(cutoff),
+        ..ScanIndex::default()
+    };
+    ensure_bounded_traversal(
+        source,
+        std::slice::from_ref(&root.to_path_buf()),
+        &mut index,
+        TIER_CENSUS,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let walk = index.traversal.as_mut().unwrap();
+    walk.pending_candidates = paths.iter().map(|path| queued(path, false)).collect();
+    index
 }
 
 /// [behaviour] Tier admission: a never-read file before the current tier's
@@ -423,31 +441,78 @@ fn tier_admission_defers_only_unread_files_before_the_bound() {
     let root = crate::test_scratch::unique_path("first-read-tier-admission");
     let [inside, outside, read] =
         ["inside", "outside", "read"].map(|n| root.join(format!("{n}.jsonl")));
-    write_at(&inside, tier_bound(7) + DAY);
-    write_at(&outside, tier_bound(7) - DAY);
-    write_at(&read, tier_bound(7) - DAY);
-    let mut index = ScanIndex {
-        first_read_tier_cutoff: Some(tier_bound(7)),
-        ..ScanIndex::default()
-    };
+    let gone = root.join("gone.jsonl");
+    write_at(&inside, tier_bound(1) + 3600);
+    write_at(&outside, tier_bound(1) - DAY);
+    write_at(&read, tier_bound(1) - DAY);
+    let queue = [&*inside, &*outside, &*read, &*gone];
+    let mut index = gated(SnapshotSource::Pi, &root, &queue, tier_bound(1));
     index.confirmed_empty_files.insert(key(&read));
-    assert!(!first_read_tier_deferred(&index, &inside));
-    assert!(first_read_tier_deferred(&index, &outside));
-    assert!(
-        !first_read_tier_deferred(&index, &read),
-        "read evidence keeps the walk window"
-    );
-    assert!(!first_read_tier_deferred(&index, &root.join("gone.jsonl")));
-    index.first_read_tier_cutoff = Some(tier_bound(14));
-    assert!(
-        !first_read_tier_deferred(&index, &outside),
-        "the next tier admits it"
-    );
+    let gate = TierGate::new(SnapshotSource::Pi, &index);
+    assert!(!gate.defers(&inside));
+    assert!(gate.defers(&outside));
+    assert!(!gate.defers(&read), "read evidence keeps the walk window");
+    assert!(!gate.defers(&gone));
+    index.first_read_tier_cutoff = Some(tier_bound(3));
+    let gate = TierGate::new(SnapshotSource::Pi, &index);
+    assert!(!gate.defers(&outside), "the next tier admits it");
     index.first_read_tier_cutoff = None;
+    let gate = TierGate::new(SnapshotSource::Pi, &index);
+    assert!(!gate.defers(&outside), "final tier: untiered");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// [behaviour] Claude: a path family is admitted whole once a member is in
+/// the tier or read (an old subagent of a fresh main), and a main in the
+/// folder of a read copy that counted an unproven prefix (DISCLOSED) is
+/// pulled with its family. Another folder's old main waits; so does every
+/// old Claude file when nothing pulls it.
+#[test]
+fn claude_tier_gate_admits_families_and_pulls_disclosed_folders() {
+    use crate::snapshots::claude_request_money::e2::money_mark;
+    let root = crate::test_scratch::unique_path("first-read-tier-claude");
+    let [fresh, holder, other] = [
+        "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "2338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "3338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    ];
+    let main = root.join(format!("project/{fresh}.jsonl"));
+    let agent = root.join(format!("project/{fresh}/subagents/agent-a1.jsonl"));
+    let old_holder = root.join(format!("project/{holder}.jsonl"));
+    let elsewhere = root.join(format!("elsewhere/{other}.jsonl"));
+    write_at(&main, tier_bound(1) + 3600);
+    for old in [&agent, &old_holder, &elsewhere] {
+        write_at(old, tier_bound(1) - 20 * DAY);
+    }
+    let queue = [&*main, &*agent, &*old_holder, &*elsewhere];
+    let source = SnapshotSource::ClaudeCode;
+    let mut index = gated(source, &root, &queue, tier_bound(1));
+    let gate = TierGate::new(source, &index);
+    assert!(!gate.defers(&main));
     assert!(
-        !first_read_tier_deferred(&index, &outside),
-        "final tier: untiered"
+        !gate.defers(&agent) && gate.pulled(&agent),
+        "family admitted whole"
     );
+    assert!(gate.defers(&old_holder), "nothing pulls the holder yet");
+    assert!(gate.defers(&elsewhere));
+    // The fresh main was read as a copy whose prefix no holder proved.
+    let copy = key(&main);
+    index.files.insert(copy.clone(), ScanIndexEntry::default());
+    index
+        .claude_money_birth_store
+        .set_money_marks(&copy, money_mark::DISCLOSED);
+    let walk = index.traversal.as_mut().unwrap();
+    walk.pending_candidates.retain(|queued| queued.path != main);
+    let gate = TierGate::new(source, &index);
+    assert!(
+        !gate.defers(&agent),
+        "a read member keeps its family admitted"
+    );
+    assert!(gate.pulled(&old_holder), "the copy's folder is pulled");
+    assert!(gate.defers(&elsewhere), "another folder waits for its tier");
+    // Codex never pulls by folder or family.
+    let gate = TierGate::new(SnapshotSource::Codex, &index);
+    assert!(gate.defers(&old_holder));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -466,7 +531,7 @@ fn write_pi(root: &Path, ages: &[u64]) -> Vec<PathBuf> {
 }
 
 /// [money] Pi under recency tiers, cold, restarted and restored after the
-/// first tier: the 7-day file is read first and alone in its tier, and the
+/// first tier: the 1-day file is read first and alone in its tier, and the
 /// emitted money, placement and exact ACKs match the untiered first read.
 /// A quiet restart after the final tier emits nothing.
 #[test]
@@ -483,7 +548,7 @@ fn pi_tiered_first_read_matches_untiered_money() {
         assert_eq!(
             first_tier,
             BTreeSet::from([key(&files[4])]),
-            "{interrupt:?}: the 7-day tier holds only the newest file"
+            "{interrupt:?}: the 1-day tier holds only the newest file"
         );
         assert_eq!(tiered.order.first(), Some(&files[4]), "{interrupt:?}");
         for file in &files {
@@ -521,8 +586,8 @@ fn pi_tiered_first_read_matches_untiered_money() {
     }
 }
 
-/// [money] Codex: a join group straddling tiers (one member 3 days old, one
-/// 40) is read whole in the 7-day tier, by its newest member; groups wholly
+/// [money] Codex: a join group straddling tiers (one member new, one 40 days
+/// old) is read whole in the 1-day tier, by its newest member; groups wholly
 /// in later tiers wait. Money and placement match the untiered first read.
 #[test]
 fn codex_tiered_first_read_reads_a_straddling_group_by_its_newest_member() {
@@ -530,7 +595,7 @@ fn codex_tiered_first_read_reads_a_straddling_group_by_its_newest_member() {
     let root = crate::test_scratch::unique_path("first-read-tier-codex");
     fs::create_dir_all(&root).unwrap();
     for (owner, prefix, ages) in [
-        ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "a", [40, 3]),
+        ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "a", [40, 0]),
         ("ffffffff-1111-4111-8111-ffffffffffff", "b", [21, 20]),
         ("12121212-3434-4565-8787-909090909090", "c", [51, 50]),
     ] {
@@ -561,7 +626,7 @@ fn codex_tiered_first_read_reads_a_straddling_group_by_its_newest_member() {
     assert_eq!(
         first_tier,
         BTreeSet::from([key(&root.join("a0.jsonl")), key(&root.join("a1.jsonl"))]),
-        "the straddling group is read whole in the 7-day tier"
+        "the straddling group is read whole in the 1-day tier"
     );
     let _ = fs::remove_dir_all(root);
 }

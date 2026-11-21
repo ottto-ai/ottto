@@ -702,19 +702,18 @@ impl OwnedSourceScan {
             );
         }
         let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
+        #[cfg(test)]
+        trace_projection::permute_candidates(index.traversal.as_mut().expect("traversal"));
+        let tier_gate = TierGate::new(source, index);
         let mut selection_traversal = index.traversal.take().expect("traversal initialized");
         let traversal = &mut selection_traversal;
-        #[cfg(test)]
-        trace_projection::permute_candidates(traversal);
         // Recency tier: first reads before the current tier's bound sit out
         // this selection and return behind the queue in their order. They
         // stay queued and owed; nothing else changes.
         let tier_deferred = if index.first_read_tier_cutoff.is_some() {
             let (deferred, selectable) = std::mem::take(&mut traversal.pending_candidates)
                 .into_iter()
-                .partition::<VecDeque<_>, _>(|candidate| {
-                    first_read_tier_deferred(index, &candidate.path)
-                });
+                .partition::<VecDeque<_>, _>(|candidate| tier_gate.defers(&candidate.path));
             traversal.pending_candidates = selectable;
             deferred
         } else {
@@ -955,6 +954,10 @@ impl OwnedSourceScan {
             pending_paths.extend(rereads);
         }
         traversal.pending_candidates.extend(tier_deferred);
+        index.first_read_tier_pulled += pending_paths
+            .iter()
+            .filter(|pending| tier_gate.pulled(&pending.path))
+            .count() as u64;
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
         index.traversal = Some(selection_traversal);

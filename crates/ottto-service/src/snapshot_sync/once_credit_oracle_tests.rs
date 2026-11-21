@@ -3983,3 +3983,132 @@ mod money_equivalence_tests {
 mod walk_gate_oracle_tests {
     include!("walk_gate_oracle_tests.rs");
 }
+
+fn pi_session(id: &str, tokens: u64) -> Vec<Value> {
+    vec![
+        json!({"type":"session","id":id,"timestamp":"2026-09-01T07:00:00Z"}),
+        json!({"type":"message","timestamp":"2026-09-01T07:01:00Z","message":{"role":"assistant",
+            "model":"gpt-5","provider":"openai","responseId":format!("{id}-r"),
+            "timestamp":"2026-09-01T07:01:00Z","usage":{"input":tokens,"output":1}}}),
+    ]
+}
+
+/// [money] Recency tiers end to end through the real prepare and finish: a
+/// 45-day-old Pi file waits while the destination walks 1, 3, 7, 14 and 30
+/// days; each advance asks for the next paced pass as a first import, the
+/// advance into the final tier asks at background QoS, and the final tier
+/// reads the old file once. Every terminal status that carries the tier
+/// cutoff carries the first-read cutoff too.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.row = "c30";
+    let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    let old = home.source.default_roots(&home.fixture.home)[0].join("old.jsonl");
+    write_rows_at(&old, &pi_session("oracle-pi-old", 100));
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
+        .unwrap();
+    home.write_rows(&pi_session("oracle-pi-new", 10));
+    super::resource_schedule::with_power("ac", || {
+        let tier = || {
+            crate::backfill::load_backfill_state(&home.support)
+                .first_read_tiers
+                .get(&destination)
+                .map(|tier| tier.days)
+        };
+        assert_eq!(tier(), Some(1));
+        let mut walked = Vec::new();
+        let mut tokens = Vec::new();
+        for _ in 0..8 {
+            let cycle = home.cycle(&server, &recording);
+            assert!(cycle.finish.is_ok());
+            tokens.extend(cycle.finalized.iter().map(|item| item.input_tokens));
+            let first_import =
+                with_source_cadence(SnapshotSource::Pi, |cadence| cadence.paced_first_import());
+            let days = tier().unwrap();
+            if walked.last().map_or(1, |(days, _)| *days) != days {
+                walked.push((days, first_import));
+            }
+            if days == crate::snapshots::FIRST_READ_WINDOW_DAYS && tokens.contains(&100) {
+                break;
+            }
+            assert!(!tokens.contains(&100), "the old file waits for the final tier");
+        }
+        assert_eq!(
+            walked,
+            vec![
+                (3, Some(true)),
+                (7, Some(true)),
+                (14, Some(true)),
+                (30, Some(true)),
+                (crate::snapshots::FIRST_READ_WINDOW_DAYS, Some(false)),
+            ],
+            "each advance asks for a paced pass; the final tier runs at background QoS"
+        );
+        assert_eq!(tokens.iter().filter(|&&n| n == 100).count(), 1);
+        assert_eq!(tokens.iter().filter(|&&n| n == 10).count(), 1);
+    });
+    let statuses = server.statuses.lock().unwrap();
+    assert!(statuses
+        .iter()
+        .any(|status| status.get("tier_ready_cutoff").is_some()));
+    for status in statuses.iter() {
+        assert!(
+            status.get("tier_ready_cutoff").is_none() || status.get("first_read_cutoff").is_some(),
+            "{status}"
+        );
+    }
+}
+
+/// Liveness: a tier-1 file whose answer is terminal (a permanent refusal, or
+/// an unchanged answer that stores nothing) settles the tier like an accept,
+/// so the tier advances while the older file still waits.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
+    for answer in [
+        Answer::Refuse("synthetic"),
+        Answer::Unstored,
+        Answer::Dominated,
+    ] {
+        let recording = Recording::start();
+        let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+        *server.fallback.lock().unwrap() = answer;
+        let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+        home.row = "c31";
+        let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+        let old = home.source.default_roots(&home.fixture.home)[0].join("old.jsonl");
+        write_rows_at(&old, &pi_session("oracle-pi-old", 100));
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
+            .unwrap();
+        home.write_rows(&pi_session("oracle-pi-new", 10));
+        let mut advanced = false;
+        for _ in 0..3 {
+            let cycle = home.cycle(&server, &recording);
+            assert!(cycle.finish.is_ok(), "{answer:?}");
+            assert!(
+                !cycle.finalized.iter().any(|item| item.input_tokens == 100),
+                "{answer:?}: the old file waits"
+            );
+            let state = crate::backfill::load_backfill_state(&home.support);
+            if state.first_read_tiers[&destination].days > 1 {
+                advanced = true;
+                break;
+            }
+        }
+        assert!(advanced, "{answer:?}: a terminal answer never holds the tier");
+    }
+}

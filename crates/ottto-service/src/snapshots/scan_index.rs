@@ -54,6 +54,9 @@ pub struct ScanIndex {
     /// destination bootstrap gates the source. Set at prepare; never saved.
     #[serde(skip)]
     pub(crate) first_read_tier_cutoff: Option<u64>,
+    /// Files this pass's pages pulled into the tier (report only); never saved.
+    #[serde(skip)]
+    pub(crate) first_read_tier_pulled: u64,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -609,6 +612,7 @@ impl Default for ScanIndex {
             withheld_memo: Default::default(),
             first_read_pending: false,
             first_read_tier_cutoff: None,
+            first_read_tier_pulled: 0,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
@@ -1000,11 +1004,12 @@ impl ScanIndex {
                 return due;
             }
             // A tier-deferred first read waits for the tier advance, not a pass.
+            let gate = TierGate::new(scan.source, self);
             let queued = !t.pending_directories.is_empty()
                 || t.pending_candidates.iter().any(|candidate| {
                     candidate.census_member
                         && eligible(&local_index_key(&candidate.path))
-                        && !first_read_tier_deferred(self, &candidate.path)
+                        && !gate.defers(&candidate.path)
                 });
             if queued
                 || (unblocked
@@ -1027,14 +1032,16 @@ impl ScanIndex {
     /// The current first-read tier is finished here: the walk ended, no
     /// census member left in the queue is selectable in this tier, and no
     /// terminal retry is held. The caller adds exact upload settlement.
-    pub(crate) fn first_read_tier_finished(&self) -> bool {
+    pub(crate) fn first_read_tier_finished(&self, source: SnapshotSource) -> bool {
+        let gate = TierGate::new(source, self);
         self.first_read_tier_cutoff.is_some()
             && self.terminal_contract_retries.is_empty()
             && self.traversal.as_ref().is_some_and(|walk| {
                 walk.pending_directories.is_empty()
-                    && walk.pending_candidates.iter().all(|candidate| {
-                        !candidate.census_member || first_read_tier_deferred(self, &candidate.path)
-                    })
+                    && walk
+                        .pending_candidates
+                        .iter()
+                        .all(|candidate| !candidate.census_member || gate.defers(&candidate.path))
             })
     }
     /// Census members still queued at page end, exactly what

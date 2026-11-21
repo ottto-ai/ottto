@@ -2581,6 +2581,9 @@ pub(super) fn finish_sync_source(
             &current_rfc3339(),
         ),
     ) {
+        // The final tier runs gentler: background QoS at the same bootstrap pace.
+        let first_import =
+            first_import && !backfill_state.first_read_tier_final(&upload_destination_namespace);
         continuation::request_resident_scan_on_power(source, first_import, power);
     }
 
@@ -2618,28 +2621,37 @@ pub(super) fn finish_sync_source(
 
     // Recency tier: this source finished the current tier once its walk
     // ended, nothing selectable is left in the tier and the upload settled
-    // exactly. The tier advances under the backfill-state lock when every
+    // (a terminal outcome is settled; a pending retry is not). The tier
+    // advances under the backfill-state lock when every configured
     // participant has. Order only: a failed save retries on a later pass.
-    if upload_fully_settled && index.first_read_tier_finished() {
-        match crate::backfill::record_first_read_tier_done(
+    let tier_finished = upload_fully_settled && index.first_read_tier_finished(source);
+    let pulled = std::mem::take(&mut index.first_read_tier_pulled);
+    crate::local_resource_diagnostics::pass_outcomes(|outcomes| {
+        outcomes.first_read_tier_pulled = pulled;
+    });
+    if tier_finished || pulled > 0 {
+        match crate::backfill::record_first_read_tier_pass(
             support_dir,
             source,
             &upload_destination_namespace,
+            &device.sources,
+            pulled,
+            tier_finished,
         ) {
             Ok(Some(advance)) => {
                 crate::local_resource_diagnostics::first_read_tier_advanced(
                     source.api_slug(),
-                    advance.from,
-                    advance.to,
-                    advance.since_first_census_seconds,
+                    &advance,
                 );
                 // Every participant reads the next tier without waiting for
-                // its routine cadence.
+                // its routine cadence; the final tier at background QoS.
+                let first_import = advance.to < crate::snapshots::FIRST_READ_WINDOW_DAYS;
                 for participant in crate::backfill::first_read_tier_participants(
                     &crate::backfill::load_backfill_state(support_dir),
                     &upload_destination_namespace,
+                    &device.sources,
                 ) {
-                    continuation::request_resident_scan_on_power(participant, true, power);
+                    continuation::request_resident_scan_on_power(participant, first_import, power);
                 }
             }
             Ok(None) => {}

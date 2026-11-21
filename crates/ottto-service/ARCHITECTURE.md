@@ -358,25 +358,44 @@ child CPU totals; arguments, paths and command output are never included.
 ## Stores
 
 **First-read recency tiers.** A destination's first census anchor starts its tier
-at 7 days in `BackfillState.first_read_tiers`; the tiers are 7, 14, 30, then the
-60-day first-read window. An absent entry is the final tier, so a daemon upgraded
-mid-import keeps its untiered order. Sources opt in through the durable source table:
-Codex and Pi are tiered; Claude is not, because a copied or forked file's holder is
-known only from the request census after a read, so a tier could read a child before
-its holder. A tiered source with an anchor whose bootstrap is incomplete is a
-participant. Prepare sets the runtime `first_read_tier_cutoff` (anchor minus the
-tier's days). A queued file never read (no index entry, confirmed empty, account
-hold or committed Tail head) older than that bound sits out page selection; it stays
-queued, so the census, freshness debt, disappearance diagnostics and completion keep
-owing it, and it never asks for a paced pass. A Codex join group is read whole once
-any member is selected, so it takes its newest member's tier; within a tier the
-newest-first order is unchanged. Finish records a participant's tier done when its
-walk ended, no selectable census member is left, no terminal retry is held and its
-upload settled exactly; under the backfill-state lock the tier advances once every
+at 1 day in `BackfillState.first_read_tiers`; the tiers are 1, 3, 7, 14, 30, then
+the 60-day first-read window, and a tier's bound is the anchor minus its days (1
+day is 24 hours). An absent entry is the final tier, so a daemon upgraded mid-import
+keeps its untiered order and pacing. Sources opt in through the durable source
+table; Claude, Codex and Pi are tiered. A tiered source with an anchor whose
+bootstrap is incomplete, configured on the device and not stopped by policy is a
+participant: a policy stop (disabled by an admin, a zero receipt window) records the
+source in the tier's `stopped` set, so it stops holding the tier at once, and its
+next collecting pass rejoins it. Prepare sets the runtime `first_read_tier_cutoff`.
+`TierGate` looks at the queue once per selection: a queued file never read (no index
+entry, confirmed empty, account hold or committed Tail head) older than the bound
+sits out page selection; it stays queued, so the census, freshness debt,
+disappearance diagnostics and completion keep owing it, and it never asks for a
+paced pass. A Codex join group is read whole once any member is selected, so it takes
+its newest member's tier; within a tier the newest-first order is unchanged.
+
+Claude admits a path family (root, subagents, path twins) whole once any member is
+read or in the tier. A copied or forked file's holder is known only from the request
+census after a read, so no tier holds a child for its holder: a child read before its
+holder counts its unproven prefix and is marked `DISCLOSED`, exactly as an untiered
+first read that reaches the child first. Every main in that copy's folder is then
+pulled into the current tier with its family, and once the holder is accepted the
+existing save-time re-decide (`CopyOwnership::reconcile`, changed copy decisions,
+settled counted copies) removes the copied prefix from the child, so the final state
+matches an untiered read. Chains follow one read at a time. Pulled files are counted
+for diagnostics only.
+
+Finish records a participant's tier done when its walk ended, no selectable census
+member is left, no terminal retry is held and its upload settled; terminal outcomes
+(unproven, refused, gone, usage-identical or dominated answers) settle, a pending
+retry does not. Under the backfill-state lock the tier advances once every
 participant is done, and every participant is asked for a paced pass. The census
-cannot complete while deferred files are queued, so bootstrap completion, first-import
-pacing and QoS follow the final tier. `first_read_cutoff` keeps meaning 60 days;
-`tier_ready_cutoff` reports the highest completed tier.
+cannot complete while deferred files are queued, so bootstrap completion follows the
+final tier. While the destination is in the final tier, paced requests carry
+`first_import = false`: those passes run at background QoS at the unchanged
+`PACED_AC`/`PACED_BATTERY` pace, while tiers 1 to 30 keep first-import QoS on AC.
+`first_read_cutoff` keeps meaning 60 days; `tier_ready_cutoff` reports the highest
+completed tier, and the terminal report reads both from one backfill-state load.
 
 Terminal scan status optionally reports `first_read_cutoff`, the destination/source's
 first census end minus the fixed 60-day first-read window, as UTC milliseconds.

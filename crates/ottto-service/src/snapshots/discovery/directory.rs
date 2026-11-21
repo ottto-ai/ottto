@@ -947,24 +947,100 @@ fn has_read_evidence(index: &ScanIndex, path: &Path) -> bool {
             && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)))
 }
 
-/// Recency tier (`backfill::FIRST_READ_TIER_DAYS`): while a tiered
-/// destination bootstrap gates the source, a queued file never read whose
-/// mtime is before the current tier's bound is not selectable yet. It stays
-/// queued and owed (census, freshness debt, completion); only the page
+/// Recency tier (`backfill::FIRST_READ_TIER_DAYS`) for one look at the queue:
+/// while a tiered destination bootstrap gates the source, a queued file never
+/// read whose mtime is before the current tier's bound is not selectable yet.
+/// It stays queued and owed (census, freshness debt, completion); only page
 /// selection skips it. The same read evidence as `first_read_aged` keeps it
-/// selectable. An unknown mtime (vanished) stays selectable for its removal
-/// route. A Codex join group is read whole once any member is selected, so it
-/// takes the tier of its newest member.
-pub(in crate::snapshots) fn first_read_tier_deferred(index: &ScanIndex, path: &Path) -> bool {
-    let Some(cutoff) = index.first_read_tier_cutoff else {
-        return false;
-    };
-    fs::symlink_metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(unix_seconds)
-        .is_some_and(|modified| modified < cutoff)
-        && !has_read_evidence(index, path)
+/// selectable, and an unknown mtime (vanished) keeps its removal route. A
+/// Codex join group is read whole once any member is selected.
+///
+/// Claude admits a path family (root, subagents, path twins) whole once any
+/// member is read or in the tier. A main whose folder holds a read copy that
+/// counted an unproven prefix (`money_mark::DISCLOSED`) is pulled with its
+/// family whatever its mtime: a copy holder or fork parent proves only in its
+/// copy's folder, so the family settles in the copy's tier through the
+/// existing save-time re-decide. Chains follow, one read at a time.
+pub(in crate::snapshots) struct TierGate {
+    deferred: BTreeSet<PathBuf>,
+    pulled: BTreeSet<PathBuf>,
+}
+
+impl TierGate {
+    pub(in crate::snapshots) fn new(source: SnapshotSource, index: &ScanIndex) -> Self {
+        let mut gate = Self {
+            deferred: BTreeSet::new(),
+            pulled: BTreeSet::new(),
+        };
+        let (Some(cutoff), Some(walk)) = (index.first_read_tier_cutoff, index.traversal.as_ref())
+        else {
+            return gate;
+        };
+        gate.deferred = walk
+            .pending_candidates
+            .iter()
+            .filter(|candidate| {
+                fs::symlink_metadata(&candidate.path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(unix_seconds)
+                    .is_some_and(|modified| modified < cutoff)
+                    && !has_read_evidence(index, &candidate.path)
+            })
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        if source != SnapshotSource::ClaudeCode || gate.deferred.is_empty() {
+            return gate;
+        }
+        let mut admitted = BTreeSet::new();
+        let mut folders = BTreeSet::new();
+        for key in index.files.keys() {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            admitted.insert(member.root.to_owned());
+            if member.subagent_stem.is_none()
+                && index
+                    .claude_money_birth_store
+                    .money_marks(claude_money_birth_store::location_key(key))
+                    & claude_request_money::e2::money_mark::DISCLOSED
+                    != 0
+            {
+                folders.extend(Path::new(key).parent().map(Path::to_path_buf));
+            }
+        }
+        for candidate in &walk.pending_candidates {
+            let Some(member) = claude_index_path_member_ref(&candidate.path) else {
+                continue;
+            };
+            if !gate.deferred.contains(&candidate.path)
+                || (member.subagent_stem.is_none()
+                    && candidate
+                        .path
+                        .parent()
+                        .is_some_and(|folder| folders.contains(folder)))
+            {
+                admitted.insert(member.root.to_owned());
+            }
+        }
+        (gate.pulled, gate.deferred) =
+            std::mem::take(&mut gate.deferred)
+                .into_iter()
+                .partition(|path| {
+                    claude_index_path_member_ref(path)
+                        .is_some_and(|member| admitted.contains(member.root))
+                });
+        gate
+    }
+
+    pub(in crate::snapshots) fn defers(&self, path: &Path) -> bool {
+        self.deferred.contains(path)
+    }
+
+    /// Admitted although before the bound: pulled with a family or holder.
+    pub(in crate::snapshots) fn pulled(&self, path: &Path) -> bool {
+        self.pulled.contains(path)
+    }
 }
 
 pub(in crate::snapshots) fn opened_candidate_is_within_frozen_window(

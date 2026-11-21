@@ -1733,6 +1733,9 @@ pub(crate) struct PassOutcomes {
     /// The destination's current first-read recency tier, while it gates this source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) first_read_tier_days: Option<u64>,
+    /// Files this pass pulled into the current tier with a family or holder.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) first_read_tier_pulled: u64,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.
@@ -2442,13 +2445,20 @@ pub fn log_startup_resources() {
 }
 
 /// One point when a destination's first-read recency tier advances: the
-/// finished and next tier in days, and seconds since the source's first
-/// census end. Counts only.
-pub(crate) fn first_read_tier_advanced(source: &str, from: u64, to: u64, since_first_census: u64) {
+/// finished and next tier in days, seconds since the source's first census
+/// end and the files pulled into the finished tier. Counts only.
+pub(crate) fn first_read_tier_advanced(
+    source: &str,
+    advance: &crate::backfill::FirstReadTierAdvance,
+) {
     let counts = BTreeMap::from([
-        ("from_days", from),
-        ("to_days", to),
-        ("seconds_since_first_census_end", since_first_census),
+        ("from_days", advance.from),
+        ("to_days", advance.to),
+        (
+            "seconds_since_first_census_end",
+            advance.since_first_census_seconds,
+        ),
+        ("pulled_files", advance.pulled),
     ]);
     traversal_point("first_read_tier_advanced", source, &counts);
 }

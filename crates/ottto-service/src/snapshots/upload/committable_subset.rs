@@ -259,6 +259,7 @@ impl ScanIndex {
             withheld_memo: self.withheld_memo.clone(),
             first_read_pending: self.first_read_pending,
             first_read_tier_cutoff: self.first_read_tier_cutoff,
+            first_read_tier_pulled: self.first_read_tier_pulled,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),

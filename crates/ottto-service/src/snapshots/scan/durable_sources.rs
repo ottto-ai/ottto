@@ -15,8 +15,7 @@ pub(crate) struct Properties {
     /// Queue order during the source's first read (`first_read_order.rs`).
     pub(crate) first_read_newest_first: bool,
     /// First reads of a destination bootstrap go in recency tiers
-    /// (`backfill::FIRST_READ_TIER_DAYS`). Claude keeps one untiered FIFO
-    /// read: a copied or forked file's holder is known only after a read.
+    /// (`backfill::FIRST_READ_TIER_DAYS`).
     pub(crate) first_read_recency_tiers: bool,
 }
 
@@ -26,7 +25,7 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         first_read_newest_first: false,
-        first_read_recency_tiers: false,
+        first_read_recency_tiers: true,
     },
     Properties {
         source: DurableSource::Codex,

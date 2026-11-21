@@ -1085,10 +1085,17 @@ pub(super) fn withdraw_and_report_policy_stop(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let source = status.source;
-    withdraw_source_manifest(
-        &snapshot_upload_destination_namespace(device, device_secret),
-        source,
-    );
+    let destination = snapshot_upload_destination_namespace(device, device_secret);
+    withdraw_source_manifest(&destination, source);
+    // A stopped source never holds its destination's recency tiers.
+    if crate::backfill::record_first_read_tier_stop(support_dir, source, &destination, true)
+        .is_err()
+    {
+        eprintln!(
+            "local snapshot backfill tier save deferred for {}",
+            source.api_slug()
+        );
+    }
     let _ =
         crate::active_sessions::clear_active_sessions(support_dir, source, status.scan_started_at);
     report_status_with_fresh_relay_token(
