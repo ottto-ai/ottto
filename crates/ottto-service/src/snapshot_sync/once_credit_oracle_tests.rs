@@ -325,6 +325,7 @@ impl OracleServer {
                             }
                             Answer::Retry => {
                                 reference["reason"] = "other".into();
+                                reference["detail"] = "synthetic".into();
                                 reference["permanent"] = false.into();
                                 reply["rejected_entities"]
                                     .as_array_mut()
@@ -3876,6 +3877,16 @@ fn trio_acks(server: &OracleServer) -> [usize; 3] {
     acks
 }
 
+/// `fingerprint` is held in retry custody: in the upload ledger until an
+/// index save transfers it, then in the saved index.
+fn trio_held(cycle: &Cycle, fingerprint: &str) -> bool {
+    cycle.progress.quarantined_fingerprints.contains_key(fingerprint)
+        || cycle
+            .index
+            .quarantined_snapshot_fingerprints
+            .contains_key(fingerprint)
+}
+
 fn codex_import_pending(home: &OracleHome) -> bool {
     crate::backfill::bootstrap_pending_for_destination(
         &crate::backfill::load_backfill_state(&home.support),
@@ -3982,10 +3993,7 @@ fn first_import_pair_acks_a_exactly_while_b_stays_owed() {
     let b = trio_item(&first, TRIO_B);
     assert!(!first.accepted_body(b));
     assert!(
-        first
-            .progress
-            .quarantined_fingerprints
-            .contains_key(&b.snapshot_fingerprint),
+        trio_held(&first, &b.snapshot_fingerprint),
         "B stays owed in retry custody"
     );
     assert_eq!(trio_acks(&server), [1, 0, 0]);
@@ -4110,10 +4118,7 @@ fn first_import_pair_identity_503_on_b_resends_a_and_keeps_b_owed() {
     assert!(first.accepted_body(trio_item(&first, TRIO_A)));
     let b = trio_item(&first, TRIO_B);
     assert!(!first.accepted_body(b));
-    assert!(first
-        .progress
-        .quarantined_fingerprints
-        .contains_key(&b.snapshot_fingerprint));
+    assert!(trio_held(&first, &b.snapshot_fingerprint));
     assert_eq!(
         first
             .progress
@@ -4188,10 +4193,7 @@ fn first_import_short_transient_503_then_shed_keeps_prior_acks_and_b_owed() {
     }
     assert_eq!(trio_acks(&server), [1, 0, 0], "only the prior ACK exists");
     assert!(trio_credited(&second).iter().all(|role| *role == TRIO_A));
-    assert!(
-        second.progress.quarantined_fingerprints.contains_key(&b),
-        "B keeps its debt"
-    );
+    assert!(trio_held(&second, &b), "B keeps its debt");
     assert!(codex_import_pending(&home), "no early completion");
     *server.fallback.lock().unwrap() = Answer::Accept;
     let later = settle_trio(

@@ -1616,13 +1616,11 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
     }
     let root = temp_root("probe-cure");
     write_probe_order(&root, OTHER, ["c", "d"], 0, 40);
-    // Each header read takes at most one 1 KiB buffer; probes read line 0
-    // and the first native.
+    // Probes read line 0 and the first native.
     let probes = head_bytes(&root.join("sessions/c.jsonl"), 2)
         + head_bytes(&root.join("sessions/d.jsonl"), 2);
-    let singleton = 2 * 1024 + probes + 1024;
-    // A two-member group that sorts first and charges its headers and
-    // probes to the shared page before `c`/`d` boot. Groups are read in key
+    // A two-member group that sorts first and charges its headers, probes
+    // and body to the shared page before `c`/`d` boot. Groups are read in key
     // order and a key hashes the home path, which differs every run, so the
     // owner is chosen by key: a fixed few candidates can all sort after.
     let home = inventory_groups(&root)
@@ -1648,6 +1646,24 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
         filler,
         "a filler group that sorts first"
     );
+    // A header read charges at most one 1 KiB buffer; a filler member's probe,
+    // if it probes, reads up to its first native (line 3).
+    let len = |name: &str| {
+        fs::metadata(root.join(format!("sessions/{name}.jsonl")))
+            .unwrap()
+            .len()
+    };
+    let header = |name: &str| len(name).min(1024);
+    let filler_probes = head_bytes(&root.join("sessions/f1.jsonl"), 4)
+        + head_bytes(&root.join("sessions/f2.jsonl"), 4);
+    // The filler's headers, probes and body fit the page at both totals, so
+    // both charge the same work before `c`/`d` boot. Left over at the
+    // ordinary total: at most `filler_probes + 256` less `c`/`d`'s headers,
+    // short of their probes. At the first-import total another threshold.
+    let singleton = header("f1") + header("f2") + filler_probes + len("f1") + len("f2") + 256;
+    let other_headers = header("c") + header("d");
+    assert!(filler_probes + 256 < other_headers + probes, "short at 64");
+    assert!(len("c") + len("d") > singleton, "a paged group");
     // The group's physical aliases share one body fingerprint.
     let other = |scan: &SourceScanResult| {
         let snapshots = scan

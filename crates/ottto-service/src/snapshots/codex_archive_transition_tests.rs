@@ -2886,10 +2886,21 @@ fn first_import_page_total_moves_pages_not_money() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    // A failure is caught inside the guard and resumed after it is dropped,
+    // so it never poisons the decoder lock for other tests.
+    let outcome = {
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::panic::catch_unwind(first_import_page_total_rows)
+    };
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn first_import_page_total_rows() {
     const LATER_PASS: &str = "2026-10-07T13:00:00Z";
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let c = Corpus::new();
     c.write(MAIN, Some("a"));
     append(&c.path(MAIN), &header(MAIN, Some("switched")));
@@ -2958,13 +2969,15 @@ fn first_import_page_total_moves_pages_not_money() {
     // (route, switch page, upgraded). Not upgraded: the first `switch` pages
     // read the first-import total and the rest the ordinary one (MAX: every
     // page). Upgraded: the first `switch` pages are ordinary, as saved by a
-    // process without the larger total, and the rest resume at it.
+    // process without the larger total, and the rest resume at it. The
+    // first-import route runs last: its later append grows the shared corpus.
     for (arm, switch, upgraded) in [
         ("ordinary", 0, false),
-        ("first-import", usize::MAX, false),
         ("crossing", 2, false),
         ("resume", 2, true),
+        ("first-import", usize::MAX, false),
     ] {
+        assert_eq!(len(&exact_a), threshold, "{arm}: the corpus cold read");
         let store = crate::test_scratch::ScratchDir::canonical(&format!("first-import-{arm}"));
         let dir = fs::canonicalize(store.as_ref()).unwrap().join("state");
         crate::test_scratch::create_private_dir(&dir).unwrap();
