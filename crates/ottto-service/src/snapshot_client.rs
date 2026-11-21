@@ -1591,7 +1591,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
 /// computed from the fields being sent.
 ///
 /// `Deserialize` is not wire-inbound: nothing ever parses a report kind off a
-/// response. It exists because the terminal status journal (ottto#393) writes
+/// response. It exists because the terminal status journal writes
 /// the exact `SnapshotStatusRequest` it is about to POST to disk and reads it
 /// back, so every field of that struct — this one included — must survive the
 /// round trip rather than being silently dropped from the replayed receipt.
@@ -1743,7 +1743,7 @@ pub struct SnapshotStatusRequest {
     /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
-    /// Local control-plane health (public ottto#440), carried only by
+    /// Local control-plane health, carried only by
     /// check-ins; every other body leaves it `None`, which omits the key, so
     /// their wire shape is unchanged. Additive: the backend's status model is
     /// forward-tolerant, and `default` keeps journals written before the field
@@ -1828,7 +1828,7 @@ impl SnapshotStatusRequest {
             // is exactly what the manifest exists to expose.
             manifest: _,
             // Daemon process health, not scan evidence: a beat is exactly the
-            // cadence it is meant to travel on (public ottto#440).
+            // cadence it is meant to travel on.
             control_plane: _,
         } = self;
         // A collector reporting itself disabled is making a durable state

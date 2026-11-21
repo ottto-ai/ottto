@@ -303,7 +303,7 @@ fn captured_terminal_receipt_for_source_under_hint(
     http_request_json(&requests[1])
 }
 
-/// Public ottto#440: a serving daemon's check-in reports its local control
+/// A serving daemon's check-in reports its local control
 /// plane beside upload liveness.
 #[test]
 #[serial(source_manifests)]
@@ -804,7 +804,7 @@ mod census_ownership_tests {
     }
 }
 
-/// The codex witness once its residue settles (ottto#399): a COMPLETED
+/// The codex witness once its residue settles: a COMPLETED
 /// census whose every nonzero loss class equals its terminal counterpart,
 /// with the witness reported as counts only.
 fn m1_named_residue_counts() -> SyncCounts {
