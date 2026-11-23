@@ -168,6 +168,218 @@ impl PartialEq for FileStamp {
 }
 impl Eq for FileStamp {}
 
+/// An opened object's write generation count, with the birth that names the
+/// object. APFS bumps the count on every data write, the same bytes
+/// rewritten included, and never on a metadata change such as setting the
+/// modification time. An equal count on the same inode and the same known
+/// birth therefore proves the object's bytes unchanged since the count was
+/// taken. A new object starts its count low, so counts of different objects
+/// can be equal: a count is compared only under an equal birth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WriteGeneration {
+    count: std::num::NonZeroU32,
+    birth_nanos: u64,
+}
+
+impl WriteGeneration {
+    /// The held descriptor's count, under the birth `metadata` reports: one
+    /// attribute call, never a byte read. `None` when the birth is unknown or
+    /// the count is unavailable (`write_generation_count`).
+    pub(crate) fn capture(file: &File, metadata: &Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        let birth_nanos = birth_unix_nanos(metadata);
+        #[cfg(not(unix))]
+        let birth_nanos = 0;
+        if birth_nanos == 0 {
+            return None;
+        }
+        Some(Self {
+            count: write_generation_count(file, metadata)?,
+            birth_nanos,
+        })
+    }
+
+    /// A stored count, for the object a certificate names by `birth_nanos`.
+    pub(crate) fn stored(count: std::num::NonZeroU32, birth_nanos: u64) -> Option<Self> {
+        (birth_nanos != 0).then_some(Self { count, birth_nanos })
+    }
+
+    pub(crate) fn count(self) -> std::num::NonZeroU32 {
+        self.count
+    }
+}
+
+#[cfg(not(test))]
+fn write_generation_count(file: &File, metadata: &Metadata) -> Option<std::num::NonZeroU32> {
+    platform_write_generation(file, metadata)
+}
+
+/// Tests choose where counts come from; by default there are none, so every
+/// fixture that does not opt in keeps the rule without a count.
+#[cfg(test)]
+fn write_generation_count(file: &File, metadata: &Metadata) -> Option<std::num::NonZeroU32> {
+    match GENERATIONS.with(std::cell::Cell::get) {
+        Generations::Off => None,
+        Generations::Platform => platform_write_generation(file, metadata),
+        Generations::Simulated => simulated_write_generation(file, metadata),
+    }
+}
+
+/// The reply `fgetattrlist` fills for `ATTR_CMN_RETURNED_ATTRS |
+/// ATTR_CMN_GEN_COUNT`: its length, the returned attribute set (five groups)
+/// and the count.
+#[cfg(any(target_os = "macos", test))]
+const GENERATION_REPLY_BYTES: u32 = 4 + 5 * 4 + 4;
+#[cfg(any(target_os = "macos", test))]
+const GENERATION_COUNT_BIT: u32 = 0x0008_0000;
+
+/// A reply's count, or `None` unless the reply is complete, the file system
+/// returned the count (a volume without one, such as exFAT or FAT, leaves its
+/// returned bit clear) and the count is nonzero (a file mapped writable and
+/// shared reads 0 while it is mapped).
+#[cfg(any(target_os = "macos", test))]
+fn accepted_generation(
+    reply_bytes: u32,
+    returned_common: u32,
+    count: u32,
+) -> Option<std::num::NonZeroU32> {
+    if reply_bytes < GENERATION_REPLY_BYTES || returned_common & GENERATION_COUNT_BIT == 0 {
+        return None;
+    }
+    std::num::NonZeroU32::new(count)
+}
+
+/// `statfs`'s type name, up to its terminator, is APFS's.
+#[cfg(any(target_os = "macos", test))]
+fn apfs_type_name(name: &[u8]) -> bool {
+    name.split(|byte| *byte == 0).next() == Some(b"apfs".as_slice())
+}
+
+/// Whether the held descriptor's volume is APFS, from `fstatfs`, kept per
+/// volume by its device number (the local volume's file system id). A failed
+/// call is not kept.
+#[cfg(target_os = "macos")]
+fn apfs_volume(file: &File, device: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    static VOLUMES: std::sync::Mutex<std::collections::BTreeMap<u64, bool>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut volumes = VOLUMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(apfs) = volumes.get(&device) {
+        return *apfs;
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `stat` is a valid out pointer for one `statfs`, and the
+    // descriptor is open for the duration of the call.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstatfs` returned 0, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    let apfs = apfs_type_name(&stat.f_fstypename.map(|byte| byte as u8));
+    volumes.insert(device, apfs);
+    apfs
+}
+
+/// The count of the object open at `file`, from `fgetattrlist` on the held
+/// descriptor: no path, so no symlink is followed and no other object can be
+/// named. APFS only; any failure is `None`.
+#[cfg(target_os = "macos")]
+fn platform_write_generation(file: &File, metadata: &Metadata) -> Option<std::num::NonZeroU32> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Reply {
+        length: u32,
+        returned: libc::attribute_set_t,
+        count: u32,
+    }
+    const _: () = assert!(
+        libc::ATTR_CMN_GEN_COUNT == GENERATION_COUNT_BIT
+            && size_of::<Reply>() == GENERATION_REPLY_BYTES as usize
+    );
+    if !apfs_volume(file, metadata.dev()) {
+        return None;
+    }
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_GEN_COUNT,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = std::mem::MaybeUninit::<Reply>::zeroed();
+    // SAFETY: both pointers are valid for the sizes passed, and the
+    // descriptor is open for the duration of the call.
+    let status = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&mut request as *mut libc::attrlist).cast(),
+            reply.as_mut_ptr().cast(),
+            size_of::<Reply>(),
+            libc::FSOPT_ATTR_CMN_EXTENDED,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: zeroed integers are a valid `Reply`; the call wrote at most it.
+    let reply = unsafe { reply.assume_init() };
+    accepted_generation(reply.length, reply.returned.commonattr, reply.count)
+}
+
+/// No other target has a write generation count.
+#[cfg(not(target_os = "macos"))]
+fn platform_write_generation(_: &File, _: &Metadata) -> Option<std::num::NonZeroU32> {
+    None
+}
+
+/// Tests only: a count that changes exactly when the bytes change, from a
+/// positioned read of the whole object (the descriptor's offset stays).
+#[cfg(test)]
+fn simulated_write_generation(file: &File, metadata: &Metadata) -> Option<std::num::NonZeroU32> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0; usize::try_from(metadata.len()).ok()?];
+    file.read_exact_at(&mut bytes, 0).ok()?;
+    let digest = Sha256::digest(&bytes);
+    std::num::NonZeroU32::new(u32::from_be_bytes(digest[..4].try_into().ok()?) | 1)
+}
+
+/// Tests only: where write generation counts come from on this thread.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Generations {
+    /// None, as on a volume without counts (the default).
+    Off,
+    /// The platform call (APFS on macOS; none elsewhere).
+    Platform,
+    /// A content digest: a touch keeps it, any byte change moves it.
+    Simulated,
+}
+
+#[cfg(test)]
+thread_local! {
+    static GENERATIONS: std::cell::Cell<Generations> = const { std::cell::Cell::new(Generations::Off) };
+}
+
+/// Tests only: counts on this thread come from `source` until the guard drops.
+#[cfg(test)]
+pub(crate) struct UseGenerations(Generations);
+#[cfg(test)]
+impl UseGenerations {
+    pub(crate) fn new(source: Generations) -> Self {
+        Self(GENERATIONS.with(|current| current.replace(source)))
+    }
+}
+#[cfg(test)]
+impl Drop for UseGenerations {
+    fn drop(&mut self) {
+        GENERATIONS.with(|current| current.set(self.0));
+    }
+}
+
 /// A metadata-only witness. Symlinks and other nonregular entries are not
 /// reusable sources; absence is distinct from an unreadable source.
 #[derive(Clone)]
@@ -473,6 +685,12 @@ pub(crate) struct Checkpoint {
     samples: Samples,
     last_full_verified_unix_seconds: u64,
     audit_debt: Option<AuditDebt>,
+    /// The count of the bytes this checkpoint describes: taken before the
+    /// read's first byte and unchanged when it committed (or, restored,
+    /// unchanged across the certificate's samples). `None` otherwise.
+    write_generation: Option<WriteGeneration>,
+    /// Restored by a count-proven same-size touch.
+    touch_proven: bool,
 }
 
 impl Checkpoint {
@@ -490,6 +708,13 @@ impl Checkpoint {
     }
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
+    }
+    /// The count to store beside this checkpoint's durable certificate made
+    /// with `birth_nanos`: only under that same known birth.
+    pub(crate) fn write_generation_for(&self, birth_nanos: u64) -> Option<std::num::NonZeroU32> {
+        self.write_generation
+            .filter(|generation| birth_nanos != 0 && generation.birth_nanos == birth_nanos)
+            .map(WriteGeneration::count)
     }
     /// The interpretation scope this checkpoint was made under.
     pub(crate) fn scope(&self) -> &Scope {
@@ -546,6 +771,7 @@ impl Checkpoint {
             sealed_offset: self.samples.sealed_offset,
             samples_valid: self.samples.valid_for(self.stamp.length),
             verified: self.last_full_verified_unix_seconds,
+            generation: self.write_generation,
         }
     }
 
@@ -702,13 +928,14 @@ impl PrefixSeal {
             } else {
                 self.verified_unix_seconds
             },
+            generation: None,
         };
         let debt = (!publication)
             .then_some(self.audit_debt_unix_seconds)
             .flatten()
             .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
         let mut guard = 0;
-        let mode = select_mode(Some(view), debt, &stamp, scope, now, |at| {
+        let mode = select_mode(Some(view), debt, &stamp, scope, now, false, |at| {
             let (offset, expected) = match at {
                 SampleAt::Head => (0, &self.head_sha256),
                 SampleAt::Boundary => (sealed - len as u64, &self.boundary_sha256),
@@ -865,6 +1092,10 @@ pub(crate) struct ReadPlan {
     debt: Option<AuditDebt>,
     guard_bytes_read: usize,
     pending_record: Option<Samples>,
+    /// The count taken with the opening stamp, before any byte of this read,
+    /// when it is bound to the bytes the completed reduction will describe.
+    generation: Option<WriteGeneration>,
+    touch_proven: bool,
 }
 
 fn earlier_debt(a: Option<AuditDebt>, b: Option<AuditDebt>) -> Option<AuditDebt> {
@@ -932,6 +1163,9 @@ struct CertificateView<'a> {
     sealed_offset: u64,
     samples_valid: bool,
     verified: u64,
+    /// The count bound to this certificate's bytes; always `None` for the
+    /// exact-stamp view.
+    generation: Option<WriteGeneration>,
 }
 
 impl CertificateView<'_> {
@@ -941,6 +1175,19 @@ impl CertificateView<'_> {
         } else {
             now.same_content(self.stamp)
         }
+    }
+
+    /// The same object at the same length with a moved mtime, and its count
+    /// (under the same known birth) equal to the certificate's: the mtime was
+    /// set, the bytes were not written. Never part of `unchanged`, so it
+    /// grants no Full credit; the caller still checks both samples.
+    fn same_size_touch(&self, now: &FileStamp, current: Option<WriteGeneration>) -> bool {
+        !self.exact_stamp
+            && self.stamp.same_object(now)
+            && self.stamp.length == now.length
+            && !self.unchanged(now)
+            && self.generation.is_some()
+            && self.generation == current
     }
 }
 
@@ -957,12 +1204,19 @@ fn audit_due(exact_stamp: bool, debt: Option<AuditDebt>, now: u64) -> bool {
 /// `prepare`'s mode decision. `sample_eq` compares one sample window of the
 /// held FD with the certificate's; it is called only when the decision needs
 /// that window, in the order head then boundary.
+/// `touched`: the held FD's count, taken with `stamp`, proves a same-size
+/// moved mtime a touch (`CertificateView::same_size_touch`, or a restore that
+/// proved it). That is no `SameSizeEdit`: with a due debt it is the audit's
+/// Full, otherwise it continues as an unchanged file does, after both samples
+/// match (on a restore, the restore's), and carries the certificate's
+/// verification and debt.
 fn select_mode(
     old: Option<CertificateView<'_>>,
     debt: Option<AuditDebt>,
     stamp: &FileStamp,
     scope: &Scope,
     now: u64,
+    touched: bool,
     mut sample_eq: impl FnMut(SampleAt) -> io::Result<bool>,
 ) -> io::Result<ReadMode> {
     // Only PrefixSeal uses the exact-stamp view. Its proof horizon stays
@@ -993,14 +1247,20 @@ fn select_mode(
             ReadMode::Full(FullReason::Replaced)
         } else if stamp.length < old.stamp.length {
             ReadMode::Full(FullReason::Shrunk)
-        } else if stamp.length == old.stamp.length && !old.unchanged(stamp) {
+        } else if stamp.length == old.stamp.length && !old.unchanged(stamp) && !touched {
             ReadMode::Full(FullReason::SameSizeEdit)
+        } else if touched && debt.is_some_and(|debt| now >= debt.due_unix_seconds) {
+            // A proven touch never stands in for a due audit, and so never
+            // reaches a quiet retirement: the audit reads Full.
+            ReadMode::Full(FullReason::AuditDue)
         } else if old.unchanged(stamp) && old.sealed_offset == stamp.length {
             ReadMode::Unchanged
         } else if !sample_eq(SampleAt::Head)? {
             ReadMode::Full(FullReason::HeadChanged)
         } else if !sample_eq(SampleAt::Boundary)? {
             ReadMode::Full(FullReason::BoundaryChanged)
+        } else if touched && old.sealed_offset == stamp.length {
+            ReadMode::Unchanged
         } else if old.exact_stamp {
             let due = old
                 .verified
@@ -1031,7 +1291,10 @@ impl ReadPlan {
         durable_debt: Option<AuditDebt>,
         now: u64,
     ) -> io::Result<Self> {
-        let stamp = FileStamp::capture(file.metadata()?)?;
+        let metadata = file.metadata()?;
+        // Before any byte of this read, samples included.
+        let generation = WriteGeneration::capture(file, &metadata);
+        let stamp = FileStamp::capture(metadata)?;
         let debt = earlier_debt(durable_debt, checkpoint.and_then(Checkpoint::audit_debt));
         let mut guard_bytes_read = 0;
         let view = checkpoint.map(Checkpoint::view);
@@ -1040,7 +1303,17 @@ impl ReadPlan {
             view.samples_valid &= !OLD_CHECKPOINT_INVALID.with(std::cell::Cell::get);
             view
         });
-        let mode = select_mode(view, debt, &stamp, scope, now, |at| {
+        // A retained checkpoint proves a touch here; a restored one proved it
+        // across its samples, and still holds only under the same count now.
+        let touched = view
+            .as_ref()
+            .is_some_and(|view| view.same_size_touch(&stamp, generation))
+            || checkpoint.is_some_and(|checkpoint| {
+                checkpoint.touch_proven
+                    && generation.is_some()
+                    && checkpoint.write_generation == generation
+            });
+        let mode = select_mode(view, debt, &stamp, scope, now, touched, |at| {
             #[cfg(test)]
             if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
                 return Err(io::Error::other(
@@ -1095,6 +1368,15 @@ impl ReadPlan {
         };
         let start_offset = samples.sealed_offset;
         file.seek(SeekFrom::Start(start_offset))?;
+        // A Full reads every byte after the count was taken, and a Tail
+        // re-read both samples after it. `Unchanged` reads nothing: its bytes
+        // are the checkpoint's, so the count binds only when it is the
+        // checkpoint's own.
+        let generation = generation.filter(|generation| {
+            mode != ReadMode::Unchanged
+                || checkpoint.and_then(|checkpoint| checkpoint.write_generation)
+                    == Some(*generation)
+        });
         Ok(Self {
             mode,
             stamp,
@@ -1106,11 +1388,18 @@ impl ReadPlan {
             debt,
             guard_bytes_read,
             pending_record: None,
+            generation,
+            touch_proven: touched && !matches!(mode, ReadMode::Full(_)),
         })
     }
 
     pub(crate) fn mode(&self) -> ReadMode {
         self.mode
+    }
+    /// This read continues a same-size file whose moved mtime its write
+    /// generation count proved a touch (`same_size_touch_proven`).
+    pub(crate) fn same_size_touch_proven(&self) -> bool {
+        self.touch_proven
     }
     /// A Full with no checkpoint whose stored state already proved the file
     /// changed: the read is the same, its reason is the proven one.
@@ -1216,8 +1505,9 @@ impl ReadPlan {
         current_scope: &Scope,
         now: u64,
     ) -> io::Result<Checkpoint> {
-        if !FileStamp::capture(file.metadata()?)?.same_content(&self.stamp)
-            || current_scope != &self.scope
+        let metadata = file.metadata()?;
+        let write_generation = self.generation_unchanged(file, &metadata);
+        if !FileStamp::capture(metadata)?.same_content(&self.stamp) || current_scope != &self.scope
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1251,7 +1541,17 @@ impl ReadPlan {
             samples: self.samples,
             last_full_verified_unix_seconds: verified,
             audit_debt,
+            write_generation,
+            touch_proven: false,
         })
+    }
+
+    /// The opening count, kept only when the held FD still reports it now: a
+    /// write between the opening and this commit leaves the checkpoint with
+    /// no count, so no count ever covers bytes the read did not see.
+    fn generation_unchanged(&self, file: &File, metadata: &Metadata) -> Option<WriteGeneration> {
+        self.generation
+            .filter(|opened| WriteGeneration::capture(file, metadata) == Some(*opened))
     }
 }
 
@@ -1328,7 +1628,14 @@ impl ReadPlan {
         if !cfg!(unix) {
             return invalid(UnsupportedIdentity);
         }
-        let Ok(current) = file.metadata().and_then(FileStamp::capture) else {
+        let Ok(metadata) = file.metadata() else {
+            return invalid(Replaced);
+        };
+        // The count binds only a read that sealed its whole opening length.
+        let write_generation = self
+            .generation_unchanged(file, &metadata)
+            .filter(|_| self.samples.sealed_offset == self.stamp.length);
+        let Ok(current) = FileStamp::capture(metadata) else {
             return invalid(Replaced);
         };
         let sealed = self.samples.sealed_offset;
@@ -1405,6 +1712,8 @@ impl ReadPlan {
             samples: self.samples,
             last_full_verified_unix_seconds: verified,
             audit_debt,
+            write_generation,
+            touch_proven: false,
         })
     }
 }
@@ -1446,9 +1755,11 @@ crate::heap_layout_bound::fields!(FileStamp; length, #[cfg(unix)] device, #[cfg(
     #[cfg(unix)] modified, #[cfg(unix)] changed);
 crate::heap_layout_bound::fields!(Samples; sealed_offset, head, boundary);
 crate::heap_layout_bound::fields!(LossyPrefixIdentity; stamp, samples);
-crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt);
+crate::heap_layout_bound::fields!(Checkpoint; stamp, scope, samples, last_full_verified_unix_seconds, audit_debt,
+    write_generation, touch_proven);
 crate::heap_layout_bound::fields!(ReadPlan; mode, stamp, scope, samples, start_offset,
-    last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record);
+    last_full_verified_unix_seconds, debt, guard_bytes_read, pending_record, generation, touch_proven);
+crate::heap_layout_bound::no_heap!(true; WriteGeneration { count, birth_nanos });
 #[cfg(test)]
 crate::heap_layout_bound::fields!(PrefixSeal; stamp, scope, sample_len, head_sha256, boundary_sha256,
     verified_unix_seconds, sealed_unix_seconds, audit_debt_unix_seconds);
@@ -1492,6 +1803,15 @@ pub(crate) struct DurableCertificate {
     pub(crate) audit_debt_unix_seconds: Option<u64>,
 }
 
+/// The held FD's count as `checked_stamp` took it, and whether it proved a
+/// same-size moved mtime a touch.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct ObservedGeneration {
+    generation: Option<WriteGeneration>,
+    touch_proven: bool,
+}
+
 /// What `DurableCertificate::admits` found on the held FD.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1521,12 +1841,59 @@ pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
 /// report it. Never a default such as mtime or now.
 #[cfg(unix)]
 pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
-    metadata
-        .created()
-        .ok()
-        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|since| u64::try_from(since.as_nanos()).ok())
-        .unwrap_or(0)
+    recycled(
+        metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| u64::try_from(since.as_nanos()).ok())
+            .unwrap_or(0),
+    )
+}
+
+#[cfg(all(not(test), unix))]
+fn recycled(birth: u64) -> u64 {
+    birth
+}
+
+#[cfg(all(test, unix))]
+fn recycled(birth: u64) -> u64 {
+    match RECYCLED_BIRTH.with(std::cell::Cell::get) {
+        None => birth,
+        Some(0) => 0,
+        Some(shift) => birth.wrapping_add(shift),
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Tests only: `None` reads real births; `Some(0)` reads every birth as
+    /// unknown; `Some(n)` reads every birth `n` nanoseconds later, as an
+    /// inode reused by a new object reports it.
+    static RECYCLED_BIRTH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: births read on this thread are another object's (or unknown)
+/// until the guard drops, while the inode, bytes and count stay.
+#[cfg(all(test, unix))]
+pub(crate) struct RecycledBirth(());
+#[cfg(all(test, unix))]
+impl RecycledBirth {
+    pub(crate) fn later(nanos: u64) -> Self {
+        assert_ne!(nanos, 0);
+        RECYCLED_BIRTH.with(|birth| birth.set(Some(nanos)));
+        Self(())
+    }
+    pub(crate) fn unknown() -> Self {
+        RECYCLED_BIRTH.with(|birth| birth.set(Some(0)));
+        Self(())
+    }
+}
+#[cfg(all(test, unix))]
+impl Drop for RecycledBirth {
+    fn drop(&mut self) {
+        RECYCLED_BIRTH.with(|birth| birth.set(None));
+    }
 }
 
 /// APFS moves an object's birth down to its mtime when the mtime is set
@@ -1589,16 +1956,33 @@ impl CertificateRefusal {
     }
 }
 
+/// What `admit_samples` returns: the admission, head and boundary samples, the
+/// checked stamp and the observed write generation count.
+#[cfg(unix)]
+type AdmittedSamples = (
+    DurableAdmission,
+    Vec<u8>,
+    Vec<u8>,
+    FileStamp,
+    ObservedGeneration,
+);
+
 #[cfg(unix)]
 impl DurableCertificate {
-    /// The native engine's grown path permits concurrent appends outside the certified prefix.
-    pub(crate) fn restore_grown(
+    /// The native engine's grown path permits concurrent appends outside the
+    /// certified prefix. With the write generation count stored beside this
+    /// certificate, if any, an unchanged length also admits a moved mtime the
+    /// count proves a touch (`checked_stamp`).
+    pub(crate) fn restore_grown_counted(
         &self,
         file: &mut File,
         scope: Scope,
         read_changed_nanos: Option<u64>,
+        stored_generation: Option<std::num::NonZeroU32>,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        self.restore_with_append(file, scope, true, read_changed_nanos)
+        let stored =
+            stored_generation.and_then(|count| WriteGeneration::stored(count, self.birth_nanos));
+        self.restore_with_append(file, scope, true, read_changed_nanos, stored)
     }
 
     fn restore_with_append(
@@ -1607,9 +1991,10 @@ impl DurableCertificate {
         scope: Scope,
         allow_append: bool,
         read_changed_nanos: Option<u64>,
+        stored: Option<WriteGeneration>,
     ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
-        let (admission, head, boundary, current) =
-            self.admit_samples(file, allow_append, read_changed_nanos)?;
+        let (admission, head, boundary, current, observed) =
+            self.admit_samples(file, allow_append, read_changed_nanos, stored)?;
         #[cfg(test)]
         let scope = if RESTORED_SCOPE_MISMATCH.with(std::cell::Cell::get) {
             Scope(String::new())
@@ -1640,6 +2025,10 @@ impl DurableCertificate {
             audit_debt: self
                 .audit_debt_unix_seconds
                 .map(|due_unix_seconds| AuditDebt { due_unix_seconds }),
+            // The certified bytes at an unchanged length, held by the count
+            // across both samples; a grown object's count covers more.
+            write_generation: observed.generation.filter(|_| admission.unchanged),
+            touch_proven: observed.touch_proven,
         };
         if !checkpoint.samples.valid_for(checkpoint.stamp.length) {
             return Err(CertificateRefusal::Changed(FullReason::InvalidCheckpoint));
@@ -1651,8 +2040,11 @@ impl DurableCertificate {
         &self,
         file: &File,
         read_changed_nanos: Option<u64>,
-    ) -> Result<FileStamp, CertificateRefusal> {
+        stored: Option<WriteGeneration>,
+    ) -> Result<(FileStamp, ObservedGeneration), CertificateRefusal> {
         let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
+        // Before either sample.
+        let generation = WriteGeneration::capture(file, &metadata);
         let stamp =
             FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
         if u64::from(self.sample_len) != self.sealed_offset.min(SAMPLE_BYTES as u64)
@@ -1676,18 +2068,27 @@ impl DurableCertificate {
         }
         let modified_nanos =
             i128::from(stamp.modified.0) * 1_000_000_000 + i128::from(stamp.modified.1);
-        if stamp.length == self.length
-            && stamp.modified != self.modified
-            && !read_changed_nanos.is_some_and(|bound| {
+        let moved = stamp.length == self.length && stamp.modified != self.modified;
+        let bound = moved
+            && read_changed_nanos.is_some_and(|bound| {
                 bound != 0
                     && self.birth_nanos != 0
                     && birth == self.birth_nanos
                     && modified_nanos <= i128::from(bound)
-            })
-        {
+            });
+        // The same inode (above) and, inside the count, the same known birth:
+        // the mtime moved, forward or back, and no byte was written.
+        let touch_proven = moved && !bound && stored.is_some() && generation == stored;
+        if moved && !bound && !touch_proven {
             return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
-        Ok(stamp)
+        Ok((
+            stamp,
+            ObservedGeneration {
+                generation,
+                touch_proven,
+            },
+        ))
     }
 
     fn admit_samples(
@@ -1695,8 +2096,9 @@ impl DurableCertificate {
         file: &mut File,
         allow_append: bool,
         read_changed_nanos: Option<u64>,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
-        let stamp = self.checked_stamp(file, read_changed_nanos)?;
+        stored: Option<WriteGeneration>,
+    ) -> Result<AdmittedSamples, CertificateRefusal> {
+        let (stamp, mut observed) = self.checked_stamp(file, read_changed_nanos, stored)?;
         let unchanged = stamp.length == self.length;
         let len = self.sample_len as usize;
         let mut read = 0;
@@ -1719,10 +2121,16 @@ impl DurableCertificate {
         if durable_sample_digest(&boundary) != self.boundary_sha256 {
             return Err(CertificateRefusal::Changed(FullReason::BoundaryChanged));
         }
-        let after = file
-            .metadata()
-            .and_then(FileStamp::capture)
-            .map_err(|_| CertificateRefusal::ReadError)?;
+        let after_metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
+        // The count must hold across both samples to describe what they saw.
+        observed.generation = observed
+            .generation
+            .filter(|before| WriteGeneration::capture(file, &after_metadata) == Some(*before));
+        if observed.touch_proven && observed.generation.is_none() {
+            return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
+        }
+        let after =
+            FileStamp::capture(after_metadata).map_err(|_| CertificateRefusal::ReadError)?;
         if if allow_append {
             !append_compatible(&stamp, &after)
         } else {
@@ -1738,6 +2146,7 @@ impl DurableCertificate {
             head,
             boundary,
             after,
+            observed,
         ))
     }
 }
@@ -1899,6 +2308,275 @@ mod tests {
                 .unwrap(),
             read,
         )
+    }
+
+    /// Move the file's mtime by `seconds` (either way) without writing.
+    fn move_mtime(f: &Fixture, seconds: i64) {
+        let file = f.open();
+        let at = file.metadata().unwrap().modified().unwrap();
+        let by = std::time::Duration::from_secs(seconds.unsigned_abs());
+        let at = if seconds >= 0 { at + by } else { at - by };
+        file.set_times(fs::FileTimes::new().set_modified(at))
+            .unwrap();
+    }
+
+    /// [behaviour] Capture guards. A reply without the count's returned bit
+    /// (exFAT, FAT), a short reply or a zero count (a writable shared mapping)
+    /// is no count; only APFS names an APFS volume. Tests read no count unless
+    /// they ask. The platform count, on an APFS volume, holds across a touch
+    /// and moves on a write of the same byte; every other target has none.
+    #[cfg(unix)]
+    #[test]
+    fn write_generation_capture_guards() {
+        use std::os::unix::fs::FileExt;
+        let returned = 0x8000_0000;
+        let five = std::num::NonZeroU32::new(5);
+        let reply = GENERATION_REPLY_BYTES;
+        let bit = GENERATION_COUNT_BIT;
+        assert_eq!(accepted_generation(reply, returned | bit, 5), five);
+        assert_eq!(accepted_generation(reply, returned, 5), None);
+        assert_eq!(accepted_generation(reply, returned | bit, 0), None);
+        assert_eq!(accepted_generation(reply - 4, returned | bit, 5), None);
+        assert!(apfs_type_name(b"apfs\0\0\0\0"));
+        for other in [&b"hfs\0"[..], b"exfat\0", b"msdos\0", b"apfsx\0", b""] {
+            assert!(!apfs_type_name(other), "{other:?}");
+        }
+
+        let f = Fixture::new(b"one\n");
+        let file = f.open();
+        let count = |file: &File| WriteGeneration::capture(file, &file.metadata().unwrap());
+        assert_eq!(count(&file), None, "no count unless a test asks");
+        let _platform = UseGenerations::new(Generations::Platform);
+        #[cfg(target_os = "macos")]
+        let apfs = apfs_volume(&file, file.metadata().unwrap().dev());
+        #[cfg(not(target_os = "macos"))]
+        let apfs = false;
+        let before = count(&file);
+        if !apfs {
+            assert_eq!(before, None);
+            return;
+        }
+        let before = before.expect("an APFS file has a count");
+        move_mtime(&f, 100);
+        assert_eq!(count(&file), Some(before), "a touch writes no data");
+        file.write_all_at(b"o", 0).unwrap();
+        let after = count(&file).unwrap();
+        assert_ne!(after, before, "the same byte rewritten is a write");
+        assert_eq!(after.birth_nanos, before.birth_nanos);
+    }
+
+    /// [money] A retained checkpoint continues a same-size moved mtime, forward
+    /// or back, only when its count (same inode, same known birth) is
+    /// unchanged: both samples are read and the checkpoint's verification and
+    /// debt carry, as for an unchanged file. No count, another birth's count
+    /// or a same-size edit is `SameSizeEdit`, as without the count.
+    #[cfg(unix)]
+    #[test]
+    fn ram_same_size_touch_continues_only_under_an_equal_count() {
+        let _counts = UseGenerations::new(Generations::Simulated);
+        let f = Fixture::new(b"one\ntwo\n");
+        move_mtime(&f, 1_000);
+        let cp = initial(&f, 10);
+        assert!(cp.write_generation.is_some());
+        let debt = Some(AuditDebt {
+            due_unix_seconds: 99,
+        });
+        for (seconds, now) in [(100, 20), (-500, 30)] {
+            move_mtime(&f, seconds);
+            let mut file = f.open();
+            let plan = ReadPlan::prepare(&mut file, Some(&cp), &scope(), debt, now).unwrap();
+            assert_eq!(plan.mode(), ReadMode::Unchanged, "{seconds}");
+            assert!(plan.same_size_touch_proven());
+            assert_eq!(plan.guard_bytes_read(), 2 * 8, "both samples");
+            let next = plan
+                .commit_after_native_completion(&file, &scope(), now)
+                .unwrap();
+            assert_eq!(next.last_full_verified(), 10, "no Full credit");
+            assert_eq!(next.audit_debt(), debt);
+            assert_eq!(next.write_generation, cp.write_generation);
+            assert_ne!(next.stamp.modified, cp.stamp.modified);
+        }
+        // Never a bare Unchanged: either sample that differs is a Full.
+        move_mtime(&f, 3);
+        let mut head = cp.clone();
+        head.samples.head[0] ^= 1;
+        assert_eq!(
+            run(&f, Some(&head), None, 32).0,
+            ReadMode::Full(FullReason::HeadChanged)
+        );
+        let mut boundary = cp.clone();
+        let last = boundary.samples.boundary.len() - 2;
+        boundary.samples.boundary[last] ^= 1;
+        assert_eq!(
+            run(&f, Some(&boundary), None, 33).0,
+            ReadMode::Full(FullReason::BoundaryChanged)
+        );
+        // A due debt is the audit's Full, never a touch continued into a
+        // quiet retirement.
+        let due = Some(AuditDebt {
+            due_unix_seconds: 35,
+        });
+        let mut file = f.open();
+        let plan = ReadPlan::prepare(&mut file, Some(&cp), &scope(), due, 35).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::AuditDue));
+        assert!(!plan.same_size_touch_proven());
+        {
+            let _off = UseGenerations::new(Generations::Off);
+            let (mode, _, _) = run(&f, Some(&cp), None, 40);
+            assert_eq!(mode, ReadMode::Full(FullReason::SameSizeEdit), "no count");
+        }
+        let mut other = cp.clone();
+        other.write_generation = other.write_generation.map(|generation| WriteGeneration {
+            birth_nanos: generation.birth_nanos + 1,
+            ..generation
+        });
+        let (mode, _, _) = run(&f, Some(&other), None, 50);
+        assert_eq!(
+            mode,
+            ReadMode::Full(FullReason::SameSizeEdit),
+            "another birth"
+        );
+        let mut uncounted = cp.clone();
+        uncounted.write_generation = None;
+        let (mode, _, _) = run(&f, Some(&uncounted), None, 60);
+        assert_eq!(
+            mode,
+            ReadMode::Full(FullReason::SameSizeEdit),
+            "an old checkpoint"
+        );
+        f.replace_bytes(b"one\ntwX\n");
+        move_mtime(&f, 10);
+        let (mode, _, _) = run(&f, Some(&cp), None, 70);
+        assert_eq!(mode, ReadMode::Full(FullReason::SameSizeEdit), "an edit");
+        // An exact-stamp seal never compares a count.
+        let seal = initial(&f, 80).seal(80);
+        move_mtime(&f, 10);
+        let admitted = seal.admits(&mut f.open(), &scope(), 90, false);
+        assert_eq!(admitted, Err(FullReason::SameSizeEdit));
+    }
+
+    /// [money] The count binds only bytes the read saw: a same-size write
+    /// between the opening and the commit (its mtime put back) leaves the
+    /// checkpoint with no count, and so does a sealed prefix shorter than
+    /// the opening length.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_during_the_read_leaves_no_count() {
+        use std::os::unix::fs::FileExt;
+        let _counts = UseGenerations::new(Generations::Simulated);
+        let f = Fixture::new(b"one\ntwo\n");
+        let mut file = f.open();
+        let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 10).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        plan.observe_complete_records(&bytes).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        file.write_all_at(b"X", 0).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let cp = plan
+            .commit_after_native_completion(&file, &scope(), 10)
+            .unwrap();
+        assert_eq!(cp.write_generation, None);
+
+        let f = Fixture::new(b"one\ntwo\nunfinished");
+        let mut file = f.open();
+        let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 10).unwrap();
+        plan.observe_complete_records(b"one\ntwo\n").unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        let length = file.metadata().unwrap().len();
+        let cp = plan
+            .commit_sealed_prefix(&mut file, true, &scope(), 10, 10, false, length)
+            .unwrap();
+        assert_eq!(
+            cp.write_generation, None,
+            "the prefix is not the opened file"
+        );
+    }
+
+    /// [money] A durable certificate admits a same-size moved mtime only
+    /// under its stored count and known birth; the restored checkpoint reads
+    /// `Unchanged`, carries its verification and keeps the count. Without the
+    /// count, under another count or after an edit it is `SameSizeEdit`.
+    #[cfg(unix)]
+    #[test]
+    fn durable_restore_admits_only_a_count_proven_touch() {
+        let _counts = UseGenerations::new(Generations::Simulated);
+        let f = Fixture::new(b"one\ntwo\n");
+        move_mtime(&f, 1_000);
+        let cp = initial(&f, 10);
+        let birth = birth_unix_nanos(&f.open().metadata().unwrap());
+        let certificate = cp.durable_certificate(birth).unwrap();
+        let count = cp.write_generation_for(birth);
+        assert!(count.is_some() && birth != 0);
+        assert_eq!(cp.write_generation_for(birth + 1), None);
+        move_mtime(&f, -500);
+        let edit = Some(CertificateRefusal::Changed(FullReason::SameSizeEdit));
+        let restore = |stored| {
+            certificate
+                .restore_grown_counted(&mut f.open(), scope(), None, stored)
+                .map(|(checkpoint, _)| checkpoint)
+        };
+        assert_eq!(restore(None).err(), edit, "no stored count");
+        let other = count.and_then(|count| std::num::NonZeroU32::new(count.get() ^ 2));
+        assert_eq!(restore(other).err(), edit, "another count");
+        let restored = restore(count).unwrap();
+        assert!(restored.touch_proven);
+        let mut file = f.open();
+        let plan = ReadPlan::prepare(&mut file, Some(&restored), &scope(), None, 20).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Unchanged);
+        assert!(plan.same_size_touch_proven());
+        let next = plan
+            .commit_after_native_completion(&file, &scope(), 20)
+            .unwrap();
+        assert_eq!(next.last_full_verified(), 10);
+        assert_eq!(next.write_generation_for(birth), count);
+        // Never a bare Unchanged: the restore compares both samples first.
+        let mut head = certificate.clone();
+        head.head_sha256[0] ^= 1;
+        assert_eq!(
+            head.restore_grown_counted(&mut f.open(), scope(), None, count)
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::HeadChanged))
+        );
+        let mut boundary = certificate.clone();
+        boundary.boundary_sha256[0] ^= 1;
+        assert_eq!(
+            boundary
+                .restore_grown_counted(&mut f.open(), scope(), None, count)
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::BoundaryChanged))
+        );
+        // A due debt on the restored checkpoint is the audit's Full.
+        let restored = restore(count).unwrap();
+        let due = Some(AuditDebt {
+            due_unix_seconds: 20,
+        });
+        let plan = ReadPlan::prepare(&mut f.open(), Some(&restored), &scope(), due, 20).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::AuditDue));
+        // A write after the restore is not the restore's touch: it moves
+        // the count, so it is the edit it would be without one.
+        {
+            use std::os::unix::fs::FileExt;
+            let restored = restore(count).unwrap();
+            f.open().write_all_at(b"O", 0).unwrap();
+            let (mode, _, _) = run(&f, Some(&restored), None, 21);
+            assert_eq!(mode, ReadMode::Full(FullReason::SameSizeEdit));
+            f.open().write_all_at(b"o", 0).unwrap();
+            move_mtime(&f, 600);
+        }
+        let mut reborn = certificate.clone();
+        reborn.birth_nanos = birth + 1;
+        assert_eq!(
+            reborn
+                .restore_grown_counted(&mut f.open(), scope(), None, count)
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::Replaced)),
+            "another birth is another object"
+        );
+        f.replace_bytes(b"one\ntwX\n");
+        move_mtime(&f, 10);
+        assert_eq!(restore(count).err(), edit, "an edit moves the count");
     }
 
     #[test]
@@ -3013,6 +3691,8 @@ mod tests {
             },
             last_full_verified_unix_seconds: now,
             audit_debt: None,
+            write_generation: None,
+            touch_proven: false,
         };
         let mut count = 0;
         assert!(sample_at(&mut file, sealed - window, &boundary, &mut count).unwrap());
@@ -3178,7 +3858,7 @@ mod tests {
             "APFS clamps birth to mtime"
         );
         let (restored, admission) = certificate
-            .restore_grown(&mut f.open(), scope(), None)
+            .restore_grown_counted(&mut f.open(), scope(), None, None)
             .expect("the certified object continues");
         assert!(!admission.unchanged);
         assert_eq!(
@@ -3189,7 +3869,9 @@ mod tests {
             let mut later = certificate.clone();
             later.birth_nanos = now_birth - 1;
             assert_eq!(
-                later.restore_grown(&mut f.open(), scope(), None).err(),
+                later
+                    .restore_grown_counted(&mut f.open(), scope(), None, None)
+                    .err(),
                 Some(CertificateRefusal::Changed(FullReason::Replaced)),
                 "a birth after the certified one is another object"
             );
@@ -3197,7 +3879,7 @@ mod tests {
             unclamped.birth_nanos = now_birth + 1;
             assert_eq!(
                 unclamped
-                    .restore_grown(&mut f.open(), scope(), None)
+                    .restore_grown_counted(&mut f.open(), scope(), None, None)
                     .map(|_| ()),
                 if cfg!(target_os = "macos") {
                     Ok(())

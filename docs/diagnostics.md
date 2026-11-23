@@ -255,7 +255,10 @@ existing index calculations. These three fields are state gauges. The same
 object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
 To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
 emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
-`pace_evicted` is emitted by `sampled_audit_pace_alarm`. Values remain exact.
+`pace_evicted` is emitted by `sampled_audit_pace_alarm`. A nonzero-only
+`same_size_touch_proven` record counts same-size files whose moved mtime an
+unchanged write generation count proved a touch, so they continued from stored
+state instead of a `same_size_edit` Full. Values remain exact.
 Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
 paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its

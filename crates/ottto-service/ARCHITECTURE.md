@@ -465,7 +465,27 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   births are known and equal, and both bounded sample digests match. This removes a
   whole-file read for retention touches; ordinary later writes still read Full. A first
   touch after a long gap can still read Full; steady reuse depends on the lease cadence
-  remaining within its backdate interval. Source fingerprints include metadata and
+  remaining within its backdate interval. A same-size mtime move outside that bound,
+  forward or back, continues from stored state only when the file's write
+  generation count proves it a touch: macOS APFS counts every data write, the same
+  bytes rewritten included, and never a metadata change such as setting the mtime.
+  The count is read with `fgetattrlist` on the held descriptor, before the samples,
+  and is kept only when it is nonzero, the file system returned it and the volume
+  is APFS (`fstatfs`, kept per device). A read keeps it only when the held
+  descriptor reports the same count at commit and the read sealed the whole
+  opening length; it is stored beside the certificate in the Tail head (envelope 2,
+  writer capability 7) and compared only under the same inode and the same known
+  birth. A due audit still reads Full, so a touch never stands in for an audit or
+  reaches a quiet retirement. Otherwise a proven touch reads both samples (the
+  retained checkpoint's, or the restore's) and then continues as an unchanged
+  file does: it carries the certificate's verification and debt, earns
+  no Full credit, and never enters `same_content`/`unchanged`, so an exact-stamp
+  seal and Full-verification credit ignore the count. Without a count (another
+  platform or file system, a zero count, a head written before counts, a file set
+  aside) the rule above is unchanged. Freshness debt lists a proven touch at its
+  indexed mtime, so the walk owes what it owed before the touch. Rolling back
+  below the release that writes envelope 2 holds collection until roll-forward.
+  Source fingerprints include metadata and
   bounded content samples, rather than a whole-file digest. Freshness debt clears only
   through the existing receipt proof on a later listing.
   Codex checks its ownership-affecting sidecar binding before reusing a head; changed

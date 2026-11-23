@@ -2071,16 +2071,34 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
 fn certify_job(
     fixture: &ScanRoot,
     cache: &Arc<SharedCache>,
-    mut index: ScanIndex,
+    index: ScanIndex,
     clock: &TestClock,
     now: &mut u64,
     page_number: &mut u64,
     append_mid_read: bool,
 ) -> (ScanIndex, u64, u64, [usize; 11]) {
+    certify_job_with(fixture, cache, index, clock, now, page_number, |fixture| {
+        if append_mid_read {
+            fixture.append(SESSION, &token_line(41));
+        }
+    })
+}
+
+/// `certify_job`, with `mid_read` run once on the file after the job's
+/// first page.
+fn certify_job_with(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    mut index: ScanIndex,
+    clock: &TestClock,
+    now: &mut u64,
+    page_number: &mut u64,
+    mid_read: impl FnOnce(&ScanRoot),
+) -> (ScanIndex, u64, u64, [usize; 11]) {
+    let mut mid_read = Some(mid_read);
     let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
     let certified = counter(cache, |c| c.jobs_certified);
     let mut opened = None;
-    let mut appended = !append_mid_read;
     for _ in 0..64 {
         clock.set(*now);
         *page_number += 1;
@@ -2104,13 +2122,76 @@ fn certify_job(
             return (index, opened, *now, reasons);
         }
         assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
-        if !appended && opened.is_some() {
-            fixture.append(SESSION, &token_line(41));
-            appended = true;
+        if opened.is_some() {
+            if let Some(mid_read) = mid_read.take() {
+                mid_read(fixture);
+            }
         }
         *now += step;
     }
     panic!("the cursor job did not certify: {}", counters(cache));
+}
+
+/// [money] A same-size touch landing during an in-flight Full (a cursor job
+/// past its first page) earns exactly the completion credit it earns without
+/// write generation counts: the count never enters the stamp a Full's commit
+/// compares. The job that certifies is verified at its own commit with no
+/// debt, and its opening and commit clocks, Full reasons, job counts, head
+/// verification, debt and marker are the same with counts as without.
+#[test]
+fn a_touch_during_an_in_flight_full_earns_the_credit_it_earns_without_counts() {
+    use crate::transcript_acquisition::{Generations, UseGenerations};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let outcome = |generations| {
+        let _counts = UseGenerations::new(generations);
+        let clock = TestClock;
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut now = 1_900_000_000_u64;
+        clock.set(now);
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 8192, 64, || {
+            let mut page_number = 0;
+            let (index, opened, committed, reasons) = certify_job_with(
+                &fixture,
+                &cache,
+                ScanIndex::default(),
+                &clock,
+                &mut now,
+                &mut page_number,
+                |fixture| {
+                    let path = fixture.file(SESSION);
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(modified + std::time::Duration::from_secs(2))
+                        .unwrap();
+                },
+            );
+            let complete = head(&index, &key).expect("complete head");
+            assert_eq!(complete.sealed_offset, fixture.len(SESSION));
+            (
+                opened,
+                committed,
+                reasons,
+                counter(&cache, |c| c.jobs_started),
+                counter(&cache, |c| c.jobs_certified),
+                complete.verified_unix_seconds,
+                complete.audit_debt_unix_seconds,
+                index.files[&key].unverified_deadline(),
+            )
+        })
+    };
+    let without = outcome(Generations::Off);
+    let (_, committed, _, _, certified, verified, debt, marker) = without;
+    assert_eq!(certified, 1);
+    assert_eq!(verified, committed, "the certified read verifies at commit");
+    assert_eq!((debt, marker), (None, None));
+    assert_eq!(outcome(Generations::Simulated), without);
 }
 
 /// The candidate an unchanged file presents to the scheduler: its own index

@@ -2098,7 +2098,8 @@ mod progress_rows {
     }
 
     /// [format] Carry fixture for an older binary: a published route holding
-    /// progress rows at writer capability 6, checkpointed and kept on disk.
+    /// progress rows (which need writer capability 6; this build writes 7),
+    /// checkpointed and kept on disk.
     /// Run only by the historical carry harness, which needs older release sources.
     #[test]
     #[ignore = "run by the historical carry harness"]
@@ -2135,7 +2136,8 @@ mod progress_rows {
                 })
             });
         assert!(matches!(outcome.unwrap(), progress::Outcome::Committed(_)));
-        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        // This build's writer capability (7: Tail head envelope 2).
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(7));
         let mut expected = Json::Null;
         with_session_db(&index, |db| {
             expected = stored_rows(db);
@@ -2168,7 +2170,8 @@ mod progress_rows {
             actual, expected,
             "re-upgrade equals the never-downgraded store"
         );
-        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        // This build's writer capability (7: Tail head envelope 2).
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(7));
         println!("PROGRESS_CARRY_REUPGRADE_VERIFIED");
     }
 
