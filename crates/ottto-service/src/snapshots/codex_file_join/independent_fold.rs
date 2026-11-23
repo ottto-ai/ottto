@@ -124,6 +124,38 @@ fn merge_rows(into: &mut Vec<SnapshotModelUsage>, rows: Vec<SnapshotModelUsage>)
     Ok(())
 }
 
+/// Context posture of one revert branch folded into the running body. Each
+/// member counted only its own lines, so the session's figures compose
+/// exactly: the peak is the highest member peak (ties keep the earlier
+/// member), the last request is the most recently active member's, and the
+/// compactions are every member's (count summed; markers through the same
+/// newest-64 order the parser uses, the earlier member winning an equal
+/// timestamp). The first request and the opening block stay the original's:
+/// the session starts there.
+fn compose_context_posture(item: &mut SnapshotItem, next: &mut SnapshotItem) {
+    if next.peak_context_fill_tokens > item.peak_context_fill_tokens {
+        item.peak_context_fill_tokens = next.peak_context_fill_tokens;
+        item.peak_context_fill_window_tokens = next.peak_context_fill_window_tokens;
+    }
+    // `item` already holds the latest activity of the members folded so far.
+    if next.last_turn_context_tokens.is_some()
+        && next.source_last_activity_at > item.source_last_activity_at
+    {
+        item.last_turn_context_tokens = next.last_turn_context_tokens;
+        item.last_turn_context_window_tokens = next.last_turn_context_window_tokens;
+    }
+    item.compaction_count = match (item.compaction_count, next.compaction_count) {
+        (Some(own), Some(other)) => Some(own.saturating_add(other)),
+        (own, other) => own.or(other),
+    };
+    let mut timestamps = std::mem::take(&mut item.compaction_timestamps);
+    timestamps.append(&mut next.compaction_timestamps);
+    item.compaction_timestamps = crate::snapshots::bounded_compaction_timestamps(timestamps);
+    let mut events = std::mem::take(&mut item.compaction_events);
+    events.append(&mut next.compaction_events);
+    item.compaction_events = crate::snapshots::bounded_compaction_events(events);
+}
+
 /// The original member supplies the session metadata/binding. The final member
 /// is only the transport carrier. Each file has already finished independently,
 /// including its cache detector; never infer adjacency across revert branches.
@@ -165,7 +197,7 @@ pub(in crate::snapshots) fn fold(
             )
         })
     };
-    for next in iter {
+    for mut next in iter {
         anyhow::ensure!(
             resolve_codex_identity(&item.source_session_id)
                 == resolve_codex_identity(&next.source_session_id),
@@ -215,6 +247,7 @@ pub(in crate::snapshots) fn fold(
                 && item.request_evidence == next.request_evidence,
             "folded member placement differs"
         );
+        compose_context_posture(&mut item, &mut next);
         let mut sum = usage_totals_from_item(&item);
         anyhow::ensure!(
             sum.add(&usage_totals_from_item(&next)),
