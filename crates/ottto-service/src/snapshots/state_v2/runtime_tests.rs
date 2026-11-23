@@ -2099,9 +2099,9 @@ mod progress_rows {
 
     /// [format] Carry fixture for an older binary: a published route holding
     /// progress rows at writer capability 6, checkpointed and kept on disk.
-    /// Run only by scripts/test_progress_rows_carry.py.
+    /// Run only by the historical carry harness, which needs older release sources.
     #[test]
-    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    #[ignore = "run by the historical carry harness"]
     fn write_progress_rows_carry_fixture() {
         let root = carry_dir();
         let support = root.join("support");
@@ -2155,7 +2155,7 @@ mod progress_rows {
     /// [format] After an older binary refused the store, this binary opens it
     /// and reads exactly the rows it wrote: re-upgrade equals no downgrade.
     #[test]
-    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    #[ignore = "run by the historical carry harness"]
     fn verify_progress_rows_carry_reupgrade() {
         let root = carry_dir();
         let path = PathBuf::from(fs::read_to_string(root.join("index-path.txt")).unwrap());

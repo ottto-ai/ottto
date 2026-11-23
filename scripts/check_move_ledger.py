@@ -106,7 +106,6 @@ REPORT_LIMIT = 50
 VALIDATOR_EDITS = {
     "crates/ottto-service/src/snapshot_sync/source_guard_tests.rs",
     "crates/ottto-service/tests/support/scan_index_v201.rs",
-    "scripts/test_codex_zst_downgrade.py",
 }
 DIFF_LIMIT = 40
 # Module attributes that change formatting only, compared with whitespace dropped.
