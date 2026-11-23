@@ -3663,6 +3663,8 @@ fn decide_holders(
     };
 
     for wanted in wanted {
+        #[cfg(test)]
+        pipeline_test_observer::record_holder(wanted.order.1, wanted.covered.values().min());
         let decided =
             |hash: &u64| wanted.covered.contains_key(hash) || wanted.stored.contains(hash);
         let uncovered = wanted
