@@ -120,6 +120,23 @@ fails. Verify `release-manifest.json.sig` with
 before trusting the manifest as the stable release record so the CMS payload is
 bound to the expected Ottto Developer ID identity.
 
+## Releases before 0.1.262
+
+Ottto 0.1.262 and earlier were built before this repository's history begins
+(see [CHANGELOG.md](../CHANGELOG.md)). For those releases:
+
+- Releases 0.1.255 through 0.1.262 keep their artifacts, release manifests and
+  `release-manifest.json.sig` at their versioned CDN URLs, for example
+  `https://install.ottto.net/ottto-local-platform/releases/stable/0.1.262/release-manifest.json`.
+  [Verify Checksums](#verify-checksums), [Verify macOS Trust](#verify-macos-trust)
+  and the manifest signature check above apply to them unchanged.
+- Releases 0.1.254 and earlier are no longer offered for download.
+- Their GitHub artifact attestations name commits from the earlier history as
+  the source digest. Those commits are not in this repository, so
+  `gh attestation verify` against this repository does not apply to them.
+- The file tree of this repository's first commit is identical to the source of
+  0.1.262.
+
 ## GitHub Release Verification Mirror
 
 The macOS stable release workflow can optionally publish a public GitHub Release
