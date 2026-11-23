@@ -80,3 +80,4 @@ ottto diagnostics collect --json
 
 Lower-level source nouns can still appear in protocol payloads and compatibility
 options, but public docs should prefer `apps` and `--app`.
+
