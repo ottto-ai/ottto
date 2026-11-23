@@ -149,6 +149,9 @@ impl Corpus {
         index.activate_effective_upload_body_witness_revision(3);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        // As prepare: the claim cutoff finish applies to this pass.
+        index.backfill_cutoff_nanos =
+            crate::backfill::load_backfill_state(&self.support).backfill_cutoff_nanos();
         let committed = index.clone();
         let (index, scan, modes) = scanner.scan(
             std::slice::from_ref(&self.root),
@@ -170,6 +173,7 @@ impl Corpus {
             stats: Default::default(),
             delivered: None,
             upload_policy: SnapshotUploadPolicy::default(),
+            cutoff_candidates: Vec::new(),
         }
     }
 
@@ -207,6 +211,9 @@ struct Page {
     delivered: Option<BTreeMap<String, String>>,
     /// What this pass's upload filter keeps.
     upload_policy: SnapshotUploadPolicy,
+    /// The claim cutoff's Claude corrections, captured where the cutoff
+    /// applies; finish settles them.
+    cutoff_candidates: Vec<crate::snapshots::ClaudeCutoffCorrectionCandidate>,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
@@ -287,7 +294,7 @@ impl Page {
             self.upload_policy,
         );
         let backfill = crate::backfill::load_backfill_state(&corpus.support);
-        apply_backfill_cutoff_with_claude_corrections(
+        (_, self.cutoff_candidates) = apply_backfill_cutoff_with_claude_corrections(
             &mut self.scan,
             &self.index,
             &disposition,
@@ -790,6 +797,7 @@ fn twin(p: &Page) -> Page {
         // A twin is an undelivered copy: only `ready`'s original earns receipts.
         delivered: None,
         upload_policy: p.upload_policy,
+        cutoff_candidates: Vec::new(),
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
@@ -6263,3 +6271,1397 @@ mod late_member_side_calls_tests {
 }
 
 mod copied_session_file_tests;
+
+// ---- Recency tiers: Claude copy holders read in tiers ----
+
+/// The fixture's census end; tier bounds and file ages count back from it.
+const TIER_CENSUS: &str = "2026-08-02T08:00:00Z";
+const OLD_AT: &str = "2026-07-02T07:00:10Z";
+
+fn census_minus(days: u64) -> u64 {
+    crate::snapshots::rfc3339_unix_seconds(TIER_CENSUS).unwrap() - days * 86_400
+}
+
+fn tier_bounds() -> Vec<u64> {
+    [1, 3, 7, 14, 30].map(census_minus).to_vec()
+}
+
+/// Write `contents` born at `birth`, last modified `days` before the census.
+fn write_aged(c: &mut Corpus, relative: &str, contents: &str, birth: &str, days: u64) -> PathBuf {
+    let path = c.write_at(relative, contents, birth);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(census_minus(days)))
+        .unwrap();
+    path
+}
+
+/// How a tiered first read is broken or answered.
+#[derive(Clone, Copy, Default)]
+struct TierRun {
+    /// The first upload of the page that reads this file is lost before any
+    /// reply: nothing commits, the ledger keeps the send pending and the
+    /// next pass reads and settles it again.
+    lost_upload_of: Option<&'static str>,
+    /// A daemon restart from the saved store right after that loss.
+    restart_on_loss: bool,
+    /// The server answers this session `unchanged` (`usage_identical`).
+    not_stored: Option<&'static str>,
+    /// This file is removed after the first page.
+    removed: Option<&'static str>,
+    /// Files per page (zero: one).
+    page_files: usize,
+    /// The tiers come from this destination's saved tier state, as prepare
+    /// and finish keep it, instead of `tiers`.
+    destination: Option<&'static str>,
+    /// This file (same path, birth and mtime) appears only once the first
+    /// read has completed, so a later pass reads it.
+    late: Option<&'static str>,
+}
+
+struct TieredRead {
+    index: ScanIndex,
+    scan: SourceScanResult,
+    /// Each page's tier bound and the files it read.
+    pages: Vec<(Option<u64>, Vec<PathBuf>)>,
+    /// The server's latest accepted body per session after each page.
+    stored: Vec<BTreeMap<String, SnapshotItem>>,
+    /// With a `destination`, before each page: its tier days, the tier
+    /// Claude finished itself and the `tier_ready_cutoff` it would report.
+    claims: Vec<(u64, Option<u64>, Option<String>)>,
+}
+
+/// One first read to its end, `page_files` per page, each page uploaded,
+/// settled and reloaded as the daemon does. Each bound in `tiers` gates the
+/// read until the settled index finishes the tier (as finish records it),
+/// then the next applies. The census completing ends the import and so its
+/// tiers, as bootstrap completion does; four more passes follow. The server
+/// keeps each session's latest accepted body, recorded from its reply.
+fn tiered_read(c: &Corpus, tiers: &[u64], run: TierRun) -> TieredRead {
+    tiered_read_from(c, tiers, run, ScanIndex::default())
+}
+
+/// `tiered_read` from a committed index `start` (an earlier read's), to a
+/// destination whose server holds nothing yet.
+fn tiered_read_from(c: &Corpus, tiers: &[u64], run: TierRun, start: ScanIndex) -> TieredRead {
+    let scanner = E2ScanFixture::default();
+    let hidden = c.base.join("late-file");
+    if let Some(relative) = run.late {
+        std::fs::rename(c.root.join(relative), &hidden).unwrap();
+    }
+    let claude = SnapshotSource::ClaudeCode;
+    let state = || crate::backfill::load_backfill_state(&c.support);
+    let bound = |destination: &str| {
+        state()
+            .first_read_tier(destination, claude)
+            .map(|(_, bound)| bound)
+    };
+    let mut tiers = tiers.iter().copied();
+    let mut cutoff = match run.destination {
+        Some(destination) => {
+            crate::backfill::record_first_census(
+                &c.support,
+                claude,
+                destination,
+                TIER_CENSUS,
+                true,
+            )
+            .unwrap();
+            bound(destination)
+        }
+        None => tiers.next(),
+    };
+    let mut claims = Vec::new();
+    let mut committed = start;
+    let mut progress = e2_progress();
+    let mut latest = BTreeMap::new();
+    let mut pages = Vec::new();
+    let mut stored = Vec::new();
+    let mut last = None;
+    let mut lost = false;
+    let mut completed = false;
+    let mut quiet = 0;
+    for n in 0..64 {
+        if let Some(destination) = run.destination {
+            let state = state();
+            let tier = &state.first_read_tiers[destination];
+            claims.push((
+                tier.days,
+                tier.finished.get(claude.api_slug()).copied(),
+                state.first_read_cutoffs(destination, claude.api_slug()).1,
+            ));
+        }
+        let mut index = committed.clone();
+        index.first_read_tier_cutoff = cutoff;
+        let mut page = ready(c, &scanner, index, run.page_files.max(1), true);
+        let paths = scanner.paths();
+        pages.push((cutoff, paths.clone()));
+        if n == 0 {
+            if let Some(relative) = run.removed {
+                std::fs::remove_file(c.root.join(relative)).unwrap();
+            }
+        }
+        if !lost
+            && run
+                .lost_upload_of
+                .is_some_and(|file| paths.iter().any(|path| path.ends_with(file)))
+        {
+            lost = true;
+            page.finish();
+            let (result, _, _) = upload(&page.scan.snapshots, &mut progress, |_| {
+                Err(anyhow!("synthetic connection reset before any reply"))
+            });
+            assert!(result.is_err());
+            stored.push(latest.clone());
+            drop(page);
+            if run.restart_on_loss && n > 0 {
+                committed = cold_restart(committed);
+            }
+            continue;
+        }
+        let complete = page.scan.census_complete;
+        let sent = {
+            let mut sent = twin(&page);
+            sent.finish();
+            sent.scan
+        };
+        let (settled, accepted) =
+            settle_answering(c, &committed, page, &mut progress, run.not_stored);
+        committed = settled;
+        for item in accepted {
+            latest.insert(item.source_session_id.clone(), item);
+        }
+        stored.push(latest.clone());
+        last = Some(sent);
+        committed.first_read_tier_cutoff = cutoff;
+        if complete {
+            if !completed {
+                if let Some(relative) = run.late {
+                    std::fs::rename(&hidden, c.root.join(relative)).unwrap();
+                }
+            }
+            completed = true;
+            cutoff = None;
+        } else if cutoff.is_some()
+            && committed.first_read_tier_finished(SnapshotSource::ClaudeCode, |_| None)
+        {
+            cutoff = match run.destination {
+                Some(destination) => {
+                    crate::backfill::record_first_read_tier_pass(
+                        &c.support,
+                        claude,
+                        destination,
+                        &[claude],
+                    )
+                    .unwrap();
+                    bound(destination)
+                }
+                None => tiers.next(),
+            };
+        }
+        committed.first_read_tier_cutoff = None;
+        // A holder's save may mark a copy's correction for a later pass, so
+        // a few passes follow the census.
+        if completed {
+            quiet += 1;
+            if quiet > 4 {
+                break;
+            }
+        }
+    }
+    let mut scan = last.expect("a page was sent");
+    assert!(completed, "first read finished: {pages:?}");
+    let mut bodies = BTreeSet::new();
+    scan.snapshots = latest
+        .into_values()
+        .filter(|item| bodies.insert(item.snapshot_fingerprint.clone()))
+        .collect();
+    TieredRead {
+        index: committed,
+        scan,
+        pages,
+        stored,
+        claims,
+    }
+}
+
+/// `settle`, with `not_stored`'s bodies answered `unchanged`
+/// (`usage_identical`). Returns the settled index and the bodies the server
+/// accepted.
+fn settle_answering(
+    c: &Corpus,
+    committed: &ScanIndex,
+    mut page: Page,
+    progress: &mut SnapshotUploadProgress,
+    not_stored: Option<&str>,
+) -> (ScanIndex, Vec<SnapshotItem>) {
+    page.finish();
+    let sent = page.scan.snapshots.clone();
+    let mut stored = BTreeSet::new();
+    upload(&sent, progress, |batch| {
+        let mut response = ack(batch)?;
+        let (unchanged, accepted) = std::mem::take(&mut response.accepted_entities)
+            .into_iter()
+            .partition::<Vec<_>, _>(|entity| Some(entity.source_session_id.as_str()) == not_stored);
+        stored.extend(
+            accepted
+                .iter()
+                .map(|entity| entity.snapshot_fingerprint.clone()),
+        );
+        response.accepted_entities = accepted;
+        for mut entity in unchanged {
+            entity.unchanged_basis = Some("usage_identical".into());
+            response.unchanged_entities.push(entity);
+        }
+        Ok(response)
+    })
+    .0
+    .unwrap();
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut page.index,
+        &mut page.scan,
+        &page.disposition,
+    );
+    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, progress);
+    // The production order after save selection, with the claim cutoff's
+    // corrections.
+    finish_selected_settlement(
+        &mut settled.index,
+        SelectedSettlementInputs {
+            scan: &page.scan,
+            committed_index: committed,
+            progress,
+            candidates: &[],
+            cutoff_candidates: &page.cutoff_candidates,
+            transport_fully_settled: settled.fully_settled,
+            body_drains: Default::default(),
+            audit_release: None,
+        },
+    );
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
+    let accepted = sent
+        .into_iter()
+        .filter(|item| stored.contains(&item.snapshot_fingerprint))
+        .collect();
+    (c.reload_in(&mut settled.index, "scan-index.json"), accepted)
+}
+
+/// The tier bound of the page that read `file`.
+fn read_under(read: &TieredRead, file: &str) -> Option<Option<u64>> {
+    read.pages
+        .iter()
+        .find(|(_, paths)| paths.iter().any(|path| path.ends_with(file)))
+        .map(|(cutoff, _)| *cutoff)
+}
+
+/// The final state of a tiered read equals the untiered read's (after the
+/// existing reconcile), in money, receipts, ownership and placement.
+fn assert_tiered_equals_untiered(name: &str, untiered: &TieredRead, tiered: &TieredRead) {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    let requests = |read: &TieredRead| {
+        read.scan
+            .snapshots
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.request_count))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        requests(untiered),
+        requests(tiered),
+        "{name}: requests per session; untiered pages {:?}; tiered pages {:?}",
+        untiered.pages,
+        tiered.pages
+    );
+    let buckets = |read: &TieredRead| {
+        read.scan
+            .snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    serde_json::to_value(&item.usage_buckets).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        buckets(untiered),
+        buckets(tiered),
+        "{name}: accepted buckets per session"
+    );
+    assert_eq!(
+        e2::pipeline_test_observer::durable_ownership(&untiered.index),
+        e2::pipeline_test_observer::durable_ownership(&tiered.index),
+        "{name}: durable copy ownership and upload eligibility per file"
+    );
+    let source = SnapshotSource::ClaudeCode;
+    let cold = scan_money(source, &untiered.index, &untiered.scan);
+    let other = scan_money(source, &tiered.index, &tiered.scan);
+    money_oracle::assert_equivalent(&cold, &other);
+    money_oracle::assert_no_smaller_reemit(name, &cold, &other, &cold, false);
+}
+
+/// A holder (20 days old) and its copy (new) in one folder: the copy's own
+/// line and the copied one, born after the copied line.
+fn holder_and_copy(c: &mut Corpus, copy_folder: &str) {
+    write_aged(
+        c,
+        &format!("{ROOT}.jsonl"),
+        &line(ROOT, "original", OLD_AT, 10),
+        "2026-07-02T07:00:00Z",
+        20,
+    );
+    c.write_at(
+        &format!("{copy_folder}{COPY}.jsonl"),
+        &(line(COPY, "original", OLD_AT, 10) + &line(COPY, "own", AT, 20)),
+        "2026-08-02T07:00:00Z",
+    );
+}
+
+/// [money] The copy is read first in the 1-day tier with its holder unread:
+/// it counts and discloses the copied prefix, which pulls the 20-day holder
+/// into the same tier; once the holder is accepted the save-time re-decide
+/// removes the prefix from the copy. The final state equals the untiered read.
+#[test]
+fn e2_tier_pulls_the_copy_holder_into_tier_one() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-holder-pulled");
+        holder_and_copy(&mut c, "");
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        let copy = format!("{COPY}.jsonl");
+        let holder = format!("{ROOT}.jsonl");
+        let page_of = |file: &str| {
+            tiered
+                .pages
+                .iter()
+                .position(|(_, paths)| paths.iter().any(|path| path.ends_with(file)))
+        };
+        assert!(
+            page_of(&copy) < page_of(&holder),
+            "the copy is read before its holder: {:?}",
+            tiered.pages
+        );
+        assert_eq!(
+            read_under(&tiered, &holder),
+            Some(Some(tier_bounds()[0])),
+            "the holder is pulled into the 1-day tier: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("holder-pulled", &untiered, &tiered);
+    });
+}
+
+/// [money] A chain of two holders (40 and 20 days old) and a new copy of the
+/// copy, in one folder: the new copy pulls both; the final state equals the
+/// untiered read.
+#[test]
+fn e2_tier_pulls_a_chain_of_two_holders() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-holder-chain");
+        let first = line(ROOT, "r1", "2026-06-20T07:00:10Z", 10);
+        write_aged(&mut c, &format!("{ROOT}.jsonl"), &first, "2026-06-20T07:00:00Z", 40);
+        let second = line(COPY, "r1", "2026-06-20T07:00:10Z", 10)
+            + &line(COPY, "r2", OLD_AT, 20);
+        write_aged(&mut c, &format!("{COPY}.jsonl"), &second, "2026-07-02T07:00:00Z", 20);
+        c.write_at(
+            &format!("{THIRD}.jsonl"),
+            &(line(THIRD, "r1", "2026-06-20T07:00:10Z", 10)
+                + &line(THIRD, "r2", OLD_AT, 20)
+                + &line(THIRD, "r3", AT, 30)),
+            "2026-08-02T07:00:00Z",
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        for holder in [ROOT, COPY] {
+            assert_eq!(
+                read_under(&tiered, &format!("{holder}.jsonl")),
+                Some(Some(tier_bounds()[0])),
+                "{holder} is pulled into the 1-day tier: {:?}",
+                tiered.pages
+            );
+        }
+        assert_tiered_equals_untiered("holder-chain", &untiered, &tiered);
+    });
+}
+
+/// [money] The holder is listed, then removed before any read: the copy
+/// counts the copied request once and discloses it (`copy_unproven` route),
+/// the removed holder takes its removal route and the tiers still finish.
+/// The final state equals an untiered read of the copy alone (same files).
+#[test]
+fn e2_tier_holder_gone_keeps_the_copy_count_and_finishes() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-holder-gone");
+        holder_and_copy(&mut c, "");
+        let removed = Box::leak(format!("{ROOT}.jsonl").into_boxed_str());
+        let tiered = tiered_read(
+            &c,
+            &tier_bounds(),
+            TierRun {
+                removed: Some(removed),
+                ..TierRun::default()
+            },
+        );
+        assert!(
+            e2::pipeline_test_observer::disclosed(&tiered.scan.snapshots) > 0,
+            "the copy discloses its unproven prefix"
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        assert_tiered_equals_untiered("holder-gone", &untiered, &tiered);
+    });
+}
+
+/// [money] The holder's body is answered `unchanged` (`usage_identical`, no
+/// stored body) in both reads: the final state equals the untiered read.
+#[test]
+fn e2_tier_not_stored_holder_matches_untiered() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-holder-not-stored");
+        holder_and_copy(&mut c, "");
+        let run = TierRun {
+            not_stored: Some(ROOT),
+            ..TierRun::default()
+        };
+        let untiered = tiered_read(&c, &[], run);
+        let tiered = tiered_read(&c, &tier_bounds(), run);
+        assert_tiered_equals_untiered("holder-not-stored", &untiered, &tiered);
+    });
+}
+
+/// [money] A `/branch` fork in another folder, its `fork-context-ref` line
+/// naming the parent: the parent is not pulled; it is read in its own
+/// (30-day) tier, after the fork. The final state equals the untiered read.
+#[test]
+fn e2_tier_fork_parent_in_another_folder_settles_by_redecide() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-fork-parent");
+        write_aged(
+            &mut c,
+            &format!("{ROOT}.jsonl"),
+            &line(ROOT, "original", OLD_AT, 10),
+            "2026-07-02T07:00:00Z",
+            20,
+        );
+        c.write_at(
+            &format!("fork/{COPY}.jsonl"),
+            &(fork_ref(COPY, ROOT)
+                + &line(COPY, "original", OLD_AT, 10)
+                + &line(COPY, "own", AT, 20)),
+            "2026-08-02T07:00:00Z",
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        assert_eq!(
+            read_under(&tiered, &format!("{ROOT}.jsonl")),
+            Some(Some(tier_bounds()[4])),
+            "the parent waits for its own tier: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("fork-parent", &untiered, &tiered);
+    });
+}
+
+/// [money] The upload of the page that reads the pulled holder fails before
+/// any reply (the ledger keeps it pending), and the daemon restarts from the
+/// saved store before the next pass, which reads and settles it again. The
+/// final state equals the untiered read.
+#[test]
+fn e2_tier_pending_retry_and_restart_match_untiered() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-retry-restart");
+        holder_and_copy(&mut c, "");
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let holder: &'static str = Box::leak(format!("{ROOT}.jsonl").into_boxed_str());
+        let tiered = tiered_read(
+            &c,
+            &tier_bounds(),
+            TierRun {
+                lost_upload_of: Some(holder),
+                restart_on_loss: true,
+                ..TierRun::default()
+            },
+        );
+        assert!(
+            tiered
+                .pages
+                .iter()
+                .filter(|(_, paths)| paths.iter().any(|path| path.ends_with(holder)))
+                .count()
+                >= 2,
+            "the holder is read again after the loss: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("retry-restart", &untiered, &tiered);
+    });
+}
+
+/// [money] The upload of the copy's own first page fails before any reply:
+/// nothing commits and the next pass reads the copy again. The final state
+/// equals the untiered read.
+#[test]
+fn e2_tier_lost_upload_on_the_copy_page_matches_untiered() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-lost-copy-page");
+        holder_and_copy(&mut c, "");
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let copy: &'static str = Box::leak(format!("{COPY}.jsonl").into_boxed_str());
+        let tiered = tiered_read(
+            &c,
+            &tier_bounds(),
+            TierRun {
+                lost_upload_of: Some(copy),
+                ..TierRun::default()
+            },
+        );
+        assert_tiered_equals_untiered("lost-copy-page", &untiered, &tiered);
+    });
+}
+
+/// [money] Pages of two files. Untiered, the holder and its copy share the
+/// first page, so the copy's first body already removes the copied prefix.
+/// Tiered, the copy is read alone in the 1-day tier and its first body
+/// counts and discloses the prefix (pinned: the one difference). The page
+/// that reads the pulled holder re-reads the copy, so the server never holds
+/// the holder beside an uncorrected copy. The final state equals the
+/// untiered read.
+#[test]
+fn e2_tier_holder_page_rereads_its_copy() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-holder-page-copy");
+        holder_and_copy(&mut c, "");
+        let run = TierRun {
+            page_files: 2,
+            ..TierRun::default()
+        };
+        let untiered = tiered_read(&c, &[], run);
+        let tiered = tiered_read(&c, &tier_bounds(), run);
+        let removed = |read: &TieredRead, at: usize| {
+            read.stored[at]
+                .get(COPY)
+                .map(|copy| copy.removed_request_count)
+        };
+        let first_with = |read: &TieredRead, session: &str| {
+            (0..read.stored.len())
+                .find(|&at| read.stored[at].contains_key(session))
+                .expect("stored")
+        };
+        assert_eq!(
+            removed(&untiered, first_with(&untiered, COPY)),
+            Some(Some(1)),
+            "untiered: the copy's first body removes the prefix: {:?}",
+            untiered.pages
+        );
+        assert_eq!(
+            removed(&tiered, first_with(&tiered, COPY)),
+            Some(Some(0)),
+            "tiered: the copy's first body counts and discloses it: {:?}",
+            tiered.pages
+        );
+        let holder_page = first_with(&tiered, ROOT);
+        for at in holder_page..tiered.stored.len() {
+            assert_eq!(
+                removed(&tiered, at),
+                Some(Some(1)),
+                "after the holder's page the copy is corrected: {:?}",
+                tiered.pages
+            );
+        }
+        assert_tiered_equals_untiered("holder-page-copy", &untiered, &tiered);
+    });
+}
+
+/// [money] A chain whose middle holder sits in another folder: the new copy
+/// pulls the 40-day holder of its folder; the middle one (20 days, another
+/// folder) waits for its own tier. The final state equals the untiered read.
+#[test]
+fn e2_tier_chain_with_its_middle_holder_in_another_folder() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-chain-middle-elsewhere");
+        let first = line(ROOT, "r1", "2026-06-20T07:00:10Z", 10);
+        write_aged(&mut c, &format!("{ROOT}.jsonl"), &first, "2026-06-20T07:00:00Z", 40);
+        let second = line(COPY, "r1", "2026-06-20T07:00:10Z", 10)
+            + &line(COPY, "r2", OLD_AT, 20);
+        write_aged(&mut c, &format!("mid/{COPY}.jsonl"), &second, "2026-07-02T07:00:00Z", 20);
+        c.write_at(
+            &format!("{THIRD}.jsonl"),
+            &(line(THIRD, "r1", "2026-06-20T07:00:10Z", 10)
+                + &line(THIRD, "r2", OLD_AT, 20)
+                + &line(THIRD, "r3", AT, 30)),
+            "2026-08-02T07:00:00Z",
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        assert_eq!(
+            read_under(&tiered, &format!("{ROOT}.jsonl")),
+            Some(Some(tier_bounds()[0])),
+            "the folder's holder is pulled: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("chain-middle-elsewhere", &untiered, &tiered);
+    });
+}
+
+/// [money] The pulled holder has a path twin (same session, 20 days old) in
+/// another folder: the twin is admitted with the holder's family, so both
+/// are read in the 1-day tier. The final state equals the untiered read.
+#[test]
+fn e2_tier_pulled_holder_brings_its_path_twin() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-pulled-holder-twin");
+        holder_and_copy(&mut c, "");
+        write_aged(
+            &mut c,
+            &format!("x/{ROOT}.jsonl"),
+            &line(ROOT, "original", OLD_AT, 10),
+            "2026-07-02T07:00:00Z",
+            20,
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        assert_eq!(
+            read_under(&tiered, &format!("x/{ROOT}.jsonl")),
+            Some(Some(tier_bounds()[0])),
+            "the twin comes with the pulled holder's family: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("pulled-holder-twin", &untiered, &tiered);
+    });
+}
+
+/// A claim cutoff between the holder's line (`OLD_AT`) and its copy's own
+/// line (`AT`).
+const SWITCH_CUTOFF: &str = "2026-07-15T00:00:00Z";
+
+/// When a body's session activity ended, as the claim cutoff reads it.
+fn activity_ended(item: &SnapshotItem) -> Option<u64> {
+    [
+        &item.source_last_activity_at,
+        &item.source_ended_at,
+        &item.source_started_at,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|at| crate::snapshots::rfc3339_unix_seconds(at))
+    .max()
+}
+
+/// Claim completion for `destination`: `policy` with `cutoff`, for `user`,
+/// recorded before its bootstrap.
+fn claim(c: &Corpus, policy: &str, cutoff: Option<&str>, user: &str, destination: &str) {
+    crate::backfill::apply_claim_backfill_policy_for_destination(
+        &c.support,
+        Some(policy),
+        cutoff,
+        user,
+        Some(destination),
+    )
+    .unwrap();
+}
+
+/// The server's latest accepted body of `session` once the read ends.
+fn latest_of<'a>(read: &'a TieredRead, session: &str) -> Option<&'a SnapshotItem> {
+    read.stored.last().and_then(|stored| stored.get(session))
+}
+
+fn page_of(read: &TieredRead, file: &str) -> Option<usize> {
+    read.pages
+        .iter()
+        .position(|(_, paths)| paths.iter().any(|path| path.ends_with(file)))
+}
+
+/// The three placements of the holder and its copy, each with the tiers
+/// that keep it: (a) one two-file page, under one tier wide enough for both
+/// (the 1-day tier reads the copy alone and pulls its holder onto a later
+/// page); (b) the holder read first; (c) the copy read first.
+fn placements() -> [(&'static str, TierRun, Vec<u64>); 3] {
+    let holder: &'static str = Box::leak(format!("{ROOT}.jsonl").into_boxed_str());
+    let copy: &'static str = Box::leak(format!("{COPY}.jsonl").into_boxed_str());
+    [
+        (
+            "same-page",
+            TierRun {
+                page_files: 2,
+                ..TierRun::default()
+            },
+            vec![census_minus(30)],
+        ),
+        (
+            "holder-first",
+            TierRun {
+                late: Some(copy),
+                ..TierRun::default()
+            },
+            tier_bounds(),
+        ),
+        (
+            "copy-first",
+            TierRun {
+                late: Some(holder),
+                ..TierRun::default()
+            },
+            tier_bounds(),
+        ),
+    ]
+}
+
+/// `read` read the holder and its copy in `placement`.
+fn assert_placed(name: &str, placement: &str, read: &TieredRead) {
+    let holder = page_of(read, &format!("{ROOT}.jsonl"));
+    let copy = page_of(read, &format!("{COPY}.jsonl"));
+    let placed = match placement {
+        "same-page" => holder == copy,
+        "holder-first" => holder < copy,
+        "copy-first" => copy < holder,
+        other => panic!("unknown placement {other}"),
+    };
+    assert!(
+        holder.is_some() && copy.is_some() && placed,
+        "{name}: {placement}: {:?}",
+        read.pages
+    );
+}
+
+/// A cold restart from a read's saved store (`saved`, the route's last
+/// index handle), then one more pass: settled, it opens no file and sends
+/// nothing.
+fn assert_settled_after_restart(name: &str, c: &Corpus, saved: ScanIndex) {
+    let index = cold_restart(saved);
+    let scanner = E2ScanFixture::default();
+    scanner
+        .on_committed_route(&crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).unwrap());
+    let page = ready(c, &scanner, index, 100, true);
+    assert!(
+        scanner.paths().is_empty(),
+        "{name}: a settled pass after a restart opens no file: {:?}",
+        scanner.paths()
+    );
+    assert!(
+        page.scan.snapshots.is_empty(),
+        "{name}: and sends nothing"
+    );
+}
+
+/// The one answer under a `from` cutoff: the holder (its session ended
+/// before the cutoff) never reaches the server, its accepted rows or accepted
+/// origin, and the copy counts its `own` requests only: the copied one is
+/// removed, not disclosed.
+fn assert_copied_prefix_counts_nowhere(name: &str, c: &Corpus, read: &TieredRead, own: u64) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let holder = c
+        .root
+        .join(format!("{ROOT}.jsonl"))
+        .to_string_lossy()
+        .into_owned();
+    for stored in &read.stored {
+        assert!(
+            !stored.contains_key(ROOT),
+            "{name}: the holder never reaches the server: {:?}",
+            read.pages
+        );
+    }
+    assert!(
+        !crate::snapshots::e2_pipeline_scan_fixture::accepted_file_for_test(&read.index, &holder),
+        "{name}: the holder is no accepted origin"
+    );
+    assert!(
+        !read
+            .index
+            .upload_context_proof
+            .request_contributions
+            .values()
+            .flat_map(|slot| slot.rows.iter())
+            .any(|(loc, _)| *loc == location_key(&holder)),
+        "{name}: the holder has no accepted rows"
+    );
+    let copy = latest_of(read, COPY).unwrap_or_else(|| panic!("{name}: the copy is stored"));
+    assert_eq!(
+        (copy.request_count, copy.removed_request_count),
+        (own, Some(1)),
+        "{name}: the copy counts its own requests and removes the copied one: {:?}",
+        read.pages
+    );
+    assert_eq!(
+        e2::pipeline_test_observer::disclosed(std::slice::from_ref(copy)),
+        0,
+        "{name}: nothing is disclosed"
+    );
+}
+
+/// [money] A real account switch. Destination A reads the history tiered
+/// from its own tier state, and the history grows. A claim then binds
+/// destination B through the claim policy, for another user, with B recorded
+/// before its bootstrap: `from` with a cutoff between the holder's line and
+/// its copy's own line, the same `from` claim followed by a same-user `full`
+/// one (which keeps the cutoff), or `full`. B's first import then runs
+/// untiered and tiered from the same saved state, through the claim cutoff
+/// and the finish settlement with its corrections. The final states are
+/// equal. Under the cutoff no session that ended before it reaches B and the
+/// copied request counts nowhere; under `full` the holder counts it. B's
+/// tiers start at 1 day with no claim, and B never claims a tier it did not
+/// finish; A's tier state stays A's.
+#[test]
+fn e2_tier_fresh_destination_after_account_switch_matches_untiered() {
+    for (policy, then_full) in [("from", false), ("from-then-full", true), ("full", false)] {
+        with_e2(|| {
+            let mut c = Corpus::new(&format!("e2-tier-account-switch-{policy}"));
+            holder_and_copy(&mut c, "");
+            // In its own folder, so no folder pull brings it into tier 1.
+            write_aged(
+                &mut c,
+                &format!("old/{THIRD}.jsonl"),
+                &line(THIRD, "t1", "2026-06-20T07:00:10Z", 5),
+                "2026-06-20T07:00:00Z",
+                40,
+            );
+            let (a, b) = ("destination-a", "destination-b");
+            let claude = SnapshotSource::ClaudeCode.api_slug();
+            let state = || crate::backfill::load_backfill_state(&c.support);
+            claim(&c, "full", None, "user-a", a);
+            tiered_read(
+                &c,
+                &[],
+                TierRun {
+                    destination: Some(a),
+                    ..TierRun::default()
+                },
+            );
+            let a_tier = state().first_read_tiers[a].clone();
+            assert!(
+                a_tier.finished.contains_key(claude),
+                "{policy}: A finished tiers itself"
+            );
+            assert!(state().first_read_cutoffs(a, claude).1.is_some());
+            append(
+                &c.root.join(format!("{COPY}.jsonl")),
+                &line(COPY, "after-switch", "2026-08-02T07:40:00Z", 40),
+            );
+            let cutoff = (policy != "full").then_some(SWITCH_CUTOFF);
+            claim(&c, policy.split('-').next().unwrap(), cutoff, "user-b", b);
+            if then_full {
+                claim(&c, "full", None, "user-b", b);
+            }
+            assert_eq!(
+                state().backfill_cutoff_at.as_deref(),
+                cutoff,
+                "{policy}: a same-user full claim keeps the cutoff"
+            );
+            let path = crate::backfill::backfill_state_path(&c.support);
+            let start = std::fs::read(&path).unwrap();
+            let untiered = tiered_read(&c, &[], TierRun::default());
+            std::fs::write(&path, &start).unwrap();
+            let tiered = tiered_read(
+                &c,
+                &[],
+                TierRun {
+                    destination: Some(b),
+                    ..TierRun::default()
+                },
+            );
+            assert_tiered_equals_untiered(&format!("account-switch-{policy}"), &untiered, &tiered);
+            for (run, read) in [("untiered", &untiered), ("tiered", &tiered)] {
+                let name = format!("{policy}-{run}");
+                match cutoff {
+                    Some(cutoff) => {
+                        assert_copied_prefix_counts_nowhere(&name, &c, read, 2);
+                        let cutoff = crate::snapshots::rfc3339_unix_seconds(cutoff).unwrap();
+                        for stored in &read.stored {
+                            assert!(
+                                !stored.contains_key(THIRD),
+                                "{name}: sessions that ended before the cutoff stay off B"
+                            );
+                            for item in stored.values() {
+                                assert!(
+                                    activity_ended(item).is_some_and(|ended| ended >= cutoff),
+                                    "{name}: {} ended before the cutoff",
+                                    item.source_session_id
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        let copy = latest_of(read, COPY).unwrap();
+                        assert_eq!(
+                            (
+                                latest_of(read, ROOT).map(|holder| holder.request_count),
+                                copy.request_count,
+                                copy.removed_request_count
+                            ),
+                            (Some(1), 2, Some(1)),
+                            "{name}: the holder counts the copied request"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                tiered.claims.first(),
+                Some(&(1, None, None)),
+                "{policy}: B starts at 1 day with nothing finished and no claim"
+            );
+            for (_, finished, claimed) in &tiered.claims {
+                match (finished, claimed) {
+                    (_, None) => {}
+                    (Some(days), Some(claimed)) => assert!(
+                        crate::snapshots::rfc3339_unix_seconds(claimed).unwrap()
+                            >= census_minus(*days),
+                        "{policy}: B claims no wider than it finished: {:?}",
+                        tiered.claims
+                    ),
+                    (None, Some(_)) => {
+                        panic!("{policy}: a claim B did not earn: {:?}", tiered.claims)
+                    }
+                }
+            }
+            assert!(
+                tiered.claims.iter().any(|(_, finished, _)| finished.is_some()),
+                "{policy}: B finished a tier itself: {:?} {:?}",
+                tiered.claims,
+                tiered.pages
+            );
+            let after = state();
+            assert_eq!(after.first_read_tiers[a], a_tier, "{policy}: A's tier state is A's");
+            assert!(after.first_read_tiers.contains_key(b));
+        });
+    }
+}
+
+/// [money] Placement (a), under a `from` cutoff: the holder and its copy on
+/// one page (two-file pages; the tiered read under one tier wide enough for
+/// both). The holder's page body proves the copied request; finish drops the
+/// holder, and the emptied holder keeps proving it. Tiered and untiered reads
+/// give the one answer, and a pass after a cold restart reads nothing.
+#[test]
+fn e2_tier_switch_holder_and_copy_on_one_page_count_the_prefix_nowhere() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-same-page");
+        holder_and_copy(&mut c, "");
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let [(placement, run, tiers), ..] = placements();
+        let untiered = tiered_read(&c, &[], run);
+        let tiered = tiered_read(&c, &tiers, run);
+        for (name, read) in [("same-page-untiered", &untiered), ("same-page-tiered", &tiered)] {
+            assert_placed(name, placement, read);
+            assert_copied_prefix_counts_nowhere(name, &c, read, 1);
+        }
+        assert_tiered_equals_untiered("switch-same-page", &untiered, &tiered);
+        drop(untiered);
+        assert_settled_after_restart("same-page-tiered", &c, tiered.index);
+    });
+}
+
+/// [money] Placement (b), under a `from` cutoff: the holder is read and
+/// emptied by the cutoff in an earlier pass; the copy appears and is read
+/// later. The emptied holder (last written before the cutoff) proves the
+/// copied request. Tiered and untiered reads give the one answer, and a pass
+/// after a cold restart reads nothing.
+#[test]
+fn e2_tier_switch_holder_emptied_before_its_copy_counts_the_prefix_nowhere() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-holder-first");
+        holder_and_copy(&mut c, "");
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let [_, (placement, run, tiers), _] = placements();
+        let untiered = tiered_read(&c, &[], run);
+        let tiered = tiered_read(&c, &tiers, run);
+        for (name, read) in [("holder-first-untiered", &untiered), ("holder-first-tiered", &tiered)] {
+            assert_placed(name, placement, read);
+            assert_copied_prefix_counts_nowhere(name, &c, read, 1);
+        }
+        assert_tiered_equals_untiered("switch-holder-first", &untiered, &tiered);
+        drop(untiered);
+        assert_settled_after_restart("holder-first-tiered", &c, tiered.index);
+    });
+}
+
+/// [money] Placement (c), under a `from` cutoff: the copy is read first and
+/// counts the copied request (disclosed) before the holder is read; the
+/// holder appears and is read later, and the cutoff empties it. The save-time
+/// re-decide marks the copy, whose next read removes the request. Tiered and
+/// untiered reads give the one answer, and a pass after a cold restart reads
+/// nothing.
+#[test]
+fn e2_tier_switch_holder_read_after_its_copy_counts_the_prefix_nowhere() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-copy-first");
+        holder_and_copy(&mut c, "");
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let [_, _, (placement, run, tiers)] = placements();
+        let untiered = tiered_read(&c, &[], run);
+        let tiered = tiered_read(&c, &tiers, run);
+        for (name, read) in [("copy-first-untiered", &untiered), ("copy-first-tiered", &tiered)] {
+            assert_placed(name, placement, read);
+            let (at, first) = read
+                .stored
+                .iter()
+                .enumerate()
+                .find_map(|(at, stored)| stored.get(COPY).map(|copy| (at, copy)))
+                .unwrap_or_else(|| panic!("{name}: the copy is stored"));
+            assert!(
+                Some(at) < page_of(read, &format!("{ROOT}.jsonl")),
+                "{name}: the copy's first body is stored before the holder is read: {:?}",
+                read.pages
+            );
+            assert_eq!(
+                first.request_count, 2,
+                "{name}: before the holder is read the copy counts the copied request"
+            );
+            assert!(
+                e2::pipeline_test_observer::disclosed(std::slice::from_ref(first)) > 0,
+                "{name}: and discloses it"
+            );
+            assert_copied_prefix_counts_nowhere(name, &c, read, 1);
+        }
+        assert_tiered_equals_untiered("switch-copy-first", &untiered, &tiered);
+        drop(untiered);
+        assert_settled_after_restart("copy-first-tiered", &c, tiered.index);
+    });
+}
+
+/// [money] A touched holder: its session ended before the `from` cutoff, but
+/// its file was last written after it, so nothing local shows that finish
+/// empties the history. It owns nothing: in each placement, tiered or not,
+/// every stored body of the copy counts the copied request and discloses it,
+/// from the first.
+#[test]
+fn e2_tier_switch_touched_holder_leaves_the_copy_counting() {
+    for (placement, run, tiers) in placements() {
+        with_e2(|| {
+            let mut c = Corpus::new(&format!("e2-tier-switch-touched-{placement}"));
+            holder_and_copy(&mut c, "");
+            write_aged(
+                &mut c,
+                &format!("{ROOT}.jsonl"),
+                &line(ROOT, "original", OLD_AT, 10),
+                "2026-07-02T07:00:00Z",
+                13,
+            );
+            claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+            let untiered = tiered_read(&c, &[], run);
+            let tiered = tiered_read(&c, &tiers, run);
+            for (mode, read) in [("untiered", &untiered), ("tiered", &tiered)] {
+                let name = format!("touched-{placement}-{mode}");
+                assert_placed(&name, placement, read);
+                assert_copy_counts_and_discloses(&name, read);
+            }
+            assert_tiered_equals_untiered(&format!("touched-{placement}"), &untiered, &tiered);
+        });
+    }
+}
+
+/// The holder never reaches the server, and every stored body of the copy
+/// counts the copied request with its own and discloses it.
+fn assert_copy_counts_and_discloses(name: &str, read: &TieredRead) {
+    assert!(latest_of(read, COPY).is_some(), "{name}: the copy is stored");
+    for stored in &read.stored {
+        assert!(
+            !stored.contains_key(ROOT),
+            "{name}: the holder never reaches the server: {:?}",
+            read.pages
+        );
+        if let Some(copy) = stored.get(COPY) {
+            assert_eq!(
+                copy.request_count, 2,
+                "{name}: the copy counts the copied request: {:?}",
+                read.pages
+            );
+            assert!(
+                e2::pipeline_test_observer::disclosed(std::slice::from_ref(copy)) > 0,
+                "{name}: and discloses it"
+            );
+        }
+    }
+}
+
+/// [money] Path twins under a `from` cutoff: one session in two folders,
+/// both written and ended before the cutoff, with the copy beside one. Finish
+/// empties both. A holder whose session has another location proves nothing
+/// under the cutoff (that location's body may carry its requests and be
+/// refused), so the copy counts the copied request and discloses it, tiered
+/// or not.
+#[test]
+fn e2_tier_switch_holder_with_a_path_twin_leaves_the_copy_counting() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-twin-holder");
+        for folder in ["a", "b"] {
+            write_aged(
+                &mut c,
+                &format!("{folder}/{ROOT}.jsonl"),
+                &line(ROOT, "original", OLD_AT, 10),
+                "2026-07-02T07:00:00Z",
+                20,
+            );
+        }
+        c.write_at(
+            &format!("b/{COPY}.jsonl"),
+            &(line(COPY, "original", OLD_AT, 10) + &line(COPY, "own", AT, 20)),
+            "2026-08-02T07:00:00Z",
+        );
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        for (name, read) in [("twin-untiered", &untiered), ("twin-tiered", &tiered)] {
+            assert_copy_counts_and_discloses(name, read);
+        }
+        assert_tiered_equals_untiered("switch-twin-holder", &untiered, &tiered);
+    });
+}
+
+/// [money] A holder that ended and was last written before a `from` cutoff,
+/// read and emptied, whose root the birth store then forgets (absent past its
+/// retention). Nothing records its location as the session's only one, so it
+/// proves nothing: the copy, read later, counts the copied request and
+/// discloses it.
+#[test]
+fn e2_tier_switch_holder_without_a_birth_observation_leaves_the_copy_counting() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-unobserved-holder");
+        write_aged(
+            &mut c,
+            &format!("{ROOT}.jsonl"),
+            &line(ROOT, "original", OLD_AT, 10),
+            "2026-07-02T07:00:00Z",
+            20,
+        );
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let read = tiered_read(&c, &[], TierRun::default());
+        let mut prior = read.index;
+        let births = &mut prior.claude_money_birth_store;
+        assert!(
+            births.observations(ROOT).next().is_some(),
+            "the read observed the holder"
+        );
+        births.prune(1, Vec::<(&str, &str)>::new());
+        births.prune(u64::MAX, Vec::<(&str, &str)>::new());
+        assert!(
+            births.observations(ROOT).next().is_none(),
+            "the store forgot the holder's root"
+        );
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "original", OLD_AT, 10) + &line(COPY, "own", AT, 20)),
+            "2026-08-02T07:00:00Z",
+        );
+        let after = tiered_read_from(&c, &[], TierRun::default(), prior);
+        assert_copy_counts_and_discloses("unobserved-holder", &after);
+    });
+}
+
+/// [money] A /branch names its parent in a `fork-context-ref` line, and the
+/// parent's census is retired, so no request id matches. Under a `from`
+/// cutoff the parent ended before the cutoff and finish emptied it: the
+/// named-parent fallback takes no cutoff ownership, so the branch counts the
+/// copied request and discloses it.
+#[test]
+fn e2_tier_switch_named_emptied_parent_leaves_the_branch_counting() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-named-parent");
+        write_aged(
+            &mut c,
+            &format!("{ROOT}.jsonl"),
+            &line(ROOT, "original", OLD_AT, 10),
+            "2026-07-02T07:00:00Z",
+            20,
+        );
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let read = tiered_read(&c, &[], TierRun::default());
+        assert!(
+            read.stored.iter().all(|stored| !stored.contains_key(ROOT)),
+            "finish empties the parent: {:?}",
+            read.pages
+        );
+        let mut prior = read.index;
+        e2::pipeline_test_observer::retire_census(&mut prior, &format!("{ROOT}.jsonl"));
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(fork_ref(COPY, ROOT) + &line(COPY, "original", OLD_AT, 10)),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = tiered_read_from(&c, &[], TierRun::default(), prior);
+        let copy = latest_of(&branch, COPY)
+            .unwrap_or_else(|| panic!("the branch is stored: {:?}", branch.pages));
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (1, Some(0)),
+            "the branch keeps its copied request counted"
+        );
+        assert!(
+            e2::pipeline_test_observer::disclosed(std::slice::from_ref(copy)) > 0,
+            "and discloses it"
+        );
+    });
+}
+
+/// [money] The clock row, under a `from` cutoff: the holder's transcript
+/// ends before the cutoff, but its matched API event was observed after it.
+/// Finish keeps and uploads the holder on the emitted session clock, so the
+/// holder owns the copied request and it counts once, on the holder.
+#[test]
+fn e2_tier_switch_holder_kept_by_its_api_event_counts_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-clock");
+        holder_and_copy(&mut c, "");
+        let mut row = api_for(ROOT, "original", 10, 100);
+        row.observed_at = "2026-07-20T07:00:10Z".into();
+        row.fingerprint = String::new();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        c.evidence(&[row], &[]);
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        let cutoff = crate::snapshots::rfc3339_unix_seconds(SWITCH_CUTOFF).unwrap();
+        for (name, read) in [("clock-untiered", &untiered), ("clock-tiered", &tiered)] {
+            let holder = latest_of(read, ROOT)
+                .unwrap_or_else(|| panic!("{name}: finish keeps the holder: {:?}", read.pages));
+            assert!(
+                activity_ended(holder).is_some_and(|ended| ended >= cutoff),
+                "{name}: the holder ends on its API event's clock"
+            );
+            let copy = latest_of(read, COPY).unwrap();
+            assert_eq!(
+                (holder.request_count, copy.request_count, copy.removed_request_count),
+                (1, 1, Some(1)),
+                "{name}: the copied request counts once, on the holder"
+            );
+        }
+        assert_tiered_equals_untiered("switch-clock", &untiered, &tiered);
+    });
+}
+
+/// [money] Acceptance, under a `from` cutoff: the emptied holder never
+/// reaches the server, its accepted rows or accepted origin, while it owns
+/// the copied request. A later claim by another user clears the cutoff; that
+/// destination's replay of the same index uploads the holder, and the copy,
+/// read again, removes the request the holder now counts: counted once.
+#[test]
+fn e2_tier_switch_emptied_holder_is_never_accepted_and_a_cleared_cutoff_counts_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-acceptance");
+        holder_and_copy(&mut c, "");
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let first = tiered_read(&c, &tier_bounds(), TierRun::default());
+        assert_copied_prefix_counts_nowhere("acceptance-from", &c, &first, 1);
+        claim(&c, "full", None, "user-c", "destination-c");
+        assert_eq!(
+            crate::backfill::load_backfill_state(&c.support).backfill_cutoff_at,
+            None,
+            "another user's claim clears the cutoff"
+        );
+        let mut start = first.index.clone();
+        assert!(start.prepare_historical_replay("destination-c".into()));
+        let replay = tiered_read_from(&c, &[], TierRun::default(), start);
+        let holder = latest_of(&replay, ROOT)
+            .unwrap_or_else(|| panic!("the holder uploads: {:?}", replay.pages));
+        let copy = latest_of(&replay, COPY).unwrap();
+        assert_eq!(
+            (holder.request_count, copy.request_count, copy.removed_request_count),
+            (1, 1, Some(1)),
+            "the copied request counts once, on the holder"
+        );
+    });
+}
+
+/// [money] A deleted holder proves nothing: under a `from` cutoff its copy
+/// counts the copied request (disclosed), the same whether the holder shared
+/// the copy's page, was read and emptied first, or was never read.
+#[test]
+fn e2_tier_switch_deleted_holder_leaves_the_copy_counting() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-switch-holder-deleted");
+        claim(&c, "from", Some(SWITCH_CUTOFF), "user-b", "destination-b");
+        let removed: &'static str = Box::leak(format!("{ROOT}.jsonl").into_boxed_str());
+        let copy: &'static str = Box::leak(format!("{COPY}.jsonl").into_boxed_str());
+        let mut reads = Vec::new();
+        for (name, tiers, run) in [
+            (
+                "same-page",
+                Vec::new(),
+                TierRun {
+                    page_files: 2,
+                    removed: Some(removed),
+                    ..TierRun::default()
+                },
+            ),
+            (
+                "holder-first",
+                Vec::new(),
+                TierRun {
+                    removed: Some(removed),
+                    late: Some(copy),
+                    ..TierRun::default()
+                },
+            ),
+            (
+                "copy-first",
+                tier_bounds(),
+                TierRun {
+                    removed: Some(removed),
+                    ..TierRun::default()
+                },
+            ),
+        ] {
+            holder_and_copy(&mut c, "");
+            let read = tiered_read(&c, &tiers, run);
+            let body = latest_of(&read, COPY)
+                .unwrap_or_else(|| panic!("{name}: the copy is stored"))
+                .clone();
+            assert_eq!(
+                body.request_count, 2,
+                "{name}: the copy counts the copied request: {:?}",
+                read.pages
+            );
+            assert!(
+                e2::pipeline_test_observer::disclosed(std::slice::from_ref(&body)) > 0,
+                "{name}: and discloses it"
+            );
+            reads.push((name, body));
+        }
+        let fields = |body: &SnapshotItem| {
+            (
+                body.request_count,
+                body.removed_request_count,
+                serde_json::to_value(&body.usage_buckets).unwrap(),
+            )
+        };
+        for (name, body) in &reads[1..] {
+            assert_eq!(fields(body), fields(&reads[0].1), "{name}: same as same-page");
+        }
+    });
+}
+
+/// [money] Path twins (one session in two folders, the old one 20 days
+/// back): the new twin admits its family whole, so both are read in the
+/// 1-day tier and twin ownership is unchanged. The final state equals the
+/// untiered read.
+#[test]
+fn e2_tier_path_twins_are_read_together() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-tier-path-twins");
+        let r1 = line_by(ROOT, "r1", OLD_AT, 10, UNLISTED_WRITER);
+        write_aged(&mut c, &format!("a/{ROOT}.jsonl"), &r1, "2026-07-02T07:00:00Z", 20);
+        c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(r1 + &line_by(ROOT, "r2", AT, 20, UNLISTED_WRITER)),
+            "2026-08-02T07:00:00Z",
+        );
+        let untiered = tiered_read(&c, &[], TierRun::default());
+        let tiered = tiered_read(&c, &tier_bounds(), TierRun::default());
+        assert_eq!(
+            read_under(&tiered, &format!("a/{ROOT}.jsonl")),
+            Some(Some(tier_bounds()[0])),
+            "the old twin is admitted with its family: {:?}",
+            tiered.pages
+        );
+        assert_tiered_equals_untiered("path-twins", &untiered, &tiered);
+    });
+}

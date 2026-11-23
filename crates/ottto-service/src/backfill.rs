@@ -7,7 +7,7 @@
 //! explicitly requests it. A machine with no prior successful bootstrap still
 //! receives the initial historical walk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -95,6 +95,10 @@ pub struct BackfillState {
     /// Immutable first census ends, keyed by destination namespace + ":" + source.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) first_census_ends: BTreeMap<String, String>,
+    /// First-read recency tier per destination, created with its first anchor.
+    /// Absent is the final tier: an import upgraded mid-way stays untiered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) first_read_tiers: BTreeMap<String, FirstReadTier>,
     #[serde(default)]
     pub last_report: Option<BackfillReport>,
     /// Server-issued account-switch backfill cutoff (RFC3339, UTC). Set when a
@@ -137,6 +141,26 @@ pub struct BackfillState {
     /// Never automatically cleared by a claim, index rebuild or census.
     #[serde(default, skip_serializing_if = "ClaudeHistoryListIntent::is_absent")]
     pub(crate) claude_history_list_intent: ClaudeHistoryListIntent,
+}
+
+/// First-read recency tiers in days. The last is the whole first-read window.
+pub(crate) const FIRST_READ_TIER_DAYS: [u64; 6] =
+    [1, 3, 7, 14, 30, crate::snapshots::FIRST_READ_WINDOW_DAYS];
+
+/// One destination's current first-read tier and the sources that finished it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct FirstReadTier {
+    pub(crate) days: u64,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) done: BTreeSet<String>,
+    /// Sources out of the tiers: a policy stop, a failed prepare, or a pass
+    /// with no first census to anchor. A pass that anchors rejoins.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) stopped: BTreeSet<String>,
+    /// The highest tier each source finished on its own pass; a stop forgets
+    /// it. A source claims no tier above it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) finished: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,32 +322,182 @@ pub(crate) fn record_first_census(
         let key = format!("{destination}:{slug}");
         let completed = state.has_completed_destination(slug, destination, true);
         if missing_index && !completed && !state.prior_history_unverified {
+            // The destination's first anchor starts its tiers.
+            if !state
+                .first_census_ends
+                .keys()
+                .any(|anchored| anchored.rsplit_once(':').map(|(d, _)| d) == Some(destination))
+            {
+                state
+                    .first_read_tiers
+                    .entry(destination.to_owned())
+                    .or_insert(FirstReadTier {
+                        days: FIRST_READ_TIER_DAYS[0],
+                        ..FirstReadTier::default()
+                    });
+            }
             state
                 .first_census_ends
                 .entry(key.clone())
                 .or_insert_with(|| census_end.to_owned());
         }
         anchor = state.first_census_ends.get(&key).cloned();
+        let anchored = state.anchor(destination, slug).is_some();
+        if let Some(tier) = state.first_read_tiers.get_mut(destination) {
+            if anchored {
+                tier.stopped.remove(slug);
+            } else {
+                tier.stopped.insert(slug.to_owned());
+            }
+        }
     })?;
     Ok(anchor.filter(|value| parse_rfc3339(value).is_some()))
 }
 
 impl BackfillState {
-    pub(crate) fn first_read_cutoff(&self, destination: &str, source: &str) -> Option<String> {
-        let anchor = self
-            .first_census_ends
-            .get(&format!("{destination}:{source}"))?;
-        let cutoff = parse_rfc3339(anchor)?
-            .checked_sub(time::Duration::days(
-                crate::snapshots::FIRST_READ_WINDOW_DAYS as i64,
-            ))?
-            .to_offset(time::UtcOffset::UTC);
-        let format = time::format_description::parse_borrowed::<2>(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
-        )
-        .ok()?;
-        cutoff.format(&format).ok()
+    /// The claim cutoff `apply_backfill_cutoff` applies, as UTC nanoseconds.
+    pub(crate) fn backfill_cutoff_nanos(&self) -> Option<i128> {
+        self.backfill_cutoff_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .map(time::OffsetDateTime::unix_timestamp_nanos)
     }
+
+    /// Terminal cutoffs: first census end minus the first-read window, and
+    /// (only with it) minus the highest completed tier this source finished
+    /// itself while taking part.
+    pub(crate) fn first_read_cutoffs(
+        &self,
+        destination: &str,
+        source: &str,
+    ) -> (Option<String>, Option<String>) {
+        let (Some(anchor), Ok(format)) = (
+            self.anchor(destination, source),
+            time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+            ),
+        ) else {
+            return (None, None);
+        };
+        let minus = |days: u64| {
+            let cutoff = anchor.checked_sub(time::Duration::days(days as i64))?;
+            cutoff.to_offset(time::UtcOffset::UTC).format(&format).ok()
+        };
+        let first_read = minus(crate::snapshots::FIRST_READ_WINDOW_DAYS);
+        let completed = self
+            .first_read_tiers
+            .get(destination)
+            .filter(|_| self.first_read_tier_participant(destination, source))
+            .and_then(|tier| {
+                let own = *tier.finished.get(source)?;
+                FIRST_READ_TIER_DAYS
+                    .into_iter()
+                    .take_while(|&days| days < tier.days && days <= own)
+                    .last()
+            });
+        let ready = first_read.as_ref().and(completed).and_then(minus);
+        (first_read, ready)
+    }
+
+    fn anchor(&self, destination: &str, source: &str) -> Option<time::OffsetDateTime> {
+        parse_rfc3339(
+            self.first_census_ends
+                .get(&format!("{destination}:{source}"))?,
+        )
+    }
+
+    /// In the destination's tiers: import not complete and not out of them.
+    /// Anchored or not: a source holds the tier until its first pass anchors.
+    fn first_read_tier_participant(&self, destination: &str, source: &str) -> bool {
+        !self.destination_completed(source, destination)
+            && self
+                .first_read_tiers
+                .get(destination)
+                .is_none_or(|tier| !tier.stopped.contains(source))
+    }
+
+    /// The destination's import reached the final tier (absent: upgraded).
+    pub(crate) fn first_read_tier_final(&self, destination: &str) -> bool {
+        self.first_read_tiers
+            .get(destination)
+            .is_some_and(|tier| tier.days >= crate::snapshots::FIRST_READ_WINDOW_DAYS)
+    }
+
+    /// The tier gating this source's first reads: days, bound (UTC seconds).
+    pub(crate) fn first_read_tier(
+        &self,
+        destination: &str,
+        source: SnapshotSource,
+    ) -> Option<(u64, u64)> {
+        let days = self.first_read_tiers.get(destination)?.days;
+        if days >= crate::snapshots::FIRST_READ_WINDOW_DAYS
+            || !self.first_read_tier_participant(destination, source.api_slug())
+        {
+            return None;
+        }
+        let cutoff = self
+            .anchor(destination, source.api_slug())?
+            .checked_sub(time::Duration::days(days as i64))?;
+        Some((days, u64::try_from(cutoff.unix_timestamp()).ok()?))
+    }
+}
+
+/// A participant finished the tier; it advances once every enabled one has.
+/// A saved advance returns whom to wake and whether it is not the final tier.
+pub(crate) fn record_first_read_tier_pass(
+    state_dir: &Path,
+    source: SnapshotSource,
+    destination: &str,
+    enabled: &[SnapshotSource],
+) -> Result<Option<(Vec<SnapshotSource>, bool)>> {
+    let mut wake = None;
+    update_backfill_state(state_dir, |state| {
+        if state.first_read_tier(destination, source).is_none() {
+            return;
+        }
+        let participants = enabled
+            .iter()
+            .copied()
+            .filter(|other| state.first_read_tier_participant(destination, other.api_slug()))
+            .collect::<Vec<_>>();
+        let tier = state
+            .first_read_tiers
+            .get_mut(destination)
+            .expect("tier checked above");
+        tier.done.insert(source.api_slug().to_owned());
+        tier.finished
+            .insert(source.api_slug().to_owned(), tier.days);
+        if participants
+            .iter()
+            .all(|other| tier.done.contains(other.api_slug()))
+        {
+            tier.days = FIRST_READ_TIER_DAYS
+                .into_iter()
+                .find(|&days| days > tier.days)
+                .unwrap_or(crate::snapshots::FIRST_READ_WINDOW_DAYS);
+            tier.done.clear();
+            wake = Some((
+                participants,
+                tier.days < crate::snapshots::FIRST_READ_WINDOW_DAYS,
+            ));
+        }
+    })?;
+    Ok(wake)
+}
+
+/// A policy stop or a failed prepare takes the source out of the
+/// destination's tiers at once, and forgets the tier it finished.
+pub(crate) fn record_first_read_tier_stop(
+    state_dir: &Path,
+    source: SnapshotSource,
+    destination: &str,
+) -> Result<()> {
+    update_backfill_state(state_dir, |state| {
+        if let Some(tier) = state.first_read_tiers.get_mut(destination) {
+            tier.stopped.insert(source.api_slug().to_owned());
+            tier.finished.remove(source.api_slug());
+        }
+    })
 }
 
 /// A good list read is the only automatic transition to Set. A Set value
@@ -434,6 +608,13 @@ fn snapshot_activity_ended_at(item: &SnapshotItem) -> Option<time::OffsetDateTim
     .flatten()
     .filter_map(parse_rfc3339)
     .max()
+}
+
+/// `apply_backfill_cutoff` drops `item` under a cutoff of `cutoff_nanos`
+/// (UTC): its session activity ended before it.
+pub(crate) fn ended_before_backfill_cutoff(item: &SnapshotItem, cutoff_nanos: i128) -> bool {
+    snapshot_activity_ended_at(item)
+        .is_some_and(|ended| ended.unix_timestamp_nanos() < cutoff_nanos)
 }
 
 /// Drop snapshots whose session activity ended strictly BEFORE the persisted
@@ -801,7 +982,7 @@ mod tests {
         let old = r#"{"completed_parser_versions":{},"completed_replay_revisions":{},"completed_destination_namespaces":{},"last_completed_at":null,"last_report":null}"#;
         let state: BackfillState = serde_json::from_str(old).unwrap();
         assert_eq!(serde_json::to_string(&state).unwrap(), old);
-        assert_eq!(state.first_read_cutoff("destination", "codex"), None);
+        assert_eq!(state.first_read_cutoffs("destination", "codex").0, None);
     }
 
     #[test]
@@ -822,11 +1003,15 @@ mod tests {
             let loaded = load_backfill_state(&dir);
             assert_eq!(
                 loaded
-                    .first_read_cutoff("destination", source.api_slug())
+                    .first_read_cutoffs("destination", source.api_slug())
+                    .0
                     .as_deref(),
                 Some("2026-09-13T12:00:00.123Z")
             );
-            assert_eq!(loaded.first_read_cutoff("other", source.api_slug()), None);
+            assert_eq!(
+                loaded.first_read_cutoffs("other", source.api_slug()).0,
+                None
+            );
             // Completion and explicit replay bookkeeping preserve the anchor.
             update_backfill_state(&dir, |state| {
                 mark_backfill_complete_for_destination(state, source, "destination");
@@ -857,10 +1042,221 @@ mod tests {
                 Some("2026-12-12T12:00:00Z")
             );
             assert_eq!(
-                load_backfill_state(&dir).first_read_cutoff("destination", source.api_slug()),
-                loaded.first_read_cutoff("destination", source.api_slug())
+                load_backfill_state(&dir)
+                    .first_read_cutoffs("destination", source.api_slug())
+                    .0,
+                loaded
+                    .first_read_cutoffs("destination", source.api_slug())
+                    .0
             );
         }
+    }
+
+    /// Recency tiers: a new destination starts at 1 day ("1 day" is 24 hours
+    /// before the first census end) and walks 1, 3, 7, 14, 30, then the final
+    /// tier (absent from the list). A tier advances only once every enabled
+    /// participant has finished it, survives a reload, and returns the
+    /// participants to wake (first import until the final tier). Bootstrap
+    /// completion ends participation and the ready cutoff.
+    #[test]
+    fn first_read_tiers_advance_when_every_participant_finishes() {
+        let dir = crate::test_scratch::ScratchDir::canonical("first-read-tiers");
+        let anchor = "2026-11-12T12:00:00.000Z";
+        let (claude, codex, pi) = (
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        );
+        let all = [claude, codex, pi];
+        for source in all {
+            record_first_census(&dir, source, "d", anchor, true).unwrap();
+        }
+        let days = |source| {
+            load_backfill_state(&dir)
+                .first_read_tier("d", source)
+                .map(|(days, _)| days)
+        };
+        let done = |source| record_first_read_tier_pass(&dir, source, "d", &all).unwrap();
+        let ready = |source: SnapshotSource| {
+            load_backfill_state(&dir)
+                .first_read_cutoffs("d", source.api_slug())
+                .1
+        };
+        assert_eq!(
+            FIRST_READ_TIER_DAYS,
+            [1, 3, 7, 14, 30, crate::snapshots::FIRST_READ_WINDOW_DAYS]
+        );
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.first_read_tiers["d"].days, 1);
+        assert!(!state.first_read_tier_final("d"));
+        let anchor_seconds = parse_rfc3339(anchor).unwrap().unix_timestamp() as u64;
+        assert_eq!(
+            state.first_read_tier("d", codex),
+            Some((1, anchor_seconds - 86_400))
+        );
+        assert_eq!(ready(codex), None, "no tier completed yet");
+        assert_eq!(state.first_read_tier("other", codex), None);
+
+        // Codex finishes the 1-day tier first and waits.
+        assert_eq!(done(codex), None);
+        assert_eq!(done(codex), None, "idempotent");
+        assert_eq!(days(codex), Some(1));
+        assert_eq!(done(claude), None);
+        assert_eq!(done(pi), Some((all.to_vec(), true)));
+        // Durable: a restart keeps the tier.
+        let state = load_backfill_state(&dir);
+        assert_eq!(days(pi), Some(3));
+        assert!(state.first_read_tiers["d"].done.is_empty());
+        assert_eq!(ready(codex).as_deref(), Some("2026-11-11T12:00:00.000Z"));
+        assert_eq!(done(codex), None);
+        assert_eq!(done(claude), None);
+        assert_eq!(done(pi), Some((all.to_vec(), true)));
+
+        // Pi's import completes; Claude and Codex walk the empty tiers.
+        update_backfill_state(&dir, |state| {
+            mark_backfill_complete_for_destination(state, pi, "d")
+        })
+        .unwrap();
+        assert_eq!(days(pi), None);
+        for to in [14, 30, crate::snapshots::FIRST_READ_WINDOW_DAYS] {
+            assert_eq!(done(claude), None);
+            assert_eq!(
+                done(codex),
+                Some((
+                    vec![claude, codex],
+                    to < crate::snapshots::FIRST_READ_WINDOW_DAYS
+                ))
+            );
+        }
+        let state = load_backfill_state(&dir);
+        assert!(state.first_read_tier_final("d"));
+        assert_eq!(state.first_read_tier("d", codex), None, "final tier");
+        assert_eq!(ready(codex).as_deref(), Some("2026-10-13T12:00:00.000Z"));
+        assert_eq!(done(codex), None, "the final tier never advances");
+        assert!(
+            !state.destination_completed("codex", "d"),
+            "completion is the census's"
+        );
+        update_backfill_state(&dir, |state| {
+            mark_backfill_complete_for_destination(state, codex, "d")
+        })
+        .unwrap();
+        assert_eq!(ready(codex), None, "absent after the import");
+        assert_eq!(
+            load_backfill_state(&dir)
+                .first_read_cutoffs("d", "codex")
+                .0
+                .as_deref(),
+            Some("2026-09-13T12:00:00.000Z"),
+            "the first-read cutoff keeps meaning 60 days"
+        );
+    }
+
+    /// Liveness: a policy stop takes a source out of the tiers at once, so the
+    /// others advance without it; a pass that anchors rejoins. A source that
+    /// has not anchored yet holds the tier until its first pass: it anchors
+    /// and joins, or, unable to anchor, leaves the tiers.
+    #[test]
+    fn a_stopped_source_never_holds_a_tier() {
+        let dir = crate::test_scratch::ScratchDir::canonical("first-read-tiers-stop");
+        let (claude, codex, pi) = (
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        );
+        let at = "2026-11-12T12:00:00Z";
+        let all = [claude, codex, pi];
+        let done = |source| {
+            record_first_read_tier_pass(&dir, source, "d", &all)
+                .unwrap()
+                .map(|(wake, _)| wake)
+        };
+        let days = |source| {
+            load_backfill_state(&dir)
+                .first_read_tier("d", source)
+                .map(|(days, _)| days)
+        };
+        for source in [claude, codex] {
+            record_first_census(&dir, source, "d", at, true).unwrap();
+        }
+        assert_eq!(done(codex), None, "Claude and the unanchored Pi hold");
+        assert_eq!(done(claude), None, "Pi has not anchored yet");
+        // Pi's first pass finds an index it may not anchor: it leaves.
+        record_first_census(&dir, pi, "d", at, false).unwrap();
+        assert_eq!(days(pi), None);
+        assert_eq!(done(codex), Some(vec![claude, codex]));
+        record_first_read_tier_stop(&dir, claude, "d").unwrap();
+        let state = load_backfill_state(&dir);
+        assert_eq!(days(claude), None);
+        assert_eq!(state.first_read_cutoffs("d", "claude_code").1, None);
+        assert_eq!(done(codex), Some(vec![codex]));
+        assert_eq!(done(claude), None, "a stopped source never moves it");
+        record_first_census(&dir, claude, "d", at, true).unwrap();
+        assert_eq!(days(claude), Some(7), "an anchored pass rejoins");
+        let claim = |source: SnapshotSource| {
+            load_backfill_state(&dir)
+                .first_read_cutoffs("d", source.api_slug())
+                .1
+        };
+        assert_eq!(
+            claim(claude),
+            None,
+            "the stop forgot its tier: no claim until it finishes one itself"
+        );
+        assert_eq!(claim(codex).as_deref(), Some("2026-11-09T12:00:00.000Z"));
+        assert_eq!(done(codex), None, "rejoined: Claude holds again");
+        assert_eq!(done(claude), Some(vec![claude, codex]));
+        assert_eq!(claim(claude).as_deref(), Some("2026-11-05T12:00:00.000Z"));
+        assert_eq!(claim(claude), claim(codex));
+    }
+
+    /// The terminal report reads both cutoffs from one state: none without
+    /// the import, the first-read cutoff alone in the first tier, both once a
+    /// tier completed; a tier cutoff never comes without the first-read one
+    /// (both need the first census end).
+    #[test]
+    fn first_read_and_tier_cutoffs_travel_together() {
+        let dir = crate::test_scratch::ScratchDir::canonical("first-read-tiers-wire");
+        let codex = SnapshotSource::Codex;
+        let pair = || load_backfill_state(&dir).first_read_cutoffs("d", "codex");
+        assert_eq!(pair(), (None, None));
+        record_first_census(&dir, codex, "d", "2026-11-12T12:00:00Z", true).unwrap();
+        assert!(matches!(pair(), (Some(_), None)));
+        record_first_read_tier_pass(&dir, codex, "d", &[codex]).unwrap();
+        let (first, tier) = pair();
+        assert_eq!(first.as_deref(), Some("2026-09-13T12:00:00.000Z"));
+        assert_eq!(tier.as_deref(), Some("2026-11-11T12:00:00.000Z"));
+    }
+
+    /// A daemon upgraded mid-import (anchors, no tier) gains no tier, even
+    /// when a later source records its first anchor: its order is unchanged.
+    #[test]
+    fn an_upgrade_mid_import_stays_untiered() {
+        let dir = crate::test_scratch::ScratchDir::canonical("first-read-tiers-upgrade");
+        let old = r#"{"completed_parser_versions":{},"completed_replay_revisions":{},"completed_destination_namespaces":{},"first_census_ends":{"d:codex":"2026-11-12T12:00:00Z"},"last_completed_at":null,"last_report":null}"#;
+        let state: BackfillState = serde_json::from_str(old).unwrap();
+        assert!(state.first_read_tiers.is_empty());
+        save_backfill_state(&dir, &state).unwrap();
+        record_first_census(&dir, SnapshotSource::Pi, "d", "2026-11-12T13:00:00Z", true).unwrap();
+        let state = load_backfill_state(&dir);
+        assert!(
+            state.first_read_tiers.is_empty(),
+            "absent means the final tier"
+        );
+        let all = [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ];
+        for source in all {
+            assert_eq!(state.first_read_tier("d", source), None);
+            assert_eq!(state.first_read_cutoffs("d", source.api_slug()).1, None);
+            assert_eq!(
+                record_first_read_tier_pass(&dir, source, "d", &all).unwrap(),
+                None
+            );
+        }
+        assert!(load_backfill_state(&dir).first_read_tiers.is_empty());
     }
 
     #[test]
@@ -960,7 +1356,8 @@ mod tests {
                 assert_eq!(scan.census_window_end, original);
                 assert_eq!(
                     load_backfill_state(&support)
-                        .first_read_cutoff("destination", source.api_slug())
+                        .first_read_cutoffs("destination", source.api_slug())
+                        .0
                         .as_deref(),
                     Some("2026-09-13T12:00:00.000Z")
                 );
@@ -968,7 +1365,8 @@ mod tests {
             index.prepare_historical_replay("later-generation".to_owned());
             assert_eq!(
                 load_backfill_state(&support)
-                    .first_read_cutoff("destination", source.api_slug())
+                    .first_read_cutoffs("destination", source.api_slug())
+                    .0
                     .as_deref(),
                 Some("2026-09-13T12:00:00.000Z")
             );
@@ -1735,6 +2133,8 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_destination_replays, first_census_ends, completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
+crate::heap_layout_bound::fields!(BackfillState; completed_destination_replays, first_census_ends, first_read_tiers, completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
+
+crate::heap_layout_bound::fields!(FirstReadTier; days, done, stopped, finished);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

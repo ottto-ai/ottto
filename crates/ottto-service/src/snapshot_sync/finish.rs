@@ -259,6 +259,20 @@ pub(super) struct UploadIndexSettlement {
     pub(super) fully_settled: bool,
 }
 
+/// Settled for a recency tier: account holds wait outside the import.
+pub(super) fn tier_settled(
+    settled: bool,
+    transport_settled: bool,
+    holds: &LocalHoldSettlement,
+) -> bool {
+    settled
+        || (transport_settled
+            && holds.retry_pending_family_count == 0
+            && holds
+                .held_fingerprints
+                .is_subset(&holds.account_deferred_fingerprints))
+}
+
 /// A persisted account hold was never uploaded, so the backfill and replay it
 /// belongs to stay pending even on a page that did not revisit it.
 pub(super) fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
@@ -2556,6 +2570,9 @@ pub(super) fn finish_sync_source(
             &current_rfc3339(),
         ),
     ) {
+        // The final tier runs gentler: background QoS at the same bootstrap pace.
+        let first_import =
+            first_import && !backfill_state.first_read_tier_final(&upload_destination_namespace);
         let existing = continuation::resident_scan_requested(&scan_result, first_read_bootstrap);
         pass_outcomes(|counts| {
             counts.paced_request_existing = u64::from(existing);
@@ -2596,6 +2613,40 @@ pub(super) fn finish_sync_source(
                 safe_error(&error)
             );
             return Err(anyhow!("local snapshot backfill state save failed"));
+        }
+    }
+
+    // A tier waits only for work in flight inside the import; refusals and
+    // account holds stay owed. Order only: a failed save retries later.
+    let tier_finished = tier_settled(
+        upload_fully_settled,
+        upload_completed || resolved_permanent_rejections,
+        &local_holds,
+    ) && index.first_read_tier_finished(source, |fingerprint| {
+        upload_progress
+            .permanent_rejections
+            .get(fingerprint)
+            .map(|rejection| rejection.body_witness.clone())
+    });
+    if tier_finished {
+        match crate::backfill::record_first_read_tier_pass(
+            support_dir,
+            source,
+            &upload_destination_namespace,
+            &super::enabled_snapshot_sources_in(device, support_dir),
+        ) {
+            // Every participant reads the next tier now; the final at background QoS.
+            Ok(Some((wake, first_import))) => {
+                for participant in wake {
+                    continuation::request_resident_scan_on_power(participant, first_import, power);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "local snapshot backfill tier save deferred for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            ),
         }
     }
 

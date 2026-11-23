@@ -1676,6 +1676,34 @@ files are all skipped waits the ordinary cadence. These observations add no
 timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
+## First-read recency tiers
+
+During a new destination's first import, Claude, Codex and Pi read their
+history in recency tiers: files active in the last day (24 hours before the
+first census end) first, then 3, 7, 14 and 30 days, then the rest of the
+60-day first-read window (the final tier). The final tier's paced passes run
+at background QoS at the same pace. Report-only fields:
+
+- The `source_finish` pass carries `first_read_tier_days` while a tier gates
+  the source; it is absent at the final tier and when the source is untiered.
+- The `source_finish` pass carries `tier_pulled_family` and
+  `tier_pulled_folder` when its pages selected Claude files older than the
+  tier: the first counts those selected through a path family pull (a member
+  of the family is read or in the tier), the second the mains selected
+  because a read copy in their folder disclosed an unproven prefix. Both
+  count selections, not reads, and are absent when zero.
+- Terminal scan status carries the optional `tier_ready_cutoff` next to
+  `first_read_cutoff`: the source's first census end minus the days of the
+  highest completed tier that the source finished itself, as UTC
+  milliseconds. It is absent before the 1-day tier completes, until a source
+  that joined late, returned from a stop or recovered from a failed pass
+  finishes a tier itself, after the source's import completes and for
+  untiered sources, and never sent without `first_read_cutoff`. Check-ins
+  omit it.
+
+A deferred file stays queued and owed; it is counted in pending and skipped
+census counts like any queued file. None of these fields enters uploads.
+
 ## Idle passes of a settled source
 
 A pass the walk gate held logs `walk_idle=true` at the end of its

@@ -1780,6 +1780,14 @@ pub(crate) struct PassOutcomes {
     pub(crate) paced_first_import: u64,
     pub(crate) paced_power_allowed: u64,
     pub(crate) paced_power_battery: u64,
+    /// The first-read recency tier gating this pass, and the older Claude
+    /// paths it selected via a family pull and via a `DISCLOSED` folder pull.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_read_tier_days: Option<u64>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) tier_pulled_family: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) tier_pulled_folder: u64,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.

@@ -56,6 +56,13 @@ pub struct ScanIndex {
     /// never saved; only Codex reads it.
     #[serde(skip)]
     pub(crate) first_import_pending: bool,
+    /// The first-read recency tier bound (UTC seconds). Set at prepare; never saved.
+    #[serde(skip)]
+    pub(crate) first_read_tier_cutoff: Option<u64>,
+    /// The claim cutoff (UTC nanoseconds) finish applies to this pass's
+    /// uploads; copy ownership reads it. Set at prepare; never saved.
+    #[serde(skip)]
+    pub(crate) backfill_cutoff_nanos: Option<i128>,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -614,6 +621,8 @@ impl Default for ScanIndex {
             withheld_memo: Default::default(),
             first_read_pending: false,
             first_import_pending: false,
+            first_read_tier_cutoff: None,
+            backfill_cutoff_nanos: None,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,
@@ -1004,9 +1013,13 @@ impl ScanIndex {
             if terminal {
                 return due;
             }
+            // A tier-deferred first read waits for the tier advance, not a pass.
+            let gate = TierGate::new(scan.source, self);
             let queued = !t.pending_directories.is_empty()
                 || t.pending_candidates.iter().any(|candidate| {
-                    candidate.census_member && eligible(&local_index_key(&candidate.path))
+                    candidate.census_member
+                        && eligible(&local_index_key(&candidate.path))
+                        && !gate.defers(&candidate.path)
                 });
             if queued
                 || (unblocked
@@ -1025,6 +1038,66 @@ impl ScanIndex {
             && self.decode_holds.is_empty()
             && (fresh_offer
                 || (quarantined.is_empty() && self.files.keys().any(|key| eligible(key))))
+    }
+    /// The current first-read tier is finished here: the walk ended (or the
+    /// census completed) and every queued census member is deferred or waits
+    /// outside the import (an account hold, or an unchanged file whose every
+    /// current entity is refused for its current body). `refused` returns the
+    /// ledger's refused body witness for an entity fingerprint.
+    pub(crate) fn first_read_tier_finished(
+        &self,
+        source: SnapshotSource,
+        refused: impl Fn(&str) -> Option<String>,
+    ) -> bool {
+        if self.first_read_tier_cutoff.is_none() || !self.terminal_contract_retries.is_empty() {
+            return false;
+        }
+        let Some(walk) = self.traversal.as_ref() else {
+            return true;
+        };
+        if !walk.pending_directories.is_empty() {
+            return false;
+        }
+        let gate = TierGate::new(source, self);
+        let waits_outside = |path: &Path| {
+            let key = local_index_key(path);
+            if self.claude_account_deferred_holds.contains_key(&key) {
+                return true;
+            }
+            let Some(body) = self
+                .files
+                .get(&key)
+                .and_then(|entry| entry.last_upload_body_witness.as_deref())
+            else {
+                return false;
+            };
+            let Some(entities) = self.file_snapshot_fingerprints.get(&key) else {
+                return false;
+            };
+            let refused_body = |fingerprint: &str| {
+                refused(fingerprint).or_else(|| {
+                    self.quarantined_snapshot_fingerprints
+                        .get(fingerprint)
+                        .filter(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                        })
+                        .and_then(|record| record.upload_body_witness.clone())
+                })
+            };
+            let witnesses: Option<BTreeSet<String>> = entities
+                .iter()
+                .map(|fp| refused_body(fp.as_str()))
+                .collect();
+            !entities.is_empty()
+                && witnesses.is_some_and(|set| snapshot_file_upload_body_set_hex(&set) == body)
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| self.listing_stamp_matches(path, &metadata))
+        };
+        walk.pending_candidates.iter().all(|candidate| {
+            !candidate.census_member
+                || gate.defers(&candidate.path)
+                || waits_outside(&candidate.path)
+        })
     }
     /// Census members still queued at page end, exactly what
     /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,
