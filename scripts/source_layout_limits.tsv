@@ -1,11 +1,9 @@
 # path	max_lines
 crates/ottto-service/src/snapshots/claude_request_identity.rs	5459
 crates/ottto-service/src/snapshots/claude_request_identity_tests.rs	3928
-crates/ottto-service/src/snapshots/codex_compressed_input.rs	3859
-crates/ottto-service/src/snapshots/codex_file_join.rs	4471
+crates/ottto-service/src/snapshots/codex_file_join/tests.rs	3510
 crates/ottto-service/src/snapshots/lenient_decode.rs	3044
 crates/ottto-service/src/snapshots/lenient_decode_tests.rs	4072
-crates/ottto-service/src/snapshots/session_start.rs	3464
 crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs	3168
 crates/ottto-service/src/snapshots/tests.rs	22743
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	4658
