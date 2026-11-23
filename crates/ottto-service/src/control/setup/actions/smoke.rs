@@ -102,11 +102,6 @@ pub(in crate::control) fn run_verification_smoke_prompt(
             local_session_observed: None,
         });
     }
-    daemon.remember_claude_verification_auth_marker(
-        crate::agent_status::claude_credential_modified_marker(
-            &ottto_core::ClaudeConfigDirSlot::Default,
-        ),
-    )?;
     Ok(run_claude_smoke_prompt())
 }
 

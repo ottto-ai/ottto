@@ -570,7 +570,6 @@ use setup::actions::verification::pi_route_result_from_backend_error;
 use setup::actions::verification::pi_route_result_from_smoke;
 #[cfg(test)]
 use setup::actions::verification::pi_route_result_from_verification;
-pub(crate) use setup::actions::verification::reverify_failed_source;
 #[cfg(test)]
 use setup::actions::verification::run_one_pi_route_verification;
 #[cfg(test)]

@@ -201,7 +201,6 @@ use self::lane::local_cadence_phase_offset;
 #[cfg(test)]
 pub(crate) use self::lane::retained_with_withheld;
 pub use self::lane::spawn_claude_agent_status_refresh;
-pub use self::lane::spawn_failed_verification_reverify;
 pub use self::lane::spawn_local_health_projection_sync;
 pub use self::lane::spawn_local_snapshot_sync;
 pub use self::lane::spawn_one_shot_local_snapshot_sync;
@@ -209,13 +208,7 @@ pub use self::lane::spawn_startup_source_reverify;
 #[cfg(test)]
 use self::lane::ClaudeAccountSwitchProbe;
 #[cfg(test)]
-use self::lane::ReverifySchedule;
-#[cfg(test)]
 use self::lane::SnapshotCycleOwner;
-#[cfg(test)]
-use self::lane::FAILED_VERIFY_RETRY_INITIAL;
-#[cfg(test)]
-use self::lane::FAILED_VERIFY_RETRY_MAX;
 use self::retry::cadence_phase_offset;
 #[cfg(test)]
 use self::retry::clear_cadence_state_for_test;

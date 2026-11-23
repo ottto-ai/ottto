@@ -30,6 +30,56 @@ const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
 /// The process's one history writer. A failed open or write drops it; the
 /// next attempt opens it again.
 static HISTORY: Mutex<Option<Store>> = Mutex::new(None);
+/// The latest time this daemon had an upload accepted, per app. In memory
+/// only: it lets a failed Verify clear on real usage. Tests keep their
+/// own copy per thread so parallel tests never see each other's uploads.
+#[cfg(not(test))]
+static LAST_ACCEPTED_UPLOAD: Mutex<Vec<(SourceKind, OffsetDateTime)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+thread_local! {
+    static LAST_ACCEPTED_UPLOAD: RefCell<Vec<(SourceKind, OffsetDateTime)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn with_last_accepted<R>(f: impl FnOnce(&mut Vec<(SourceKind, OffsetDateTime)>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut LAST_ACCEPTED_UPLOAD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        LAST_ACCEPTED_UPLOAD.with(|accepted| f(&mut accepted.borrow_mut()))
+    }
+}
+
+fn note_accepted_upload(source: SourceKind, at: OffsetDateTime) {
+    with_last_accepted(
+        |accepted| match accepted.iter_mut().find(|(kind, _)| *kind == source) {
+            Some((_, latest)) => *latest = (*latest).max(at),
+            None => accepted.push((source, at)),
+        },
+    );
+}
+
+/// True when this daemon had an upload for `source` accepted after `since`
+/// (RFC 3339): real usage from that app reached Ottto from this Mac.
+pub(crate) fn accepted_upload_after(source: &SourceKind, since: &str) -> bool {
+    let Ok(since) = OffsetDateTime::parse(since, &Rfc3339) else {
+        return false;
+    };
+    with_last_accepted(|accepted| {
+        accepted
+            .iter()
+            .any(|(kind, latest)| kind == source && *latest > since)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn note_accepted_upload_for_test(source: SourceKind, at: &str) {
+    note_accepted_upload(source, OffsetDateTime::parse(at, &Rfc3339).unwrap());
+}
 pub(crate) fn sample_pager_writes() {
     if let Ok(history) = HISTORY.try_lock() {
         history.iter().for_each(Store::sample_pager_writes);
@@ -621,6 +671,11 @@ pub(crate) fn append_success_with_evidence_context(
         .map(sanitize_entity_rejection)
         .collect();
     let uploaded_at = now_rfc3339();
+    if !response.disabled && response.accepted > 0 {
+        if let Ok(at) = OffsetDateTime::parse(&uploaded_at, &Rfc3339) {
+            note_accepted_upload(source.clone(), at);
+        }
+    }
     let evidence = evidence_request.and_then(|(request, namespace, api_destination, cas)| {
         validated_evidence(
             request,
@@ -1277,6 +1332,27 @@ mod tests {
             "2026-10-03T00:00:00Z",
             Some("safe-request"),
         )
+    }
+
+    /// Only a reply that accepted items marks usage for a failed check;
+    /// a disabled or empty reply never does.
+    #[test]
+    fn only_accepted_upload_replies_mark_usage_for_a_failed_check() {
+        let dir = temp_dir();
+        let before = "2000-01-01T00:00:00Z";
+        let mut disabled = response("session-disabled");
+        disabled.disabled = true;
+        append_success(&dir, SourceKind::Pi, 1, 200, None, &disabled).unwrap();
+        let mut empty = response("session-empty");
+        empty.accepted = 0;
+        empty.accepted_entities.clear();
+        append_success(&dir, SourceKind::Pi, 1, 200, None, &empty).unwrap();
+        assert!(!accepted_upload_after(&SourceKind::Pi, before));
+
+        append_success(&dir, SourceKind::Pi, 1, 200, None, &response("session-new")).unwrap();
+        assert!(accepted_upload_after(&SourceKind::Pi, before));
+        assert!(!accepted_upload_after(&SourceKind::Codex, before));
+        assert!(!accepted_upload_after(&SourceKind::Pi, "not a time"));
     }
 
     #[test]

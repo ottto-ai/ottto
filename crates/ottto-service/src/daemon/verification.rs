@@ -236,69 +236,6 @@ impl LocalDaemon {
         Ok(())
     }
 
-    /// Sources whose stored health is a blocking verification failure
-    /// (`Failed` state with a `TelemetryNotVerified` problem) that the
-    /// background re-verify loop retries, so a transient smoke failure heals
-    /// without the customer pressing Verify by hand. Pi is never retried here:
-    /// see `blocking_verification_retry_states`.
-    pub fn sources_with_blocking_verification_failure(
-        &self,
-    ) -> Result<Vec<SourceKind>, LocalApiError> {
-        Ok(self
-            .blocking_verification_retry_states()?
-            .into_iter()
-            .map(|(source, _)| source)
-            .collect())
-    }
-
-    pub(crate) fn remember_claude_verification_auth_marker(
-        &self,
-        marker: Option<String>,
-    ) -> Result<(), LocalApiError> {
-        let mut state = self.state()?;
-        // An unavailable read must not make an already-tried login look new.
-        if marker.is_some() || state.claude_verification_auth_marker.is_none() {
-            state.claude_verification_auth_marker = Some(marker);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn claude_verification_auth_marker(
-        &self,
-    ) -> Result<Option<Option<String>>, LocalApiError> {
-        Ok(self.state()?.claude_verification_auth_marker.clone())
-    }
-
-    /// Read failure and Claude sign-in action together without collecting status or credentials.
-    /// Pi is left out: its check is a paid prompt to the user's default model
-    /// and Pi usage collection does not depend on it, so a failed Pi check
-    /// waits for the customer's Verify (or the Pi status pass) instead of
-    /// re-running on a timer.
-    pub(crate) fn blocking_verification_retry_states(
-        &self,
-    ) -> Result<Vec<(SourceKind, bool)>, LocalApiError> {
-        let state = self.state()?;
-        Ok(state
-            .sources
-            .iter()
-            .filter(|health| {
-                health.source != SourceKind::Pi
-                    && health.state == SourceState::Failed
-                    && has_verification_failure_problem(health)
-            })
-            .map(|health| {
-                (
-                    health.source.clone(),
-                    health.source == SourceKind::ClaudeCode
-                        && health
-                            .recommended_actions
-                            .iter()
-                            .any(|action| action.action == RepairActionKind::ReauthProvider),
-                )
-            })
-            .collect())
-    }
-
     pub fn record_config_repair_result(
         &self,
         source: &SourceKind,
@@ -1006,7 +943,8 @@ pub(crate) fn preserve_blocking_verification_state(
         || (has_pi_route_smoke_failure_problem(existing)
             && refreshed_pi_status_has_available_routes(refreshed))
         || (has_pi_oauth_reauth_problem(existing)
-            && refreshed_pi_status_has_subscription_oauth_identity_evidence(refreshed));
+            && refreshed_pi_status_has_subscription_oauth_identity_evidence(refreshed))
+        || real_usage_since_failed_check(existing);
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
         && !clear_failed_verification;
@@ -1030,6 +968,19 @@ pub(crate) fn preserve_blocking_verification_state(
         // letting it supply verification authority to a later runtime failure.
         refreshed.last_verified_at = existing.last_verified_at.clone();
     }
+}
+
+/// Real usage clears a failed check: this Mac had an upload for the
+/// app accepted by Ottto after the check failed. Verify itself runs only at
+/// setup or when the person presses it.
+fn real_usage_since_failed_check(existing: &SourceHealth) -> bool {
+    has_verification_failure_problem(existing)
+        && existing
+            .last_verified_at
+            .as_deref()
+            .is_some_and(|failed_at| {
+                crate::upload_receipts::accepted_upload_after(&existing.source, failed_at)
+            })
 }
 
 /// Verification warnings are point-in-time evidence. They may remain in the
