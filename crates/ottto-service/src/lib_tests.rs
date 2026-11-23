@@ -3532,6 +3532,14 @@ mod tests {
         assert_eq!(health.problems[0].code, StableProblemCode::Unknown);
         assert_eq!(health.problems[0].title, CODEX_USAGE_READ_RETRYING_TITLE);
         assert!(health.problems[0].retryable);
+        // Its own canonical reason, so the web can treat it as a soft
+        // warning; the wire problem code stays `unknown`.
+        assert_eq!(
+            local_health_problem_code_slug(&health.problems[0]),
+            "codex_usage_check_retrying"
+        );
+        let wire = serde_json::to_value(&health.problems[0]).expect("problem json");
+        assert_eq!(wire["code"], "unknown");
     }
 
     #[test]

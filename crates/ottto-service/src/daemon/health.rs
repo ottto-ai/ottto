@@ -5,6 +5,7 @@
 use crate::claude_shell_telemetry;
 use crate::control::TerminalRefreshRejection;
 use crate::has_verification_failure_problem;
+use crate::is_codex_usage_read_retrying_problem;
 use crate::is_usage_checks_paused_problem;
 use crate::otlp_relay;
 use crate::projected_scan_index_refusal;
@@ -15,6 +16,7 @@ use crate::BlockerFirstSeen;
 use crate::DaemonState;
 use crate::LocalApiError;
 use crate::LocalDaemon;
+use crate::CODEX_USAGE_CHECK_RETRYING_REASON;
 use crate::USAGE_CHECKS_PAUSED_REASON;
 use ottto_core::LocalConnectionBinding;
 use ottto_protocol::DaemonRuntimeState;
@@ -1074,6 +1076,9 @@ pub(crate) fn local_health_problem_code_slug(problem: &HealthProblem) -> &'stati
     }
     if is_usage_checks_paused_problem(problem) {
         return USAGE_CHECKS_PAUSED_REASON;
+    }
+    if is_codex_usage_read_retrying_problem(problem) {
+        return CODEX_USAGE_CHECK_RETRYING_REASON;
     }
     stable_problem_code_slug(&problem.code)
 }

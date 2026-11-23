@@ -1089,6 +1089,15 @@ pub(crate) fn usage_checks_paused_problem(snapshot: &AgentStatusSnapshot) -> Opt
 
 pub(crate) const CODEX_USAGE_READ_RETRYING_TITLE: &str = "Codex usage check failed; retrying";
 
+/// Canonical-health slug for the retrying Codex usage check: a transient read
+/// failure with the login fine, not a setup item. Like the paused-checks
+/// problem it keeps the `Unknown` code on the wire for strict older decoders.
+pub(crate) const CODEX_USAGE_CHECK_RETRYING_REASON: &str = "codex_usage_check_retrying";
+
+pub(crate) fn is_codex_usage_read_retrying_problem(problem: &HealthProblem) -> bool {
+    problem.code == StableProblemCode::Unknown && problem.title == CODEX_USAGE_READ_RETRYING_TITLE
+}
+
 pub(crate) fn is_usage_checks_paused_problem(problem: &HealthProblem) -> bool {
     problem.code == StableProblemCode::Unknown && problem.title == USAGE_CHECKS_PAUSED_TITLE
 }

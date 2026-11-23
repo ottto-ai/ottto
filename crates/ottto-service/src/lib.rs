@@ -154,6 +154,7 @@ use daemon::status::status_from_state_with_relay_finding;
 pub(crate) use daemon::status::ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE;
 use daemon::verification::claude_connected_health;
 use daemon::verification::has_verification_failure_problem;
+use daemon::verification::is_codex_usage_read_retrying_problem;
 use daemon::verification::is_usage_checks_paused_problem;
 use daemon::verification::preserve_blocking_verification_state;
 use daemon::verification::usage_checks_paused_problem;
@@ -161,6 +162,7 @@ use daemon::verification::usage_checks_paused_problem;
 use daemon::verification::verification_result_records_success;
 pub(crate) use daemon::verification::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
 pub(crate) use daemon::verification::CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE;
+use daemon::verification::CODEX_USAGE_CHECK_RETRYING_REASON;
 use daemon::verification::CODEX_USAGE_READ_RETRYING_TITLE;
 pub(crate) use daemon::verification::PI_DEFAULT_MODEL_TEXT;
 #[cfg(test)]
