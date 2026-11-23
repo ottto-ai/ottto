@@ -350,6 +350,55 @@ fn revisions(index: &ScanIndex, key: &str, head: &TailHead) -> Option<BTreeMap<u
     (!damaged).then_some(found)
 }
 
+/// A listed file at its indexed length whose moved mtime the head's write
+/// generation count proves a touch: the same inode and known birth as the
+/// head's certificate, which sealed the whole file, and the same count now.
+/// The file is opened (never read) only when every stored fact agrees.
+#[cfg(unix)]
+fn touch_proven(index: &ScanIndex, key: &str, head: &TailHead, listing: &Listing<'_>) -> bool {
+    use crate::transcript_acquisition::WriteGeneration;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = listing.metadata;
+    let (Some(count), Some(entry)) = (head.write_generation, index.files.get(key)) else {
+        return false;
+    };
+    if entry.size_bytes != metadata.len()
+        || index.listing_stamp_matches(listing.path, metadata)
+        || entry.same_listing_stamp_as(metadata)
+    {
+        return false;
+    }
+    let Ok(certificate) = crate::snapshots::tail_source::certified_certificate(&head.body) else {
+        return false;
+    };
+    let Some(stored) = WriteGeneration::stored(count, certificate.birth_nanos) else {
+        return false;
+    };
+    if certificate.inode != metadata.ino()
+        || certificate.length != metadata.len()
+        || certificate.sealed_offset != certificate.length
+        || entry.opened_birth_nanos != certificate.birth_nanos
+    {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(listing.path)
+    else {
+        return false;
+    };
+    file.metadata().is_ok_and(|opened| {
+        opened.ino() == certificate.inode
+            && opened.len() == certificate.length
+            && WriteGeneration::capture(&file, &opened) == Some(stored)
+    })
+}
+#[cfg(not(unix))]
+fn touch_proven(_: &ScanIndex, _: &str, _: &TailHead, _: &Listing<'_>) -> bool {
+    false
+}
+
 fn over_alarm_age(now_ms: u64, at: u64) -> bool {
     now_ms.saturating_sub(at) / 1000 > ALARM_AFTER
 }
@@ -651,7 +700,11 @@ impl<'a> Page<'a> {
         }
     }
 
-    fn live(&self, index: &ScanIndex, key: &str, listing: &Listing<'_>) -> Live {
+    /// `touched`: a same-size moved mtime its head's write generation count
+    /// proved a touch ([`touch_proven`]). The file is then listed as the
+    /// unchanged file it is, at the indexed mtime, so the walk owes what it
+    /// owed before the touch.
+    fn live(&self, index: &ScanIndex, key: &str, listing: &Listing<'_>, touched: bool) -> Live {
         let metadata = listing.metadata;
         let len = metadata.len();
         // A future mtime is a regressed clock: unknown, never fresh. Read the
@@ -690,8 +743,19 @@ impl<'a> Page<'a> {
             return live;
         };
         // Equal length only: a held-back Codex fragment's bytes stay owed.
-        let unchanged = index.listing_stamp_matches(listing.path, metadata)
+        let unchanged = (touched && entry.size_bytes == len)
+            || index.listing_stamp_matches(listing.path, metadata)
             || (entry.size_bytes == len && entry.same_listing_stamp_as(metadata));
+        let mtime = if touched && unchanged {
+            // An entry stored without mtime nanos has whole seconds.
+            Some(entry.modified_unix_nanos.map_or_else(
+                || entry.modified_unix_seconds.saturating_mul(1000),
+                |nanos| nanos / 1_000_000,
+            ))
+        } else {
+            mtime
+        };
+        live.change.0 = mtime;
         let len = if unchanged { entry.size_bytes } else { len };
         live.len = len;
         if unchanged {
@@ -735,12 +799,15 @@ impl<'a> Page<'a> {
             return;
         }
         let key = local_index_key(listing.path);
-        let live = self.live(index, &key, &listing);
         // One keyed read per listed file; an absent head is `None`.
         let head = match state_v2::load_head(index, &key, u32::MAX) {
             Ok(head) => head,
             Err(_) => return self.count(index, listing.path, key, FileDebt::UNKNOWN, false),
         };
+        let touched = head
+            .as_ref()
+            .is_some_and(|head| touch_proven(index, &key, head, &listing));
+        let live = self.live(index, &key, &listing, touched);
         let committed = match &head {
             Some(head) => match revisions(index, &key, head) {
                 Some(committed) => committed,

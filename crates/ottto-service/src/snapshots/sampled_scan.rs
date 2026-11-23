@@ -244,13 +244,16 @@ pub(super) struct Context {
     pub(super) audit_cap_full: usize,
     pub(super) audit_cap_delay: usize,
     pub(super) pace_evicted: usize,
+    /// Same-size files whose moved mtime a write generation count proved a
+    /// touch: continued from stored state instead of a Full.
+    pub(super) same_size_touch_proven: usize,
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
 crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
     full_files, tail_files, unchanged_files, native_bytes, full_native_bytes, sample_bytes, full_reasons,
-    priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, start_overdue_seconds,
+    priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, same_size_touch_proven, start_overdue_seconds,
     completion_overdue_seconds, admission);
 
 pub(super) struct Active {
@@ -397,6 +400,7 @@ impl OwnedSourceScan {
                 audit_cap_full: 0,
                 audit_cap_delay: 0,
                 pace_evicted: 0,
+                same_size_touch_proven: 0,
                 start_overdue_seconds: 0,
                 completion_overdue_seconds: 0,
                 admission: Default::default(),

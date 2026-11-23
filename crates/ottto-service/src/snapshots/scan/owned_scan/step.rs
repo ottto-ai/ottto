@@ -3753,6 +3753,10 @@ impl OwnedSourceScan {
                         crate::local_resource_diagnostics::traversal_point("sampled_audit_pace_alarm", source.api_slug(),
                             &serde_json::json!({"pace_evicted": context.pace_evicted}));
                     }
+                    if context.same_size_touch_proven > 0 {
+                        crate::local_resource_diagnostics::traversal_point("same_size_touch_proven", source.api_slug(),
+                            &serde_json::json!({"same_size_touch_proven": context.same_size_touch_proven}));
+                    }
                     crate::local_resource_diagnostics::ReadCounts {
                         full_selections: context.full_files,
                         tail_selections: context.tail_files,
@@ -5186,6 +5190,10 @@ impl OwnedSourceScan {
             if let Some(context) = sampling.as_mut() {
                 if let Some((mode, audit_due)) = planned_mode {
                     context.record_mode(mode, audit_due);
+                    context.same_size_touch_proven +=
+                        usize::from(active.parser.reader.acquisition.as_ref().is_some_and(
+                            crate::transcript_acquisition::ReadPlan::same_size_touch_proven,
+                        ));
                     resource_probe
                         .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
                     resource_probe.full_parse_reason(

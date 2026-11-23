@@ -18,6 +18,10 @@ const WRITER_CAPABILITIES_HISTORY: &[(u64, &str)] = &[
         6,
         "upload progress rows: older writers would read stale JSON progress",
     ),
+    (
+        7,
+        "Tail head envelope 2 (write generation count): rolling back below this release holds collection until roll-forward",
+    ),
 ];
 pub(super) const WRITER_CAPABILITY: u64 =
     WRITER_CAPABILITIES_HISTORY[WRITER_CAPABILITIES_HISTORY.len() - 1].0;
@@ -64,6 +68,13 @@ fn writer_supported_at(conn: &Connection, capability: u64) -> Result<()> {
         super::super::Hold::ReferenceDrift
     );
     Ok(())
+}
+/// Tests only: whether a writer of `capability` is refused as `NewerSchema`.
+#[cfg(test)]
+pub(super) fn refused_at_for_test(conn: &Connection, capability: u64) -> bool {
+    writer_supported_at(conn, capability).is_err_and(|error| {
+        error.downcast_ref::<super::super::Hold>() == Some(&super::super::Hold::NewerSchema)
+    })
 }
 /// Used for EVERY explicit write, including N-only maintenance markers.
 pub(super) fn begin_write(conn: &Connection) -> Result<()> {
@@ -160,7 +171,7 @@ mod tests {
         let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
         db.control("minimum_writer_capability", &6_u64).unwrap();
         let conn = db.conn().unwrap();
-        assert_eq!(WRITER_CAPABILITY, 6);
+        const { assert!(WRITER_CAPABILITY >= 6) };
         assert_eq!(revision(conn).unwrap(), 1);
         assert!(writer_supported(conn).is_ok());
         let error = writer_supported_at(conn, 5).unwrap_err();
@@ -168,6 +179,19 @@ mod tests {
             error.downcast_ref::<super::super::super::Hold>(),
             Some(&super::super::super::Hold::NewerSchema)
         );
+    }
+    /// [format] Capability 7 (Tail head envelope 2, the write generation
+    /// count) fences the previous reader/writer without DDL.
+    #[test]
+    fn write_generation_envelope_fences_capability_six() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("generation-writer-fence");
+        let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
+        db.control("minimum_writer_capability", &7_u64).unwrap();
+        let conn = db.conn().unwrap();
+        assert_eq!(WRITER_CAPABILITY, 7);
+        assert_eq!(revision(conn).unwrap(), 1);
+        assert!(writer_supported(conn).is_ok());
+        assert!(refused_at_for_test(conn, 6));
     }
     /// [format] format ledgers are consecutive and cover every catalogue kind.
     #[test]

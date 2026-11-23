@@ -419,7 +419,16 @@ fn stored<S: TailSource>(
             && entry.opened_birth_nanos == cert.birth_nanos)
             .then_some(entry.opened_changed_nanos)
     });
-    let checkpoint = match cert.restore_grown(held, scope.clone(), read_changed_nanos) {
+    // The head's write generation count, bound to this certificate. A file
+    // set aside is offered none: its next stage replaces every stored row,
+    // so a touch of it takes the rule without a count.
+    let stored_generation = head.write_generation.filter(|_| !set_aside(index, key));
+    let checkpoint = match cert.restore_grown_counted(
+        held,
+        scope.clone(),
+        read_changed_nanos,
+        stored_generation,
+    ) {
         Ok((checkpoint, _admission)) => {
             #[cfg(test)]
             assert!(
@@ -430,7 +439,7 @@ fn stored<S: TailSource>(
         Err(CertificateRefusal::Changed(reason)) => return Err(Miss::Changed(reason)),
         Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
     };
-    let mut base = TailBase::new(&head.body);
+    let mut base = TailBase::new(&head.body).with_write_generation(head.write_generation);
     let mut failed = None;
     let mut page_bytes = 0u64;
     let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
