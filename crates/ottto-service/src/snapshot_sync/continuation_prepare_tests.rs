@@ -136,6 +136,7 @@ impl ContinuationFixture {
         let status = test_agent_status(SourceKind::Codex);
         SourcePreparation {
             source: SnapshotSource::Codex,
+            prepare_elapsed: Duration::ZERO,
             claude_scan_roots: None,
             account_witness: [3; 32],
             scan_started_at: "2026-10-24T00:00:00Z".into(),

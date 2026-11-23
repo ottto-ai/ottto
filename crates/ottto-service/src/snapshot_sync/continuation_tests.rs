@@ -1500,6 +1500,98 @@ fn byte_budget_pages_pace_only_during_a_first_backfill() {
 const WALK_NOW: &str = "2026-11-17T00:01:00Z";
 const WALK_START: &str = "2026-11-17T00:00:00Z";
 
+#[test]
+fn slow_paced_prepare_limits_per_source() {
+    let ms = Duration::from_millis(1);
+    let codex = Duration::from_secs(10);
+    for (source, limit) in [
+        (SnapshotSource::ClaudeCode, CONTENTION_WORK),
+        (SnapshotSource::Codex, codex),
+    ] {
+        assert!(slow_paced_prepare(source, limit + ms, true), "{source:?}");
+        assert!(!slow_paced_prepare(source, limit, true), "{source:?}");
+        // A slow utility pass never cuts.
+        assert!(!slow_paced_prepare(source, limit * 3, false), "{source:?}");
+    }
+    assert!(!slow_paced_prepare(
+        SnapshotSource::Pi,
+        CONTENTION_WORK * 3,
+        true
+    ));
+    assert!(!paced_background_pass());
+}
+
+#[test]
+fn slow_paced_prepare_stops_only_file_limit_pacing() {
+    use crate::local_resource_diagnostics::{capture, source_finish, source_prepare};
+
+    let check = |scan: &SourceScanResult, bootstrap, cut_walk: bool, power, expected, cut: bool| {
+        let source = scan.source.api_slug();
+        let (request, rows) = capture(|| {
+            source_prepare(source, || (), |_| false);
+            source_finish(source, false, || {
+                Ok(resident_scan_request_after_settlement(
+                    scan,
+                    bootstrap,
+                    || cut_walk,
+                    power,
+                    true,
+                ))
+            })
+            .unwrap()
+        });
+        assert_eq!(request, expected, "{source} {power:?}");
+        let finish = rows
+            .iter()
+            .find(|row| row["stage"] == "source_finish")
+            .unwrap();
+        let pass = finish["counts"]["pass"].as_object().unwrap();
+        assert_eq!(
+            pass.get("paced_request_slow_prepare_cut"),
+            cut.then(|| serde_json::json!(1)).as_ref(),
+            "{source} {power:?}"
+        );
+    };
+    let mut scan = empty_scan();
+    scan.page_file_limit_hit = true;
+    scan.census_status.pending_work = true;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        scan.source = source;
+        for power in [PlatformState::Allowed, PlatformState::Battery] {
+            // A full page on a non-routine walk: the cut wins and is counted.
+            check(&scan, false, true, power, None, true);
+            check(&scan, false, false, power, Some(false), false);
+            check(&scan, true, true, power, Some(true), false);
+            scan.charge_deferred = true;
+            check(&scan, false, true, power, Some(false), false);
+            scan.charge_deferred = false;
+        }
+    }
+    // Bootstrap and charge deferral never consult, so never arm, the walk latch.
+    let latch_untouched = || -> bool { panic!("walk latch consulted") };
+    let request = |scan: &SourceScanResult, bootstrap| {
+        resident_scan_request_after_settlement(
+            scan,
+            bootstrap,
+            latch_untouched,
+            PlatformState::Allowed,
+            true,
+        )
+    };
+    assert_eq!(request(&scan, true), Some(true));
+    scan.charge_deferred = true;
+    assert_eq!(request(&scan, false), Some(false));
+    scan.charge_deferred = false;
+    scan.routine_recensus = true;
+    check(&scan, false, true, PlatformState::Allowed, None, false);
+    scan.routine_recensus = false;
+    scan.census_status.pending_work = false;
+    check(&scan, false, true, PlatformState::Allowed, None, false);
+    scan.census_status.pending_work = true;
+    scan.page_file_limit_hit = false;
+    check(&scan, false, true, PlatformState::Allowed, None, false);
+}
+
 fn pacing_index(queued: bool) -> ScanIndex {
     let key = "/synthetic/work.jsonl";
     let fp = "a".repeat(64);
@@ -1529,6 +1621,7 @@ fn walk_request(scan: &SourceScanResult, index: &ScanIndex, power: PlatformState
     resident_scan_request_after_settlement(
         scan,
         true,
+        || false,
         power,
         index.runnable_walk_or_followup(scan, &Default::default(), false, false, WALK_NOW),
     )
@@ -1581,7 +1674,7 @@ fn first_import_open_walk_pacing_decision_table() {
                     WALK_NOW,
                 );
                 assert_eq!(
-                    resident_scan_request_after_settlement(&scan, false, power, runnable),
+                    resident_scan_request_after_settlement(&scan, false, || false, power, runnable),
                     None,
                     "bootstrap complete {source:?} {name}"
                 );
@@ -1747,6 +1840,7 @@ fn first_import_final_page_conflict_requests_followup_after_settlement() {
         resident_scan_request_after_settlement(
             &scan,
             true,
+            || true,
             PlatformState::Allowed,
             index.runnable_walk_or_followup(&scan, &Default::default(), false, fresh, WALK_NOW),
         )
@@ -1921,7 +2015,7 @@ fn first_read_progress_pages_pace_only_during_a_first_backfill() {
             PlatformState::Unknown,
         ] {
             assert_eq!(
-                resident_scan_request_after_settlement(&scan, bootstrap, power, false),
+                resident_scan_request_after_settlement(&scan, bootstrap, || false, power, false),
                 requested.then_some(bootstrap),
                 "old predicate and QoS {bits:08b} {power:?}"
             );
@@ -2855,14 +2949,26 @@ fn first_import_recensus_and_no_progress_pages_take_import_qos_on_ac_only() {
         scan.first_read_progress = false;
         scan.page_file_limit_hit = false;
         assert!(!resident_scan_requested(&scan, true), "routine={routine}");
-        let ac = resident_scan_request_after_settlement(&scan, true, PlatformState::Allowed, true);
+        let ac = resident_scan_request_after_settlement(
+            &scan,
+            true,
+            || false,
+            PlatformState::Allowed,
+            true,
+        );
         assert_eq!(ac, Some(true), "routine={routine}");
         assert_eq!(
             paced_pass_qos(PlatformState::Allowed, true),
             PassQos::Default
         );
         assert_eq!(
-            resident_scan_request_after_settlement(&scan, true, PlatformState::Battery, true),
+            resident_scan_request_after_settlement(
+                &scan,
+                true,
+                || false,
+                PlatformState::Battery,
+                true
+            ),
             None,
             "battery keeps its own pacing, routine={routine}"
         );
@@ -2871,7 +2977,13 @@ fn first_import_recensus_and_no_progress_pages_take_import_qos_on_ac_only() {
             PassQos::Background
         );
         assert_eq!(
-            resident_scan_request_after_settlement(&scan, false, PlatformState::Allowed, true),
+            resident_scan_request_after_settlement(
+                &scan,
+                false,
+                || false,
+                PlatformState::Allowed,
+                true
+            ),
             None,
             "steady state, routine={routine}"
         );

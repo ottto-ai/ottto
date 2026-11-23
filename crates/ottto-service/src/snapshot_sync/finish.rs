@@ -1157,6 +1157,7 @@ pub(super) fn finish_sync_source(
     );
     let SourcePreparation {
         source,
+        prepare_elapsed,
         walk_idle_pass,
         claude_scan_roots,
         account_witness,
@@ -2544,9 +2545,15 @@ pub(super) fn finish_sync_source(
             &upload_destination_namespace,
         );
     let power = continuation::MacPlatformSignals::default().power();
+    let slow_prepare = continuation::slow_paced_prepare(
+        source,
+        prepare_elapsed,
+        continuation::paced_background_pass(),
+    );
     if let Some(first_import) = continuation::resident_scan_request_after_settlement(
         &scan_result,
         first_read_bootstrap,
+        || index.walk_pacing_cut(source, slow_prepare),
         power,
         index.runnable_walk_or_followup(
             &scan_result,

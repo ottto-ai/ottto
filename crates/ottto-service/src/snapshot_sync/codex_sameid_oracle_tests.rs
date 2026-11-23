@@ -635,6 +635,7 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         upload_progress_path: progress_path.clone(),
     };
     let preparation = SourcePreparation {
+        prepare_elapsed: std::time::Duration::ZERO,
         account_witness: daemon.snapshot_scan_account_witness().unwrap(),
         scan_started_at: scan.census_window_end.clone(),
         activity_hint: serde_json::from_value(json!({"source":"codex",

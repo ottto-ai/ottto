@@ -311,6 +311,7 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         upload_progress_path: progress_path.clone(),
     };
     let preparation = SourcePreparation {
+        prepare_elapsed: std::time::Duration::ZERO,
         account_witness: daemon.snapshot_scan_account_witness().unwrap(),
         scan_started_at: scan.census_window_end.clone(),
         activity_hint: serde_json::from_value(serde_json::json!({"source":"codex", "server_time":scan.census_window_end, "last_data_at":null,

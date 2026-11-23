@@ -465,6 +465,11 @@ The pass reports each of the following outcome counts even when it is zero.
   the first-import flag, and `paced_power_allowed` or `paced_power_battery`
   records the power state it saw. All are 0 when no request was made.
 
+When a paced background pass's prepare takes more than 20 seconds (Claude) or
+10 seconds (Codex), finish skips paced requests triggered only by the file limit
+for the rest of that walk. Each skipped request shows
+`paced_request_slow_prepare_cut` with a value of 1.
+
 `source_prepare` counts say why the pass ran or stopped. Exactly one of
 `due_paced` (a paced request was due), `due_ordinary` (the ordinary cadence
 tier) or `due_deferred` (the cadence gate stopped the pass) is 1, together with

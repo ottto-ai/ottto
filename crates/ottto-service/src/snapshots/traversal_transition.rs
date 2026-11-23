@@ -46,7 +46,42 @@ impl SnapshotSource {
             })
             .collect::<std::collections::BTreeSet<_>>();
         recensus().retain(|(slot, context), _| *slot != self.slot() || !contexts.contains(context));
+        PACING_CUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(slot, context), _| *slot != self.slot() || !contexts.contains(context));
         super::money_freshness::restart_for_test();
+    }
+}
+
+// The window of the walk whose slow paced prepare stopped file-limit pacing,
+// keyed like the recensus marker. Every walk start takes a new window, so
+// retire and context change end it. Process memory only.
+type PacingCut = BTreeMap<(usize, String), String>;
+static PACING_CUT: Mutex<PacingCut> = Mutex::new(BTreeMap::new());
+
+impl ScanIndex {
+    /// Latches the current walk when `slow`, then says whether it is latched.
+    pub(crate) fn walk_pacing_cut(&self, source: SnapshotSource, slow: bool) -> bool {
+        let Some(t) = &self.traversal else {
+            return false;
+        };
+        let mut cut = PACING_CUT.lock().unwrap_or_else(|poisoned| {
+            PACING_CUT.clear_poison();
+            poisoned.into_inner()
+        });
+        let key = (source.slot(), t.context_fingerprint.clone());
+        if slow {
+            // One latched walk per source.
+            cut.retain(|(slot, _), _| *slot != source.slot());
+            cut.insert(key, t.census_window_end.clone());
+            return true;
+        }
+        if cut.get(&key) == Some(&t.census_window_end) {
+            return true;
+        }
+        cut.remove(&key);
+        false
     }
 }
 
@@ -677,6 +712,41 @@ mod tests {
             let traversal = index.traversal.as_ref().unwrap();
             assert!(routine_recensus(source, traversal));
             assert_recensus_witness(&rows[0], traversal, true);
+        }
+    }
+
+    #[test]
+    fn slow_paced_prepare_cut_lasts_for_its_walk_only() {
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            let scratch = crate::test_scratch::ScratchDir::new("pacing-cut");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            assert!(!index.walk_pacing_cut(source, true), "{source:?} no walk");
+            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+            assert!(
+                !index.walk_pacing_cut(source, false),
+                "{source:?} unlatched"
+            );
+            assert!(index.walk_pacing_cut(source, true), "{source:?} slow");
+            // A fast utility prepare after the cut does not renew pacing.
+            assert!(index.walk_pacing_cut(source, false), "{source:?} latched");
+            let context = index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone();
+            index.traversal.as_mut().unwrap().context_fingerprint = "0".repeat(64);
+            assert!(!index.walk_pacing_cut(source, false), "{source:?} context");
+            index.traversal.as_mut().unwrap().context_fingerprint = context;
+            assert!(index.walk_pacing_cut(source, false), "{source:?} same walk");
+            index.traversal = None;
+            ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS);
+            assert!(
+                !index.walk_pacing_cut(source, false),
+                "{source:?} next walk"
+            );
+            assert!(!index.walk_pacing_cut(source, false), "{source:?} cleared");
         }
     }
 

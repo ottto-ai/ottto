@@ -416,7 +416,7 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 - A clean census completion arms the next routine walk in process memory only.
   Routine walk pages use ordinary cadence when only their file allowance is full;
   resident-charge deferrals still request paced pages. A process restart, sidecar
-  restart, changed traversal context, unhealthy retry or clean follow-up keeps pacing.
+  restart, changed traversal context, unhealthy retry or clean follow-up can keep pacing.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full audit credit or upload acceptance.
@@ -480,8 +480,10 @@ file-level only: no namespace loss, directory cap, rejected symlink or watcher o
 Retry arming needs no same-process evidence: after a restart or upgrade, a kept
 terminal-unhealthy traversal's first eligible retry walk is routine under those conditions.
 The active routine marker is process-local and binds the scan context and census window;
-resuming an unfinished walk after restart does not restore it. Resident deferral can still
-request pacing.
+resuming an unfinished walk after restart does not restore it. When a paced background pass's
+prepare takes more than 20 seconds (Claude) or 10 seconds (Codex), file-limit-only requests
+outside first import give way to ordinary cadence for the rest of that walk (process memory
+only). Resident deferrals still request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.

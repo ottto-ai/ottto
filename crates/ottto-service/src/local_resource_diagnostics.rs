@@ -1780,6 +1780,8 @@ pub(crate) struct PassOutcomes {
     pub(crate) paced_first_import: u64,
     pub(crate) paced_power_allowed: u64,
     pub(crate) paced_power_battery: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) paced_request_slow_prepare_cut: u64,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.

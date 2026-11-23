@@ -45,7 +45,6 @@ use super::Context;
 #[cfg(not(test))]
 use super::Context as _;
 use super::Digest;
-#[cfg(test)]
 use super::Duration;
 use super::Instant;
 use super::LocalDaemon;
@@ -358,6 +357,7 @@ pub(super) fn exclude_held_effective_body_witness_revision(
 // crosses a collection step.
 pub(super) struct SourcePreparation {
     pub(super) source: SnapshotSource,
+    pub(super) prepare_elapsed: Duration,
     /// Walk-gate inputs, and whether the cycle's own state owed no walk.
     pub(super) walk_idle_pass: Option<(crate::snapshots::walk_idle::Pass, bool)>,
     pub(super) claude_scan_roots: Option<Vec<PathBuf>>,
@@ -700,6 +700,7 @@ pub(super) fn prepare_sync_source_inner(
     transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     account_witness: [u8; 32],
 ) -> Result<Option<SourcePreparation>> {
+    let prepare_started = Instant::now();
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -1215,6 +1216,7 @@ pub(super) fn prepare_sync_source_inner(
     }
     Ok(Some(SourcePreparation {
         source,
+        prepare_elapsed: prepare_started.elapsed(),
         walk_idle_pass: Some((walk_idle_pass, cycle_owes_nothing)),
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
         account_witness,

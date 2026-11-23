@@ -61,8 +61,8 @@ pub(super) const PACING: ContinuationPacing = ContinuationPacing {
     idle_per_work: 9,
 };
 
-/// Ordinary resident-paced passes reuse cadence requests, without the cursor's
-/// contention cutoff: each pass repeats prepare and commits its queued work.
+/// Resident-paced passes repeat prepare and commit their queued work.
+/// A slow paced prepare can stop file-limit pacing for the rest of its walk.
 pub(super) const PACED_AC: ContinuationPacing = ContinuationPacing {
     min_gap: Duration::from_secs(30),
     idle_per_work: 0,
@@ -113,9 +113,26 @@ pub(super) fn paced_pass_qos(power: PlatformState, first_import: bool) -> PassQo
 thread_local! {
     /// This owner thread's current pass took [`PassQos::Default`]; diagnostics only.
     static FIRST_IMPORT_DEFAULT_QOS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This owner thread's current pass is a paced pass at [`PassQos::Background`].
+    static PACED_BACKGROUND_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) fn first_import_default_qos() -> bool {
     FIRST_IMPORT_DEFAULT_QOS.get()
+}
+/// Codex prepares run faster than Claude's: this sits between its utility and
+/// background prepare times.
+const CODEX_SLOW_PREPARE: Duration = Duration::from_secs(10);
+/// A paced background pass whose prepare took longer than its source's limit.
+pub(super) fn slow_paced_prepare(source: SnapshotSource, elapsed: Duration, paced: bool) -> bool {
+    let limit = match source {
+        SnapshotSource::ClaudeCode => CONTENTION_WORK,
+        SnapshotSource::Codex => CODEX_SLOW_PREPARE,
+        SnapshotSource::Pi => return false,
+    };
+    paced && elapsed > limit
+}
+pub(super) fn paced_background_pass() -> bool {
+    PACED_BACKGROUND_PASS.get()
 }
 /// Background QoS for one source's ordinary pass, only while THAT source's
 /// paced scan is due; a refused entry clears only that source's request.
@@ -125,6 +142,7 @@ pub(super) fn paced_source_qos(
     background: impl FnOnce() -> Option<MacPlatformSignals>,
 ) -> Option<MacPlatformSignals> {
     FIRST_IMPORT_DEFAULT_QOS.set(false);
+    PACED_BACKGROUND_PASS.set(false);
     if !source_paced_due(source).is_some_and(|due| due <= crate::scan_clock::now()) {
         return None;
     }
@@ -134,7 +152,11 @@ pub(super) fn paced_source_qos(
             FIRST_IMPORT_DEFAULT_QOS.set(true);
             return None;
         }
-        PassQos::Background => background(),
+        PassQos::Background => {
+            let qos = background();
+            PACED_BACKGROUND_PASS.set(qos.is_some());
+            qos
+        }
         PassQos::Cleared => None,
     };
     if qos.is_none() {
@@ -152,6 +174,7 @@ pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: Sn
 pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
     drop(slot.take());
     FIRST_IMPORT_DEFAULT_QOS.set(false);
+    PACED_BACKGROUND_PASS.set(false);
 }
 /// A spent byte budget or first-read progress asks only during the source's
 /// first backfill. Progress asks only while the census is unfinished and not
@@ -173,10 +196,19 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
 pub(super) fn resident_scan_request_after_settlement(
     scan: &SourceScanResult,
     bootstrap: bool,
+    walk_cut: impl FnOnce() -> bool,
     power: PlatformState,
     runnable: bool,
 ) -> Option<bool> {
     let existing = resident_scan_requested(scan, bootstrap);
+    // Outside bootstrap and charge deferral, only a full page can ask for pacing.
+    // `walk_cut` latches a slow paced prepare for the rest of that walk.
+    if existing && !bootstrap && !scan.charge_deferred && walk_cut() {
+        crate::local_resource_diagnostics::pass_outcomes(|counts| {
+            counts.paced_request_slow_prepare_cut = 1;
+        });
+        return None;
+    }
     (existing || (bootstrap && power == PlatformState::Allowed && runnable)).then_some(bootstrap)
 }
 #[cfg(not(test))]
@@ -1686,6 +1718,7 @@ pub(super) fn prepare_continuation_source(
     .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         source,
+        prepare_elapsed: Duration::ZERO,
         walk_idle_pass: None,
         claude_scan_roots: None,
         account_witness: inputs.account_witness,
