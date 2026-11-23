@@ -9034,13 +9034,12 @@ fn launcher_event_binds_a_worker_transcript_to_its_controller_session() {
     );
     crate::session_attribution::validate_fact_limits(&item.attribution_facts)
         .expect("launch facts stay inside the wire contract");
-    // The event file left `pending/` and stays joinable for the next scan of
-    // the same worker.
+    // The event file left `pending/`, filed under its worker, and stays
+    // joinable for the next scan of the same worker.
     assert!(!pending.join(format!("{digest}.json")).exists());
-    assert!(home
-        .join(".ottto/launch-events/processed")
-        .join(format!("{digest}.json"))
-        .exists());
+    let processed = home.join(".ottto/launch-events/processed");
+    assert!(processed.join(format!("{worker}.{digest}.json")).exists());
+    assert!(!processed.join(format!("{digest}.json")).exists());
     let _ = fs::remove_dir_all(&home);
 }
 
