@@ -690,14 +690,15 @@ class LedgerTests(unittest.TestCase):
     def test_validator_edits_are_listed_and_only_for_listed_files(self):
         listed = 'crates/ottto-service/tests/support/scan_index_v201.rs'
         other = 'crates/ottto-service/tests/support/other_v201.rs'
+        guard = 'crates/ottto-service/src/snapshot_sync/source_guard_tests.rs'
         test = 'fn anchors() {\n    assert!(true);\n}\n'
         base = self.repo.commit({'crates/ottto-service/Cargo.toml': '[package]\nname = "s"\n', listed: test,
-                                 other: test, 'scripts/test_codex_zst_downgrade.py': 'print(1)\n'})
+                                 other: test, guard: 'print(1)\n'})
         head = self.repo.commit({listed: test.replace('true', '!false'),
-                                 'scripts/test_codex_zst_downgrade.py': 'print(2)\n'})
+                                 guard: 'print(2)\n'})
         status, out = run(self.repo, base, head)
         self.assertEqual(status, 0, out)
-        self.assertIn(f'validator edits: {listed}, scripts/test_codex_zst_downgrade.py', out)
+        self.assertIn(f'validator edits: {guard}, {listed}', out)
         status, out = run(self.repo, head, self.repo.commit({other: test.replace('true', '!false')}))
         self.assertEqual(status, 1, out)
         self.assertIn('changed: fn anchors', out)

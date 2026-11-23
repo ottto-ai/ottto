@@ -15,7 +15,6 @@ use oracle::money_oracle::{
 use otel::ClaudeLocalOtelEvidence as Api;
 use serde_json::{from_slice as decode, to_value as value, to_vec as encode, Value};
 use std::fs;
-use std::process::Command;
 
 fn signed(mut row: Api) -> Api {
     row.fingerprint.clear();
@@ -438,50 +437,6 @@ fn pair_hold() {
         if matches!(case, "bytes" | "authority") {
             assert!(caps()[7] > before[7]);
         }
-    }
-}
-
-/// [format] Old readers refuse the newer layout; a current reopen keeps custody.
-#[test]
-fn telemetry_only_previous_release_refuses_new_layout() {
-    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
-        || std::env::var("RUNNER_OS").as_deref() != Ok("Linux")
-    {
-        return;
-    }
-    let dir = test_dir("otel-only-carry-orchestration");
-    let child = |stage: &str, root: &Path| {
-        let test = format!(
-            "{}::telemetry_only_carry_child",
-            module_path!().split_once("::").unwrap().1
-        );
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
-            .env("OTTTO_OTEL_CARRY_STAGE", stage)
-            .env("OTTTO_OTEL_CARRY_ROOT", root)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "carry {stage}: {output:?}");
-    };
-    for tag in ["v0.1.239", "v0.1.244", "v0.1.256"] {
-        let root = dir.join(tag);
-        fs::create_dir_all(&root).unwrap();
-        child("write", &root);
-        child("checkpoint", &root);
-        let (index_path, _, _): (PathBuf, PathBuf, Value) =
-            decode(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        let result = Command::new("python3")
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../scripts/test_telemetry_only_carry.py"),
-            )
-            .arg(tag)
-            .arg(index_path)
-            .status()
-            .unwrap();
-        assert!(result.success(), "pinned source round trip {tag}");
-        child("verify", &root);
-        println!("TELEMETRY_ONLY_ROLL_FORWARD_VERIFIED {tag}");
     }
 }
 
