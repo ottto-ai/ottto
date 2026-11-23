@@ -826,6 +826,7 @@ mod record_mode_tests {
             audit_cap_full: 0,
             audit_cap_delay: 0,
             pace_evicted: 0,
+            same_size_touch_proven: 0,
             start_overdue_seconds: 0,
             completion_overdue_seconds: 0,
             admission: Default::default(),
