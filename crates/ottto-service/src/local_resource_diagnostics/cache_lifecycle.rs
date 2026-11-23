@@ -23,7 +23,7 @@ sparse_lifetime_counters! {
     llm_request_span_success_false: LlmRequestSpanSuccessFalse,
     llm_request_span_missing_session_id: LlmRequestSpanMissingSessionId,
     llm_request_span_missing_start_time: LlmRequestSpanMissingStartTime,
-    // Local OTLP relay rows and encoded bytes successfully appended (no fsync).
+    // Local OTLP relay rows and encoded bytes accepted into the journal (no fsync).
     otlp_relay_appended_rows: OtlpRelayAppendedRows,
     otlp_relay_appended_bytes: OtlpRelayAppendedBytes,
     // Relay evidence file appends, handle opens, and the gap since the previous
@@ -35,6 +35,15 @@ sparse_lifetime_counters! {
     otlp_relay_append_gap_5_30s_cumulative: OtlpRelayAppendGap5To30s,
     otlp_relay_append_gap_30_120s_cumulative: OtlpRelayAppendGap30To120s,
     otlp_relay_append_gap_ge_120s_or_first_cumulative: OtlpRelayAppendGapGe120sOrFirst,
+    // The shared relay journal: request writes, non-empty drains, rows moved
+    // to per-session files, and torn lines skipped (never copied).
+    otlp_relay_journal_appends_cumulative: OtlpRelayJournalAppends,
+    otlp_relay_journal_drains_cumulative: OtlpRelayJournalDrains,
+    otlp_relay_journal_drained_rows_cumulative: OtlpRelayJournalDrainedRows,
+    otlp_relay_journal_skipped_lines_cumulative: OtlpRelayJournalSkippedLines,
+    // Drain wall time, and drains that took a second or more.
+    otlp_relay_journal_drain_ms_cumulative: OtlpRelayJournalDrainMs,
+    otlp_relay_journal_drains_ge_1s_cumulative: OtlpRelayJournalDrainsGe1s,
     claude_sqlite_pager_wal_page_bytes_cumulative: ClaudePagerBytes,
     codex_sqlite_pager_wal_page_bytes_cumulative: CodexPagerBytes,
     pi_sqlite_pager_wal_page_bytes_cumulative: PiPagerBytes,
@@ -122,18 +131,26 @@ pub(crate) fn add_logical_writes<T>(event: Event, f: impl FnOnce() -> T) -> T {
     value
 }
 
-/// Rows the local OTLP relay appended in this process.
+/// Rows the local OTLP relay accepted (counted at the journal append) and
+/// rows its journal drains moved to the per-session files, in this process.
 #[cfg(not(test))]
-pub(crate) fn otlp_appended_rows() -> u64 {
-    Counts::totals().otlp_relay_appended_rows
+pub(crate) fn otlp_relay_rows() -> (u64, u64) {
+    let totals = Counts::totals();
+    (
+        totals.otlp_relay_appended_rows,
+        totals.otlp_relay_journal_drained_rows_cumulative,
+    )
 }
 
-/// Rows this test thread appended while observed.
+/// The same rows this test thread counted while observed.
 #[cfg(test)]
-pub(crate) fn otlp_appended_rows() -> u64 {
+pub(crate) fn otlp_relay_rows() -> (u64, u64) {
     TEST_EVENTS.with(|events| {
-        events
-            .get()
-            .map_or(0, |values| values[Event::OtlpRelayAppendedRows as usize])
+        events.get().map_or((0, 0), |values| {
+            (
+                values[Event::OtlpRelayAppendedRows as usize],
+                values[Event::OtlpRelayJournalDrainedRows as usize],
+            )
+        })
     })
 }

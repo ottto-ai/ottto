@@ -466,6 +466,19 @@ pub(crate) fn diagnostics_items(
         "maximum_bytes_read".into(),
         RedactedValue::Number((2 * MAX_FILES_PER_STORE as u64 * MAX_BYTES_PER_FILE) as i64),
     );
+    // Rows accepted since the last drain wait here, outside the stores below.
+    for (field, path) in [
+        ("relay_journal_bytes", relay_journal::journal_path(support)),
+        (
+            "relay_journal_prev_bytes",
+            relay_journal::prev_path(support),
+        ),
+    ] {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            let bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            fields.insert(field.into(), RedactedValue::Number(bytes));
+        }
+    }
     match open_directory(support) {
         Ok(root) => {
             fields.insert(

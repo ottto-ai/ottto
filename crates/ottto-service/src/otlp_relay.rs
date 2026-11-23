@@ -2812,6 +2812,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_rows_are_in_the_relay_journal_before_the_exporter_is_answered() {
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-journal-answer");
+        grant_claude(&support_dir);
+        let journal = crate::claude_local_otel::relay_journal_path_for_test(&support_dir);
+        crate::claude_local_otel::keep_relay_rows_waiting_for_test(true);
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_export_success(&response, "application/json", b"{}");
+        let stored = std::fs::read(&journal).expect("journal written before the answer");
+        assert!(stored.starts_with(b"a{") && stored.ends_with(b"\n"));
+        assert!(String::from_utf8_lossy(&stored).contains("req-retired-forward"));
+        let unread = crate::claude_local_otel::load_claude_effort_evidence(
+            &support_dir,
+            ["retired-forward-session".to_string()],
+        )
+        .expect("per-session files read");
+        assert!(
+            unread.is_empty(),
+            "rows reach the session file at the drain"
+        );
+
+        // A journal that cannot be appended to fails the request as today.
+        std::fs::remove_file(&journal).expect("remove journal");
+        std::fs::create_dir(&journal).expect("block journal");
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        crate::claude_local_otel::keep_relay_rows_waiting_for_test(false);
+        assert_eq!(response.status, 500);
+    }
+
+    #[test]
     fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
         use std::io::Write as _;
         let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");

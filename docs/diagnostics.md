@@ -506,7 +506,10 @@ and entry counts for process-lifetime maps: `rearm_clear_tags`,
 `rearm_open_pages`, `counted_poison_scopes`, `counted_poison_fingerprints`,
 `telemetry_notice_dirs`, `telemetry_notice_roots`, `state_v2_routes`,
 `grant_rebind_refusals`, `claude_token_owners`, `claude_spawn_admitted`, and
-`repository_identities`. Counts only, never keys. A map whose lock is busy
+`repository_identities`. It also carries the current
+`otlp_relay_journal_kept_rows` and `otlp_relay_journal_kept_bytes`: rows waiting
+in the relay journal because their per-session file refused them at the last
+drain (not cumulative). Counts only, never keys. A map whose lock is busy
 reports `null` instead of waiting. A count that keeps rising across quiet hours
 names the map behind a rising rest footprint.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
@@ -2097,10 +2100,47 @@ local relay counts connections refused at its concurrency limit
 also one `bad_framing` log line), Claude exports acknowledged while Claude
 collection is off (`otlp_relay_collection_disabled`) and bodies with an
 unsupported content encoding (`otlp_relay_unknown_content_encoding`). The
-local relay also counts evidence rows appended by successful file writes
-(`otlp_relay_appended_rows`) and their encoded bytes (`otlp_relay_appended_bytes`),
-with one append per evidence file per request and no fsync. Counts only: no ids,
-paths or payload content, and they never affect usage or cost.
+local relay also counts evidence rows it accepted (`otlp_relay_appended_rows`)
+and their encoded bytes (`otlp_relay_appended_bytes`), counted when the request's
+rows are appended to the shared relay journal, before the exporter is answered,
+with no fsync. Counts only: no ids, paths or payload content, and they never
+affect usage or cost.
+
+The relay appends each request's rows to one shared journal file under
+`local-otel` instead of to each session's evidence files. A drain moves them to
+the per-session files, in arrival order and one append per file: at daemon
+start, at each scan start, and inline when a request takes the journal 16 MiB
+past its length after the last drain (scans stalled; nothing is refused or
+dropped for size). Rows a drain could not move set that length, so a refused
+backlog never drains on each request. A drain first renames the journal to a
+`prev` file and keeps it until a drain at least a minute later replaces it, so
+rows keep an on-disk copy until their per-session writes have been written
+back; a drain at least a minute later with an empty journal removes `prev`, so
+an idle `prev` lives about one scan interval. The first drain after a start
+replays `prev`, then the journal. A drain that adds the journal to `prev` syncs
+`prev` before it cuts the journal.
+Readers read only the per-session files, after a drain. A replay or a crash
+mid-drain can copy rows twice; the readers drop identical rows. A torn line
+from a crash mid-append, in the journal or a per-session file, is ended before
+the next append and never joins a full row: text after the last newline is
+padding only when it is all whitespace. Retention holds a session's files while
+the journal or `prev` holds one of its rows, so a later replay never recreates
+files retention removed. Rows a per-session file refuses wait in the journal
+until that file accepts them, and only that session's files stay held. While
+they pass 32 MiB, each drain emits one `local_resources`
+`otlp_relay_journal_kept_alarm` point with `otlp_relay_journal_kept_rows` and
+`otlp_relay_journal_kept_bytes`, like the other local alarms; the rows are kept.
+A notice for the
+telemetry-only path is taken when a row is captured with notices active and
+delivered when its rows reach the per-session file. The walk gate of a settled
+Claude source binds both the accepted row count and the drained row count, so a
+row accepted after one scan-start drain wakes the pass that follows the next
+drain. `ottto-service snapshot-audit` never drains: with Claude sidecars
+supplied and rows waiting in the journal it prints one stderr line that its
+input is incomplete, with the waiting row count. The doctor's support
+inspection reports the journal's and `prev`'s sizes (`relay_journal_bytes`,
+`relay_journal_prev_bytes`); the stores it samples hold rows as of the last
+drain.
 
 The same `process_retained_cache_lifecycle_totals` row carries these cumulative
 writer counters in `counts` (all sources; the row's `source` is `unknown`):
@@ -2115,8 +2155,14 @@ writer counters in `counts` (all sources; the row's `source` is `unknown`):
 | `erasure_vacuum_logical_write_bytes_cumulative` | The same process logical-write delta across each erasure (Purge) VACUUM attempt, including its TRUNCATE checkpoint, the `VACUUM INTO` copy and its validation, whether or not it publishes. Also a process-wide upper bound; macOS only. |
 | `shared_cache_helper_write_bytes_cumulative` | Payload bytes from successful complete writes through `write_json_atomic` and `replace_json_cache`. Counts temp-file writes before rename, even if rename later fails; does not mean all status persistence. |
 | `json_cache_write_bytes_cumulative.{active_sessions,context_footprint,mcp_inventory,codex_prelude_footprint,upload_policy,other}` | The same helper payload bytes split by a fixed cache kind that each caller names; `other` is for callers outside that list. A fixed map: no paths or ids. Each write adds to the total before its kind, so the kinds sum to at most the total in one row. |
-| `otlp_relay_appended_bytes` | Existing cumulative encoded bytes from successful local OTLP evidence appends; reused unchanged. |
-| `otlp_relay_file_appends_cumulative` | Successful relay evidence file writes: one per evidence file per request, each extending that file. |
+| `otlp_relay_appended_bytes` | Existing cumulative encoded row bytes the relay accepted, counted at the journal append; the same bytes later land in the per-session files. |
+| `otlp_relay_journal_appends_cumulative` | Successful relay journal writes: one per request that stored at least one row. |
+| `otlp_relay_journal_drains_cumulative` | Drains that found a non-empty journal. |
+| `otlp_relay_journal_drained_rows_cumulative` | Rows a drain appended to their per-session files. |
+| `otlp_relay_journal_skipped_lines_cumulative` | Journal lines a drain skipped and did not copy: a torn line left by a crash mid-append. |
+| `otlp_relay_journal_drain_ms_cumulative` | Wall time of non-empty drains, in milliseconds; the relay waits on the append lock meanwhile. |
+| `otlp_relay_journal_drains_ge_1s_cumulative` | Non-empty drains that took one second or more. |
+| `otlp_relay_file_appends_cumulative` | Successful per-session evidence file writes: one per evidence file per drain, each extending that file. |
 | `otlp_relay_append_handle_opens_cumulative` | Evidence file handle opens: first use and every miss after eviction, file replacement, the per-cycle handle release, or on every append when no handle cache is available. |
 | `otlp_relay_append_gap_{lt_1s,1_5s,5_30s,30_120s,ge_120s_or_first}_cumulative` | Per successful file append, the time since the previous append through the same cached handle, in fixed buckets (lower edge inclusive). An append through a newly opened handle (first use, eviction or release) counts as `ge_120s_or_first`. Kept in memory with the handle; no new state. |
 

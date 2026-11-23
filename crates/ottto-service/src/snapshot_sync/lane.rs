@@ -76,6 +76,9 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
         .name("ottto-snapshot-sync".to_string())
         .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
         .spawn(move || {
+            // A journal left by a crash or stop is replayed before anything
+            // reads the per-session files.
+            drain_relay_journal(&support_dir);
             // Spread the fleet's cycle phase deterministically before the first
             // cycle. Otherwise phase is set by install or restart time, and every
             // fleet-wide event re-aligns every machine onto the same tick.
@@ -588,6 +591,15 @@ pub(super) fn cycle_start_scan_started_at(source: SnapshotSource, at: &str) -> O
     (!crate::snapshots::walk_idle::armed(source)).then_some(at)
 }
 
+fn drain_relay_journal(support_dir: &Path) {
+    if let Err(error) = crate::claude_local_otel::drain_relay_journal(support_dir) {
+        eprintln!(
+            "local snapshot sync: relay journal drain deferred: {}",
+            safe_error(&error)
+        );
+    }
+}
+
 pub(super) fn sync_once(
     home: &Path,
     support_dir: &Path,
@@ -607,7 +619,9 @@ pub(super) fn sync_once(
     }
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
-    crate::claude_local_otel::close_append_handles();
+    // Before any reader: relay rows accepted since the last drain move to
+    // their per-session files, which this cycle then reads as before.
+    drain_relay_journal(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
