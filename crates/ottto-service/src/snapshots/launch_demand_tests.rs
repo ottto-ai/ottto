@@ -21,9 +21,9 @@ const PARENTS: [&str; 3] = [
 /// A UUID-looking subagent stem that also names a retained launch worker.
 const UUID_STEM: &str = "22222222-aaaa-4bbb-8ccc-000000000004";
 
-struct Home(PathBuf);
+pub(super) struct Home(PathBuf);
 impl Home {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = crate::test_scratch::unique_path("ottto-launch-demand");
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -46,7 +46,17 @@ impl Home {
         )
         .unwrap();
     }
-    fn context(&self) -> crate::session_attribution::SessionAttributionContext {
+    pub(super) fn fill_retained_events(&self, count: usize) {
+        for n in 1..=count {
+            self.event(&format!("{n:08x}-2222-3333-4444-555555555555"));
+        }
+    }
+    pub(super) fn block_pending_directory(&self) {
+        let root = self.0.join(".ottto/launch-events");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("pending"), b"not a directory").unwrap();
+    }
+    pub(super) fn context(&self) -> crate::session_attribution::SessionAttributionContext {
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32]);
         crate::session_attribution::SessionAttributionContext::from_activity_hint(
             SnapshotSource::ClaudeCode,
@@ -138,21 +148,7 @@ fn scan(
     crate::session_attribution::SessionAttributionContext,
 ) {
     let context = home.context();
-    let mut state = OwnedSourceScan::new(
-        SnapshotSource::ClaudeCode,
-        &[root.to_path_buf()],
-        ScanIndex::default(),
-        NOW,
-        BACKFILL_WINDOW_DAYS,
-        10,
-        None,
-        &[],
-        false,
-    )
-    .with_sampled_acquisition(
-        Arc::new(sampled_scan::SharedCache::default()),
-        crate::transcript_acquisition::Scope("launch-demand-fixture".into()),
-    );
+    let mut state = new_scan(root);
     let mut steps = 0;
     loop {
         steps += 1;
@@ -179,6 +175,24 @@ fn scan(
     }
 }
 
+fn new_scan(root: &Path) -> OwnedSourceScan {
+    OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        &[root.to_path_buf()],
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(
+        Arc::new(sampled_scan::SharedCache::default()),
+        crate::transcript_acquisition::Scope("launch-demand-fixture".into()),
+    )
+}
+
 fn item<'a>(scan: &'a SourceScanResult, session: &str) -> &'a SnapshotItem {
     scan.snapshots
         .iter()
@@ -195,9 +209,7 @@ fn subagents_with_unbatched_parents_keep_one_prepared_native_batch() {
         home.event(worker);
     }
     // Enough retained claims that every full sweep spans several native steps.
-    for n in 1..=1100 {
-        home.event(&format!("{n:08x}-2222-3333-4444-555555555555"));
-    }
+    home.fill_retained_events(1100);
     let probe = home.context();
     let mut sweep_steps = 0;
     while !probe
@@ -261,7 +273,7 @@ fn incomplete_lookup_holds_top_level_workers_but_not_subagents() {
     let fixture = transcripts(&home);
     home.event(TOP);
     // A regular file where the inbox directory belongs fails every sweep.
-    fs::write(home.0.join(".ottto/launch-events/pending"), b"unreadable").unwrap();
+    home.block_pending_directory();
     let (_, result, _, context) = scan(&home, &fixture.root);
     assert!(!context.launch_events().prepared(&[TOP.to_owned()]));
     assert!(
@@ -287,4 +299,56 @@ fn incomplete_lookup_holds_top_level_workers_but_not_subagents() {
         }
         assert_subagent_without_launch_lineage(item(&result, session), parent);
     }
+}
+
+#[test]
+fn unfinished_launch_batch_leaves_the_selection_untouched() {
+    let home = Home::new();
+    let fixture = transcripts(&home);
+    let second = PARENTS[0];
+    fs::write(
+        fixture
+            .root
+            .join("fixture-project")
+            .join(format!("{second}.jsonl")),
+        transcript(second, "second", false),
+    )
+    .unwrap();
+    home.fill_retained_events(300);
+    let context = home.context();
+    let events = context.launch_events();
+    let workers = [TOP.to_owned(), second.to_owned()];
+    let mut scan = new_scan(&fixture.root);
+    scan.identified_candidates.retain(|candidate| {
+        candidate
+            .path
+            .file_stem()
+            .is_some_and(|stem| stem == TOP || stem == second)
+    });
+    let before = scan.trace_projection();
+    let candidates = |scan: &OwnedSourceScan| {
+        scan.identified_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>()
+    };
+    let selected = candidates(&scan);
+    assert_eq!(selected.len(), workers.len());
+    for step in 0..32 {
+        let OwnedSourceScanStep::Pending(next) = scan.step(Some(&context)) else {
+            panic!("the first batch must prepare before page close");
+        };
+        if events.prepared(&workers) {
+            assert!(step > 0, "the retained store requires more than one step");
+            assert!(
+                next.active_file.is_some(),
+                "prepared batch starts the first file"
+            );
+            return;
+        }
+        assert_eq!(next.trace_projection(), before);
+        assert_eq!(candidates(&next), selected);
+        scan = next;
+    }
+    panic!("the whole selection's launch batch never prepared");
 }

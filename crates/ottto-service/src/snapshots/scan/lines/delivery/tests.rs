@@ -544,8 +544,7 @@ fn two_lines_delivered(recorder: &Recorder) -> impl Fn(&OwnedSourceScan) -> bool
     move |_| recorder.lines().len() >= 2
 }
 
-/// An open file removed between steps ends once `Incomplete`, also when
-/// the page completes in that same step.
+/// A file removed between steps ends once `Incomplete` on the failed reopen.
 #[test]
 fn file_removed_mid_read_ends_incomplete() {
     let root = Root::new("ld-held");
@@ -556,9 +555,51 @@ fn file_removed_mid_read_ends_incomplete() {
             .with_line_observer("test", Box::new(recorder.clone())),
         two_lines_delivered(&recorder),
     );
-    drop(scan.active_file.take());
-    finish(scan);
+    let active = scan.active_file.take().expect("partially delivered file");
+    // Feed the old selection back through its second-open check. A removed
+    // selection yields Pending before the ordinary page close can end delivery.
+    let candidate = active.candidate.clone();
+    let key = local_index_key(&candidate.path);
+    drop(active);
+    assert!(
+        recorder.ends().is_empty(),
+        "delivery is open before removal"
+    );
+    fs::remove_file(&candidate.path).unwrap();
+    scan.identified_candidates.push_front(candidate);
+    let OwnedSourceScanStep::Pending(scan) = scan.step(None) else {
+        panic!("the vanished candidate should yield before closing the page");
+    };
+    assert!(scan.active_file.is_none());
+    assert!(
+        scan.census.removed_index_keys.contains(&key),
+        "the failed reopen records the removed file"
+    );
     assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+    drop(scan);
+    assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+}
+
+#[test]
+fn completed_read_keeps_its_index_write_across_the_pending_frame() {
+    let root = Root::new("ld-index");
+    three_line_file(&root);
+    let path = root.file(SESSION);
+    let key = local_index_key(&path);
+    let initial = ScanIndex::default();
+    let scan = step_until(new_scan(&root.projects(), initial.clone()), |scan| {
+        scan.pending_finalization
+            .iter()
+            .any(|row| row.index_key == key)
+    });
+    let entry = &scan.index.files[&key];
+    assert_eq!(entry.size_bytes, fs::metadata(path).unwrap().len());
+    let fingerprint = entry.source_file_fingerprint.clone();
+    assert!(!initial.files.contains_key(&key));
+    let OwnedSourceScanStep::Complete { index, .. } = scan.step(None) else {
+        panic!("the read was the last selection");
+    };
+    assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
 }
 
 /// A failed read ends once `Incomplete` and is counted.

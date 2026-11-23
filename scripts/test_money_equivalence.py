@@ -991,6 +991,147 @@ def receipt_dirs(testcase, base, head, bodies=None):
     return left, right
 
 
+@mock.patch.object(money_equivalence, "REQUIRED_STEP_TRACES", {"existing-0"})
+class StepTraceTests(unittest.TestCase):
+    def compare(self, base, head, missing_file=None, log=None, on_disk=None, declared=()):
+        left, right = receipt_dirs(self, [], [])
+        logs = {}
+        for arm, directory, traces in (("base", left, base), ("head", right, head)):
+            trace_dir = directory / "step-trace"
+            trace_dir.mkdir()
+            lines = []
+            for name, data in traces.items():
+                if (arm, name) != missing_file:
+                    stored = on_disk if on_disk is not None and arm == "head" else data
+                    (trace_dir / f"{name}.json").write_bytes(stored)
+                lines.append(f"STEP_TRACE {name} sha256={hashlib.sha256(data).hexdigest()}")
+            logs[arm] = "\n".join(lines) if log is None or arm == "base" else log(lines)
+        return money_equivalence.compare_step_traces(left, right, logs, declared)
+
+    def test_equal_traces_and_byte_difference(self):
+        base = {"existing-0": b"[]"}
+        self.assertEqual(self.compare(base, base),
+                         {"compared": 1, "uncompared_head_only": [], "changed": []})
+        with self.assertRaisesRegex(RuntimeError, "1 changed; first"):
+            self.compare(base, {"existing-0": b"[ ]"})
+
+    def test_required_or_reported_trace_missing(self):
+        base = {"existing-0": b"[]"}
+        for left, right, missing_file in (({}, {}, None), (base, {}, None),
+                                          (base, base, ("base", "existing-0"))):
+            with self.subTest(left=left, right=right, missing_file=missing_file):
+                with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+                    self.compare(left, right, missing_file)
+
+    def test_extra_trace_requires_a_head_only_declaration(self):
+        base = {"existing-0": b"[]"}
+        head = base | {"new-0": b"[]"}
+        with self.assertRaisesRegex(RuntimeError, "step traces differ"):
+            self.compare(base, head)
+        with mock.patch.object(money_equivalence, "HEAD_ONLY_STEP_TRACES", {"new-0"}):
+            self.assertEqual(self.compare(base, head),
+                             {"compared": 1, "uncompared_head_only": ["new-0"], "changed": []})
+            self.assertEqual(self.compare(head, head),
+                             {"compared": 2, "uncompared_head_only": [], "changed": []})
+            with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+                self.compare(base, base)
+            with self.assertRaisesRegex(RuntimeError, "1 changed; first"):
+                self.compare(head, head | {"new-0": b"[1]"})
+
+    def test_damaged_or_removed_traces_fail_closed(self):
+        base = {"existing-0": b"[]", "other-0": b"[]"}
+        with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+            self.compare(base, base, log=lambda lines: "\n".join(lines + lines[:1]))
+        for stored in (b"[1]", b""):
+            with self.subTest(stored=stored):
+                with self.assertRaisesRegex(RuntimeError, "step-trace digest"):
+                    self.compare(base, base, on_disk=stored)
+        with self.assertRaisesRegex(RuntimeError, "step traces differ"):
+            self.compare(base, {"existing-0": b"[]"})
+        # The first trace of a test follows the harness's own prefix on one line.
+        prefixed = self.compare(base, base, log=lambda lines: "test a::b ... " + "\n".join(lines))
+        self.assertEqual(prefixed["compared"], 2)
+
+    def test_a_changed_trace_must_be_declared_and_a_declared_one_must_change(self):
+        base = {"existing-0": b"[]", "other-0": b"[]"}
+        head = base | {"other-0": b"[1]"}
+        with self.assertRaisesRegex(RuntimeError, "1 changed; first other-0"):
+            self.compare(base, head)
+        declared = parse_declarations(pr_body('{"step_traces": ["other-0"]}'))["step_traces"]
+        self.assertEqual(self.compare(base, head, declared=declared)["changed"], ["other-0"])
+        with self.assertRaisesRegex(RuntimeError, "1 changed; first existing-0"):
+            self.compare(base, head | {"existing-0": b"[2]"}, declared=declared)
+        with self.assertRaisesRegex(RuntimeError, "1 declared_not_changed; first other-0"):
+            self.compare(base, base, declared=declared)
+        with mock.patch.object(money_equivalence, "HEAD_ONLY_STEP_TRACES", {"other-0"}):
+            with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
+                self.compare(base, head, declared=declared)
+        for block in ('{"step_traces": []}', '{"step_traces": ["a", "a"]}',
+                      '{"step_traces": ["a b"]}', '{"step_traces": {"a": 1}}'):
+            with self.subTest(block=block):
+                with self.assertRaisesRegex(RuntimeError, "step_traces must list"):
+                    parse_declarations(pr_body(block))
+
+    def test_scheduling_rows_are_left_out_and_lookalikes_are_not(self):
+        base = {"existing-0": b"[]"}
+        left_out = ("schedule_claude-0", "schedule_codex-result-15", "schedule_pi-result-0",
+                    "schedule_equal_birth_twins-4034", "schedule_equal_birth_twins_before_cutoff-3")
+        # Changed, added, removed, duplicated, or without a file: none of it is read.
+        old = base | {name: b"[1]" for name in left_out[:3]}
+        new = base | {name: b"[2]" for name in left_out[1:]}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for missing_file in (None, ("head", "schedule_pi-result-0")):
+                self.assertEqual(
+                    self.compare(old, new, missing_file,
+                                 log=lambda lines: "\n".join(lines + lines[-1:])),
+                    {"compared": 1, "uncompared_head_only": [], "changed": []})
+        self.assertEqual(out.getvalue(), "")
+        for name in ("schedule_other-0", "schedule_claude-x", "schedule_claude-result-",
+                     "xschedule_claude-0", "schedule_claude-0-1", "schedule_pi-01",
+                     "schedule_equal_birth_twins-result-0", "schedule_codex-\u0663"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "1 added; first"):
+                    self.compare(base, base | {name: b"[]"})
+        with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
+            self.compare(old, new, declared={"schedule_codex-result-15"})
+        for listed in ("REQUIRED_STEP_TRACES", "HEAD_ONLY_STEP_TRACES"):
+            with mock.patch.object(money_equivalence, listed, {"schedule_pi-0"}):
+                with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
+                    self.compare(base, base)
+
+    def test_every_difference_is_printed_before_the_verdict(self):
+        base = {"existing-0": b'{"io":1,"steps":[1]}', "gone-0": b"[]", "other-0": b'{"io":1}'}
+        head = {"existing-0": b'{"io":2,"steps":[1]}', "new-0": b"[]", "other-0": b'{"io":1,"debt":0}'}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                self.assertRaisesRegex(RuntimeError, "1 added, 1 changed, 1 removed; first existing-0"):
+            self.compare(base, head, declared={"other-0"})
+        self.assertEqual(out.getvalue().splitlines(), [
+            'MONEY_EQUIVALENCE_STEP_TRACE_DIFF existing-0 {"class": "changed", "declared": false, "parts": ["io"]}',
+            'MONEY_EQUIVALENCE_STEP_TRACE_DIFF gone-0 {"class": "removed"}',
+            'MONEY_EQUIVALENCE_STEP_TRACE_DIFF new-0 {"class": "added"}',
+            'MONEY_EQUIVALENCE_STEP_TRACE_DIFF other-0 {"class": "changed", "declared": true, "parts": ["debt"]}',
+        ])
+
+
+class RequiredStepTraceTests(unittest.TestCase):
+    def test_the_required_list_is_the_fixed_rows(self):
+        required = money_equivalence.REQUIRED_STEP_TRACES
+        self.assertEqual(len(required), 84)
+        self.assertLessEqual({"c11_both-15", "c11_marker-16"}, required)
+        self.assertFalse({"c11_both-16", "c11_marker-17"} & required)
+        self.assertFalse(any(money_equivalence._UNCOMPARED_TRACE.fullmatch(name) or
+                             name.startswith("schedule_") for name in required))
+
+
+class DistinctCommitTests(unittest.TestCase):
+    def test_a_base_that_is_the_head_is_refused(self):
+        money_equivalence.require_distinct_commits("a" * 40, "b" * 40)
+        with self.assertRaisesRegex(RuntimeError, "base is the head commit"):
+            money_equivalence.require_distinct_commits("a" * 40, "a" * 40)
+
+
 class HeadOnlyFixtureTests(unittest.TestCase):
     """A new native fixture is required on the head, optional and UNCOMPARED on the base."""
 

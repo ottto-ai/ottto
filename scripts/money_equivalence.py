@@ -119,6 +119,40 @@ HEAD_ONLY_FIXTURES = (
     "claude_status_s26_consented_pass",
 )
 
+# Every cycle each fixed row runs. The two bounded drain rows (c11_both,
+# c11_marker) are listed at their full length too, so a drain that gets
+# shorter or longer fails coverage instead of passing on both sides.
+_TRACE_CYCLES = {
+    "c01_claude": 2, "c01_codex": 2, "c01_pi": 2,
+    "c02": 2, "c03": 2, "c04": 2, "c04_cold": 1, "c05": 5,
+    "c06_dropped": 2, "c06_lost_ack": 2, "c06_selected_save": 2,
+    "c07": 2, "c08": 2, "c09": 3, "c10": 3, "c11_account_hold": 2,
+    "c11_both": 16, "c11_marker": 17, "c12": 10, "c12_cold": 1,
+    "c13": 3, "c13_cold": 1,
+}
+REQUIRED_STEP_TRACES = {
+    f"{row}-{i}" for row, count in _TRACE_CYCLES.items() for i in range(count)
+}
+# The trace comparison covers the fixed rows above only. The five scheduling
+# rows below are NOT compared and NOT required here: their traces differ
+# between two builds of the same code, because the result trace holds physical
+# file fingerprints and the twin rows order their homes by a key of the full
+# temporary path. Those rows stay ordinary test assertions, so "step traces
+# equal" says nothing about them. Every trace outside these five rows keeps
+# the rules below.
+_UNCOMPARED_TRACE = re.compile(
+    r"schedule_(?:equal_birth_twins(?:_before_cutoff)?-|(?:claude|codex|pi)-(?:result-)?)"
+    r"(?:0|[1-9][0-9]*)")
+# A new row is required on the head and can be uncompared only when absent
+# from the base. Once present on both sides its receipt must match.
+HEAD_ONLY_STEP_TRACES = frozenset()
+# A change that means to alter a row's receipt (a declared addition, a signed
+# money diff or an intended scan behaviour change) lists the row under
+# "step_traces" in its PR-body declaration block (see parse_declarations).
+# Each listed row must exist on both sides and must differ; every other shared
+# row must match exactly. The list is read from that PR only.
+_TRACE_NAME = re.compile(r"[\w-]+")
+
 
 # Base and head bodies must match exactly. The only accepted difference is a
 # new key ADDED where both sides have the record, and only when it is not money:
@@ -216,8 +250,9 @@ def parse_declarations(body):
     """Return the PR body's declared additions, or None without a block.
 
     The block is one fenced code block with the info string above, holding
-    {"envelope": {key: value}, "snapshot": {key: value}, "money": {...}}; any
-    part may be omitted. Anything else fails closed.
+    {"envelope": {key: value}, "snapshot": {key: value}, "money": {...},
+    "step_traces": [name, ...]}; any part may be omitted. Anything else fails
+    closed.
     """
     # Follow fences like CommonMark: nothing inside a fence opens another, and a
     # fence closes only with the same character, at least as long, and no info.
@@ -246,10 +281,17 @@ def parse_declarations(body):
                             object_pairs_hook=_json_object)
     except ValueError as error:
         raise RuntimeError(f"declared additions: invalid JSON ({error})") from None
-    if not isinstance(parsed, dict) or not parsed.keys() <= {"envelope", "snapshot", "money"}:
-        raise RuntimeError("declared additions: expected an object with envelope/snapshot/money parts")
+    if (not isinstance(parsed, dict)
+            or not parsed.keys() <= {"envelope", "snapshot", "money", "step_traces"}):
+        raise RuntimeError(
+            "declared additions: expected an object with envelope/snapshot/money/step_traces parts")
     snapshot_vocabulary = _schema_keys(_SNAPSHOT_DIFF_SCHEMA)
     for part, declared in parsed.items():
+        if part == "step_traces":
+            if (type(declared) is not list or not declared or len(set(map(str, declared))) != len(declared)
+                    or not all(type(name) is str and _TRACE_NAME.fullmatch(name) for name in declared)):
+                raise RuntimeError("declared additions: step_traces must list distinct trace names")
+            continue
         if not isinstance(declared, dict):
             raise RuntimeError(f"declared additions: {part} must be an object")
         if part == "money":
@@ -613,6 +655,81 @@ def receipt_names(left, right, head_expected, base_expected=None):
     return sorted(base & head), sorted(head - base)
 
 
+def compare_step_traces(left, right, logs, declared_changed=()):
+    """Verify the emitted trace manifests and compare shared receipts byte for byte.
+
+    Every difference is printed, one line per trace, before the verdict. A
+    difference is fatal unless the row is in `declared_changed`; a declared row
+    must exist on both sides and must differ. The scheduling rows named by
+    _UNCOMPARED_TRACE are left out entirely and cannot be declared.
+    """
+    declared_changed = set(declared_changed)
+    if (REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES or HEAD_ONLY_STEP_TRACES & declared_changed
+            or any(_UNCOMPARED_TRACE.fullmatch(name)
+                   for name in REQUIRED_STEP_TRACES | HEAD_ONLY_STEP_TRACES | declared_changed)):
+        raise RuntimeError("step-trace declarations overlap")
+    manifests = {}
+    for arm, directory in (("base", left), ("head", right)):
+        lines = [line for line in re.findall(
+            r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
+            if not _UNCOMPARED_TRACE.fullmatch(line[0])]
+        digests = dict(lines)
+        required = REQUIRED_STEP_TRACES | (HEAD_ONLY_STEP_TRACES if arm == "head" else set())
+        files = {path.stem for path in (directory / "step-trace").glob("*.json")
+                 if not _UNCOMPARED_TRACE.fullmatch(path.stem)}
+        if len(lines) != len(digests) or files != digests.keys() or not required <= files:
+            raise RuntimeError(f"incomplete {arm} step-trace coverage")
+        manifests[arm] = digests
+    base, head = manifests["base"], manifests["head"]
+
+    def read(directory, name, digest):
+        data = (directory / "step-trace" / f"{name}.json").read_bytes()
+        if not data or hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"invalid {directory.name} step-trace digest: {name}")
+        return data
+
+    def parts(old, new):
+        """The top-level receipt parts that differ (schema names, never content)."""
+        try:
+            old, new = json.loads(old), json.loads(new)
+        except ValueError:
+            return ["<not JSON>"]
+        if not isinstance(old, dict) or not isinstance(new, dict):
+            return ["<whole receipt>"]
+        return sorted(key for key in old.keys() | new.keys() if old.get(key) != new.get(key)
+                      or (key in old) != (key in new))
+
+    differences, changed = {}, []
+    for name in sorted(base.keys() | head.keys()):
+        new = read(right, name, head[name]) if name in head else None
+        old = read(left, name, base[name]) if name in base else None
+        if old is None:
+            if name not in HEAD_ONLY_STEP_TRACES:
+                differences[name] = {"class": "added"}
+        elif new is None:
+            differences[name] = {"class": "removed"}
+        elif old != new:
+            changed.append(name)
+            differences[name] = {"class": "changed", "declared": name in declared_changed,
+                                 "parts": parts(old, new)}
+    for name in sorted(declared_changed - set(changed)):
+        # A declared row missing on one side keeps its own class; all are fatal.
+        differences.setdefault(name, {"class": "declared_not_changed"})
+    for name in sorted(differences):
+        print(f"MONEY_EQUIVALENCE_STEP_TRACE_DIFF {name} "
+              + json.dumps(differences[name], sort_keys=True), flush=True)
+    fatal = sorted(name for name, difference in differences.items()
+                   if not difference.get("declared"))
+    if fatal:
+        counts = {}
+        for name in fatal:
+            counts[differences[name]["class"]] = counts.get(differences[name]["class"], 0) + 1
+        raise RuntimeError("base/head step traces differ: " + ", ".join(
+            f"{count} {kind}" for kind, count in sorted(counts.items())) + "; first " + fatal[0])
+    return {"compared": len(base.keys() & head.keys()),
+            "uncompared_head_only": sorted(head.keys() - base.keys()), "changed": changed}
+
+
 def require_saved_digests(directory, name):
     cross_name = Path(name).with_suffix(".cross-build.json")
     for body_name in (Path(name), cross_name):
@@ -652,6 +769,12 @@ def verified_summary(names, uncompared, base_sha, head_sha, seconds):
             f"{seconds:.1f}s. Family vector/Pi remain ignored.\n")
 
 
+def require_distinct_commits(base_sha, head_sha):
+    """A base that is the head compares the head with itself and proves nothing."""
+    if base_sha == head_sha:
+        raise RuntimeError("comparison base is the head commit: nothing to compare")
+
+
 def main():
     started = time.monotonic()
     repo = Path.cwd()
@@ -685,6 +808,7 @@ def main():
         # base changes are not this branch's.
         base_sha = output(["git", "merge-base", base_sha, "HEAD"])
     head_sha = output(["git", "rev-parse", "HEAD"])
+    require_distinct_commits(base_sha, head_sha)
     require_disjoint_head_only()
     # Declarations come from the public PR body, so the receipt records them.
     pr_number, declarations = pr_declarations(prs, explicit)
@@ -721,7 +845,7 @@ def main():
         # Nothing is transplanted: each arm builds its own tree unchanged.
         require_base_scan_fixture(base)
         require_base_harness(base)
-        expected = {}
+        expected, logs = {}, {}
         for arm, tree in [("base", base), ("head", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
@@ -744,6 +868,7 @@ def main():
             (receipts / f"{arm}.log").write_text(result.stdout)
             result.check_returncode()
             expected[arm] = native_coverage(arm, result.stdout)
+            logs[arm] = result.stdout
         left, right = receipts / "base", receipts / "head"
         names, uncompared = receipt_names(left, right, expected["head"], expected["base"])
         signed_lists = signed_money_lists(declarations, names + uncompared)
@@ -781,6 +906,8 @@ def main():
                           "nothing to match): " + ", ".join(signed_uncompared))
         if errors:
             raise RuntimeError("; ".join(errors))
+        manifest["step_traces"] = compare_step_traces(
+            left, right, logs, (declarations or {}).get("step_traces", ()))
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         if uncompared:
@@ -790,6 +917,10 @@ def main():
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(verified_summary(names, uncompared, base_sha, head_sha, manifest["runtime_seconds"]))
+            traces = manifest["step_traces"]
+            f.write(f"Step traces: {traces['compared']} compared, "
+                    f"{len(traces['changed'])} changed (declared); "
+                    f"{len(traces['uncompared_head_only'])} head-only uncompared.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 
