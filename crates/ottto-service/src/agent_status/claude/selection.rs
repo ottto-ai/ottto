@@ -661,8 +661,8 @@ pub(in crate::agent_status) fn claude_ottto_accounts_signed_in(
 /// - A transient read failure means the meters could not be read right now.
 ///   `projected_claude_quota_access_state` already classifies these
 ///   `TemporarilyUnavailable`, the credential is untouched, background upkeep
-///   keeps running, and the failed-verification re-verify backoff clears them
-///   without the operator doing anything. Their approved copy names no action
+///   keeps running, and the next status pass reads them again without the
+///   operator doing anything. Their approved copy names no action
 ///   ("Ottto could not read current limits", "Staged"), unlike `NeedsLogin`,
 ///   `StaleAccessToken`, `ReloginApproaching` and `IdentityMismatch`, which
 ///   all tell the operator to sign in again and so stay actionable here.

@@ -27,7 +27,7 @@ Review tier: `official`
 - Local Pi session reads stay on the user's machine until transformed into aggregate usage, source-plan, or collector-health records.
 - Local route observations must omit provider credentials and raw endpoint secrets.
 - A Pi smoke that creates a local session is sufficient for local-only source acceptance. Missing fresh live telemetry must be reported as `pi_local_only`, not as a repair-required telemetry failure.
-- The Pi live check runs only at setup or when the person presses Verify, with `--thinking off`. A failed check is never re-run in the background.
+- The Pi live check runs only at setup or when the person presses Verify, with `--thinking off`. A failed check is never re-run in the background; it clears when Pi routes are available again or this Mac's next upload of Pi usage is accepted.
 
 ## Upload Boundaries
 

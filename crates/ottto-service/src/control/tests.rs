@@ -1537,8 +1537,7 @@ fn pi_default_model_not_found_names_the_model() {
     let two_routes = pi_route_aggregate_result(vec![failed(not_found_404), failed(not_found_404)]);
     assert_eq!(two_routes.message.text, generic);
 
-    // A failed Pi check still shows as failed, but the background loop never
-    // re-runs its paid prompt.
+    // A failed Pi check shows as failed until real usage or a Verify clears it.
     let daemon = daemon().with_account(connected_account());
     daemon.record_verification_result(&not_found).unwrap();
     let status = daemon.status("token").unwrap();
@@ -1548,10 +1547,6 @@ fn pi_default_model_not_found_names_the_model() {
         .find(|health| health.source == SourceKind::Pi)
         .unwrap();
     assert_eq!(health.state, ottto_protocol::SourceState::Failed);
-    assert!(daemon
-        .blocking_verification_retry_states()
-        .unwrap()
-        .is_empty());
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1627,10 +1622,6 @@ fn pi_admin_disabled_import_rejection_stays_typed_and_non_blocking() {
     daemon
         .record_verification_result(&aggregate)
         .expect("record typed admin-disabled result");
-    assert!(daemon
-        .sources_with_blocking_verification_failure()
-        .expect("list blocking verification failures")
-        .is_empty());
     let status = daemon.status("token").expect("read projected health");
     let source = status.sources.first().expect("Pi source health");
     assert_eq!(source.grade, ottto_protocol::HealthGrade::Warning);
@@ -12922,10 +12913,7 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
             health.recommended_actions[0].action,
             RepairActionKind::ReauthProvider
         );
-        assert_eq!(
-            daemon.blocking_verification_retry_states().unwrap(),
-            vec![(SourceKind::ClaudeCode, true)]
-        );
+        assert_eq!(health.state, ottto_protocol::SourceState::Failed);
     }
     let daemon = daemon().with_account(connected_account());
     let snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
@@ -12971,13 +12959,11 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
             );
         }
     }
-    assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
     assert!(!root.join("spawned").exists());
     let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
     assert_eq!(smoke.duration_ms, 0);
     assert_eq!(smoke.exit_status, None);
     assert!(!root.join("spawned").exists());
-    assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
     initial = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
     attach_verification_check(&mut initial);
     assert_eq!(initial.status, SourceVerificationStatus::Warning);
@@ -13001,10 +12987,6 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
         ottto_protocol::StableProblemCode::AgentCliUnavailable
     );
     assert!(health.recommended_actions.is_empty());
-    assert!(daemon
-        .blocking_verification_retry_states()
-        .unwrap()
-        .is_empty());
     let canonical_health = status.canonical_health.unwrap();
     assert_ne!(
         canonical_health.overall.severity,
