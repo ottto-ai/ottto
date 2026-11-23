@@ -246,6 +246,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          QUEUE_BASE_REF: ${{ github.event.merge_group.base_ref }}
           QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.event.after }}
@@ -266,6 +267,17 @@ jobs:
               [[ "$checkout_head" == "$QUEUE_HEAD" && "${GITHUB_SHA:-}" == "$QUEUE_HEAD" ]] ||
                 fail "$QUEUE_HEAD" 'merge group head does not match checkout'
               args=(--base "$QUEUE_BASE" --head "$QUEUE_HEAD" --require-ancestor)
+              # base_sha is the previous queue entry's head, not the target branch:
+              # also check everything the group adds on top of the target's tip.
+              [[ "$QUEUE_BASE_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]] ||
+                fail "$QUEUE_HEAD" 'unexpected merge group target branch'
+              git fetch -q --no-tags origin "+$QUEUE_BASE_REF:refs/remotes/origin/queue-target" ||
+                fail "$QUEUE_HEAD" 'cannot fetch merge group target branch'
+              target="$(git rev-parse --verify 'refs/remotes/origin/queue-target^{commit}')" ||
+                fail "$QUEUE_HEAD" 'cannot resolve merge group target branch'
+              git merge-base --is-ancestor "$target" "$QUEUE_BASE" ||
+                fail "$QUEUE_HEAD" 'merge group base is not on its target branch'
+              group_args=(--base "$target" --head "$QUEUE_HEAD" --require-ancestor)
               ;;
             push)
               if [[ "$PUSH_BEFORE" == 0000000000000000000000000000000000000000 ]]; then
@@ -282,6 +294,9 @@ jobs:
             *) fail '' 'unsupported workflow event' ;;
           esac
           python3 scripts/public_repo_commit_guards.py "${args[@]}"
+          if [[ -n "${group_args+set}" ]]; then
+            python3 scripts/public_repo_commit_guards.py "${group_args[@]}"
+          fi
 
       # Pinned binary with the action's per-version SHA-256; no unverified
       # cargo-install fallback.
