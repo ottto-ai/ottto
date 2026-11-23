@@ -1125,8 +1125,8 @@ fn observed_pass(
 /// [regress] 0.1.219 left a never-read archived rollout as a metadata-only
 /// head owing the whole archive, unread. Its ordinary counted Full and exact
 /// ACK settle that debt: the file leaves the outstanding set, counts once
-/// (equivalent to a cold run) and keeps no metadata-only head. Later passes
-/// in the same process (one process-lifetime cache, as the daemon keeps) are
+/// (equivalent to a cold run) and keeps only its archive inventory and job
+/// decision in the head. Later passes in the same process (one process-lifetime cache, as the daemon keeps) are
 /// quiet. After a restart (a fresh cache and a reloaded index) the archive
 /// has its header decoded at most once, within the header bound, with no
 /// identity sample, Full or POST; the next same-process pass is quiet. The
@@ -1135,6 +1135,7 @@ fn observed_pass(
 /// so it cannot poison other decoder rows.
 #[test]
 fn archive_whole_unread_debt_settles_after_one_counted_full() {
+    use crate::session_attribution::job_template::JobState;
     use crate::snapshots::upload::freshness_debt::tests as g7;
     const CONTEXT: &str = "g7-archive-whole-context";
     struct Arm {
@@ -1147,6 +1148,7 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         restart: PassFacts,
         settled: Value,
         head: Option<(bool, state_v2::Representation, state_v2::DebtSummary)>,
+        job: Option<JobState>,
         revisions: usize,
         after: Value,
         facts: String,
@@ -1224,12 +1226,13 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
                 head.common.debt,
             )
         });
+        let job = loaded.and_then(|head| head.common.job.map(|job| job.state));
         index.activate_file_upload_context(SnapshotSource::Codex, context.into());
         let after = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index)["debt"].clone();
         let facts = format!(
             "{} arm: compressed={} decoded={}\nseeded head: {seeded_head:?} owed: {owed}\n\
              pass 1: {first:?}\nrestart pass 4: {restart:?}\nsettled: {settled}\n\
-             head: {head:?} revisions={revisions}\nafter: {after}",
+             head: {head:?} job: {job:?} revisions={revisions}\nafter: {after}",
             if seeded { "seeded" } else { "control" },
             encoded.len(),
             rollout(MAIN, Some("a")).len(),
@@ -1245,6 +1248,7 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
             restart,
             settled,
             head,
+            job,
             revisions,
             after,
             facts,
@@ -1302,16 +1306,174 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
         assert_eq!(arm.settled["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["over_6h_files"], 0, "{label}\n{all}");
         assert_eq!(arm.settled["unread_bytes"], 0, "{label}\n{all}");
-        if let Some((metadata_only, representation, debt)) = arm.head {
-            assert!(!metadata_only, "{label}: no metadata-only head\n{all}");
-            assert_eq!(representation, state_v2::Representation::Tail, "{all}");
-            assert_eq!(debt, Default::default(), "{all}");
-        }
+        assert_eq!(
+            arm.head,
+            Some((true, state_v2::Representation::Archive, Default::default())),
+            "{label}: archive metadata with no debt or reduction\n{all}"
+        );
+        assert_eq!(
+            arm.job,
+            Some(JobState::NoId),
+            "{label}: archive predates cutoff"
+        );
         assert_eq!(arm.revisions, 0, "{label}\n{all}");
         assert_eq!(arm.after["outstanding_files"], 0, "{label}\n{all}");
         assert_eq!(arm.after["over_6h_files"], 0, "{label}\n{all}");
         money_oracle::assert_equivalent(&arm.expected, &arm.read);
     }
+}
+
+const ARCHIVE_JOB_TASK: &str = "Inspect the service and explain every failure with clear evidence";
+
+fn archive_with_terminal_job() -> (Corpus, StateV2ColdSession, ScanIndex, PathBuf) {
+    use crate::snapshots::upload::freshness_debt::tests as g7;
+    const CONTEXT: &str = "archive-job-context";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    let (session, prior) = c.publish();
+    let original = c.path(MAIN).with_extension("jsonl.zst");
+    let prompt = json!({"type": "event_msg", "payload": {"type": "user_message", "message": ARCHIVE_JOB_TASK}});
+    let bytes = header(MAIN, Some("a")) + &format!("{prompt}\n") + &turn(1);
+    fs::write(
+        &original,
+        zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut index, read, first) = observed_pass(&c, &original, prior, CONTEXT, &cache);
+    assert_eq!(first.posts, 1);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let (mut index, _) = assert_quiet_on(&c, index, &read, cache);
+    index.activate_file_upload_context(SnapshotSource::Codex, CONTEXT.into());
+    let settled = g7::walk(SnapshotSource::Codex, &c.roots(), &mut index);
+    assert_eq!(settled["debt"]["outstanding_files"], 0, "{settled}");
+    index.save(session.path()).unwrap();
+    (c, session, index, original)
+}
+
+/// A first decision made in an archive has file custody without a reduction.
+#[test]
+fn same_object_archive_rename_carries_terminal_job_without_progress() {
+    use crate::session_attribution::job_template::{context, JobState};
+    use std::os::unix::fs::MetadataExt;
+
+    let (c, session, mut index, original) = archive_with_terminal_job();
+    let from = local_index_key(&original);
+    let progress = serde_json::to_value(&index.files[&from]).unwrap();
+    let head = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert!(head.metadata_only);
+    assert!(!head.table.contains_key(&state_v2::Collection::Revisions));
+    let job = head.common.job.unwrap();
+    assert_eq!(job.state, JobState::NoId);
+    assert_ne!(job.birth_nanos, 0);
+
+    let archived = c.archived.join(original.file_name().unwrap());
+    fs::rename(&original, &archived).unwrap();
+    let to = local_index_key(&archived);
+    let stat = fs::metadata(&archived).unwrap();
+    let mut candidate = codex_file_join::header_candidate(c.archived.clone(), archived, &stat);
+    candidate.physical_identity = Some([stat.dev(), stat.ino()]);
+    candidate.fingerprint_birth_nanos = crate::transcript_acquisition::birth_unix_nanos(&stat);
+    assert_eq!(candidate.fingerprint_birth_nanos, job.birth_nanos);
+    let carry = |index: &mut ScanIndex| {
+        index
+            .carry_codex_rollout_with_cache(
+                session.path(),
+                &candidate,
+                vec![(from.clone(), c.sessions.clone(), MAIN.to_owned())],
+                None,
+            )
+            .unwrap()
+    };
+    assert!(carry(&mut index));
+    assert_eq!(serde_json::to_value(&index.files[&from]).unwrap(), progress);
+    assert!(!index.files.contains_key(&to));
+    assert!(state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .is_none_or(|head| head.common.job.is_none()));
+    let head = state_v2::load_head(&index, &to, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(head.common.job, Some(job));
+    assert!(
+        !carry(&mut index),
+        "an unfinished census can revisit the old key"
+    );
+
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    tail_source::seed_full_job_template(&index, &candidate, &[], &mut acc).unwrap();
+    acc.observe_job(ARCHIVE_JOB_TASK);
+    acc.finish_job_template(Some(&context(7)));
+    assert_eq!(acc.job_template, Some(JobState::NoId));
+}
+
+#[test]
+fn same_object_archive_rename_with_job_and_owed_debt_defers_and_holds_owner() {
+    use crate::snapshots::upload::freshness_debt::tests::seed_archive_whole_unread;
+
+    let (c, session, mut index, original) = archive_with_terminal_job();
+    let candidate = codex_file_join::header_candidate(
+        c.sessions.clone(),
+        original.clone(),
+        &fs::metadata(&original).unwrap(),
+    );
+    codex_file_join::stage_independent_inventory(&index, &[candidate], MAIN).unwrap();
+    index.save(session.path()).unwrap();
+    seed_archive_whole_unread(&index, &original);
+    index.save(session.path()).unwrap();
+    let from = local_index_key(&original);
+    let progress = serde_json::to_value(&index.files[&from]).unwrap();
+    let before = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert!(before.metadata_only);
+    assert!(before.common.job.is_some());
+    assert_eq!(before.table[&state_v2::Collection::Revisions].pages, 1);
+
+    let archived = c.archived.join(original.file_name().unwrap());
+    fs::rename(&original, &archived).unwrap();
+    let to = local_index_key(&archived);
+    assert!(codex_rollout_carry::physical_matches(
+        &before,
+        &fs::metadata(&archived).unwrap()
+    ));
+    index.traversal = None;
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        &c.roots(),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .codex_rollout_paths
+        .insert(to.clone());
+    let (deferred, held) = index.prepare_codex_carries(None);
+    assert_eq!(deferred, BTreeSet::from([to.clone()]));
+    assert_eq!(held, BTreeSet::from([MAIN.to_owned()]));
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&from));
+    assert_eq!(serde_json::to_value(&index.files[&from]).unwrap(), progress);
+    assert!(!index.files.contains_key(&to));
+    assert!(state_v2::load_head(&index, &to, REVISION)
+        .unwrap()
+        .is_none());
+    let after = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.common, before.common);
+    assert!(after.table == before.table);
 }
 
 /// [regress] A provider archive moves a rollout to another path, keeping its

@@ -193,7 +193,12 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (6, "upload context proof stamps one row per entity"),
     (7, "upload progress rows"),
     (8, "accepted request contributions per session slot"),
+    (
+        JOB_TEMPLATE_LAYOUT,
+        "job decision in the Tail head and eligibility cutoff",
+    ),
 ];
+pub(super) const JOB_TEMPLATE_LAYOUT: u32 = 9;
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
 /// Tail state's closed kinds, each owned by `tail.rs`: no `ScanIndex` field, no
@@ -219,8 +224,8 @@ pub(super) const TAIL_KINDS: &[&str] = &[
     "tail.frag",
     "tail.set_aside",
 ];
-/// The Tail store's own layout. A Tail-only exit commit raises a store to this
-/// layout at most, never to a later one whose graph roots it does not write.
+/// The initial Tail layout. Later Tail format changes may raise a layout
+/// only when the graph already has the required roots.
 pub(super) const TAIL_LAYOUT: u32 = 4;
 /// Tail kinds added after the Tail store, each at its own layout.
 const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];

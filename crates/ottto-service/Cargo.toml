@@ -45,6 +45,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 ring.workspace = true
 subtle.workspace = true
+regex = "1"
 thiserror.workspace = true
 time.workspace = true
 toml_edit.workspace = true

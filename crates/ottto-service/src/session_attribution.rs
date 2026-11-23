@@ -10,6 +10,8 @@
 //! agent task label; upload policy removes them unless the existing
 //! session-title privacy consent and the backend capability are both active.
 
+pub(crate) mod job_template;
+
 use crate::hex::sha256_lower as sha256_hex;
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};

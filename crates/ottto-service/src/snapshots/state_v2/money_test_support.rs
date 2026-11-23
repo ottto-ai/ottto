@@ -279,6 +279,7 @@ pub(crate) fn publish_fixture_at_generation(
     let mut cx = KindCx::default();
     cx.binding = Some(binding);
     let mut tx = db.begin(TxnMode::Write).unwrap();
+    kinds::initialize_job_template_since(&mut tx).unwrap();
     kinds::populate(index, &mut tx, &mut cx).unwrap();
     for (header, bytes) in &retained.0 {
         tx.put(RowInput {

@@ -70,6 +70,17 @@ pub(in crate::snapshots) fn seed_archive_whole_unread(index: &ScanIndex, path: &
     state_v2::observe_tails(&route, vec![(local_index_key(path), observation)]).unwrap();
 }
 
+pub(in crate::snapshots) fn seed_raw_unread(index: &ScanIndex, path: &Path) {
+    let owed = [raw(0, std::fs::metadata(path).unwrap().len(), 7, UNREAD)];
+    let observation = Observation {
+        summary: summary(&owed, None),
+        added: owed.iter().map(Revision::encode).collect(),
+        ..Default::default()
+    };
+    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    state_v2::observe_tail(&route, &local_index_key(path), observation).unwrap();
+}
+
 pub(in crate::snapshots) fn entry(path: &Path) -> ScanIndexEntry {
     let live = std::fs::metadata(path).unwrap();
     let mut entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({

@@ -1,7 +1,7 @@
 //! The complete semantic adapter has one context and one transaction boundary.
 //! A context belongs to the committed graph; discard it after any failed write.
 use super::*;
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Context};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
@@ -113,6 +113,24 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         links_only: false,
     })
 }
+const JOB_TEMPLATE_SINCE: &str = "job_template_since";
+
+pub(super) fn job_template_since(tx: &mut dyn Transaction) -> Result<Option<u64>> {
+    tx.get(&RowKey::Meta(JOB_TEMPLATE_SINCE.into()))?
+        .map(|header| mapper::read(tx, &header, None))
+        .transpose()
+}
+
+pub(super) fn initialize_job_template_since(tx: &mut dyn Transaction) -> Result<()> {
+    let key = RowKey::Meta(JOB_TEMPLATE_SINCE.into());
+    if tx.get(&key)?.is_none() {
+        let now = super::super::discovery::candidate_open::unix_nanos(std::time::SystemTime::now())
+            .context("state_v2_job_template_clock")?;
+        mapper::put(tx, &key, &now)?;
+    }
+    Ok(())
+}
+
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
     ensure!(!cx.valid, "state_v2_context_already_populated");
     let result = (|| {
@@ -237,6 +255,9 @@ pub(super) fn delta(
     ensure!(cx.valid, "state_v2_context_invalid");
     cx.valid = false;
     let result = (|| {
+        if cx.layout < catalogue::JOB_TEMPLATE_LAYOUT {
+            initialize_job_template_since(tx)?;
+        }
         let mut rows = mapper::Rows {
             tx: Some(&mut *tx as &mut dyn Transaction),
             old: previous.rows,
@@ -314,8 +335,10 @@ pub(super) fn save_graph(
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
         if let Some((to, carry)) = &pending.carry {
-            // CAS-restored custody joins the same map move before encoding.
-            next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+            if matches!(carry.contents, tail::CarryContents::File { .. }) {
+                // CAS-restored custody joins the same map move before encoding.
+                next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+            }
         }
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;

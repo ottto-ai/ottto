@@ -290,7 +290,7 @@ pub(in crate::snapshots) fn claude_cache_request_slot(
 /// `message.role` is `user`, skipping `isMeta` records, `tool_result` content
 /// blocks (which also ride `type=user` records), and harness wrappers
 /// (slash-command envelopes, injected system reminders).
-pub(in crate::snapshots) fn claude_first_user_prompt(value: &Value) -> Option<String> {
+pub(in crate::snapshots) fn claude_user_text(value: &Value) -> Option<String> {
     if !string_eq_at(value, &["type"], "user")
         || value.get("isMeta").and_then(Value::as_bool) == Some(true)
         || !string_eq_at(value, &["message", "role"], "user")
@@ -302,7 +302,7 @@ pub(in crate::snapshots) fn claude_first_user_prompt(value: &Value) -> Option<St
             if claude_prompt_is_harness_wrapper(text) {
                 return None;
             }
-            normalize_title(text.clone())
+            Some(text.clone())
         }
         Some(content @ Value::Array(_)) => claude_prompt_text_from_content(content),
         _ => None,
@@ -324,7 +324,7 @@ fn claude_prompt_text_from_content(content: &Value) -> Option<String> {
             }
         }
     }
-    normalize_title(parts.join("\n"))
+    Some(parts.join("\n"))
 }
 
 /// True for text the Claude Code harness writes into `type=user` records that
