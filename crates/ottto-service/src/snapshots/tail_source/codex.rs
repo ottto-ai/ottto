@@ -222,6 +222,10 @@ impl TailSource for Codex {
                 acc.claude_desktop_spawn_lineage.is_some(),
             ),
             (
+                "claude_desktop_scheduled_task",
+                acc.claude_desktop_scheduled_task,
+            ),
+            (
                 "seen_claude_capability_tool_uses",
                 !acc.seen_claude_capability_tool_uses.is_empty(),
             ),

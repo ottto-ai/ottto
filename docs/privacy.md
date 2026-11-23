@@ -278,6 +278,15 @@ hours, and reprocesses only files whose size or modification time changed.
 Missing or ambiguous evidence produces no attribution label; it is never
 reclassified as human activity.
 
+From the Claude desktop app's per-session store, the daemon reads two launch
+markers. The first is whether another agent opened the session (`spawnedFrom`
+with `sideSession: true`). That session gets the starting session's transcript
+id as its parent. A task an agent suggested and the person clicked has no
+`sideSession`, and it gets no parent or agent launch fact. The second is
+whether the app ran the session as one of its own scheduled tasks
+(`scheduledTaskId`). Only the fact that it was a scheduled task is uploaded,
+never the task id.
+
 Upload settings apply going forward. Turning a setting on applies to sessions
 that are active after it is turned on: a session that has already ended keeps
 what it uploaded before, and the daemon reads no transcript again to fill it

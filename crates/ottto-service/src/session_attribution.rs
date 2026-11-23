@@ -1102,6 +1102,55 @@ pub fn claude_subagent_facts(
     facts
 }
 
+/// A launch already stated (desktop lineage or scheduled task, a launcher
+/// edge, a Codex agent thread) outranks an external-scheduler match in the
+/// grouping facts: that whole bundle (origin, scheduler kind, schedule id) is
+/// dropped rather than send two origins. Grouping facts without an origin are
+/// kept as they are.
+pub(crate) fn drop_superseded_scheduler_match(
+    stated: &[SessionAttributionFact],
+    grouping: &mut Vec<SessionAttributionFact>,
+) {
+    let has_origin =
+        |facts: &[SessionAttributionFact]| facts.iter().any(|fact| fact.field == "origin_kind");
+    if has_origin(stated) && has_origin(grouping) {
+        grouping.retain(|fact| {
+            !matches!(
+                fact.field.as_str(),
+                "origin_kind" | "scheduler_kind" | "schedule_definition_id"
+            )
+        });
+    }
+}
+
+/// Parser id stamped on the scheduled-task fact read from the Claude desktop
+/// app's per-session store.
+pub const CLAUDE_DESKTOP_SCHEDULED_SOURCE_VERSION: &str = "claude_desktop_task:v1";
+
+/// The launch fact for a session the Claude desktop app ran as one of its own
+/// scheduled tasks (`scheduledTaskId` in its store): a provider-owned artifact.
+/// No scheduler kind or schedule id is stated yet.
+pub fn claude_desktop_scheduled_task_facts(
+    source_session_id: &str,
+    observed_at: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version: CLAUDE_DESKTOP_SCHEDULED_SOURCE_VERSION,
+    };
+    push_fact(
+        &mut facts,
+        "origin_kind",
+        "provider_scheduled_task",
+        "provider_artifact",
+        "direct",
+        &evidence_context,
+    );
+    facts
+}
+
 /// Parser id stamped on the lineage facts read from the Claude desktop app's
 /// per-session store. The backend serves an edge with this capture source as
 /// `launched`: the parent started a separate session rather than sub-work.
@@ -1109,8 +1158,9 @@ pub const CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION: &str = "claude_desktop_spawn:v1";
 
 /// Fixed-name lineage facts for a Claude Code session another session started
 /// from the Claude desktop app (its `start_session` tool). The app records the
-/// starting session as `spawnedFrom` in the child's own store file, so these
-/// are provider-owned artifacts, not inference. `parent_session_ref` is the
+/// starting session as `spawnedFrom` with `sideSession: true` in the child's
+/// own store file, so these are provider-owned artifacts, not inference. A
+/// task the person clicked gets none of these facts. `parent_session_ref` is the
 /// starting session's transcript id (its `cliSessionId`).
 ///
 /// Same shape as a launcher edge: the child is a separate top-level session,
@@ -1547,6 +1597,99 @@ mod tests {
         assert!(facts
             .iter()
             .any(|fact| fact.field == "provider_surface" && fact.value == "codex_desktop"));
+    }
+
+    /// [behaviour] An external-scheduler match never adds a second origin to a
+    /// session whose launch is already stated; without one it stays whole.
+    #[test]
+    fn a_stated_launch_drops_an_external_scheduler_match() {
+        let context = EvidenceContext {
+            source_session_id: "session-x",
+            observed_at: "2026-11-23T00:00:00Z",
+            source_version: "test:v1",
+        };
+        let mut matched = Vec::new();
+        for (field, value) in [
+            ("template_group_id", "hmac-sha256:v1:template"),
+            ("origin_kind", "external_scheduler"),
+            ("scheduler_kind", "launchd"),
+            ("schedule_definition_id", "hmac-sha256:v1:schedule"),
+        ] {
+            push_fact(
+                &mut matched,
+                field,
+                value,
+                "local_template",
+                "direct",
+                &context,
+            );
+        }
+        let stated = claude_desktop_scheduled_task_facts("session-x", "2026-11-23T00:00:00Z");
+        let mut grouping = matched.clone();
+        drop_superseded_scheduler_match(&stated, &mut grouping);
+        assert_eq!(
+            grouping
+                .iter()
+                .map(|fact| fact.field.as_str())
+                .collect::<Vec<_>>(),
+            ["template_group_id"]
+        );
+        let mut unstated = matched.clone();
+        drop_superseded_scheduler_match(&[], &mut unstated);
+        assert_eq!(unstated, matched);
+    }
+
+    /// [behaviour] The desktop app's own scheduled task is one direct,
+    /// provider-artifact launch fact, with no scheduler kind or schedule id.
+    #[test]
+    fn claude_desktop_scheduled_task_facts_state_a_provider_scheduled_task() {
+        let facts = claude_desktop_scheduled_task_facts("session-task", "2026-11-23T00:00:00Z");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].field, "origin_kind");
+        assert_eq!(facts[0].value, "provider_scheduled_task");
+        assert_eq!(facts[0].evidence.kind, "provider_artifact");
+        assert_eq!(facts[0].evidence.strength, "direct");
+        assert_eq!(facts[0].evidence.source_version, "claude_desktop_task:v1");
+    }
+
+    /// [behaviour] A Remote Control session driven from the phone reaches
+    /// fact building as an ordinary desktop session: `promptSource` and
+    /// `clientPlatform` are not origin inputs, so only the surface is stated.
+    #[test]
+    fn remote_control_desktop_session_states_only_its_surface() {
+        let mut origin = origin();
+        origin.entrypoint = Some("claude-desktop".to_string());
+        let facts = direct_provider_facts(
+            SnapshotSource::ClaudeCode,
+            Some(&origin),
+            "05578284-remote",
+            "2026-11-23T08:18:00Z",
+            "claude_jsonl:v1",
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| (fact.field.as_str(), fact.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("provider_surface", "claude_desktop")]
+        );
+        // Neither name can reach the session origin or execution mode.
+        let source = include_str!("session_attribution.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module")];
+        for name in [
+            "promptSource",
+            "prompt_source",
+            "clientPlatform",
+            "client_platform",
+        ] {
+            assert!(!production.contains(name), "{name}");
+        }
+        let wire = include_str!("snapshots/wire.rs");
+        for name in ["prompt_source", "client_platform"] {
+            assert!(!wire.contains(name), "{name}");
+        }
     }
 
     #[test]
