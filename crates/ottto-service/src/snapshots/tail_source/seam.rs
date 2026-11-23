@@ -126,7 +126,16 @@ impl PendingTail {
     /// The native verdict, then this completion's one call into the store.
     /// True when the committed head stays valid for this completion: staged,
     /// or nothing to restate.
+    #[cfg(test)]
     pub(in crate::snapshots) fn publish(self, native: &Result<ParsedJsonlFile>) -> bool {
+        self.publish_with_job(native, &mut None)
+    }
+
+    pub(in crate::snapshots) fn publish_with_job(
+        self,
+        native: &Result<ParsedJsonlFile>,
+        job: &mut Option<state_v2::JobUpdate>,
+    ) -> bool {
         let Some(encoded) = self.encoded else {
             return false; // PRE never ran: the read failed before it.
         };
@@ -145,7 +154,16 @@ impl PendingTail {
                 let _ = state_v2::set_aside_tail(&self.route, &self.key, SetAsideCause::Encode);
                 false
             }
-            Ok(Some(staged)) => state_v2::stage_tail(&self.route, &self.key, staged).is_ok(),
+            Ok(Some(mut staged)) => {
+                staged.job.clone_from(job);
+                let staged = state_v2::stage_tail(&self.route, &self.key, staged).is_ok();
+                if staged {
+                    *job = None;
+                }
+                staged
+            }
+            // The caller still owns a metadata-only update if the parser's
+            // reduction bytes did not change.
             Ok(None) => true,
         }
     }

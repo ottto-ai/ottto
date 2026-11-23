@@ -4,6 +4,7 @@
 //! damaged or missing state is a counted reconstruction, a Tail-only failure
 //! resumes from the committed head, absence retires, an identity mismatch
 //! retires before reuse, and a newer build's head holds.
+mod job_template;
 use super::super::claude::tests::lines;
 use super::super::claude::Claude;
 use super::super::seam::tests::{route, scope, Route, NOW};
@@ -64,7 +65,7 @@ fn load_as(route: &Route, path: &Path, key: &str, index_path: &Path) -> (Load, L
         false,
     );
     let mut held = File::open(path).unwrap();
-    let fresh = super::settlement_tests::candidate(path);
+    let fresh = job_template::file_candidate(path);
     let before = counters::totals();
     let (load, records) = capture(|| {
         load::<Claude>(

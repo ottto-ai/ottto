@@ -1,0 +1,79 @@
+[
+  {
+    "name": "plain",
+    "prompt": "inspect the service and explain every failure with clear evidence",
+    "masked": "inspect the service and explain every failure with clear evidence",
+    "material": "inspect the service and explain every failure with clear evidence\u0000inspect the service and explain every failure with clear evidence",
+    "id": "hmac-sha256:v1:UAmRusSJwSB-sh2kQXwyMzjRBoGIjGEKOyeNs8rhISI"
+  },
+  {
+    "name": "wrapped",
+    "prompt": "# AGENTS.md instructions for /example\n<INSTRUCTIONS>rules</INSTRUCTIONS><environment_context>context</environment_context><recommended_plugins>plugins</recommended_plugins><system_instruction>rules</system_instruction>inspect the service and explain every failure with clear evidence",
+    "masked": "inspect the service and explain every failure with clear evidence",
+    "material": "inspect the service and explain every failure with clear evidence\u0000inspect the service and explain every failure with clear evidence",
+    "id": "hmac-sha256:v1:UAmRusSJwSB-sh2kQXwyMzjRBoGIjGEKOyeNs8rhISI"
+  },
+  {
+    "name": "unicode",
+    "prompt": "résumé café 日本語 αβγ explain the behavior with clear evidence",
+    "masked": "résumé café 日本語 αβγ explain the behavior with clear evidence",
+    "material": "résumé café 日本語 αβγ explain the behavior with clear evidence\u0000résumé café 日本語 αβγ explain the behavior with clear evidence",
+    "id": "hmac-sha256:v1:PsrI3XM4eUDtvjCaieC012xIkS73Vykt31Oj0DJNu1w"
+  },
+  {
+    "name": "mask-order",
+    "prompt": "inspect the service and explain every failure with clear evidence https://example.org user@example.org ./src/file.rs report.md `code` \"value\" abcdefa 12:30 task42",
+    "masked": "inspect the service and explain every failure with clear evidence <url> <email> <path> <file> <code> <quoted> <hex> <time> <n>",
+    "material": "inspect the service and explain every failure with clear evidence <url> <email> <path> <file> <code> <quoted> <hex> <time> <n>\u0000inspect the service and explain every failure with clear evidence <url> <email> <path> <file> <code> <quoted> <hex> <time> <n>",
+    "id": "hmac-sha256:v1:nfKFQNoeKsqKLhIMwFD4nQnWdSgvcEJvw987oO9Ic9g"
+  },
+  {
+    "name": "shared-header-a",
+    "prompt": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header inspect the service and explain every failure with clear evidence",
+    "masked": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header inspect the service and explain every failure with clear evidence",
+    "material": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header\u0000header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header inspect the service and explain every failure with clear evidence",
+    "id": "hmac-sha256:v1:z3zvUcmoWyOVWnSrnLmycHSZCjftXQDB-Cw6gRCKAdE"
+  },
+  {
+    "name": "shared-header-b",
+    "prompt": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header repair the client and document every decision with clear evidence",
+    "masked": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header repair the client and document every decision with clear evidence",
+    "material": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header\u0000header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header repair the client and document every decision with clear evidence",
+    "id": "hmac-sha256:v1:xei9xZCfj2kqj4UqJTcsJL7EAvOcGSh7IyuRxlDdnyQ"
+  },
+  {
+    "name": "accepted-collision-a",
+    "prompt": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header inspect internal behavior tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail ",
+    "masked": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header inspect internal behavior tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail ",
+    "material": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header\u0000tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail",
+    "id": "hmac-sha256:v1:BzWajdv3mpUl2etBj3MBn1erxzENZUZcwGHb5ZTb3Qo"
+  },
+  {
+    "name": "accepted-collision-b",
+    "prompt": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header replace external behavior tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail ",
+    "masked": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header replace external behavior tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail ",
+    "material": "header header header header header header header header header header header header header header header header header header header header header header header header header header header header header header\u0000tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail tail",
+    "id": "hmac-sha256:v1:BzWajdv3mpUl2etBj3MBn1erxzENZUZcwGHb5ZTb3Qo"
+  },
+  {
+    "name": "short",
+    "prompt": "one two three four five six seven",
+    "masked": null,
+    "material": null,
+    "id": null
+  },
+  {
+    "name": "placeholder-only",
+    "prompt": "https://a https://b https://c https://d https://e https://f https://g https://h",
+    "masked": null,
+    "material": null,
+    "id": null
+  },
+  {
+    "name": "punctuation",
+    "prompt": "inspect the service and explain every failure with clear evidence ! , ?",
+    "masked": "inspect the service and explain every failure with clear evidence ! , ?",
+    "material": "inspect the service and explain every failure with clear evidence ! , ?\u0000inspect the service and explain every failure with clear evidence ! , ?",
+    "id": "hmac-sha256:v1:ptXGJzsqMPPNUSZaDr_6DLO-zeeIAp5po7lcfUrE5zg"
+  }
+]

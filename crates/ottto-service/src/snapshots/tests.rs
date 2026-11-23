@@ -1,3 +1,4 @@
+mod job_template;
 mod claude_file_cap_tests {
     include!("claude_file_cap_tests.rs");
 }

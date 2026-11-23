@@ -1270,8 +1270,8 @@ use sources::codex::line::{
 };
 
 use sources::claude::line::{
-    apply_claude_code_line, claude_first_user_prompt, claude_fork_line_provenance,
-    claude_response_tool_uses, ClaudeForkLineProvenance,
+    apply_claude_code_line, claude_fork_line_provenance, claude_response_tool_uses,
+    ClaudeForkLineProvenance,
 };
 #[cfg(test)]
 use sources::claude::line::{extract_session_artifacts, parse_artifact_url};

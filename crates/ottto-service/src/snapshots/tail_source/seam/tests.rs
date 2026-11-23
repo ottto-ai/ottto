@@ -74,6 +74,7 @@ pub(in crate::snapshots::tail_source) fn stage_reduction<S: TailSource>(
 
 pub(in crate::snapshots::tail_source) fn copy(staged: &StagedFile) -> StagedFile {
     StagedFile {
+        job: None,
         revision: staged.revision,
         head: staged.head.clone(),
         collections: staged.collections.clone(),

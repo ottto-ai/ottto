@@ -189,7 +189,7 @@ fn names_off_drops_skill_ids_and_keeps_template_group_ids() {
         let mut fact = item.attribution_facts.remove(0);
         fact.display_label = None;
         fact.display_label_source = None;
-        for field in ["skill_id", "template_group_id"] {
+        for field in ["skill_id", "template_group_id", "job_template_id"] {
             fact.field = field.to_string();
             fact.value = format!("hmac-sha256:v1:{field}");
             item.attribution_facts.push(fact.clone());
@@ -202,7 +202,7 @@ fn names_off_drops_skill_ids_and_keeps_template_group_ids() {
         session_attribution_enabled: true,
         ..SnapshotUploadPolicy::MOST_PRIVATE
     });
-    assert_eq!(off.len(), 1);
+    assert_eq!(off.len(), 2);
     assert_eq!(off[0].field, "template_group_id");
     let on = facts(SnapshotUploadPolicy {
         session_titles_enabled: true,
@@ -210,9 +210,11 @@ fn names_off_drops_skill_ids_and_keeps_template_group_ids() {
         session_attribution_enabled: true,
         ..SnapshotUploadPolicy::MOST_PRIVATE
     });
-    assert_eq!(on.len(), 2);
+    assert_eq!(on.len(), 3);
     assert_eq!(on[0].field, "skill_id");
     assert_eq!(on[0].value, "hmac-sha256:v1:skill_id");
+    assert_eq!(off[1].field, "job_template_id");
+    assert_eq!(on[2], off[1]);
     assert_eq!(on[1], off[0], "template ids are the same either way");
 }
 

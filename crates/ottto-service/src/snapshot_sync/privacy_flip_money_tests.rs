@@ -8,14 +8,18 @@ use super::*;
 use crate::session_attribution::{normalize_template_material, opaque_hmac_id};
 use crate::snapshots::privacy_flip_modes::{all as policy_all, link, Mode, FLIPS};
 use crate::snapshots::sampled_scan::transition_fixture::{
-    money_oracle::assert_equivalent, RouteResult,
+    money_oracle::{assert_equivalent, assert_placement_equivalent, entity_differences},
+    RouteResult,
 };
 
 /// A resumed session: its copied prefix is what the copy capability marks.
 const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 /// A session whose cold requests are what the cache capability carries.
 const COLD: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-const PROMPT: &str = "Review the synthetic checkout flow and report only safe results.";
+// The forward-only fixture uses the shorter task; the flip matrix also
+// exercises a job-qualified task while keeping the money assertions intact.
+const JOB_PROMPT: &str = "Review the synthetic checkout flow and report all observed results.";
+const PROMPT: &str = "Review synthetic checkout flow and report results.";
 const SKILL: &str = "synthetic-review";
 
 /// The state a flip starts from. A key only shows while attribution is on, so
@@ -98,7 +102,7 @@ pub(super) fn page_under(
 /// The root with everything a setting governs: a title, a repository, a link,
 /// a first prompt (a keyed template and its label) and a skill (a keyed id, its
 /// label and the activity summary).
-fn write_root_material(c: &mut Corpus) -> PathBuf {
+fn write_root_material(c: &mut Corpus, prompt: &str) -> PathBuf {
     let repository = c.base.join("synthetic-repo");
     std::fs::create_dir_all(&repository).unwrap();
     let status = std::process::Command::new("git")
@@ -117,7 +121,7 @@ fn write_root_material(c: &mut Corpus) -> PathBuf {
     ]);
     let text = [
         json!({"type":"user","sessionId":ROOT,"timestamp":AT,"cwd":cwd,
-            "message":{"role":"user","content":PROMPT}}),
+            "message":{"role":"user","content":prompt}}),
         json!({"timestamp":AT,"sessionId":ROOT,"summary":"Synthetic title","cwd":cwd}),
         link(ROOT, AT, 0),
         response,
@@ -210,7 +214,7 @@ fn carried(value: &serde_json::Value) -> bool {
 }
 /// The POSTed bodies carry each field exactly when `mode` lets them, and keyed
 /// values are the ones computed here under the key at send.
-fn assert_wire(route: &RouteResult, mode: Mode, label: &str) {
+fn assert_wire(route: &RouteResult, mode: Mode, prompt: &str, label: &str) {
     let policy = mode.policy;
     let root = &route.snapshots[ROOT];
     assert_eq!(
@@ -244,7 +248,7 @@ fn assert_wire(route: &RouteResult, mode: Mode, label: &str) {
     };
     if policy.session_attribution_enabled {
         let key = key_bytes(mode.key);
-        let template = normalize_template_material(PROMPT).unwrap();
+        let template = normalize_template_material(prompt).unwrap();
         assert_eq!(
             keyed("template_group_id"),
             vec![opaque_hmac_id(&key, "template_group", &template).unwrap()],
@@ -283,6 +287,29 @@ fn assert_wire(route: &RouteResult, mode: Mode, label: &str) {
     );
 }
 
+fn assert_job_wire(route: &RouteResult, mode: Mode, expected: bool, label: &str) {
+    let value = route.snapshots[ROOT]["attribution_facts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|fact| fact["field"] == "job_template_id")
+        .and_then(|fact| fact["value"].as_str());
+    let expected = expected.then(|| {
+        use crate::session_attribution::job_template::material;
+        opaque_hmac_id(
+            &key_bytes(mode.key),
+            "job_template:v1",
+            &material(JOB_PROMPT).unwrap(),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        value,
+        expected.as_deref(),
+        "{label}: job under the key at decision"
+    );
+}
+
 /// [money] T1 on the real pipeline, for every setting and capability bit in
 /// both directions.
 #[cfg(unix)]
@@ -301,12 +328,14 @@ fn flipped_policy_tail_places_money_like_a_full() {
                 field(&mut after);
 
                 let (mut c, _) = claude_corpus("progressive_response");
-                let path = write_root_material(&mut c);
+                let path = write_root_material(&mut c, JOB_PROMPT);
                 evidence_gap(&mut c, false);
                 resumed_session(&mut c, false);
                 cold_session(&mut c, false);
                 let scanner = E2ScanFixture::with_identity_capture(true);
-                let mut warm = page_under(&c, &scanner, ScanIndex::default(), before);
+                let warm_index = scanner.routed(ScanIndex::default(), &c.base);
+                crate::snapshots::state_v2::seed_job_fixture_cutoff(&warm_index);
+                let mut warm = page_under(&c, &scanner, warm_index, before);
                 settle(&c, &mut warm, before);
                 claude_change(&c, &path, "progressive_response");
                 append(&path, &format!("{}\n", link(ROOT, AT, 1)));
@@ -322,7 +351,9 @@ fn flipped_policy_tail_places_money_like_a_full() {
                 assert_eq!(tail.modes, (0, 4, 0), "{label}");
 
                 let fresh = E2ScanFixture::with_identity_capture(true);
-                let mut cold = page_under(&c, &fresh, ScanIndex::default(), after);
+                let cold_index = fresh.routed(ScanIndex::default(), &c.base);
+                crate::snapshots::state_v2::seed_job_fixture_cutoff(&cold_index);
+                let mut cold = page_under(&c, &fresh, cold_index, after);
                 settle(&c, &mut cold, after);
                 assert_eq!(cold.modes.0, 4, "{label}: control is a Full");
                 let root = cold
@@ -367,15 +398,41 @@ fn flipped_policy_tail_places_money_like_a_full() {
                     .collect::<BTreeSet<_>>();
                 assert!(accounts.len() >= 2, "positive control: two accounts placed");
                 let mut tampered = routed(&tail, after.policy);
-                let (cold, tail) = (routed(&cold, after.policy), routed(&tail, after.policy));
-                assert_wire(&cold, after, &format!("{label}/cold"));
-                assert_wire(&tail, after, &format!("{label}/tail"));
-                assert_equivalent(&cold, &tail);
+                let mut cold_post = routed(&cold, after.policy);
+                let tail = routed(&tail, after.policy);
+                assert_wire(&cold_post, after, JOB_PROMPT, &format!("{label}/cold"));
+                assert_wire(&tail, after, JOB_PROMPT, &format!("{label}/tail"));
+                let cold_has_job = after.policy.session_attribution_enabled;
+                let tail_has_job = cold_has_job
+                    && before.policy.session_attribution_enabled
+                    && before.key == after.key;
+                assert_job_wire(&cold_post, after, cold_has_job, &label);
+                assert_job_wire(&tail, after, tail_has_job, &label);
+                if cold_has_job && !tail_has_job {
+                    // Check the posted usage and placement before aligning the
+                    // single, already-asserted job difference for body equality.
+                    assert_placement_equivalent(&cold_post, &tail);
+                    let mut differences = Vec::new();
+                    entity_differences(&cold_post, &tail, &mut differences);
+                    assert!(differences.is_empty(), "{label}: {differences:?}");
+                    let root = cold
+                        .scan
+                        .snapshots
+                        .iter_mut()
+                        .find(|item| item.source_session_id == ROOT)
+                        .unwrap();
+                    root.attribution_facts
+                        .retain(|fact| fact.field != "job_template_id");
+                    root.snapshot_fingerprint =
+                        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, root);
+                    cold_post = routed(&cold, after.policy);
+                }
+                assert_equivalent(&cold_post, &tail);
                 let body = tampered.snapshots.values_mut().next().unwrap();
                 body["input_tokens"] = json!(u32::MAX);
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        assert_equivalent(&cold, &tampered)
+                        assert_equivalent(&cold_post, &tampered)
                     }))
                     .is_err(),
                     "positive control: the oracle sees a token difference"
@@ -405,7 +462,7 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             field(&mut after);
 
             let (mut c, _) = claude_corpus("progressive_response");
-            let path = write_root_material(&mut c);
+            let path = write_root_material(&mut c, PROMPT);
             evidence_gap(&mut c, false);
             resumed_session(&mut c, false);
             cold_session(&mut c, false);
@@ -467,8 +524,8 @@ fn flip_reads_no_unproven_delivered_file_then_tail_places_money_like_a_full() {
             settle(&c, &mut cold, after);
             assert_eq!(cold.modes.0, 4, "{label}: control is a Full");
             let (cold, tail) = (routed(&cold, after.policy), routed(&tail, after.policy));
-            assert_wire(&cold, after, &format!("{label}/cold"));
-            assert_wire(&tail, after, &format!("{label}/tail"));
+            assert_wire(&cold, after, PROMPT, &format!("{label}/cold"));
+            assert_wire(&tail, after, PROMPT, &format!("{label}/tail"));
             assert_equivalent(&cold, &tail);
         }
     });

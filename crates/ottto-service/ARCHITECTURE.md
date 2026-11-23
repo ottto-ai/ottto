@@ -888,3 +888,24 @@ Rows survive refusal, temporary census loss, historical replay and bounded rebui
 A destination change clears them; positive deletion prunes only hashes no stored copy names.
 The rows confer no upload receipt authority. State layout 8 stores each slot separately;
 older readers refuse this layout and require a forward update.
+
+## Job fingerprint
+
+The first qualifying human task supplies `job_template_id` independently of display
+titles. Balanced leading envelopes are stripped, volatile values are masked, and
+the first 30 and last 60 whitespace words are HMACed with the attribution key.
+Only tasks with eight non-placeholder words and at most 64 KiB qualify. Equal
+windows can identify different middle tasks; this is inferred grouping evidence.
+A single file-bound field in the common Tail head stores pending eligibility,
+a terminal no-id decision, or the identifier and key epoch. It survives native
+Full reads and publication without a continuation checkpoint, including Codex
+archives. A proven Codex path carry rebinds the decision. A same-object rename
+can move a settled metadata-only decision by itself. Outstanding revisions keep
+the existing carry hold. An unreadable head leaves the Full read without a job
+decision. A certified checkpoint reset can restore the head from the read and
+preserve surviving debt. Retirement and scope erasure remove the decision.
+Indexed legacy runs have no eligibility. Unindexed files qualify only with
+a known file birth time at or after the store's first layout 9 write. Layout 9
+fences older readers at source load, before any head can be rewritten. The
+attribution key must be available when a qualifying task is first decided. A
+rotated key suppresses ids from the previous epoch. No new prompt text persists.

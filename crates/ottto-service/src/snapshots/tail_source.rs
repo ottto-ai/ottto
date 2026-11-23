@@ -52,6 +52,11 @@ pub(in crate::snapshots) fn reduction_revision(source: SnapshotSource) -> u32 {
     with_codec!(source, S => S::REDUCTION_REVISION)
 }
 
+mod job_template;
+pub(in crate::snapshots) use job_template::{
+    job_for_carry, job_matches_checkpoint, job_update, seed_full_job_template,
+};
+
 /// `source`'s load of `candidate` on `route`, through its codec. `live` is the
 /// read's fresh accumulator, configured with this cycle's inputs.
 #[allow(
@@ -1053,6 +1058,9 @@ head_fields! {
         N title_source: Option<String>,
         X first_prompt_title: Option<String>,
         X first_prompt_material: Option<String>,
+        I job_template: Option<crate::session_attribution::job_template::JobState>,
+        I job_template_changed: bool,
+        I job_material: Option<String>,
         N provider_skills: BTreeSet<String>,
         N started_at: Option<String>,
         N ended_at: Option<String>,
@@ -1301,3 +1309,6 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
 
 #[cfg(test)]
 pub(in crate::snapshots) mod historical_codex;
+
+#[cfg(test)]
+mod tests;

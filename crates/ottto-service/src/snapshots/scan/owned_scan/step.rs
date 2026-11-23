@@ -947,6 +947,15 @@ impl OwnedSourceScan {
                     if let Some(context) = sampling.as_ref() {
                         context.cache.cursor_unwait(&context.namespace, &boot_key);
                     }
+                    if matches!(job, Err(codex_file_join::GroupEnd::Unavailable)) {
+                        residue_index_keys.extend(
+                            group_members
+                                .iter()
+                                .map(|member| local_index_key(&member.path)),
+                        );
+                        scan::owned_scan::requeue_members(index, &selected_flags, &group_members);
+                        pending!();
+                    }
                     codex_file_join::disclose_strict(&group_members, targets!());
                     pending!();
                 };
@@ -1629,6 +1638,17 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     };
+                    if tail_source::seed_full_job_template(
+                        index,
+                        &active.candidate,
+                        &[],
+                        &mut parser.accumulator,
+                    )
+                    .is_err()
+                    {
+                        residue_index_keys.insert(local_index_key(&active.candidate.path));
+                        pending!();
+                    }
                     acquisition.mode = mode;
                     if let Some(plan) = parser.reader.acquisition.as_ref() {
                         parser
@@ -2269,7 +2289,14 @@ impl OwnedSourceScan {
                         None => tail,
                     });
                 let mut resident_bytes = 0;
+                let mut job_template = group.as_mut().and_then(|group| group.job_template.take());
+                let job_template_file = group
+                    .as_deref()
+                    .map_or(&candidate, |group| &group.members[0]);
                 let mut encode = |live: PreFinalization<'_>| {
+                    if !independent_group {
+                        job_template = tail_source::job_update(job_template_file, live.accumulator);
+                    }
                     #[cfg(unix)]
                     if let Some(tail) = tail.as_mut() {
                         tail.encode(&live);
@@ -2290,7 +2317,8 @@ impl OwnedSourceScan {
                 // On a Tail route: whether this file's committed head stays
                 // its continuation (staged, or nothing to restate).
                 #[cfg(unix)]
-                let tail_reused = tail.map(|tail| tail.publish(&parsed_file));
+                let tail_reused =
+                    tail.map(|tail| tail.publish_with_job(&parsed_file, &mut job_template));
                 #[cfg(test)]
                 sampled_scan::test_hooks::fire(
                     sampled_scan::test_hooks::Point::BeforeNativeEffects,
@@ -2541,6 +2569,16 @@ impl OwnedSourceScan {
                     sampled_audit::queue_cap_retry(index, &candidate);
                     census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
                     pending!();
+                }
+                if let Some(job) = job_template.filter(|_| parse_complete) {
+                    let key = local_index_key(&job_template_file.path);
+                    let saved = state_v2::tail_route_path(index).and_then(|route| {
+                        route.map_or(Ok(()), |route| state_v2::stage_job(&route, &key, job))
+                    });
+                    if saved.is_err() {
+                        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                        pending!();
+                    }
                 }
                 // Debt-free after quiet retirement is scheduling state, not
                 // Full authority, including a later forced Unchanged read.
@@ -5004,6 +5042,20 @@ impl OwnedSourceScan {
                         .into()
                 });
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
+                pending!();
+            }
+            if planned_mode.is_none_or(|(mode, _)| {
+                matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+            }) && tail_source::seed_full_job_template(
+                index,
+                &candidate,
+                &[],
+                &mut parser.accumulator,
+            )
+            .is_err()
+            {
+                tail_source::counters::bump(source, "tail_db_loads", "held");
+                residue_index_keys.insert(local_index_key(&candidate.path));
                 pending!();
             }
             // Every physical Full/Tail acquisition stops at its opening extent,

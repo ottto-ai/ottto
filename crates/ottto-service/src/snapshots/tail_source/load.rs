@@ -172,11 +172,13 @@ pub(in crate::snapshots) fn retire_absent(
                     && head.table.contains_key(&state_v2::Collection::Revisions) =>
             {
                 kept_debt += 1;
+                if head.common.job.is_some() || head.job_corrupt {
+                    retire.insert(key);
+                }
             }
-            Ok(Some(_)) => {
+            Ok(Some(_)) | Ok(None) => {
                 retire.insert(key);
             }
-            Ok(None) => {}
             Err(error)
                 if matches!(
                     error.downcast_ref::<Hold>(),
@@ -469,6 +471,7 @@ fn stored<S: TailSource>(
         .map(|(c, m)| (*c, m.meta))
         .collect();
     S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
+    super::job_template::restore_job(&head, fresh, &mut acc);
     S::install_live(&mut acc, fresh, live).map_err(|error| match error {
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),

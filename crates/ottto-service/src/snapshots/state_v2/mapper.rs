@@ -699,6 +699,12 @@ pub(super) fn field_write<T: Serialize + ?Sized>(
     };
     rows.map(kind, &entries)
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static MAX_CATALOGUE_LAYOUT: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(catalogue::LAYOUT) };
+}
+
 /// A recorded layout is authoritative. Unversioned stores use the authenticated
 /// original-field inventory to distinguish older writers from missing rows.
 pub(super) fn layout(tx: &mut dyn Transaction) -> Result<u32> {
@@ -709,7 +715,11 @@ pub(super) fn layout(tx: &mut dyn Transaction) -> Result<u32> {
         catalogue::legacy_layout(&kinds_misc::read_control("field_presence", tx)?)
     };
     ensure!(layout > 0, "state_v2_catalogue_layout");
-    ensure!(layout <= catalogue::LAYOUT, Hold::Future);
+    #[cfg(test)]
+    let supported = MAX_CATALOGUE_LAYOUT.get();
+    #[cfg(not(test))]
+    let supported = catalogue::LAYOUT;
+    ensure!(layout <= supported, Hold::Future);
     Ok(layout)
 }
 /// Only a kind unknown to the saved layout may lack its root. Orphan members

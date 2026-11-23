@@ -1,7 +1,8 @@
 //! Route seams of the Tail store (`tail.rs`): staging in the route's state,
 //! on-demand reads on the graph's session, and the cycle-exit commit.
 use super::super::tail::{
-    Collection, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead, TailStage,
+    Collection, JobUpdate, Observation, PathCarry, SetAside, SetAsideCause, StagedFile, TailHead,
+    TailStage,
 };
 use super::*;
 
@@ -55,6 +56,13 @@ pub(in crate::snapshots) fn stage_tail(path: &Path, key: &str, file: StagedFile)
         Ok(())
     })
 }
+pub(in crate::snapshots) fn stage_job(path: &Path, key: &str, job: JobUpdate) -> Result<()> {
+    with_state(path, |state| {
+        state.tail.stage_job(key, job);
+        Ok(())
+    })
+}
+
 /// Files a save does not keep: their staged heads go, the committed ones stay.
 pub(in crate::snapshots) fn unstage_tail(
     path: &Path,
@@ -170,6 +178,18 @@ pub(in crate::snapshots) fn load_head(
     }
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
+    })
+}
+/// Full admission needs no reduction pages. Bind the cutoff and common head
+/// to the same authenticated graph generation.
+pub(in crate::snapshots) fn load_job_head(
+    index: &ScanIndex,
+    key: &str,
+    revision: u32,
+) -> Result<(Option<TailHead>, Option<u64>)> {
+    read_txn_at(index, |tx, stamp| {
+        let head = tail::load_head(tx, key.as_bytes(), revision, stamp.0)?;
+        Ok((head, kinds::job_template_since(tx)?))
     })
 }
 pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {

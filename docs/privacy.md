@@ -290,6 +290,11 @@ is stated as an agent launch, with no parent unless the delegation wrapper
 below supplies one. This applies to such threads read after the update; an
 ended thread uploaded before it keeps what it uploaded.
 
+Job grouping also uses a tenant-keyed HMAC of the masked first qualifying human
+task, separately from its display title. Only the opaque identifier is uploaded;
+the masked words are temporary local memory. The server issues the tenant key and
+can use it to confirm a task it already knows.
+
 Upload settings apply going forward. Turning a setting on applies to sessions
 that are active after it is turned on: a session that has already ended keeps
 what it uploaded before, and the daemon reads no transcript again to fill it

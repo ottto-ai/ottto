@@ -2300,7 +2300,10 @@ fn layout_seven_upgrade_preserves_delivery_proof_and_persists_exact_request_ack(
     assert!(save_with(&f.path, &mut index).unwrap());
     index = load_with(&f.path, false).unwrap().unwrap();
     with_session_db(&index, |db| {
-        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+        assert_eq!(
+            db.read_control::<u32>("catalogue_layout").unwrap(),
+            Some(catalogue::LAYOUT)
+        );
     });
     assert!(index.upload_context_proof.request_contributions.is_empty());
     delivery_unchanged(&index);
@@ -2348,7 +2351,10 @@ fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
         .insert(slot.clone(), row.clone());
     assert!(save_with(&f.path, &mut index).unwrap());
     with_session_db(&index, |db| {
-        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+        assert_eq!(
+            db.read_control::<u32>("catalogue_layout").unwrap(),
+            Some(catalogue::LAYOUT)
+        );
     });
     index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(index.upload_context_proof.request_contributions[&slot], row);
@@ -2374,7 +2380,10 @@ fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
     assert!(legacy.is_empty());
     // The current reader exercises the same refusal used by an older reader
     // when its supported layout is below the stored layout.
-    with_session_db(&index, |db| db.control("catalogue_layout", &9_u32).unwrap());
+    with_session_db(&index, |db| {
+        db.control("catalogue_layout", &(catalogue::LAYOUT + 1))
+            .unwrap()
+    });
     let error = load_with(&f.path, false).unwrap_err();
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
 }

@@ -591,6 +591,59 @@ fn exit_commit_moves_g_and_fences_stale_siblings() {
     assert_eq!(pages[&(Collection::Responses, 0)], b"page");
 }
 
+/// Layout 8 readers refuse the whole source after either publication path
+/// writes the new layout. The refused load leaves the committed rows intact.
+#[test]
+fn job_publication_fences_layout_eight_readers() {
+    use crate::snapshots::{scan_index_health, SnapshotSource};
+    let source = SnapshotSource::ClaudeCode;
+    for exit in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        let mut index = load_with(&f.path, false).unwrap().unwrap();
+        with_session_db(&index, |db| {
+            db.control("catalogue_layout", &8_u32).unwrap();
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            tx.delete(&RowKey::Meta("job_template_since".into()))
+                .unwrap();
+            assert!(
+                matches!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(n) if n == G + 1)
+            );
+        });
+        // Load the layout-8 baseline so the graph-save case must publish its upgrade.
+        index = load_with(&f.path, false).unwrap().unwrap();
+        stage_tail(&f.path, FILE, staged(b"head", &[])).unwrap();
+        if exit {
+            BaselineRelease::new(&f.path, &index).commit_tail().unwrap();
+        } else {
+            save_with(&f.path, &mut index).unwrap();
+        }
+        let mut since = None;
+        with_session_db(&index, |db| {
+            assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(9));
+            since = db.read_control::<u64>("job_template_since").unwrap();
+            assert!(since.is_some_and(|nanos| nanos > 0));
+        });
+        let previous = mapper::MAX_CATALOGUE_LAYOUT.replace(8);
+        let refused = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support);
+        mapper::MAX_CATALOGUE_LAYOUT.set(previous);
+        let error = refused.unwrap_err();
+        assert!(error
+            .chain()
+            .any(|cause| cause.downcast_ref::<Hold>() == Some(&Hold::Future)));
+        assert!(scan_index_health::current(source).is_some());
+        let mut reloaded =
+            ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
+        assert!(scan_index_health::current(source).is_none());
+        assert_eq!(reloaded.generation, G + 2);
+        assert_eq!(read(&reloaded, FILE).unwrap().0.unwrap().body, b"head");
+        save_with(&f.path, &mut reloaded).unwrap();
+        with_session_db(&reloaded, |db| {
+            assert_eq!(db.read_control::<u64>("job_template_since").unwrap(), since);
+        });
+    }
+}
+
 /// [format] An unconfirmed exit never adopts a stamp: refused stays G, and a
 /// commit that published without confirmation reloads what committed. A store
 /// behind the previous layout keeps its layout until a full save fills it in.
@@ -956,13 +1009,57 @@ fn debt_survives_reset_and_retire_until_settled() {
     };
     let encoded = tail::encode_head(REVISION, &Default::default(), &common, None, None).unwrap();
     assert!(tail::decode_head(&encoded).is_ok());
-    // Envelope 2 (a write generation count) is known; 3 is newer.
-    for (at, value) in [(5, 3), (6, 4), (24, 3), (30, 4)] {
+    // Envelope 2 (a write generation count) and parts flag 4 (a job decision)
+    // are known; envelope 3 and flag 8 are newer.
+    for (at, value) in [(5, 3), (6, 4), (24, 3), (30, 8)] {
         let mut newer = encoded.clone();
         newer[at] = value;
         let error = tail::decode_head(&newer).err().unwrap();
         assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future), "{at}");
     }
+}
+
+#[test]
+fn malformed_job_state_can_be_cleared_without_replacing_the_reduction() {
+    use super::super::tail::{FileJob, JobUpdate};
+    use crate::session_attribution::job_template::JobState;
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    let body = b"existing reduction";
+    let common = Common {
+        job: Some(FileJob {
+            inode: 11,
+            birth_nanos: 12,
+            state: JobState::Pending,
+        }),
+        ..Default::default()
+    };
+    let mut head =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(body), None).unwrap();
+    head[31 + 16] = 255; // invalid decision tag, inside the optional slot
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &mapper::key("tail.head", FILE, 0).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &head,
+        })
+        .unwrap();
+        assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+    });
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let loaded = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(loaded.body, body);
+    assert!(loaded.job_corrupt);
+    assert!(loaded.common.job.is_none());
+    super::tail_route::stage_job(&f.path, FILE, JobUpdate::Clear).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let cleared = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert_eq!(cleared.body, body);
+    assert!(!cleared.job_corrupt);
+    assert!(cleared.common.job.is_none());
 }
 
 /// [format] The write generation count is envelope 2 only: 4 nonzero
@@ -1008,6 +1105,44 @@ fn write_generation_count_is_envelope_two_and_version_one_has_none() {
         refused.unwrap_err().to_string(),
         "state_v2_tail_value_shape"
     );
+}
+
+/// [format] A head with both a job decision and a write generation count
+/// stores the job block, then the 4 count bytes, then the reduction. Each
+/// part decodes back on its own, and the job block alone stays envelope 1.
+#[test]
+fn job_block_then_count_then_reduction() {
+    use super::super::tail::FileJob;
+    use crate::session_attribution::job_template::JobState;
+    use std::num::NonZeroU32;
+    let common = Common {
+        job: Some(FileJob {
+            inode: 11,
+            birth_nanos: 12,
+            state: JobState::NoId,
+        }),
+        ..Default::default()
+    };
+    let seven = NonZeroU32::new(7);
+    let job_only =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), None).unwrap();
+    assert_eq!(job_only[5], 1, "a job block alone keeps envelope 1");
+    let both =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), seven).unwrap();
+    assert_eq!(both[5], 2);
+    let body_at = both.len() - b"head".len();
+    assert_eq!(&both[body_at..], b"head");
+    assert_eq!(&both[body_at - 4..body_at], &[0, 0, 0, 7]);
+    let mut expected = job_only.clone();
+    expected[5] = 2;
+    expected.splice(body_at - 4..body_at - 4, [0, 0, 0, 7]);
+    assert_eq!(
+        both, expected,
+        "the count sits between the job block and the reduction"
+    );
+    let decoded = tail::decode_head(&both).unwrap();
+    assert_eq!(decoded.write_generation, seven);
+    assert_eq!(decoded.common.job, common.job);
 }
 
 /// The version 1 Tail head 0.1.261 writes for the counted-head test's file:
