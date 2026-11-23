@@ -19,6 +19,7 @@ pub(in crate::snapshots) struct DesktopSessionFileFacts {
     desktop_session_id: Option<String>,
     spawned_from_desktop_session_id: Option<String>,
     spawned_from_unresolved: bool,
+    scheduled_task: bool,
 }
 
 /// Claude Code sidecar title metadata read from the Claude desktop app's
@@ -52,6 +53,9 @@ pub(in crate::snapshots) struct ClaudeTitleMetadata {
     /// (`spawnedFrom`), resolved through the store to the parent's own
     /// transcript id. Only unambiguous, acyclic links are kept.
     pub(in crate::snapshots) spawn_lineage: BTreeMap<String, ClaudeDesktopSpawnLineage>,
+    /// Transcript ids of sessions the desktop app ran as one of its own
+    /// scheduled tasks (`scheduledTaskId` in the store).
+    pub(in crate::snapshots) scheduled_tasks: BTreeSet<String>,
     /// This cycle's existing held retries with recovered proof; counts only.
     pub(in crate::snapshots) recovered_account_holds: BTreeSet<String>,
     pub(in crate::snapshots) legacy_sidecar_fingerprint: String,
@@ -97,6 +101,10 @@ pub(in crate::snapshots) struct ClaudeDesktopTitleIndexEntry {
     /// the starting session is unknown, which is not the same as none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(in crate::snapshots) spawned_from_unresolved: bool,
+    /// The app ran this session as one of its scheduled tasks
+    /// (`scheduledTaskId`). Only the marker is kept, never the task id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(in crate::snapshots) scheduled_task: bool,
 }
 
 /// Directory identity is original only for a native, unimported session. Desktop's
@@ -225,7 +233,17 @@ impl ClaudeTitleMetadata {
                 lineage.parent_session_id.as_str(),
             ]);
         }
+        // Appended only for a scheduled task, so other sessions keep their
+        // fingerprint and only scheduled ones re-emit once.
+        if self.scheduled_tasks.contains(source_session_id) {
+            parts.push("desktop_scheduled_task:v1");
+        }
         sha256_hex(&parts)
+    }
+
+    /// The desktop app ran this session as one of its own scheduled tasks.
+    pub(in crate::snapshots) fn scheduled_task(&self, source_session_id: &str) -> bool {
+        self.scheduled_tasks.contains(source_session_id)
     }
 
     pub(in crate::snapshots) fn spawn_lineage(
@@ -541,6 +559,11 @@ impl ClaudeTitleMetadata {
 
     fn from_durable_index_with_metadata(index: &ScanIndex, mut metadata: Self) -> Self {
         for entry in index.claude_desktop_title_files.values() {
+            if entry.scheduled_task {
+                metadata
+                    .scheduled_tasks
+                    .insert(entry.cli_session_id.clone());
+            }
             if let Some(original_identity) = &entry.original_identity {
                 metadata
                     .original_identity_evidence
@@ -1170,11 +1193,22 @@ fn load_desktop_session_file_facts(path: &Path) -> Result<Option<DesktopSessionF
             .filter(|id| lineage_ids_exact && is_claude_desktop_session_id(id))
     };
     let desktop_session_id = lineage_id_at(&["sessionId"]);
-    let spawned_from_desktop_session_id = lineage_id_at(&["spawnedFrom", "sessionId"]);
-    let spawned_from_unresolved = spawned_from_desktop_session_id.is_none()
-        && value
-            .get("spawnedFrom")
-            .is_some_and(|value| !value.is_null());
+    // Only a session another agent opened (the app's `start_session` tool,
+    // `spawnedFrom.sideSession: true`) is an agent launch. A task an agent
+    // suggested and the person clicked also records `spawnedFrom`, without
+    // `sideSession`: the person started it, so it carries no lineage at all.
+    // This assumes no desktop build opened agent sessions without writing
+    // `sideSession`: children without it have a person's first turn.
+    let opened_by_agent = value
+        .get("spawnedFrom")
+        .and_then(|spawned_from| spawned_from.get("sideSession"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let spawned_from_desktop_session_id =
+        lineage_id_at(&["spawnedFrom", "sessionId"]).filter(|_| opened_by_agent);
+    let spawned_from_unresolved = opened_by_agent && spawned_from_desktop_session_id.is_none();
+    // The app's own scheduled task. Only the marker is kept, never the id.
+    let scheduled_task = string_at(&value, &["scheduledTaskId"]).is_some();
     Ok(Some(DesktopSessionFileFacts {
         cli_session_id,
         title,
@@ -1184,6 +1218,7 @@ fn load_desktop_session_file_facts(path: &Path) -> Result<Option<DesktopSessionF
         desktop_session_id,
         spawned_from_desktop_session_id,
         spawned_from_unresolved,
+        scheduled_task,
     }))
 }
 
@@ -1199,9 +1234,9 @@ fn is_claude_desktop_session_id(value: &str) -> bool {
 
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
 crate::heap_layout_bound::fields!(ClaudeDesktopSpawnLineage; parent_session_id);
-crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
+crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, title, user_set, account_identifier_hash, original_identity, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved, scheduled_task);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
-crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
+crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, scheduled_tasks, recovered_account_holds, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 
 impl DesktopSessionFileFacts {
     fn into_entry(
@@ -1222,10 +1257,11 @@ impl DesktopSessionFileFacts {
             desktop_session_id: self.desktop_session_id,
             spawned_from_desktop_session_id: self.spawned_from_desktop_session_id,
             spawned_from_unresolved: self.spawned_from_unresolved,
+            scheduled_task: self.scheduled_task,
         }
     }
 }
-crate::heap_layout_bound::fields!(DesktopSessionFileFacts; cli_session_id, title, user_set, imported, source_created_at, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved);
+crate::heap_layout_bound::fields!(DesktopSessionFileFacts; cli_session_id, title, user_set, imported, source_created_at, desktop_session_id, spawned_from_desktop_session_id, spawned_from_unresolved, scheduled_task);
 
 #[cfg(all(test, unix))]
 mod reuse_tests;

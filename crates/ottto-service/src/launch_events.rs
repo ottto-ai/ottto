@@ -61,6 +61,14 @@
 //! Retained events remain available when a transcript is first imported,
 //! re-scanned, or replayed; they are not consumed with its first observation. Filenames are the SHA-256 of the triple, so re-emitting the same
 //! launch resolves to the same path and can never produce a second edge.
+//!
+//! Intake files a processed event as `<worker>.<digest>.json`, a filename
+//! index: a lookup reads `processed/` names only and opens just the demanded
+//! workers' files, so its cost follows the demand, not the 30-day store.
+//! Every claim on one worker shares that prefix, so the two-controllers rule
+//! still sees all of them. Legacy `<digest>.json` names are opened by every
+//! lookup until they expire. Expiry is a slow sweep, at most once a day per
+//! process, never part of each lookup.
 
 use crate::hex::is_uuid;
 use serde_json::{Map, Value};
@@ -128,11 +136,17 @@ const INVENTORY_TTL: Duration = Duration::from_secs(60);
 const CAPTURE_SOURCE_LANDING_REPAIR: &str = "launcher_event:landing_repair";
 const CAPTURE_SOURCE_GPT_SOL_RELAY: &str = "launcher_event:gpt_sol_relay";
 const CAPTURE_SOURCE_OPUS_CLI_AGENT: &str = "launcher_event:opus_cli_agent";
+const CAPTURE_SOURCE_HELPER_AGENT: &str = "launcher_event:helper_agent";
 const CAPTURE_SOURCES: &[(&str, &str)] = &[
     (CAPTURE_SOURCE_LANDING_REPAIR, "pr-fixer"),
     (CAPTURE_SOURCE_GPT_SOL_RELAY, "gpt-sol"),
     (CAPTURE_SOURCE_OPUS_CLI_AGENT, "opus-cli-agent"),
+    (CAPTURE_SOURCE_HELPER_AGENT, "helper-agent"),
 ];
+
+/// How often one process walks `processed/` to delete expired events. Lookups
+/// never stat files they do not open; expiry is this slow sweep's job.
+const PROCESSED_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One accepted launch event, reduced to what a fact may carry.
 ///
@@ -167,6 +181,11 @@ struct Lookup {
     complete: bool,
     failed: bool,
     loaded_at: Option<Instant>,
+    /// Counts only, for the lookup diagnostic: processed files skipped by
+    /// name, event files opened, and expired files the slow sweep removed.
+    skipped_by_name: u64,
+    opened: u64,
+    swept: u64,
     pending_stamp: Option<SystemTime>,
     processed_stamp: Option<SystemTime>,
 }
@@ -253,6 +272,13 @@ impl LaunchEventInventory {
             .all(|worker| lookup.workers.contains_key(worker));
         for _ in 0..LOOKUP_ENTRIES_PER_STEP {
             if lookup.entries.is_none() {
+                // Expiry of processed events is a slow sweep, not every lookup.
+                if lookup.phase == 3 && !processed_sweep_due(root) {
+                    if advance_phase(root, &mut lookup) {
+                        return finish_lookup(root, &mut lookup).map(|_| demand_matches);
+                    }
+                    continue;
+                }
                 let subdir = match lookup.phase {
                     0 | 1 => PENDING_SUBDIR,
                     2 | 3 => PROCESSED_SUBDIR,
@@ -281,6 +307,18 @@ impl LaunchEventInventory {
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
+                    // The filename index: a processed event named for its
+                    // worker is opened only when that worker is demanded.
+                    // Every claim on one worker shares the prefix, so the
+                    // two-controllers rule still sees all of them.
+                    if lookup.phase == 2 {
+                        if let Some(worker) = indexed_worker(&path) {
+                            if !lookup.workers.contains_key(worker) {
+                                lookup.skipped_by_name += 1;
+                                continue;
+                            }
+                        }
+                    }
                     match entry.file_type() {
                         Ok(kind) if kind.is_file() => {}
                         Ok(kind) if kind.is_symlink() => {
@@ -301,17 +339,20 @@ impl LaunchEventInventory {
                         PROCESSED_RETENTION
                     };
                     if is_expired(&path, retention) {
-                        if lookup.phase == 0 || lookup.phase >= 3 {
-                            let _ = fs::remove_file(&path);
+                        if (lookup.phase == 0 || lookup.phase >= 3)
+                            && fs::remove_file(&path).is_ok()
+                        {
+                            lookup.swept += 1;
                         }
                         continue;
                     }
                     if lookup.phase >= 3 {
                         continue;
                     }
+                    lookup.opened += 1;
                     match read_and_validate(&path) {
-                        Ok(_) if lookup.phase == 0 => {
-                            if !relocate(&path, &root.join(PROCESSED_SUBDIR)) {
+                        Ok(event) if lookup.phase == 0 => {
+                            if !relocate_processed(&path, &root.join(PROCESSED_SUBDIR), &event) {
                                 lookup.failed = true;
                             }
                         }
@@ -457,12 +498,71 @@ fn finish_lookup(root: &Path, lookup: &mut Lookup) -> Result<bool, ()> {
     if lookup.failed {
         eprintln!("ottto-service: launch lookup incomplete: local evidence changed or was unreadable; work remains owed");
     }
+    // Only a lookup that touched an event file reports, so a Mac with no
+    // launcher events writes no line per scan.
+    if lookup.phase != 0 && lookup.opened + lookup.skipped_by_name + lookup.swept > 0 {
+        crate::local_resource_diagnostics::traversal_point(
+            "launch_event_lookup",
+            "unknown",
+            &LookupCounts {
+                demanded_workers: lookup.workers.len() as u64,
+                processed_skipped_by_name: lookup.skipped_by_name,
+                event_files_opened: lookup.opened,
+                expired_files_removed: lookup.swept,
+            },
+        );
+    }
     lookup.complete = true;
     lookup.loaded_at = Some(Instant::now());
     if lookup.failed {
         Err(())
     } else {
         Ok(true)
+    }
+}
+
+/// The lookup diagnostic: counts only, never a reference or a name.
+#[derive(serde::Serialize)]
+struct LookupCounts {
+    demanded_workers: u64,
+    processed_skipped_by_name: u64,
+    event_files_opened: u64,
+    expired_files_removed: u64,
+}
+
+/// The worker a processed event is filed under (`<worker>.<digest>.json`), or
+/// `None` for a legacy `<digest>.json` name, which every lookup still opens.
+fn indexed_worker(path: &Path) -> Option<&str> {
+    let (worker, digest) = path.file_stem()?.to_str()?.split_once('.')?;
+    (is_uuid(worker)
+        && !worker.bytes().any(|byte| byte.is_ascii_uppercase())
+        && crate::hex::is_sha256_any_case(digest))
+    .then_some(worker)
+}
+
+static LAST_PROCESSED_SWEEP: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new());
+
+/// Tests: the next lookup under `home` runs the processed expiry sweep.
+#[cfg(test)]
+pub(crate) fn forget_processed_sweep(home: &Path) {
+    LAST_PROCESSED_SWEEP
+        .lock()
+        .unwrap()
+        .remove(&home.join(DROP_ROOT_DIR));
+}
+
+/// True at most once per [`PROCESSED_SWEEP_INTERVAL`] for one drop root in
+/// this process: the first lookup after a start sweeps, later ones skip.
+fn processed_sweep_due(root: &Path) -> bool {
+    let Ok(mut last) = LAST_PROCESSED_SWEEP.lock() else {
+        return true;
+    };
+    match last.get(root) {
+        Some(at) if at.elapsed() < PROCESSED_SWEEP_INTERVAL => false,
+        _ => {
+            last.insert(root.to_path_buf(), Instant::now());
+            true
+        }
     }
 }
 
@@ -505,6 +605,17 @@ fn relocate(path: &Path, destination: &Path) -> bool {
     fs::rename(path, destination.join(name)).is_ok()
 }
 
+/// Move a validated pending event into `processed/`, filed under its worker:
+/// `<worker>.<digest>.json`. The digest is the same triple hash, so a replayed
+/// launch still lands on the same name.
+fn relocate_processed(path: &Path, processed: &Path, event: &LaunchEvent) -> bool {
+    if fs::create_dir_all(processed).is_err() {
+        return false;
+    }
+    let name = format!("{}.{}.json", event.worker_session_ref, event_digest(event));
+    fs::rename(path, processed.join(name)).is_ok()
+}
+
 /// Quarantine a file and say why in a CODE, never in its contents.
 ///
 /// The only other thing logged is a 16-character prefix of the file's own name,
@@ -523,6 +634,8 @@ fn redacted_label(path: &Path) -> String {
     let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
         return "unnamed".to_string();
     };
+    // A processed name leads with its worker id, which is never logged.
+    let stem = stem.rsplit_once('.').map_or(stem, |(_, digest)| digest);
     if crate::hex::is_sha256_any_case(stem) {
         return stem[..16].to_string();
     }
@@ -568,11 +681,18 @@ fn read_and_validate(path: &Path) -> Result<LaunchEvent, &'static str> {
         return Err("unreadable");
     }
     let event = validate_event(&raw)?;
-    let expected = path
+    let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or("unnamed")?;
-    if expected != event_digest(&event) {
+    // `<digest>` as the emitter writes it, or `<worker>.<digest>` once filed
+    // in `processed/`; either way the name must match this exact event.
+    let digest = match stem.split_once('.') {
+        Some((worker, digest)) if worker == event.worker_session_ref => digest,
+        Some(_) => return Err("filename_mismatch"),
+        None => stem,
+    };
+    if digest != event_digest(&event) {
         return Err("filename_mismatch");
     }
     Ok(event)
@@ -641,6 +761,12 @@ pub(crate) fn validate_event(raw: &str) -> Result<LaunchEvent, &'static str> {
         CAPTURE_SOURCE_OPUS_CLI_AGENT => {
             Some(session_ref_field(object, "workflow_ref").ok_or("bad_workflow_ref")?)
         }
+        CAPTURE_SOURCE_HELPER_AGENT if object.get("workflow_ref").is_some_and(Value::is_null) => {
+            None
+        }
+        CAPTURE_SOURCE_HELPER_AGENT => {
+            Some(session_ref_field(object, "workflow_ref").ok_or("bad_workflow_ref")?)
+        }
         _ => return Err("unknown_capture_source"),
     };
     // A session cannot launch itself. Reaching here means one of the two
@@ -661,6 +787,8 @@ pub(crate) fn validate_event(raw: &str) -> Result<LaunchEvent, &'static str> {
             Some(pr_ref) if pr_ref > 0 => {}
             _ => return Err("bad_pr_ref"),
         },
+        CAPTURE_SOURCE_HELPER_AGENT if object.get("pr_ref").is_some_and(Value::is_null) => {}
+        CAPTURE_SOURCE_HELPER_AGENT => return Err("bad_pr_ref"),
         _ => return Err("unknown_capture_source"),
     }
     if !is_utc_second_timestamp(string_field(object, "launch_ts").unwrap_or_default()) {
@@ -1088,6 +1216,8 @@ mod tests {
                 .set_modified(SystemTime::now() - PROCESSED_RETENTION - Duration::from_secs(1)),
         )
         .unwrap();
+        // Expiry is the slow sweep's job; make the next lookup the one that sweeps.
+        forget_processed_sweep(&home.0);
         let expired = LaunchEventInventory::refresh(&home.0);
         // Cleanup may change the directory fence once; the next context converges.
         while expired.prepare_step(std::slice::from_ref(&id)) == Ok(false) {}
@@ -1095,6 +1225,114 @@ mod tests {
         complete(&after_cleanup, std::slice::from_ref(&id));
         assert!(after_cleanup.matching(&id).is_none());
         assert!(!path.exists());
+    }
+
+    fn helper_event(worker: &str, controller: &str) -> String {
+        event_json(&[
+            ("worker_session_ref", &format!("\"{worker}\"")),
+            ("controller_session_ref", &format!("\"{controller}\"")),
+            ("capture_source", "\"launcher_event:helper_agent\""),
+            ("pr_ref", "null"),
+        ])
+    }
+
+    /// [behaviour] The helper launcher's events are accepted as `helper-agent`,
+    /// with an attempt id or none, and never with a pull-request number.
+    #[test]
+    fn helper_agent_events_are_an_instrumented_launcher() {
+        let event = validate_event(&helper_event(WORKER, CONTROLLER)).expect("helper event");
+        assert_eq!(event.agent_kind, "helper-agent");
+        assert_eq!(event.workflow_ref.as_deref(), Some(ATTEMPT));
+        let no_attempt = event_json(&[
+            ("capture_source", "\"launcher_event:helper_agent\""),
+            ("workflow_ref", "null"),
+            ("pr_ref", "null"),
+        ]);
+        assert_eq!(validate_event(&no_attempt).unwrap().workflow_ref, None);
+        let with_pr = event_json(&[("capture_source", "\"launcher_event:helper_agent\"")]);
+        assert_eq!(validate_event(&with_pr), Err("bad_pr_ref"));
+    }
+
+    /// [behaviour] Intake files a processed event under its worker, and a
+    /// lookup opens only the demanded workers' files: the others are skipped
+    /// by name, with no open and no stat.
+    #[test]
+    fn processed_events_are_filed_by_worker_and_opened_only_on_demand() {
+        let home = TestHome::new();
+        let (first, second) = (worker(1), worker(2));
+        for id in [&first, &second] {
+            drop_event(&home.0, &helper_event(id, CONTROLLER), None);
+        }
+        let intake = LaunchEventInventory::refresh(&home.0);
+        complete(&intake, std::slice::from_ref(&first));
+        assert_eq!(intake.matching(&first).unwrap().agent_kind, "helper-agent");
+        let processed = home.0.join(DROP_ROOT_DIR).join(PROCESSED_SUBDIR);
+        let mut names = bounded_entries(&processed, 8)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        let expected = |id: &str| {
+            let event = validate_event(&helper_event(id, CONTROLLER)).unwrap();
+            format!("{id}.{}.json", event_digest(&event))
+        };
+        assert_eq!(names, [expected(&first), expected(&second)]);
+
+        let lookup = LaunchEventInventory::refresh(&home.0);
+        complete(&lookup, std::slice::from_ref(&second));
+        assert_eq!(lookup.matching(&second).unwrap().worker_session_ref, second);
+        let counts = lookup.lookup.lock().unwrap();
+        assert_eq!(counts.opened, 1, "only the demanded worker's file");
+        assert_eq!(counts.skipped_by_name, 1);
+    }
+
+    /// [behaviour] Two controllers claiming one worker still withhold both
+    /// when both claims are filed under that worker.
+    #[test]
+    fn filed_claims_from_two_controllers_withhold_the_worker() {
+        let home = TestHome::new();
+        let id = worker(7);
+        let other = "11111111-2222-3333-4444-555555555555";
+        for controller in [CONTROLLER, other] {
+            drop_event(&home.0, &helper_event(&id, controller), None);
+        }
+        let intake = LaunchEventInventory::refresh(&home.0);
+        let _ = complete(&intake, std::slice::from_ref(&id));
+        let lookup = LaunchEventInventory::refresh(&home.0);
+        complete(&lookup, std::slice::from_ref(&id));
+        assert!(lookup.matching(&id).is_none());
+        assert_eq!(lookup.lookup.lock().unwrap().ambiguous.len(), 1);
+    }
+
+    /// [behaviour] A filed name must lead with the event's own worker.
+    #[test]
+    fn a_filed_name_for_another_worker_is_a_mismatch() {
+        let home = temp_dir("launch-filed-mismatch");
+        fs::create_dir_all(&home).unwrap();
+        let raw = helper_event(WORKER, CONTROLLER);
+        let event = validate_event(&raw).unwrap();
+        let wrong = home.join(format!("{}.{}.json", worker(9), event_digest(&event)));
+        fs::write(&wrong, &raw).unwrap();
+        assert_eq!(read_and_validate(&wrong), Err("filename_mismatch"));
+        let right = home.join(format!("{WORKER}.{}.json", event_digest(&event)));
+        fs::write(&right, &raw).unwrap();
+        assert_eq!(read_and_validate(&right), Ok(event));
+        assert_eq!(
+            indexed_worker(&right),
+            Some(WORKER),
+            "a filed name names its worker"
+        );
+        assert_eq!(indexed_worker(&home.join("ab.json")), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// [behaviour] The processed sweep runs once per interval per drop root.
+    #[test]
+    fn the_processed_sweep_is_due_once_per_interval() {
+        let root = temp_dir("launch-sweep-gate");
+        assert!(processed_sweep_due(&root));
+        assert!(!processed_sweep_due(&root));
+        LAST_PROCESSED_SWEEP.lock().unwrap().remove(&root);
     }
 
     #[test]
@@ -1106,6 +1344,14 @@ mod tests {
         assert_eq!(
             redacted_label(Path::new(&format!("/tmp/{}.json", "ab".repeat(32)))),
             "abababababababab"
+        );
+        // A filed name's worker id is never logged, only its digest prefix.
+        assert_eq!(
+            redacted_label(Path::new(&format!(
+                "/tmp/{WORKER}.{}.json",
+                "cd".repeat(32)
+            ))),
+            "cdcdcdcdcdcdcdcd"
         );
     }
 }
@@ -1121,6 +1367,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for Lookup {
             complete,
             failed,
             loaded_at,
+            skipped_by_name,
+            opened,
+            swept,
             pending_stamp,
             processed_stamp,
         } = self;
@@ -1134,7 +1383,14 @@ impl crate::heap_layout_bound::HeapLayoutBound for Lookup {
         phase.heap_bound(c)?;
         complete.heap_bound(c)?;
         failed.heap_bound(c)?;
-        let _ = (loaded_at, pending_stamp, processed_stamp);
+        let _ = (
+            loaded_at,
+            skipped_by_name,
+            opened,
+            swept,
+            pending_stamp,
+            processed_stamp,
+        );
         c.add(0)
     }
 }

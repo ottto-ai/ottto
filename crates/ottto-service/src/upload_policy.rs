@@ -36,7 +36,7 @@ pub(crate) const HIDDEN_MCP_NAME: &str = "mcp__names-hidden__names-hidden";
 const CUSTOM: &str = "custom";
 
 /// Claude Code's own agent types and this daemon's collector-owned kinds.
-const PROVIDER_AGENT_KINDS: [&str; 9] = [
+const PROVIDER_AGENT_KINDS: [&str; 10] = [
     "general-purpose",
     "Explore",
     "Plan",
@@ -46,6 +46,7 @@ const PROVIDER_AGENT_KINDS: [&str; 9] = [
     "workflow-subagent",
     "claude_desktop_session",
     "codex_subagent",
+    "codex_agent_thread",
 ];
 /// Codex's built-in subagent roles.
 const PROVIDER_AGENT_ROLES: [&str; 3] = ["default", "explorer", "worker"];

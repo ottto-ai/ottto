@@ -464,6 +464,7 @@
     "original_identity.imported",
     "original_identity.provider_workspace_hash",
     "original_identity.source_created_at",
+    "scheduled_task",
     "spawned_from_desktop_session_id",
     "spawned_from_unresolved",
     "title",

@@ -348,8 +348,11 @@ fn native_launcher_first_import_then_idle_edit_conflict_and_removal_use_one_path
                 SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60),
             ))
             .unwrap();
-        // Cleanup invalidates its first directory fence. A stable replacement
-        // sweep can complete in this native page or the next ordinary scan.
+        // Expiry is the daily sweep's job; make the next lookup the one that
+        // sweeps. Cleanup invalidates its first directory fence. A stable
+        // replacement sweep can complete in this native page or the next
+        // ordinary scan.
+        crate::launch_events::forget_processed_sweep(&home.0);
         let (index, cleaning, _) = run(&home, source, &root, index, &cache);
         let (_, expired, _) = run(&home, source, &root, index, &cache);
         let corrections = cleaning

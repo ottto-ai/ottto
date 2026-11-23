@@ -84,6 +84,10 @@ impl TailSource for Claude {
                 acc.claude_desktop_spawn_lineage.is_some(),
             ),
             (
+                "claude_desktop_scheduled_task",
+                acc.claude_desktop_scheduled_task,
+            ),
+            (
                 "account_identifier_hash",
                 acc.account_identifier_hash.is_some(),
             ),
