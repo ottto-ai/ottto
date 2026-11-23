@@ -1643,27 +1643,20 @@ fn frame_drop_mid_job_returns_job_to_slot() {
     let fixture = ScanRoot::new(40);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 4096, 64, || {
-        let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
-            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
-        for _ in 0..10_000 {
-            if scan
-                .active_file
-                .as_ref()
-                .is_some_and(|active| active.cursor.is_some())
-            {
-                break;
-            }
-            match scan.step(None) {
-                OwnedSourceScanStep::Pending(next) => scan = next,
-                OwnedSourceScanStep::Complete { .. } => panic!("the job never started"),
-            }
-        }
+        let scan = step_to_leased_file(&fixture, &cache);
         assert!(!cache.cursor_slot_free(), "the frame holds the job");
         drop(scan);
         assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
         assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         assert!(cache.cursor_charge() > 0);
         assert_eq!(cache.cursor_reserved(), 0);
+        let resumed = step_to_leased_file(&fixture, &cache);
+        assert_eq!(counter(&cache, |c| c.jobs_resumed), 1);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        drop(resumed);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 2);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
         let mut index = ScanIndex::default();
         for _ in 0..32 {
             let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -1680,6 +1673,124 @@ fn frame_drop_mid_job_returns_job_to_slot() {
         );
         assert_eq!(counter(&cache, |c| c.jobs_started), 1);
         assert!(counter(&cache, |c| c.jobs_resumed) > 0);
+    });
+}
+
+fn step_to_leased_file(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> OwnedSourceScan {
+    let mut scan = codex_scan(fixture, ScanIndex::default(), NOW)
+        .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    for _ in 0..10_000 {
+        if scan
+            .active_file
+            .as_ref()
+            .is_some_and(|active| active.cursor.is_some())
+        {
+            assert!(scan.active_file.holds_lease_for_test());
+            assert!(!cache.cursor_slot_free());
+            return scan;
+        }
+        let OwnedSourceScanStep::Pending(next) = scan.step(None) else {
+            panic!("the job never entered the scan frame");
+        };
+        scan = next;
+    }
+    panic!("the job never entered the scan frame");
+}
+
+#[test]
+fn orphan_cursor_lease_is_lost_before_the_next_pending_return() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let mut scan = step_to_leased_file(&fixture, &cache);
+        let active = scan.active_file.take().expect("paired cursor parser");
+        let candidate = active.candidate.clone();
+        drop(active);
+        fs::remove_file(&candidate.path).unwrap();
+        scan.identified_candidates.push_front(candidate);
+        assert!(scan.active_file.holds_lease_for_test());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        let OwnedSourceScanStep::Pending(next) = scan.step(None) else {
+            panic!("the removed candidate must yield before page close");
+        };
+        assert!(!next.active_file.holds_lease_for_test());
+        assert!(cache.cursor_slot_free());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+    });
+}
+
+#[test]
+fn eof_launch_demand_carries_the_parser_until_the_lookup_fails() {
+    use crate::snapshots::launch_demand_tests::Home;
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    with_test_limits(fixture.len(SESSION) + 1, 1024, 64, || {
+        for fails in [false, true] {
+            let home = Home::new();
+            if fails {
+                home.block_pending_directory();
+            } else {
+                home.fill_retained_events(300);
+            }
+            let context = home.context();
+            let cache = Arc::new(SharedCache::default());
+            let mut scan = step_to_leased_file(&fixture, &cache);
+            let count = scan.scanned_file_count;
+            let before_unreadable = scan.census.unreadable_path_count;
+            for _ in 0..10_000 {
+                let OwnedSourceScanStep::Pending(next) = scan.step(Some(&context)) else {
+                    panic!("launch demand should yield at EOF");
+                };
+                assert!(next.active_file.holds_lease_for_test());
+                assert_eq!(next.scanned_file_count, count);
+                assert!(next.pending_finalization.is_empty());
+                assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+                assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                if fails && next.active_file.is_none() {
+                    assert_eq!(next.census.unreadable_path_count, before_unreadable + 1);
+                    assert!(
+                        !cache.cursor_slot_free(),
+                        "the returned frame still owns the lease"
+                    );
+                    let OwnedSourceScanStep::Complete { scan: closed, .. } =
+                        next.step(Some(&context))
+                    else {
+                        panic!("the orphan has no more active work");
+                    };
+                    assert_eq!(closed.scanned_file_count, count);
+                    assert!(cache.cursor_slot_free());
+                    assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+                    assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+                    break;
+                }
+                let active = next.active_file.as_ref().expect("parser retained");
+                if active.parser.reader.finished {
+                    assert!(!fails, "an unreadable launch store drops the parser");
+                    assert_eq!(next.census.unreadable_path_count, before_unreadable);
+                    assert_eq!(
+                        local_index_key(&active.candidate.path),
+                        local_index_key(&fixture.file(SESSION))
+                    );
+                    drop(next);
+                    assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 1);
+                    assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+                    break;
+                }
+                scan = next;
+            }
+            assert_eq!(
+                counter(&cache, |c| c.jobs_frame_returned),
+                u64::from(!fails)
+            );
+            assert_eq!(counter(&cache, |c| c.jobs_lost), u64::from(fails));
+        }
     });
 }
 
@@ -2567,18 +2678,7 @@ fn hinted_page_limited(
     hints: &[PathBuf],
     limit: usize,
 ) -> (ScanIndex, SourceScanResult) {
-    let mut scan = OwnedSourceScan::new(
-        SnapshotSource::Codex,
-        std::slice::from_ref(&fixture.root),
-        index,
-        collected_at,
-        BACKFILL_WINDOW_DAYS,
-        limit,
-        None,
-        hints,
-        false,
-    )
-    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    let mut scan = hinted_scan(fixture, index, cache, collected_at, hints, limit);
     loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -2590,6 +2690,28 @@ fn hinted_page_limited(
             }
         }
     }
+}
+
+fn hinted_scan(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    hints: &[PathBuf],
+    limit: usize,
+) -> OwnedSourceScan {
+    OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        limit,
+        None,
+        hints,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()))
 }
 
 /// G1/G2 at scan level. Three medium files grow on every page and are
@@ -3959,13 +4081,41 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.with_cursor(|cursor| cursor.headers.clear());
-        let (index, scan) = hinted_page(
+        let mut closing = hinted_scan(
             &fixture,
             index,
             &cache,
             &collected_at(1),
             std::slice::from_ref(&x_path),
+            10,
         );
+        // A remove hint already proved absent after reconciliation passed
+        // this key. Leave the old offered body for page-close retirement.
+        let removed = local_index_key(&fixture.file(SESSION));
+        let fingerprint = "removed-offer";
+        let mut entry = crate::snapshots::tests::manifest_index_entry(Some(fingerprint));
+        entry.last_upload_body_witness = Some("unacknowledged-body".into());
+        closing.index.files.insert(removed.clone(), entry);
+        closing
+            .index
+            .file_snapshot_fingerprints
+            .insert(removed.clone(), BTreeSet::from([fingerprint.to_owned()]));
+        closing.census.removed_index_keys.insert(removed.clone());
+        assert_eq!(closing.index.unacked_bodies([&removed]), vec![&removed]);
+        let ((index, scan), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| finish_page(closing));
+        let losses = |rows: Vec<serde_json::Value>| {
+            rows.iter()
+                .filter_map(|row| row["counts"]["unacked_usage_lost_to_deletion"]["files"].as_u64())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            losses(diagnostics),
+            1,
+            "the removed unacknowledged offer is lost once"
+        );
+        assert!(!index.files.contains_key(&removed));
+        assert!(!index.file_snapshot_fingerprints.contains_key(&removed));
         record(&scan);
         assert!(
             scan.census_complete,
@@ -3988,8 +4138,11 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         let mut closed = false;
         for page_number in 2..6 {
             assert_eq!(census_token(&index).as_deref(), Some(second.as_str()));
-            let (next, scan) =
-                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            let ((next, scan), diagnostics) = crate::local_resource_diagnostics::capture(|| {
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[])
+            });
+            assert_eq!(losses(diagnostics), 0, "carry cannot repeat retirement");
+            assert!(!next.files.contains_key(&removed));
             index = next;
             record(&scan);
             x_reads += scan
@@ -6442,9 +6595,15 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
         let mut published = None;
         for _ in 0..64 {
             let resumed = counter(&cache, |c| c.jobs_resumed);
+            let paused = counter(&cache, |c| c.jobs_paused);
             let (next, scan) = continuation_page(&fixture, index, &cache, |_| {});
             index = next;
             assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(counter(&cache, |c| c.jobs_paused), paused + 1);
+            assert_eq!(counter(&cache, |c| c.jobs_frame_returned), 0);
+            assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+            assert_eq!(cache.paused_members_for_test().unwrap().len(), 1);
+            assert_eq!(cache.cursor_reserved(), 0);
             assert_eq!(counter(&cache, |c| c.jobs_started), started);
             assert_eq!(group_replays(), before, "no group replay on continuation");
             assert!(pending_hint(&index, &other).is_some(), "still queued");
@@ -6455,7 +6614,15 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
             );
             assert!(scan.snapshots.is_empty());
             if parked_eof(&cache) {
+                let before = cache.counters_for_test();
                 let (_, ordinary) = page(&fixture, index, Some(Arc::clone(&cache)));
+                let after = cache.counters_for_test();
+                assert_eq!(after.jobs_resumed, before.jobs_resumed + 1);
+                assert_eq!(after.jobs_certified, before.jobs_certified + 1);
+                assert_eq!(after.jobs_paused, before.jobs_paused);
+                assert_eq!((after.jobs_frame_returned, after.jobs_lost), (0, 0));
+                assert_eq!(cache.cursor_charge(), 0);
+                assert_eq!(cache.cursor_reserved(), 0);
                 published = Some(ordinary);
                 break;
             }
@@ -6916,6 +7083,104 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             })
             .flatten();
         assert_eq!(accelerated, Some(true), "{now:?}");
+    });
+}
+
+thread_local! {
+    static START_PLANS: std::cell::RefCell<VecDeque<StartPlan>> = Default::default();
+    static START_REFUSAL: std::cell::Cell<Option<StartRefusal>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn fixture_start_plan() -> Option<StartPlan> {
+    START_PLANS.with(|plans| plans.borrow_mut().pop_front())
+}
+
+pub(super) fn fixture_start_refusal() -> Option<StartRefusal> {
+    START_REFUSAL.with(std::cell::Cell::take)
+}
+
+#[test]
+fn singleton_start_yields_with_the_expected_attempt_count_and_lease() {
+    use crate::codex_scan_diagnostics::UnreadableCause::{OpenRead, Reduction};
+    use StartPlan::{Cursor, Defer, Fenced};
+    use StartRefusal::{Busy, InputsUnavailable, Unstartable};
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    with_test_limits(2048, 1024, 64, || {
+        for (label, plans, refusal, charged, requeued, unreadable, cause) in [
+            ("early defer", vec![Defer], None, 0, true, 0, None),
+            ("early fence", vec![Fenced], None, 0, false, 0, None),
+            (
+                "late busy",
+                vec![Cursor, Cursor],
+                Some(Busy),
+                0,
+                true,
+                0,
+                None,
+            ),
+            ("late defer", vec![Cursor, Defer], None, 0, true, 0, None),
+            ("late fence", vec![Cursor, Fenced], None, 0, false, 0, None),
+            (
+                "unstartable",
+                vec![Cursor, Cursor],
+                Some(Unstartable),
+                1,
+                false,
+                1,
+                Some(OpenRead),
+            ),
+            (
+                "missing inputs",
+                vec![Cursor, Cursor],
+                Some(InputsUnavailable),
+                1,
+                false,
+                1,
+                Some(Reduction),
+            ),
+        ] {
+            let cache = Arc::new(SharedCache::default());
+            let mut scan = codex_scan(&fixture, ScanIndex::default(), NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            START_PLANS.with(|slot| slot.replace(plans.into()));
+            START_REFUSAL.with(|slot| slot.set(refusal));
+            for _ in 0..32 {
+                let OwnedSourceScanStep::Pending(next) = scan.step(None) else {
+                    panic!("{label}: closed before consuming the candidate");
+                };
+                scan = next;
+                if scan.identified_candidates.is_empty() {
+                    break;
+                }
+            }
+            assert!(scan.identified_candidates.is_empty(), "{label}");
+            assert!(START_PLANS.with(|slot| slot.borrow().is_empty()), "{label}");
+            assert!(START_REFUSAL.with(|slot| slot.get().is_none()), "{label}");
+            assert_eq!(scan.scanned_file_count, charged, "{label}");
+            assert_eq!(
+                pending_hint(&scan.index, &path).is_some(),
+                requeued,
+                "{label}"
+            );
+            assert_eq!(scan.census.unreadable_path_count, unreadable, "{label}");
+            let mut expected_counts = [0_u64; 8];
+            if let Some(cause) = cause {
+                expected_counts[cause as usize] = 1;
+            }
+            let causes = scan.census.unreadable_causes.projection(unreadable as u64);
+            let causes = serde_json::to_value(causes).unwrap();
+            assert_eq!(causes["counts"], json!(expected_counts), "{label}");
+            assert!(
+                scan.active_file.is_none() && !scan.active_file.holds_lease_for_test(),
+                "{label}"
+            );
+            assert!(cache.cursor_slot_free(), "{label}");
+        }
     });
 }
 

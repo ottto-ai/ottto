@@ -4649,12 +4649,28 @@ mod money_equivalence_tests {
             .collect::<Vec<_>>();
         let effects: Value =
             serde_json::from_slice(&test_effects::canonical(&cycle.effects)).unwrap();
+        let finish_error = cycle.finish.as_ref().err().map(|error| {
+            use crate::snapshot_sync::upload::{
+                is_shed_failure, is_upload_outage, snapshot_upload_error_class,
+                SnapshotEntityDeferred, SnapshotUploadErrorClass,
+            };
+            match snapshot_upload_error_class(error) {
+                Some(SnapshotUploadErrorClass::LocalState) => "local_state",
+                Some(SnapshotUploadErrorClass::BackendResponse) => "backend_response",
+                None if error.is::<SnapshotEntityDeferred>() => "entity_deferred",
+                None if error.is::<crate::source_rotation::LocalRefusal>() => "local_refusal",
+                None if error.is::<std::io::Error>() => "local_io",
+                None if is_shed_failure(error) => "shed",
+                None if is_upload_outage(error) => "upload_outage",
+                None => "other",
+            }
+        });
         let receipt = json!({"row":row,"cycle":number,"source":source.api_slug(),
             "steps":cycle.steps,"gate_c":cycle.gate,"finalized":finalized,"posts":normalized_posts,
             "effects":effects,"saved":{"generation":cycle.index.generation,
                 "fingerprints":cycle.index.current_snapshot_fingerprints(),
                 "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
-            "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed,
+            "finish_ok":cycle.finish.is_ok(),"finish_error":finish_error,"parser_bytes":cycle.consumed,
             "io":{"cheap_checks":cycle.io.cheap_checks,"anchor_reads":cycle.io.anchor_reads,
                 "other_reads":cycle.io.other_reads,"parse_activity":cycle.io.parse_activity,
                 "quiet_anchor_window":cycle.quiet_anchor_window},

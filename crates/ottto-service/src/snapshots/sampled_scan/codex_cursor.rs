@@ -3399,6 +3399,10 @@ impl SharedCache {
         census_member: bool,
         pace: Option<PaceProbe<'_>>,
     ) -> StartPlan {
+        #[cfg(test)]
+        if let Some(plan) = tests::fixture_start_plan() {
+            return plan;
+        }
         let plan = page.plan(limits, expected, slot_free, cursor_enabled);
         // Only a returned budget Defer counts (not busy, rotation, pace or fence).
         let spent = plan == StartPlan::Defer && page.budget_spent(limits, expected);
@@ -3476,6 +3480,10 @@ impl SharedCache {
         census_trusted: bool,
         index: &ScanIndex,
     ) -> std::result::Result<CursorLease, StartRefusal> {
+        #[cfg(test)]
+        if let Some(refusal) = tests::fixture_start_refusal() {
+            return Err(refusal);
+        }
         let key = local_index_key(&job.candidate.path);
         let waiter = rotation_key(&namespace.0, &key);
         let refuse = |refusal: StartRefusal| {
