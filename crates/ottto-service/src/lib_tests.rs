@@ -3556,13 +3556,17 @@ mod tests {
     }
 
     fn paused_usage_checks_status(paused: bool) -> DaemonStatus {
+        paused_usage_checks_status_for(usize::from(paused))
+    }
+
+    fn paused_usage_checks_status_for(accounts: usize) -> DaemonStatus {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut snapshot = available_agent_status(SourceKind::ClaudeCode, "2026-10-03T06:46:07Z");
-        if paused {
+        for _ in 0..accounts {
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                 agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
                 AgentDiagnosticSeverity::Warning,
-                "Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z. Last readings stay shown until then.",
+                "Claude usage checks paused for this account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z. Last readings stay shown until then.",
             ));
         }
         {
@@ -3584,7 +3588,7 @@ mod tests {
         assert_eq!(problem.title, "Claude usage checks paused");
         assert!(problem
             .detail
-            .starts_with("Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z."));
+            .starts_with("Claude usage checks paused for this account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z."));
         assert!(!problem.retryable);
         assert!(source.recommended_actions.is_empty());
         // Existing problem code on the wire, so strict older decoders keep working.
@@ -3604,6 +3608,19 @@ mod tests {
         let healthy_canonical = healthy.canonical_health.as_ref().expect("canonical");
         assert_eq!(canonical.overall.state, healthy_canonical.overall.state);
         assert_eq!(canonical.blockers.len(), healthy_canonical.blockers.len());
+    }
+
+    /// [behaviour] One paused-usage diagnostic per account still makes one
+    /// source problem; with several accounts it counts them.
+    #[test]
+    fn paused_usage_checks_for_two_accounts_make_one_counted_problem() {
+        let status = paused_usage_checks_status_for(2);
+        let problems = &status.sources[0].problems;
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            problems[0].detail,
+            "Claude usage checks paused for 2 accounts; Ottto checks each again automatically. Last readings stay shown until then."
+        );
     }
 
     #[test]

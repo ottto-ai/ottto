@@ -1074,13 +1074,26 @@ pub(crate) fn usage_checks_paused_problem(snapshot: &AgentStatusSnapshot) -> Opt
     if snapshot.source != SourceKind::ClaudeCode {
         return None;
     }
-    let diagnostic = snapshot.diagnostics.iter().find(|diagnostic| {
-        diagnostic.code == agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE
-    })?;
+    // One diagnostic per paused account; the problem stays one per source.
+    let paused = snapshot
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code == agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE
+        })
+        .collect::<Vec<_>>();
+    let detail = match paused.as_slice() {
+        [] => return None,
+        [only] => only.message.clone(),
+        many => format!(
+            "Claude usage checks paused for {} accounts; Ottto checks each again automatically. Last readings stay shown until then.",
+            many.len()
+        ),
+    };
     Some(HealthProblem {
         code: StableProblemCode::Unknown,
         title: USAGE_CHECKS_PAUSED_TITLE.to_string(),
-        detail: diagnostic.message.clone(),
+        detail,
         // Clears on Ottto's own schedule; a manual retry must not force a
         // provider check.
         retryable: false,

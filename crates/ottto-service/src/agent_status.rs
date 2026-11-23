@@ -77,6 +77,8 @@ mod types;
 use claude::collect::apply_claude_statusline_context_provenance;
 use claude::collect::apply_claude_token_owner;
 #[cfg(test)]
+use claude::collect::bind_claude_relogin_warning;
+#[cfg(test)]
 use claude::collect::claude_alternative_auth;
 pub(crate) use claude::collect::claude_alternative_auth_layers;
 pub(crate) use claude::collect::claude_refresher_skip_reason;
@@ -304,7 +306,7 @@ use claude::selection::claude_stale_saved_slot_states;
 #[cfg(test)]
 use claude::selection::claude_uploaded_candidate_snapshot;
 #[cfg(test)]
-use claude::selection::claude_usage_checks_paused_diagnostic;
+use claude::selection::claude_usage_checks_paused_diagnostics;
 use claude::selection::collect_claude_status_snapshots;
 #[cfg(test)]
 use claude::selection::strip_slot_owned_plan_observations;

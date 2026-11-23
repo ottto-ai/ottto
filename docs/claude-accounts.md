@@ -112,6 +112,12 @@ only older readings remain) and no other credential still serves that account,
 "Claude usage checks paused" that names how many accounts are affected and the
 next automatic check. The source stays `healthy`, the problem asks for no
 sign-in, and Ottto keeps its own schedule; nothing forces an earlier check.
+Each paused account also gets its own `claude_usage_checks_paused` diagnostic
+on the local source-health copy, carrying that account's
+`account_identifier_hash` and `organization_identifier_hash` so the app can
+show it on the right row. When the provider answered a usage read with a
+retry time (a rate-limit hold), that diagnostic says the provider asked Ottto
+to wait and sets `retry_after` to that time.
 
 The `claude_quota_access_state_v1` capability marks daemon versions that know
 this contract. On an older daemon, or for a desktop/status-line observation
@@ -388,7 +394,9 @@ then marked stale.
 `refreshTokenExpiresAt` (about 28 days after a browser sign-in) is an absolute
 login horizon. Three days and one day before it, the slot (and the default
 login) report `relogin_approaching`; once elapsed it reports `needs_login` and
-waits for the customer to sign in again.
+waits for the customer to sign in again. The default login's
+`claude_relogin_approaching` diagnostic carries that login's account and
+organization hashes when its identity is proven.
 
 ### Background limit refresh
 
