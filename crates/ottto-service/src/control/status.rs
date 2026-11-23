@@ -792,13 +792,32 @@ fn load_persisted_machine_icon() -> Option<(String, String)> {
 }
 
 pub(super) fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
+    service_owner_state_with(
+        client_owner,
+        crate::macos_service::inspect_launch_agent_owner,
+    )
+}
+
+/// The ordinary status request's owner state: the launchd job probe may be
+/// reused for up to 60 s while launchd runs this process as the job.
+pub(super) fn cached_service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
+    service_owner_state_with(
+        client_owner,
+        crate::macos_service::inspect_launch_agent_owner_for_status,
+    )
+}
+
+fn service_owner_state_with(
+    client_owner: InstallOwner,
+    inspect: fn(
+        &std::path::Path,
+        Option<&std::path::Path>,
+    ) -> crate::macos_service::LaunchAgentOwnerState,
+) -> ServiceOwnerState {
     let daemon_owner = detect_install_owner();
     let owner_state = local_lifecycle_home_dir().ok().map(|home| {
         let plist_path = crate::macos_service::launch_agent_path(&home);
-        crate::macos_service::inspect_launch_agent_owner(
-            &plist_path,
-            std::env::current_exe().ok().as_deref(),
-        )
+        inspect(&plist_path, std::env::current_exe().ok().as_deref())
     });
     let (plist_owner, loaded_owner, plist_exists, launchd_loaded, mut owner_drift) =
         if let Some(owner_state) = owner_state {

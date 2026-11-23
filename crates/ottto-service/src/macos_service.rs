@@ -10,6 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod status_probe;
+
 pub const LAUNCH_AGENT_LABEL: &str = MACOS_LAUNCH_AGENT_LABEL;
 pub const MACH_SERVICE_NAME: &str = "net.ottto.service.xpc";
 /// Env var read by the daemon (see `control::companion_code_requirement`) to
@@ -162,6 +164,40 @@ pub fn inspect_launch_agent_owner(
     )
 }
 
+/// [`inspect_launch_agent_owner`] for the ordinary status request only: the
+/// plist is read now, the launchd job probe may be up to 60 s old (see
+/// `status_probe`). Repair, migration and install paths use the uncached form.
+pub fn inspect_launch_agent_owner_for_status(
+    plist_path: &Path,
+    expected_executable_path: Option<&Path>,
+) -> LaunchAgentOwnerState {
+    let (plist_exists, plist_executable_path, plist_error) =
+        read_launch_agent_program_path(plist_path);
+    let loaded = STATUS_PROBE.loaded_program(std::time::Instant::now, loaded_launch_agent_job);
+    inspect_launch_agent_owner_with_loaded_program(
+        plist_path,
+        expected_executable_path,
+        plist_exists,
+        plist_executable_path,
+        plist_error,
+        loaded,
+    )
+}
+
+/// Called after this process bootstraps, boots out or kickstarts the job.
+pub fn invalidate_status_launchd_probe() {
+    STATUS_PROBE.invalidate();
+}
+
+/// Called when shutdown begins (the SIGTERM handler): status requests then
+/// probe launchd afresh, because launchd may already run another job.
+/// Async-signal-safe: one atomic store.
+pub fn begin_status_launchd_probe_shutdown() {
+    STATUS_PROBE.begin_shutdown();
+}
+
+static STATUS_PROBE: status_probe::ProbeCache = status_probe::ProbeCache::new();
+
 pub fn inspect_launch_agent_owner_with_loaded_program(
     plist_path: &Path,
     expected_executable_path: Option<&Path>,
@@ -258,20 +294,61 @@ fn parse_launchctl_prefixed_path(output: &str, prefix: &str) -> Option<PathBuf> 
 }
 
 pub fn loaded_launch_agent_program_path() -> Option<PathBuf> {
+    loaded_launch_agent_job().program
+}
+
+fn loaded_launch_agent_job() -> status_probe::JobProbe {
+    let body = launchctl_print_job();
+    status_probe::JobProbe {
+        program: body.as_deref().and_then(parse_launchctl_program_path),
+        runs_this_process: body.as_deref().and_then(parse_launchctl_pid)
+            == Some(std::process::id()),
+    }
+}
+
+/// `launchctl print` of the job; counted as a `launchctl` child start.
+fn launchctl_print_job() -> Option<String> {
+    use std::io::Read;
     if std::env::consts::OS != "macos" {
         return None;
     }
-    let output = Command::new("launchctl")
+    let mut command = Command::new("launchctl");
+    command
         .arg("print")
         .arg(macos_launch_agent_target())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command).ok()?;
+    let mut body = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .map(|mut stdout| stdout.read_to_end(&mut body));
+    let status = child.wait().ok()?;
+    if !status.success() || !matches!(read, Some(Ok(_))) {
         return None;
     }
-    let body = String::from_utf8(output.stdout).ok()?;
-    parse_launchctl_program_path(&body)
+    String::from_utf8(body).ok()
+}
+
+/// The job's running pid, from the `pid = <n>` line directly inside the job
+/// block; a `pid` inside a nested block (an endpoint, a coalition) is not it.
+fn parse_launchctl_pid(output: &str) -> Option<u32> {
+    let mut depth = 0usize;
+    for line in output.lines() {
+        let line = line.trim();
+        if line.ends_with('{') {
+            depth += 1;
+        } else if line.starts_with('}') {
+            depth = depth.saturating_sub(1);
+        } else if depth == 1 {
+            if let Some(value) = line.strip_prefix("pid = ") {
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
 }
 
 pub fn install_owner_label(owner: InstallOwner) -> &'static str {
@@ -610,6 +687,30 @@ mod tests {
             parse_launchctl_program_path(output),
             Some(PathBuf::from("/opt/homebrew/opt/ottto/bin/ottto-service"))
         );
+    }
+
+    /// [behaviour] The job's pid is read from its `pid = <n>` line; a job
+    /// with no running process has none.
+    #[test]
+    fn parses_loaded_launchd_job_pid() {
+        let running = "gui/501/net.ottto.service = {\n\tstate = running\n\tprogram = /x/ottto-service\n\tpid = 14828\n}\n";
+        assert_eq!(parse_launchctl_pid(running), Some(14828));
+        let waiting = "gui/501/net.ottto.service = {\n\tstate = not running\n\tprogram = /x/ottto-service\n}\n";
+        assert_eq!(parse_launchctl_pid(waiting), None);
+    }
+
+    /// [behaviour] Only the job's own `pid` line counts: one in a nested
+    /// block, before or without the job's line, is ignored.
+    #[test]
+    fn launchd_job_pid_ignores_nested_blocks() {
+        let nested = "\t\"x\" = {\n\t\t\tpid = 999\n\t\t}\n";
+        let job = |own_pid: &str| {
+            format!(
+                "gui/501/net.ottto.service = {{\n\tstate = running\n\tendpoints = {{\n\t{nested}\t}}\n{own_pid}\tresource coalition = {{\n\t\tpid = 777\n\t}}\n}}\n"
+            )
+        };
+        assert_eq!(parse_launchctl_pid(&job("\tpid = 14828\n")), Some(14828));
+        assert_eq!(parse_launchctl_pid(&job("")), None);
     }
 
     #[test]
