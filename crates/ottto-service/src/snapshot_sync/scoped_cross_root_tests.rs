@@ -196,6 +196,7 @@ fn page_over(
         stats: Default::default(),
         delivered: None,
         upload_policy: SnapshotUploadPolicy::default(),
+        cutoff_candidates: Vec::new(),
     }
 }
 

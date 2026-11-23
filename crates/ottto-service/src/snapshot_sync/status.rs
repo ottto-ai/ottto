@@ -863,6 +863,7 @@ pub(super) fn collector_status_request(
         last_snapshot_superseded_terminal_count: status.counts.snapshot_superseded_terminal_count,
         last_backfill_window_days: status.counts.backfill_window_days,
         first_read_cutoff: None,
+        tier_ready_cutoff: None,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
@@ -1043,8 +1044,8 @@ pub(super) fn report_status_with_fresh_relay_token(
         status,
         census_residue_status_admitted,
     )?;
-    request.first_read_cutoff = load_backfill_state(support_dir)
-        .first_read_cutoff(&destination_namespace, source.api_slug());
+    (request.first_read_cutoff, request.tier_ready_cutoff) = load_backfill_state(support_dir)
+        .first_read_cutoffs(&destination_namespace, source.api_slug());
     small_source_upload(source, || client.report_status(&relay_token, &request))?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -1076,10 +1077,15 @@ pub(super) fn withdraw_and_report_policy_stop(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let source = status.source;
-    withdraw_source_manifest(
-        &snapshot_upload_destination_namespace(device, device_secret),
-        source,
-    );
+    let destination = snapshot_upload_destination_namespace(device, device_secret);
+    withdraw_source_manifest(&destination, source);
+    // A stopped source never holds its destination's recency tiers.
+    if crate::backfill::record_first_read_tier_stop(support_dir, source, &destination).is_err() {
+        eprintln!(
+            "local snapshot backfill tier save deferred for {}",
+            source.api_slug()
+        );
+    }
     let _ =
         crate::active_sessions::clear_active_sessions(support_dir, source, status.scan_started_at);
     report_status_with_fresh_relay_token(
@@ -1172,6 +1178,7 @@ pub(super) fn report_checkin_status(
         last_snapshot_superseded_terminal_count: 0,
         last_backfill_window_days: receipt_window_days,
         first_read_cutoff: None,
+        tier_ready_cutoff: None,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,

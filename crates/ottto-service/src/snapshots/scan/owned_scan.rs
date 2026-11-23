@@ -702,10 +702,22 @@ impl OwnedSourceScan {
             );
         }
         let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
+        #[cfg(test)]
+        trace_projection::permute_candidates(index.traversal.as_mut().expect("traversal"));
+        let tier_gate = TierGate::new(source, index);
         let mut selection_traversal = index.traversal.take().expect("traversal initialized");
         let traversal = &mut selection_traversal;
-        #[cfg(test)]
-        trace_projection::permute_candidates(traversal);
+        // Recency tier: deferred first reads sit out this selection and return
+        // behind the queue in their order.
+        let tier_deferred = if index.first_read_tier_cutoff.is_some() {
+            let (deferred, selectable) = std::mem::take(&mut traversal.pending_candidates)
+                .into_iter()
+                .partition::<VecDeque<_>, _>(|candidate| tier_gate.defers(&candidate.path));
+            traversal.pending_candidates = selectable;
+            deferred
+        } else {
+            VecDeque::new()
+        };
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
         let mut pending_paths = scoped_prefix_paths;
@@ -946,6 +958,53 @@ impl OwnedSourceScan {
             pending_paths.extend(members);
             pending_paths.extend(rereads);
         }
+        traversal.pending_candidates.extend(tier_deferred);
+        let (family, folder) =
+            tier_gate.selected_pulls(pending_paths.iter().map(|pending| pending.path.as_path()));
+        // A pulled holder's page re-reads the copies that pulled it: the copy
+        // decision then proves the holder in-page, and both bodies go up
+        // together.
+        let copies =
+            tier_gate.copies_of_pulled(pending_paths.iter().map(|pending| pending.path.as_path()));
+        for copy in copies {
+            let Some(scan_root) = traversal
+                .scan_roots
+                .iter()
+                .find(|root| copy.starts_with(root))
+                .cloned()
+            else {
+                continue;
+            };
+            let mut reread = ScanTraversalPath {
+                scan_root,
+                path: copy,
+                census_member: false,
+                watcher_hint: false,
+            };
+            traversal.pending_candidates.retain(|queued| {
+                if queued.path != reread.path {
+                    return true;
+                }
+                reread.census_member |= queued.census_member;
+                reread.watcher_hint |= queued.watcher_hint;
+                false
+            });
+            if pending_paths
+                .iter()
+                .all(|pending| pending.path != reread.path)
+            {
+                index
+                    .claude_copy_removals
+                    .mark(claude_money_birth_store::location_key(&local_index_key(
+                        &reread.path,
+                    )));
+                pending_paths.push(reread);
+            }
+        }
+        crate::local_resource_diagnostics::pass_outcomes(|outcomes| {
+            outcomes.tier_pulled_family += family;
+            outcomes.tier_pulled_folder += folder;
+        });
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let causes = traversal.counts.causes.page(census_unix_seconds);
         index.traversal = Some(selection_traversal);

@@ -453,6 +453,8 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
     into.claude_no_list_policy = from.claude_no_list_policy;
+    into.first_read_tier_cutoff = from.first_read_tier_cutoff;
+    into.backfill_cutoff_nanos = from.backfill_cutoff_nanos;
     into.claude_history_emission = from.claude_history_emission.clone();
     into.withheld_memo = from.withheld_memo.clone();
 }

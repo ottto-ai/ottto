@@ -147,6 +147,8 @@ macro_rules! scan_index_fields {
             claude_history_emission => Misc (runtime none) [] side,
             first_read_pending => Misc (runtime none) [] side,
             first_import_pending => Misc (runtime none) [] side,
+            first_read_tier_cutoff => Misc (runtime none) [] side,
+            backfill_cutoff_nanos => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,

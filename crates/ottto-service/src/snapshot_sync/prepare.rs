@@ -638,6 +638,20 @@ pub(super) fn prepare_sync_source(
             pulse.prepare_outcome(result.as_ref().err());
         }
     });
+    if result.is_err() {
+        // A failed pass never holds the others' recency tier; it keeps its
+        // owed work and rejoins when a pass records its census.
+        let destination = snapshot_upload_destination_namespace(device, device_secret);
+        if let Err(error) =
+            crate::backfill::record_first_read_tier_stop(support_dir, source, &destination)
+        {
+            eprintln!(
+                "local snapshot backfill tier save deferred for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+        }
+    }
     let counts = diagnostics.finish();
     if source == SnapshotSource::ClaudeCode {
         crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
@@ -934,6 +948,10 @@ pub(super) fn prepare_sync_source_inner(
     if source == SnapshotSource::ClaudeCode {
         daemon.transcript_cache.bind_withheld(&mut index);
     }
+    // Every save of this pass, the recovery's first, reconciles copy
+    // ownership under the claim cutoff finish applies.
+    let backfill_state = load_backfill_state(support_dir);
+    index.backfill_cutoff_nanos = backfill_state.backfill_cutoff_nanos();
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &index_path,
@@ -973,7 +991,6 @@ pub(super) fn prepare_sync_source_inner(
         ),
         upload_policy,
     );
-    let backfill_state = load_backfill_state(support_dir);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.
     let prior_claude_history = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -1017,6 +1034,14 @@ pub(super) fn prepare_sync_source_inner(
             &backfill_state,
             &upload_destination_namespace,
         );
+    // Recency tier: the current tier gates this pass's first reads (order only).
+    let tier = backfill_pending
+        .then(|| backfill_state.first_read_tier(&upload_destination_namespace, source))
+        .flatten();
+    index.first_read_tier_cutoff = tier.map(|(_, cutoff)| cutoff);
+    crate::local_resource_diagnostics::pass_outcomes(|outcomes| {
+        outcomes.first_read_tier_days = tier.map(|(days, _)| days);
+    });
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
