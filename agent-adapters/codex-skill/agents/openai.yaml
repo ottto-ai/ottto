@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ottto"
+  short_description: "Manage Ottto local setup, verification, repair, and diagnostics through the JSON CLI."
+  default_prompt: "Check Ottto local setup and tell me the next action."

@@ -1,0 +1,5192 @@
+//! Content-free observations in the existing local service log, never wire data.
+//! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
+use serde::{ser::SerializeMap, Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{Relaxed, SeqCst},
+};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) mod cli_children;
+pub(crate) mod jsonl;
+
+/// One lifecycle module's cumulative process totals: `Counts` (one `u64` per
+/// field), `Event`, saturating `add`/`record`, `Counts::totals` and the
+/// test-only `observe` seam.
+macro_rules! lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [] $($field: $event),+);
+    };
+    (@core [$($hook:path)?] $($field:ident: $event:ident),+) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
+        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event { $($event),+ }
+        const COUNT: usize = [$(stringify!($field)),+].len();
+        // Fixed static instrumentation only: no owner/cache graph fields,
+        // allocations, additional locks, identifiers or retained history.
+        static TOTALS: [::std::sync::atomic::AtomicU64; COUNT] =
+            [const { ::std::sync::atomic::AtomicU64::new(0) }; COUNT];
+        impl Counts {
+            fn from_array(values: [u64; COUNT]) -> Self {
+                Self { $($field: values[Event::$event as usize]),+ }
+            }
+            fn totals() -> Self {
+                use ::std::sync::atomic::Ordering::Relaxed;
+                Self::from_array(::std::array::from_fn(|i| TOTALS[i].load(Relaxed)))
+            }
+            #[cfg(test)]
+            pub(super) fn maximum() -> Self { Self { $($field: u64::MAX),+ } }
+        }
+        pub(crate) fn add(event: Event, amount: u64) {
+            use ::std::sync::atomic::Ordering::Relaxed;
+            $($hook(event, amount);)?
+            let _ = TOTALS[event as usize].try_update(Relaxed, Relaxed, |n| {
+                Some(n.saturating_add(amount))
+            });
+            #[cfg(test)]
+            TEST_EVENTS.with(|events| {
+                if let Some(mut values) = events.get() {
+                    values[event as usize] = values[event as usize].saturating_add(amount);
+                    events.set(Some(values));
+                }
+            });
+        }
+        pub(crate) fn record(event: Event) {
+            add(event, 1);
+        }
+        #[cfg(test)]
+        thread_local! {
+            static TEST_EVENTS: std::cell::Cell<Option<[u64; COUNT]>> = const { std::cell::Cell::new(None) };
+        }
+        /// Isolates assertions from concurrent fixtures without resetting or
+        /// changing the production process totals. No production observer or callback.
+        #[cfg(test)]
+        pub(crate) fn observe<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+            struct Reset(Option<[u64; COUNT]>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    TEST_EVENTS.with(|events| events.set(self.0));
+                }
+            }
+            let reset = Reset(TEST_EVENTS.with(|events| events.replace(Some([0; COUNT]))));
+            let value = f();
+            let counts = TEST_EVENTS.with(|events| Counts::from_array(events.get().unwrap()));
+            drop(reset);
+            (value, counts)
+        }
+    };
+}
+/// `lifetime_counters!` plus `Sparse` and `Counts::{add, merge, is_empty}`;
+/// each `add` first feeds `claude_reread::cache_event` (cache_lifecycle).
+macro_rules! sparse_lifetime_counters {
+    ($($field:ident: $event:ident),+ $(,)?) => {
+        lifetime_counters!(@core [super::claude_reread::cache_event] $($field: $event),+);
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl ::serde::Serialize for Sparse {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use ::serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
+        impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
+        }
+    };
+}
+/// A process-wide diagnostic static behind `$with`. Each test thread gets its
+/// own copy, so a fixture never reads or drains another test's counts.
+macro_rules! process_static {
+    ($(#[$attr:meta])* $vis:vis fn $with:ident: $ty:ty = $init:expr_2021) => {
+        $(#[$attr])*
+        $vis fn $with<T>(f: impl FnOnce(&$ty) -> T) -> T {
+            #[cfg(not(test))]
+            {
+                static STATE: $ty = $init;
+                f(&STATE)
+            }
+            #[cfg(test)]
+            {
+                thread_local! { static STATE: $ty = const { $init }; }
+                STATE.with(f)
+            }
+        }
+    };
+}
+pub(crate) use process_static;
+/// The Codex cursor's logged event counters, in log key order: the one name
+/// list behind `CodexCursorEvents` (fields and keys) and the cursor's RAM
+/// `Counters` and their projection. Expands to `$callback! { fields }`.
+macro_rules! codex_cursor_events {
+    ($callback:ident) => {
+        $callback! {
+            jobs_started,
+            jobs_paused,
+            jobs_resumed,
+            /// Published with a sealed-prefix certificate (after `finish`).
+            jobs_certified,
+            /// Lossy with intact samples, finished uncertified (after `finish`).
+            /// Publication then follows main's completeness rule: retryable loss
+            /// (a malformed or invalid line) publishes nothing and is not indexed.
+            jobs_uncertified,
+            /// Restarted after a necessary invalidation; nothing committed.
+            jobs_invalidated,
+            /// Ended as strict `MemberChanged` debt after repeated invalidations.
+            jobs_member_changed,
+            /// Ended as strict `JoinStateBound` debt: the job did not fit the state
+            /// budget even after releasing retained copies.
+            jobs_state_bound,
+            jobs_lost,
+            /// Evidence unavailable at start, resume or emission (K9): deferred as
+            /// `InProgress`, never counted as a member change.
+            jobs_deferred_inputs,
+            /// Start refused because the held file's stamp could not be read.
+            jobs_start_unstartable,
+            /// A tail reached its audit deadline before commit: restarted as
+            /// the full audit, uncounted.
+            jobs_audit_restarted,
+            /// Committed, then the native finish refused publication.
+            jobs_finish_failed,
+            /// A dropped scan frame returned its intact job to the slot (K12).
+            jobs_frame_returned,
+            deferred,
+            /// A large file waited because another is ahead in rotation (K7).
+            deferred_rotation,
+            /// A large read after this generation's completed attempt, left for the
+            /// next generation (K7 fence).
+            deferred_next_generation,
+            /// A resume found a live job of another namespace in the slot (K10).
+            namespace_busy,
+            cursor_disabled_unsupported_layout,
+            /// Certified at or after its audit deadline: the debt stays staged.
+            audit_overdue,
+            /// A completion on a file that did not grow withheld an unterminated
+            /// final record (N2): debt staged, the record left to main's EOF path.
+            sealed_fragment_withheld,
+            /// A completion at genuine unchanged EOF applied its withheld final
+            /// record with main's trailing-line rule (strict finish identity).
+            /// Counted only once its `finish` succeeded.
+            eof_record_applied,
+            /// A paused job ended because its path no longer named the held
+            /// object or its evidence stayed unavailable for `UNAVAILABLE_RESUMES`
+            /// (3 consecutive resume pages).
+            jobs_unavailable_ended,
+            memo_hits,
+            memo_records,
+            parked_hits,
+            /// Durable header-fact lookups the Codex header inventory tried.
+            header_durable_lookups,
+            /// Header facts reused without a native header read.
+            header_reuse_hits,
+            /// Header bytes those reuses did not read.
+            header_bytes_avoided,
+        }
+    };
+}
+pub(crate) use codex_cursor_events;
+
+pub(crate) mod cache_lifecycle;
+pub(crate) mod change_reason;
+pub(crate) mod claude_absence;
+pub(crate) mod claude_contract;
+pub(crate) mod claude_reread;
+pub(crate) mod codex_memo_lifecycle;
+mod footprint;
+pub(crate) mod rearm_cause;
+pub(crate) mod rest_heap;
+#[cfg(unix)]
+mod shutdown;
+#[cfg(unix)]
+mod stderr_rotation;
+
+process_static!(fn with_claude_identity_over_cap: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]);
+
+/// Append-only reason labels, cumulative per process (not distinct sessions).
+/// Records each attempted over-cap body before its identities are stripped.
+pub(crate) fn claude_identity_over_cap(
+    reasons: &std::collections::BTreeSet<crate::snapshots::claude_request_identity::OverCap>,
+    item_bytes: usize,
+    components: Option<&ClaudeIdentityOverCapBytes>,
+) {
+    use crate::snapshots::claude_request_identity::OverCap;
+    const LABELS: [&str; 8] = [
+        "evidence_entries",
+        "authority_keys",
+        "parts_per_row",
+        "parts_per_item",
+        "rows",
+        "bytes",
+        "near_cap",
+        "identity_over_cap_held",
+    ];
+    let record = |counters: &[AtomicU64; 8]| {
+        for reason in reasons {
+            let index = match reason {
+                OverCap::EvidenceEntries => 0,
+                OverCap::AuthorityKeys => 1,
+                OverCap::PartsPerRow => 2,
+                OverCap::PartsPerItem => 3,
+                OverCap::Rows => 4,
+                OverCap::Bytes => 5,
+                OverCap::NearCap => 6,
+                OverCap::IdentityHeld => 7,
+            };
+            let _ = counters[index].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        }
+        #[derive(Serialize)]
+        struct Counts<'a> {
+            claude_request_identity_over_cap: BTreeMap<&'static str, u64>,
+            claude_request_identity_last_over_cap_item_bytes: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            claude_request_identity_last_over_cap_components:
+                Option<&'a ClaudeIdentityOverCapBytes>,
+        }
+        traversal_point(
+            "claude_request_identity_over_cap",
+            "claude_code",
+            &Counts {
+                claude_request_identity_over_cap: LABELS
+                    .into_iter()
+                    .zip(counters.iter().map(|n| n.load(Relaxed)))
+                    .filter(|(label, count)| {
+                        !matches!(*label, "near_cap" | "identity_over_cap_held") || *count != 0
+                    })
+                    .collect(),
+                claude_request_identity_last_over_cap_item_bytes: item_bytes,
+                claude_request_identity_last_over_cap_components: components,
+            },
+        );
+    };
+    with_claude_identity_over_cap(record);
+}
+
+#[cfg(test)]
+pub(crate) fn identity_over_cap_counts_for_test() -> [u64; 8] {
+    with_claude_identity_over_cap(|counts| std::array::from_fn(|i| counts[i].load(Relaxed)))
+}
+
+/// Wire bytes of the last over-cap tagged body by component, measured before
+/// its display leaves are shed; `after_shed` is what the tag selector then
+/// sees. Counts and an 8-hex entity digest only.
+#[derive(Serialize)]
+pub(crate) struct ClaudeIdentityOverCapBytes {
+    pub(crate) entity: String,
+    pub(crate) item: usize,
+    pub(crate) context_curve: usize,
+    pub(crate) cache_observations: usize,
+    pub(crate) identity: usize,
+    pub(crate) usage_buckets: usize,
+    pub(crate) rest: usize,
+    pub(crate) after_shed: usize,
+}
+
+/// Live compressed-input refusal causes. Numeric slots remain frozen;
+/// retired causes have no producers and their old serialized values stay inert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
+pub(crate) enum CodexZstCause {
+    #[serde(rename = "CompressedReplayNotAuthorized")]
+    ReplayNotAuthorized = 0,
+    #[serde(rename = "CompressedGroupProbeUnsupported")]
+    GroupProbeUnsupported = 4,
+    #[serde(rename = "CompressedGroupReadUnsupported")]
+    GroupReadUnsupported = 5,
+    #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
+    PhysicalOffsetUnsupported = 7,
+    #[serde(rename = "CompressedAdmissionRefused")]
+    AdmissionRefused = 8,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed = 9,
+    #[serde(rename = "CompressedDecodedOverLimit")]
+    DecodedOverLimit = 12,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded = 15,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded = 16,
+    #[doc(hidden)]
+    #[serde(skip)]
+    __Count = 20,
+}
+impl std::fmt::Display for CodexZstCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for CodexZstCause {}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
+/// Live counted causes; holes retain the old numeric slots.
+const CODEX_ZST_ALL: [CodexZstCause; 9] = [
+    CodexZstCause::ReplayNotAuthorized,
+    CodexZstCause::GroupProbeUnsupported,
+    CodexZstCause::GroupReadUnsupported,
+    CodexZstCause::PhysicalOffsetUnsupported,
+    CodexZstCause::AdmissionRefused,
+    CodexZstCause::DecodeFailed,
+    CodexZstCause::DecodedOverLimit,
+    CodexZstCause::HeaderUnfunded,
+    CodexZstCause::CompatibilityUnfunded,
+];
+struct CodexZstRefused {
+    counters: [AtomicU64; CODEX_ZST_CAUSES],
+    /// The counters' sum at the last flush.
+    flushed: AtomicU64,
+}
+impl CodexZstRefused {
+    const fn new() -> Self {
+        Self {
+            counters: [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES],
+            flushed: AtomicU64::new(0),
+        }
+    }
+}
+process_static!(fn with_codex_zst_refused: CodexZstRefused = CodexZstRefused::new());
+
+/// Counts only; `codex_zst_refused_flush` reports the totals once per pass.
+pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
+    with_codex_zst_refused(|refused| {
+        let _ = refused.counters[cause as usize]
+            .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
+/// One decoder close's counts, in `codex_zst_input` key order.
+pub(crate) const CODEX_ZST_INPUT_KEYS: [&str; 6] = [
+    "codex_zst_compressed_bytes",
+    "codex_zst_compressed_consumed_bytes",
+    "codex_zst_decoded_bytes",
+    "codex_zst_cpu_micros",
+    "codex_zst_decoder_native_peak_bytes",
+    "codex_zst_decoder_allocation_refusals",
+];
+/// The native peak is a maximum across header decoders; the rest are sums.
+const CODEX_ZST_PEAK: usize = 4;
+// Header-only decoder closes since the last flush: the decoder count (retries
+// included), then the `CODEX_ZST_INPUT_KEYS` totals.
+process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
+
+/// Counts only: inventory header reads decode every `.zst` once per walk, so
+/// `codex_zst_refused_flush` reports them as one per-walk row.
+pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
+    with_codex_zst_headers(|headers| {
+        let _ = headers[0].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        for (index, (total, count)) in headers[1..].iter().zip(counts).enumerate() {
+            if index == CODEX_ZST_PEAK {
+                total.fetch_max(count, Relaxed);
+            } else {
+                let _ = total.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(count)));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_header_decoders() -> u64 {
+    with_codex_zst_headers(|headers| headers[0].load(Relaxed))
+}
+
+/// One sparse line of the non-zero cumulative counters, only when their sum
+/// moved since the last flush. Header decoder totals since the last flush go
+/// on their own `codex_zst_input_headers` row, then reset.
+pub(crate) fn codex_zst_refused_flush() {
+    let headers: [u64; 7] =
+        with_codex_zst_headers(|headers| std::array::from_fn(|i| headers[i].swap(0, Relaxed)));
+    if headers[0] != 0 {
+        let counts: BTreeMap<&str, u64> = std::iter::once("codex_zst_header_decoders")
+            .chain(CODEX_ZST_INPUT_KEYS)
+            .zip(headers)
+            .collect();
+        traversal_point("codex_zst_input_headers", "codex", &counts);
+    }
+    let counts = with_codex_zst_refused(|refused| {
+        let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL
+            .into_iter()
+            .map(|cause| (cause, refused.counters[cause as usize].load(Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        let total = counts
+            .values()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
+        (refused.flushed.swap(total, Relaxed) != total).then_some(counts)
+    });
+    if let Some(counts) = counts {
+        traversal_point(
+            "codex_zst_refused",
+            "codex",
+            &BTreeMap::from([("codex_zst_refused", counts)]),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn codex_zst_refused_count(cause: CodexZstCause) -> u64 {
+    with_codex_zst_refused(|refused| refused.counters[cause as usize].load(Relaxed))
+}
+
+/// Counts per observed usage line, before response deduplication and timestamp
+/// drops; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn pi_cost_observations(refused: u64, rounded: u64) {
+    if refused == 0 && rounded == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostRefusedOverflow, refused);
+    cache_lifecycle::add(cache_lifecycle::Event::PiCostPrecisionRounded, rounded);
+}
+
+/// Counts per observed `priority` or `flex` thread-settings snapshot, dated or
+/// not; rereads count again. Only the lifecycle registry atomics are updated.
+pub(crate) fn codex_non_default_thread_tier() {
+    cache_lifecycle::record(cache_lifecycle::Event::CodexNonDefaultThreadTier);
+}
+
+/// Counts per observed Claude usage line with an `iterations[]` entry naming
+/// another model than the line; rereads count again. Only the lifecycle
+/// registry atomics are updated.
+pub(crate) fn claude_usage_iteration_model_differs() {
+    cache_lifecycle::record(cache_lifecycle::Event::UsageIterationModelDiffers);
+}
+
+/// Counts per numeric key the Claude usage parser does not read, per observed
+/// usage line; rereads count again. Only the lifecycle registry atomics are
+/// updated.
+pub(crate) fn claude_usage_unknown_numeric_keys(keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    cache_lifecycle::add(cache_lifecycle::Event::UsageUnknownNumericKey, keys);
+}
+
+/// Sidecar read attempts and actual input bytes since the last Claude page.
+/// Repeated reads count again; missing/refused files add nothing. No identities.
+/// Absent scalars are zero, keeping quiet pages lean on the shared carrier.
+/// Retention: pairs deleted (and their bytes), pairs kept by a protection,
+/// copy or write fence (of them, by the copy rule), pairs kept by a read or
+/// unlink fault, and held pairs (and their bytes) with no listed transcript.
+#[derive(Default, Serialize)]
+struct ClaudeSidecarReparse {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_sidecar_reparse_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_sidecar_reparse_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_retired_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_copied: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_read_fault: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_roots: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_telemetry_held_no_transcript_bytes: u64,
+}
+process_static!(fn with_claude_sidecar_reparse: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9]);
+pub(crate) fn claude_sidecar_reparse(files: u64, bytes: u64) {
+    add_claude_sidecar_counts([files, bytes, 0, 0, 0, 0, 0, 0, 0]);
+}
+/// One Claude telemetry retention run.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct ClaudeTelemetryRetention {
+    pub(crate) retired_roots: u64,
+    pub(crate) retired_bytes: u64,
+    pub(crate) held_roots: u64,
+    pub(crate) held_copied: u64,
+    pub(crate) read_fault: u64,
+    pub(crate) held_no_transcript_roots: u64,
+    pub(crate) held_no_transcript_bytes: u64,
+}
+pub(crate) fn claude_telemetry_retention(run: ClaudeTelemetryRetention) {
+    add_claude_sidecar_counts([
+        0,
+        0,
+        run.retired_roots,
+        run.retired_bytes,
+        run.held_roots,
+        run.held_copied,
+        run.read_fault,
+        run.held_no_transcript_roots,
+        run.held_no_transcript_bytes,
+    ]);
+}
+fn add_claude_sidecar_counts(deltas: [u64; 9]) {
+    with_claude_sidecar_reparse(|counts| {
+        for (counter, delta) in counts.iter().zip(deltas) {
+            let _ = counter.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(delta)));
+        }
+    });
+}
+fn take_claude_sidecar_reparse() -> ClaudeSidecarReparse {
+    with_claude_sidecar_reparse(|counts| ClaudeSidecarReparse {
+        claude_sidecar_reparse_files: counts[0].swap(0, Relaxed),
+        claude_sidecar_reparse_bytes: counts[1].swap(0, Relaxed),
+        claude_telemetry_retired_roots: counts[2].swap(0, Relaxed),
+        claude_telemetry_retired_bytes: counts[3].swap(0, Relaxed),
+        claude_telemetry_held_roots: counts[4].swap(0, Relaxed),
+        claude_telemetry_held_copied: counts[5].swap(0, Relaxed),
+        claude_telemetry_read_fault: counts[6].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_roots: counts[7].swap(0, Relaxed),
+        claude_telemetry_held_no_transcript_bytes: counts[8].swap(0, Relaxed),
+    })
+}
+
+/// Test seam: drain this thread's Claude page counters as their logged keys.
+#[cfg(test)]
+pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
+    serde_json::to_value(take_claude_sidecar_reparse()).unwrap()
+}
+
+/// Test bound on one serialized `native_collection_page` record. Fixed page
+/// gate totals, the Full/Tail byte split and the Codex header lookup counts
+/// extend this local diagnostic record only; upload/finish records and all
+/// runtime resource caps stay unchanged. The bound covers a Codex page with
+/// every read counter at its maximum, the full page schedule and the macOS
+/// process sample fields (about 4.4 KB measured).
+#[cfg(test)]
+pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4608;
+/// Test bound on one `native_full_prior_stamp` record with every cell at
+/// `u64::MAX`; kept off the page line so that line keeps its bound.
+#[cfg(test)]
+const FULL_PRIOR_STAMP_RECORD_TEST_LIMIT: usize = 8192;
+
+/// Nonzero-only counters on the existing native_collection_page line. They
+/// observe a finalized file's retained records and gate nothing.
+#[derive(Default, Serialize)]
+struct ClaudeRecordCaps {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_half_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_hits: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_file: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_records_max_per_response: u64,
+}
+pub(crate) fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+struct ClaudeRecordCounters {
+    half: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    max_file: std::sync::atomic::AtomicU64,
+    max_response: std::sync::atomic::AtomicU64,
+}
+impl ClaudeRecordCounters {
+    const fn new() -> Self {
+        Self {
+            half: std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            max_file: std::sync::atomic::AtomicU64::new(0),
+            max_response: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+process_static!(fn with_claude_record_counters: ClaudeRecordCounters = ClaudeRecordCounters::new());
+/// `file_alarm` is the size this parser once refused past: nothing is dropped
+/// above it, the counters only show how memory grows.
+pub(crate) fn claude_record_counts(
+    file_records: usize,
+    largest_response_records: usize,
+    file_alarm: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| {
+        if file_records >= file_alarm / 2 {
+            counters.half.fetch_add(1, Relaxed);
+        }
+        if file_records > file_alarm {
+            counters.hits.fetch_add(1, Relaxed);
+        }
+        counters.max_file.fetch_max(file_records as u64, Relaxed);
+        counters
+            .max_response
+            .fetch_max(largest_response_records as u64, Relaxed);
+    });
+}
+fn take_claude_record_caps() -> ClaudeRecordCaps {
+    use std::sync::atomic::Ordering::Relaxed;
+    with_claude_record_counters(|counters| ClaudeRecordCaps {
+        claude_money_record_cap_half_files: counters.half.swap(0, Relaxed),
+        claude_money_record_cap_hits: counters.hits.swap(0, Relaxed),
+        claude_records_max_per_file: counters.max_file.swap(0, Relaxed),
+        claude_records_max_per_response: counters.max_response.swap(0, Relaxed),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64, u64, u64) {
+    let c = take_claude_record_caps();
+    (
+        c.claude_money_record_cap_half_files,
+        c.claude_money_record_cap_hits,
+        c.claude_records_max_per_file,
+        c.claude_records_max_per_response,
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CapCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bootstrap_overflow_events: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub price_trace_row_limit_hits: u64,
+}
+impl CapCounts {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    pub(crate) fn drain(&mut self, source: &str) -> Self {
+        for (event, total) in [
+            (1, &mut self.bootstrap_overflow_events),
+            (3, &mut self.price_trace_row_limit_hits),
+        ] {
+            *total = total.saturating_add(source_count(source, CAP_EVENT_START + event, |n| {
+                n.swap(0, Relaxed)
+            }));
+        }
+        if !self.is_empty() {
+            traversal_point("scan_cap_events", source, self);
+        }
+        *self
+    }
+    pub(crate) fn record(source: &str, event: usize, amount: u64) {
+        source_count(source, CAP_EVENT_START + event, |slot| {
+            slot.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+
+crate::heap_layout_bound::fields!(CapCounts; bootstrap_overflow_events, price_trace_row_limit_hits);
+
+/// K10 (LD): one line observer's counts for a page; nonzero keys only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineDeliveryCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) lines: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) incomplete: u64,
+}
+
+/// K10 (LD): why a discovery gate left a file unselected.
+pub(crate) enum UnselectedReason {
+    Age,
+    /// A never-read file past the first-read bound.
+    FirstReadAge = 16,
+    /// F4 kept custody because another same-member path prevents absence proof.
+    WithheldAbsenceAmbiguous = 18,
+}
+const CAP_EVENT_START: usize = 19;
+const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
+const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 10;
+const FILE_READ_START: usize = change_reason::END;
+const HOLD_WAKE_START: usize = FILE_READ_START + 3;
+const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
+const FORCED_SEED_START: usize = USAGE_GAP_START + 4;
+const TAIL_LOAD_START: usize = FORCED_SEED_START + FORCED_SEEDS;
+const UNSELECTED_REASONS: usize = TAIL_LOAD_START + 2;
+process_static!(
+    /// Claude, Codex, Pi x reason, drained by that source's page line.
+    fn with_line_unselected: [AtomicU64; 3 * UNSELECTED_REASONS] =
+    [const { AtomicU64::new(0) }; 3 * UNSELECTED_REASONS]);
+/// The one per-source slot of every process-local diagnostic array here.
+fn source_slot(source: &str) -> Option<usize> {
+    ["claude_code", "codex", "pi"]
+        .iter()
+        .position(|s| *s == source)
+}
+fn source_count(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+    let Some(slot) = source_slot(source) else {
+        return 0;
+    };
+    with_line_unselected(|slots| f(&slots[UNSELECTED_REASONS * slot + reason]))
+}
+/// One skip decision, recorded after the gate decided; never a gate input.
+pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
+    source_count(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
+/// A vanished file's index entry was retired while its parsed body was not
+/// ACKed; nothing holds or resends that body. `usage` is the resident
+/// reduction's `(requests, tokens)`; `None` (no copy in RAM, or Claude
+/// responses not yet folded) counts in `totals_unknown_files`, so
+/// `requests`/`tokens` are at least. Counted after
+/// the retirement; never a gate.
+pub(crate) fn unacked_usage_lost_to_deletion(source: &str, usage: Option<(u64, u64)>) {
+    let (requests, tokens, unknown) = usage.map_or((0, 0, 1), |(r, t)| (r, t, 0));
+    for (slot, amount) in [1, requests, tokens, unknown].into_iter().enumerate() {
+        source_count(source, UNACKED_LOST_START + slot, |n| {
+            n.try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(amount)))
+                .unwrap_or_else(|n| n)
+        });
+    }
+}
+/// One page's selection, counted after it was made; never a gate input.
+#[derive(Clone, Copy)]
+pub(crate) enum PageSelection {
+    /// Queued paths the page took.
+    Selected,
+    /// The selected paths whose index entry is re-armed (owed).
+    OwedSelected,
+    /// Selected paths that ended as a Skip (unchanged or confirmed empty).
+    Skipped,
+    /// Claude roots put back at the queue front to wait for their family.
+    DeferredRoots,
+    /// Distinct Claude roots forced by twin seeds, and family paths the
+    /// closure for forced roots names (those added and those on the page).
+    ForcedFamilyRoots,
+    ForcedFamilyMembersPulled,
+    ChargeDeferred,
+    ChargeEstimate,
+    /// Distinct Claude roots whose own seeds read only the root's homes.
+    ForcedFamilyMemberScoped,
+    ByteBudgetHit,
+}
+pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
+    source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+/// One successful Tail hit on this native page; bytes are the loaded
+/// reduction pages (`tail_db_load_bytes.page`), excluding the head.
+pub(crate) fn tail_loaded(source: &str, bytes: u64) {
+    for (slot, amount) in [(TAIL_LOAD_START, 1), (TAIL_LOAD_START + 1, bytes)] {
+        source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
+    }
+}
+const PAGE_SELECTION: [(&str, usize); 10] = [
+    ("selected", PAGE_SELECTION_START),
+    ("owed_selected", PAGE_SELECTION_START + 1),
+    ("skipped", PAGE_SELECTION_START + 2),
+    ("deferred_roots", PAGE_SELECTION_START + 3),
+    ("forced_family_roots", PAGE_SELECTION_START + 4),
+    ("forced_family_members_pulled", PAGE_SELECTION_START + 5),
+    ("charge_deferred", PAGE_SELECTION_START + 6),
+    ("charge_estimate", PAGE_SELECTION_START + 7),
+    ("forced_family_member_scoped", PAGE_SELECTION_START + 8),
+    ("page_byte_budget_hit", PAGE_SELECTION_START + 9),
+];
+/// Claude twin seeds (one each), by the twin's own `CandidateParseReason`,
+/// `other` for a Parse without one, or `identification_failed`, and again as
+/// `root_member` or `child_member`; the distinct roots they force, and those
+/// read only as the root's homes. Never a gate.
+pub(crate) fn forced_family_seeds(
+    seeds: Vec<(Option<Option<crate::snapshots::CandidateParseReason>>, bool)>,
+    roots: usize,
+    scoped: usize,
+) {
+    for (seed, root_member) in seeds {
+        let reason = seed.map_or(FORCED_SEEDS - 3, |reason| {
+            reason.map_or(FORCED_SEEDS - 4, |reason| reason as usize)
+        });
+        let member = FORCED_SEEDS - 1 - usize::from(root_member);
+        for slot in [reason, member] {
+            source_count("claude_code", FORCED_SEED_START + slot, |n| {
+                n.fetch_add(1, Relaxed)
+            });
+        }
+    }
+    page_selection(
+        "claude_code",
+        PageSelection::ForcedFamilyRoots,
+        roots as u64,
+    );
+    page_selection(
+        "claude_code",
+        PageSelection::ForcedFamilyMemberScoped,
+        scoped as u64,
+    );
+}
+pub(crate) fn forced_family_member_pulled() {
+    page_selection("claude_code", PageSelection::ForcedFamilyMembersPulled, 1);
+}
+const FORCED_SEEDS: usize = crate::snapshots::CANDIDATE_PARSE_REASON_COUNT + 4;
+const UNACKED_LOST: [(&str, usize); 4] = [
+    ("files", UNACKED_LOST_START),
+    ("requests", UNACKED_LOST_START + 1),
+    ("tokens", UNACKED_LOST_START + 2),
+    ("totals_unknown_files", UNACKED_LOST_START + 3),
+];
+
+/// Claude withheld-account hold events, in the slots after the reasons.
+#[derive(Clone, Copy)]
+pub(crate) enum WithheldEvent {
+    /// A held key's file was proved absent and its hold released.
+    ReleasedDeleted = 3,
+    /// A held key re-parsed: first time in this process, after an account
+    /// evidence change, or after its transcript stamp changed.
+    ReparseStart,
+    ReparseEvidence,
+    ReparseGrowth,
+    /// A parse resolved the account and released the hold.
+    ReleasedResolved,
+    /// A withheld key past the hold cap left unrecorded, and its withheld tokens.
+    UnrecordedEvents,
+    UnrecordedTokens,
+    ReleasedDeletedTokens = 11,
+    BirthClampAccepted = 15,
+}
+/// Recorded after the decision; never a gate input.
+pub(crate) fn withheld_event(event: WithheldEvent, amount: u64) {
+    source_count("claude_code", event as usize, |slot| {
+        slot.fetch_add(amount, Relaxed)
+    });
+}
+fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str, u64> {
+    slots
+        .iter()
+        .map(|&(key, slot)| (key, source_count(source, slot, |n| n.swap(0, Relaxed))))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+pub(crate) fn audit_retired_absent(source: &str) {
+    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
+}
+/// One aged gate retained a grown indexed file (not a unique-file count).
+pub(crate) fn discovery_retained_grown(source: &str) {
+    source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
+}
+/// Actual aged, unchanged fragment-only Tail completions; bytes exclude samples.
+pub(crate) fn codex_fragment_tail_repeat(bytes: u64) {
+    source_count("codex", 13, |slot| slot.fetch_add(1, Relaxed));
+    source_count("codex", 14, |slot| slot.fetch_add(bytes, Relaxed));
+}
+/// Post-save fate and current estimated age of this page's observed growth.
+pub(crate) fn discovery_growth_fate(
+    source: &str,
+    counts: &crate::snapshots::discovery_growth::Counts,
+) {
+    traversal_point("discovery_growth_fate", source, counts);
+}
+const WITHHELD_RELEASED: [(&str, usize); 3] =
+    [("deleted", 3), ("resolved", 7), ("deleted_tokens", 11)];
+const WITHHELD_UNRECORDED: [(&str, usize); 2] = [("events", 8), ("tokens", 9)];
+const WITHHELD_REPARSE: [(&str, usize); 3] = [("start", 4), ("evidence", 5), ("growth", 6)];
+#[cfg(test)]
+pub(crate) mod withheld_support {
+    use super::*;
+    pub(crate) fn take_withheld() -> [BTreeMap<&'static str, u64>; 3] {
+        let claude = "claude_code";
+        [
+            drain(claude, &WITHHELD_RELEASED),
+            drain(claude, &WITHHELD_REPARSE),
+            drain(claude, &WITHHELD_UNRECORDED),
+        ]
+    }
+}
+
+const SCHEMA_VERSION: u8 = 2;
+
+pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    credential_file_read(result).inspect_err(|_| {
+        traversal_point(
+            "connection_binding_read",
+            "unknown",
+            &serde_json::json!({"connection_binding_unreadable": 1}),
+        );
+    })
+}
+
+process_static!(fn with_credential_file_cap_refused: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4]);
+/// Observe typed cap errors before snapshot callers replace their detail.
+/// Ordinary snapshot sync and retained retry use these same authority loads.
+pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    use ottto_core::{CredentialFileCapRefused, TokenStoreError};
+    let kind = result.as_ref().err().and_then(|error| {
+        error.chain().find_map(|cause| {
+            if let Some(TokenStoreError::OversizeRefused) = cause.downcast_ref::<TokenStoreError>()
+            {
+                return Some(CredentialFileCapRefused::FileSecret);
+            }
+            cause
+                .downcast_ref::<CredentialFileCapRefused>()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<CredentialFileCapRefused>()
+                })
+                .copied()
+        })
+    });
+    if let Some(kind) = kind {
+        let (slot, file_kind) = match kind {
+            CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
+            CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+            CredentialFileCapRefused::ConnectionBinding => (2, "connection_binding"),
+            CredentialFileCapRefused::PendingDeviceCredential => (3, "pending_device_credential"),
+        };
+        let increment = |counts: &[AtomicU64; 4]| {
+            counts[slot]
+                .try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .map_or(u64::MAX, |n| n.saturating_add(1))
+        };
+        let total = with_credential_file_cap_refused(increment);
+        traversal_point(
+            "credential_file_cap_refusal",
+            "unknown",
+            &serde_json::json!({
+                "file_kind": file_kind,
+                "credential_file_cap_refused": 1,
+                "credential_file_cap_refused_total": total,
+            }),
+        );
+    }
+    result
+}
+
+/// Cumulative shared-process totals, NOT events attributed to the finishing
+/// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
+pub(crate) fn cache_lifecycle_totals() {
+    crate::upload_receipts::sample_pager_writes();
+    traversal_point(
+        "process_retained_cache_lifecycle_totals",
+        "unknown",
+        &cache_lifecycle::snapshot(),
+    );
+}
+
+/// Cumulative shared-process Codex memo totals (L-2): lifetime counters plus
+/// one resident gauge, NOT events attributed to the finishing page/source.
+/// Codex scans only.
+pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
+    if source == "codex" {
+        traversal_point(
+            "process_codex_memo_lifecycle_totals",
+            "codex",
+            &codex_memo_lifecycle::snapshot(),
+        );
+    }
+}
+
+/// Local alarm, once per process: a Claude context fold first withheld
+/// session scalars for a resource limit. Counts only.
+pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
+    traversal_point("claude_context_resource_withhold", "claude_code", counts);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Source {
+    ClaudeCode,
+    Codex,
+    Pi,
+    Unknown,
+}
+impl Source {
+    fn from_slug(slug: &str) -> Self {
+        match slug {
+            "claude_code" => Self::ClaudeCode,
+            "codex" => Self::Codex,
+            "pi" => Self::Pi,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessSample {
+    cpu_us: u64,
+    lifetime_max_rss_bytes: u64,
+    disk: Option<DiskBytes>,
+}
+/// Process-wide disk bytes: cumulative in a sample, a delta on a window row.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct DiskBytes {
+    pub(crate) disk_read_bytes: u64,
+    pub(crate) disk_written_bytes: u64,
+    #[serde(flatten, serialize_with = "tier_a")]
+    counters: Metrics<7>,
+}
+/// This process's `proc_pid_rusage` v6 fields after the UUID; `None` on a
+/// failed read (older kernels reject v6).
+#[cfg(target_os = "macos")]
+fn rusage_v6() -> Option<[u64; 56]> {
+    // resource.h v6: UUID followed by 56 uint64_t fields (libc stops at v4).
+    #[repr(C)]
+    struct Usage {
+        uuid: [u8; 16],
+        fields: [u64; 56],
+    }
+    let mut usage = Usage {
+        uuid: [0; 16],
+        fields: [0; 56],
+    };
+    (unsafe { libc::proc_pid_rusage(libc::getpid(), 6, (&raw mut usage).cast()) } == 0)
+        .then_some(usage.fields)
+}
+
+/// Process-wide cumulative `ri_logical_writes` bytes (v6 field 27). macOS
+/// only; `None` elsewhere or on a failed read.
+pub(crate) fn logical_write_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        rusage_v6().map(|fields| fields[27])
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+impl DiskBytes {
+    /// macOS `proc_pid_rusage` only; `None` elsewhere or on a failed read.
+    pub(crate) fn now() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(f) = rusage_v6() {
+                // (numer, denom); libc marks the mach timebase items deprecated in favour of
+                // the mach2 crate, which this crate does not depend on.
+                static TIMEBASE: std::sync::OnceLock<Option<(u32, u32)>> =
+                    std::sync::OnceLock::new();
+                #[allow(
+                    deprecated,
+                    reason = "libc mach_timebase_info is the only timebase source without a new crate"
+                )]
+                let timebase = TIMEBASE.get_or_init(|| {
+                    let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
+                    (unsafe { libc::mach_timebase_info(&mut info) } == 0 && info.denom != 0)
+                        .then_some((info.numer, info.denom))
+                });
+                let micros = |ticks: Option<u64>| {
+                    ticks
+                        .zip(timebase.as_ref())
+                        .and_then(|(n, &(numer, denom))| {
+                            u64::try_from(
+                                u128::from(n) * u128::from(numer) / u128::from(denom) / 1000,
+                            )
+                            .ok()
+                        })
+                };
+                return Some(Self {
+                    disk_read_bytes: f[16],
+                    disk_written_bytes: f[17],
+                    counters: Metrics([
+                        Some(f[40]),
+                        Some(f[41]),
+                        Some(f[3]),
+                        Some(f[2]),
+                        micros(Some(f[21])),
+                        micros(f[19].checked_add(f[20])),
+                        micros(
+                            f[18]
+                                .checked_add(f[22])
+                                .and_then(|n| n.checked_add(f[23]))
+                                .and_then(|n| n.checked_add(f[24])),
+                        ),
+                    ]),
+                });
+            }
+            // Older kernels may reject v6; retain their existing disk measurements.
+            let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            (unsafe {
+                libc::proc_pid_rusage(
+                    libc::getpid(),
+                    libc::RUSAGE_INFO_V2,
+                    (&raw mut usage).cast(),
+                )
+            } == 0)
+                .then_some(Self {
+                    disk_read_bytes: usage.ri_diskio_bytesread,
+                    disk_written_bytes: usage.ri_diskio_byteswritten,
+                    counters: Metrics::default(),
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+    /// `None` when either sample is unavailable or a counter regressed.
+    fn between(before: Option<ProcessSample>, after: Option<ProcessSample>) -> Option<Self> {
+        let (a, b) = before?.disk.zip(after?.disk)?;
+        Some(Self {
+            disk_read_bytes: b.disk_read_bytes.checked_sub(a.disk_read_bytes)?,
+            disk_written_bytes: b.disk_written_bytes.checked_sub(a.disk_written_bytes)?,
+            counters: b.counters.delta(a.counters),
+        })
+    }
+}
+
+const METRIC_KEYS: [&str; 7] = [
+    "energy_nj",
+    "penergy_nj",
+    "interrupt_wkups",
+    "pkg_idle_wkups",
+    "qos_utility_us",
+    "qos_background_us",
+    "qos_default_us",
+];
+#[derive(Clone, Copy, Debug)]
+struct Metrics<const N: usize>([Option<u64>; N]);
+impl<const N: usize> Default for Metrics<N> {
+    fn default() -> Self {
+        Self([None; N])
+    }
+}
+impl<const N: usize> Metrics<N> {
+    fn delta(self, before: Self) -> Self {
+        Self(std::array::from_fn(|i| {
+            self.0[i]?.checked_sub(before.0[i]?)
+        }))
+    }
+}
+impl<const N: usize> Serialize for Metrics<N> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        for (key, value) in METRIC_KEYS.iter().zip(self.0) {
+            if let Some(n) = value {
+                map.serialize_entry(key, &n)?;
+            }
+        }
+        map.end()
+    }
+}
+fn tier_a<S: serde::Serializer>(m: &Metrics<7>, s: S) -> Result<S::Ok, S::Error> {
+    Metrics::<4>(std::array::from_fn(|i| m.0[i])).serialize(s)
+}
+
+fn process_sample() -> Option<ProcessSample> {
+    process_usage().map(|(sample, _)| sample)
+}
+
+/// Cumulative user/system CPU and page faults; readers subtract samples.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct StateV2Cpu {
+    pub(crate) cpu_user_us: u64,
+    pub(crate) cpu_sys_us: u64,
+    pub(crate) minor_faults: u64,
+    pub(crate) major_faults: u64,
+}
+
+/// One getrusage read shared by the process sample and its CPU/fault split.
+fn process_usage() -> Option<(ProcessSample, StateV2Cpu)> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the complete struct on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let micros = |time: libc::timeval| {
+            u64::try_from(time.tv_sec)
+                .ok()?
+                .checked_mul(1_000_000)?
+                .checked_add(u64::try_from(time.tv_usec).ok()?)
+        };
+        let raw_rss = u64::try_from(usage.ru_maxrss).ok()?;
+        let split = StateV2Cpu {
+            cpu_user_us: micros(usage.ru_utime)?,
+            cpu_sys_us: micros(usage.ru_stime)?,
+            minor_faults: u64::try_from(usage.ru_minflt).ok()?,
+            major_faults: u64::try_from(usage.ru_majflt).ok()?,
+        };
+        Some((
+            ProcessSample {
+                disk: DiskBytes::now(),
+                cpu_us: split.cpu_user_us.checked_add(split.cpu_sys_us)?,
+                lifetime_max_rss_bytes: if cfg!(target_os = "macos") {
+                    raw_rss
+                } else {
+                    raw_rss.checked_mul(1024)?
+                },
+            },
+            split,
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
+}
+
+/// Current retained refusal exposure. No history, buckets, timer or retention.
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct RefusalExposure {
+    pub(crate) owed_entities: usize,
+    pub(crate) held_terminal_entities: usize,
+    pub(crate) known_requests: u64,
+    pub(crate) known_tokens: u64,
+    pub(crate) unknown_request_entities: usize,
+    pub(crate) unknown_token_entities: usize,
+    pub(crate) unknown_age_entities: usize,
+    pub(crate) oldest_age_seconds: u64,
+}
+crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_entities, known_requests, known_tokens, unknown_request_entities, unknown_token_entities, unknown_age_entities, oldest_age_seconds);
+
+#[derive(Debug)]
+pub(crate) struct Probe {
+    pub(crate) refusal_exposure: Option<RefusalExposure>,
+    pub(crate) page_schedule: BTreeMap<&'static str, bool>,
+    withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
+    started: Instant,
+    process: Option<ProcessSample>,
+    pub(crate) page_events: claude_reread::Counts,
+    pub(crate) full_causes: FullCauses,
+    pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
+    pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
+    /// Sampled page/upload window: `Some(None)` is a refused sampler slot,
+    /// reported as one sample failure. Other probes carry `None`.
+    footprint: Option<Option<footprint::Stage>>,
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        rearm_cause::finish_page(self.started);
+    }
+}
+impl Probe {
+    pub(crate) fn set_withheld_memo(&mut self, memo: crate::snapshots::withheld_account::Memo) {
+        self.withheld_memo = Some(memo);
+    }
+    pub(crate) fn with_withheld_memo(
+        mut self,
+        memo: crate::snapshots::withheld_account::Memo,
+    ) -> Self {
+        self.set_withheld_memo(memo);
+        self
+    }
+    pub(crate) fn rearm_full_selected(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+    ) {
+        rearm_cause::selected(self.started, key, mode);
+    }
+    pub(crate) fn rearm_full_completed(
+        &self,
+        key: &str,
+        mode: crate::transcript_acquisition::ReadMode,
+        bytes: u64,
+    ) {
+        rearm_cause::completed(self.started, key, mode, bytes);
+    }
+    /// Frozen selection bucket; group replays have none.
+    pub(crate) fn full_parse_reason(
+        &self,
+        mode: crate::transcript_acquisition::ReadMode,
+        reason: Option<crate::snapshots::CandidateParseReason>,
+        prior: Option<claude_reread::PriorStamp>,
+        count: u64,
+        native_bytes: u64,
+    ) {
+        use crate::transcript_acquisition::ReadMode;
+        if let (ReadMode::Full(_), Some(prior)) = (mode, prior)
+            && (count != 0 || native_bytes != 0)
+        {
+            rearm_cause::record_parse_reason(self.started, reason, prior, count, native_bytes);
+        }
+    }
+    pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
+        rearm_cause::full_by_parse_reason(self.started)
+    }
+    pub(crate) fn rearm_fulls(&self) -> rearm_cause::Counts {
+        rearm_cause::page(self.started)
+    }
+    pub(crate) fn start() -> Self {
+        Self {
+            refusal_exposure: None,
+            page_schedule: BTreeMap::new(),
+            withheld_memo: None,
+            started: Instant::now(),
+            process: process_sample(),
+            page_events: Default::default(),
+            full_causes: Default::default(),
+            line_delivery: None,
+            discovery_growth: Default::default(),
+            footprint: None,
+        }
+    }
+    /// A native collection page probe. Its `native_collection_page` row
+    /// carries the same footprint fields as a `StageWindow` row, from the
+    /// shared bounded sampler. Diagnostics only; nothing reads them.
+    pub(crate) fn page() -> Self {
+        let mut probe = Self::start();
+        probe.footprint = Some(footprint::Stage::begin());
+        probe
+    }
+    fn stage_observation(&self, footprint: Option<&footprint::Stage>) -> Observation {
+        let mut observation = self.observation();
+        observation.footprint =
+            footprint.map_or_else(footprint::unavailable, footprint::Stage::finish);
+        observation
+    }
+    fn observation(&self) -> Observation {
+        Observation::between(wall_us(self.started), self.process, process_sample())
+    }
+    fn page_observation(&self) -> Observation {
+        match &self.footprint {
+            Some(window) => self.stage_observation(window.as_ref()),
+            None => self.observation(),
+        }
+    }
+    pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
+        #[derive(Serialize)]
+        struct Counts<'a> {
+            #[serde(flatten)]
+            page_schedule: &'a BTreeMap<&'static str, bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
+            #[serde(flatten)]
+            collection: CollectionCounts,
+            #[serde(flatten)]
+            money: crate::snapshots::claude_request_money::e2::Counts,
+            #[serde(flatten)]
+            caps: ClaudeRecordCaps,
+            #[serde(flatten)]
+            sidecar_reparse: Option<ClaudeSidecarReparse>,
+            #[serde(flatten)]
+            identity: crate::snapshots::claude_request_identity::IdentityCounts,
+            #[serde(flatten)]
+            reread: claude_reread::Counts,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            line_delivery_unselected: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            audit_retired_absent: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            discovery_retained: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_released: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_reparse: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_birth_clamp_accepted: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            withheld_hold_unrecorded: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            withheld_memo: Option<crate::snapshots::withheld_account::Census>,
+            #[serde(flatten)]
+            withheld_held: Option<crate::snapshots::withheld_account::HeldGauge>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            unacked_usage_lost_to_deletion: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            page_selection: BTreeMap<&'static str, u64>,
+            tail_loads: u64,
+            tail_load_bytes: u64,
+            #[serde(flatten)]
+            file_reads: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            hold_wake: BTreeMap<&'static str, u64>,
+            #[serde(flatten)]
+            usage_gaps: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            forced_family_seeds: BTreeMap<&'static str, u64>,
+        }
+        let claude = source == "claude_code";
+        let jsonl = jsonl::take(source);
+        let reasons = crate::snapshots::CANDIDATE_PARSE_REASON_NAMES.into_iter();
+        let seeds = reasons.chain(["other", "identification_failed"]);
+        let seeds = seeds.chain(["root_member", "child_member"]);
+        let seeds = seeds.zip(FORCED_SEED_START..).collect::<Vec<_>>();
+        let counts = Counts {
+            page_schedule: &self.page_schedule,
+            forced_family_seeds: drain(source, &seeds),
+            line_delivery: self
+                .line_delivery
+                .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
+                .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
+            line_delivery_unselected: drain(
+                source,
+                &[
+                    ("age", 0),
+                    ("first_read_age", 16),
+                    ("size", 1),
+                    ("withheld_oversized", 2),
+                    ("withheld_absence_ambiguous", 18),
+                ],
+            ),
+            audit_retired_absent: drain(source, &[("events", 12)]),
+            discovery_retained: drain(source, &[("grown", 10)]),
+            codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
+            withheld_hold_released: drain(source, &WITHHELD_RELEASED),
+            withheld_reparse: drain(source, &WITHHELD_REPARSE),
+            withheld_birth_clamp_accepted: drain(source, &[("events", 15)]),
+            withheld_hold_unrecorded: drain(source, &WITHHELD_UNRECORDED),
+            withheld_memo: claude
+                .then(|| self.withheld_memo.as_ref().and_then(|memo| memo.census()))
+                .flatten(),
+            withheld_held: claude
+                .then(|| {
+                    self.withheld_memo
+                        .as_ref()
+                        .and_then(|memo| memo.held_gauge())
+                })
+                .flatten(),
+            unacked_usage_lost_to_deletion: drain(source, &UNACKED_LOST),
+            page_selection: drain(source, &PAGE_SELECTION),
+            tail_loads: source_count(source, TAIL_LOAD_START, |n| n.swap(0, Relaxed)),
+            tail_load_bytes: source_count(source, TAIL_LOAD_START + 1, |n| n.swap(0, Relaxed)),
+            file_reads: drain(source, &FILE_READS),
+            hold_wake: drain(
+                source,
+                &[
+                    ("keys", HOLD_WAKE_START),
+                    ("oldest_expired_secs", HOLD_WAKE_START + 1),
+                ],
+            ),
+            usage_gaps: drain(source, &USAGE_GAPS),
+            reread: if claude {
+                self.page_events.with_current()
+            } else {
+                self.page_events.with_current().retained_cache_only()
+            },
+            refusal_exposure: self.refusal_exposure,
+            collection: counts,
+            identity: if claude {
+                crate::snapshots::claude_request_identity::take_identity_counts()
+            } else {
+                Default::default()
+            },
+            sidecar_reparse: claude.then(take_claude_sidecar_reparse),
+            caps: if claude {
+                take_claude_record_caps()
+            } else {
+                Default::default()
+            },
+            money: if claude {
+                crate::snapshots::claude_request_money::e2::take_counts()
+            } else {
+                Default::default()
+            },
+        };
+        let malloc_in_use_bytes = footprint::malloc_in_use();
+        pass_malloc(source, |points| points.page_end = malloc_in_use_bytes);
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: "native_collection_page",
+            source: Source::from_slug(source),
+            observation: Observation {
+                malloc_in_use_bytes,
+                ..self.page_observation()
+            },
+            counts,
+        });
+        // Own records, so the page line stays under its size bound (§13).
+        if let Some(change_reasons) = change_reason::drain(source) {
+            #[derive(Serialize)]
+            struct Counts {
+                change_reasons: change_reason::Page,
+            }
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_change_reasons",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: Counts { change_reasons },
+            });
+        }
+        let full_by_prior_stamp = rearm_cause::take_full_by_prior_stamp(self.started);
+        if !full_by_prior_stamp.is_empty() {
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_full_prior_stamp",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: BTreeMap::from([("full_by_prior_stamp", full_by_prior_stamp)]),
+            });
+        }
+        jsonl.emit_page_lines(source);
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for Probe {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+            &self.full_causes.restore_outcome.miss,
+            c,
+        )?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.discovery_growth, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Observation {
+    observed_unix_ms: Option<u64>,
+    wall_elapsed_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes: Option<u64>,
+    shared_process_cpu_delta_us: Option<u64>,
+    #[serde(flatten)]
+    shared_process_disk_delta: Option<DiskBytes>,
+    process_lifetime_max_rss_bytes: Option<u64>,
+    process_lifetime_max_rss_before_bytes: Option<u64>,
+    #[serde(flatten)]
+    footprint: footprint::Observation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cli_children: Vec<cli_children::Counts>,
+}
+impl Observation {
+    fn slim(mut self) -> Self {
+        if let Some(disk) = self.shared_process_disk_delta.as_mut() {
+            disk.counters = Metrics::default();
+        }
+        self
+    }
+    /// A zero-window event: a timestamp and no resource measurements.
+    fn point() -> Self {
+        Self::between(0, None, None)
+    }
+    fn between(wall: u64, before: Option<ProcessSample>, after: Option<ProcessSample>) -> Self {
+        Self {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: wall,
+            malloc_in_use_bytes: None,
+            malloc_in_use_bytes_delta: None,
+            malloc_allocated_bytes: None,
+            footprint: Default::default(),
+            cli_children: Vec::new(),
+            shared_process_cpu_delta_us: before
+                .zip(after)
+                .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
+            shared_process_disk_delta: DiskBytes::between(before, after),
+            process_lifetime_max_rss_bytes: after.map(|sample| sample.lifetime_max_rss_bytes),
+            process_lifetime_max_rss_before_bytes: before.zip(after).and_then(|(before, after)| {
+                (before.lifetime_max_rss_bytes <= after.lifetime_max_rss_bytes)
+                    .then_some(before.lifetime_max_rss_bytes)
+            }),
+        }
+    }
+}
+
+/// Why a prepare ran or stopped at the cadence gate: one fixed key each for the
+/// due reason and the power state, plus whether a destination change asked
+/// for a paced scan. Counts only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrepareDue {
+    pub(crate) due: &'static str,
+    pub(crate) destination_switch: bool,
+    pub(crate) power: &'static str,
+}
+thread_local! {
+    static PREPARE_DUE: std::cell::Cell<Option<PrepareDue>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn prepare_due(due: PrepareDue) {
+    PREPARE_DUE.set(Some(due));
+}
+fn prepare_due_counts() -> BTreeMap<&'static str, u64> {
+    let mut counts = BTreeMap::new();
+    if let Some(due) = PREPARE_DUE.take() {
+        counts.insert(due.due, 1);
+        counts.insert(due.power, 1);
+        if due.destination_switch {
+            counts.insert("destination_switch", 1);
+        }
+    }
+    counts
+}
+
+/// Local prepare window, including index load/baseline work before page probes.
+/// Return values and errors pass through; unwinding closes sampling silently.
+pub(crate) fn source_prepare<T>(
+    source: &str,
+    inner: impl FnOnce() -> T,
+    v2_active: impl FnOnce(&T) -> bool,
+) -> T {
+    flush_offpass();
+    PREPARE_DUE.set(None);
+    let probe = Probe::start();
+    let (malloc_in_use_bytes, malloc_allocated_bytes) = footprint::malloc_zone();
+    if let Some(slot) = source_slot(source) {
+        PASS_OUTCOMES.set(Some(PassOutcomes::default()));
+        with_passes(|p| {
+            p.lock().unwrap_or_else(|e| e.into_inner())[slot] = Some((
+                probe.started,
+                probe.process,
+                [malloc_in_use_bytes, malloc_allocated_bytes],
+                None,
+                MallocCheckpoints::default(),
+            ))
+        });
+        // Bumped after the slot is set: a window that read the count before
+        // this bump reads the open slot next.
+        with_pass_starts(|n| n.fetch_add(1, SeqCst));
+    }
+    let footprint = footprint::Stage::begin();
+    let result = inner();
+    if source == "claude_code" && v2_active(&result) {
+        crate::snapshots::state_v2_prepare_observed();
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "source_prepare",
+        source: Source::from_slug(source),
+        observation: Observation {
+            malloc_in_use_bytes,
+            malloc_allocated_bytes,
+            // Cumulative totals: once per prepare, not on every row.
+            cli_children: cli_children::snapshot(),
+            ..probe.stage_observation(footprint.as_ref())
+        },
+        counts: prepare_due_counts(),
+    });
+    result
+}
+
+/// Observe only a normally returned finish; move its value/error through unchanged.
+/// A panic drops the probe silently. Outcome reporting remains with the caller.
+#[cfg(test)]
+pub(crate) fn source_finish<T>(
+    source: &str,
+    v2_active: bool,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    source_finish_inner(source, v2_active, None, inner)
+}
+pub(crate) fn source_finish_with_refusals<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: RefusalExposure,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    source_finish_inner(source, v2_active, Some(exposure), inner)
+}
+fn source_finish_inner<T>(
+    source: &str,
+    v2_active: bool,
+    exposure: Option<RefusalExposure>,
+    inner: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut window = StageWindow::begin(source, "source_finish");
+    if let Some(exposure) = exposure {
+        window.set_refusal_exposure(exposure);
+    }
+    let v2_active = source == "claude_code" && v2_active;
+    let v2_window = v2_active
+        .then(crate::snapshots::state_v2_finish_window)
+        .flatten();
+    let result = inner();
+    drop(v2_window);
+    if v2_active {
+        crate::snapshots::state_v2_post_pass_observed();
+    }
+    let started = Instant::now();
+    let after = process_sample();
+    let zone_end = footprint::malloc_zone();
+    let outcomes = PASS_OUTCOMES.take().unwrap_or_default();
+    window.finish_sample = Some(after);
+    window.pass = source_slot(source)
+        .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
+        .map(|(start, before, zone_start, retained, _)| {
+            let (retained_heap_bytes, retained_cost_us) = retained
+                .map(|(bytes, cost)| (Some(bytes), cost))
+                .unwrap_or_default();
+            let counters = before
+                .and_then(|p| p.disk)
+                .zip(after.and_then(|p| p.disk))
+                .map(|(a, b)| b.counters.delta(a.counters))
+                .unwrap_or_default();
+            PassSummary {
+                wall_us: wall_us(start),
+                cpu_us: before
+                    .zip(after)
+                    .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+                counters,
+                malloc_in_use_bytes_start: zone_start[0],
+                malloc_allocated_bytes_start: zone_start[1],
+                malloc_in_use_bytes: zone_end.0,
+                malloc_allocated_bytes: zone_end.1,
+                sample_cost_us: wall_us(started).saturating_add(retained_cost_us),
+                retained_heap_bytes,
+                outcomes,
+            }
+        });
+    drop(window);
+    result
+}
+#[derive(Default, Serialize)]
+pub(crate) struct RetainedBytes {
+    #[serde(flatten)]
+    pub(crate) totals: BTreeMap<&'static str, Option<u64>>,
+    pub(crate) side_maps_parts: BTreeMap<&'static str, Option<u64>>,
+}
+crate::heap_layout_bound::fields!(RetainedBytes; totals, side_maps_parts);
+type PassStart = (
+    Instant,
+    Option<ProcessSample>,
+    [Option<u64>; 2],
+    Option<(RetainedBytes, u64)>,
+    MallocCheckpoints,
+);
+#[derive(Default)]
+struct MallocCheckpoints {
+    // Outer None: no window; Some(None): active with an unavailable sample.
+    index_clone: Option<Option<u64>>,
+    page_end: Option<u64>,
+}
+fn pass_malloc<T>(source: &str, f: impl FnOnce(&mut MallocCheckpoints) -> T) -> Option<T> {
+    let slot = source_slot(source)?;
+    with_passes(|p| {
+        p.lock().unwrap_or_else(|e| e.into_inner())[slot]
+            .as_mut()
+            .map(|pass| f(&mut pass.4))
+    })
+}
+pub(crate) fn index_clone_start(source: &str) {
+    let sample = footprint::malloc_in_use();
+    pass_malloc(source, |points| {
+        points.index_clone = Some(sample);
+        points.page_end = None;
+    });
+}
+pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedBytes) {
+    let started = Instant::now();
+    let bytes = measure();
+    let cost_us = wall_us(started);
+    if let Some(slot) = source_slot(source) {
+        with_passes(|p| {
+            if let Some(pass) = p.lock().unwrap_or_else(|e| e.into_inner())[slot].as_mut() {
+                pass.3 = Some((bytes, cost_us));
+            }
+        });
+    }
+}
+#[derive(Default, Serialize)]
+pub(crate) struct PassOutcomes {
+    pub(crate) selected: u64,
+    pub(crate) accepted: u64,
+    pub(crate) index_saved: u64,
+    pub(crate) progress_committed: u64,
+    pub(crate) progress_unchanged: u64,
+    pub(crate) progress_not_published: u64,
+    /// The paced request this finish made: a page reason (`existing`) or the
+    /// first-import AC arm (`bootstrap_runnable`), its first-import flag and
+    /// the power state it saw. All zero when no request was made.
+    pub(crate) paced_request_existing: u64,
+    pub(crate) paced_request_bootstrap_runnable: u64,
+    pub(crate) paced_first_import: u64,
+    pub(crate) paced_power_allowed: u64,
+    pub(crate) paced_power_battery: u64,
+}
+thread_local! {
+    // Rotation owns a source from prepare through finish on the same thread.
+    static PASS_OUTCOMES: std::cell::RefCell<Option<PassOutcomes>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn pass_outcomes(record: impl FnOnce(&mut PassOutcomes)) {
+    PASS_OUTCOMES.with_borrow_mut(|outcomes| {
+        if let Some(outcomes) = outcomes {
+            record(outcomes);
+        }
+    });
+}
+process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([const { None }; 3]));
+process_static!(fn with_pass_starts: AtomicU64 = AtomicU64::new(0));
+/// Passes started so far, then whether one is open. Read at an off-pass
+/// window's open and close; any change or open pass marks the window.
+fn pass_state() -> (u64, bool) {
+    let started = with_pass_starts(|n| n.load(SeqCst));
+    let open = with_passes(|p| {
+        p.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(Option::is_some)
+    });
+    (started, open)
+}
+/// A pass that ended without a finish (none to do, refused, failed) is no
+/// longer open; a finished pass already took its slot.
+pub(crate) fn pass_ended(source: &str) {
+    if let Some(slot) = source_slot(source) {
+        PASS_OUTCOMES.set(None);
+        with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot] = None);
+    }
+}
+#[derive(Serialize)]
+struct PassSummary {
+    wall_us: u64,
+    cpu_us: Option<u64>,
+    #[serde(flatten)]
+    counters: Metrics<7>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_allocated_bytes: Option<u64>,
+    sample_cost_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_heap_bytes: Option<RetainedBytes>,
+    #[serde(flatten)]
+    outcomes: PassOutcomes,
+}
+/// Named stage window, emitted on normal drop; unwinding emits nothing.
+/// `offpass_` stages add CPU split scalars and do not start footprint sampling.
+pub(crate) struct StageWindow {
+    stage: &'static str,
+    source: Source,
+    probe: Probe,
+    footprint: Option<footprint::Stage>,
+    jsonl: Option<jsonl::Scope>,
+    evidence_mem: Option<EvidenceMem>,
+    offpass_cpu: Option<Option<StateV2Cpu>>,
+    offpass_passes: Option<(u64, bool)>,
+    finish_sample: Option<Option<ProcessSample>>,
+    pass: Option<PassSummary>,
+    /// Off-pass control request counts from `take_control` (no ids or args).
+    pub(crate) control: BTreeMap<&'static str, u64>,
+}
+/// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
+/// at A (API evidence attached), B (root loop done) and C (cross-root finish
+/// done), footprint at A and B (C is `stage_end`), and at B the rows the pass
+/// keeps, the largest root's rows with its keep bit, and legacy owners; and
+/// the evidence chunk's families and their side-file bytes (`None`: a size
+/// could not be read).
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct EvidenceMem {
+    in_use_bytes: [Option<u64>; 3],
+    footprint_bytes: [Option<u64>; 2],
+    pub(crate) kept_rows: usize,
+    largest_root_rows: usize,
+    largest_root_kept: bool,
+    pub(crate) legacy_owners: usize,
+    groups: usize,
+    side_file_bytes: Option<u64>,
+}
+crate::heap_layout_bound::no_heap!(true; EvidenceMem);
+impl EvidenceMem {
+    pub(crate) fn of_chunk(groups: usize, side_file_bytes: Option<u64>) -> Self {
+        Self {
+            groups,
+            side_file_bytes,
+            ..Self::default()
+        }
+    }
+    /// Checkpoint 0 = A, 1 = B, 2 = C.
+    pub(crate) fn sample(&mut self, at: usize) {
+        self.in_use_bytes[at] = footprint::malloc_in_use();
+        if let Some(slot) = self.footprint_bytes.get_mut(at) {
+            *slot = footprint::current().phys_footprint_bytes;
+        }
+    }
+    pub(crate) fn note_root(&mut self, rows: usize, kept: bool) {
+        if rows > self.largest_root_rows {
+            self.largest_root_rows = rows;
+            self.largest_root_kept = kept;
+        }
+    }
+}
+impl StageWindow {
+    pub(crate) fn set_refusal_exposure(&mut self, counts: RefusalExposure) {
+        self.probe.refusal_exposure = (counts != RefusalExposure::default()).then_some(counts);
+    }
+    pub(crate) fn set_evidence_mem(&mut self, mem: EvidenceMem) {
+        self.evidence_mem = Some(mem);
+    }
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        let offpass = stage.starts_with("offpass_");
+        let offpass_passes = offpass.then(pass_state);
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            probe: Probe::start(),
+            footprint: (!offpass).then(footprint::Stage::begin).flatten(),
+            jsonl: None,
+            evidence_mem: None,
+            finish_sample: None,
+            pass: None,
+            offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            offpass_passes,
+            control: BTreeMap::new(),
+        }
+    }
+    /// A window that also scopes and reports JSONL line scalars for `source`.
+    pub(crate) fn begin_jsonl(source: &str, stage: &'static str) -> Self {
+        let mut window = Self::begin(source, stage);
+        window.jsonl = Some(jsonl::Scope::begin(source));
+        window
+    }
+}
+impl Drop for StageWindow {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(before) = self.offpass_cpu {
+            let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
+            let observation = self.probe.observation();
+            let (started, open) = pass_state();
+            let pass_overlap = open
+                || self
+                    .offpass_passes
+                    .is_some_and(|(before, open)| open || before != started);
+            aggregate_offpass(Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: self.stage,
+                source: self.source,
+                counts: OffpassCounts {
+                    count: 1,
+                    wall_max_us: observation.wall_elapsed_us,
+                    cpu_user_us: samples
+                        .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
+                    cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+                    control: std::mem::take(&mut self.control),
+                    pass_overlap,
+                },
+                observation,
+            });
+            return;
+        }
+        #[derive(Serialize)]
+        struct Counts {
+            // Zero exposure is stored as None and stays off the record.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refusal_exposure: Option<RefusalExposure>,
+            #[serde(flatten)]
+            jsonl: Option<jsonl::Counts>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            evidence_mem: Option<EvidenceMem>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pass: Option<PassSummary>,
+        }
+        let mut observation = match self.finish_sample {
+            Some(after) => {
+                Observation::between(wall_us(self.probe.started), self.probe.process, after)
+            }
+            None => self.probe.observation(),
+        };
+        observation.footprint = self
+            .footprint
+            .as_ref()
+            .map_or_else(footprint::unavailable, footprint::Stage::finish);
+        if !matches!(
+            self.stage,
+            "source_finish" | "claude_local_evidence" | "evidence_read" | "evidence_fold"
+        ) {
+            observation = observation.slim();
+        }
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: self.stage,
+            source: self.source,
+            observation,
+            counts: Counts {
+                refusal_exposure: self.probe.refusal_exposure,
+                jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
+                evidence_mem: self.evidence_mem,
+                pass: self.pass.take(),
+            },
+        });
+    }
+}
+#[derive(Serialize)]
+struct OffpassCounts {
+    count: u64,
+    cpu_user_us: Option<u64>,
+    cpu_sys_us: Option<u64>,
+    wall_max_us: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    control: BTreeMap<&'static str, u64>,
+    /// A source pass ran at some point in the window; absent means none did.
+    /// Kept in its own row so clean windows stay clean.
+    #[serde(skip_serializing_if = "is_zero")]
+    pass_overlap: bool,
+}
+std::thread_local! {
+    static CONTROL: std::cell::RefCell<BTreeMap<&'static str, u64>> = const {
+        std::cell::RefCell::new(BTreeMap::new())
+    };
+}
+/// One control request's command class on its worker thread; counts only.
+pub(crate) fn control_class(class: &'static str) {
+    CONTROL.with_borrow_mut(|counts| counts.insert(class, 1));
+}
+/// Times the Companion code-signature check; its result passes through as is.
+pub(crate) fn trust_check(check: impl FnOnce() -> bool) -> bool {
+    let started = Instant::now();
+    let trusted = check();
+    let us = wall_us(started);
+    if cfg!(target_os = "macos") {
+        let timer = [
+            ("trust_checks", 1),
+            ("trust_us_sum", us),
+            ("trust_us_max", us),
+        ];
+        CONTROL.with_borrow_mut(|counts| counts.extend(timer));
+    }
+    trusted
+}
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
+    CONTROL.take()
+}
+// Literal source/stage keys only; one pending row per lane and pass overlap,
+// no work-unit history.
+type OffpassRows = BTreeMap<(Source, &'static str, bool), Record<OffpassCounts>>;
+process_static!(fn with_offpass: std::sync::Mutex<OffpassRows> = std::sync::Mutex::new(BTreeMap::new()));
+fn aggregate_offpass(mut row: Record<OffpassCounts>) {
+    with_offpass(|state| {
+        let mut rows = state.lock().unwrap_or_else(|error| error.into_inner());
+        let key = (row.source, row.stage, row.counts.pass_overlap);
+        if let Some(previous) = rows.remove(&key) {
+            row.counts.count += previous.counts.count;
+            row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
+            for (key, n) in previous.counts.control {
+                let max = key.ends_with("_max");
+                let total = row.counts.control.entry(key).or_default();
+                *total = if max { n.max(*total) } else { n + *total };
+            }
+            for (sum, prior) in [
+                (&mut row.counts.cpu_user_us, previous.counts.cpu_user_us),
+                (&mut row.counts.cpu_sys_us, previous.counts.cpu_sys_us),
+                (
+                    &mut row.observation.shared_process_cpu_delta_us,
+                    previous.observation.shared_process_cpu_delta_us,
+                ),
+            ] {
+                *sum = sum.zip(prior).map(|(a, b)| a + b);
+            }
+            row.observation.shared_process_disk_delta = row
+                .observation
+                .shared_process_disk_delta
+                .zip(previous.observation.shared_process_disk_delta)
+                .map(|(a, b)| DiskBytes {
+                    disk_read_bytes: a.disk_read_bytes + b.disk_read_bytes,
+                    disk_written_bytes: a.disk_written_bytes + b.disk_written_bytes,
+                    counters: Metrics(std::array::from_fn(|i| {
+                        a.counters.0[i]?.checked_add(b.counters.0[i]?)
+                    })),
+                });
+            row.observation.wall_elapsed_us += previous.observation.wall_elapsed_us;
+            row.observation.process_lifetime_max_rss_before_bytes =
+                previous.observation.process_lifetime_max_rss_before_bytes;
+        }
+        rows.insert(key, row);
+    });
+}
+fn flush_offpass() {
+    let rows = with_offpass(|state| {
+        std::mem::take(&mut *state.lock().unwrap_or_else(|error| error.into_inner()))
+    });
+    for row in rows.into_values() {
+        emit(&row);
+    }
+}
+#[cfg(all(test, unix))]
+pub(crate) fn flush_offpass_for_resource_test() {
+    flush_offpass();
+}
+
+/// The page's largest listed or read file size, without paths or read
+/// admission decisions.
+pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
+    source_count(source.api_slug(), FILE_READ_START + 2, |n| {
+        n.fetch_max(bytes, Relaxed)
+    });
+}
+/// A file new to the index: its read time, counted on the page when the
+/// file finishes (unwinding counts nothing).
+pub(crate) struct FirstRead {
+    source: &'static str,
+    started: Instant,
+}
+crate::heap_layout_bound::no_heap!(true; FirstRead { source, started });
+impl FirstRead {
+    pub(crate) fn begin(
+        source: crate::snapshots::SnapshotSource,
+        bytes: u64,
+        first: bool,
+    ) -> Option<Self> {
+        observe_file_size(source, bytes);
+        first.then(|| Self {
+            source: source.api_slug(),
+            started: Instant::now(),
+        })
+    }
+}
+impl Drop for FirstRead {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let ms = wall_us(self.started) / 1000;
+        source_count(self.source, FILE_READ_START, |n| n.fetch_add(1, Relaxed));
+        source_count(self.source, FILE_READ_START + 1, |n| {
+            n.fetch_max(ms, Relaxed)
+        });
+    }
+}
+const FILE_READS: [(&str, usize); 3] = [
+    ("first_read_files", FILE_READ_START),
+    ("first_read_max_ms", FILE_READ_START + 1),
+    ("largest_file_bytes", FILE_READ_START + 2),
+];
+/// Expired growth claims that selection woke this page: keys woken and the
+/// oldest expiry. Counted after selection; never a gate.
+pub(crate) fn hold_wake(source: &str, keys: u64, oldest_expired_secs: u64) {
+    source_count(source, HOLD_WAKE_START, |n| n.fetch_add(keys, Relaxed));
+    source_count(source, HOLD_WAKE_START + 1, |n| {
+        n.fetch_max(oldest_expired_secs, Relaxed)
+    });
+}
+const USAGE_GAPS: [(&str, usize); 4] = [
+    ("usage_rows_missing_model_rows", USAGE_GAP_START),
+    ("usage_rows_missing_model_sessions", USAGE_GAP_START + 1),
+    ("zero_request_body_with_tokens_bodies", USAGE_GAP_START + 2),
+    (
+        "zero_request_body_with_tokens_sessions",
+        USAGE_GAP_START + 3,
+    ),
+];
+/// Gaps in one source's finished bodies (Claude after its local evidence
+/// fold): requests on rows with tokens whose model is the parsers' implicit
+/// one, and bodies with tokens but no request, each with its sessions.
+/// Borrowed and counted once the bodies are final; never a gate. The sync
+/// finish runs after the scan's page line, so these land on the next one.
+pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]) {
+    let mut sessions = [std::collections::BTreeSet::new(), Default::default()];
+    let (mut rows, mut zero_request_bodies) = (0_u64, 0_u64);
+    for body in bodies {
+        let implicit = body
+            .model_usage
+            .iter()
+            .filter(|row| {
+                row.model == crate::snapshots::IMPLICIT_USAGE_MODEL
+                    && crate::detected_uses::row_total_tokens(row) > 0
+            })
+            .fold(0_u64, |sum, row| sum.saturating_add(row.request_count));
+        if implicit > 0 {
+            rows = rows.saturating_add(implicit);
+            sessions[0].insert(body.source_session_id.as_str());
+        }
+        if body.request_count == 0
+            && crate::snapshots::claude_request_census::claude_conserved_tokens(body) > 0
+        {
+            zero_request_bodies += 1;
+            sessions[1].insert(body.source_session_id.as_str());
+        }
+    }
+    let [missing, zero] = sessions.map(|ids| ids.len() as u64);
+    for ((_, slot), amount) in USAGE_GAPS
+        .iter()
+        .zip([rows, missing, zero_request_bodies, zero])
+    {
+        source_count(source, *slot, |n| n.fetch_add(amount, Relaxed));
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        if let Some(pass) = &self.pass {
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&pass.retained_heap_bytes, c)?;
+        }
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.control, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
+    }
+}
+
+fn wall_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn emit_stage(
+    stage: &'static str,
+    source: Source,
+    demanded_requests: Option<usize>,
+    observation: impl FnOnce() -> Observation,
+) {
+    if std::thread::panicking() {
+        return;
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source,
+        observation: observation(),
+        counts: StageCounts { demanded_requests },
+    });
+}
+/// Named window summed over repeated steps inside a source stage: one record
+/// with summed wall time and process CPU, and no footprint fields. Counts
+/// hold only an optional demand size; unwinding emits nothing, like
+/// `StageWindow`.
+pub(crate) struct StageSum {
+    stage: &'static str,
+    source: Source,
+    wall_us: u64,
+    cpu_us: Option<u64>,
+    pub(crate) demanded_requests: Option<usize>,
+}
+impl StageSum {
+    pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
+        Self {
+            stage,
+            source: Source::from_slug(source),
+            wall_us: 0,
+            cpu_us: Some(0),
+            demanded_requests: None,
+        }
+    }
+    /// Runs `step` unchanged and adds its wall and CPU to the window.
+    pub(crate) fn time<T>(&mut self, step: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let before = process_sample();
+        let result = step();
+        let delta = Observation::between(wall_us(started), before, process_sample());
+        self.wall_us = self.wall_us.saturating_add(delta.wall_elapsed_us);
+        self.cpu_us = self
+            .cpu_us
+            .zip(delta.shared_process_cpu_delta_us)
+            .map(|(sum, cpu)| sum.saturating_add(cpu));
+        result
+    }
+}
+impl Drop for StageSum {
+    fn drop(&mut self) {
+        emit_stage(self.stage, self.source, self.demanded_requests, || {
+            let mut observation = Observation::point();
+            observation.wall_elapsed_us = self.wall_us;
+            observation.shared_process_cpu_delta_us = self.cpu_us;
+            observation
+        });
+    }
+}
+/// Point outcome at an existing Codex authority boundary. Two fixed records at
+/// most per completed page, using the existing best-effort stderr carrier.
+/// This is not a completion heartbeat, resource window or ingestion verdict.
+pub(crate) fn codex_census_fence(
+    phase: crate::codex_scan_diagnostics::CensusFencePhase,
+    outcome: crate::codex_scan_diagnostics::CensusFenceOutcome,
+    invalidation: crate::codex_scan_diagnostics::CensusInvalidation,
+) {
+    #[derive(Serialize)]
+    struct Counts {
+        phase: crate::codex_scan_diagnostics::CensusFencePhase,
+        outcome: crate::codex_scan_diagnostics::CensusFenceOutcome,
+        invalidation: crate::codex_scan_diagnostics::CensusInvalidation,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "codex_census_fence",
+        source: Source::Codex,
+        // A point observation has no measured resource window. Do not take
+        // extra CPU/RSS samples or invent numeric measurements for this event.
+        observation: Observation::point(),
+        counts: Counts {
+            phase,
+            outcome,
+            invalidation,
+        },
+    });
+}
+
+#[derive(Serialize)]
+struct StageCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    demanded_requests: Option<usize>,
+}
+
+/// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
+pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
+    traversal_point("bounded_traversal_transition", source, counts);
+}
+#[derive(Serialize)]
+struct ListMissingCause {
+    cause: &'static str,
+}
+
+/// Local alarm, once per Claude cycle while it lasts: the re-emission list was
+/// installed once and its file is now missing, so the one-time history
+/// re-read is paused. `cause` names why it reads installed: the seen-marker,
+/// Set intent, or intent that could not be read (addendum 3). No path, id or
+/// wire event.
+pub(crate) fn claude_reemission_list_missing(cause: &'static str) {
+    traversal_point(
+        "claude_reemission_list_missing_after_install",
+        "claude_code",
+        &ListMissingCause { cause },
+    );
+}
+/// Local alarm, at most hourly: Claude history owes an upgrade to the active
+/// body-witness revision while the protected list was never installed, so
+/// the history gate holds it. Counts only; no path, id or wire event.
+pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_upgrade_owed_without_list",
+        "claude_code",
+        counts,
+    );
+}
+static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct HistoryProofCorrectionDeferred {
+    history_proof_correction_deferred: u64,
+    history_proof_correction_deferred_total: u64,
+}
+
+/// Local counter: proof-correction members
+/// the history gate holds, deferred instead of blocking settlement. This
+/// settlement's count and a saturating process total. Counts only; no path,
+/// id or wire event.
+pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
+    let members = u64::try_from(members).unwrap_or(u64::MAX);
+    let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
+        .try_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_history_proof_correction_deferred",
+        "claude_code",
+        &HistoryProofCorrectionDeferred {
+            history_proof_correction_deferred: members,
+            history_proof_correction_deferred_total: previous.saturating_add(members),
+        },
+    );
+}
+/// Local diagnostic, at most hourly: the backfill state's
+/// `prior_history_unverified` marker has been read set since the given time
+/// (first seen by this process). Counts and times only; no path, id or wire
+/// event.
+pub(crate) fn claude_prior_history_unverified(counts: &impl Serialize) {
+    traversal_point("claude_prior_history_unverified", "claude_code", counts);
+}
+/// Local alarm, once per refusal: a body-witness revision with no history
+/// policy row was not activated, and the previous active revision was kept.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_history_revision_activation_refused(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_revision_activation_refused",
+        "claude_code",
+        counts,
+    );
+}
+static REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct ReemissionFamilyClosureRootAbsentExcluded {
+    claude_reemission_family_closure_root_absent_excluded: u64,
+    claude_reemission_family_closure_root_absent_excluded_total: u64,
+}
+
+/// Local counter: subagent members the
+/// history gate held only through their listed family root while the root
+/// file is absent. This page's count and a saturating process total. Counts
+/// only; no path, id or wire event.
+pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
+    let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
+        .try_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_reemission_family_closure_root_absent_excluded",
+        "claude_code",
+        &ReemissionFamilyClosureRootAbsentExcluded {
+            claude_reemission_family_closure_root_absent_excluded: members,
+            claude_reemission_family_closure_root_absent_excluded_total: previous
+                .saturating_add(members),
+        },
+    );
+}
+/// Local alarm: the one-time Claude history re-read latched its stop until
+/// the daemon restarts, once when it sets and at most
+/// hourly as a reminder. Counts and hashed root refs only; no wire event.
+pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Serialize) {
+    let stage = if reminder {
+        "claude_reemission_stop_latched_reminder"
+    } else {
+        "claude_reemission_stop_latched"
+    };
+    traversal_point(stage, "claude_code", counts);
+}
+/// State-v2 backend observations use the existing local-only diagnostics sink.
+/// Callers supply counts, lengths and bounded states, never storage keys.
+pub(crate) fn claude_state_v2(counts: &impl Serialize) {
+    traversal_point("claude_state_v2", "claude_code", counts);
+}
+/// The page's local counter line, as [since last, total] counts. No path, id or
+/// wire event.
+pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_alarm", source, counts);
+}
+pub(crate) fn codex_continuation(held: Option<&'static str>) {
+    let counts = serde_json::json!({
+        "continuation_pages_run": u8::from(held.is_none()),
+        "continuation_held": held.map(|reason| BTreeMap::from([(reason, 1u8)])).unwrap_or_default(),
+    });
+    traversal_point("codex_continuation", "codex", &counts);
+}
+pub(crate) fn codex_continuation_mint(outcome: &'static str) {
+    let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
+    traversal_point("codex_continuation_mint", "codex", &counts);
+}
+/// Rotates a large service log once at startup, while the state lock is held.
+pub fn rotate_service_log_at_startup() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_at_startup();
+}
+/// Rotates a service log that reached the startup threshold while running.
+pub(crate) fn rotate_service_log_if_due() {
+    #[cfg(unix)]
+    stderr_rotation::rotate_while_running();
+}
+
+/// Content-free allocator launch configuration, called once before serving.
+pub fn log_startup_resources() {
+    let setting = |name: &str| {
+        let value = std::env::var_os(name);
+        let number = value
+            .as_deref()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u64>().ok());
+        (value.is_some(), number)
+    };
+    let (large_cache_set, large_cache) = setting("MallocLargeCache");
+    let (space_efficient_set, space_efficient) = setting("MallocSpaceEfficient");
+    traversal_point(
+        "startup",
+        "unknown",
+        &serde_json::json!({
+            "malloc_large_cache_set": large_cache_set,
+            "malloc_large_cache": large_cache,
+            "malloc_space_efficient_set": space_efficient_set,
+            "malloc_space_efficient": space_efficient,
+        }),
+    );
+    // The shutdown row is process-wide; a captured unit test only checks startup.
+    #[cfg(test)]
+    if TEST_OUTPUT.with(|output| output.borrow().is_some()) {
+        return;
+    }
+    #[cfg(unix)]
+    shutdown::install();
+}
+
+pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source: Source::from_slug(source),
+        observation: Observation::point(),
+        counts,
+    });
+}
+
+pub(crate) fn state_save_start(source: &str) {
+    let before = pass_malloc(source, |points| points.page_end).flatten();
+    malloc_delta_point(
+        "state_save_start",
+        source,
+        before,
+        footprint::malloc_in_use(),
+    );
+}
+fn malloc_delta_point(stage: &'static str, source: &str, before: Option<u64>, after: Option<u64>) {
+    emit_stage(stage, Source::from_slug(source), None, || Observation {
+        malloc_in_use_bytes: after,
+        malloc_in_use_bytes_delta: before
+            .zip(after)
+            .and_then(|(a, b)| i64::try_from(i128::from(b) - i128::from(a)).ok()),
+        ..Observation::point()
+    });
+}
+
+/// Per-page restore attempts. A miss class never authorizes a body read.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FullCauses {
+    pub(crate) restore_outcome: RestoreCounts,
+}
+impl FullCauses {
+    fn is_empty(&self) -> bool {
+        self.restore_outcome.miss.is_empty()
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RestoreCounts {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    miss: BTreeMap<&'static str, u64>,
+}
+impl RestoreCounts {
+    #[cfg(unix)]
+    pub(crate) fn record(&mut self, class: crate::snapshots::sampled_scan::MissClass) {
+        let count = self.miss.entry(class.label()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CollectionCounts {
+    pub(crate) scanned_files: usize,
+    pub(crate) semantic_noops: usize,
+    /// Absent without sampled acquisition. Even when present, these are not
+    /// total filesystem reads: byte counts exclude failed plans, joins,
+    /// discovery and sidecars. Selection counts can include failed/repeated plans.
+    pub(crate) sampled_acquisition: Option<ReadCounts>,
+    #[serde(skip_serializing_if = "FullCauses::is_empty")]
+    pub(crate) full_causes: FullCauses,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct ReadCounts {
+    pub(crate) full_selections: usize,
+    pub(crate) tail_selections: usize,
+    pub(crate) unchanged_selections: usize,
+    pub(crate) completed_native_bytes: u64,
+    /// Of `completed_native_bytes`, Full reads'; the rest is Tail.
+    pub(crate) completed_full_native_bytes: u64,
+    pub(crate) completed_guard_bytes: u64,
+    pub(crate) acquisition_admission: AcquisitionAdmission,
+    pub(crate) page_events: PageEvents,
+    pub(crate) index_state_at_page_end: IndexState,
+    /// Resumable large-file Codex read cursor. `null` when its
+    /// snapshot could not be obtained (no Codex cursor page tick in this scan,
+    /// or the cursor state was busy at completion): unknown, never zero
+    /// activity.
+    pub(crate) codex_cursor: Option<Box<CodexCursorCounts>>,
+}
+
+/// Content-free, fixed width; each count saturates at `u32::MAX`. Like
+/// `FullReasons`, only nonzero keys are serialized (an absent key is zero);
+/// the block itself is `null` when unknown.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct CodexCursorCounts {
+    /// Process-global cursor counter deltas while this scan's window was
+    /// open (its first cursor page tick to its completion). The cursor is
+    /// shared by every namespace in the process and overlapping scans move
+    /// these counters too: NOT events caused by this scan.
+    pub(crate) during_scan_window: CodexCursorEvents,
+    /// Process-wide cursor gauges when this scan completed.
+    pub(crate) retained: CodexCursorRetained,
+}
+
+macro_rules! codex_cursor_events_struct {
+    ($($(#[$doc:meta])* $field:ident,)+) => {
+        /// Process-global cursor events during a scan window (shared process scope,
+        /// not attributed to one scan or namespace).
+        #[derive(Clone, Copy, Debug, Default)]
+        pub(crate) struct CodexCursorEvents { $($(#[$doc])* pub(crate) $field: u32,)+ }
+        impl Serialize for CodexCursorEvents {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.$field != 0 { map.serialize_entry(stringify!($field), &self.$field)?; })+
+                map.end()
+            }
+        }
+    };
+}
+codex_cursor_events!(codex_cursor_events_struct);
+
+/// Process-wide cursor state when the scan completed (gauges, not events).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorRetained {
+    /// A paused job is waiting in the slot.
+    pub(crate) paused_job: bool,
+    /// Its charged bytes (requested layout, measured at pause).
+    pub(crate) paused_job_charged_bytes: u32,
+    pub(crate) memo_entries: u32,
+    pub(crate) parked_entries: u32,
+    pub(crate) invalidation_entries: u32,
+    pub(crate) rotation_waiters: u32,
+    /// Process-lifetime maximum `now - due` of an overdue certification.
+    pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
+}
+impl Serialize for CodexCursorRetained {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if self.paused_job {
+            map.serialize_entry("paused_job", &true)?;
+        }
+        for (key, count) in [
+            ("paused_job_charged_bytes", self.paused_job_charged_bytes),
+            ("memo_entries", self.memo_entries),
+            ("parked_entries", self.parked_entries),
+            ("invalidation_entries", self.invalidation_entries),
+            ("rotation_waiters", self.rotation_waiters),
+            (
+                "lifetime_audit_overdue_max_age_seconds",
+                self.lifetime_audit_overdue_max_age_seconds,
+            ),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// Fixed page totals, not per-file history. Unassessed is attempts - assessed;
+/// a short-circuited gate is never reported as a known false result.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AssessedBool {
+    assessed: usize,
+    matched: usize,
+}
+impl AssessedBool {
+    pub(crate) fn observe(&mut self, value: bool) {
+        self.assessed = self.assessed.saturating_add(1);
+        self.matched = self.matched.saturating_add(usize::from(value));
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AcquisitionAdmission {
+    pub(crate) attempts: usize,
+    pub(crate) owning_header_current: AssessedBool,
+    pub(crate) state_census_complete: AssessedBool,
+    pub(crate) sidecar_census_complete: AssessedBool,
+    pub(crate) reduction_dependencies_available: AssessedBool,
+    pub(crate) index_entry_present: AssessedBool,
+    pub(crate) audit_metadata_supported: AssessedBool,
+    pub(crate) protected_history: AssessedBool,
+    pub(crate) forced_family: AssessedBool,
+    pub(crate) audit_debt_present: AssessedBool,
+    pub(crate) audit_slot_available: AssessedBool,
+    pub(crate) sampling_allowed: AssessedBool,
+    pub(crate) prepare_started: usize,
+    pub(crate) prepare_failed: usize,
+}
+crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
+
+/// Existing audit point, using already computed final/previous fingerprints.
+/// Additive aliases retain their meaning; neither comparison is an audit-policy
+/// benefit verdict (a suffix or policy change can also change either witness).
+pub(crate) fn sampled_audit_comparison(
+    source: &str,
+    semantic: (Option<&str>, Option<&str>),
+    additive: (Option<&str>, Option<&str>),
+) {
+    #[derive(Serialize)]
+    struct Counts {
+        body_comparison_available: bool,
+        effective_body_changed: bool,
+        semantic_comparison_available: bool,
+        semantic_changed: bool,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "sampled_audit_comparison",
+        source: Source::from_slug(source),
+        observation: Observation::point(),
+        counts: Counts {
+            body_comparison_available: additive.1.is_some(),
+            effective_body_changed: additive.0 != additive.1,
+            semantic_comparison_available: semantic.1.is_some(),
+            semantic_changed: semantic.0 != semantic.1,
+        },
+    });
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct PageEvents {
+    #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
+    pub(crate) full_cause: rearm_cause::Counts,
+    #[serde(skip_serializing_if = "claude_reread::FullByParseReason::is_empty")]
+    pub(crate) full_by_parse_reason: claude_reread::FullByParseReason,
+    pub(crate) full_reasons: FullReasons,
+    pub(crate) priority_full_replays: usize,
+    pub(crate) audits_started: usize,
+    pub(crate) audits_completed: usize,
+    pub(crate) max_start_overdue_seconds: u64,
+    pub(crate) max_completion_overdue_seconds: u64,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct IndexState {
+    pub(crate) audit_quiet_retired: usize,
+    pub(crate) audit_cap_full: usize,
+    pub(crate) pending_audits: usize,
+    pub(crate) overdue_audits: usize,
+    pub(crate) oldest_due_age_seconds: u64,
+}
+/// Reuse the existing counters; serialize only nonzero closed reason keys.
+#[derive(Debug)]
+pub(crate) struct FullReasons(pub(crate) [usize; 11]);
+impl Serialize for FullReasons {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::transcript_acquisition::FullReason::*;
+        let mut map = serializer.serialize_map(None)?;
+        for (reason, key) in [
+            (StateMissing, "state_missing"),
+            (AuditDue, "audit_due"),
+            (ClockChanged, "clock_changed"),
+            (ScopeChanged, "scope_changed"),
+            (InvalidCheckpoint, "invalid_checkpoint"),
+            (Replaced, "replaced"),
+            (Shrunk, "shrunk"),
+            (SameSizeEdit, "same_size_edit"),
+            (HeadChanged, "head_changed"),
+            (BoundaryChanged, "boundary_changed"),
+            (UnsupportedIdentity, "unsupported_identity"),
+        ] {
+            let count = self.0[reason.slot()];
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct UploadCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_start: Option<u64>,
+    serialized_body_bytes: Option<u64>,
+    gzip_attempts: u64,
+    identity_attempts: u64,
+    attempted_encoded_body_bytes: u64,
+    attempted_decoded_body_bytes: u64,
+}
+pub(crate) struct UploadCall {
+    probe: Probe,
+    source: Source,
+    counts: UploadCounts,
+}
+impl UploadCall {
+    pub(crate) fn start(source: &str) -> Self {
+        let probe = Probe::page();
+        let malloc_in_use_bytes_start = footprint::malloc_in_use();
+        if let Some(before) = pass_malloc(source, |points| points.index_clone.take()).flatten() {
+            malloc_delta_point(
+                "index_clone_to_upload",
+                source,
+                before,
+                malloc_in_use_bytes_start,
+            );
+        }
+        Self {
+            probe,
+            source: Source::from_slug(source),
+            counts: UploadCounts {
+                malloc_in_use_bytes_start,
+                ..UploadCounts::default()
+            },
+        }
+    }
+    pub(crate) fn serialized(&mut self, bytes: usize) {
+        self.counts.serialized_body_bytes = Some(bytes as u64);
+    }
+    /// Call after request construction/validation, immediately before send_bytes.
+    /// Counts attempted body buffers, not successfully delivered network bytes.
+    pub(crate) fn attempt(&mut self, encoded_bytes: usize, gzip: bool) {
+        let count = if gzip {
+            &mut self.counts.gzip_attempts
+        } else {
+            &mut self.counts.identity_attempts
+        };
+        *count = count.saturating_add(1);
+        self.counts.attempted_encoded_body_bytes = self
+            .counts
+            .attempted_encoded_body_bytes
+            .saturating_add(encoded_bytes as u64);
+        self.counts.attempted_decoded_body_bytes = self
+            .counts
+            .attempted_decoded_body_bytes
+            .saturating_add(self.counts.serialized_body_bytes.unwrap_or(0));
+    }
+}
+impl Drop for UploadCall {
+    fn drop(&mut self) {
+        emit(&Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: std::process::id(),
+            stage: "snapshot_batch_call",
+            source: self.source,
+            observation: Observation {
+                malloc_in_use_bytes: footprint::malloc_in_use(),
+                ..self.probe.page_observation().slim()
+            },
+            counts: &self.counts,
+        });
+    }
+}
+
+#[derive(Serialize)]
+struct Record<T: Serialize> {
+    schema_version: u8,
+    process_id: u32,
+    stage: &'static str,
+    source: Source,
+    observation: Observation,
+    counts: T,
+}
+fn emit(record: &impl Serialize) {
+    if let Ok(json) = serde_json::to_string(record) {
+        #[cfg(test)]
+        if TEST_OUTPUT.with(|output| {
+            if let Some(output) = output.borrow_mut().as_mut() {
+                output.push(json.clone());
+                #[cfg(unix)]
+                crate::snapshots::resource_fixture::record_native_stage(&json);
+                #[cfg(unix)]
+                {
+                    // Count the actual formatter/writer bytes, including prefix/newline.
+                    let mut sink = Vec::new();
+                    write_line(&json, &mut sink);
+                    crate::snapshots::resource_fixture::record_log(sink.len() as u64);
+                }
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+        // Diagnostic sink failure must not change collection or ACK/recovery.
+        write_line(&json, &mut std::io::stderr().lock());
+    }
+}
+
+fn write_line(json: &str, writer: &mut impl Write) {
+    let _ = writeln!(writer, "ottto-service: local_resources {json}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OUTPUT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_OUTPUT.with(|output| *output.borrow_mut() = None);
+        }
+    }
+    TEST_OUTPUT.with(|output| {
+        assert!(output.borrow().is_none());
+        *output.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let result = f();
+    let output = TEST_OUTPUT.with(|output| output.borrow_mut().take().unwrap());
+    (
+        result,
+        output
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    /// [behaviour] Startup settings use the versioned content-free diagnostic carrier.
+    #[test]
+    fn startup_resources_use_the_shared_carrier() {
+        let (_, rows) = super::capture(super::log_startup_resources);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], std::process::id());
+        assert_eq!(row["stage"], "startup");
+        assert_eq!(row["source"], "unknown");
+        let counts = row["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 4);
+        for prefix in ["malloc_large_cache", "malloc_space_efficient"] {
+            assert!(counts[&format!("{prefix}_set")].is_boolean());
+            let value = &counts[prefix];
+            assert!(value.is_null() || value.is_u64());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "private subprocess shutdown fixture"]
+    fn shutdown_record_fixture() {
+        if std::env::var_os("OTTTO_SHUTDOWN_FIXTURE").is_none() {
+            return;
+        }
+        super::log_startup_resources();
+        println!("shutdown-fixture-ready");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    /// [behaviour] Startup diagnostics install the shutdown row: SIGTERM
+    /// writes exactly one, and the process still dies by SIGTERM.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_writes_one_shutdown_row() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        let now_ms = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_resource_diagnostics::tests::shutdown_record_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OTTTO_SHUTDOWN_FIXTURE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let before = now_ms();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("shutdown-fixture-ready") {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "fixture ended early"
+            );
+        }
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let status = child.wait().unwrap();
+        let after = now_ms();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("local_resources ") && line.contains("\"shutdown\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        // The handler's fixed stack buffer holds the whole row with room for
+        // longer process ids and timestamps.
+        assert!(
+            lines[0].len() < super::shutdown::LINE_BUFFER / 2,
+            "{}",
+            lines[0]
+        );
+        let (_, json) = lines[0]
+            .split_once("ottto-service: local_resources ")
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(row["stage"], "shutdown");
+        assert_eq!(row["schema_version"], super::SCHEMA_VERSION);
+        assert_eq!(row["process_id"], child.id());
+        assert_eq!(row["source"], "unknown");
+        assert_eq!(row["counts"], serde_json::json!({}));
+        let observed = row["observation"]["observed_unix_ms"].as_u64().unwrap();
+        assert!(
+            (before..=after).contains(&observed),
+            "{before} {observed} {after}"
+        );
+    }
+
+    #[test]
+    fn compressed_causes_have_distinct_pinned_indices() {
+        use super::CodexZstCause::*;
+        // Frozen numeric slots survive as holes; only live producers keep
+        // enum variants. Old archive causes decode through the inert fields.
+        const ALL: [Option<super::CodexZstCause>; super::CODEX_ZST_CAUSES] = [
+            Some(ReplayNotAuthorized),
+            None,
+            None,
+            None,
+            Some(GroupProbeUnsupported),
+            Some(GroupReadUnsupported),
+            None,
+            Some(PhysicalOffsetUnsupported),
+            Some(AdmissionRefused),
+            Some(DecodeFailed),
+            None,
+            None,
+            Some(DecodedOverLimit),
+            None,
+            None,
+            Some(HeaderUnfunded),
+            Some(CompatibilityUnfunded),
+            None,
+            None,
+            None,
+        ];
+        assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        assert!(serde_json::from_str::<super::CodexZstCause>(
+            "\"decoder_refused_header_occupancy\""
+        )
+        .is_err());
+        let mut labels = std::collections::BTreeSet::new();
+
+        for (index, cause) in ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cause)| cause.as_ref().map(|cause| (index, cause)))
+        {
+            assert_eq!(*cause as usize, index);
+            let label = serde_json::to_string(cause).unwrap();
+            assert!(labels.insert(label.clone()), "unique persisted label");
+            assert_eq!(
+                serde_json::from_str::<super::CodexZstCause>(&label).unwrap(),
+                *cause
+            );
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn sidecar_reparse_counts_are_sparse_exact_and_drained_per_page() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        // Drain earlier fixture activity on this test thread.
+        take_claude_sidecar_reparse();
+        let (_, rows) = capture(|| {
+            Probe::start().collection("claude_code", collection());
+            claude_sidecar_reparse(2, 123);
+            Probe::start().collection("claude_code", collection());
+            Probe::start().collection("claude_code", collection());
+        });
+        for row in [&rows[0], &rows[2]] {
+            for key in [
+                "claude_sidecar_reparse_files",
+                "claude_sidecar_reparse_bytes",
+            ] {
+                assert!(row["counts"].get(key).is_none());
+            }
+        }
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_files"], 2);
+        assert_eq!(rows[1]["counts"]["claude_sidecar_reparse_bytes"], 123);
+        let maximum = serde_json::to_value(ClaudeSidecarReparse {
+            claude_sidecar_reparse_files: u64::MAX,
+            claude_sidecar_reparse_bytes: u64::MAX,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(maximum["claude_sidecar_reparse_files"], u64::MAX);
+        assert_eq!(maximum["claude_sidecar_reparse_bytes"], u64::MAX);
+        let (_, rows) = capture(|| {
+            claude_telemetry_retention(ClaudeTelemetryRetention {
+                held_roots: 3,
+                held_copied: 1,
+                held_no_transcript_roots: 2,
+                held_no_transcript_bytes: 7,
+                ..Default::default()
+            });
+            Probe::start().collection("claude_code", collection());
+        });
+        let counts = &rows[0]["counts"];
+        assert_eq!(counts["claude_telemetry_held_roots"], 3);
+        assert_eq!(counts["claude_telemetry_held_copied"], 1);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_roots"], 2);
+        assert_eq!(counts["claude_telemetry_held_no_transcript_bytes"], 7);
+    }
+
+    #[test]
+    fn connection_binding_failures_are_counted_without_sensitive_detail() {
+        let (_, lines) = capture(|| {
+            assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
+                .unwrap()
+                .is_none());
+            assert_eq!(connection_binding_read(Ok(7)).unwrap(), 7);
+            for message in [
+                "open connection binding /private/synthetic",
+                "parse connection binding https://synthetic.invalid",
+            ] {
+                let error =
+                    connection_binding_read::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+                assert_eq!(error.to_string(), message);
+            }
+            let error = anyhow::Error::new(ottto_core::CredentialFileCapRefused::ConnectionBinding);
+            assert!(connection_binding_read::<()>(Err(error)).is_err());
+        });
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|r| r["stage"] == "connection_binding_read")
+            .collect();
+        assert_eq!(unreadable.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r["stage"] == "credential_file_cap_refusal")
+                .count(),
+            1
+        );
+        for line in unreadable {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"],
+                serde_json::json!({"connection_binding_unreadable": 1})
+            );
+            let text = line.to_string();
+            assert!(!text.contains("/private") && !text.contains("synthetic.invalid"));
+        }
+    }
+
+    #[test]
+    fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
+        use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
+        with_credential_file_cap_refused(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let store = FileDeviceStore::new(&path);
+        let (_, lines) = capture(|| {
+            let error = credential_file_read(store.load()).unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            assert!(
+                credential_file_read(ottto_core::FileConnectionStore::new(&path).load()).is_err()
+            );
+            assert!(credential_file_read(
+                ottto_core::FilePendingDeviceCredentialStore::new(&path).load()
+            )
+            .is_err());
+            // The core secret store preserves this typed variant across its API.
+            let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
+            assert!(credential_file_read(secret)
+                .unwrap_err()
+                .is::<TokenStoreError>());
+            // Growth refusals carry the same typed inner error through io::Error.
+            let growth: anyhow::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                CredentialFileCapRefused::FileSecret,
+            )
+            .into());
+            assert!(credential_file_read(growth).is_err());
+            assert_eq!(credential_file_read(Ok(7)).unwrap(), 7);
+            let other: anyhow::Result<()> = Err(anyhow::anyhow!("ordinary read failure"));
+            assert!(credential_file_read(other).is_err());
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(lines.len(), 6);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["stage"], "credential_file_cap_refusal");
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"]["file_kind"],
+                match i {
+                    0 | 1 => "device_binding",
+                    2 => "connection_binding",
+                    3 => "pending_device_credential",
+                    _ => "file_secret",
+                }
+            );
+            assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
+            assert_eq!(
+                line["counts"]["credential_file_cap_refused_total"],
+                match i {
+                    0 | 2 | 3 | 4 => 1,
+                    _ => 2,
+                }
+            );
+            assert_eq!(line["counts"].as_object().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn history_proof_correction_deferral_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_history_proof_correction_deferred(2);
+            claude_history_proof_correction_deferred(3);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_history_proof_correction_deferred"
+        );
+        assert_eq!(lines[1]["counts"]["history_proof_correction_deferred"], 3);
+        let first = lines[0]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 2 && second >= first + 3, "{first} {second}");
+    }
+    #[test]
+    fn family_closure_root_absent_exclusion_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_reemission_family_closure_root_absent_excluded(1);
+            claude_reemission_family_closure_root_absent_excluded(2);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_reemission_family_closure_root_absent_excluded"
+        );
+        assert_eq!(
+            lines[1]["counts"]["claude_reemission_family_closure_root_absent_excluded"],
+            2
+        );
+        let first = lines[0]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 1 && second >= first + 2, "{first} {second}");
+    }
+    fn max_read_counts() -> ReadCounts {
+        let gate = AssessedBool {
+            assessed: usize::MAX,
+            matched: usize::MAX,
+        };
+        ReadCounts {
+            full_selections: (usize::MAX / 11) * 11,
+            tail_selections: usize::MAX,
+            unchanged_selections: usize::MAX,
+            completed_native_bytes: u64::MAX,
+            completed_full_native_bytes: u64::MAX,
+            completed_guard_bytes: u64::MAX,
+            acquisition_admission: AcquisitionAdmission {
+                attempts: usize::MAX,
+                owning_header_current: gate,
+                state_census_complete: gate,
+                sidecar_census_complete: gate,
+                reduction_dependencies_available: gate,
+                index_entry_present: gate,
+                audit_metadata_supported: gate,
+                protected_history: gate,
+                forced_family: gate,
+                audit_debt_present: gate,
+                audit_slot_available: gate,
+                sampling_allowed: gate,
+                prepare_started: usize::MAX,
+                prepare_failed: usize::MAX,
+            },
+            page_events: PageEvents {
+                full_cause: Default::default(),
+                full_by_parse_reason: Default::default(),
+                full_reasons: FullReasons([usize::MAX / 11; 11]),
+                priority_full_replays: usize::MAX,
+                audits_started: usize::MAX,
+                audits_completed: usize::MAX,
+                max_start_overdue_seconds: u64::MAX,
+                max_completion_overdue_seconds: u64::MAX,
+            },
+            index_state_at_page_end: IndexState {
+                audit_quiet_retired: usize::MAX,
+                audit_cap_full: usize::MAX,
+                pending_audits: usize::MAX,
+                overdue_audits: usize::MAX,
+                oldest_due_age_seconds: u64::MAX,
+            },
+            codex_cursor: Some(Box::new(max_codex_cursor_counts())),
+        }
+    }
+
+    fn max_codex_cursor_counts() -> CodexCursorCounts {
+        let m = u32::MAX;
+        macro_rules! all_max {
+            ($($(#[$doc:meta])* $field:ident,)+) => {
+                CodexCursorEvents { $($field: m),+ }
+            };
+        }
+        CodexCursorCounts {
+            during_scan_window: codex_cursor_events!(all_max),
+            retained: CodexCursorRetained {
+                paused_job: true,
+                paused_job_charged_bytes: m,
+                memo_entries: m,
+                parked_entries: m,
+                invalidation_entries: m,
+                rotation_waiters: m,
+                lifetime_audit_overdue_max_age_seconds: m,
+            },
+        }
+    }
+
+    fn assert_finish_record(record: &serde_json::Value, source: &str) {
+        assert_eq!(record["schema_version"], SCHEMA_VERSION);
+        assert_eq!(record["stage"], "source_finish");
+        assert_eq!(record["source"], source);
+        assert!(record["counts"].get("allocator_relief").is_none());
+        assert!(record.get("result").is_none());
+        println!("RESOURCE_V2_FINISH_FIXTURE {record}");
+    }
+
+    #[test]
+    fn census_fence_events_have_closed_fields_and_bounded_encoding() {
+        use crate::codex_scan_diagnostics::{
+            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
+        };
+        let (_, rows) = capture(|| {
+            for phase in [P::Outer, P::Inner] {
+                for outcome in [
+                    O::Passed,
+                    O::Rejected,
+                    O::Published,
+                    O::ProjectionUnavailable,
+                    O::ClockUnavailable,
+                    O::EncodingFailed,
+                    O::PrivateWriteFailed,
+                ] {
+                    for invalidation in [I::NotAttempted, I::Removed, I::AlreadyMissing, I::Failed]
+                    {
+                        codex_census_fence(phase, outcome, invalidation);
+                    }
+                }
+            }
+        });
+        assert_eq!(rows.len(), 56);
+        for row in rows {
+            assert_eq!(row["stage"], "codex_census_fence");
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(row["observation"]["process_lifetime_max_rss_bytes"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 3);
+            let text = serde_json::to_string(&row).unwrap();
+            assert!(text.len() < 1024);
+            for forbidden in [
+                "namespace",
+                "account",
+                "path",
+                "digest",
+                "credential",
+                "error",
+            ] {
+                assert!(!text.contains(forbidden));
+            }
+        }
+    }
+
+    /// [behaviour] A completed off-pass work unit uses the existing stage carrier.
+    #[test]
+    fn offpass_work_reports_cpu_split_and_wall_without_footprint_sampling() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, rows) = capture(|| {
+                for _ in 0..3 {
+                    let _stage = StageWindow::begin(source, "offpass_agent_status");
+                }
+                source_prepare(source, || Ok::<_, anyhow::Error>(17), |_| false)
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(rows.len(), 2);
+            let row = &rows[0];
+            assert_eq!(row["counts"]["count"], 3);
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["stage"], "offpass_agent_status");
+            assert_eq!(row["source"], source);
+            assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            assert!(row["observation"].get("cli_children").is_none());
+            for field in ["cpu_user_us", "cpu_sys_us"] {
+                assert!(row["counts"].get(field).is_some());
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                assert!(row["counts"][field].is_u64());
+            }
+            // Disk byte deltas: macOS only, absent elsewhere.
+            for field in ["disk_read_bytes", "disk_written_bytes"] {
+                let present = row["observation"].get(field).is_some();
+                assert_eq!(present, cfg!(target_os = "macos"));
+                assert_eq!(row["observation"][field].is_u64(), present);
+            }
+            assert!(row["observation"].get("footprint_samples").is_none());
+            assert!(row["observation"]
+                .get("footprint_sample_failures")
+                .is_none());
+        }
+    }
+
+    /// [regress] Repeated off-pass work emits one row with exact totals at prepare.
+    #[test]
+    fn offpass_windows_aggregate_until_prepare() {
+        let (_, rows) = capture(|| {
+            for _ in 0..3 {
+                aggregate_offpass(Record {
+                    schema_version: SCHEMA_VERSION,
+                    process_id: std::process::id(),
+                    stage: "offpass_cloud_sessions",
+                    source: Source::Codex,
+                    observation: Observation::between(
+                        7,
+                        Some(ProcessSample {
+                            cpu_us: 1,
+                            lifetime_max_rss_bytes: 1,
+                            disk: Some(DiskBytes {
+                                disk_read_bytes: 1,
+                                disk_written_bytes: 1,
+                                counters: Metrics([Some(1); 7]),
+                            }),
+                        }),
+                        Some(ProcessSample {
+                            cpu_us: 2,
+                            lifetime_max_rss_bytes: 1,
+                            disk: Some(DiskBytes {
+                                disk_read_bytes: 2,
+                                disk_written_bytes: 2,
+                                counters: Metrics([Some(2); 7]),
+                            }),
+                        }),
+                    ),
+                    counts: OffpassCounts {
+                        count: 1,
+                        cpu_user_us: Some(2),
+                        cpu_sys_us: Some(5),
+                        wall_max_us: 7,
+                        control: BTreeMap::new(),
+                        pass_overlap: false,
+                    },
+                });
+            }
+            source_prepare("codex", || (), |_| false);
+            flush_offpass();
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["counts"],
+            serde_json::json!({"count": 3, "cpu_user_us": 6, "cpu_sys_us": 15, "wall_max_us": 7})
+        );
+        assert_eq!(rows[0]["observation"]["wall_elapsed_us"], 21);
+        for key in &METRIC_KEYS[..4] {
+            assert_eq!(rows[0]["observation"][key], 3);
+        }
+        assert_eq!(rows[1]["stage"], "source_prepare");
+    }
+
+    /// [regress] A pass overlapping an off-pass window marks it `pass_overlap`
+    /// in its own row with every delta kept; clean windows omit the field.
+    #[test]
+    fn offpass_pass_overlap_splits_rows_and_keeps_deltas() {
+        let quota = || drop(StageWindow::begin("codex", "offpass_codex_quota"));
+        let sample = |n| ProcessSample {
+            cpu_us: n,
+            lifetime_max_rss_bytes: 1,
+            disk: Some(DiskBytes {
+                disk_read_bytes: n,
+                disk_written_bytes: n,
+                counters: Metrics([Some(n); 7]),
+            }),
+        };
+        let (_, rows) = capture(|| {
+            let window = StageWindow::begin("codex", "offpass_codex_quota");
+            source_prepare("codex", || (), |_| false);
+            source_finish("codex", false, || Ok(())).unwrap();
+            drop(window); // a pass started and ended mid-window
+            quota(); // clean, same period: its own row
+                     // Two fixed windows per flag: same-flag sums, cross-flag separation.
+            for (pass_overlap, d) in [(true, 44), (false, 10), (true, 44), (false, 10)] {
+                aggregate_offpass(Record {
+                    schema_version: SCHEMA_VERSION,
+                    process_id: std::process::id(),
+                    stage: "offpass_cloud_sessions",
+                    source: Source::Codex,
+                    observation: Observation::between(7, Some(sample(1)), Some(sample(1 + d))),
+                    counts: OffpassCounts {
+                        count: 1,
+                        cpu_user_us: Some(d),
+                        cpu_sys_us: Some(2 * d),
+                        wall_max_us: 7,
+                        control: BTreeMap::new(),
+                        pass_overlap,
+                    },
+                });
+            }
+            source_prepare("codex", || (), |_| false); // flushes the period
+            quota(); // the pass is open at open and close
+            flush_offpass();
+        });
+        let offpass: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["stage"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("offpass_"))
+            })
+            .collect();
+        let flags: Vec<_> = offpass
+            .iter()
+            .map(|row| {
+                let overlap = row["counts"].get("pass_overlap");
+                (
+                    row["stage"].as_str().unwrap(),
+                    overlap.and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect();
+        let (cloud, quota) = ("offpass_cloud_sessions", "offpass_codex_quota");
+        assert_eq!(
+            flags,
+            [
+                (cloud, None),
+                (cloud, Some(true)),
+                (quota, None),
+                (quota, Some(true)),
+                (quota, Some(true)),
+            ]
+        );
+        for (row, d) in offpass[..2].iter().zip([10, 44]) {
+            let mut counts = serde_json::json!(
+                {"count": 2, "cpu_user_us": 2 * d, "cpu_sys_us": 4 * d, "wall_max_us": 7}
+            );
+            if d == 44 {
+                counts["pass_overlap"] = true.into();
+            }
+            assert_eq!(row["counts"], counts);
+            let observation = &row["observation"];
+            assert_eq!(observation["wall_elapsed_us"], 14);
+            let summed = [
+                "shared_process_cpu_delta_us",
+                "disk_read_bytes",
+                "disk_written_bytes",
+            ];
+            for key in summed.iter().chain(&METRIC_KEYS[..4]) {
+                assert_eq!(observation[key], 2 * d, "{key}");
+            }
+        }
+        for row in &offpass[2..] {
+            assert_eq!(row["counts"]["count"], 1);
+            let disk = row["observation"].get("disk_read_bytes").is_some();
+            assert_eq!(disk, cfg!(target_os = "macos"));
+        }
+    }
+
+    /// [behaviour] Control requests sum per class; the trust timer sums, maxes
+    /// and counts on macOS and is absent elsewhere.
+    #[test]
+    fn offpass_control_counts_classes_and_trust_time() {
+        let (_, rows) = capture(|| {
+            for class in ["status", "status", "other"] {
+                control_class(class);
+                assert!(trust_check(|| true));
+                let mut stage = StageWindow::begin("unknown", "offpass_control_xpc");
+                stage.control = take_control();
+            }
+            flush_offpass();
+        });
+        let control = &rows[0]["counts"]["control"];
+        assert_eq!(
+            (control["status"].as_u64(), control["other"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            control.get("trust_checks").is_some(),
+            cfg!(target_os = "macos")
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(control["trust_checks"], 3);
+            assert!(control["trust_us_max"].as_u64() <= control["trust_us_sum"].as_u64());
+        }
+    }
+
+    #[test]
+    fn source_finish_reports_pass_outcomes_and_resets_counts() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(
+                    source,
+                    || pass_outcomes(|counts| counts.progress_unchanged += 1),
+                    |_| false,
+                );
+                source_finish(source, false, || {
+                    pass_outcomes(|counts| {
+                        counts.selected = 5;
+                        counts.accepted = 3;
+                        counts.index_saved = 1;
+                        counts.progress_committed += 2;
+                        counts.progress_unchanged += 1;
+                        counts.progress_not_published += 1;
+                    });
+                    Ok(())
+                })
+                .unwrap();
+                source_prepare(source, || (), |_| false);
+                source_finish(source, false, || Ok(())).unwrap();
+            });
+            assert_finish_record(&records[1], source);
+            assert_finish_record(&records[3], source);
+            for (field, expected) in [
+                ("selected", 5_u64),
+                ("accepted", 3),
+                ("index_saved", 1),
+                ("progress_committed", 2),
+                ("progress_unchanged", 2),
+                ("progress_not_published", 1),
+            ] {
+                assert_eq!(records[1]["counts"]["pass"][field].as_u64(), Some(expected));
+                assert_eq!(records[3]["counts"]["pass"][field].as_u64(), Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn source_prepare_reports_due_reason_power_and_switch_and_finish_the_paced_request() {
+        let (_, records) = capture(|| {
+            source_prepare(
+                "codex",
+                || {
+                    prepare_due(PrepareDue {
+                        due: "due_deferred",
+                        destination_switch: true,
+                        power: "power_allowed",
+                    })
+                },
+                |_| false,
+            );
+            source_prepare("codex", || (), |_| false);
+            source_finish("codex", false, || {
+                pass_outcomes(|counts| {
+                    counts.paced_request_bootstrap_runnable = 1;
+                    counts.paced_first_import = 1;
+                    counts.paced_power_allowed = 1;
+                });
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert_eq!(
+            records[0]["counts"],
+            serde_json::json!({"due_deferred": 1, "power_allowed": 1, "destination_switch": 1})
+        );
+        assert_eq!(
+            records[1]["counts"],
+            serde_json::json!({}),
+            "never carried over"
+        );
+        let pass = &records[2]["counts"]["pass"];
+        assert_eq!(pass["paced_request_bootstrap_runnable"].as_u64(), Some(1));
+        assert_eq!(pass["paced_request_existing"].as_u64(), Some(0));
+        assert_eq!(pass["paced_first_import"].as_u64(), Some(1));
+        assert_eq!(pass["paced_power_allowed"].as_u64(), Some(1));
+        assert_eq!(pass["paced_power_battery"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn retained_heap_is_on_each_source_finish_and_unknown_stays_unknown() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(source, || (), |_| false);
+                source_finish(source, false, || {
+                    pass_retained(source, || RetainedBytes {
+                        totals: BTreeMap::from([
+                            ("files_bytes", Some(123)),
+                            ("side_maps_bytes", None),
+                        ]),
+                        side_maps_parts: BTreeMap::from([
+                            ("growth_retention", Some(123)),
+                            ("persistence_controls", None),
+                        ]),
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            });
+            let retained = &records[1]["counts"]["pass"]["retained_heap_bytes"];
+            assert_eq!(retained["files_bytes"], 123);
+            assert!(retained["side_maps_bytes"].is_null());
+            assert_eq!(retained["side_maps_parts"]["growth_retention"], 123);
+            assert!(retained["side_maps_parts"]["persistence_controls"].is_null());
+            assert_eq!(retained.as_object().unwrap().len(), 3);
+            assert!(records[0]["counts"].get("pass").is_none());
+        }
+    }
+    #[test]
+    fn footprint_fields_are_stage_only_for_all_native_sources() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (result, records) = capture(|| {
+                source_prepare(
+                    source,
+                    || source_finish(source, false, || Ok::<_, anyhow::Error>(17)),
+                    |_| false,
+                )
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["stage"], "source_finish");
+            assert_eq!(records[1]["stage"], "source_prepare");
+            for record in records {
+                assert_eq!(record["source"], source);
+                if record["stage"] == "source_finish" {
+                    let pass = &record["counts"]["pass"];
+                    assert!(pass["wall_us"].is_u64() && pass["cpu_us"].is_u64());
+                    assert!(pass["sample_cost_us"].is_u64());
+                    assert_eq!(
+                        pass["malloc_allocated_bytes"].is_u64(),
+                        cfg!(target_os = "macos")
+                    );
+                } else {
+                    assert_eq!(record["counts"], serde_json::json!({}));
+                }
+                assert!(record["observation"]["footprint_sample_failures"].is_u64());
+                let row = &record["observation"];
+                if cfg!(target_os = "macos") && record["stage"] == "source_prepare" {
+                    assert!(row["malloc_in_use_bytes"].is_u64());
+                    assert!(row["malloc_allocated_bytes"].is_u64());
+                } else {
+                    assert!(row.get("malloc_in_use_bytes").is_none());
+                }
+                if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                    for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                        if let Some(bytes) = row[endpoint].as_u64() {
+                            assert!(peak >= bytes);
+                        }
+                    }
+                    assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                }
+            }
+        }
+        let (_, records) = capture(|| {
+            traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
+        });
+        let page = serde_json::to_value(Probe::start().observation()).unwrap();
+        for row in records.iter().map(|r| &r["observation"]).chain([&page]) {
+            for field in [
+                "malloc_in_use_bytes",
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_sample_failures",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn page_end_row_carries_malloc_in_use_when_available() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                Probe::page().collection(
+                    source,
+                    CollectionCounts {
+                        scanned_files: 0,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                        full_causes: Default::default(),
+                    },
+                );
+            });
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "native_collection_page");
+            assert_eq!(records[0]["source"], source);
+            assert_eq!(
+                records[0]["observation"]
+                    .get("malloc_in_use_bytes")
+                    .is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(records[0]["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_malloc_endpoints_when_available() {
+        let (_, records) = capture(|| drop(UploadCall::start("claude_code")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "snapshot_batch_call");
+        assert_eq!(records[0]["source"], "claude_code");
+        for (section, field) in [
+            ("counts", "malloc_in_use_bytes_start"),
+            ("observation", "malloc_in_use_bytes"),
+        ] {
+            let value = records[0][section].get(field);
+            assert_eq!(value.is_some(), cfg!(target_os = "macos"));
+            if let Some(value) = value {
+                assert!(value.is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_sampled_footprint_window() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| drop(UploadCall::start(source)));
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "snapshot_batch_call");
+            assert_eq!(records[0]["source"], source);
+            let row = &records[0]["observation"];
+            assert!(row["footprint_sample_failures"].is_u64());
+            if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                    if let Some(bytes) = row[endpoint].as_u64() {
+                        assert!(peak >= bytes);
+                    }
+                }
+                assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+            } else {
+                assert!(row["footprint_sample_failures"].as_u64().unwrap() >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn state_save_start_is_a_content_free_malloc_point() {
+        for (source, expected) in [
+            ("claude_code", "claude_code"),
+            ("codex", "codex"),
+            ("pi", "pi"),
+            ("secret/path/provider", "unknown"),
+        ] {
+            let (_, records) = capture(|| state_save_start(source));
+            assert_eq!(records.len(), 1);
+            let row = &records[0];
+            assert_eq!(row["stage"], "state_save_start");
+            assert_eq!(row["source"], expected);
+            assert_eq!(row["counts"], serde_json::json!({}));
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert_eq!(
+                row["observation"].get("malloc_in_use_bytes").is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(row["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+            assert!(row["observation"]
+                .get("stage_peak_footprint_bytes")
+                .is_none());
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(!serde_json::to_string(row).unwrap().contains("secret/path"));
+        }
+    }
+
+    #[test]
+    fn malloc_delta_point_rows_preserve_signed_net_bytes_and_missing_samples() {
+        for stage in ["index_clone_to_upload", "state_save_start"] {
+            for (before, after, expected) in [
+                (Some(100), Some(130), Some(30)),
+                (Some(100), Some(70), Some(-30)),
+                (Some(100), Some(100), Some(0)),
+                (None, Some(70), None),
+                (Some(100), None, None),
+                (Some(u64::MAX), Some(0), None),
+            ] {
+                let (_, records) = capture(|| {
+                    malloc_delta_point(stage, "secret/path/provider", before, after);
+                });
+                assert_eq!(records.len(), 1);
+                let row = &records[0];
+                assert_eq!(row["stage"], stage);
+                assert_eq!(row["source"], "unknown");
+                assert_eq!(row["counts"], serde_json::json!({}));
+                let observation = &row["observation"];
+                assert_eq!(observation["malloc_in_use_bytes"].as_u64(), after);
+                assert_eq!(observation["malloc_in_use_bytes_delta"].as_i64(), expected);
+                assert_eq!(
+                    observation.get("malloc_in_use_bytes_delta").is_some(),
+                    expected.is_some()
+                );
+                assert_eq!(observation["wall_elapsed_us"], 0);
+                assert!(observation.get("stage_peak_footprint_bytes").is_none());
+                assert!(!serde_json::to_string(row).unwrap().contains("secret/path"));
+            }
+        }
+    }
+
+    #[test]
+    fn pass_malloc_windows_end_at_first_batch_and_save_after_page() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(
+                    source,
+                    || {
+                        index_clone_start(source);
+                        Probe::page().collection(
+                            source,
+                            CollectionCounts {
+                                scanned_files: 0,
+                                semantic_noops: 0,
+                                sampled_acquisition: None,
+                                full_causes: Default::default(),
+                            },
+                        );
+                        source_finish(source, false, || {
+                            drop(UploadCall::start(source));
+                            drop(UploadCall::start(source));
+                            state_save_start(source);
+                            Ok(())
+                        })
+                        .unwrap();
+                    },
+                    |_| false,
+                );
+            });
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|row| row["stage"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "native_collection_page",
+                    "index_clone_to_upload",
+                    "snapshot_batch_call",
+                    "snapshot_batch_call",
+                    "state_save_start",
+                    "source_finish",
+                    "source_prepare",
+                ]
+            );
+            for row in [&records[1], &records[4]] {
+                assert_eq!(row["source"], source);
+                assert_eq!(
+                    row["observation"]
+                        .get("malloc_in_use_bytes_delta")
+                        .is_some(),
+                    cfg!(target_os = "macos")
+                );
+                if cfg!(target_os = "macos") {
+                    assert!(row["observation"]["malloc_in_use_bytes_delta"].is_i64());
+                }
+            }
+            let page_end = records[0]["observation"]["malloc_in_use_bytes"].as_u64();
+            let save_start = records[4]["observation"]["malloc_in_use_bytes"].as_u64();
+            assert_eq!(
+                records[4]["observation"]["malloc_in_use_bytes_delta"].as_i64(),
+                page_end
+                    .zip(save_start)
+                    .and_then(|(a, b)| i64::try_from(i128::from(b) - i128::from(a)).ok())
+            );
+            let (_, rows) = capture(|| drop(UploadCall::start(source)));
+            assert_eq!(
+                rows.len(),
+                1,
+                "a finished pass cannot supply another clone baseline"
+            );
+            assert_eq!(rows[0]["stage"], "snapshot_batch_call");
+        }
+    }
+
+    /// [behaviour] Each native page sums successful Tail loads and reduction
+    /// page bytes for its own source, then drains both scalars.
+    #[test]
+    fn tail_load_counts_reset_per_native_page() {
+        let (_, records) = capture(|| {
+            for source in ["claude_code", "codex", "pi"] {
+                tail_loaded(source, 11);
+                tail_loaded(source, 29);
+            }
+            for source in ["claude_code", "codex", "pi"] {
+                for bytes in [None, Some(7), None] {
+                    let probe = Probe::page();
+                    if let Some(bytes) = bytes {
+                        tail_loaded(source, bytes);
+                    }
+                    probe.collection(
+                        source,
+                        CollectionCounts {
+                            scanned_files: 0,
+                            semantic_noops: 0,
+                            sampled_acquisition: None,
+                            full_causes: Default::default(),
+                        },
+                    );
+                }
+            }
+        });
+        let pages: Vec<_> = records
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect();
+        assert_eq!(pages.len(), 9);
+        for (pages, source) in pages.chunks_exact(3).zip(["claude_code", "codex", "pi"]) {
+            for (page, (loads, bytes)) in pages.iter().zip([(2, 40), (1, 7), (0, 0)]) {
+                assert_eq!(page["source"], source);
+                assert_eq!(page["counts"]["tail_loads"], loads);
+                assert_eq!(page["counts"]["tail_load_bytes"], bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn page_window_row_carries_stage_footprint_fields_for_all_native_sources() {
+        let collection = || CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes: Default::default(),
+        };
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                let probe = Probe::page();
+                probe.collection(source, collection());
+                // A second drop-time close must not reopen or re-emit.
+                drop(probe);
+                Probe::start().collection(source, collection());
+            });
+            assert_eq!(records.len(), 2);
+            let (page, plain) = (&records[0], &records[1]);
+            for record in [page, plain] {
+                assert_eq!(record["stage"], "native_collection_page");
+                assert_eq!(record["source"], source);
+            }
+            // The page window reports like a StageWindow row: a refused
+            // sampler slot is one failure, never zeros or a missing record.
+            let row = &page["observation"];
+            assert!(row["footprint_sample_failures"].is_u64());
+            if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                    if let Some(bytes) = row[endpoint].as_u64() {
+                        assert!(peak >= bytes);
+                    }
+                }
+                assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+                if let Some(over) = row["footprint_samples_over_400"].as_u64() {
+                    assert!(over >= 1);
+                    assert!(peak > 400 * 1024 * 1024);
+                }
+            } else {
+                assert!(row["footprint_sample_failures"].as_u64().unwrap() >= 1);
+            }
+            for field in [
+                "stage_peak_footprint_bytes",
+                "stage_start_footprint_bytes",
+                "stage_end_footprint_bytes",
+                "footprint_samples",
+                "footprint_samples_over_400",
+                "footprint_sample_failures",
+            ] {
+                assert!(plain["observation"].get(field).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn resource_finish_success_preserves_value_and_contains_batch_window() {
+        let value = Box::new(17);
+        let original = std::ptr::from_ref(value.as_ref());
+        let (result, records) = capture(|| {
+            source_finish("claude_code", false, || {
+                let mut upload = UploadCall::start("claude_code");
+                upload.serialized(20);
+                upload.attempt(20, false);
+                Ok(value)
+            })
+        });
+        assert_eq!(std::ptr::from_ref(result.unwrap().as_ref()), original);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["stage"], "snapshot_batch_call");
+        assert_finish_record(&records[1], "claude_code");
+        let batch = &records[0]["observation"];
+        let finish = &records[1]["observation"];
+        assert!(
+            batch["wall_elapsed_us"].as_u64().unwrap()
+                <= finish["wall_elapsed_us"].as_u64().unwrap()
+        );
+        // Unix timestamps are millisecond-granular; the monotonic span comparison
+        // above remains valid independently of wall-clock resolution.
+        assert!(
+            batch["observed_unix_ms"].as_u64().unwrap()
+                <= finish["observed_unix_ms"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn resource_finish_error_preserves_typed_error_and_chain() {
+        #[derive(Debug)]
+        struct OriginalError(std::sync::Arc<()>);
+        impl std::fmt::Display for OriginalError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("synthetic inner failure")
+            }
+        }
+        impl std::error::Error for OriginalError {}
+        let identity = std::sync::Arc::new(());
+        let error =
+            anyhow::Error::new(OriginalError(identity.clone())).context("synthetic context");
+        let original_chain: Vec<_> = error.chain().map(ToString::to_string).collect();
+        let (result, records) = capture(|| source_finish::<()>("codex", false, || Err(error)));
+        let returned = result.unwrap_err();
+        assert_eq!(
+            returned
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            original_chain
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &returned.downcast_ref::<OriginalError>().unwrap().0,
+            &identity
+        ));
+        assert_eq!(records.len(), 1);
+        assert_finish_record(&records[0], "codex");
+    }
+
+    #[test]
+    fn resource_finish_panic_preserves_payload_without_record() {
+        let payload = std::sync::Arc::new("synthetic panic");
+        let original = payload.clone();
+        let (result, records) = capture(|| {
+            std::panic::catch_unwind(|| {
+                source_finish::<()>("pi", false, || std::panic::panic_any(payload))
+            })
+        });
+        let panic = result.unwrap_err();
+        assert!(std::sync::Arc::ptr_eq(
+            panic.downcast_ref::<std::sync::Arc<&str>>().unwrap(),
+            &original
+        ));
+        assert!(records.is_empty());
+    }
+
+    /// [behaviour] A model-less Codex or Pi response gets the parsers'
+    /// implicit model and counts, beside a body with tokens and no request,
+    /// on its own source's next page line; a named-model body adds nothing.
+    #[test]
+    fn usage_gaps_count_implicit_model_rows_and_token_only_bodies() {
+        use crate::snapshots::{SnapshotItem, IMPLICIT_USAGE_MODEL};
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("ottto-usage-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parse = |id: &str, lines: [serde_json::Value; 2]| -> SnapshotItem {
+            let path = dir.join(format!("{id}.jsonl"));
+            let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            std::fs::write(&path, text).unwrap();
+            type Parse = fn(&std::path::Path, &str, String) -> anyhow::Result<Vec<SnapshotItem>>;
+            let parse: Parse = if id.starts_with("pi") {
+                crate::snapshots::parse_pi_jsonl_file
+            } else {
+                crate::snapshots::parse_codex_jsonl_file
+            };
+            parse(&path, "2026-10-05T00:00:00Z", id.to_string())
+                .unwrap()
+                .remove(0)
+        };
+        let codex = |id: &str, model: Option<&str>| {
+            let mut info = json!({"total_token_usage": {"input_tokens": 10, "output_tokens": 5},
+                "last_token_usage": {"input_tokens": 10, "output_tokens": 5}});
+            if let Some(model) = model {
+                info["model"] = json!(model);
+            }
+            parse(
+                id,
+                [
+                    json!({"timestamp": "2026-10-04T10:00:00Z", "type": "session_meta", "payload": {"id": id}}),
+                    json!({"timestamp": "2026-10-04T10:00:01Z", "type": "event_msg",
+                    "payload": {"type": "token_count", "info": info}}),
+                ],
+            )
+        };
+        let missing = codex("gap-missing", None);
+        let mut token_only = codex("gap-token-only", Some("gpt-6"));
+        token_only.request_count = 0;
+        let normal = codex("gap-normal", Some("gpt-6"));
+        let pi = parse(
+            "pi-gap",
+            [
+                json!({"type": "session", "id": "pi-gap", "timestamp": "2026-10-04T10:00:00Z"}),
+                json!({"type": "message_end", "message": {"timestamp": 1_791_108_001_000_u64,
+                "usage": {"input": 10, "output": 5}}}),
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        for body in [&missing, &pi] {
+            assert_eq!(body.model_usage[0].model, IMPLICIT_USAGE_MODEL);
+        }
+        let page = |source: &str| {
+            let (_, rows) = capture(|| {
+                Probe::start().collection(
+                    source,
+                    CollectionCounts {
+                        scanned_files: 1,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                        full_causes: Default::default(),
+                    },
+                )
+            });
+            rows.into_iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap()["counts"]
+                .clone()
+        };
+        usage_gaps("codex", &[missing, token_only, normal]);
+        usage_gaps("pi", &[pi]);
+        let (codex_page, pi_page) = (page("codex"), page("pi"));
+        for (key, _) in USAGE_GAPS {
+            assert_eq!(codex_page[key], 1, "{key}");
+            let pi_count = u64::from(key.starts_with("usage_rows"));
+            assert_eq!(
+                pi_page.get(key).map_or(0, |n| n.as_u64().unwrap()),
+                pi_count,
+                "{key}"
+            );
+            assert!(page("codex").get(key).is_none(), "{key} not drained");
+        }
+    }
+
+    /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.
+    /// The prior-stamp matrix rides its own record for every source, with an
+    /// unattributed row; a group replay (no frozen stamp) stays out of it.
+    #[test]
+    fn full_parse_reasons_are_sparse_page_local_counts_and_completed_bytes() {
+        use crate::snapshots::CandidateParseReason::{Rearmed, TranscriptChanged};
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        use claude_reread::PriorStamp;
+        let full = ReadMode::Full(FullReason::StateMissing);
+        let unchanged = Some(PriorStamp::ListingUnchanged);
+        let collect = |probe: &Probe, source: &str, reads: Option<ReadCounts>| {
+            probe.collection(
+                source,
+                CollectionCounts {
+                    scanned_files: 6,
+                    semantic_noops: 0,
+                    sampled_acquisition: reads,
+                    full_causes: Default::default(),
+                },
+            )
+        };
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            for (mode, reason, bytes) in [
+                (full, Some(Rearmed), 123),
+                (full, Some(TranscriptChanged), 456),
+                (ReadMode::Tail, Some(Rearmed), 999),
+                (ReadMode::Unchanged, Some(Rearmed), 999),
+                (full, None, 999),
+            ] {
+                probe.full_parse_reason(mode, reason, unchanged, 1, 0);
+                probe.full_parse_reason(mode, reason, unchanged, 0, bytes);
+            }
+            // A selected Full that has not completed contributes no bytes.
+            probe.full_parse_reason(full, Some(Rearmed), unchanged, 1, 0);
+            // A group replay carries no frozen stamp and no reason.
+            probe.full_parse_reason(full, None, None, 1, 77);
+            let empty = Probe::start();
+            empty.full_parse_reason(full, Some(Rearmed), unchanged, 0, 0);
+            for probe in [probe, empty] {
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                collect(&probe, "claude_code", Some(reads));
+            }
+        });
+        let stage = |name: &str| {
+            rows.iter()
+                .filter(|row| row["stage"] == name)
+                .collect::<Vec<_>>()
+        };
+        let pages = stage("native_collection_page");
+        assert_eq!(
+            pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+            serde_json::json!({
+                "rearmed": {"count": 2, "completed_native_bytes": 123},
+                "transcript_changed": {"count": 1, "completed_native_bytes": 456},
+            })
+        );
+        assert!(pages[1]["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_by_parse_reason")
+            .is_none());
+        let cell = |count, bytes| serde_json::json!({"listing_unchanged": {"count": count, "completed_native_bytes": bytes}});
+        let stamps = stage("native_full_prior_stamp");
+        assert_eq!(stamps.len(), 1, "an empty matrix emits no record");
+        assert_eq!(stamps[0]["source"], "claude_code");
+        assert_eq!(
+            stamps[0]["counts"],
+            serde_json::json!({"full_by_prior_stamp": {
+                "rearmed": cell(2, 123),
+                "transcript_changed": cell(1, 456),
+                "unattributed": cell(1, 999),
+            }})
+        );
+
+        // Bucket x source: one shared classification and emission path.
+        let committed = Some((10, Some(7)));
+        let cases = [
+            ((10, 7), committed, "listing_unchanged"),
+            ((10, 8), committed, "same_size_moved_mtime"),
+            ((11, 7), committed, "size_changed"),
+            ((10, 7), Some((10, None)), "no_baseline"),
+            ((10, 7), None, "no_baseline"),
+        ];
+        let sources = ["claude_code", "codex", "pi"];
+        let (_, rows) = capture(|| {
+            for source in sources {
+                let probe = Probe::start();
+                for (listing, committed, _) in cases {
+                    let prior = Some(PriorStamp::classify(listing, committed));
+                    probe.full_parse_reason(full, Some(TranscriptChanged), prior, 1, 0);
+                    probe.full_parse_reason(full, Some(TranscriptChanged), prior, 0, 5);
+                }
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                collect(&probe, source, Some(reads));
+            }
+        });
+        let mut expected = serde_json::Map::new();
+        for (_, _, bucket) in cases {
+            let n = cases.iter().filter(|case| case.2 == bucket).count() as u64;
+            expected.insert(
+                bucket.into(),
+                serde_json::json!({"count": n, "completed_native_bytes": 5 * n}),
+            );
+        }
+        let expected = serde_json::json!({"transcript_changed": expected});
+        for source in sources {
+            let row = rows
+                .iter()
+                .find(|row| row["stage"] == "native_full_prior_stamp" && row["source"] == source)
+                .unwrap_or_else(|| panic!("{source}"));
+            assert_eq!(row["counts"]["full_by_prior_stamp"], expected, "{source}");
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page" && row["source"] == source)
+                .unwrap();
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+                serde_json::json!({"transcript_changed": {"count": 5, "completed_native_bytes": 25}}),
+                "{source}"
+            );
+        }
+    }
+
+    /// [behaviour] Every matrix cell at its maximum stays within the record's
+    /// own test bound, off the page line.
+    #[test]
+    fn full_prior_stamp_record_with_every_cell_stays_bounded() {
+        use crate::snapshots::CandidateParseReason::*;
+        use claude_reread::PriorStamp::*;
+        let full = crate::transcript_acquisition::ReadMode::Full(
+            crate::transcript_acquisition::FullReason::StateMissing,
+        );
+        let reasons = [
+            TerminalDisposition,
+            NewFile,
+            AuthorityQuarantine,
+            Audit,
+            BodyWitnessAdoption,
+            UploadContext,
+            ActivityOrQuarantineRetry,
+            TranscriptChanged,
+            CodexCapture,
+            UnknownOutcome,
+            LegacyActivity,
+            LegacyIdentity,
+            Rearmed,
+            SourceChanged,
+            ForcedFamily,
+        ];
+        assert_eq!(
+            reasons.len(),
+            crate::snapshots::CANDIDATE_PARSE_REASON_COUNT
+        );
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            for reason in reasons.map(Some).into_iter().chain([None]) {
+                for stamp in [
+                    ListingUnchanged,
+                    SameSizeMovedMtime,
+                    SizeChanged,
+                    NoBaseline,
+                ] {
+                    probe.full_parse_reason(full, reason, Some(stamp), u64::MAX, u64::MAX);
+                }
+            }
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: usize::MAX,
+                    semantic_noops: usize::MAX,
+                    sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
+                },
+            );
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "native_full_prior_stamp")
+            .unwrap();
+        let matrix = row["counts"]["full_by_prior_stamp"].as_object().unwrap();
+        assert_eq!(matrix.len(), reasons.len() + 1);
+        assert!(matrix
+            .values()
+            .all(|cells| cells.as_object().unwrap().len() == 4));
+        let text = serde_json::to_string(row).unwrap();
+        assert!(
+            text.len() > NATIVE_PAGE_RECORD_TEST_LIMIT,
+            "the full matrix needs a separate record"
+        );
+        assert!(
+            text.len() < FULL_PRIOR_STAMP_RECORD_TEST_LIMIT,
+            "{}",
+            text.len()
+        );
+        let page = rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert!(serde_json::to_string(page).unwrap().len() < NATIVE_PAGE_RECORD_TEST_LIMIT);
+    }
+
+    #[test]
+    fn claude_page_events_use_existing_carriers_without_source_leakage() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::restored(true, false, false);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            // Another source's page: its retained-cache events and nothing else.
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::restored(true, false, false);
+            cache_lifecycle::record(cache_lifecycle::Event::PrefixExcludedBody);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
+            probe.collection(
+                "codex",
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::restored(true, false, true);
+            claude_reread::emit_without_lease(scope.finish());
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["source"], "claude_code");
+        assert_eq!(
+            rows[0]["counts"]["claude_reread"]["restored_empty_sibling"],
+            1
+        );
+        assert_eq!(
+            rows[0]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
+            1
+        );
+        assert!(rows[1]["counts"].get("claude_reread").is_none());
+        assert_eq!(
+            rows[1]["counts"]["retained_cache_page_events"]["prefix_excluded_bodies"],
+            1
+        );
+        assert_eq!(rows[2]["stage"], "native_collection_page");
+        assert_eq!(
+            rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
+            1
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
+    }
+
+    #[test]
+    fn pi_cost_observations_update_registry_without_emitting_records() {
+        let (((), counts), rows) = capture(|| {
+            cache_lifecycle::observe(|| {
+                pi_cost_observations(0, 0);
+                pi_cost_observations(2, 3);
+            })
+        });
+        assert_eq!(counts.pi_cost_refused_overflow, 2);
+        assert_eq!(counts.pi_cost_precision_rounded, 3);
+        assert!(rows.is_empty());
+    }
+
+    /// [regress] Both shared helpers count completed writes, including temp files.
+    #[test]
+    fn shared_cache_helpers_raise_cumulative_bytes_in_captured_row() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("cache-write-bytes");
+        let field = "shared_cache_helper_write_bytes_cumulative";
+        let before = capture(cache_lifecycle_totals).1[0]["counts"][field]
+            .as_u64()
+            .unwrap();
+        let value = serde_json::json!({"count": 3});
+        let payload = b"{\"count\":4}";
+        let ((_, kinds), counts) = cache_lifecycle::observe(|| {
+            cache_lifecycle::json_cache::observe(|| {
+                crate::locked_state_dir::write_json_atomic(
+                    &scratch.join("first.json"),
+                    &value,
+                    cache_lifecycle::JsonCacheKind::UploadPolicy,
+                );
+                crate::locked_state_dir::replace_json_cache(
+                    &scratch.join("second.json"),
+                    payload,
+                    "cache",
+                    "cache",
+                    cache_lifecycle::JsonCacheKind::ActiveSessions,
+                )
+                .unwrap();
+            })
+        });
+        let first = serde_json::to_vec(&value).unwrap().len() as u64;
+        let expected = first + payload.len() as u64;
+        assert_eq!(counts.shared_cache_helper_write_bytes_cumulative, expected);
+        // Each write counts once in the total and once under its fixed kind.
+        assert_eq!(
+            serde_json::to_value(kinds).unwrap(),
+            serde_json::json!({
+                "active_sessions": payload.len(),
+                "context_footprint": 0,
+                "mcp_inventory": 0,
+                "codex_prelude_footprint": 0,
+                "upload_policy": first,
+                "other": 0,
+            })
+        );
+        let (_, rows) = capture(cache_lifecycle_totals);
+        assert_eq!(rows[0]["stage"], "process_retained_cache_lifecycle_totals");
+        let total = rows[0]["counts"][field].as_u64().unwrap();
+        assert!(total >= before + expected);
+        let by_kind = rows[0]["counts"]["json_cache_write_bytes_cumulative"]
+            .as_object()
+            .unwrap();
+        assert_eq!(by_kind.len(), 6);
+        assert!(by_kind["active_sessions"].as_u64().unwrap() >= payload.len() as u64);
+        assert!(by_kind["upload_policy"].as_u64().unwrap() >= first);
+        assert!(by_kind.values().map(|n| n.as_u64().unwrap()).sum::<u64>() <= total);
+        assert_eq!(std::fs::read(scratch.join("second.json")).unwrap(), payload);
+    }
+
+    /// [regress] Small-file writes and unchanged skips reach the totals row by class.
+    #[test]
+    fn small_file_writes_raise_cumulative_counts_in_captured_row() {
+        use crate::locked_state_dir::{replace_small_file_if_changed, SmallFileClass};
+        let scratch = crate::test_scratch::ScratchDir::canonical("small-file-counts");
+        let field = "small_file_writes_skipped_unchanged_pure_cache";
+        let before = capture(cache_lifecycle_totals).1[0]["counts"][field]
+            .as_u64()
+            .unwrap_or(0);
+        let path = scratch.join("status.json");
+        let (_, counts) = cache_lifecycle::observe(|| {
+            replace_small_file_if_changed(&path, b"{}", SmallFileClass::PureCache).unwrap();
+            replace_small_file_if_changed(&path, b"{}", SmallFileClass::PureCache).unwrap();
+            replace_small_file_if_changed(&path, b"[1]", SmallFileClass::Durable).unwrap();
+        });
+        assert_eq!(counts.small_file_writes_pure_cache, 1);
+        assert_eq!(counts.small_file_writes_skipped_unchanged_pure_cache, 1);
+        assert_eq!(counts.small_file_write_bytes_pure_cache, 2);
+        assert_eq!(counts.small_file_writes_durable, 1);
+        assert_eq!(counts.small_file_writes_skipped_unchanged_durable, 0);
+        assert_eq!(counts.small_file_write_bytes_durable, 3);
+        let (_, rows) = capture(cache_lifecycle_totals);
+        assert!(rows[0]["counts"][field].as_u64().unwrap() > before);
+    }
+
+    #[test]
+    fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_retained_cache_lifecycle_totals",
+                "unknown",
+                &cache_lifecycle::Totals::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
+        assert_eq!(record["source"], "unknown");
+        assert_eq!(record["counts"]["prefix_excluded_bodies"], u64::MAX);
+        for field in [
+            "claude_sqlite_pager_wal_page_bytes_cumulative",
+            "codex_sqlite_pager_wal_page_bytes_cumulative",
+            "pi_sqlite_pager_wal_page_bytes_cumulative",
+            "upload_history_sqlite_pager_wal_page_bytes_cumulative",
+            "sqlite_tempbuf_spill_bytes_cumulative",
+            "sqlite_checkpoint_reported_pages_cumulative",
+            "sqlite_checkpoint_logical_write_bytes_cumulative",
+            "erasure_vacuum_logical_write_bytes_cumulative",
+            "shared_cache_helper_write_bytes_cumulative",
+            "small_file_writes_durable",
+            "small_file_writes_pure_cache",
+            "small_file_writes_skipped_unchanged_durable",
+            "small_file_writes_skipped_unchanged_pure_cache",
+            "small_file_write_bytes_durable",
+            "small_file_write_bytes_pure_cache",
+            "otlp_relay_file_appends_cumulative",
+            "otlp_relay_append_handle_opens_cumulative",
+            "otlp_relay_append_gap_lt_1s_cumulative",
+            "otlp_relay_append_gap_1_5s_cumulative",
+            "otlp_relay_append_gap_5_30s_cumulative",
+            "otlp_relay_append_gap_30_120s_cumulative",
+            "otlp_relay_append_gap_ge_120s_or_first_cumulative",
+        ] {
+            assert_eq!(record["counts"][field], u64::MAX);
+        }
+        let kinds = &record["counts"]["json_cache_write_bytes_cumulative"];
+        assert_eq!(kinds.as_object().unwrap().len(), 6);
+        assert_eq!(kinds["other"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        // The four Pi fields, the Codex tier field, the two Claude usage
+        // fields, the seven OTLP skip fields, the per-kind JSON cache map and
+        // the relay append fields stay bounded at u64::MAX.
+        // The six small-file fields add 349 bytes at u64::MAX.
+        assert!(serde_json::to_string(record).unwrap().len() < 4350);
+        let (_, actual) = capture(cache_lifecycle_totals);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+    }
+
+    #[test]
+    fn codex_memo_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_codex_memo_lifecycle_totals",
+                "codex",
+                &codex_memo_lifecycle::Record::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_codex_memo_lifecycle_totals");
+        assert_eq!(record["source"], "codex");
+        assert_eq!(
+            record["counts"]["memo_hit_estimated_avoided_parser_bytes"],
+            u64::MAX
+        );
+        assert_eq!(record["counts"]["memo_miss_exact_stamp_bytes"], u64::MAX);
+        assert_eq!(record["counts"]["memo_resident_bytes"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        let width = serde_json::to_string(record).unwrap().len();
+        println!("CODEX_MEMO_LIFECYCLE_MAX_WIDTH bytes={width}");
+        assert!(width < 2048);
+        let (_, actual) = capture(|| codex_memo_lifecycle_totals("codex"));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+        let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn resource_log_sink_failure_does_not_escape() {
+        struct FailedSink;
+        impl Write for FailedSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "synthetic",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        write_line("{}", &mut FailedSink);
+    }
+
+    #[test]
+    #[ignore = "bounded native measurement; process allocation scope needs serial isolation"]
+    fn measure_local_resource_probe_overhead() {
+        const ITERATIONS: u64 = 1000;
+        for stage in ["native_collection_page", "source_finish"] {
+            let process_before = process_sample();
+            let wall = Instant::now();
+            let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
+                for _ in 0..ITERATIONS {
+                    if stage == "source_finish" {
+                        source_finish("claude_code", false, || Ok(())).unwrap();
+                    } else {
+                        Probe::start().collection(
+                            "claude_code",
+                            CollectionCounts {
+                                scanned_files: usize::MAX,
+                                semantic_noops: usize::MAX,
+                                sampled_acquisition: Some(max_read_counts()),
+                                full_causes: Default::default(),
+                            },
+                        );
+                    }
+                }
+            });
+            let wall_us = wall.elapsed().as_micros();
+            let cpu_us = Observation::between(0, process_before, process_sample())
+                .shared_process_cpu_delta_us;
+            println!(
+                "RESOURCE_PROBE_OVERHEAD {}",
+                serde_json::json!({
+                    "stage": stage, "iterations": ITERATIONS, "wall_us": wall_us,
+                    "wall_us_per_record": wall_us as f64 / ITERATIONS as f64,
+                    "shared_process_cpu_us": cpu_us,
+                    "shared_process_cpu_us_per_record": cpu_us.map(|cpu| cpu as f64 / ITERATIONS as f64),
+                    "probe_inline_bytes": std::mem::size_of::<Probe>(),
+                    "upload_call_inline_bytes": std::mem::size_of::<UploadCall>(),
+                    "scope_requested_allocation_peak_bytes": allocation.requested_peak,
+                    "scope_requested_allocation_live_bytes": allocation.requested_live,
+                    "includes_two_os_samples_json_encoding_and_existing_stderr_write": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn resource_unavailable_or_regressing_cpu_and_disk_are_unknown_not_zero() {
+        let sample = |cpu_us: u64| {
+            Some(ProcessSample {
+                cpu_us,
+                lifetime_max_rss_bytes: 4096,
+                disk: Some(DiskBytes {
+                    disk_read_bytes: cpu_us * 100,
+                    disk_written_bytes: cpu_us,
+                    counters: Metrics([Some(cpu_us); 7]),
+                }),
+            })
+        };
+        for (before, after) in [
+            (None, sample(9)),
+            (sample(10), None),
+            (sample(10), sample(9)),
+        ] {
+            assert_eq!(
+                Observation::between(12, before, after).shared_process_cpu_delta_us,
+                None
+            );
+            let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
+            assert!(record.get("disk_read_bytes").is_none());
+            assert!(record.get("disk_written_bytes").is_none());
+            for key in METRIC_KEYS {
+                assert!(record.get(key).is_none());
+            }
+        }
+        let result = Observation::between(12, sample(10), sample(17));
+        assert_eq!(result.shared_process_cpu_delta_us, Some(7));
+        let record = serde_json::to_value(&result).unwrap();
+        assert_eq!(record["disk_read_bytes"], 700);
+        assert_eq!(record["disk_written_bytes"], 7);
+        for key in &METRIC_KEYS[..4] {
+            assert_eq!(record[key], 7);
+        }
+        for key in &METRIC_KEYS[4..] {
+            assert!(record.get(key).is_none());
+        }
+        let regressing = Metrics([Some(12), Some(1), None, Some(0)]).delta(Metrics([
+            Some(10),
+            Some(2),
+            Some(1),
+            Some(0),
+        ]));
+        assert_eq!(regressing.0, [Some(2), None, None, Some(0)]);
+        assert_eq!(result.process_lifetime_max_rss_bytes, Some(4096));
+        assert_eq!(result.process_lifetime_max_rss_before_bytes, Some(4096));
+        for (before, after) in [
+            (None, sample(9)),
+            (sample(10), None),
+            (
+                sample(10),
+                Some(ProcessSample {
+                    cpu_us: 17,
+                    lifetime_max_rss_bytes: 2048,
+                    disk: None,
+                }),
+            ),
+        ] {
+            let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
+            assert!(record["process_lifetime_max_rss_before_bytes"].is_null());
+            assert!(record.get("disk_written_bytes").is_none());
+        }
+        let rising = Observation::between(
+            12,
+            sample(10),
+            Some(ProcessSample {
+                cpu_us: 17,
+                lifetime_max_rss_bytes: 8192,
+                disk: None,
+            }),
+        );
+        assert_eq!(rising.process_lifetime_max_rss_before_bytes, Some(4096));
+        assert_eq!(rising.process_lifetime_max_rss_bytes, Some(8192));
+    }
+    /// [behaviour] The first-import page-total key rides only a page that
+    /// read the larger total; a worst-case page row with the whole page
+    /// schedule stays under its size bound.
+    #[test]
+    fn first_import_page_total_key_is_set_only_and_within_the_page_bound() {
+        let mut lengths = Vec::new();
+        for first_import in [false, true] {
+            let (_, records) = capture(|| {
+                let mut probe = Probe::page();
+                probe.page_schedule = BTreeMap::from([
+                    ("routine_recensus", false),
+                    ("page_file_limit_hit", false),
+                    ("pending_work", false),
+                    ("first_read_progress", false),
+                    ("first_import_default_qos", false),
+                ]);
+                if first_import {
+                    probe
+                        .page_schedule
+                        .insert("codex_first_import_page_total", true);
+                }
+                probe.collection(
+                    "codex",
+                    CollectionCounts {
+                        scanned_files: usize::MAX,
+                        semantic_noops: usize::MAX,
+                        sampled_acquisition: Some(max_read_counts()),
+                        full_causes: Default::default(),
+                    },
+                );
+            });
+            let page = records
+                .iter()
+                .find(|record| record["stage"] == "native_collection_page")
+                .unwrap();
+            assert_eq!(
+                page["counts"].get("codex_first_import_page_total"),
+                first_import.then_some(&serde_json::Value::Bool(true))
+            );
+            let text = serde_json::to_string(page).unwrap();
+            assert!(text.len() < NATIVE_PAGE_RECORD_TEST_LIMIT, "{}", text.len());
+            lengths.push(text.len());
+        }
+        // The key adds only its own bytes; each record takes its own process
+        // sample, so the two lengths can also differ by a few digits.
+        let key = r#","codex_first_import_page_total":true"#.len();
+        let grown = lengths[1].abs_diff(lengths[0] + key);
+        assert!(grown <= 16, "{lengths:?}");
+    }
+    #[test]
+    fn resource_attempts_count_fallback_and_presend_refusal_without_content() {
+        let (_, records) = capture(|| {
+            Probe::page().collection(
+                "secret/path/provider",
+                CollectionCounts {
+                    scanned_files: usize::MAX,
+                    semantic_noops: usize::MAX,
+                    sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
+                },
+            );
+            source_finish("secret/path/provider", false, || Ok(())).unwrap();
+            let mut upload = UploadCall::start("secret/path/provider");
+            upload.serialized(1000);
+            upload.attempt(100, true);
+            upload.attempt(1000, false);
+            let mut refused = UploadCall::start("codex");
+            refused.serialized(500);
+        });
+        assert_eq!(records[2]["counts"]["identity_attempts"], 0);
+        assert_eq!(records[2]["counts"]["attempted_encoded_body_bytes"], 0);
+        assert_eq!(records[3]["counts"]["gzip_attempts"], 1);
+        assert_eq!(records[3]["counts"]["identity_attempts"], 1);
+        assert_eq!(records[3]["counts"]["attempted_encoded_body_bytes"], 1100);
+        assert_eq!(records[3]["counts"]["attempted_decoded_body_bytes"], 2000);
+        assert_eq!(records[3]["source"], "unknown");
+        // The cursor block: a window of shared process deltas plus gauges;
+        // an unobtainable snapshot is `null`, never zeros.
+        let cursor = &records[0]["counts"]["sampled_acquisition"]["codex_cursor"];
+        assert_eq!(cursor["during_scan_window"]["jobs_started"], u32::MAX);
+        assert_eq!(
+            cursor["retained"]["lifetime_audit_overdue_max_age_seconds"],
+            u32::MAX
+        );
+        let unavailable = ReadCounts {
+            codex_cursor: None,
+            ..max_read_counts()
+        };
+        assert!(serde_json::to_value(&unavailable).unwrap()["codex_cursor"].is_null());
+        let idle = serde_json::to_value(CodexCursorCounts::default()).unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({"during_scan_window": {}, "retained": {}})
+        );
+        for record in records {
+            let text = serde_json::to_string(&record).unwrap();
+            let limit = if record["stage"] == "native_collection_page" {
+                NATIVE_PAGE_RECORD_TEST_LIMIT
+            } else {
+                2048
+            };
+            assert!(text.len() < limit);
+            assert!(!text.contains("secret/path"));
+            assert!(!text.contains("cycle_peak"));
+            assert_eq!(record["schema_version"], SCHEMA_VERSION);
+        }
+    }
+}
+#[cfg(test)]
+mod continuation_tests {
+    #[test]
+    fn continuation_mint_counts_have_closed_fixed_keys() {
+        let outcomes = [
+            "minted",
+            "inventory_incomplete",
+            "groups_completed",
+            "no_remaining",
+            "over_bound",
+            "not_mintable",
+        ];
+        let (_, rows) = super::capture(|| {
+            for outcome in outcomes {
+                super::codex_continuation_mint(outcome);
+            }
+        });
+        assert_eq!(rows.len(), outcomes.len());
+        for (row, outcome) in rows.iter().zip(outcomes) {
+            assert_eq!(row["stage"], "codex_continuation_mint");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(
+                row["counts"],
+                serde_json::json!({"continuation_mint":{outcome:1}})
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_counts_use_fixed_point_schema() {
+        let (_, rows) = super::capture(|| {
+            super::codex_continuation(None);
+            for cause in [
+                "roster_changed",
+                "context_changed",
+                "policy_changed",
+                "group_job",
+                "other",
+            ] {
+                super::codex_continuation(Some(cause));
+            }
+        });
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0]["counts"]["continuation_pages_run"], 1);
+        assert_eq!(
+            rows[0]["counts"]["continuation_held"],
+            serde_json::json!({})
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["stage"], "codex_continuation");
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 2);
+            assert!(
+                row["counts"]["continuation_held"]
+                    .as_object()
+                    .unwrap()
+                    .len()
+                    <= 1
+            );
+        }
+    }
+}
+
+/// Fixed low-cardinality storage observations on the existing diagnostics envelope.
+pub(crate) fn scan_index_storage(
+    source: &'static str,
+    orphans: u64,
+    reserved: u64,
+    unavailable: [[u64; 6]; 3],
+) {
+    #[cfg(test)]
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| v.borrow_mut().push((orphans, unavailable, reserved)));
+
+    static TOTAL_ORPHANS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_MISSING_RESERVED_ONLY: AtomicU64 = AtomicU64::new(0);
+    static UNAVAILABLE: [[AtomicU64; 6]; 3] = [const { [const { AtomicU64::new(0) }; 6] }; 3];
+    let add = |counter: &AtomicU64, n: u64| {
+        counter
+            .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(n)))
+            .unwrap_or_else(|v| v)
+            .saturating_add(n)
+    };
+    let reserved_total = add(&ROOT_MISSING_RESERVED_ONLY, reserved);
+    if reserved != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("root_missing_reserved_only", reserved_total)]),
+        );
+    }
+    let total = add(&TOTAL_ORPHANS, orphans);
+    for (map, counts) in unavailable.into_iter().enumerate() {
+        for (cause, n) in counts.into_iter().enumerate() {
+            let count = add(&UNAVAILABLE[map][cause], n);
+            if n != 0 {
+                traversal_point(
+                    "scan_index_storage",
+                    source,
+                    &serde_json::json!({"index_shard_unavailable": {"map": (["account_pending", "usage_pending", "request_census"][map]), "cause": ([crate::snapshots::scan_index_persistence::UnavailableCause::Missing, crate::snapshots::scan_index_persistence::UnavailableCause::Generation, crate::snapshots::scan_index_persistence::UnavailableCause::Digest, crate::snapshots::scan_index_persistence::UnavailableCause::Decode, crate::snapshots::scan_index_persistence::UnavailableCause::Descriptor, crate::snapshots::scan_index_persistence::UnavailableCause::Unsafe][cause].label()), "count": count}}),
+                );
+            }
+        }
+    }
+    if orphans != 0 {
+        traversal_point(
+            "scan_index_storage",
+            source,
+            &BTreeMap::from([("scanindex_orphan_init_discarded", total)]),
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_STORAGE_OBSERVATIONS: std::cell::RefCell<Vec<StorageReadObservation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_scan_index_storage_observations() -> Vec<StorageReadObservation> {
+    SCAN_INDEX_STORAGE_OBSERVATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+#[cfg(test)]
+type StorageReadObservation = (u64, [[u64; 6]; 3], u64);
+
+/// One content-free alarm on entry to a shard-unavailable source episode.
+pub(crate) fn scan_index_shard_alarm(source: &'static str, unavailable: usize, transitions: u64) {
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "index_shard_unavailable_alarm": 1,
+            "unavailable_maps": unavailable,
+            "blocked_sources": 1,
+            "transitions": transitions,
+        }),
+    );
+}
+pub(crate) fn scan_index_manifest_refused(source: &'static str) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let count = TOTAL
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scanindex_manifest_unavailable_refused": count,
+        }),
+    );
+}
+
+/// Per-refused-load counter, independent of the repair blocker's episode alarm.
+/// Only fixed causes and numeric counts; never include the originating error.
+pub(crate) fn scan_index_repair_required(
+    source: &str,
+    cause: crate::snapshots::scan_index_health::RepairCause,
+) {
+    static TOTALS: [AtomicU64; crate::snapshots::scan_index_health::RepairCause::COUNT] =
+        [const { AtomicU64::new(0) }; crate::snapshots::scan_index_health::RepairCause::COUNT];
+    let count = TOTALS[cause as usize]
+        .try_update(Relaxed, Relaxed, |v| Some(v.saturating_add(1)))
+        .unwrap_or_else(|v| v)
+        .saturating_add(1);
+    traversal_point(
+        "scan_index_storage",
+        source,
+        &serde_json::json!({
+            "scan_index_repair_required": {
+                "cause": cause.label(), "delta": 1, "count": count,
+            },
+        }),
+    );
+}
+
+/// Reuses the bounded stage sampler. CPU is process-attributed; concurrent work
+/// can contribute. Peaks are 50-ms observations, not hard memory bounds.
+pub(crate) struct StateV2Probe {
+    started: Instant,
+    footprint: Option<footprint::Stage>,
+    cpu: Option<ProcessSample>,
+}
+impl StateV2Probe {
+    pub(crate) fn begin() -> Self {
+        Self {
+            started: Instant::now(),
+            footprint: footprint::Stage::begin(),
+            cpu: process_sample(),
+        }
+    }
+    pub(crate) fn wall_us(&self) -> u64 {
+        wall_us(self.started)
+    }
+    pub(crate) fn disk(&self) -> Option<DiskBytes> {
+        DiskBytes::between(self.cpu, process_sample())
+    }
+    pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
+        self.footprint
+            .as_ref()
+            .map(|s| s.finish().memory())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn finish(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let (steady, peak) = self
+            .footprint
+            .as_ref()
+            .map(|s| {
+                let (end, peak) = s.finish().memory();
+                (end.rss_bytes, peak.rss_bytes)
+            })
+            .unwrap_or_default();
+        (
+            self.cpu
+                .zip(process_sample())
+                .and_then(|(a, b)| b.cpu_us.checked_sub(a.cpu_us)),
+            steady,
+            peak,
+        )
+    }
+}
+
+/// V2 growth counters use the existing local diagnostics row. No keys or paths.
+pub(crate) fn v2_growth_retained(bytes: u64) {
+    claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
+}
+/// One row per revalidating loop: its (stats, uncertain) sums, when any.
+pub(crate) fn v2_growth_revalidate((stats, uncertain): (u64, u64)) {
+    if stats > 0 {
+        claude_state_v2(
+            &serde_json::json!({"v2_growth_revalidate": {"stats": stats, "uncertain": uncertain}}),
+        );
+    }
+}
+pub(crate) fn v2_growth_uncertain_alarm(passes: u32) {
+    traversal_point(
+        "v2_growth_uncertain_alarm",
+        "claude_code",
+        &serde_json::json!({"consecutive_passes": passes}),
+    );
+}
+
+/// Current process memory, not lifetime ru_maxrss. Unavailable is never zero.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct StateV2Memory {
+    pub(crate) rss_bytes: Option<u64>,
+    pub(crate) phys_footprint_bytes: Option<u64>,
+}
+pub(crate) fn state_v2_memory() -> StateV2Memory {
+    footprint::current()
+}
+pub(crate) fn state_v2_cpu_us() -> Option<u64> {
+    process_sample().map(|p| p.cpu_us)
+}
+pub(crate) fn state_v2_cpu() -> Option<StateV2Cpu> {
+    process_usage().map(|(_, split)| split)
+}
+
+crate::heap_layout_bound::no_heap!(true; CodexZstCause);

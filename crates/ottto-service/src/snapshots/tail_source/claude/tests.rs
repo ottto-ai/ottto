@@ -1,0 +1,312 @@
+//! The Claude Tail codec on real parses of synthetic transcripts: every field
+//! home round-trips, missing state is an incomplete reconstruction, skill
+//! labels are data, and the head identity binds no delivery input.
+use super::super::seam::tests::{copy, load, parse_lines, stage_full, stage_reduction};
+use super::*;
+use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
+use crate::snapshots::state_v2::StagedFile;
+use serde_json::json;
+
+const SESSION: &str = "5f0c2a8e-1111-4222-8333-944445555777";
+/// Non-ASCII, and longer than the record store's 96-byte label bound.
+const SKILL: &str = "ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé-skill-ünïcödé";
+
+/// A user prompt, then `responses` assistant responses a minute apart, each
+/// with a capability tool use, a compaction boundary after every fourth, and
+/// a title. The first response also invokes the `SKILL` skill.
+pub(in crate::snapshots) fn lines(responses: usize) -> Vec<String> {
+    let at = |minute: usize| format!("2026-10-20T{:02}:{:02}:00Z", 10 + minute / 60, minute % 60);
+    let mut lines = vec![json!({"type":"user","sessionId":SESSION,"uuid":"u-0",
+        "parentUuid":null,"timestamp":at(0),"cwd":"/tmp/tail-claude","version":"2.1.0",
+        "message":{"role":"user","content":"please review the change"}})
+    .to_string()];
+    for i in 0..responses {
+        let mut content = vec![json!({"type":"tool_use","id":format!("toolu_{i:04}"),
+            "name":"mcp__claude-in-chrome__navigate","input":{}})];
+        if i == 0 {
+            content.push(json!({"type":"tool_use","id":"toolu_skill","name":"Skill",
+                "input":{"skill":SKILL}}));
+        }
+        lines.push(
+            json!({"type":"assistant","sessionId":SESSION,"uuid":format!("a-{i}"),
+                "timestamp":at(i),"cwd":"/tmp/tail-claude","requestId":format!("req_{i:04}"),
+                "message":{"id":format!("msg_{i:04}"),"type":"message","role":"assistant",
+                    "model":"claude-opus-4-1","stop_reason":"tool_use","content":content,
+                    "usage":{"input_tokens":10 + i,"cache_creation_input_tokens":0,
+                        "cache_read_input_tokens":0,"output_tokens":5}}})
+            .to_string(),
+        );
+        if i % 4 == 3 {
+            lines.push(
+                json!({"type":"system","subtype":"compact_boundary","sessionId":SESSION,
+                    "uuid":format!("c-{i}"),"timestamp":at(i),
+                    "compactMetadata":{"trigger":"auto","preTokens":1000,"postTokens":100,
+                        "durationMs":7}})
+                .to_string(),
+            );
+        }
+    }
+    lines.push(
+        json!({"type":"ai-title","sessionId":SESSION,"aiTitle":"Review the change"}).to_string(),
+    );
+    lines
+}
+
+fn parse(lines: &[String]) -> (CachedJsonlReduction, DurableCertificate) {
+    parse_lines(
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        lines,
+        "session.jsonl",
+    )
+}
+
+fn identity(file: &str, capture: bool) -> HeadIdentity {
+    let root = Path::new("/home/projects");
+    HeadIdentity::new(
+        Path::new("/state/scan-index.json"),
+        SnapshotSource::ClaudeCode,
+        root,
+        &root.join(file),
+        capture,
+    )
+}
+
+fn stage(reduction: &CachedJsonlReduction, certificate: &DurableCertificate) -> StagedFile {
+    stage_reduction::<Claude>(reduction, certificate, &identity("session.jsonl", false))
+}
+
+/// [format] Every Claude field home round-trips: head scalars and lineage,
+/// paged collections across page boundaries, and content as session facts
+/// only (opening-call files by call id). Finish and live fields stay out.
+#[test]
+fn every_claude_field_home_round_trips_through_head_and_pages() {
+    let (mut reduction, certificate) = parse(&lines(300));
+    let acc = reduction.accumulator_for_test();
+    acc.activity_changed_file_hashes.extend(
+        (0..3).map(|n| sha256_hex(&["ottto-activity-changed-file:v1", &format!("src/{n}.rs")])),
+    );
+    acc.claude_fork_parent = Some("4a1b2c3d-0000-4000-8000-000000000001".into());
+    acc.artifacts.push(SessionArtifact {
+        kind: "pull_request".into(),
+        value: "https://example.invalid/pull/7".into(),
+    });
+    for (position, attachment) in [
+        (
+            1,
+            json!({"type":"session_context","context":{"userEmail":"person@example.invalid"}}),
+        ),
+        (
+            2,
+            json!({"type":"credential_org","organizationUuid":"6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"}),
+        ),
+    ] {
+        claude_request_identity::note_marker_line(
+            &mut acc.claude_org_markers,
+            &json!({"type":"attachment","attachment":attachment}),
+            position,
+        );
+    }
+    acc.session_start
+        .open_call_for_test("toolu_open", &["src/CANARY_OPEN_FILE.rs"]);
+    let staged = stage(&reduction, &certificate);
+    let (acc, _, _) = reduction.finish_view();
+    assert_eq!(Claude::SOURCE, acc.source);
+    assert_eq!(Claude::finish_field_nonempty(acc), None);
+    let pages = |collection: Collection| {
+        staged
+            .pages
+            .keys()
+            .filter(|(stored, _)| *stored == collection)
+            .count()
+    };
+    assert_eq!(
+        [
+            Collection::Responses,
+            Collection::ToolUses,
+            Collection::ChangedFiles,
+            Collection::CapabilityHours,
+            Collection::Compactions,
+            Collection::SessionFacts,
+        ]
+        .map(pages),
+        [2, 2, 1, 5, 2, 4]
+    );
+    let contents: [&[u8]; 4] = [
+        b"please review",
+        b"/tmp/tail-claude",
+        b"Review the change",
+        b"CANARY_OPEN_FILE",
+    ];
+    let holds =
+        |value: &[u8], content: &[u8]| value.windows(content.len()).any(|window| window == content);
+    for (key, value) in std::iter::once((None, &staged.head))
+        .chain(staged.pages.iter().map(|(key, value)| (Some(key), value)))
+    {
+        if key.is_some_and(|(collection, _)| *collection == Collection::SessionFacts) {
+            continue;
+        }
+        for content in contents {
+            assert!(!holds(value, content), "content outside the session facts");
+        }
+    }
+    // Title, first prompt, workspace, opening settings: each in its own slot.
+    for (slot, content) in contents.into_iter().enumerate() {
+        let slot = [1, 2, 0, 3][slot];
+        assert!(holds(
+            &staged.pages[&(Collection::SessionFacts, slot)],
+            content
+        ));
+    }
+
+    let mut loaded = acc.clone();
+    let head = load::<Claude>(&staged, &mut loaded).unwrap();
+    assert_eq!(head.certificate, certificate);
+    assert_eq!(
+        (&loaded.title, &loaded.workspace_path),
+        (&acc.title, &acc.workspace_path)
+    );
+    assert_eq!(
+        (&loaded.first_prompt_material, &loaded.first_prompt_title),
+        (&acc.first_prompt_material, &acc.first_prompt_title)
+    );
+    assert_eq!(
+        loaded.session_start.call_files_for_test("toolu_open"),
+        acc.session_start.call_files_for_test("toolu_open")
+    );
+    assert_eq!(loaded.claude_fork_parent, acc.claude_fork_parent);
+    assert!(loaded.provider_skills.contains(SKILL));
+
+    // The loaded state encodes to exactly the stored head and pages.
+    let view = PreFinalization::new(&loaded, &head.report, head.scalars);
+    let again = stage_full::<Claude>(&view, &head.certificate, &identity("session.jsonl", false));
+    assert_eq!(
+        (
+            again.revision,
+            &again.head,
+            &again.pages,
+            &again.collections
+        ),
+        (
+            staged.revision,
+            &staged.head,
+            &staged.pages,
+            &staged.collections
+        )
+    );
+
+    let mut live = acc.clone();
+    live.account_identifier_hash = Some("a".repeat(64));
+    assert_eq!(
+        Claude::finish_field_nonempty(&live),
+        Some("account_identifier_hash")
+    );
+}
+
+/// [format] Missing or inconsistent stored state is a reconstruction cause,
+/// never a default-empty success; an empty required collection is staged.
+#[test]
+fn missing_stored_state_is_an_incomplete_reconstruction() {
+    let (reduction, certificate) = parse(&lines(300));
+    let staged = stage(&reduction, &certificate);
+    let (acc, _, _) = reduction.finish_view();
+    let load_edited = |edit: &dyn Fn(&mut StagedFile)| {
+        let mut edited = copy(&staged);
+        edit(&mut edited);
+        load::<Claude>(&edited, &mut acc.clone()).map(|_| ())
+    };
+    assert_eq!(load_edited(&|_| {}), Ok(()));
+    assert_eq!(
+        load_edited(&|staged| {
+            staged.pages.remove(&(Collection::Responses, 1));
+        }),
+        Err(ReconstructCause::Incomplete)
+    );
+    assert_eq!(
+        load_edited(&|staged| {
+            staged.collections.remove(&Collection::ToolUses);
+        }),
+        Err(ReconstructCause::Incomplete)
+    );
+    assert_eq!(
+        load_edited(&|staged| {
+            if let Some(meta) = staged.collections.get_mut(&Collection::Responses) {
+                meta.elements_per_page = 64;
+            }
+        }),
+        Err(ReconstructCause::INCOMPATIBLE)
+    );
+    assert_eq!(
+        load_edited(&|staged| staged.revision = 0),
+        Err(ReconstructCause::INCOMPATIBLE)
+    );
+    let mut loaded = acc.clone();
+    Claude::decode_head(staged.revision, &staged.head, &mut loaded).unwrap();
+    assert_eq!(
+        Claude::decode_page(
+            Collection::Responses,
+            1,
+            &staged.pages[&(Collection::Responses, 1)],
+            &mut loaded
+        ),
+        Err(ReconstructCause::Corrupt)
+    );
+
+    // No compactions: the collection is still staged, empty and without pages.
+    let (small, certificate) = parse(&lines(2));
+    let staged = stage(&small, &certificate);
+    let (acc, _, _) = small.finish_view();
+    assert_eq!(staged.collections[&Collection::Compactions].elements, 0);
+    assert!(!staged
+        .pages
+        .keys()
+        .any(|(collection, _)| *collection == Collection::Compactions));
+    let mut edited = copy(&staged);
+    load::<Claude>(&edited, &mut acc.clone()).unwrap();
+    edited.collections.remove(&Collection::Compactions);
+    assert_eq!(
+        load::<Claude>(&edited, &mut acc.clone()).map(|_| ()),
+        Err(ReconstructCause::Incomplete)
+    );
+}
+
+/// [behaviour] Skill labels are data: non-ASCII, over-length, dot names, case
+/// duplicates and more than 33 entries are stored as they are, never refused.
+#[test]
+fn skill_labels_round_trip_as_data() {
+    let (mut reduction, certificate) = parse(&lines(2));
+    let acc = reduction.accumulator_for_test();
+    acc.activity_skills
+        .extend(["Review", "review", ".", "..", SKILL].map(String::from));
+    acc.activity_skills
+        .extend((0..40).map(|n| format!("skill-{n:02}")));
+    let staged = stage(&reduction, &certificate);
+    let (acc, _, _) = reduction.finish_view();
+    let mut loaded = acc.clone();
+    load::<Claude>(&staged, &mut loaded).unwrap();
+    assert!(acc.provider_skills.contains(SKILL) && acc.activity_skills.len() > 33);
+    assert_eq!(loaded.provider_skills, acc.provider_skills);
+    assert_eq!(loaded.activity_skills, acc.activity_skills);
+}
+
+/// [format] The head identity binds the route, the file and the capture mode.
+/// A delivery-policy change (here the artifacts toggle) leaves it valid.
+#[test]
+fn head_identity_binds_route_file_and_capture_mode_only() {
+    let (mut reduction, certificate) = parse(&lines(2));
+    let before = stage(&reduction, &certificate);
+    let acc = reduction.accumulator_for_test();
+    acc.artifacts_enabled = !acc.artifacts_enabled;
+    let after = stage(&reduction, &certificate);
+    let id = identity("session.jsonl", false);
+    assert_eq!(id.check(&before.head), Ok(false));
+    assert_eq!(id.check(&after.head), Ok(false));
+    assert_eq!(
+        identity("other.jsonl", false).check(&before.head),
+        Err(ReconstructCause::Identity)
+    );
+    assert_eq!(
+        identity("session.jsonl", true).check(&before.head),
+        Err(ReconstructCause::INCOMPATIBLE)
+    );
+}

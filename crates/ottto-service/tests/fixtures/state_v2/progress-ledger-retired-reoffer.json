@@ -1,0 +1,22 @@
+{
+  "permanent_rejections": {
+    "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0": {
+      "body_witness": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "reason": "other",
+      "reoffer": {
+        "version": 1,
+        "reason": "legacy_other_reclassification",
+        "retry_after_unix_seconds": 1
+      }
+    },
+    "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1": {
+      "body_witness": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+      "reason": "other",
+      "reoffer": {
+        "version": 1,
+        "reason": "original_pair_candidate_unproved",
+        "retry_after_unix_seconds": 1
+      }
+    }
+  }
+}

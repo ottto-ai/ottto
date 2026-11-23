@@ -1,0 +1,181 @@
+# Troubleshooting
+
+Start with machine-readable status:
+
+```bash
+ottto status --json
+ottto doctor --json
+```
+
+Do not parse human summaries. Use JSON status, error codes, and next-action
+fields. For setup-specific JSON, prefer `agent_action.kind` as the stable
+machine branch: `open_browser_claim`, `answer_setup_question`, `retry_setup`,
+`wait_or_check_status`, or `inspect_failure`.
+
+## Common Exit Codes
+
+| Code | Meaning | First response |
+| --- | --- | --- |
+| `10` | `ottto-service` unavailable | Let CLI autostart once, then check install owner service state. |
+| `11` | Local daemon authentication failed | Reinstall or repair local control token through the install owner. |
+| `13` | Connected to another account | Ask the user before reset or logout. |
+| `14` | Backend unreachable | Check network and retry. |
+| `16` | Backend unavailable | Wait and retry; do not clear local credentials. |
+| `30` | Repair locked | Wait for the active local operation to finish. |
+| `50` | Permission denied | Check macOS permissions and app trust. |
+| `60` | Browser/user action needed | Open or share the claim URL/code. |
+| `61` | Setup timed out | Rerun setup or use headless setup with claim URL/code. |
+
+## Setup Stuck Waiting
+
+```bash
+ottto setup --json --no-browser --no-wait
+```
+
+Share the returned claim URL or code with the user. If browser approval already
+happened, run:
+
+```bash
+ottto status --refresh-agent-status --json
+ottto apps detect --json
+```
+
+## App Needs Repair
+
+For Claude Code:
+
+```bash
+ottto doctor --json
+ottto verify --repair --app claude-code --json
+ottto fix --app claude-code --json
+ottto verify --app claude-code --json
+```
+
+If Verify returns `claude_oauth_reauth_required`, Ottto and the Mac connection
+are still healthy; only Claude Code's default provider login expired. Open
+Claude Code without `CLAUDE_CONFIG_DIR`, type `/login`, complete Claude's
+sign-in, then run Verify again. Do not start a new Ottto setup or Mac claim for
+this source-scoped result.
+
+If Doctor reports `claude_shell_profile_telemetry_override`, Claude Desktop may
+inherit telemetry exports from a shell profile. The report lists variable names
+and destination classes, never their values. An unreadable profile is Unknown.
+Fix reports the warning and preserves user-owned profile lines while keeping
+managed configuration repair available. Remove or comment out the relevant
+unfenced exports, quit and reopen Claude Desktop, start a new session, then run
+Verify again. This check reports literal exports in zsh/bash profiles; it does not
+inspect running process environments or establish a session capture gap.
+
+For Codex:
+
+```bash
+ottto doctor --json
+ottto verify --repair --app codex --json
+ottto fix --app codex --json
+ottto verify --app codex --json
+```
+
+Plain verify is read-only. `verify --repair` repairs only daemon-owned
+WriteConfig config drift, re-reads config, and runs telemetry smoke only after
+the config is clean. If repair JSON requires browser approval, or if verify
+returns `patch_disabled`, do not edit config files directly. Present the
+browser/setup next action or the patch-disabled fact.
+
+Claude Code quota windows also depend on the daemon-owned statusLine wrapper.
+If plan/account detection works but 5-hour or weekly quota windows are missing,
+use the same `verify --repair` / `fix` flow; repair recreates a missing or stale
+`claude-code-statusline.sh` wrapper before re-verifying.
+
+## Companion Cannot Reach The Daemon
+
+The Companion app authenticates to `ottto-service` by its code signature, not by
+a token. If a request comes back `local_client_not_trusted` — the app opens but
+shows nothing and never connects — the daemon refused it.
+
+Check the daemon error log; it records the reason once per run. A Homebrew
+install logs to `ottto-service.error.log`; a LaunchAgent written by the app or
+`macos_dev_install.sh` logs to `ottto-service.err.log`. The glob covers both:
+
+```bash
+grep 'refused token-less Companion trust' ~/Library/Logs/Ottto/ottto-service.err*.log
+```
+
+The rule is that a Developer ID signed `ottto-service` requires a Developer ID
+signed `Ottto.app` from the same Apple team. An internal (ad-hoc sealed) daemon
+only requires the `net.ottto.Companion` bundle identifier, so a normal internal
+install needs no configuration.
+
+So a customer install failing this way means `Ottto.app` is not the signed app
+it should be — reinstall from the official download rather than working around
+it. The combination that legitimately hits this is an internal one: a release
+daemon (Homebrew or a stable install) next to a locally built app. Point that
+daemon at the local app explicitly:
+
+```bash
+./scripts/macos_dev_install.sh --bootstrap-launch-agent --trust-dev-companion
+```
+
+which writes `OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent.
+Equivalently, `ottto-service service write-launch-agent --executable <path>
+--companion-code-requirement 'identifier "net.ottto.Companion"'`. Setting the
+variable in your shell does nothing: the daemon runs under launchd and does not
+inherit it.
+
+## Local Relay Port Conflict
+
+The default local OTLP relay listens on `127.0.0.1:43119`. If another macOS
+user account or stale Ottto service already owns that port, `ottto-service`
+binds a deterministic per-user fallback port and reports the active endpoint in
+`ottto status --json`.
+
+Run the app repair flow after a fallback bind so Codex or Claude Code settings
+are rewritten to the active endpoint:
+
+```bash
+ottto verify --repair --app codex --json
+ottto fix --app codex --json
+ottto verify --app codex --json
+```
+
+If the stale service belongs to a test user or old login session, also remove
+that user's `net.ottto.service` LaunchAgent through the normal macOS account or
+install-owner path. Do not kill another user's process unless you own that test
+account and have confirmed it is not the active customer install.
+
+## Account Disconnect Problems
+
+Use cloud-first logout:
+
+```bash
+ottto logout --json
+```
+
+If the backend is unavailable or rejects a stale binding, the CLI should keep
+local credentials and point to the explicit emergency path:
+
+```bash
+ottto logout --local-only --json
+```
+
+Use local-only cleanup only after the user accepts that cloud disconnect did not
+complete.
+
+Cloud logout also releases this Mac's server registration when the response
+reports `device_released: true`. Local-only cleanup never does: the Mac stays
+registered to the old Ottto account until that account removes it on its Apps
+page (Disconnect), and only then can a different account connect it. An
+expired Ottto connection no longer blocks the release: when Ottto has already
+ended this Mac's setup run, logout releases the registration with this Mac's
+device credential and reports `device_released: true` with
+`cloud_disconnected: false`.
+
+## Support Bundle
+
+```bash
+ottto diagnostics collect --json
+```
+
+Upload only with explicit approval, retention disclosure acceptance, and an
+active login or support claim. Support claims are authorization material; do
+not paste them into issues, chat, diagnostics summaries, or support bundle
+content.

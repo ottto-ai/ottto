@@ -1,0 +1,218 @@
+//! Reader closure uses synthetic files only. A refusal produces no body.
+use super::*;
+use crate::local_resource_diagnostics::capture;
+use codex_compressed_input::{compressed_input_credit, is_compressed_codex_rollout};
+
+thread_local! {
+    static ACTIVITY: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+pub(in crate::snapshots) fn activity() -> (usize, usize) {
+    ACTIVITY.with(std::cell::Cell::get)
+}
+pub(super) fn decoder_constructed() {
+    ACTIVITY.with(|counts| {
+        let (d, p) = counts.get();
+        counts.set((d + 1, p));
+    });
+}
+pub(super) fn jsonl_parse_attempted() {
+    ACTIVITY.with(|counts| {
+        let (d, p) = counts.get();
+        counts.set((d, p + 1));
+    });
+}
+/// Counters are cumulative totals, per thread under test. The flush a pass makes
+/// reports them on one row.
+pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -> T {
+    use crate::local_resource_diagnostics::{codex_zst_refused_count, codex_zst_refused_flush};
+    let before = ACTIVITY.with(std::cell::Cell::get);
+    let count = codex_zst_refused_count(cause);
+    let (result, rows) = capture(|| {
+        let result = run();
+        codex_zst_refused_flush();
+        result
+    });
+    assert_eq!(
+        ACTIVITY.with(std::cell::Cell::get),
+        before,
+        "no decoder or JSONL parse"
+    );
+    let key = serde_json::to_value(cause).unwrap();
+    let key = key.as_str().unwrap();
+    let totals = rows
+        .iter()
+        .filter(|row| row["stage"] == "codex_zst_refused")
+        .map(|row| {
+            row["counts"]["codex_zst_refused"][key]
+                .as_u64()
+                .expect("named cause counter")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals, [codex_zst_refused_count(cause)]);
+    assert!(totals[0] > count);
+    result
+}
+
+/// §13: a pass flushes one sparse line when the counters changed, none when not.
+#[test]
+fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
+    use crate::local_resource_diagnostics::codex_zst_refused;
+    let flushed = |rows: &[Value]| {
+        rows.iter()
+            .filter(|row| row["stage"] == "codex_zst_refused")
+            .map(|row| row["counts"]["codex_zst_refused"].clone())
+            .collect::<Vec<_>>()
+    };
+    let (_, rows) = capture(crate::local_resource_diagnostics::codex_zst_refused_flush);
+    assert_eq!(flushed(&rows), Vec::<Value>::new(), "nothing refused yet");
+    let (_, rows) = capture(|| {
+        for _ in 0..3 {
+            codex_zst_refused(CodexZstCause::AdmissionRefused);
+        }
+        codex_zst_refused(CodexZstCause::HeaderUnfunded);
+        // No line per refusal: only the pass reports.
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
+    });
+    assert_eq!(
+        flushed(&rows),
+        [serde_json::json!({
+            "CompressedAdmissionRefused": 3,
+            "CompressedHeaderUnfunded": 1,
+        })]
+    );
+    let (_, rows) = capture(crate::local_resource_diagnostics::codex_zst_refused_flush);
+    assert_eq!(flushed(&rows), Vec::<Value>::new(), "unchanged pass");
+    let (_, rows) = capture(|| {
+        codex_zst_refused(CodexZstCause::AdmissionRefused);
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
+        crate::local_resource_diagnostics::codex_zst_refused_flush();
+    });
+    assert_eq!(
+        flushed(&rows),
+        [serde_json::json!({
+            "CompressedAdmissionRefused": 4,
+            "CompressedHeaderUnfunded": 1,
+        })],
+        "cumulative, one line for the changed pass"
+    );
+}
+
+pub(super) fn candidate(path: &Path) -> CandidateFile {
+    CandidateFile {
+        physical_identity: None,
+        scan_root: path.parent().unwrap().to_owned(),
+        path: path.to_owned(),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
+    }
+}
+
+/// [behaviour] Unfunded reader families refuse archives; the plain header
+/// inventory excludes them without poisoning ordinary join completeness.
+#[test]
+fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
+    let root = crate::test_scratch::private_dir("codex-zst-closure");
+    let path = root.join("rollout-synthetic.jsonl.zst");
+    // Valid JSON under the archive suffix catches accidental plain parsing too.
+    fs::write(
+        &path,
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\"}}\n",
+    )
+    .unwrap();
+    let member = candidate(&path);
+    let file = || File::open(&path).unwrap();
+    assert_refused(CodexZstCause::CompatibilityUnfunded, || {
+        assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
+        assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
+    });
+    assert_refused(CodexZstCause::ReplayNotAuthorized, || {
+        assert!(
+            reopen_for_replay(SnapshotSource::Codex, &member, &OpenedInput::plain(file())).is_err()
+        );
+    });
+    assert_refused(CodexZstCause::HeaderUnfunded, || {
+        assert!(codex_file_join::header_reduction_witness(&member).is_err());
+    });
+    assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(sampled_scan::codex_cursor::LiveWitness::read(&path, &file(), 8).is_none());
+    });
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    directories.observe(&root, &fs::metadata(&root).unwrap());
+    let inventory_paths = BTreeSet::from([local_index_key(&path)]);
+    let mut inventory = codex_file_join::HeaderInventory::new(
+        std::slice::from_ref(&root),
+        &inventory_paths,
+        Some(&directories),
+    );
+    // An unfunded encoded header holds its filename owner for ordinary
+    // retry; unrelated membership stays complete, with no read or unreadable record.
+    let before = ACTIVITY.with(std::cell::Cell::get);
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    assert!(inventory.headers.is_empty());
+    assert!(inventory.complete);
+    assert_eq!(
+        inventory.held_owners,
+        codex_session_id_candidates_from_path(&path)
+            .into_iter()
+            .collect()
+    );
+    assert!(inventory.refused.is_empty());
+    assert_eq!(ACTIVITY.with(std::cell::Cell::get), before);
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal() {
+    let root = crate::test_scratch::private_dir("codex-zst-opened-closure");
+    let path = root.join("rollout.jsonl");
+    fs::write(&path, b"{\"n\":1}\n").unwrap();
+    let mut physical = File::open(&path).unwrap();
+    let plain = OpenedInput::plain(physical.try_clone().unwrap());
+    assert!(!is_compressed_codex_rollout(Some(&path), Some(&plain)));
+    let (_, rows) = capture(|| {
+        refuse_compressed_codex(
+            Some(&path),
+            Some(&plain),
+            CodexZstCause::ReplayNotAuthorized,
+        )
+        .unwrap();
+        assert!(sampled_scan::codex_cursor::LiveWitness::read(&path, &physical, 8).is_some());
+    });
+    assert!(rows.is_empty());
+    let archive = root.join("rollout.jsonl.zst");
+    fs::write(
+        &archive,
+        zstd::stream::encode_all(&b"{\"n\":1}\n"[..], 1).unwrap(),
+    )
+    .unwrap();
+    physical = File::open(&archive).unwrap();
+    assert!(
+        read_opened_content_samples(&mut physical, fs::metadata(&archive).unwrap().len()).is_ok()
+    );
+    let input =
+        OpenedInput::compressed(physical, 1024, compressed_input_credit().unwrap()).unwrap();
+    assert!(is_compressed_codex_rollout(Some(&path), Some(&input)));
+    let mut parser =
+        OwnedJsonlParser::new_opened(input, &path, SnapshotSource::Codex, apply_codex_line, None)
+            .unwrap();
+    assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(parser
+            .prepare_acquisition(
+                None,
+                &crate::transcript_acquisition::Scope("fixture".into()),
+                None,
+                1
+            )
+            .is_err());
+        assert!(parser.reader.acquisition.is_none());
+        assert_eq!(parser.reader.consumed_bytes(), 0);
+    });
+    fs::remove_dir_all(root).unwrap();
+}

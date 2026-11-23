@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-02T07:00:00Z","type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","requestId":"req_1","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":10}}}
+{"timestamp":"2026-08-02T07:00:01Z","type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","requestId":"req_2","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":10}}}
+{"timestamp":"2026-08-02T07:00:02Z","type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","requestId":"req_3","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":10}}}
+{"timestamp":"2026-08-02T07:00:03Z","type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5","requestId":"req_4","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":10}}}

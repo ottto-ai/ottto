@@ -1,0 +1,57 @@
+# Connector Contribution
+
+Ottto source packages describe apps and collectors without giving them runtime
+permission by default. Manifests are closed contracts and must be validated
+before they are accepted.
+
+## Package Layout
+
+Source packages live under `connectors/sources/<source>/`:
+
+- `source.toml`: source package manifest.
+- `README.md`: contributor-facing source explanation.
+- `POLICY.md`: supported surfaces, unsupported surfaces, local-only behavior,
+  and upload boundaries.
+- `collectors/<collector>/collector.toml`: collector manifest.
+- `collectors/<collector>/fixtures/*.json`: safe emitted-record examples and
+  upload policy evidence.
+
+The generated registry lives at `connectors/registry.generated.json`.
+
+## Required Safety Rules
+
+- Unknown manifest fields fail validation.
+- Required fields must be present; use explicit empty arrays when empty.
+- Hidden credential reads, raw prompt/output upload, network calls, live
+  telemetry, config writes, and undocumented auth/network surfaces cannot
+  default to enabled.
+- Official first-party fixtures must not expose raw prompts, responses, tool
+  output, command output, local paths, credentials, cookies, API keys,
+  passwords, or secrets.
+- Fixture sample keys also must not expose raw account, user, organization,
+  machine, or installation identifiers.
+- Connector manifests do not grant Advisor action permissions and do not replace
+  pricing selector or attribution contracts.
+
+## Validate A Change
+
+`connectors/registry.generated.json` is built from the manifests by maintainer
+tooling outside this repository. If your change edits a manifest, say so in the
+pull request; a maintainer regenerates the registry before merge. Validate the
+manifests and fixtures with the testkit from the repository root:
+
+```bash
+cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test first_party_sources
+```
+
+Use the public Rust testkit helpers in source-package tests instead of copying
+backend generator logic:
+
+```rust
+use ottto_connector_testkit::{
+    assert_collector_manifest_contract, CollectorManifestContract,
+};
+```
+
+First-party packages for Codex, Claude Code, and Pi are examples of the
+expected shape.

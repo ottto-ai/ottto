@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$SCRIPT_DIR/public_repo_temp_cleanup.sh"
+DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$DEFAULT_REPO_ROOT"
+STAGED_OUTPUT_DIR=""
+KEEP_TEMP=0
+SCOPE="all"
+TMP_DIR=""
+script_completed=0
+steps_run=0
+
+usage() {
+  cat <<'USAGE'
+Usage: public_repo_surface_ci.sh [--root <dir>] [--staged-output <dir>] [--keep-temp]
+                                [--scope all|portable|macos]
+
+Runs the public repository surface checks that GitHub Actions runs before a
+public commit: schema/registry JSON validation, shellcheck, release/installer
+dry-run tests, and the derived-manifest guard, committed-tree secret scan, and
+root contract checks.
+
+Use --staged-output to copy a root-shaped tree into a temporary git checkout,
+commit it, and run the same checks against that commit.
+
+--scope picks which steps run. Each step is portable (P), needed on both Linux
+and macOS (B: the scripts under test run on Macs under /bin/bash 3.2 and BSD
+tools), or macOS-only (M: real plutil, codesign, packaging tools, LaunchServices).
+  all       every step once (default; macOS only)
+  portable  P and B steps (runs on Linux; GitHub CI "Public surface checks")
+  macos     M and B steps plus a /bin/bash 3.2 parse of scripts/*.sh
+            (GitHub CI "Rust contracts" job)
+USAGE
+}
+
+fail() {
+  echo "public-surface-ci: $*" >&2
+  exit 2
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    fail "$1 is required"
+  fi
+}
+
+cleanup() {
+  local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "public-surface-ci: exited before completion" >&2
+    status=1
+  fi
+  if [[ -n "$TMP_DIR" && "$KEEP_TEMP" -eq 0 ]]; then
+    public_repo_remove_temp_dir "public-surface-ci" "$TMP_DIR" || true
+  elif [[ -n "$TMP_DIR" ]]; then
+    echo "public-surface-ci: kept temporary checkout at $TMP_DIR"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --root)
+      [[ "$#" -ge 2 ]] || fail "--root requires a value"
+      REPO_ROOT="$2"
+      shift 2
+      ;;
+    --staged-output)
+      [[ "$#" -ge 2 ]] || fail "--staged-output requires a value"
+      STAGED_OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    --keep-temp)
+      KEEP_TEMP=1
+      shift
+      ;;
+    --scope)
+      [[ "$#" -ge 2 ]] || fail "--scope requires a value"
+      SCOPE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      script_completed=1
+      exit 0
+      ;;
+    *)
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$SCOPE" in
+  all|portable|macos) ;;
+  *) fail "unknown scope: $SCOPE (use all, portable, or macos)" ;;
+esac
+echo "public-surface-ci: scope=$SCOPE bash=$BASH_VERSION"
+
+require_command git
+require_command jq
+require_command python3
+require_command cargo
+
+prepare_staged_checkout() {
+  local staged_root="$1"
+  local checkout_root="$2"
+  if [[ ! -d "$staged_root" ]]; then
+    fail "staged output is not a directory: $staged_root"
+  fi
+  mkdir -p "$checkout_root"
+  python3 - "$staged_root" "$checkout_root" <<'PY'
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+source_root = Path(sys.argv[1]).resolve()
+checkout_root = Path(sys.argv[2]).resolve()
+
+if not source_root.is_dir():
+    print(f"public-surface-ci: staged output is not a directory: {source_root}", file=sys.stderr)
+    sys.exit(2)
+
+checkout_root.mkdir(parents=True, exist_ok=True)
+for path in sorted(source_root.rglob("*")):
+    relative = path.relative_to(source_root)
+    if ".git" in relative.parts:
+        continue
+    if path.is_symlink():
+        print(f"public-surface-ci: refusing symlink in staged output: {relative.as_posix()}", file=sys.stderr)
+        sys.exit(2)
+
+for child in sorted(source_root.iterdir(), key=lambda path: path.name):
+    if child.name == ".git":
+        continue
+    target = checkout_root / child.name
+    if child.is_dir():
+        shutil.copytree(child, target, symlinks=False, ignore=shutil.ignore_patterns(".git"))
+    elif child.is_file():
+        shutil.copy2(child, target)
+PY
+  git -C "$checkout_root" init -q
+  git -C "$checkout_root" config user.email "public-surface-ci@example.invalid"
+  git -C "$checkout_root" config user.name "Public Surface CI"
+  git -C "$checkout_root" add .
+  git -C "$checkout_root" commit -qm "public surface smoke"
+}
+
+if [[ -n "$STAGED_OUTPUT_DIR" ]]; then
+  TMP_DIR="$(mktemp -d)"
+  REPO_ROOT="$TMP_DIR/public-ottto"
+  prepare_staged_checkout "$STAGED_OUTPUT_DIR" "$REPO_ROOT"
+fi
+
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+if [[ ! -d "$REPO_ROOT" ]]; then
+  fail "repository root is not a directory: $REPO_ROOT"
+fi
+if ! git -C "$REPO_ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
+  fail "repository root is not a git checkout: $REPO_ROOT"
+fi
+
+required_public_files=(
+  "connectors/registry.generated.json"
+  "public-export/deny-patterns.tsv"
+  "scripts/public_repo_contract_check.sh"
+  "scripts/public_repo_manifest.sh"
+  "scripts/public_repo_secret_scan.sh"
+  "schemas/source-manifest.schema.json"
+)
+for path in "${required_public_files[@]}"; do
+  if [[ ! -f "$REPO_ROOT/$path" ]]; then
+    fail "root is not a root-shaped public ottto checkout; missing $path"
+  fi
+done
+
+# Checked only after staged-output preparation and root checks, so their
+# failures (exit 2 with their own message) stay the same on every OS and on a
+# Mac without shellcheck (the macOS scope does not need it).
+if [[ "$SCOPE" != portable && "$(uname -s)" != Darwin ]]; then
+  fail "scope $SCOPE needs macOS; use --scope portable"
+fi
+if [[ "$SCOPE" != macos ]]; then
+  require_command shellcheck
+fi
+
+# run_step <P|B|M> <label> <command...>: see --help for the step classes.
+run_step() {
+  local class="$1"
+  local label="$2"
+  shift 2
+  case "$class" in
+    P) [[ "$SCOPE" != macos ]] || return 0 ;;
+    B) ;;
+    M) [[ "$SCOPE" != portable ]] || return 0 ;;
+    *) fail "unknown step class '$class' for: $label" ;;
+  esac
+  echo "public-surface-ci: $label"
+  (cd "$REPO_ROOT" && "$@")
+  steps_run=$((steps_run + 1))
+}
+
+# The move checks compare the change with its base: the first parent of the
+# pull-request merge commit in GitHub Actions, else the merge-base with
+# origin/main. They fail only for a pull request whose description has a line
+# starting with one of the given labels (default `Move-only:`; the description is
+# passed in MOVE_ONLY_PR_BODY); otherwise they report and pass. Without a base (a
+# staged checkout) they are skipped.
+move_check_base() {
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    git rev-parse -q --verify 'HEAD^1' || true
+  else
+    git merge-base origin/main HEAD 2>/dev/null || true
+  fi
+}
+
+move_check() {
+  local script="$1"
+  local labels="${2:-Move-only:}"
+  local base
+  base="$(move_check_base)"
+  if [[ -z "$base" ]]; then
+    echo "public-surface-ci: no base commit; skipping $script"
+    return 0
+  fi
+  if grep -qE "^($labels)" <<< "${MOVE_ONLY_PR_BODY:-}"; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 "$script" --base "$base" --head HEAD --report
+  fi
+}
+
+# Whole-file module moves and their path-absolutizing prep changes: same base,
+# report always; a line starting with `File-move:` or `Absolutize:` in the pull
+# request description makes the matching mode blocking.
+file_move_check() {
+  local mode="$1"
+  local body_line="$2"
+  local base
+  base="$(move_check_base)"
+  if [[ -z "$base" ]]; then
+    echo "public-surface-ci: no base commit; skipping the file move check ($mode)"
+    return 0
+  fi
+  if grep -q "^$body_line" <<< "${MOVE_ONLY_PR_BODY:-}"; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_file_moves.py "$mode" --base "$base" --head HEAD --report
+  fi
+}
+
+# Existing files report only; new production Rust files have a hard line ceiling.
+source_layout_report() {
+  local base
+  base="$(move_check_base)"
+  if [[ -n "$base" ]]; then
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce-new --base "$base"
+  else
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py
+  fi
+}
+
+run_step P "validate public schemas and generated registry" \
+  bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
+run_step P "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
+run_step P "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
+run_step P "test money equivalence decoded-body comparison" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_money_equivalence.py
+run_step P "test runtime test split" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_runtime_tests.py
+run_step P "test flaky test report" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_flaky_tests.py
+run_step P "test PR merge guard" bash scripts/test_pr_merge_when_mac_green.sh
+run_step P "test Mac batch helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_mac_batch.py
+run_step P "test move ledger check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_move_ledger.py
+run_step P "test test-ID map check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_test_id_map.py
+run_step P "test source layout check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_source_layout.py
+run_step P "test file move check" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_file_moves.py
+run_step P "check that a move-only change only moves items" move_check scripts/check_move_ledger.py
+run_step P "check that a file-move change only moves whole module files" file_move_check move File-move:
+run_step P "check that an absolutize change only makes super paths absolute" file_move_check absolutize Absolutize:
+# Whole-file moves rename test IDs and absolutize changes must keep them, so
+# their labels also make the test-ID map blocking.
+run_step P "check test IDs and never-retry decisions" \
+  move_check scripts/check_test_id_map.py 'Move-only:|File-move:|Absolutize:'
+run_step P "report source layout and enforce new file ceilings" source_layout_report
+
+run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
+# PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
+# (scripts/public_repo_manifest.sh --facts) and must not be committed.
+run_step P "check root manifest is derived from the commit tree" \
+  bash scripts/public_repo_manifest.sh --guard
+run_step P "scan committed public tree" bash scripts/public_repo_secret_scan.sh
+run_step P "verify root public contracts" bash scripts/public_repo_contract_check.sh
+run_step P "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
+run_step P "test public commit guards" bash scripts/test_public_repo_commit_guards.sh
+run_step B "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
+run_step P "test public contract check" bash scripts/test_public_repo_contract_check.sh
+run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
+run_step P "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
+run_step B "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
+run_step M "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
+run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_companion_entitlements.sh
+run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
+run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
+run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
+run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
+run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
+run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
+run_step P "test release evidence placeholders" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_evidence_placeholders.py
+run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
+run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
+run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
+run_step B "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh
+run_step B "test Homebrew formula generator" bash scripts/test_homebrew_formula.sh
+run_step B "test hosted native installer generator" bash scripts/test_hosted_native_installer.sh
+run_step B "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
+
+# Free macOS /bin/bash 3.2 parse check for the scripts only Linux runs.
+# shellcheck disable=SC2016
+run_step M "parse public scripts with macOS /bin/bash" \
+  /bin/bash -c 'for f in scripts/*.sh; do /bin/bash -n "$f" || exit 1; done'
+
+echo "public-surface-ci: ran $steps_run steps (scope=$SCOPE)"
+echo "public-surface-ci: completed public surface checks at $REPO_ROOT"
+script_completed=1

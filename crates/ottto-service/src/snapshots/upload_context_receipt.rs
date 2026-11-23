@@ -1,0 +1,1268 @@
+//! Per-file delivery evidence, independent of source census authority.
+use super::claude_money_birth_store::LocationKey;
+use super::*;
+use std::mem::{size_of, size_of_val};
+use std::sync::Arc;
+
+pub(crate) type RequestRows = Box<[(LocationKey, Arc<[u64]>)]>;
+impl crate::heap_layout_bound::HeapLayoutBound for RequestRows {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(size_of_val(self.as_ref()))?;
+        for (_, hashes) in self.iter() {
+            c.add(size_of_val(hashes.as_ref()).checked_add(2 * size_of::<usize>())?)?;
+        }
+        Some(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SlotRows {
+    pub fingerprint: String,
+    pub body_witness: String,
+    #[serde(with = "contribution_rows")]
+    pub rows: RequestRows,
+}
+impl SlotRows {
+    pub(crate) fn capture(item: &SnapshotItem) -> (String, Self) {
+        let mut hash = Sha256::new();
+        hash.update(SnapshotSource::ClaudeCode.api_slug().as_bytes());
+        hash.update([0]);
+        hash.update(item.source_session_id.as_bytes());
+        (
+            crate::hex::encode(&hash.finalize()[..16]),
+            Self {
+                fingerprint: item.snapshot_fingerprint.clone(),
+                body_witness: snapshot_upload_body_witness(item),
+                rows: item.request_contributions.clone(),
+            },
+        )
+    }
+}
+mod contribution_rows {
+    use super::*;
+    pub(super) fn serialize<S: serde::Serializer>(
+        rows: &RequestRows,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        rows.iter()
+            .map(|(loc, h)| (loc.to_bytes(), claude_request_census::HashBase64(h)))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<RequestRows, D::Error> {
+        Vec::<([u8; 16], String)>::deserialize(d)?
+            .into_iter()
+            .map(|(loc, text)| {
+                claude_request_census::decode_base64_hashes(&text)
+                    .map(|h| (LocationKey::from_bytes(loc), Arc::from(h)))
+                    .ok_or_else(|| serde::de::Error::custom("invalid contribution hashes"))
+            })
+            .collect()
+    }
+}
+crate::heap_layout_bound::fields!(SlotRows; fingerprint, body_witness, rows);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Receipt {
+    pub context_fingerprint: String,
+    /// Existing numeric capability replay epoch. Historical replay resets
+    /// delivery authority (including this receipt) even for retained entries.
+    pub replay_generation: u64,
+    pub source_witness: String,
+    pub body_witness: String,
+}
+
+/// Replay epoch of every receipt and local empty proof. It is fixed: the
+/// context-curve replay that once advanced it is retired (an index that never
+/// negotiated curve upload held 0). A historical replay clears receipts
+/// instead of advancing it.
+pub(crate) const RECEIPT_REPLAY_EPOCH: u64 = 0;
+
+/// One entity's exact stored-body ACK, copied from the upload ledger so it
+/// outlives ACK retirement. It proves only that body under that context, in
+/// the set's destination and replay generation; anything else means owed. It
+/// gates no credit, settlement, retirement, absence or family proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntityStamp {
+    pub context_fingerprint: String,
+    pub body_witness: String,
+}
+
+/// The inputs of the active upload context, digested, so a hash change can
+/// name what changed. Local scheduling data: only booleans reach a log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextInputs {
+    policy: String,
+    namespace: String,
+    cache_observations: bool,
+    copy_contract: bool,
+    resumed_prefix: bool,
+}
+
+impl ContextInputs {
+    pub(crate) fn new(
+        policy: &[u8],
+        namespace: Option<&str>,
+        cache_observations: bool,
+        copy_contract: bool,
+        resumed_prefix: bool,
+    ) -> Self {
+        Self {
+            policy: format!("{:x}", Sha256::digest(policy)),
+            namespace: format!(
+                "{:x}",
+                Sha256::digest(namespace.unwrap_or("none").as_bytes())
+            ),
+            cache_observations,
+            copy_contract,
+            resumed_prefix,
+        }
+    }
+}
+
+/// Per-item upload-context proof kept with the index. Old decoders drop it.
+/// Stamps bind delivery to one destination and replay generation. Request
+/// contributions track receiver membership independently of delivery proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProofState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<ContextInputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_namespace_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) request_contributions: BTreeMap<String, SlotRows>,
+    /// retired_<old>: the change-reason policy direction. Decode-only, so
+    /// state written with it still loads; never written.
+    #[serde(
+        rename = "direction",
+        default,
+        skip_serializing,
+        deserialize_with = "drop_retired_direction"
+    )]
+    retired_direction: (),
+}
+
+/// Reads the retired direction's exact old shape and drops it.
+fn drop_retired_direction<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "retired fields are decoded only for backward compatibility"
+    )]
+    struct Retired {
+        policy: [bool; 5],
+        context: Option<String>,
+        previous_context: Option<String>,
+        last_change_mask: u8,
+    }
+    Retired::deserialize(de).map(drop)
+}
+
+impl ScanIndex {
+    pub(in crate::snapshots) fn prune_request_contributions(&mut self) {
+        if self.deleted_holders.is_empty() {
+            return;
+        }
+        let live = self
+            .files
+            .keys()
+            .map(|key| claude_money_birth_store::location_key(key))
+            .collect::<BTreeSet<_>>();
+        let named = self.claude_copy_removals.referenced_hashes();
+        for slot in self.upload_context_proof.request_contributions.values_mut() {
+            slot.rows = slot
+                .rows
+                .iter()
+                .filter_map(|(loc, hashes)| {
+                    if !self.deleted_holders.contains(loc) || live.contains(loc) {
+                        return Some((*loc, Arc::clone(hashes)));
+                    }
+                    let kept = hashes
+                        .iter()
+                        .copied()
+                        .filter(|h| named.get(loc).is_some_and(|ids| ids.contains(h)))
+                        .collect::<Vec<_>>();
+                    (!kept.is_empty()).then(|| (*loc, Arc::from(kept)))
+                })
+                .collect();
+        }
+        // A slot the prune emptied proves nothing; drop it so it cannot leak.
+        self.upload_context_proof
+            .request_contributions
+            .retain(|_, slot| !slot.rows.is_empty());
+    }
+}
+
+impl ProofState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inputs.is_none()
+            && self.entity_stamps.is_empty()
+            && self.request_contributions.is_empty()
+    }
+    /// Scalar header; state v2 stores stamps and contributions as separate rows.
+    pub(crate) fn header(&self) -> Self {
+        Self {
+            inputs: self.inputs.clone(),
+            destination_namespace_hash: self.destination_namespace_hash.clone(),
+            replay_generation: self.replay_generation.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The copy-prefix money mode forms of one base: base, resumed-prefix, then
+/// copy-unproven.
+fn mode_family(base: &str) -> [String; 3] {
+    let resumed = crate::snapshot_sync::resumed_prefix_upload_context(base.to_owned(), true);
+    let unproven = crate::snapshot_sync::copy_unproven_upload_context(resumed.clone(), true);
+    [base.to_owned(), resumed, unproven]
+}
+
+/// Two delivery contexts are one family when one is a mode form of the other.
+/// The copy-unproven form of `from` itself is the resumed-prefix form's own
+/// copy-unproven sibling: both are forms of one base.
+fn same_mode_family(left: &str, right: &str) -> bool {
+    let derives = |from: &str, to: &str| {
+        mode_family(from).iter().any(|form| form == to)
+            || crate::snapshot_sync::copy_unproven_upload_context(from.to_owned(), true) == to
+    };
+    derives(left, right) || derives(right, left)
+}
+
+/// The receipt proves this entry's exact bytes at this replay epoch: its source
+/// bytes and, unless the file is confirmed empty, the body set it delivered.
+pub(super) fn receipt_binds_bytes(entry: &ScanIndexEntry, receipt: &Receipt, empty: bool) -> bool {
+    receipt.replay_generation == RECEIPT_REPLAY_EPOCH
+        && receipt.source_witness == entry.source_file_fingerprint
+        && (empty || entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness))
+}
+
+/// Measured backlog of entities and files that still owe proof under the
+/// active context. Bytes are local file sizes; state-only entities have none.
+/// File buckets are disjoint: every file without its own proof is in exactly
+/// one of `owed_files`, `listed_files`, `empty_files`, `ledger_accepted_files`.
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OwedCounts {
+    /// Non-exempt files whose indexed committed delivery remains unresolved.
+    pub owed_files: u64,
+    pub no_proof_entities: u64,
+    pub no_proof_bytes: u64,
+    pub wrong_context_entities: u64,
+    pub wrong_context_bytes: u64,
+    /// Owed files that owe no read: they pay on their next ordinary read.
+    pub context_only_files: u64,
+    /// Settled without a context receipt: operator-listed family files.
+    pub listed_files: u64,
+    /// Settled without a context receipt: confirmed empty, absent on disk.
+    pub empty_files: u64,
+    /// Settled without a context receipt: every committed member exactly in
+    /// the current accepted ledger.
+    pub ledger_accepted_files: u64,
+}
+
+/// Why a file without its own context proof still owes nothing. Counts only:
+/// none of these is delivery proof, and none gates a read or an upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exempt {
+    Listed,
+    Empty,
+    LedgerAccepted,
+}
+
+const OWED_LOG_INTERVAL_SECONDS: u64 = 3_600;
+static OWED_LOGGED_AT: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Captured from the final admitted bodies under their own context, before POST.
+/// Never serialized. A restored ACK counts only through `prior_acks`: its
+/// durable stamp of this same mode context and exact body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    key: String,
+    receipt: Receipt,
+    /// Retry/ACK mode isolation remains source-wide even when the file's
+    /// acquisition receipt uses the unaffected base context. `None` when the
+    /// mode is the receipt's own context: no allocation.
+    mode_context: Option<String>,
+    historical_replay_generation: Option<String>,
+    bodies: BTreeMap<String, String>,
+    wire_bytes: BTreeMap<String, u64>,
+    /// Bodies already exact-ACKed by an earlier pass under this mode context.
+    prior_acks: BTreeSet<String>,
+    /// This pass's catch-up allowance deferred at least one body.
+    split: bool,
+    /// The joined-group marker of a member offered another member's body;
+    /// `None` for a file offered its own.
+    joined_marker: Option<String>,
+}
+
+impl Candidate {
+    /// A file's ACKs may split across passes; its
+    /// receipt still waits until every body is exact-ACKed in this context.
+    pub(crate) fn with_split_evidence(
+        mut self,
+        stamped: impl Fn(&str, &str, &str) -> bool,
+        deferred: &BTreeSet<String>,
+    ) -> Self {
+        let context = self
+            .mode_context
+            .as_ref()
+            .unwrap_or(&self.receipt.context_fingerprint);
+        let prior_acks = self
+            .bodies
+            .iter()
+            .filter(|(entity, body)| stamped(entity, body, context))
+            .map(|(entity, _)| entity.clone())
+            .collect();
+        self.prior_acks = prior_acks;
+        self.split = self.bodies.keys().any(|entity| deferred.contains(entity));
+        self
+    }
+    pub(crate) fn entities(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.bodies.iter()
+    }
+    pub(crate) fn previous_body_matches(&self, previous: &ScanIndex) -> bool {
+        // The additive witness deliberately omits semantic/policy fields
+        // such as titles. Equal additive evidence is not an identical body
+        // when D changed the semantic entity set.
+        previous.file_snapshot_fingerprints.get(&self.key)
+            == Some(&self.bodies.keys().cloned().collect())
+            && previous
+                .files
+                .get(&self.key)
+                .and_then(|entry| entry.last_upload_body_witness.as_ref())
+                == Some(&self.receipt.body_witness)
+    }
+    pub(crate) fn has_accepted_predecessor(&self, previous: &ScanIndex) -> bool {
+        previous
+            .files
+            .get(&self.key)
+            .is_some_and(|entry| entry.source_file_fingerprint == self.receipt.source_witness)
+            && previous
+                .file_snapshot_fingerprints
+                .get(&self.key)
+                .is_some_and(|entities| {
+                    entities
+                        .iter()
+                        .any(|fp| previous.accepted_snapshot_fingerprints.contains(fp))
+                })
+    }
+    pub(crate) fn file_bytes(&self, index: &ScanIndex) -> u64 {
+        index
+            .files
+            .get(&self.key)
+            .map_or(0, |entry| entry.size_bytes)
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct RearmCounts {
+    pub files: u64,
+    pub bytes: u64,
+    pub local_bytes: u64,
+    /// Files left owed after this pass deferred part of their ACK set.
+    pub context_split_files: u64,
+}
+impl RearmCounts {
+    pub(crate) fn emit(&self, source: SnapshotSource) {
+        if self.files > 0 || self.local_bytes > 0 || self.context_split_files > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_rearm",
+                source.api_slug(),
+                &BTreeMap::from([("upload_context_rearm", self)]),
+            );
+        }
+    }
+}
+
+impl ScanIndex {
+    pub(crate) fn activate_file_upload_context(&mut self, source: SnapshotSource, context: String) {
+        self.activate_upload_context(context);
+        self.activate_quarantine_witness(source);
+    }
+
+    /// Every source decides upload-context debt per file and per entity once
+    /// an active context exists. There is no source-wide adoption.
+    pub(crate) fn file_upload_context_enabled(&self) -> bool {
+        self.active_upload_context_fingerprint.is_some()
+    }
+
+    /// Keep retry-mode isolation source-wide, but invalidate acquisition
+    /// receipts only for the operator's exact re-read set. No receipt is
+    /// manufactured: the base and qualified receipts still require real ACKs.
+    fn file_expected_context(&self, key: &str) -> Option<&String> {
+        let requested = self
+            .claude_money_birth_store
+            .money_marks(claude_money_birth_store::location_key(key))
+            & claude_copy_prefix_reread::REOWED
+            != 0;
+        if !requested {
+            if let Some(base) = self.copy_prefix_base_upload_context.as_ref() {
+                return Some(base);
+            }
+        }
+        self.active_upload_context_fingerprint.as_ref()
+    }
+
+    fn same_copy_prefix_base(&self, context: &str) -> bool {
+        self.copy_prefix_base_upload_context
+            .as_ref()
+            .is_some_and(|base| mode_family(base).iter().any(|form| form == context))
+    }
+
+    pub(crate) fn set_copy_prefix_base_upload_context(&mut self, base: Option<String>) {
+        self.copy_prefix_base_upload_context = base;
+    }
+
+    /// Only mode debt can share the scoped history-read admission. A genuine
+    /// base policy change keeps ordinary local evidence refresh semantics.
+    pub(super) fn copy_prefix_base_context_proven(&self, key: &str) -> bool {
+        self.files.get(key).is_some_and(|entry| {
+            entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    self.same_copy_prefix_base(&receipt.context_fingerprint)
+                        && receipt_binds_bytes(entry, receipt, false)
+                })
+        })
+    }
+
+    fn unaffected_file(&self, key: &str) -> bool {
+        self.copy_prefix_base_upload_context.is_some()
+            && self
+                .claude_money_birth_store
+                .money_marks(claude_money_birth_store::location_key(key))
+                & claude_copy_prefix_reread::REOWED
+                == 0
+    }
+
+    /// The receipt's context is THIS file's expected context. Pre-scope builds
+    /// may already have valid mode-qualified receipts of an unaffected file's
+    /// base; they are not unrelated read debt.
+    fn proof_context_matches(&self, key: &str, context: &str) -> bool {
+        self.file_expected_context(key).map(String::as_str) == Some(context)
+            || (self.unaffected_file(key) && self.same_copy_prefix_base(context))
+    }
+
+    /// Proof bound to THIS file: its context, the replay epoch and the exact
+    /// source bytes. A nonempty file also needs its exact final body set.
+    fn receipt_proves(
+        &self,
+        key: &str,
+        entry: &ScanIndexEntry,
+        receipt: &Receipt,
+        empty: bool,
+    ) -> bool {
+        self.proof_context_matches(key, &receipt.context_fingerprint)
+            && receipt_binds_bytes(entry, receipt, empty)
+    }
+
+    /// Also refused when an entity it covers was sent since under another
+    /// context: the receipt no longer proves what the server holds.
+    fn receipt_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
+        entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                self.receipt_proves(key, entry, receipt, false)
+                    && !self.covered_entity_sent_elsewhere(key, &receipt.context_fingerprint)
+            })
+    }
+
+    /// A confirmed-empty file has no body to compare: its local empty proof,
+    /// or a same-context ACK receipt of these exact bytes, proves it.
+    fn empty_proof_matches(&self, key: &str, entry: &ScanIndexEntry) -> bool {
+        entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| self.receipt_proves(key, entry, receipt, true))
+    }
+
+    /// The one per-file upload-context gate for every source: a file is current
+    /// only by its own proof. Nothing is owed without an active context.
+    pub(super) fn file_upload_context_requires_adoption(&self, key: &str) -> bool {
+        if !self.file_upload_context_enabled() {
+            return false;
+        }
+        let Some(entry) = self.files.get(key) else {
+            return true;
+        };
+        if self.confirmed_empty_files.contains(key) {
+            return !self.empty_proof_matches(key, entry);
+        }
+        !self.receipt_matches(key, entry)
+    }
+
+    /// The durable stamp of each entity this file covers; `None` for one
+    /// without a stamp.
+    fn covered_stamps<'a>(
+        &'a self,
+        key: &str,
+    ) -> impl Iterator<Item = Option<&'a EntityStamp>> + 'a + use<'a> {
+        self.file_snapshot_fingerprints
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|entity| self.upload_context_proof.entity_stamps.get(entity))
+    }
+
+    /// An entity this file covers was sent since under a context outside
+    /// `context`'s mode family.
+    fn covered_entity_sent_elsewhere(&self, key: &str, context: &str) -> bool {
+        self.covered_stamps(key)
+            .flatten()
+            .any(|stamp| !same_mode_family(&stamp.context_fingerprint, context))
+    }
+
+    /// The delivered bodies of the entities this file covers, from their durable
+    /// stamps. `None` when one carries no stamp.
+    fn covered_stamp_bodies(&self, key: &str) -> Option<BTreeSet<&str>> {
+        self.covered_stamps(key)
+            .map(|stamp| stamp.map(|stamp| stamp.body_witness.as_str()))
+            .collect()
+    }
+
+    /// The stamp set belongs to this index's destination and replay generation.
+    /// An index lives in one destination's directory; a stamp from another clears
+    /// the set when it is written.
+    fn entity_stamps_fenced(&self) -> bool {
+        let proof = &self.upload_context_proof;
+        proof.destination_namespace_hash.is_some()
+            && proof.replay_generation == self.historical_replay_generation
+    }
+
+    /// Count-only: the file's receipt proves these exact bytes at this replay
+    /// epoch, and the bodies stamped for every entity it covers are the body
+    /// set it delivered. A delivery context is never asked: settings and
+    /// capabilities apply from the next body on, and no debt selects a read.
+    /// A receipt of the active base in another money mode is the operator's
+    /// scoped copy-prefix re-read, not context debt. Only a confirmed-empty
+    /// file covers nothing.
+    fn context_only_debt(&self, key: &str) -> bool {
+        let Some(entry) = self.files.get(key) else {
+            return false;
+        };
+        let Some(receipt) = entry.upload_context_receipt.as_ref() else {
+            return false;
+        };
+        let Some(bodies) = self.covered_stamp_bodies(key) else {
+            return false;
+        };
+        let empty = self.confirmed_empty_files.contains(key);
+        receipt_binds_bytes(entry, receipt, empty)
+            && !self.same_copy_prefix_base(&receipt.context_fingerprint)
+            && (empty
+                || (!bodies.is_empty()
+                    && self.entity_stamps_fenced()
+                    && snapshot_file_upload_body_set_hex(bodies) == receipt.body_witness))
+    }
+
+    /// A revision-only move (an mtime-only rewrite, a sidecar touch) carries
+    /// THIS file's receipt to the new revision instead of re-sending the same
+    /// accepted bodies. The caller found a complete parse of the new revision
+    /// with the identical entity and body sets, every entity stamp-proven, and
+    /// excludes quarantined, held and correction-owed files. The old receipt
+    /// must prove that body under the file's context and replay epoch.
+    /// Anything else is sent; the read itself always happens.
+    pub(super) fn carry_upload_context_receipt(&mut self, key: &str, source_witness: &str) -> bool {
+        let body = self
+            .files
+            .get(key)
+            .and_then(|entry| entry.upload_context_receipt.as_ref())
+            .filter(|receipt| {
+                receipt.source_witness != source_witness
+                    && self.file_expected_context(key) == Some(&receipt.context_fingerprint)
+                    && receipt.replay_generation == RECEIPT_REPLAY_EPOCH
+            })
+            .map(|receipt| receipt.body_witness.clone());
+        body.is_some_and(|body| self.receipt_from_stamps(key, source_witness, &body))
+    }
+
+    /// An exact ACK of a body this daemon sent, in any context; proves a body, not each id.
+    /// A settled revision (stamped before POST) and server-learned heads are not evidence.
+    #[cfg(test)]
+    pub(super) fn file_has_accepted_body(&self, key: &str) -> bool {
+        !self.decode_holds_file(key) && self.file_has_accepted_body_unheld(key)
+    }
+
+    /// Accepted coverage survives later local withholding of the file.
+    pub(super) fn file_has_accepted_body_unheld(&self, key: &str) -> bool {
+        let Some(entry) = self.files.get(key) else {
+            return false;
+        };
+        let proof = &self.upload_context_proof;
+        entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| !receipt.body_witness.is_empty())
+            || (proof.replay_generation == self.historical_replay_generation
+                && self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|entities| {
+                        entities
+                            .iter()
+                            .any(|entity| proof.entity_stamps.contains_key(entity))
+                    }))
+    }
+
+    /// An entity's durable stamp proves this body under the active ACK context,
+    /// in the stamp set's destination and replay generation. Index selection
+    /// and stamp writes keep the set scoped to its destination.
+    pub(super) fn file_entity_stamp_proves(&self, _key: &str, entity: &str, body: &str) -> bool {
+        self.file_upload_context_enabled()
+            && self
+                .upload_context_proof
+                .destination_namespace_hash
+                .as_deref()
+                .zip(self.active_upload_context_fingerprint.as_ref())
+                .is_some_and(|(destination, context)| {
+                    self.entity_upload_context_proven(destination, entity, body, context)
+                })
+    }
+
+    /// THIS file's receipt from durable entity stamps, never from
+    /// stamps alone. The caller found a complete parse of the current
+    /// revision whose every entity is stamp-proven with this body, under the
+    /// A1-A3 exclusions: a carried revision-only move, or the exact carried
+    /// accepted set after a manual-override rebuild (which keeps stamps but
+    /// no file receipts).
+    pub(super) fn receipt_from_stamps(
+        &mut self,
+        key: &str,
+        source_witness: &str,
+        body_witness: &str,
+    ) -> bool {
+        let Some(context_fingerprint) = self.file_expected_context(key).cloned() else {
+            return false;
+        };
+        let Some(entry) = self.files.get_mut(key).filter(|entry| {
+            entry.source_file_fingerprint == source_witness
+                && entry.last_upload_body_witness.as_deref() == Some(body_witness)
+        }) else {
+            return false;
+        };
+        entry.upload_context_receipt = Some(Receipt {
+            context_fingerprint,
+            replay_generation: RECEIPT_REPLAY_EPOCH,
+            source_witness: source_witness.to_string(),
+            body_witness: body_witness.to_string(),
+        });
+        true
+    }
+
+    /// An entity's durable stamp proves exactly this body under this context,
+    /// in this destination and replay generation.
+    pub(crate) fn entity_upload_context_proven(
+        &self,
+        destination: &str,
+        entity: &str,
+        body: &str,
+        context: &str,
+    ) -> bool {
+        let proof = &self.upload_context_proof;
+        proof.destination_namespace_hash.as_deref() == Some(destination)
+            && proof.replay_generation == self.historical_replay_generation
+            && proof.entity_stamps.get(entity).is_some_and(|stamp| {
+                stamp.context_fingerprint == context && stamp.body_witness == body
+            })
+    }
+
+    pub(crate) fn file_upload_context_ack_candidates(
+        &self,
+        items: &[SnapshotItem],
+        covered: &BTreeMap<String, String>,
+    ) -> Vec<Candidate> {
+        if self.active_upload_context_fingerprint.is_none() {
+            return Vec::new();
+        }
+        let mut by_source: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+        let mut by_source_bytes = BTreeMap::<&str, BTreeMap<String, u64>>::new();
+        let mut parsed_source = BTreeMap::<&str, &str>::new();
+        for item in items {
+            if let Some(source) = item.source_file_fingerprint.as_deref() {
+                parsed_source.insert(item.snapshot_fingerprint.as_str(), source);
+                if !by_source
+                    .get(source)
+                    .is_some_and(|bodies| bodies.contains_key(&item.snapshot_fingerprint))
+                {
+                    let bytes = crate::snapshot_sync::snapshot_packing_json_length(item)
+                        .unwrap_or(0) as u64;
+                    by_source_bytes
+                        .entry(source)
+                        .or_default()
+                        .insert(item.snapshot_fingerprint.clone(), bytes);
+                }
+                by_source.entry(source).or_default().insert(
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                );
+            }
+        }
+        // A folded Codex body carries one member's source revision; each other
+        // joined member owes its own receipt for that exact body. Its wire
+        // bytes are counted once below.
+        let direct = by_source.keys().copied().collect::<BTreeSet<_>>();
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source);
+        codex_file_join::fan_out_offered_to_aliases(self, &mut by_source_bytes);
+        self.files
+            .iter()
+            .filter_map(|(key, entry)| {
+                if self.receipt_matches(key, entry) || self.decode_holds_file(key) {
+                    return None;
+                }
+                let entities = self.file_snapshot_fingerprints.get(key)?;
+                // A forced reparse clears the entry's revision after this page
+                // parsed and sent it. Its receipt is keyed by the revision the
+                // page parsed and proves nothing until the re-read restores
+                // that same revision. A file at another revision earns none.
+                let source_witness = if entry.source_file_fingerprint.is_empty() {
+                    let mut parsed = entities
+                        .iter()
+                        .map(|fp| parsed_source.get(fp.as_str()).copied());
+                    let first = parsed.next().flatten()?;
+                    parsed
+                        .all(|source| source == Some(first))
+                        .then_some(first)?
+                } else {
+                    entry.source_file_fingerprint.as_str()
+                };
+                if self
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .contains(source_witness)
+                {
+                    return None;
+                }
+                let mut bodies = by_source.get(source_witness).cloned().unwrap_or_default();
+                for fp in entities {
+                    if let Some(body) = covered.get(fp) {
+                        bodies.entry(fp.clone()).or_insert_with(|| body.clone());
+                    }
+                }
+                if bodies.len() != entities.len()
+                    || !entities.iter().all(|fp| bodies.contains_key(fp))
+                {
+                    return None;
+                }
+                let body_witness =
+                    snapshot_file_upload_body_set_hex(bodies.values().collect::<BTreeSet<_>>());
+                if entry.last_upload_body_witness.as_ref() != Some(&body_witness) {
+                    return None;
+                }
+                let mode_context = self.active_upload_context_fingerprint.as_ref()?;
+                let context_fingerprint = self.file_expected_context(key)?;
+                Some(Candidate {
+                    key: key.clone(),
+                    mode_context: (mode_context != context_fingerprint)
+                        .then(|| mode_context.clone()),
+                    receipt: Receipt {
+                        context_fingerprint: context_fingerprint.clone(),
+                        replay_generation: RECEIPT_REPLAY_EPOCH,
+                        source_witness: source_witness.to_string(),
+                        body_witness,
+                    },
+                    historical_replay_generation: self.historical_replay_generation.clone(),
+                    bodies,
+                    wire_bytes: by_source_bytes
+                        .get(source_witness)
+                        .cloned()
+                        .unwrap_or_default(),
+                    prior_acks: BTreeSet::new(),
+                    split: false,
+                    joined_marker: (!direct.contains(source_witness))
+                        .then(|| entry.codex_joined_member_set.clone())
+                        .flatten(),
+                })
+            })
+            .collect()
+    }
+
+    /// Align only candidates for the finalized body set with actual held-probe swaps.
+    pub(crate) fn substitute_file_upload_context_bodies(
+        &mut self,
+        candidates: &mut [Candidate],
+        swaps: &[(String, String, String)],
+    ) {
+        for candidate in candidates {
+            let Some(entry) = self.files.get_mut(&candidate.key) else {
+                continue;
+            };
+            if entry.last_upload_body_witness.as_ref() != Some(&candidate.receipt.body_witness) {
+                continue;
+            }
+            let mut changed = false;
+            for (fp, old, probe) in swaps {
+                if candidate.bodies.get(fp) == Some(old) {
+                    candidate.bodies.insert(fp.clone(), probe.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                let digest = snapshot_file_upload_body_set_hex(
+                    candidate.bodies.values().collect::<BTreeSet<_>>(),
+                );
+                candidate.receipt.body_witness = digest.clone();
+                entry.last_upload_body_witness = Some(digest);
+            }
+        }
+    }
+
+    /// Called on the final selected index, using only exact ACKs of the active
+    /// context: this cycle's, or an earlier pass's by its durable stamp of the
+    /// same body. Stamps are cleared on every replay-generation
+    /// change, which carries the curve epoch. No parse/finalize/quarantine/
+    /// old-context path has this authority.
+    pub(crate) fn accept_file_upload_context_acks(
+        &mut self,
+        candidates: &[Candidate],
+        fresh_acks: &BTreeMap<String, String>,
+        covered: &BTreeMap<String, String>,
+    ) -> RearmCounts {
+        let mut counts = RearmCounts {
+            local_bytes: self.context_read_counts.local_bytes,
+            ..RearmCounts::default()
+        };
+        // Joined file aliases can earn separate receipts for one wire entity.
+        let mut counted_entities = BTreeSet::new();
+        for candidate in candidates {
+            let mode_context = candidate
+                .mode_context
+                .as_ref()
+                .unwrap_or(&candidate.receipt.context_fingerprint);
+            if self.active_upload_context_fingerprint.as_ref() != Some(mode_context)
+                || self.file_expected_context(&candidate.key)
+                    != Some(&candidate.receipt.context_fingerprint)
+                || RECEIPT_REPLAY_EPOCH != candidate.receipt.replay_generation
+                || self.historical_replay_generation != candidate.historical_replay_generation
+                || self.decode_holds_file(&candidate.key)
+                || self
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .contains(&candidate.receipt.source_witness)
+                || candidate.joined_marker.as_ref().is_some_and(|marker| {
+                    self.files
+                        .get(&candidate.key)
+                        .and_then(|entry| entry.codex_joined_member_set.as_ref())
+                        != Some(marker)
+                })
+                || candidate.bodies.iter().any(|(entity, body)| {
+                    covered.get(entity) != Some(body)
+                        && ((fresh_acks.get(entity) != Some(body)
+                            && !candidate.prior_acks.contains(entity))
+                            || self.quarantined_snapshot_fingerprints.contains_key(entity))
+                })
+                || self
+                    .file_snapshot_fingerprints
+                    .get(&candidate.key)
+                    .map_or(true, |entities| {
+                        entities.len() != candidate.bodies.len()
+                            || !entities.iter().all(|fp| candidate.bodies.contains_key(fp))
+                    })
+            {
+                continue;
+            }
+            let Some(entry) = self.files.get_mut(&candidate.key) else {
+                continue;
+            };
+            // A revision cleared for a forced reparse keeps the receipt of the
+            // revision the page parsed; a file now at another revision earns
+            // none.
+            if (!entry.source_file_fingerprint.is_empty()
+                && entry.source_file_fingerprint != candidate.receipt.source_witness)
+                || entry.last_upload_body_witness.as_ref() != Some(&candidate.receipt.body_witness)
+                || entry.upload_context_receipt.as_ref() == Some(&candidate.receipt)
+            {
+                continue;
+            }
+            let rearmed = entry
+                .upload_context_receipt
+                .as_ref()
+                .map_or(true, |receipt| {
+                    receipt.context_fingerprint != candidate.receipt.context_fingerprint
+                        || receipt.replay_generation != candidate.receipt.replay_generation
+                        || receipt.body_witness.is_empty()
+                });
+            entry.upload_context_receipt = Some(candidate.receipt.clone());
+            if rearmed {
+                counts.files += 1;
+                for (entity, bytes) in &candidate.wire_bytes {
+                    if counted_entities.insert(entity) {
+                        counts.bytes = counts.bytes.saturating_add(*bytes);
+                    }
+                }
+            }
+        }
+        counts.files += self.reconcile_joined_member_receipts();
+        // A split file stays owed by its missing receipt until its last body
+        // is exact. Only a file this pass advanced returns to the queue now;
+        // one whose whole tail was deferred waits, as before, so pressure
+        // cannot loop. The next generation's context scan selects the rest.
+        let mut progressed = Vec::new();
+        for candidate in candidates.iter().filter(|candidate| candidate.split) {
+            if self
+                .files
+                .get(&candidate.key)
+                .is_some_and(|entry| self.receipt_matches(&candidate.key, entry))
+            {
+                continue;
+            }
+            counts.context_split_files += 1;
+            if candidate
+                .bodies
+                .iter()
+                .any(|(entity, body)| fresh_acks.get(entity) == Some(body))
+            {
+                progressed.push(candidate.key.as_str());
+            }
+        }
+        self.requeue_split_context_reads(progressed.into_iter());
+        counts
+    }
+
+    /// A fold accepted before each joined member could take its own receipt
+    /// reconciles like a crash after the ACK, through exact receipts. A member
+    /// takes its own receipt only when another member of its group holds the
+    /// exact receipt of the same accepted entity set and body under this
+    /// file's context, and the group's marker still binds every member's own
+    /// current source revision (a grown or changed member fails it). Reads,
+    /// sends and stores nothing new.
+    fn reconcile_joined_member_receipts(&mut self) -> u64 {
+        let mut groups = BTreeMap::<&String, Vec<(&String, &ScanIndexEntry)>>::new();
+        for (key, entry) in self.files.iter() {
+            if let Some(marker) = entry.codex_joined_member_set.as_ref() {
+                groups.entry(marker).or_default().push((key, entry));
+            }
+        }
+        let mut grants = Vec::new();
+        for (marker, members) in groups {
+            if members.len() < 2
+                || codex_file_join::member_set_witness_of(
+                    members.iter().map(|(key, entry)| {
+                        ((*key).clone(), entry.source_file_fingerprint.as_str())
+                    }),
+                ) != *marker
+            {
+                continue;
+            }
+            let proven = members
+                .iter()
+                .filter(|(key, entry)| self.receipt_matches(key, entry))
+                .filter_map(|(key, entry)| {
+                    Some((
+                        entry.upload_context_receipt.as_ref()?,
+                        self.file_snapshot_fingerprints.get(*key)?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for (key, entry) in &members {
+                let entities = self.file_snapshot_fingerprints.get(*key);
+                let Some(context) = self.file_expected_context(key) else {
+                    continue;
+                };
+                if entry.source_file_fingerprint.is_empty()
+                    || self.receipt_matches(key, entry)
+                    || self.decode_holds_file(key)
+                    || self
+                        .effective_upload_body_witness_revision_excluded_source_files
+                        .contains(&entry.source_file_fingerprint)
+                    || !claude_index_file_body_accepted(self, key, entry)
+                {
+                    continue;
+                }
+                if let Some((receipt, _)) = proven.iter().find(|(receipt, carried)| {
+                    &receipt.context_fingerprint == context
+                        && !receipt.body_witness.is_empty()
+                        && Some(*carried) == entities
+                        && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
+                }) {
+                    grants.push((
+                        (*key).clone(),
+                        Receipt {
+                            context_fingerprint: context.clone(),
+                            replay_generation: RECEIPT_REPLAY_EPOCH,
+                            source_witness: entry.source_file_fingerprint.clone(),
+                            body_witness: receipt.body_witness.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        let granted = grants.len() as u64;
+        for (key, receipt) in grants {
+            if let Some(entry) = self.files.get_mut(&key) {
+                entry.upload_context_receipt = Some(receipt);
+            }
+        }
+        granted
+    }
+
+    /// Local proof that this empty or suppressed file was evaluated under its
+    /// expected context: nothing was emitted, ACKed or credited. The empty body
+    /// witness never satisfies `receipt_matches`. A same-context ACK receipt of
+    /// these exact source bytes already proves the file and stays.
+    pub(super) fn note_empty_file_upload_context(&mut self, key: &str) {
+        let Some(context) = self.file_expected_context(key).cloned() else {
+            return;
+        };
+        let Some(entry) = self.files.get_mut(key) else {
+            return;
+        };
+        if entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                receipt.context_fingerprint == context
+                    && receipt.source_witness == entry.source_file_fingerprint
+            })
+        {
+            return;
+        }
+        entry.upload_context_receipt = Some(Receipt {
+            context_fingerprint: context,
+            replay_generation: RECEIPT_REPLAY_EPOCH,
+            source_witness: entry.source_file_fingerprint.clone(),
+            body_witness: String::new(),
+        });
+    }
+
+    /// A file that has bodies again no longer has an empty proof.
+    pub(super) fn clear_empty_file_upload_context(&mut self, key: &str) {
+        if let Some(entry) = self.files.get_mut(key) {
+            if entry
+                .upload_context_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.body_witness.is_empty())
+            {
+                entry.upload_context_receipt = None;
+            }
+        }
+    }
+
+    /// Copy exact stored-body ACKs from the ledger, before an index save can
+    /// let them retire. All three sources, including state-only Codex entities.
+    /// A stamp stays while its entity is live, so an unchanged entity of a
+    /// grown file keeps its proof after the file's receipt goes stale.
+    pub(crate) fn stamp_entity_upload_context_acks(
+        &mut self,
+        destination: &str,
+        bodies: &BTreeMap<String, String>,
+        contexts: &BTreeMap<String, String>,
+    ) {
+        if self
+            .upload_context_proof
+            .destination_namespace_hash
+            .as_deref()
+            .is_some_and(|old| old != destination)
+        {
+            self.upload_context_proof.request_contributions.clear();
+        }
+        if contexts.is_empty() && self.upload_context_proof.entity_stamps.is_empty() {
+            return;
+        }
+        let replay = self.historical_replay_generation.clone();
+        let mut stamps = std::mem::take(&mut self.upload_context_proof.entity_stamps);
+        if self
+            .upload_context_proof
+            .destination_namespace_hash
+            .as_deref()
+            != Some(destination)
+            || self.upload_context_proof.replay_generation != replay
+        {
+            stamps.clear();
+            self.upload_context_proof.destination_namespace_hash = Some(destination.to_string());
+            self.upload_context_proof.replay_generation = replay;
+        }
+        for (entity, context) in contexts {
+            let Some(body) = bodies.get(entity) else {
+                continue;
+            };
+            let current = stamps.get(entity).is_some_and(|stamp| {
+                stamp.context_fingerprint == *context && stamp.body_witness == *body
+            });
+            if !current {
+                stamps.insert(
+                    entity.clone(),
+                    EntityStamp {
+                        context_fingerprint: context.clone(),
+                        body_witness: body.clone(),
+                    },
+                );
+            }
+        }
+        let live = self
+            .upload_progress_ack_incidence()
+            .collect::<BTreeSet<_>>();
+        stamps.retain(|entity, _| live.contains(entity.as_str()));
+        self.upload_context_proof.entity_stamps = stamps;
+    }
+
+    /// One counts-only line when the active context's inputs change.
+    pub(crate) fn note_upload_context_inputs(
+        &mut self,
+        source: SnapshotSource,
+        inputs: ContextInputs,
+        policy: SnapshotUploadPolicy,
+    ) {
+        if let Some(previous) = self
+            .upload_context_proof
+            .inputs
+            .as_ref()
+            .filter(|previous| **previous != inputs)
+        {
+            crate::local_resource_diagnostics::traversal_point(
+                "upload_context_input_change",
+                source.api_slug(),
+                &BTreeMap::from([
+                    ("policy", previous.policy != inputs.policy),
+                    ("namespace", previous.namespace != inputs.namespace),
+                    (
+                        "cache_flag",
+                        previous.cache_observations != inputs.cache_observations,
+                    ),
+                    (
+                        "copy_contract",
+                        previous.copy_contract != inputs.copy_contract,
+                    ),
+                    (
+                        "resumed_prefix",
+                        previous.resumed_prefix != inputs.resumed_prefix,
+                    ),
+                ]),
+            );
+        }
+        self.upload_context_proof.inputs = Some(inputs);
+        let policy = [
+            policy.session_titles_enabled,
+            policy.workspace_labels_enabled,
+            policy.session_artifacts_enabled,
+            policy.session_attribution_enabled,
+            policy.session_attribution_labels_enabled,
+        ];
+        crate::local_resource_diagnostics::change_reason::upload_policy(
+            source.api_slug(),
+            policy
+                .iter()
+                .enumerate()
+                .fold(0u8, |bits, (bit, on)| bits | (u8::from(*on) << bit)),
+        );
+    }
+
+    /// Count-only: whether a file without its own proof still owes nothing.
+    /// Listed while the operator list names its family; Empty only while
+    /// absent on disk (a deleted file cannot grow unread; any other stat
+    /// result stays owed); LedgerAccepted by the source's exact body-accepted
+    /// predicate. Pi has no file-body predicate.
+    fn owed_count_exemption(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        entry: &ScanIndexEntry,
+    ) -> Option<Exempt> {
+        if self.claude_family_listed(key) {
+            return Some(Exempt::Listed);
+        }
+        if self.confirmed_empty_files.contains(key) {
+            let absent = std::fs::symlink_metadata(key)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            return absent.then_some(Exempt::Empty);
+        }
+        let accepted = match source {
+            SnapshotSource::ClaudeCode => claude_index_file_body_accepted(self, key, entry),
+            SnapshotSource::Codex => codex_index_file_body_accepted(self, key, entry),
+            SnapshotSource::Pi => false,
+        };
+        accepted.then_some(Exempt::LedgerAccepted)
+    }
+
+    /// Gates nothing: the one owed counter. `owed_files` counts non-exempt
+    /// files whose indexed committed delivery remains unresolved. Exempt files
+    /// (operator-listed, confirmed empty and absent, or exactly
+    /// ledger-accepted) may still lack a context receipt under forward-only
+    /// policy and count only in their settled bucket; ordinary growth is
+    /// selected elsewhere. The entity and byte buckets keep their
+    /// proof-accounting meaning for owed files.
+    pub(crate) fn upload_context_owed_counts(&self, source: SnapshotSource) -> OwedCounts {
+        let mut counts = OwedCounts::default();
+        let Some(active) = self.active_upload_context_fingerprint.as_ref() else {
+            return counts;
+        };
+        let stamps = &self.upload_context_proof.entity_stamps;
+        let stamped = |entity: &str| {
+            stamps
+                .get(entity)
+                .is_some_and(|stamp| stamp.context_fingerprint == *active)
+        };
+        for (key, entry) in &self.files {
+            let Some(expected) = self.file_expected_context(key) else {
+                continue;
+            };
+            let receipt = entry.upload_context_receipt.as_ref();
+            let empty = self.confirmed_empty_files.contains(key);
+            let proven = if empty {
+                self.empty_proof_matches(key, entry)
+            } else {
+                self.receipt_matches(key, entry)
+            };
+            if proven {
+                continue;
+            }
+            // Exemption first, before any membership early exit.
+            let exempt = self.owed_count_exemption(source, key, entry);
+            match exempt {
+                Some(Exempt::Listed) => counts.listed_files += 1,
+                Some(Exempt::Empty) => counts.empty_files += 1,
+                Some(Exempt::LedgerAccepted) => counts.ledger_accepted_files += 1,
+                None => counts.owed_files += 1,
+            }
+            let Some(members) = self.file_snapshot_fingerprints.get(key) else {
+                continue;
+            };
+            if exempt.is_some() || empty || members.is_empty() {
+                continue;
+            }
+            counts.context_only_files += u64::from(self.context_only_debt(key));
+            let owed = members.iter().filter(|fp| !stamped(fp.as_str())).count() as u64;
+            if receipt.is_some_and(|receipt| {
+                !receipt.body_witness.is_empty() && receipt.context_fingerprint != *expected
+            }) {
+                counts.wrong_context_entities += owed;
+                counts.wrong_context_bytes =
+                    counts.wrong_context_bytes.saturating_add(entry.size_bytes);
+            } else {
+                counts.no_proof_entities += owed;
+                counts.no_proof_bytes = counts.no_proof_bytes.saturating_add(entry.size_bytes);
+            }
+        }
+        counts
+    }
+
+    /// The owed backlog, per source, at most once an hour.
+    pub(crate) fn emit_upload_context_owed(&self, source: SnapshotSource) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let slot = source.slot();
+        let now = sampled_scan::now_seconds();
+        if now.saturating_sub(OWED_LOGGED_AT[slot].load(Relaxed)) < OWED_LOG_INTERVAL_SECONDS {
+            return;
+        }
+        OWED_LOGGED_AT[slot].store(now, Relaxed);
+        crate::local_resource_diagnostics::traversal_point(
+            "upload_context_owed",
+            source.api_slug(),
+            &self.upload_context_owed_counts(source),
+        );
+    }
+}
+crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
+crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness);
+crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, request_contributions, retired_direction);
+
+crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split, joined_marker);

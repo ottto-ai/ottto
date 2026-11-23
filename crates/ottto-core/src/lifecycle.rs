@@ -1,0 +1,1249 @@
+use crate::local_service::{
+    user_launchctl_domain, MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL,
+    OTTTO_LEGACY_SERVICE_BINARY_NAME, OTTTO_SERVICE_BINARY_NAME,
+};
+#[cfg(target_os = "macos")]
+use crate::token_store::{
+    classify_security_cli_delete_output, ControlTokenStore, KeychainSecretStore,
+    SecurityCliDeleteOutcome,
+};
+use crate::token_store::{
+    OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT, OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+    OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT, OTTTO_REVOCATION_RECEIPT_ACCOUNT,
+};
+use crate::{
+    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
+    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+};
+use ottto_protocol::{UninstallAction, UninstallExecutionResult, UninstallPlan};
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+use thiserror::Error;
+
+const LAUNCHCTL: &str = "/bin/launchctl";
+const PKILL: &str = "/usr/bin/pkill";
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+/// macOS Keychain generic-password *services* that hold per-source telemetry
+/// exporter keys. These are keyed by the backend-issued `key_id` (the item
+/// *account*), so a machine accumulates one item per claim until pruned, and a
+/// complete uninstall must purge every item under each service — not a fixed
+/// account.
+///
+/// The canonical definitions for the live store live in `ottto_service::keychain`
+/// (which also sweeps these on the daemon uninstall path). This crate keeps its
+/// own copy because the CLI `ottto uninstall` path (`execute_local_uninstall`)
+/// links `ottto-core` but not `ottto-service`, so it cannot reach that sweep.
+/// Keep the two lists in sync; the names are stable.
+const CODEX_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-codex";
+const CLAUDE_CODE_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-claude_code";
+const LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE: &str = "ottto.telemetry.device-secret";
+const TELEMETRY_KEYCHAIN_SERVICES: &[&str] = &[
+    CODEX_TELEMETRY_KEY_SERVICE,
+    CLAUDE_CODE_TELEMETRY_KEY_SERVICE,
+    LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE,
+];
+
+#[derive(Debug, Error)]
+pub enum LifecycleError {
+    #[error("HOME is required for Ottto local lifecycle operations")]
+    HomeRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UninstallExecutionOptions {
+    pub stop_companion_process: bool,
+    pub stop_daemon_process: bool,
+}
+
+impl UninstallExecutionOptions {
+    pub const CLI: Self = Self {
+        stop_companion_process: true,
+        stop_daemon_process: true,
+    };
+
+    pub const DAEMON: Self = Self {
+        stop_companion_process: false,
+        stop_daemon_process: false,
+    };
+}
+
+#[derive(Debug, Default)]
+struct CleanupReport {
+    credential_status: String,
+    removed_paths: Vec<String>,
+    missing_paths: Vec<String>,
+    warnings: Vec<String>,
+    failed_operations: Vec<String>,
+}
+
+impl CleanupReport {
+    fn new() -> Self {
+        Self {
+            credential_status: "not_checked".to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
+
+    fn fail(&mut self, message: impl Into<String>) {
+        self.failed_operations.push(message.into());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupTargetKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupTarget {
+    path: PathBuf,
+    kind: CleanupTargetKind,
+}
+
+pub fn local_lifecycle_home_dir() -> Result<PathBuf, LifecycleError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(LifecycleError::HomeRequired)
+}
+
+pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
+    let mut actions = vec![
+        UninstallAction {
+            action: "stop_process".to_string(),
+            target: "Ottto".to_string(),
+            kind: "process".to_string(),
+            requires_confirmation: true,
+            destructive: false,
+        },
+        UninstallAction {
+            action: "unload_launch_agent".to_string(),
+            target: launchd_target(),
+            kind: "launch_agent".to_string(),
+            requires_confirmation: true,
+            destructive: false,
+        },
+        UninstallAction {
+            action: "unload_legacy_launch_agent".to_string(),
+            target: launchd_target_for_label(MACOS_LEGACY_LAUNCH_AGENT_LABEL),
+            kind: "legacy_launch_agent".to_string(),
+            requires_confirmation: true,
+            destructive: false,
+        },
+        UninstallAction {
+            action: "stop_process".to_string(),
+            target: OTTTO_SERVICE_BINARY_NAME.to_string(),
+            kind: "process".to_string(),
+            requires_confirmation: true,
+            destructive: false,
+        },
+        UninstallAction {
+            action: "stop_process".to_string(),
+            target: OTTTO_LEGACY_SERVICE_BINARY_NAME.to_string(),
+            kind: "process".to_string(),
+            requires_confirmation: true,
+            destructive: false,
+        },
+        UninstallAction {
+            action: "remove_local_control_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_KEYCHAIN_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_setup_run_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_SETUP_RUN_TOKEN_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_relay_device_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_RELAY_DEVICE_SECRET_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_prior_relay_device_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_pending_relay_device_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_pending_setup_run_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_revocation_receipt".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_REVOCATION_RECEIPT_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+    ];
+    actions.extend(
+        [
+            (
+                "remove_local_release_marker",
+                OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+            ),
+            (
+                "remove_local_release_proof",
+                OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT,
+            ),
+            (
+                "remove_history_browser_claim",
+                OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT,
+            ),
+        ]
+        .into_iter()
+        .map(|(action, account)| UninstallAction {
+            action: action.to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{account}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        }),
+    );
+
+    actions.extend(
+        TELEMETRY_KEYCHAIN_SERVICES
+            .iter()
+            .map(|service| UninstallAction {
+                action: "remove_telemetry_keys".to_string(),
+                target: (*service).to_string(),
+                kind: "local_keychain_service".to_string(),
+                requires_confirmation: true,
+                destructive: true,
+            }),
+    );
+
+    actions.extend(
+        [
+            OTTTO_KEYCHAIN_ACCOUNT,
+            OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+            OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+        ]
+        .into_iter()
+        .map(|account| UninstallAction {
+            action: "remove_legacy_local_credential".to_string(),
+            target: format!("{OTTTO_LEGACY_KEYCHAIN_SERVICE}/{account}"),
+            kind: "legacy_local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        }),
+    );
+
+    actions.extend(uninstall_cleanup_targets(home).into_iter().map(|target| {
+        UninstallAction {
+            action: "remove_path".to_string(),
+            target: target.path.display().to_string(),
+            kind: match target.kind {
+                CleanupTargetKind::File => "file",
+                CleanupTargetKind::Directory => "directory",
+            }
+            .to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        }
+    }));
+
+    UninstallPlan {
+        plan_id: "local_uninstall_macos_user_v1".to_string(),
+        service_label: MACOS_LAUNCH_AGENT_LABEL.to_string(),
+        launchd_target: launchd_target(),
+        actions,
+        warnings: vec![
+            "Cloud provider credentials, provider CLI logins, and remote Ottto data are not revoked or removed by this local uninstall.".to_string(),
+            "Uninstall removes local sync receipts and first-sweep progress. Use `ottto uninstall --backup-state <directory> --confirm` to export those receipts first.".to_string(),
+        ],
+        requires_confirmation: true,
+        cloud_credentials_untouched: true,
+    }
+}
+
+pub fn execute_local_uninstall(
+    home: &Path,
+    options: UninstallExecutionOptions,
+) -> UninstallExecutionResult {
+    let plan = plan_local_uninstall(home);
+    let mut report = CleanupReport::new();
+
+    if std::env::consts::OS != "macos" {
+        report.fail("Ottto local uninstall is currently implemented for macOS packages");
+        return execution_result(plan, report);
+    }
+
+    if options.stop_companion_process {
+        stop_process("Ottto", &mut report);
+    } else {
+        report.warn("Companion process stop was deferred because uninstall was invoked through ottto-service");
+    }
+
+    unload_launch_agent(&mut report, home, MACOS_LAUNCH_AGENT_LABEL);
+    unload_launch_agent(&mut report, home, MACOS_LEGACY_LAUNCH_AGENT_LABEL);
+
+    if options.stop_daemon_process {
+        stop_process(OTTTO_SERVICE_BINARY_NAME, &mut report);
+        stop_process(OTTTO_LEGACY_SERVICE_BINARY_NAME, &mut report);
+    } else {
+        report.warn("Daemon process stop was deferred until after the typed uninstall response");
+    }
+
+    // The CLI just stopped the daemon: its local state is deleted only while
+    // this process holds the state-directory lock, taken once the daemon let
+    // go of it, so no new daemon can start on the directory meanwhile. The
+    // daemon's own uninstall is the holder and must not take its lock; the
+    // lock file it holds survives cleanup, so a daemon restarted before it
+    // exits is still refused.
+    let support_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("Ottto");
+    let support_claim = if options.stop_daemon_process {
+        claim_support_dir(&support_dir, DAEMON_EXIT_WAIT, &mut report)
+    } else {
+        SupportDirClaim::HeldByThisDaemon
+    };
+
+    remove_keychain_tokens(&mut report);
+
+    unregister_companion_apps(home, &mut report);
+
+    remove_cleanup_targets(
+        uninstall_cleanup_targets(home),
+        &support_dir,
+        &support_claim,
+        &mut report,
+    );
+
+    execution_result(plan, report)
+}
+
+/// Who may delete the support directory during this uninstall.
+#[derive(Debug)]
+enum SupportDirClaim {
+    /// The daemon uninstalling itself: it holds the lock.
+    HeldByThisDaemon,
+    /// This process holds the lock for the rest of the uninstall.
+    #[cfg(unix)]
+    Owned(
+        #[allow(dead_code, reason = "held only so the lock is released on drop")]
+        crate::state_dir_lock::StateDirLock,
+    ),
+    /// No directory when the claim was made. Anything created there later
+    /// belongs to someone else and is never deleted by this uninstall.
+    Absent,
+    /// A daemon kept it, or it could not be locked; recorded as a failure.
+    Refused,
+}
+
+impl SupportDirClaim {
+    fn may_remove(&self) -> bool {
+        match self {
+            Self::HeldByThisDaemon => true,
+            #[cfg(unix)]
+            Self::Owned(_) => true,
+            Self::Absent | Self::Refused => false,
+        }
+    }
+}
+
+/// Removes every target. The support directory is removed only when
+/// `support_claim` allows it, and then keeps its lock file.
+fn remove_cleanup_targets(
+    targets: Vec<CleanupTarget>,
+    support_dir: &Path,
+    support_claim: &SupportDirClaim,
+    report: &mut CleanupReport,
+) {
+    for target in targets {
+        if target.path == support_dir && !support_claim.may_remove() {
+            if matches!(support_claim, SupportDirClaim::Absent) {
+                report.missing_paths.push(target.path.display().to_string());
+            }
+            continue;
+        }
+        remove_cleanup_target(target, report);
+    }
+}
+
+fn unregister_companion_apps(home: &Path, report: &mut CleanupReport) {
+    if !Path::new(LSREGISTER).is_file() {
+        report.warn("LaunchServices helper was unavailable; ottto:// may remain registered until macOS refreshes its app database");
+        return;
+    }
+    let mut apps = [
+        home.join("Applications/Ottto.app"),
+        home.join("Applications/Ottto Companion.app"),
+        PathBuf::from("/Applications/Ottto.app"),
+        PathBuf::from("/Applications/Ottto Companion.app"),
+    ]
+    .into_iter()
+    .filter(|app| app.exists())
+    .collect::<BTreeSet<_>>();
+    match Command::new(LSREGISTER).arg("-dump").output() {
+        Ok(output) if output.status.success() => {
+            apps.extend(companion_app_paths_from_launchservices_dump(
+                &String::from_utf8_lossy(&output.stdout),
+            ));
+        }
+        Ok(output) => report.warn(format!(
+            "LaunchServices inventory returned {}; known Ottto app locations will still be unregistered",
+            output.status
+        )),
+        Err(error) => report.warn(format!(
+            "Could not inventory LaunchServices registrations: {error}; known Ottto app locations will still be unregistered"
+        )),
+    }
+    for app in apps {
+        match Command::new(LSREGISTER).arg("-u").arg(&app).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => report.warn(format!(
+                "LaunchServices unregister returned {status} for {}",
+                app.display()
+            )),
+            Err(error) => report.warn(format!(
+                "Could not unregister {} from LaunchServices: {error}",
+                app.display()
+            )),
+        }
+    }
+}
+
+fn companion_app_paths_from_launchservices_dump(dump: &str) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut current_path = None;
+    for line in dump.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("path:") {
+            let value = value.trim();
+            let value = value
+                .rsplit_once(" (0x")
+                .map_or(value, |(path, _)| path)
+                .trim();
+            current_path = value.ends_with(".app").then(|| PathBuf::from(value));
+            continue;
+        }
+        if trimmed
+            .strip_prefix("identifier:")
+            .is_some_and(|identifier| identifier.trim() == "net.ottto.Companion")
+        {
+            if let Some(path) = current_path.take() {
+                paths.insert(path);
+            }
+        }
+    }
+    paths
+}
+
+pub fn launch_agent_path(home: &Path) -> PathBuf {
+    launch_agent_path_for_label(home, MACOS_LAUNCH_AGENT_LABEL)
+}
+
+fn launch_agent_path_for_label(home: &Path, label: &str) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"))
+}
+
+pub fn launchd_target() -> String {
+    launchd_target_for_label(MACOS_LAUNCH_AGENT_LABEL)
+}
+
+fn launchd_target_for_label(label: &str) -> String {
+    format!("{}/{}", user_launchctl_domain(), label)
+}
+
+fn execution_result(plan: UninstallPlan, mut report: CleanupReport) -> UninstallExecutionResult {
+    report.warnings.extend(plan.warnings.iter().cloned());
+    UninstallExecutionResult {
+        status: if report.failed_operations.is_empty() {
+            "uninstalled".to_string()
+        } else {
+            "uninstall_incomplete".to_string()
+        },
+        plan,
+        credential_status: report.credential_status,
+        removed_paths: report.removed_paths,
+        missing_paths: report.missing_paths,
+        warnings: report.warnings,
+        failed_operations: report.failed_operations,
+        cloud_credentials_untouched: true,
+    }
+}
+
+fn uninstall_cleanup_targets(home: &Path) -> Vec<CleanupTarget> {
+    vec![
+        CleanupTarget {
+            path: launch_agent_path(home),
+            kind: CleanupTargetKind::File,
+        },
+        CleanupTarget {
+            path: launch_agent_path_for_label(home, MACOS_LEGACY_LAUNCH_AGENT_LABEL),
+            kind: CleanupTargetKind::File,
+        },
+        CleanupTarget {
+            path: home.join("Applications").join("Ottto.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: home.join("Applications").join("Ottto Companion.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: PathBuf::from("/Applications").join("Ottto.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: PathBuf::from("/Applications").join("Ottto Companion.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: home
+                .join("Library")
+                .join("Application Support")
+                .join("Ottto"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: home.join("Library").join("Logs").join("Ottto"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: home.join(".ottto"),
+            kind: CleanupTargetKind::Directory,
+        },
+    ]
+}
+
+fn stop_process(process_name: &str, report: &mut CleanupReport) {
+    match Command::new(PKILL)
+        .arg("-x")
+        .arg(process_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() || status.code() == Some(1) => {}
+        Ok(status) => report.warn(format!("pkill -x {process_name} exited with {status}")),
+        Err(error) => report.warn(format!("pkill -x {process_name} failed: {error}")),
+    }
+}
+
+fn unload_launch_agent(report: &mut CleanupReport, home: &Path, label: &str) {
+    let target = launchd_target_for_label(label);
+    let domain = user_launchctl_domain();
+    let plist_path = launch_agent_path_for_label(home, label);
+
+    if let Err(error) = run_command(LAUNCHCTL, &["disable", &target]) {
+        report.warn(format!("launchctl disable {target} failed: {error}"));
+    }
+
+    if launchd_service_loaded(&target) {
+        let bootout_target = run_command(LAUNCHCTL, &["bootout", &target]);
+        if bootout_target.is_err() && plist_path.exists() {
+            let plist = plist_path.display().to_string();
+            let _ = run_command(LAUNCHCTL, &["bootout", &domain, &plist]);
+        }
+
+        if !wait_until_launchd_unloaded(&target) {
+            report.fail(format!("launchctl bootout did not unload {target}"));
+        }
+    }
+}
+
+fn launchd_service_loaded(target: &str) -> bool {
+    Command::new(LAUNCHCTL)
+        .arg("print")
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn wait_until_launchd_unloaded(target: &str) -> bool {
+    for _ in 0..20 {
+        if !launchd_service_loaded(target) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(output.status.to_string())
+        } else {
+            Err(format!("{}: {stderr}", output.status))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_keychain_tokens(report: &mut CleanupReport) {
+    let mut failures = 0usize;
+    for account in [
+        OTTTO_REVOCATION_RECEIPT_ACCOUNT,
+        OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+        OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT,
+        OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT,
+    ] {
+        if let Err(error) = KeychainSecretStore::keychain_only(account).delete() {
+            failures += 1;
+            report.fail(format!("delete history recovery credential: {error}"));
+        }
+    }
+    for account in [
+        OTTTO_KEYCHAIN_ACCOUNT,
+        OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+        OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+    ] {
+        match KeychainSecretStore::new(account).delete() {
+            Ok(()) => {}
+            Err(error) => {
+                failures += 1;
+                report.fail(format!(
+                    "delete keychain item {OTTTO_KEYCHAIN_SERVICE}/{account}: {error}"
+                ));
+            }
+        }
+    }
+    for account in [
+        OTTTO_KEYCHAIN_ACCOUNT,
+        OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+        OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+    ] {
+        if let Err(error) = delete_legacy_keychain_item(account) {
+            failures += 1;
+            report.fail(format!(
+                "delete legacy keychain item {OTTTO_LEGACY_KEYCHAIN_SERVICE}/{account}: {error}"
+            ));
+        }
+    }
+    for service in TELEMETRY_KEYCHAIN_SERVICES {
+        match purge_keychain_service(service) {
+            Ok(0) => {}
+            Ok(removed) => report.removed_paths.push(format!(
+                "keychain://{service} ({removed} telemetry key item(s))"
+            )),
+            Err(error) => {
+                failures += 1;
+                report.fail(format!(
+                    "purge telemetry keychain service {service}: {error}"
+                ));
+            }
+        }
+    }
+    report.credential_status = if failures == 0 {
+        "removed_or_absent".to_string()
+    } else {
+        "failed".to_string()
+    };
+}
+
+#[cfg(target_os = "macos")]
+fn delete_legacy_keychain_item(account: &'static str) -> Result<(), String> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            OTTTO_LEGACY_KEYCHAIN_SERVICE,
+            "-a",
+            account,
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    match classify_security_cli_delete_output(&output) {
+        SecurityCliDeleteOutcome::Removed | SecurityCliDeleteOutcome::Missing => Ok(()),
+        SecurityCliDeleteOutcome::Failed(message) => Err(message),
+    }
+}
+
+/// Deletes every generic-password item under `service`, regardless of account.
+///
+/// `security delete-generic-password -s <service>` removes one matching item per
+/// invocation (there is no batch flag), so we loop until it reports the item is
+/// missing. Telemetry exporter keys are accounted by the backend `key_id`; the
+/// daemon-path sweep in `ottto_service::keychain` clears them, but the CLI
+/// uninstall path runs here and cannot reach that crate — so this index-free
+/// purge is what makes `ottto uninstall` actually clear them.
+#[cfg(target_os = "macos")]
+fn purge_keychain_service(service: &str) -> Result<usize, String> {
+    let mut removed = 0usize;
+    loop {
+        let output = Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-s", service])
+            .output()
+            .map_err(|error| error.to_string())?;
+        match classify_security_cli_delete_output(&output) {
+            SecurityCliDeleteOutcome::Removed => {
+                removed += 1;
+                // Defensive cap: a single service should never hold this many items.
+                // Bail rather than spin forever if `security` ever reports success
+                // without actually removing an item.
+                if removed >= 1024 {
+                    return Err(format!(
+                        "stopped after removing {removed} items from {service} (possible runaway)"
+                    ));
+                }
+            }
+            SecurityCliDeleteOutcome::Missing => return Ok(removed),
+            SecurityCliDeleteOutcome::Failed(message) => return Err(message),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_keychain_tokens(report: &mut CleanupReport) {
+    report.credential_status = "not_supported".to_string();
+    report.warn("local credential removal is only implemented for macOS");
+}
+
+/// How long CLI uninstall waits for a stopped daemon to release local state.
+const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Waits up to `wait` for a stopped daemon to release `support_dir`, then
+/// holds its lock, creating the lock file in an existing directory that has
+/// none. An absent directory is never created or adopted.
+#[cfg(unix)]
+fn claim_support_dir(
+    support_dir: &Path,
+    wait: Duration,
+    report: &mut CleanupReport,
+) -> SupportDirClaim {
+    use crate::state_dir_lock::{StateDirLock, StateDirLockError};
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match StateDirLock::acquire_in_existing_dir(support_dir) {
+            Ok(Some(lock)) => return SupportDirClaim::Owned(lock),
+            Ok(None) => return SupportDirClaim::Absent,
+            Err(StateDirLockError::Held { .. }) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                report.fail(format!(
+                    "{error}; its local state was kept, stop it and retry uninstall"
+                ));
+                return SupportDirClaim::Refused;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn claim_support_dir(
+    _support_dir: &Path,
+    _wait: Duration,
+    _report: &mut CleanupReport,
+) -> SupportDirClaim {
+    SupportDirClaim::HeldByThisDaemon
+}
+
+/// Removes `dir`. A support directory's lock file stays, with the directory
+/// that holds it: unlinking it would let a restarted daemon create and take
+/// a fresh lock while a daemon holding the old inode still runs. `Ok(true)`
+/// when the lock file was kept.
+fn remove_dir_keeping_state_lock(dir: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use crate::state_dir_lock::STATE_DIR_LOCK_FILE_NAME;
+        let lock = dir.join(STATE_DIR_LOCK_FILE_NAME);
+        if fs::symlink_metadata(&lock).is_ok_and(|meta| meta.is_file()) {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                if entry.file_name() == STATE_DIR_LOCK_FILE_NAME {
+                    continue;
+                }
+                let path = entry.path();
+                let removed = if entry.file_type()?.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                if let Err(error) = removed {
+                    if error.kind() != ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+            return Ok(true);
+        }
+    }
+    fs::remove_dir_all(dir).map(|()| false)
+}
+
+fn remove_cleanup_target(target: CleanupTarget, report: &mut CleanupReport) {
+    let result = match target.kind {
+        CleanupTargetKind::File => fs::remove_file(&target.path),
+        CleanupTargetKind::Directory => {
+            remove_dir_keeping_state_lock(&target.path).map(|kept_lock| {
+                if kept_lock {
+                    report.warn(format!(
+                        "kept the service lock file in {}",
+                        target.path.display()
+                    ));
+                }
+            })
+        }
+    };
+
+    match result {
+        Ok(()) => report.removed_paths.push(target.path.display().to_string()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            report.missing_paths.push(target.path.display().to_string())
+        }
+        Err(error) => report.fail(format!("remove {}: {error}", target.path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launchservices_inventory_finds_all_companion_registrations() {
+        let paths = companion_app_paths_from_launchservices_dump(
+            r#"
+path:                       /Applications/Ottto.app (0x123)
+name:                       Ottto
+identifier:                 net.ottto.Companion
+path:                       /Users/Shared/ottto-qa/Ottto.app (0x456)
+identifier:                 net.ottto.Companion
+path:                       /tmp/Other.app (0x789)
+identifier:                 example.other
+path:                       /tmp/not-an-app
+identifier:                 net.ottto.Companion
+"#,
+        );
+
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                PathBuf::from("/Applications/Ottto.app"),
+                PathBuf::from("/Users/Shared/ottto-qa/Ottto.app"),
+            ])
+        );
+    }
+
+    #[test]
+    fn uninstall_plan_is_user_scoped_and_cloud_safe() {
+        let plan = plan_local_uninstall(Path::new("/Users/test"));
+        let targets = plan
+            .actions
+            .iter()
+            .filter(|action| action.action == "remove_path")
+            .map(|action| action.target.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            targets,
+            vec![
+                "/Users/test/Library/LaunchAgents/net.ottto.service.plist",
+                "/Users/test/Library/LaunchAgents/net.ottto.locald.plist",
+                "/Users/test/Applications/Ottto.app",
+                "/Users/test/Applications/Ottto Companion.app",
+                "/Applications/Ottto.app",
+                "/Applications/Ottto Companion.app",
+                "/Users/test/Library/Application Support/Ottto",
+                "/Users/test/Library/Logs/Ottto",
+                "/Users/test/.ottto",
+            ]
+        );
+        assert!(plan.requires_confirmation);
+        assert!(plan.cloud_credentials_untouched);
+        assert!(plan.actions.iter().any(|action| {
+            action.action == "unload_legacy_launch_agent"
+                && action.target.ends_with("net.ottto.locald")
+        }));
+        assert!(plan.actions.iter().any(|action| {
+            action.action == "stop_process" && action.target == OTTTO_LEGACY_SERVICE_BINARY_NAME
+        }));
+        let credentials = plan
+            .actions
+            .iter()
+            .filter(|action| action.kind == "local_keychain_item")
+            .map(|action| (action.action.as_str(), action.target.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            credentials,
+            vec![
+                (
+                    "remove_local_control_credential",
+                    "net.ottto.service/control-token"
+                ),
+                (
+                    "remove_setup_run_credential",
+                    "net.ottto.service/setup-run-token"
+                ),
+                (
+                    "remove_relay_device_credential",
+                    "net.ottto.service/relay-device-secret"
+                ),
+                (
+                    "remove_prior_relay_device_credential",
+                    "net.ottto.service/prior-relay-device-secret"
+                ),
+                (
+                    "remove_pending_relay_device_credential",
+                    "net.ottto.service/pending-relay-device-secret"
+                ),
+                (
+                    "remove_pending_setup_run_credential",
+                    "net.ottto.service/pending-setup-run-token"
+                ),
+                (
+                    "remove_revocation_receipt",
+                    "net.ottto.service/revocation-receipt"
+                ),
+                (
+                    "remove_local_release_marker",
+                    "net.ottto.service/local-release-marker"
+                ),
+                (
+                    "remove_local_release_proof",
+                    "net.ottto.service/local-release-device-proof"
+                ),
+                (
+                    "remove_history_browser_claim",
+                    "net.ottto.service/history-browser-claim"
+                ),
+            ]
+        );
+        let legacy_credentials = plan
+            .actions
+            .iter()
+            .filter(|action| action.kind == "legacy_local_keychain_item")
+            .map(|action| action.target.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy_credentials,
+            vec![
+                "net.ottto.locald/control-token",
+                "net.ottto.locald/setup-run-token",
+                "net.ottto.locald/relay-device-secret",
+                "net.ottto.locald/prior-relay-device-secret",
+                "net.ottto.locald/pending-relay-device-secret",
+                "net.ottto.locald/pending-setup-run-token",
+            ]
+        );
+        let telemetry_services = plan
+            .actions
+            .iter()
+            .filter(|action| action.kind == "local_keychain_service")
+            .map(|action| (action.action.as_str(), action.target.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry_services,
+            vec![
+                ("remove_telemetry_keys", "ottto-telemetry-key-codex"),
+                ("remove_telemetry_keys", "ottto-telemetry-key-claude_code"),
+                ("remove_telemetry_keys", "ottto.telemetry.device-secret"),
+            ]
+        );
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Cloud provider credentials")));
+    }
+
+    #[test]
+    fn execution_result_marks_failures_incomplete() {
+        let plan = plan_local_uninstall(Path::new("/Users/test"));
+        let mut report = CleanupReport::new();
+        report.credential_status = "removed_or_absent".to_string();
+        report
+            .failed_operations
+            .push("launchctl bootout did not unload gui/501/net.ottto.service".to_string());
+
+        let result = execution_result(plan, report);
+
+        assert_eq!(result.status, "uninstall_incomplete");
+        assert_eq!(result.failed_operations.len(), 1);
+        assert!(result.cloud_credentials_untouched);
+    }
+
+    /// Uninstall racing a restart: cleanup removes the old daemon's state but
+    /// keeps the inode it holds, so a restarted daemon is refused for as long
+    /// as the old one runs, even while it keeps writing recreated paths.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_keeps_the_held_lock_inode_so_a_restart_is_refused() {
+        use crate::state_dir_lock::{
+            scratch, StateDirLock, StateDirLockError, STATE_DIR_LOCK_FILE_NAME,
+        };
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch("uninstall-keeps-lock");
+        let support = root.join("Ottto");
+        let old_daemon = StateDirLock::acquire(&support).expect("old daemon owns state");
+        let lock_path = support.join(STATE_DIR_LOCK_FILE_NAME);
+        let identity = |path: &Path| {
+            let meta = fs::metadata(path).expect("lock metadata");
+            (meta.dev(), meta.ino())
+        };
+        let lock_identity = identity(&lock_path);
+        let destination = support.join("snapshots").join("destinations").join("ab");
+        fs::create_dir_all(&destination).expect("state tree");
+        fs::write(destination.join("index.json"), b"{}").expect("index");
+        fs::write(support.join("control-token"), b"token").expect("token");
+        std::os::unix::fs::symlink(&root, support.join("link")).expect("symlink");
+
+        let mut report = CleanupReport::new();
+        remove_cleanup_target(
+            CleanupTarget {
+                path: support.clone(),
+                kind: CleanupTargetKind::Directory,
+            },
+            &mut report,
+        );
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+        assert_eq!(report.removed_paths, vec![support.display().to_string()]);
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        let left: Vec<_> = fs::read_dir(&support)
+            .expect("support dir kept")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from(STATE_DIR_LOCK_FILE_NAME)]
+        );
+        assert_eq!(identity(&lock_path), lock_identity);
+        assert!(root.exists(), "a symlink is removed, never followed");
+
+        // The old daemon is still finishing work against recreated paths.
+        fs::create_dir_all(&destination).expect("old daemon recreates state");
+        let restart = StateDirLock::acquire(&support).expect_err("restart refused");
+        assert!(
+            matches!(restart, StateDirLockError::Held { .. }),
+            "{restart:?}"
+        );
+
+        drop(old_daemon);
+        let restarted = StateDirLock::acquire(&support).expect("released at drop");
+        assert_eq!(identity(&lock_path), lock_identity);
+        drop(restarted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// CLI uninstall deletes state only after the stopped daemon released
+    /// it, and holds the lock meanwhile; a daemon that never exits keeps its
+    /// state.
+    #[cfg(unix)]
+    #[test]
+    fn cli_uninstall_claims_state_only_after_the_daemon_exits() {
+        use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
+        let root = scratch("uninstall-claim");
+        let support = root.join("Ottto");
+        let mut report = CleanupReport::new();
+        let absent = claim_support_dir(&support, Duration::from_millis(100), &mut report);
+        assert!(matches!(absent, SupportDirClaim::Absent), "{absent:?}");
+        assert!(!support.exists(), "the claim creates no directory");
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+
+        let daemon = StateDirLock::acquire(&support).expect("daemon owns state");
+        let refused = claim_support_dir(&support, Duration::from_millis(200), &mut report);
+        assert!(matches!(refused, SupportDirClaim::Refused), "{refused:?}");
+        assert_eq!(report.failed_operations.len(), 1, "{report:?}");
+        assert!(
+            report.failed_operations[0].contains("already owns local state"),
+            "{report:?}"
+        );
+
+        let exiting = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(daemon);
+        });
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(10), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Owned(_)), "{claim:?}");
+        exiting.join().expect("daemon thread");
+        let restart = StateDirLock::acquire(&support).expect_err("no restart mid-cleanup");
+        assert!(
+            matches!(restart, StateDirLockError::Held { .. }),
+            "{restart:?}"
+        );
+        drop(claim);
+        drop(StateDirLock::acquire(&support).expect("released at drop"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// First start racing CLI uninstall on a support directory that never had
+    /// a lock file: the claim creates and holds the lock, so a daemon start
+    /// injected between claim and cleanup is refused for the whole cleanup,
+    /// deletes nothing of a running daemon, and later takes the very inode
+    /// cleanup kept.
+    #[cfg(unix)]
+    #[test]
+    fn first_start_racing_cli_uninstall_never_loses_state_or_the_lock_inode() {
+        use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let root = scratch("uninstall-first-start");
+        let support = root.join("Ottto");
+        fs::create_dir_all(support.join("snapshots")).expect("state tree");
+        fs::write(support.join("control-token"), b"old").expect("old state");
+        let lock_path = support.join(crate::state_dir_lock::STATE_DIR_LOCK_FILE_NAME);
+        assert!(!lock_path.exists(), "no lock file before uninstall");
+        let identity = |path: &Path| {
+            let meta = fs::metadata(path).expect("lock metadata");
+            (meta.dev(), meta.ino())
+        };
+
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(1), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Owned(_)), "{claim:?}");
+        let claimed_inode = identity(&lock_path);
+
+        // A daemon start injected between the claim and the cleanup.
+        let refused = StateDirLock::acquire(&support).expect_err("start refused");
+        assert!(
+            matches!(refused, StateDirLockError::Held { .. }),
+            "{refused:?}"
+        );
+        // ...and one retrying for the whole cleanup.
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let starter = {
+            let support = support.clone();
+            let cleanup_done = Arc::clone(&cleanup_done);
+            thread::spawn(move || loop {
+                match StateDirLock::acquire(&support) {
+                    Ok(lock) => {
+                        let entered_after_cleanup = cleanup_done.load(Ordering::SeqCst);
+                        fs::write(support.join("daemon-state"), b"new").expect("daemon state");
+                        return (entered_after_cleanup, lock);
+                    }
+                    Err(StateDirLockError::Held { .. }) => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            })
+        };
+
+        remove_cleanup_targets(
+            vec![CleanupTarget {
+                path: support.clone(),
+                kind: CleanupTargetKind::Directory,
+            }],
+            &support,
+            &claim,
+            &mut report,
+        );
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+        assert_eq!(report.removed_paths, vec![support.display().to_string()]);
+        let left: Vec<_> = fs::read_dir(&support)
+            .expect("support dir kept")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from(
+                crate::state_dir_lock::STATE_DIR_LOCK_FILE_NAME
+            )]
+        );
+        assert_eq!(identity(&lock_path), claimed_inode);
+
+        cleanup_done.store(true, Ordering::SeqCst);
+        drop(claim);
+        let (entered_after_cleanup, daemon) = starter.join().expect("starter");
+        assert!(entered_after_cleanup, "a daemon entered during cleanup");
+        assert_eq!(identity(&lock_path), claimed_inode, "live inode unlinked");
+        assert!(support.join("daemon-state").is_file());
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A support directory absent at the claim is skipped for the rest of the
+    /// uninstall: a daemon that creates it afterwards keeps its state and its
+    /// lock, while every other target is still removed.
+    #[cfg(unix)]
+    #[test]
+    fn cli_uninstall_never_adopts_a_support_dir_created_after_its_claim() {
+        use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
+        let root = scratch("uninstall-absent");
+        let support = root.join("Ottto");
+        let logs = root.join("Logs");
+        fs::create_dir(&logs).expect("logs");
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(1), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Absent), "{claim:?}");
+
+        let daemon = StateDirLock::acquire(&support).expect("daemon starts afterwards");
+        fs::write(support.join("control-token"), b"daemon").expect("daemon state");
+        remove_cleanup_targets(
+            vec![
+                CleanupTarget {
+                    path: support.clone(),
+                    kind: CleanupTargetKind::Directory,
+                },
+                CleanupTarget {
+                    path: logs.clone(),
+                    kind: CleanupTargetKind::Directory,
+                },
+            ],
+            &support,
+            &claim,
+            &mut report,
+        );
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+        assert_eq!(report.missing_paths, vec![support.display().to_string()]);
+        assert_eq!(report.removed_paths, vec![logs.display().to_string()]);
+        assert_eq!(
+            fs::read(support.join("control-token")).expect("state kept"),
+            b"daemon"
+        );
+        let restart = StateDirLock::acquire(&support).expect_err("daemon still owns it");
+        assert!(
+            matches!(restart, StateDirLockError::Held { .. }),
+            "{restart:?}"
+        );
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+}

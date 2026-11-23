@@ -1,0 +1,72 @@
+{
+  "root": "{\"schema_version\":3,\"files\":{},\"storage_format\":1,\"logical_schema_version\":2,\"generation\":7,\"binding\":{\"source\":\"claude\",\"namespace_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"padding_bytes\":0,\"objects\":[{\"slot\":{\"kind\":\"metadata\"},\"bytes\":111,\"digest\":\"51de146f498b3e1026dc1bc24f57b2c7ad588f4aceda872e842881fa7f8337bc\",\"generation\":7},{\"slot\":{\"kind\":\"bucket\",\"field\":\"account_pending\",\"bucket\":174},\"bytes\":115,\"digest\":\"2398cf421d53cda4bc74b814ba02f4a45c092950c1bf4c6e2f1522dc33a206a7\",\"generation\":7},{\"slot\":{\"kind\":\"bucket\",\"field\":\"usage_pending\",\"bucket\":174},\"bytes\":115,\"digest\":\"6ce5b46cb8ad658d288f752f4f3d24861a2d1e66b5826ac4d1286761e1b262b5\",\"generation\":7},{\"slot\":{\"kind\":\"bucket\",\"field\":\"request_census\",\"bucket\":174},\"bytes\":115,\"digest\":\"b3968d1ad82f2d64c7b669fb977004f0d2bc0b9deed69b1c273665334180470c\",\"generation\":7}],\"maps\":[{\"field\":\"account_pending\",\"generation\":7,\"buckets\":[174]},{\"field\":\"usage_pending\",\"generation\":7,\"buckets\":[174]},{\"field\":\"request_census\",\"generation\":7,\"buckets\":[174]}]}",
+  "payloads": {
+    "metadata-51de146f498b3e1026dc1bc24f57b2c7ad588f4aceda872e842881fa7f8337bc.json": "{\"files\":{},\"accepted_snapshot_fingerprints\":[\"synthetic-accepted\"],\"opaque\":{\"nondefault\":113,\"neighbor\":191}}",
+    "account-ae-2398cf421d53cda4bc74b814ba02f4a45c092950c1bf4c6e2f1522dc33a206a7.json": "{\"synthetic-family\":{\"revision\":17,\"previous_windows\":[{\"boundary\":1},{\"boundary\":19}],\"member_occurrences\":[2,7]}}",
+    "usage-ae-6ce5b46cb8ad658d288f752f4f3d24861a2d1e66b5826ac4d1286761e1b262b5.json": "{\"synthetic-family\":{\"revision\":17,\"previous_windows\":[{\"boundary\":1},{\"boundary\":19}],\"member_occurrences\":[2,7]}}",
+    "census-ae-b3968d1ad82f2d64c7b669fb977004f0d2bc0b9deed69b1c273665334180470c.json": "{\"synthetic-family\":{\"revision\":17,\"previous_windows\":[{\"boundary\":1},{\"boundary\":19}],\"member_occurrences\":[2,7]}}"
+  },
+  "logical": {
+    "schema_version": 2,
+    "generation": 7,
+    "files": {},
+    "accepted_snapshot_fingerprints": [
+      "synthetic-accepted"
+    ],
+    "opaque": {
+      "nondefault": 113,
+      "neighbor": 191
+    },
+    "claude_account_family_pending": {
+      "synthetic-family": {
+        "revision": 17,
+        "previous_windows": [
+          {
+            "boundary": 1
+          },
+          {
+            "boundary": 19
+          }
+        ],
+        "member_occurrences": [
+          2,
+          7
+        ]
+      }
+    },
+    "claude_usage_family_pending": {
+      "synthetic-family": {
+        "revision": 17,
+        "previous_windows": [
+          {
+            "boundary": 1
+          },
+          {
+            "boundary": 19
+          }
+        ],
+        "member_occurrences": [
+          2,
+          7
+        ]
+      }
+    },
+    "claude_request_census": {
+      "synthetic-family": {
+        "revision": 17,
+        "previous_windows": [
+          {
+            "boundary": 1
+          },
+          {
+            "boundary": 19
+          }
+        ],
+        "member_occurrences": [
+          2,
+          7
+        ]
+      }
+    }
+  }
+}

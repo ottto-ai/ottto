@@ -1,0 +1,50 @@
+[
+  {
+    "code": "claude_oauth_usage_check_succeeded",
+    "severity": "info",
+    "message": "Successful supported quota response.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  },
+  {
+    "code": "claude_oauth_usage_check_failed",
+    "severity": "info",
+    "message": "Latest quota request failed; local fallback may remain.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  },
+  {
+    "code": "claude_oauth_usage_check_suppressed",
+    "severity": "info",
+    "message": "Local breaker suppressed this request.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  },
+  {
+    "code": "claude_oauth_usage_cache_reused",
+    "severity": "info",
+    "message": "A local cached reading was reused; no provider request was made.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  },
+  {
+    "code": "claude_statusline_read_succeeded",
+    "severity": "info",
+    "message": "Read the supported local cache; original observation time preserved.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  },
+  {
+    "code": "claude_statusline_newer_exact_binding_selected",
+    "severity": "info",
+    "message": "Newer supported local reading selected for this account/workspace.",
+    "observed_at": "2026-09-29T10:05:00Z",
+    "account_identifier_hash": "account-a",
+    "organization_identifier_hash": "org-a"
+  }
+]

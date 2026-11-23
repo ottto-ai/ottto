@@ -1,0 +1,18 @@
+schema_version = "collector_manifest.v1"
+source_id = "claude_code"
+collector_id = "quota_status"
+display_name = "Status-line quota"
+
+operations = ["detect", "monitor_quota", "diagnostics"]
+data_source_kind = "local_enriched"
+default_state = "enabled"
+
+review_tier = "official"
+maturity = "stable"
+risk_classes = ["auth_adjacent"]
+
+uploads_raw_content = false
+emits = [
+  "agent_status_snapshots",
+  "source_plan_profiles"
+]

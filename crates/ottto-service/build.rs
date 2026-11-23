@@ -1,0 +1,54 @@
+fn main() {
+    let compiler = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let version = std::process::Command::new(compiler)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=OTTTO_SCAN_LAYOUT_RUSTC={}", version.trim());
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+    );
+    let registry_candidates = [
+        manifest_dir.join("../../connectors/registry.generated.json"),
+        manifest_dir.join("../../../../connectors/registry.generated.json"),
+    ];
+    let registry_path = registry_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("could not find connectors/registry.generated.json"));
+    let registry_path = registry_path
+        .canonicalize()
+        .expect("connector registry path is canonical");
+    println!("cargo:rerun-if-changed={}", registry_path.to_string_lossy());
+    println!(
+        "cargo:rustc-env=OTTTO_CONNECTOR_REGISTRY_PATH={}",
+        registry_path.to_string_lossy()
+    );
+
+    // The Companion Developer ID team id is baked into the binary at compile
+    // time (see `OTTTO_COMPANION_DEFAULT_TEAM_ID` in ottto-service/src/control.rs).
+    // Without this, changing the build-time value would not rebuild the crate.
+    println!("cargo:rerun-if-env-changed=OTTTO_COMPANION_DEFAULT_TEAM_ID");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/xpc_shim.c")
+            .flag("-fblocks")
+            .compile("ottto_xpc_shim");
+        cc::Build::new()
+            .file("src/legacy_service_shim.m")
+            .flag("-fobjc-arc")
+            .compile("ottto_legacy_service_shim");
+        cc::Build::new()
+            .file("src/power_shim.m")
+            .flag("-fobjc-arc")
+            .compile("ottto_power_shim");
+        println!("cargo:rustc-link-lib=framework=IOKit");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=ServiceManagement");
+    }
+}

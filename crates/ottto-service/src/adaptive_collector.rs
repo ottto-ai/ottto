@@ -1,0 +1,548 @@
+use ottto_protocol::LocalCollectorState;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub struct CadenceConfig {
+    pub hot_min_interval: Duration,
+    pub warm_interval: Duration,
+    pub warm_window: Duration,
+    pub idle_interval: Duration,
+    pub cold_interval: Duration,
+    pub failure_backoffs: Vec<Duration>,
+}
+
+impl Default for CadenceConfig {
+    fn default() -> Self {
+        Self {
+            hot_min_interval: Duration::from_secs(10),
+            warm_interval: Duration::from_secs(60),
+            warm_window: Duration::from_secs(15 * 60),
+            idle_interval: Duration::from_secs(10 * 60),
+            cold_interval: Duration::from_secs(30 * 60),
+            failure_backoffs: vec![
+                Duration::from_secs(60),
+                Duration::from_secs(2 * 60),
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(15 * 60),
+                Duration::from_secs(60 * 60),
+            ],
+        }
+    }
+}
+
+impl CadenceConfig {
+    /// The cost-first tiers, which is the posture the snapshot sync loop uses.
+    ///
+    /// The difference from [`CadenceConfig::default`] is the point of the whole
+    /// exercise: the **idle and cold tiers are the win** (a machine nobody is
+    /// coding on today gets scanned every 30 minutes instead of every 5), while
+    /// the hot 10-second freshness tier is deliberately NOT enabled. Freshness is
+    /// already inside the product promise at the five-minute floor, and a
+    /// ten-second tier multiplies request volume against a server whose accept
+    /// path is the thing being redesigned.
+    ///
+    /// `hot_min_interval` and `warm_interval` are therefore both pinned to
+    /// `floor`, so file activity restores the existing cadence and never beats it.
+    /// The floor is a hard guarantee, not a default: it is what makes a 2-second
+    /// filesystem debounce incapable of producing a per-event upload.
+    pub fn cost_first(floor: Duration) -> Self {
+        let default = Self::default();
+        Self {
+            hot_min_interval: floor,
+            warm_interval: floor,
+            idle_interval: default.idle_interval.max(floor),
+            cold_interval: default.cold_interval.max(floor),
+            ..default
+        }
+    }
+}
+
+/// How closely a cursor continuation page may follow the page before it.
+///
+/// The gap after a page is at least `idle_per_work` times that page's measured
+/// work and never shorter than `min_gap`, so a run of continuation pages keeps
+/// one thread busy at most `1 / (1 + idle_per_work)` of wall time. This bounds
+/// wall-clock duty only; it is not a process CPU, IO or foreground-impact bound.
+/// There is deliberately no upper clamp: a page slow enough that its gap reaches
+/// the ordinary scan simply gets no continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinuationPacing {
+    pub min_gap: Duration,
+    pub idle_per_work: u32,
+}
+
+/// A continuation asked for by a page that paused a still-valid job only
+/// because its byte budget ran out. `work` is all of that page's measured work.
+#[derive(Debug, Clone, Copy)]
+struct ContinuationRequest {
+    finished_at: Instant,
+    work: Duration,
+    /// A paced request made during the source's first import (RAM-only).
+    first_import: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceCadence {
+    pub(crate) collection: Option<crate::collection_health::Pulse>,
+    config: CadenceConfig,
+    state: LocalCollectorState,
+    last_activity_at: Option<Instant>,
+    last_scan_at: Option<Instant>,
+    consecutive_failures: usize,
+    disabled: bool,
+    server_min_interval: Option<Duration>,
+    continuation: Option<ContinuationRequest>,
+    ordinary_pacing: Option<ContinuationPacing>,
+    power_stretch: u32,
+}
+
+impl SourceCadence {
+    pub fn new(config: CadenceConfig) -> Self {
+        Self {
+            collection: None,
+            config,
+            state: LocalCollectorState::Cold,
+            last_activity_at: None,
+            last_scan_at: None,
+            consecutive_failures: 0,
+            disabled: false,
+            server_min_interval: None,
+            continuation: None,
+            ordinary_pacing: None,
+            power_stretch: 1,
+        }
+    }
+
+    /// A server-requested minimum interval **between scans**, not a countdown.
+    ///
+    /// The distinction is the whole safety property. A relative "come back in five
+    /// minutes" that is re-read on every cycle never elapses — each cycle would
+    /// push the deadline another five minutes out and the scan would never run
+    /// again, silently, on a healthy machine. Anchored to the last scan instead,
+    /// the same repeated directive simply means "one scan per five minutes".
+    pub fn set_server_min_interval(&mut self, interval: Option<Duration>) {
+        self.server_min_interval = interval;
+    }
+
+    pub fn state(&self) -> LocalCollectorState {
+        self.state.clone()
+    }
+
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+        if disabled {
+            self.state = LocalCollectorState::Disabled;
+        } else if self.state == LocalCollectorState::Disabled {
+            self.state = LocalCollectorState::Cold;
+        }
+    }
+
+    pub fn record_file_event(&mut self, now: Instant) {
+        if self.disabled {
+            return;
+        }
+        self.last_activity_at = Some(now);
+        self.state = LocalCollectorState::Hot;
+    }
+
+    pub fn record_account_switch(&mut self, now: Instant) {
+        self.record_file_event(now);
+        self.last_scan_at = None;
+    }
+
+    pub fn set_power_stretch(&mut self, multiplier: u32) {
+        self.power_stretch = multiplier.max(1);
+    }
+
+    pub fn record_backend_hint(
+        &mut self,
+        now: Instant,
+        record_count_15m: u64,
+        last_data_is_newer_than_local_success: bool,
+        reconciliation_enabled: bool,
+    ) {
+        self.set_disabled(!reconciliation_enabled);
+        if self.disabled {
+            return;
+        }
+        if record_count_15m > 0 || last_data_is_newer_than_local_success {
+            self.last_activity_at = Some(now);
+            self.state = LocalCollectorState::Warm;
+        }
+    }
+
+    pub fn record_scan_success(&mut self, now: Instant, uploaded_count: u64) {
+        if self.disabled {
+            return;
+        }
+        if self.ordinary_pacing.is_some() {
+            self.clear_continuation();
+        }
+        self.last_scan_at = Some(now);
+        self.consecutive_failures = 0;
+        if uploaded_count > 0 {
+            self.last_activity_at = Some(now);
+            self.state = LocalCollectorState::Warm;
+        } else if self
+            .last_activity_at
+            .is_some_and(|activity| now.duration_since(activity) <= self.config.warm_window)
+        {
+            self.state = LocalCollectorState::Warm;
+        } else {
+            self.state = LocalCollectorState::Idle;
+        }
+    }
+
+    pub fn record_scan_failure(&mut self, now: Instant) {
+        if self.disabled {
+            return;
+        }
+        if self.ordinary_pacing.is_some() {
+            self.clear_continuation();
+        }
+        self.last_scan_at = Some(now);
+        self.consecutive_failures += 1;
+        self.state = LocalCollectorState::Failing;
+    }
+
+    /// The Hot tier's floor: the shortest gap the ordinary cadence ever takes.
+    pub fn hot_min_interval(&self) -> Duration {
+        self.config.hot_min_interval
+    }
+
+    /// The gap the ordinary cadence wants between scans right now: the tier
+    /// floor, or the failure backoff while failing, lengthened by any server
+    /// directive. It is a per-page lower bound of ordinary accrual, not
+    /// coverage: ordinary cycle and lock delays are unbounded, and coverage
+    /// for same-revision admission is the guard's.
+    pub fn ordinary_interval(&self) -> Duration {
+        if self.disabled {
+            return self.config.cold_interval;
+        }
+        let tier = match self.state {
+            LocalCollectorState::Hot => self.config.hot_min_interval * self.power_stretch,
+            LocalCollectorState::Warm => self.config.warm_interval * self.power_stretch,
+            LocalCollectorState::Idle => self
+                .config
+                .idle_interval
+                .max(self.config.hot_min_interval * self.power_stretch),
+            LocalCollectorState::Cold => self.config.cold_interval,
+            LocalCollectorState::Failing => self.failure_backoff(),
+            LocalCollectorState::Disabled => self.config.cold_interval,
+        };
+        // The server may ask for a longer gap between scans, never a shorter one:
+        // it is a cost directive, and a server that could shorten it would be
+        // asking the fleet to pay for the server's own load.
+        match self.server_min_interval {
+            Some(requested) => tier.max(requested),
+            None => tier,
+        }
+    }
+
+    /// Ask for a continuation page after a page that paused a still-valid,
+    /// budget-exhausted job. Only that page may call this: refusal, busy or
+    /// unknown outcomes clear instead, so they can never manufacture urgency.
+    /// Returns whether the request stands; a disabled source takes none.
+    pub fn request_continuation(&mut self, finished_at: Instant, work: Duration) -> bool {
+        self.ordinary_pacing = None;
+        self.continuation = (!self.disabled).then_some(ContinuationRequest {
+            finished_at,
+            work,
+            first_import: false,
+        });
+        self.continuation.is_some()
+    }
+
+    /// Reuse the continuation request to bring the next ordinary scan forward.
+    /// It still prepares, saves and moves the ordinary clock on success.
+    /// `first_import` rides on this request only and ends with it.
+    pub fn request_paced_scan(
+        &mut self,
+        finished_at: Instant,
+        work: Duration,
+        pacing: ContinuationPacing,
+        first_import: bool,
+    ) -> bool {
+        let requested = self.request_continuation(finished_at, work);
+        self.ordinary_pacing = requested.then_some(pacing);
+        if let Some(request) = self.continuation.as_mut() {
+            request.first_import = first_import;
+        }
+        requested
+    }
+
+    pub fn paced_scan_due(&self) -> Option<Instant> {
+        self.due_with_pacing(self.ordinary_pacing?)
+    }
+
+    /// Whether the pending paced request was made during the first import.
+    pub fn paced_first_import(&self) -> bool {
+        self.ordinary_pacing.is_some() && self.continuation.is_some_and(|r| r.first_import)
+    }
+
+    pub fn clear_cursor_continuation(&mut self) {
+        if self.ordinary_pacing.is_none() {
+            self.clear_continuation();
+        }
+    }
+
+    pub fn clear_continuation(&mut self) {
+        self.ordinary_pacing = None;
+        self.continuation = None;
+    }
+
+    /// The measured work of the page that asked for the pending continuation.
+    pub fn continuation_work(&self) -> Option<Duration> {
+        self.continuation.map(|request| request.work)
+    }
+
+    /// When the pending continuation page may run, or `None` when it should not
+    /// run before the ordinary scan.
+    ///
+    /// The interval is `max(server minimum, failure backoff if failing,
+    /// continuation gap)`, anchored to the later of the asking page and the last
+    /// ordinary scan. The continuation therefore replaces only the Hot/Warm/Idle
+    /// floor; a directive or a backoff still wins. Any overflow refuses the
+    /// continuation rather than saturating into an early deadline. This never
+    /// changes [`SourceCadence::next_scan_after`]: a continuation page is not an
+    /// ordinary scan and does not move the ordinary eligibility clock. Neither
+    /// does a continuation job's EOF completion: its caller saves the clock
+    /// before the unchanged completion upload and restores it afterwards.
+    pub fn continuation_due(&self, pacing: ContinuationPacing) -> Option<Instant> {
+        if self.ordinary_pacing.is_some() {
+            return None;
+        }
+        self.due_with_pacing(pacing)
+    }
+
+    fn due_with_pacing(&self, pacing: ContinuationPacing) -> Option<Instant> {
+        if self.disabled {
+            return None;
+        }
+        let request = self.continuation?;
+        // An unscanned source is already due on the ordinary cadence.
+        let last_scan = self.last_scan_at?;
+        let gap = request
+            .work
+            .checked_mul(pacing.idle_per_work)?
+            .max(pacing.min_gap);
+        let mut interval = gap;
+        if let Some(requested) = self.server_min_interval {
+            interval = interval.max(requested);
+        }
+        if self.state == LocalCollectorState::Failing {
+            interval = interval.max(self.failure_backoff());
+        }
+        let due = request.finished_at.max(last_scan).checked_add(interval)?;
+        let ordinary_due = last_scan.checked_add(self.ordinary_interval())?;
+        (due < ordinary_due).then_some(due)
+    }
+
+    pub fn next_scan_after(&self, now: Instant) -> Duration {
+        if self.disabled {
+            return self.config.cold_interval;
+        }
+        let interval = self.ordinary_interval();
+        let since_scan = self
+            .last_scan_at
+            .map(|last_scan| now.saturating_duration_since(last_scan));
+        let ordinary = remaining_after(interval, since_scan);
+        self.paced_scan_due().map_or(ordinary, |due| {
+            ordinary.min(due.saturating_duration_since(now))
+        })
+    }
+
+    fn failure_backoff(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return self.config.failure_backoffs[0];
+        }
+        self.config
+            .failure_backoffs
+            .get(self.consecutive_failures.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| {
+                *self
+                    .config
+                    .failure_backoffs
+                    .last()
+                    .expect("failure backoff config cannot be empty")
+            })
+    }
+}
+
+fn remaining_after(interval: Duration, elapsed: Option<Duration>) -> Duration {
+    match elapsed {
+        Some(elapsed) if elapsed >= interval => Duration::ZERO,
+        Some(elapsed) => interval - elapsed,
+        None => Duration::ZERO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_first_file_activity_restores_the_floor_and_never_beats_it() {
+        let floor = Duration::from_secs(5 * 60);
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+
+        // An inactive source falls to the cheap tiers.
+        let quiet = start + Duration::from_secs(20 * 60);
+        cadence.record_scan_success(start, 0);
+        cadence.record_scan_success(quiet, 0);
+        assert_eq!(cadence.state(), LocalCollectorState::Idle);
+        assert_eq!(
+            cadence.next_scan_after(quiet),
+            CadenceConfig::cost_first(floor).idle_interval
+        );
+
+        // A burst of filesystem events makes it hot — and hot still means the
+        // floor, so no debounce can turn a busy transcript into per-event uploads.
+        for offset in 0..50 {
+            cadence.record_file_event(quiet + Duration::from_secs(offset));
+        }
+        assert_eq!(cadence.state(), LocalCollectorState::Hot);
+        assert_eq!(
+            cadence.next_scan_after(quiet + Duration::from_secs(60)),
+            floor - Duration::from_secs(60),
+            "a hot source is due at the floor, not before it"
+        );
+    }
+
+    #[test]
+    fn a_repeated_server_directive_cannot_starve_the_scan() {
+        // The regression this guards: a relative directive re-read every cycle
+        // pushes its own deadline forward forever, so the scan never runs again
+        // and nothing looks wrong. Anchored to the last scan, a repeated
+        // "come back in 10 minutes" just means one scan per 10 minutes.
+        let start = Instant::now();
+        let interval = Duration::from_secs(10 * 60);
+        let mut cadence =
+            SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(5 * 60)));
+        cadence.record_scan_success(start, 1);
+
+        for elapsed in [0u64, 60, 300, 599] {
+            cadence.set_server_min_interval(Some(interval));
+            let now = start + Duration::from_secs(elapsed);
+            assert_eq!(
+                cadence.next_scan_after(now),
+                interval - Duration::from_secs(elapsed),
+                "the directive must count down from the last scan"
+            );
+        }
+        cadence.set_server_min_interval(Some(interval));
+        assert_eq!(cadence.next_scan_after(start + interval), Duration::ZERO);
+
+        // And it can only lengthen: a directive shorter than the tier is ignored.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(
+            cadence.next_scan_after(start),
+            Duration::from_secs(5 * 60),
+            "a short directive must not buy a faster scan"
+        );
+    }
+
+    const PACING: ContinuationPacing = ContinuationPacing {
+        min_gap: Duration::from_secs(30),
+        idle_per_work: 9,
+    };
+
+    fn hot_scanned_at(start: Instant) -> SourceCadence {
+        let mut cadence =
+            SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(5 * 60)));
+        cadence.record_scan_success(start, 1);
+        cadence.record_file_event(start);
+        cadence
+    }
+
+    #[test]
+    fn a_continuation_request_never_moves_the_ordinary_cadence() {
+        let start = Instant::now();
+        let floor = Duration::from_secs(5 * 60);
+        let mut cases = Vec::new();
+        let mut hot = hot_scanned_at(start);
+        cases.push(hot.clone());
+        hot.set_server_min_interval(Some(Duration::from_secs(1800)));
+        cases.push(hot);
+        let mut idle = SourceCadence::new(CadenceConfig::cost_first(floor));
+        idle.record_scan_success(start, 0);
+        cases.push(idle);
+        let mut failing = SourceCadence::new(CadenceConfig::cost_first(floor));
+        failing.record_scan_failure(start);
+        failing.record_scan_failure(start);
+        cases.push(failing);
+        cases.push(SourceCadence::new(CadenceConfig::cost_first(floor)));
+
+        for ordinary in cases {
+            let mut continued = ordinary.clone();
+            continued.request_continuation(start + Duration::from_secs(5), Duration::from_secs(3));
+            for offset in [0u64, 29, 30, 35, 120, 299, 300, 601, 1800, 7200] {
+                let now = start + Duration::from_secs(offset);
+                assert_eq!(
+                    continued.next_scan_after(now),
+                    ordinary.next_scan_after(now),
+                    "a continuation must not change the ordinary schedule"
+                );
+                assert_eq!(continued.state(), ordinary.state());
+            }
+        }
+    }
+
+    #[test]
+    fn the_continuation_replaces_only_the_tier_floor() {
+        let start = Instant::now();
+        let mut cadence = hot_scanned_at(start);
+        assert_eq!(cadence.continuation_due(PACING), None, "nothing asked");
+
+        // A 3 s page: the gap is the 30 s minimum, well inside the 300 s floor.
+        let page_end = start + Duration::from_secs(4);
+        cadence.request_continuation(page_end, Duration::from_secs(3));
+        assert_eq!(
+            cadence.continuation_due(PACING),
+            Some(page_end + Duration::from_secs(30))
+        );
+        // A 10 s page: nine idle seconds per working second.
+        cadence.request_continuation(page_end, Duration::from_secs(10));
+        assert_eq!(
+            cadence.continuation_due(PACING),
+            Some(page_end + Duration::from_secs(90))
+        );
+        cadence.clear_continuation();
+        assert_eq!(cadence.continuation_due(PACING), None);
+    }
+
+    #[test]
+    fn a_server_directive_wins_over_the_continuation() {
+        let start = Instant::now();
+        let mut cadence = hot_scanned_at(start);
+        cadence.request_continuation(start, Duration::from_secs(3));
+
+        // 1800 s directive: the continuation can never run before the ordinary
+        // scan, so there is none.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1800)));
+        assert_eq!(cadence.continuation_due(PACING), None);
+
+        // A directive shorter than the floor still lengthens the 30 s gap.
+        cadence.set_server_min_interval(Some(Duration::from_secs(120)));
+        assert_eq!(
+            cadence.continuation_due(PACING),
+            Some(start + Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn a_failure_backoff_wins_over_the_continuation() {
+        let start = Instant::now();
+        let mut cadence = hot_scanned_at(start);
+        cadence.request_continuation(start, Duration::from_secs(3));
+        // The ordinary pass after the continuation request failed.
+        cadence.record_scan_failure(start + Duration::from_secs(10));
+        assert_eq!(cadence.continuation_due(PACING), None);
+
+        // Even a request made after the failure waits out the backoff.
+        cadence.request_continuation(start + Duration::from_secs(20), Duration::from_secs(1));
+        assert_eq!(cadence.continuation_due(PACING), None);
+    }
+}

@@ -1,0 +1,7 @@
+{
+  "phase": "waiting_for_code",
+  "retryable": false,
+  "retry_requires_new_operation_id": false,
+  "terminal_fallback_available": false,
+  "code_error": "invalid_code"
+}

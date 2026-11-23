@@ -1,0 +1,569 @@
+# Privacy
+
+Ottto separates local enriched data, live telemetry, integration connectors,
+cloud billing connectors, and calculated estimates. The local platform keeps
+local state and secret material on the Mac unless a user-approved setup or
+diagnostics flow sends a redacted payload.
+
+## Local Ownership
+
+`ottto-service` owns:
+
+- account binding metadata;
+- setup-run binding metadata;
+- source/app health;
+- local control token storage;
+- repair planning and backups;
+- diagnostics redaction;
+- update and uninstall state.
+
+Agents, the CLI, the macOS app, and the web app are clients. They should not
+duplicate local setup or repair logic.
+
+`ottto uninstall --confirm --backup-state <directory>` copies the local sync
+state before uninstalling. That state contains local session titles, prompts and workspace paths. Keep the
+backup private; the CLI writes its files as 0600 and its folders as 0700. The
+local state folder is not excluded from Time Machine or iCloud backups.
+
+The loopback `/control` endpoint requires an allowlisted Origin and a loopback
+Host naming the listener's port. With that same Origin/Host boundary, `/whoami`
+and `/local-health` return their existing machine identity and detailed health
+replies without a token, including the pseudonymous relay-device id in health.
+Other probe callers receive only liveness and version. The health endpoint never
+returns the relay secret, account ids, or hardware UUID. Duplicate Host, Origin
+and Authorization headers are refused. Origin and Host checks are browser
+boundaries; they do not replace control-command token authorization.
+
+## Device Details
+
+Connecting a Mac (setup, claim completion and device registration) uploads:
+
+- the Mac name, which is the macOS hostname, read for each request so it
+  follows a rename;
+- a one-way id derived from the Mac's hardware UUID (`IOPlatformUUID`), sent
+  in the field `hardware_uuid`; the raw UUID is not sent. The derivation is
+  fixed and public, so anyone who already knows the UUID can compute the id:
+  it is pseudonymous, not anonymous;
+- the OS family (`macos`), the CPU architecture and the Ottto version;
+- `machine_id`, a one-way hash of the hardware UUID (of the hostname if the
+  UUID cannot be read), a random installation id, and a one-way id for the
+  macOS user account that runs Ottto.
+
+Routine health reports carry `machine_id` and the install type
+(`app_bundle_helper`, `homebrew`, `hosted_installer`, `dev` or `unknown`), not
+the Mac name, the hardware UUID or any file path. The other health fields are
+Ottto account and organization ids, versions, states, codes, timestamps and
+short status messages; command output in those messages has local paths
+removed.
+
+## The Mac App
+
+The Ottto Mac app is a client of `ottto-service`: usage collection and uploads
+go through the daemon. The app doesn't read agent transcripts or agent
+credentials, and it doesn't upload usage itself. It makes these network
+requests itself:
+
+- it downloads the Mac's icon from Ottto's servers, when there is one; the icon
+  address includes the Ottto organization and device ids;
+- it checks Ottto's update feed for new app versions (Sparkle) and, when you
+  choose to update, downloads the new version;
+- if Ottto's service was installed with Homebrew, a manual update check runs
+  `brew update` and `brew upgrade` for Ottto.
+
+Links and sign-in pages open in your browser, and a sign-in started from the
+app runs `claude` or `codex`, which contact their providers.
+
+When you open a login or session in a terminal from the app, it reads some
+local details itself: the front terminal tab's tty (through Apple Events,
+which needs Automation permission), the working folder and process details of
+processes run by your macOS user, and up to 4 KiB of a project's `.git`
+pointer files.
+
+## What Stays Local
+
+The local platform must not upload raw prompts, raw responses, tool output,
+command output, browser cookies, OAuth credentials, API keys, passwords,
+absolute local paths. MCP tool descriptions and input schemas are the exception:
+they are sent verbatim as the MCP server reported them, so they can contain
+whatever text the server put there, including paths. Ottto does not add paths to
+them.
+
+Raw provider account and organization ids are identifiers, not credentials.
+Agent status uploads carry them on the account block and on plan observations,
+next to their domain-separated hashes, so the backend can recompute those
+hashes from the original roles:
+
+- Claude: the provider account UUID and the selected organization UUID.
+- Codex: the ChatGPT user id and the selected ChatGPT workspace (account) id.
+
+Only plain ids (ASCII letters, digits and `-`, at most 128 characters) are
+sent; anything else is dropped.
+
+The same agent-status carrier sends already-acquired account email and account
+and organization/workspace display labels for account cards. Each field belongs
+to its own account or plan observation; missing text stays missing. Safe text is
+sent unmasked and unchanged, bounded to 320 characters for the account email and
+255 for display labels. Unsafe or longer values are dropped, never truncated.
+Paths, secret-shaped values and control characters remain excluded. Display text
+does not establish account identity, payer, subscription selection, or historical
+session ownership. This changes no collection permissions or provider calls.
+
+The backend's existing accepted status fact retains these fields for replay into
+its SOURCE account display read model. This forward path does not copy labels
+into historical sessions or create a historical backfill. Other upload fields,
+credit-balance labels, diagnostics, logs and support receipts retain their
+existing redaction rules; email is permitted only in the named status display
+fields. Tokens and credentials stay local.
+
+Local usage snapshots use derived and redacted fields such as session ids,
+timestamps, usage totals, model usage, hashed workspace identity, and
+display-safe account or plan evidence.
+
+Snapshots also carry per-session activity counts, whatever the Readable labels
+setting: tool calls, shell commands, patch operations, files changed, lines
+added and removed, web searches, MCP calls and subagent starts. These are
+numbers only; the commands, arguments, paths, patches and tool output behind
+them stay local.
+
+Session links are off by default. When they are on, each session can upload up
+to 50 links to pull requests, issues or merge requests (the URL's host,
+repository path and number) and commit hashes found in tool output. These
+include other people's work that a session only viewed. The daemon finds them
+locally either way and uploads them only while session links are on.
+
+The snapshot format keeps an optional `session_context_curve:v1` field, but
+the daemon builds and fits no context curves, so none are uploaded.
+
+Agent status collection also reports display-safe runtime defaults read from an
+agent's own configuration files: Codex `config.toml`, and Claude Code's
+`settings.json`, `settings.local.json`, and macOS managed-policy settings. Only
+specifically named cost-relevant keys are read — model, reasoning effort level,
+service tier or fast mode, approval or permission mode, and sandbox mode —
+together with a label naming which file supplied each
+value. Environment variables, environment blocks, credential helpers, status-line
+commands, permission allow/ask/deny rules, and sandbox filesystem or credential
+rules are never read.
+Values must be short scalars; anything long, quoted, path-like, or URL-like is
+dropped rather than uploaded, and Claude Code's `bypassPermissions` mode is
+treated as a local safety posture and never reported. Configuration that sets
+none of these keys uploads no defaults at all rather than an empty record, so
+"not configured" stays distinguishable from "not readable".
+
+When a scan needs multiple uploads, `ottto-service` stores a temporary local
+resume checkpoint containing only the semantic hashes of snapshots the backend
+already accepted, their hash-neutral body witnesses, and a
+one-way hash that binds the checkpoint to its relay device. It does not store
+raw account/device identifiers, titles, prompts,
+responses, paths, session ids, usage payloads, or attribution labels. The
+checkpoint is scoped to the active collection policy and relay destination;
+legacy or destination-mismatched state is discarded, and valid state is removed
+after the final destination-scoped scan and bootstrap markers are durable. The
+daemon prunes accepted hashes that are no longer present in the current scan, so
+a permanently invalid session cannot make the checkpoint grow with every
+historical revision.
+
+Snapshot upload receipts, one per batch attempt, live in an owner-only local
+SQLite file. Each new receipt removes receipts older than 30 days in the same
+write, except each source's newest receipt, which stays whatever its age.
+Removed rows are zeroed in the file once SQLite next checkpoints its write-ahead
+log. A request-specific validated ACK may retain a
+private content-free annotation with full semantic fingerprints, body-witness
+versions and hashes, one-way session and destination identifiers, hashed
+accepted-head or conflict-challenge references, occurrence counts, uploaded
+cache-patch presence, two numeric usage scalars and coverage. Rejected entities
+also retain a closed reason category (authority downgrade or other), hashed
+machine/entity matching references, numeric usage floors, bounded decimal costs,
+semantic activity time, and a count/digest of usage grains. Grain dimensions and
+server detail strings are not retained. At most 50 entity records are retained
+per receipt, with rejected entities taking the private evidence slots first.
+Coverage explicitly reports truncation; a grain digest detects change but cannot
+identify a decreased or missing hourly floor. This diagnostic
+annotation survives ordinary checkpoint retirement; it never becomes ACK,
+retry, checkpoint or publication authority. Raw session/account/device ids,
+head tokens, request bodies, local paths and credentials are not retained.
+Public receipt responses keep their existing abbreviated identifiers, and
+private annotations are excluded from diagnostics and uploaded payloads.
+
+Codex cloud tasks are listed under the same consent as local Codex sessions:
+the workspace's "Usage check from your Mac" switch and the user's "List my
+Codex cloud tasks" setting, both resolved by the server. There is no separate
+per-Mac approval. The collector uses an officially documented,
+upstream-experimental Codex CLI surface and invokes only `codex cloud list
+--json` as the effective user. Each due work slice first reads the Codex
+activity hint once over a short-lived source-scoped relay token; it lists tasks
+only when that hint turns listing on and names the `cloud_session_changes.v3`
+contract. Listing off, an older server, authentication failure, and network or
+parse errors stop before provider access. `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency kill
+switch and overrides the server.
+
+From each task the collector sends its Codex task id plus lifecycle,
+timestamps, attempt count, safe environment kind and coverage. The task id
+uploads as the session identifier, the same as local session ids; it opens a
+task only within the user's own Codex/ChatGPT access. A task id that is empty,
+longer than 255 characters, padded with whitespace or holding a control
+character is skipped and only counted locally. The task title
+and environment name are sent only while the same title and workspace-label
+settings that govern local session uploads allow them; every request names the
+settings it applied. It never reads `~/.codex/auth.json`, calls private
+provider endpoints, or uploads raw CLI JSON, summaries, URLs, diffs, worklogs,
+prompts, outputs, repository paths, environment ids, or cursors, and it never
+logs task ids or writes them to disk. The collector is isolated from local
+snapshot delivery: it has its own backoff, never writes upload receipts, and a
+cloud failure never delays a local upload.
+
+The collector uploads a task only when its facts or the applied settings
+changed since that task's last exact server acknowledgement (at most 200 tasks
+and 512 KiB per request). A local digest decides "changed"; the digest itself
+never leaves the machine. Each acknowledged task's digest and the server's head
+etag are cached in the local upload-history file for 30 days under a local
+digest of the task id, scoped to the backend destination, organization, user
+and contract; the cache holds no titles or task ids, and unchanged polls never rewrite or extend an entry. A lost
+response or lost cache write only causes the same task to be offered again,
+which the server answers as unchanged. A per-task refusal, or a conflict the
+server answers without its head, is remembered for exactly that content. When
+the server reports a different head, the collector lists the page again once
+and offers the fresh facts against that head.
+
+Timing: the newest provider page is read every five minutes; after each listing
+from which the server accepted nothing new the wait doubles, up to a day, and a
+task the server accepts brings it back to five minutes. One daily crawl walks
+every page, ten pages per work slice and continuing five minutes later where it
+stopped, across UTC midnight, until it reaches an explicit official
+`cursor: null`. There is no page or task ceiling. A cursor chain that repeats
+or cycles (detected in constant memory), or a response without terminal proof,
+ends that day's traversal without claiming completion. The raw cursor lives
+only in process memory; after a restart the crawl starts again from the newest
+page and the cache suppresses tasks already acknowledged. While listing is off
+the hint is read again every 30 minutes, so the first listing can follow up to
+30 minutes after it is turned on; a server without the hint route is rechecked
+every six hours. Any HTTP 409 refusal is treated like listing off; a retired
+contract (HTTP 410) is treated like a missing route. A nonempty CLI page
+with no valid task identity and status is classified locally as
+`provider_payload_invalid`; it never becomes an empty healthy page. A malformed
+row is skipped alone and its valid siblings are still processed. The Codex
+subprocess receives no provider API keys and does not start an interactive
+shell.
+
+The relay transport is composed only for the connected Codex Mac. Before
+touching Keychain the daemon requires a connected local account, a Codex relay
+device and a persisted connection sharing the same machine binding, and
+validates the backend destination before reading the relay device secret. A
+loopback destination is accepted only when the daemon process carries the exact
+same developer override. No browser JWT crosses this boundary. Every hint,
+provider, send and cache admission validates the current local identity; a
+sign-out, account replacement or device rotation closes admission and waits for
+already admitted bounded provider or relay I/O before replacing identity.
+Startup removes the files of the retired per-Mac approval and nothing else.
+
+Session attribution follows the same boundary. The daemon may use bounded
+first-prompt material, provider-native skill metadata, and local scheduled-task
+definitions to derive tenant-scoped HMAC identifiers. The prompt grouping id is
+an HMAC of the normalized first prompt, keyed by a key the Ottto server issues
+per organization (per user when there is no organization) and shares with every
+Mac in it, so the server can compute the id for a prompt text it already knows. It uploads only while session attribution is on, and it stays
+when Readable labels is off. Bounded native skill labels
+are kept in owner-only local records independently of upload settings; retirement
+and uninstall erase those records. The Companion
+session list also keeps local titles and workspace labels when uploads omit them. When the
+existing **session titles and minimal descriptions** setting is enabled and the
+backend advertises support, a template or skill fact may additionally include
+one display label: either a sanitized prompt prefix of at most 96 bytes or an
+allowlisted skill name of at most 64 bytes. New daemons default this capability
+off with older backends. Turning off the existing setting strips these labels
+and session titles before upload while preserving opaque grouping identifiers.
+The daemon does not upload a full prompt, response, scheduled-task definition,
+definition path, transcript path, or HMAC key. Path-like prompt fragments are
+replaced with `[path]`. Provider schedule inventory is bounded, cached for six
+hours, and reprocesses only files whose size or modification time changed.
+Missing or ambiguous evidence produces no attribution label; it is never
+reclassified as human activity.
+
+Upload settings apply going forward. Turning a setting on applies to sessions
+that are active after it is turned on: a session that has already ended keeps
+what it uploaded before, and the daemon reads no transcript again to fill it
+in. Turning a setting off takes effect on the server for data already uploaded,
+and on every later upload.
+
+For Codex Desktop tasks created by another task, the daemon may also inspect
+the child row's first-user-message field in memory only when Codex itself marks
+that row `agent_created_thread`. It accepts only the exact machine-generated
+`codex_delegation` wrapper and extracts only its UUID-shaped source-thread id.
+The delegated prompt body is neither retained nor uploaded. Ordinary prompt
+text, malformed wrappers, self-links, and ambiguous ids produce no family edge.
+The uploaded result uses the same content-free parent/root/depth attribution
+facts as Codex's native spawn-edge table.
+
+This label transport reuses data already read by the incremental transcript
+scanner. It adds no filesystem polling, process inspection, permission prompt,
+or always-on watcher.
+
+On macOS, external-scheduler attribution may also inventory bounded user
+launchd definitions and the user's crontab at startup and once per day. Raw
+plist, crontab, wrapper-script, command, and path content stays local. Only
+for a recently written session that already matches a plausible scheduler
+definition, a bounded `launchctl print` lookup runs at most once per candidate
+job per scan. Only while such a job is running, the daemon reads process
+parents and start times from the kernel, Claude Code's own running-session
+registration files (`sessions/<pid>.json`: pid, session id, process start), and,
+for Codex, the open file paths of the user's own processes in that job's tree,
+once per scan. A registration counts only while its pid still runs with the
+recorded start, and a job only while its pid still runs with the job's start. A
+single proven job is remembered in memory for that session, bounded, so attribution
+survives the job's exit; there is no process watcher. Static
+correlation requires matching schedule time, prompt signature, provider, and
+repository. Interval jobs require a live job-PID relationship. Missing access,
+timeouts, and ambiguity produce no external-scheduler fact.
+
+Session attribution can also read launch events written by an instrumented
+launcher into `~/.ottto/launch-events/pending/`. This is the only way Ottto can
+state that a session in one app started a session in another; nothing is
+inferred from timing, repository, worktree, model, command line, or process
+ancestry. An event file may contain exactly nine values — a schema marker, three
+UUID session references, a pull-request number, a UTC timestamp, and three fixed
+enums — and the daemon rejects any file that carries an extra key, an unknown
+schema version, a reference that is not a UUID, a timestamp that is not UTC
+second precision, a name that does not match the references it claims, a session
+that names itself, or a launcher family Ottto does not recognize. No prompt,
+path, command line, environment value, or free text can pass those checks, and
+nothing is read from any other source to complete a partial event. Accepted
+files move to `~/.ottto/launch-events/processed/` and expire after thirty days;
+rejected files move to `~/.ottto/launch-events/rejected/` and expire after seven
+days, with the local log line naming only a reason code and never the file's
+contents. Two events naming the same session with different controllers produce
+no relationship at all. This intake reads only that directory. It runs whether
+or not session attribution is enabled, so that turning the setting on or off
+does not change a file's identity; the relationship is uploaded only while the
+setting is on. It adds no watcher, process inspection, or
+permission prompt.
+
+Codex session-start footprint: for each new Codex session (in `~/.codex` and
+in Ottto-managed Codex account folders) the daemon reads only the rows before
+its first model request, once, and uploads per repository the sizes of what
+Codex loaded, dated at that session's start. For each AGENTS.md file that is
+its loaded size in characters, its byte size (omitted above 1 MiB) and whether
+Codex's `project_doc_max_bytes` limit cut it; a file loaded whole
+also gets its lines, UTF-16 characters and the same device-salted hash as the
+Claude Code file counts (the salt never leaves the Mac, so hashes cannot be
+matched to known files or compared across machines). For each listed skill it
+is the name, the size of its listing line and whether its root is the project,
+the user, the system or a plugin. Paths are repository-relative. Instruction
+and skill text never leave the Mac. The context-footprint opt-outs (including
+`<support>/context_footprint/disabled`) apply, and
+`OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
+
+MCP inventory: while Readable labels and the **MCP inventory harvesting**
+setting are on (both are on by default), the daemon starts each enabled stdio
+MCP server configured for Claude Code and Codex (including servers from
+enabled plugins) at startup and then every six hours, asks it for its tool list, and uploads
+the result with the machine id, the agent's version and its tool-search
+setting. For each server it sends the configured server name, its
+transport, whether it answered, whether it is disabled, how the agent loads its
+tools, and the character length of the server's instructions (never their
+text). For each tool it sends the tool's name, its **description** and its
+**input schema** as the server reported them, not redacted or shortened. For
+Codex it also reports whether the bundled browser, Chrome and computer-use
+plugins are enabled. Server commands, arguments, working directories,
+environment values and URLs are not sent. HTTP and SSE servers are not
+contacted and upload no tools, and disabled servers are not started. An
+unchanged inventory is uploaded again at most weekly. Each time the Ottto server
+accepts an inventory upload, it sends the name, description and input schema of
+each Claude Code tool in it to Anthropic's token-count API, only to count how
+many tokens those tool definitions add to every session. Anthropic's commercial
+terms do not allow it to train models on data sent to its API. Setting
+`OTTTO_MCP_HARVEST_DISABLED=1` or creating
+`~/Library/Application Support/Ottto/mcp_inventory/disabled` turns this off on
+the Mac; turning either setting off also stops it. Each time the Ottto server
+accepts an inventory upload, it sends the name, description and input schema of
+each Codex tool in it to OpenAI's input-token count API, only to count how many
+tokens those tool definitions add to every session. OpenAI's
+[API data guide](https://developers.openai.com/api/docs/guides/your-data) says
+data sent to its API is not used to train models unless you opt in.
+
+Claude Code context read: while Claude is on for this Mac and unless the server
+has turned it off, about every six hours (30 minutes after a pass skipped near a sign-in
+expiry) the daemon runs `claude -p /context --no-session-persistence
+--output-format json` on Claude Code's default sign-in, in each of up to 12
+workspaces used in the last 14 days; `/context` is a local command that sends
+no prompt (Claude Code may still contact Anthropic while starting), no session
+is saved, and `--strict-mcp-config` keeps MCP servers from starting except in
+the most recently used workspace. Its upload includes the model, token totals per
+context category and, while Readable labels is on, the memory files, skills,
+custom agents and MCP tools it lists with their token counts, when the result
+changes (an unchanged result at most weekly); setting
+`OTTTO_CONTEXT_FOOTPRINT_HARVEST_DISABLED=1` or creating
+`~/Library/Application Support/Ottto/context_footprint/disabled` turns it off.
+
+Codex daily usage totals: this reader is off until you turn on **Compare with
+OpenAI's reported usage** in Ottto's web Settings > Data & privacy and this Mac
+confirms it. Approval covers one Ottto user on this Mac and every Codex account
+signed in here. Once on, about every six hours it reads
+`chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts` once per
+Codex account signed in on this Mac (the default Codex sign-in and Ottto's Codex
+account slots). It covers the last 120 complete UTC days, scoped to the
+signed-in user's own usage, and uses the access token already in that login's
+`auth.json`. Tokens are never refreshed or written; an expired login is skipped.
+It uploads per day, per Codex surface and per model, plus a day total: credits
+used, uncached input, cached input, output and total tokens, and thread and turn
+counts. With them it sends the covered dates, collection time, the provider's
+data-refresh time, the collector version, the installation id, keyed-hash grant
+and account fingerprints, and unsalted SHA-256 hashes of the OpenAI account id
+and workspace id. An answer that counts more than one user is refused and
+nothing from it is uploaded. The token, the raw response, prompts, responses,
+thread or task titles, email addresses and account or workspace names are not
+uploaded, and no other ChatGPT endpoint is contacted. Turn it off in the same
+setting, exclude the account signed in to Codex's default sign-in there, or
+create `~/Library/Application Support/Ottto/codex-daily-aggregates-disabled` to
+stop reads on this Mac.
+
+Claude Code runs started by the daemon: while **Keep my Claude accounts signed
+in** is on (it is on until you turn it off), when a Claude login's access token
+is within five minutes of expiring or has expired, the daemon runs
+`claude -p /usage --no-session-persistence --strict-mcp-config` once for that
+login, pinned to that login's Claude configuration folder; it sends no prompt
+and saves no session, Claude Code only refreshes the sign-in and reads plan
+usage, and turning the setting off stops it. Verify (in the Ottto app, during
+setup, or `ottto verify`) runs `claude -p "Reply with exactly: ottto smoke
+test"` on Claude Code's default sign-in, with every tool disallowed and no
+session saved, never from 15 minutes before that login's access expiry until
+it is refreshed; while a verification stays failed, the daemon repeats it after
+2, 4, 8 and 16 minutes and then every 30 minutes, and after a sign-in failure
+it waits until the Claude sign-in changes.
+
+## Readable Labels
+
+The **Readable labels** setting applies only to what is uploaded. Local data stays
+on the Mac either way, and the Mac app keeps showing it.
+
+With Readable labels off:
+
+- Session titles and workspace and repository names are not uploaded.
+- Per-item names are not uploaded: skills, custom agents, memory and instruction
+  files, MCP servers and tools, and the files that entered a session's context.
+  Token totals per category still upload, so "MCP tools use 12k tokens" stays
+  visible without naming a tool. Once the server accepts them, unnamed counts and
+  token totals per kind upload too: sizes and counts, not names, and not anonymity.
+- Per-skill attribution identifiers are not uploaded. Prompt and template grouping
+  identifiers still are, so repeated workflows keep grouping.
+- Tool activity keeps its call counts, with every MCP tool counted under one
+  hidden name. Agent roles outside the providers' built-in set are sent as
+  `custom`.
+- The MCP inventory (tool names, descriptions and input schemas) is not
+  collected, so no MCP server is started for it.
+
+Workspace and repository path hashes still upload: they are the identity keys that
+group a user's sessions, and an unchanged path always gives the same hash.
+
+Turning the setting off applies going forward; names uploaded earlier are not
+recalled by the daemon.
+
+The filter **always sends**: it never refuses, drops or delays a body because a
+toggle is off. Transport errors, authentication, money and proof validation, source
+authorization and the server's stale-policy check can still reject a request; that
+is not the filter. A retry inside one upload pass can carry the earlier policy's
+bytes once after a setting changes, and the server rejects those bytes.
+
+## Local Erasure
+
+**Turning a source off**, a device grant that no longer names it, **logging out**
+and **switching accounts** stop collection and keep local data: scan indexes and
+durable state in `snapshots`, caches, context composition state, backfill state and
+upload receipts all stay. Turning a source back on resumes from that kept state and
+continues forward: data uploaded before the source was turned off stays on the
+server, so nothing already sent is sent again.
+Pause in the Ottto app stops that source on this Mac before it saves the pause to
+your account, so a pause that cannot be saved still stops collection; Resume
+collects again only after your account saves it.
+
+**Forget installation** clears the installation identity and credentials only; all
+collected local data stays.
+
+**Uninstall** (`ottto uninstall --confirm`) deletes the local state, after an
+optional `--backup-state` export of receipts and first-sweep progress. None of these
+actions touch your agents' own transcripts or source data.
+
+## Live Telemetry
+
+Live telemetry is source-level opt-in. Setup can mint scoped setup keys and
+write local source config through `ottto-service`. Opt-out must remove fenced
+local config or Keychain state before backend setup-key revocation completes.
+
+Reasoning effort is read from the Claude transcript itself, which records the
+applied tier on each assistant record. No OTLP is required for it.
+
+Claude Code can also send its documented OTLP logs and traces to Ottto's
+daemon on 127.0.0.1, even when cloud live telemetry is off; the daemon forwards
+none of it. From each eligible `claude_code.api_request` log record (one with a
+session id, model and timestamp) the daemon keeps one content-free row in
+owner-only local files: the session id, the API and client request ids, the
+timestamp and event sequence, the model, effort, query source, speed (service
+tier), the cost Claude Code reports, the Claude Code version, token and request
+counts, and, when present, one-way hashes of the provider account and
+organization ids. A second local file, from `claude_code.llm_request` trace
+spans, keeps the session id, the request ids, an observed timestamp, and agent,
+parent-agent and workflow-run ids; the request and agent ids tie subagent and
+workflow requests to the right session. Neither file is uploaded as is. The
+daemon never stores the raw OTLP request, raw account or organization ids,
+email, prompts, responses, commands or paths.
+
+These rows shape what the aggregate local snapshot uploads:
+
+- When a row matches a transcript request, it can fill in effort the transcript
+  doesn't record, and supply the speed mode, the cost Claude Code reports and,
+  through the account and organization hashes, which account the usage belongs
+  to.
+- A row that matches no transcript request (for example a background request,
+  or a session with no transcript; see
+  [Telemetry-only Claude sessions](telemetry-only-sessions.md)) is uploaded as
+  usage of its own: its model, effort, speed, reported cost, token and request
+  counts, hour and account hashes, under the session the second file names.
+- A row's timestamp sets the request's hour when the transcript has none, and
+  can move the session's last-activity and end times later.
+
+Raw request ids stay on the machine; they are used for matching,
+deduplication and ownership checks. Snapshots omit the query source and Claude
+Code version from these rows. Any transcript usage not exactly covered by local
+evidence remains explicitly effort-unknown.
+
+While Claude is turned off for this device, or not granted to it, the daemon
+acknowledges these exports and stores nothing; evidence already stored is
+kept. A session's sidecars are deleted once every transcript of that session
+is gone from every configured Claude folder and no other transcript, pending
+upload or retained state still reads them.
+
+## Repair Boundaries
+
+`ottto fix --json` returns repair authority metadata. Terminal repair is allowed
+only for setup-safe actions tied to an active setup-run binding. Credential,
+auth-adjacent, stale-account, or disconnected cases require browser approval.
+`ottto verify --repair --json` is narrower: it can repair only Codex or Claude
+Code WriteConfig drift after a read-only config check, then re-read config before
+source verification. `OTTTO_PATCH_CODEX_DISABLED` and
+`OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return
+`patch_disabled`.
+
+Ottto does not enable Codex live telemetry. Startup, installation and repair
+remove only exporters identified by an Ottto source header and a loopback signal
+endpoint, including older unfenced configurations. External exporters and other
+settings remain. Ambiguous markers or invalid TOML require review. The explicit
+`OTTTO_PATCH_CODEX_DISABLED` override also prevents startup cleanup.
+
+Codex verification reports local-import readiness without running a provider
+smoke or waiting for raw OTLP. It returns `verified: false` and zero observed
+records: readiness is not proof of an accepted usage upload. Existing Codex
+processes must be restarted after cleanup to discard cached exporter settings.
+Local session usage, quota, plan and check-in collection continue independently.
+This does not establish capture of background provider calls absent from local
+session files. Claude Code capture and raw forwarding behavior are unchanged.
+
+## Diagnostics Redaction
+
+Diagnostics collection is local-only by default. Uploads require explicit
+approval, retention disclosure acceptance, and either an active login or a
+support claim. Redaction covers local paths, secret tokens, account identifiers,
+machine identifiers, raw prompts, and command output before display or upload.
+
+## Reporting Guidance
+
+Support and agents should summarize status and next actions. Do not paste full
+diagnostics payloads or raw JSON containing local identifiers unless the user
+explicitly asks and the payload has been reviewed for redaction.

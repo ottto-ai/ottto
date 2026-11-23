@@ -1,0 +1,1200 @@
+//! Local-only, content-free witnesses of actual traversal decisions.
+//! No paths, identities, arbitrary strings, persisted writes or extra scans.
+use super::{
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
+    ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
+};
+use serde::Serialize;
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
+
+// None arms the next walk; Some(window) identifies its routine generation.
+// The index reloads between pages. Keep scheduling state only in this process.
+type Recensus = BTreeMap<(usize, String), Option<String>>;
+static RECENSUS: Mutex<Recensus> = Mutex::new(BTreeMap::new());
+
+fn recensus() -> MutexGuard<'static, Recensus> {
+    RECENSUS.lock().unwrap_or_else(|poisoned| {
+        RECENSUS.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+pub(super) fn routine_recensus(
+    source: SnapshotSource,
+    traversal: &ScanTraversalCheckpoint,
+) -> bool {
+    recensus().get(&(source.slot(), traversal.context_fingerprint.clone()))
+        == Some(&Some(traversal.census_window_end.clone()))
+}
+
+pub(super) fn disarm_recensus(source: SnapshotSource, context: &str) {
+    recensus().remove(&(source.slot(), context.to_owned()));
+}
+
+/// A simulated process start for one source's `roots`: their recensus arms,
+/// at every window, and this thread's walk folds are gone. Arms over other
+/// roots stay, so tests over other roots run undisturbed.
+#[cfg(test)]
+impl SnapshotSource {
+    pub(crate) fn forget_in_process_walk_state_for_test(self, roots: &[std::path::PathBuf]) {
+        let contexts = (0..=super::BACKFILL_WINDOW_DAYS)
+            .map(|days| {
+                super::discovery::traversal::scan_traversal_context_fingerprint(self, roots, days)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        recensus().retain(|(slot, context), _| *slot != self.slot() || !contexts.contains(context));
+        super::money_freshness::restart_for_test();
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StartReason {
+    NoRetainedTraversal,
+    ContextChanged,
+    TerminalUnhealthyRetry,
+}
+
+#[derive(Serialize)]
+struct Previous {
+    window_unix_seconds: Option<u64>,
+    pending_directories: usize,
+    pending_candidates: usize,
+    watcher_overflow: bool,
+    retry_attempt: u8,
+    retry_not_before_unix_seconds: Option<u64>,
+    retryable_problems: bool,
+    unsettled_residue: bool,
+    // This type contains numeric counters and a fixed cause-counter array only.
+    counts: ScanTraversalCounts,
+    max_unread_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub(super) struct Starting {
+    event: &'static str,
+    reason: StartReason,
+    index_generation: u64,
+    window_unix_seconds: Option<u64>,
+    context_matches: bool,
+    recensus_armed: bool,
+    context_fingerprint: String,
+    retry_due: Option<bool>,
+    prior_unsettled_upload: bool,
+    /// Fixed names of the paths that set `prior_unsettled_upload`. Empty
+    /// exactly when it is false.
+    prior_unsettled_causes: Vec<&'static str>,
+    previous: Option<Previous>,
+    new_retry_attempt: u8,
+    disappearance_process_totals_v1: disappearance_diagnostics::Totals,
+}
+
+impl Starting {
+    /// Called only AFTER the existing resume/backoff early return. Thus a
+    /// retained matching traversal reached the real terminal-unhealthy retry.
+    pub(super) fn capture(
+        source: SnapshotSource,
+        index: &ScanIndex,
+        now: &str,
+        matches: bool,
+        attempt: u8,
+    ) -> Self {
+        let previous = index.traversal.as_ref().map(|t| Previous {
+            window_unix_seconds: rfc3339_unix_seconds(&t.census_window_end),
+            pending_directories: t.pending_directories.len(),
+            pending_candidates: t.pending_candidates.len(),
+            watcher_overflow: t.watcher_hint_seen,
+            retry_attempt: t.unhealthy_retry_attempt,
+            retry_not_before_unix_seconds: t.unhealthy_retry_not_before_unix_seconds,
+            retryable_problems: t.has_retryable_problems(),
+            unsettled_residue: t.has_unsettled_residue(),
+            counts: t.counts.clone(),
+            max_unread_bytes: t.counts.max_unread_bytes,
+        });
+        Self {
+            disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
+            event: "starting",
+            reason: match (previous.is_some(), matches) {
+                (false, _) => StartReason::NoRetainedTraversal,
+                (true, false) => StartReason::ContextChanged,
+                (true, true) => StartReason::TerminalUnhealthyRetry,
+            },
+            index_generation: index.generation,
+            window_unix_seconds: rfc3339_unix_seconds(now),
+            context_matches: matches,
+            recensus_armed: false,
+            context_fingerprint: String::new(),
+            retry_due: matches.then_some(true),
+            prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
+            prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
+            previous,
+            new_retry_attempt: attempt,
+        }
+    }
+
+    pub(super) fn emit(
+        &self,
+        source: SnapshotSource,
+        configured_root_count: usize,
+        resolved_root_count: usize,
+        window_days: u64,
+    ) {
+        #[derive(Serialize)]
+        struct Scope<'a> {
+            #[serde(flatten)]
+            transition: &'a Starting,
+            configured_root_count: usize,
+            resolved_root_count: usize,
+            window_days: u64,
+            version_inputs_hash: String,
+        }
+        // Fixed empty roots/window isolate versions using the fingerprint's existing encoding.
+        let versions =
+            super::discovery::traversal::scan_traversal_context_fingerprint(source, &[], 0);
+        crate::local_resource_diagnostics::traversal_transition(
+            source.api_slug(),
+            &Scope {
+                transition: self,
+                configured_root_count,
+                resolved_root_count,
+                window_days,
+                version_inputs_hash: versions[..8].to_owned(),
+            },
+        );
+    }
+
+    pub(super) fn start_recensus(&mut self, source: SnapshotSource, context: &str, window: &str) {
+        let mut state = recensus();
+        let key = (source.slot(), context.to_owned());
+        let armed = state.remove(&key) == Some(None);
+        self.context_fingerprint = context.get(..8).unwrap_or_default().to_owned();
+        self.recensus_armed = (matches!(self.reason, StartReason::TerminalUnhealthyRetry)
+            && self.previous.as_ref().is_some_and(|previous| {
+                !previous.watcher_overflow
+                    && previous.counts.directory_entry_cap_exceeded_count == 0
+                    && previous.counts.symlink_rejected_count == 0
+                    && !previous
+                        .counts
+                        .unreadable_causes
+                        .walk_loss(previous.counts.unreadable_path_count as u64)
+            }))
+            || (matches!(self.reason, StartReason::NoRetainedTraversal) && armed);
+        if self.recensus_armed {
+            state.insert(key, Some(window.to_owned()));
+        }
+    }
+}
+
+pub(super) fn restarting(
+    source: SnapshotSource,
+    index_generation: u64,
+    traversal: &ScanTraversalCheckpoint,
+) {
+    disarm_recensus(source, &traversal.context_fingerprint);
+    #[derive(Serialize)]
+    struct Restarting {
+        event: &'static str,
+        reason: &'static str,
+        index_generation: u64,
+        window_unix_seconds: Option<u64>,
+        pending_directories: usize,
+        pending_candidates: usize,
+    }
+    crate::local_resource_diagnostics::traversal_transition(
+        source.api_slug(),
+        &Restarting {
+            event: "restarting",
+            reason: "sidecar_census_restart",
+            index_generation,
+            window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
+            pending_directories: traversal.pending_directories.len(),
+            pending_candidates: traversal.pending_candidates.len(),
+        },
+    );
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RetireReason {
+    Complete,
+    CompleteNeedsCleanFollowup,
+    WatcherOverflowRestart,
+    ParentResolutionRestart,
+}
+
+pub(super) fn retiring(
+    source: SnapshotSource,
+    index_generation: u64,
+    traversal: &ScanTraversalCheckpoint,
+    raw_complete: bool,
+    unsettled_causes: u16,
+    gates: CensusGates,
+) {
+    #[derive(Serialize)]
+    struct Retiring<'a> {
+        event: &'static str,
+        reason: RetireReason,
+        index_generation: u64,
+        window_unix_seconds: Option<u64>,
+        raw_census_complete: bool,
+        recensus_armed: bool,
+        context_fingerprint: &'a str,
+        gates: CensusGates,
+        /// Fixed names of the paths that set the clean follow-up's flag.
+        unsettled_causes: Vec<&'static str>,
+        counts: &'a ScanTraversalCounts,
+        max_unread_bytes: u64,
+        disappearance_process_totals_v1: disappearance_diagnostics::Totals,
+    }
+    let reason = if raw_complete {
+        if gates.clean_followup {
+            RetireReason::CompleteNeedsCleanFollowup
+        } else {
+            RetireReason::Complete
+        }
+    } else if !gates.frozen_generation {
+        RetireReason::WatcherOverflowRestart
+    } else {
+        RetireReason::ParentResolutionRestart
+    };
+    {
+        let mut state = recensus();
+        let key = (source.slot(), traversal.context_fingerprint.clone());
+        state.remove(&key);
+        if raw_complete {
+            state.insert(key, None);
+        }
+    }
+    crate::local_resource_diagnostics::traversal_transition(
+        source.api_slug(),
+        &Retiring {
+            event: "retiring",
+            reason,
+            index_generation,
+            window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
+            raw_census_complete: raw_complete,
+            recensus_armed: raw_complete,
+            context_fingerprint: traversal.context_fingerprint.get(..8).unwrap_or_default(),
+            gates,
+            unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
+            counts: &traversal.counts,
+            max_unread_bytes: traversal.counts.max_unread_bytes,
+            disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    mod sidecar_restart;
+
+    use super::*;
+    use crate::local_resource_diagnostics::capture;
+    use crate::snapshots::{ensure_bounded_traversal, scan_source_roots, BACKFILL_WINDOW_DAYS};
+    use serde_json::{json, Value};
+
+    const T0: &str = "2026-08-01T00:00:00Z";
+    const T1: &str = "2026-08-01T00:01:00Z";
+    const T2: &str = "2026-08-01T00:02:00Z";
+    const T3: &str = "2026-08-01T00:03:00Z";
+
+    fn start(index: &mut ScanIndex, now: &str, days: u64) -> Vec<Value> {
+        capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days)).1
+    }
+
+    #[test]
+    fn traversal_transition_real_start_resume_context_and_retry() {
+        let scratch = crate::test_scratch::ScratchDir::new("recensus-starts");
+        let roots = [scratch.to_path_buf()];
+        let start = |index: &mut ScanIndex, now: &str, days: u64| {
+            capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &roots, index, now, days)).1
+        };
+        let mut index = ScanIndex {
+            generation: 37,
+            ..ScanIndex::default()
+        };
+        let first = start(&mut index, T0, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first.len(), 1);
+        assert!(!routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
+        assert_eq!(first[0]["counts"]["reason"], "no_retained_traversal");
+        assert_eq!(first[0]["counts"]["configured_root_count"], 1);
+        assert_eq!(first[0]["counts"]["resolved_root_count"], 1);
+        assert_eq!(first[0]["counts"]["window_days"], BACKFILL_WINDOW_DAYS);
+        let versions = first[0]["counts"]["version_inputs_hash"].as_str().unwrap();
+        assert_eq!(versions.len(), 8);
+        assert!(versions.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first[0]["counts"]["index_generation"], 37);
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["version"],
+            1
+        );
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["scope"],
+            "process_lifetime_not_window"
+        );
+        assert_eq!(
+            first[0]["counts"]["disappearance_process_totals_v1"]["counts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let sites = first[0]["counts"]["disappearance_process_totals_v1"]["not_found_sites"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sites.len(), 5);
+        assert!(sites
+            .iter()
+            .all(|site| site.as_array().is_some_and(|slots| slots.len() == 2)));
+        for vanished in [
+            "vanished_audit_debt_dropped",
+            "vanished_request_census_removed",
+        ] {
+            assert!(first[0]["counts"]["disappearance_process_totals_v1"][vanished].is_u64());
+        }
+        assert!(first[0]["counts"]["disappearance_process_totals_v1"]["overflowed"].is_boolean());
+        assert_eq!(
+            first[0]["counts"]["window_unix_seconds"],
+            rfc3339_unix_seconds(T0).unwrap()
+        );
+        let before = serde_json::to_value(&index).unwrap();
+        assert!(start(&mut index, T1, BACKFILL_WINDOW_DAYS).is_empty());
+        assert_eq!(serde_json::to_value(&index).unwrap(), before);
+
+        let changed = start(&mut index, T1, BACKFILL_WINDOW_DAYS + 1);
+        assert_eq!(changed.len(), 1);
+        assert!(!routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
+        assert_eq!(changed[0]["counts"]["reason"], "context_changed");
+        assert_eq!(
+            changed[0]["counts"]["window_days"],
+            BACKFILL_WINDOW_DAYS + 1
+        );
+        assert_eq!(changed[0]["counts"]["version_inputs_hash"], versions);
+        assert_eq!(
+            changed[0]["counts"]["previous"]["window_unix_seconds"],
+            rfc3339_unix_seconds(T0).unwrap()
+        );
+        assert!(changed[0]["counts"]["retry_due"].is_null());
+
+        let t = index.traversal.as_mut().unwrap();
+        t.pending_directories.clear();
+        t.counts.malformed_json_line_count = 3;
+        t.unhealthy_retry_attempt = 2;
+        t.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds("2026-08-01T00:03:00Z");
+        let before = serde_json::to_value(&index).unwrap();
+        assert!(start(&mut index, "2026-08-01T00:02:00Z", BACKFILL_WINDOW_DAYS + 1).is_empty());
+        assert_eq!(serde_json::to_value(&index).unwrap(), before);
+        let retried = start(&mut index, "2026-08-01T00:03:00Z", BACKFILL_WINDOW_DAYS + 1);
+        assert_eq!(retried.len(), 1);
+        assert!(routine_recensus(
+            SnapshotSource::Pi,
+            index.traversal.as_ref().unwrap()
+        ));
+        assert_eq!(retried[0]["counts"]["reason"], "terminal_unhealthy_retry");
+        assert_eq!(retried[0]["counts"]["configured_root_count"], 1);
+        assert_eq!(retried[0]["counts"]["resolved_root_count"], 1);
+        assert_eq!(retried[0]["counts"]["version_inputs_hash"], versions);
+        assert_eq!(retried[0]["counts"]["retry_due"], true);
+        assert_eq!(
+            retried[0]["counts"]["previous"]["counts"]["malformed_json_line_count"],
+            3
+        );
+        assert_eq!(retried[0]["counts"]["previous"]["retryable_problems"], true);
+        assert_eq!(retried[0]["counts"]["new_retry_attempt"], 2);
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .counts
+                .malformed_json_line_count,
+            0
+        );
+    }
+
+    #[test]
+    fn traversal_transition_actual_retirement_and_clean_followup() {
+        let scratch = crate::test_scratch::ScratchDir::new("routine-recensus");
+        let roots = [scratch.to_path_buf()];
+        let start = |index: &mut ScanIndex, now: &str, days: u64| {
+            capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &roots, index, now, days)).1
+        };
+        let mut index = ScanIndex::default();
+        let (scan, rows) = capture(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                &roots,
+                &mut index,
+                T0,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap()
+        });
+        assert!(scan.census_complete);
+        assert!(index.traversal.is_none());
+        let retired = rows
+            .iter()
+            .find(|row| row["counts"]["event"] == "retiring")
+            .unwrap();
+        assert_eq!(retired["counts"]["reason"], "complete");
+        assert_eq!(retired["counts"]["gates"]["census_complete"], true);
+        assert_eq!(retired["counts"]["unsettled_causes"], json!([]));
+
+        start(&mut index, T1, BACKFILL_WINDOW_DAYS);
+        let traversal = index.traversal.as_ref().unwrap();
+        assert!(
+            routine_recensus(SnapshotSource::Pi, traversal),
+            "Complete arms"
+        );
+        let saved = serde_json::to_value(traversal).unwrap();
+        assert!(saved.get("routine_recensus").is_none());
+        let restored = serde_json::from_value(saved).unwrap();
+        assert!(
+            routine_recensus(SnapshotSource::Pi, &restored),
+            "page reload retains scheduling"
+        );
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        let (scan, rows) = capture(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                &roots,
+                &mut index,
+                T1,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap()
+        });
+        assert!(!scan.census_complete);
+        assert!(index.traversal.is_none());
+        let retired = rows
+            .iter()
+            .find(|row| row["counts"]["event"] == "retiring")
+            .unwrap();
+        assert_eq!(retired["counts"]["reason"], "complete_needs_clean_followup");
+        assert_eq!(retired["counts"]["raw_census_complete"], true);
+        assert_eq!(retired["counts"]["gates"]["clean_followup"], true);
+        assert_eq!(retired["counts"]["gates"]["census_complete"], false);
+        assert_eq!(retired["counts"]["unsettled_causes"], json!(["shed"]));
+
+        // The clean follow-up's start names the prior causes, then clears
+        // them with the flag.
+        let started = start(&mut index, T2, BACKFILL_WINDOW_DAYS);
+        assert_eq!(started.len(), 1);
+        assert!(
+            routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
+            "clean follow-up stays routine"
+        );
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["shed"])
+        );
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+        let started = start(&mut index, T3, BACKFILL_WINDOW_DAYS + 1);
+        assert!(
+            !routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
+            "context change stays paced"
+        );
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], false);
+        assert_eq!(started[0]["counts"]["prior_unsettled_causes"], json!([]));
+        for frozen_generation in [false, true] {
+            let traversal = index.traversal.as_ref().unwrap();
+            retiring(
+                SnapshotSource::Pi,
+                0,
+                traversal,
+                true,
+                0,
+                CensusGates::default(),
+            );
+            retiring(
+                SnapshotSource::Pi,
+                0,
+                traversal,
+                false,
+                0,
+                CensusGates {
+                    frozen_generation,
+                    ..Default::default()
+                },
+            );
+            index.traversal = None;
+            start(&mut index, T3, BACKFILL_WINDOW_DAYS + 1);
+            assert!(!routine_recensus(
+                SnapshotSource::Pi,
+                index.traversal.as_ref().unwrap()
+            ));
+        }
+    }
+
+    fn assert_recensus_witness(row: &Value, traversal: &ScanTraversalCheckpoint, armed: bool) {
+        assert_eq!(row["counts"]["recensus_armed"], armed);
+        let prefix = row["counts"]["context_fingerprint"].as_str().unwrap();
+        assert_eq!(prefix, &traversal.context_fingerprint[..8]);
+        assert_eq!(prefix.len(), 8);
+        assert!(prefix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn terminal_unhealthy_retry_arms_routine_recensus_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for problem in ["malformed", "open_read", "disappeared"] {
+                let scratch = crate::test_scratch::ScratchDir::new("retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                match problem {
+                    "open_read" => traversal.counts.record_unreadable(
+                        crate::codex_scan_diagnostics::UnreadableCause::OpenRead,
+                        1,
+                    ),
+                    "disappeared" => traversal.counts.disappeared_file_count = 1,
+                    _ => traversal.counts.malformed_json_line_count = 1,
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                // A restarted process has a retained checkpoint but no in-memory arm.
+                disarm_recensus(source, &traversal.context_fingerprint);
+                index = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(routine_recensus(source, traversal));
+                assert_recensus_witness(&rows[0], traversal, true);
+                let restored =
+                    serde_json::from_value(serde_json::to_value(traversal).unwrap()).unwrap();
+                assert!(
+                    routine_recensus(source, &restored),
+                    "page reload keeps the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_unhealthy_retry_with_walk_loss_or_overflow_stays_paced() {
+        use crate::codex_scan_diagnostics::UnreadableCause;
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for problem in [
+                "directory",
+                "metadata",
+                "unattributed",
+                "directory_cap",
+                "symlink",
+                "overflow",
+            ] {
+                let scratch = crate::test_scratch::ScratchDir::new("loss-retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                // Overflow alone is not unhealthy; keep a file-level error alongside it.
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::OpenRead, 1);
+                match problem {
+                    "directory" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Directory, 1),
+                    "metadata" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Metadata, 1),
+                    "unattributed" => traversal.counts.unreadable_path_count += 1,
+                    "directory_cap" => traversal.counts.directory_entry_cap_exceeded_count = 1,
+                    "symlink" => traversal.counts.symlink_rejected_count = 1,
+                    "overflow" => traversal.watcher_hint_seen = true,
+                    _ => unreachable!(),
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(
+                    !routine_recensus(source, traversal),
+                    "{source:?}: {problem}"
+                );
+                assert_recensus_witness(&rows[0], traversal, false);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_followup_retirement_arms_routine_recensus_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("followup-recensus");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+            let old = index.traversal.as_ref().unwrap();
+            let (_, rows) = capture(|| {
+                retiring(
+                    source,
+                    0,
+                    old,
+                    true,
+                    0,
+                    CensusGates {
+                        clean_followup: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(rows[0]["counts"]["reason"], "complete_needs_clean_followup");
+            assert_recensus_witness(&rows[0], old, true);
+            index.traversal = None;
+            let (_, rows) = capture(|| {
+                ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+            });
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(routine_recensus(source, traversal));
+            assert_recensus_witness(&rows[0], traversal, true);
+        }
+    }
+
+    #[test]
+    fn context_changed_does_not_consume_an_arm_as_routine_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("changed-recensus");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+            retiring(
+                source,
+                0,
+                index.traversal.as_ref().unwrap(),
+                true,
+                0,
+                CensusGates::default(),
+            );
+            // Even an already armed destination context cannot make a context change routine.
+            index.traversal.as_mut().unwrap().context_fingerprint = "0".repeat(64);
+            let (_, rows) = capture(|| {
+                ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+            });
+            assert_eq!(rows[0]["counts"]["reason"], "context_changed");
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(!routine_recensus(source, traversal));
+            assert_recensus_witness(&rows[0], traversal, false);
+        }
+    }
+
+    fn with_unsettled_causes(index: &ScanIndex, causes: u16) -> ScanIndex {
+        let mut value = serde_json::to_value(index).unwrap();
+        value["bounded_sweep_unsettled_causes"] = json!(causes);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn without_unsettled_causes(index: &ScanIndex) -> Value {
+        let mut value = serde_json::to_value(index).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bounded_sweep_unsettled_causes");
+        value
+    }
+
+    #[test]
+    fn unsettled_causes_persist_only_when_set_and_reset_with_the_flag() {
+        // Absent when empty: the persisted index is byte-identical to before.
+        let empty = ScanIndex::default();
+        let saved = serde_json::to_value(&empty).unwrap();
+        assert!(saved.get("bounded_sweep_unsettled_causes").is_none());
+        // An index saved before the causes existed loads unattributed.
+        let mut legacy = saved.clone();
+        legacy["bounded_sweep_had_unsettled_upload"] = json!(true);
+        let mut legacy: ScanIndex = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.bounded_sweep_had_unsettled_upload);
+        assert_eq!(
+            legacy.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
+        let started = start(&mut legacy, T0, BACKFILL_WINDOW_DAYS);
+        assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["unattributed"])
+        );
+
+        // Every cause round-trips, in declaration order.
+        let mut marked = ScanIndex::default();
+        for cause in [
+            UnsettledUploadCause::AdmissionReoffer,
+            UnsettledUploadCause::Shed,
+            UnsettledUploadCause::LegacyReconcile,
+            UnsettledUploadCause::UploadError,
+            UnsettledUploadCause::AuthorityCensusWithheld,
+            UnsettledUploadCause::DeferredConflict,
+            UnsettledUploadCause::CompletedBlockingHolds,
+            UnsettledUploadCause::RejectedWithHolds,
+            UnsettledUploadCause::Shed,
+        ] {
+            marked.mark_bounded_sweep_unsettled_by(cause);
+        }
+        marked.mark_bounded_sweep_unsettled();
+        let all = [
+            "shed",
+            "upload_error",
+            "deferred_conflict",
+            "rejected_with_holds",
+            "completed_blocking_holds",
+            "authority_census_withheld",
+            "legacy_reconcile",
+            "admission_reoffer",
+            "unattributed",
+        ];
+        assert_eq!(marked.bounded_sweep_unsettled_cause_names(), all);
+        let restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&marked).unwrap()).unwrap();
+        assert_eq!(restored.bounded_sweep_unsettled_cause_names(), all);
+
+        // A census-complete finalize clears them with the flag.
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &[],
+            &mut index,
+            T0,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert!(scan.census_complete);
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        crate::snapshots::finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Pi,
+            &mut scan,
+            &mut index,
+            |_| String::new(),
+        );
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+
+        // So does a historical replay reset.
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::UploadError);
+        index.prepare_historical_replay("unsettled-cause-replay".into());
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+        assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+    }
+
+    /// A path that marks without naming itself is still named, as
+    /// `unattributed`, beside any named path in the same sweep. A flag with no
+    /// attribution (an older daemon) is unattributed too, so a later named
+    /// mark cannot conceal it. Bits a newer daemon set stay unknown.
+    #[test]
+    fn plain_and_missing_attribution_are_named_unattributed() {
+        let mut plain = ScanIndex::default();
+        plain.mark_bounded_sweep_unsettled();
+        assert!(plain.bounded_sweep_had_unsettled_upload);
+        assert_eq!(
+            plain.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
+
+        let mut named = ScanIndex::default();
+        named.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+        assert!(named.bounded_sweep_had_unsettled_upload);
+        assert_eq!(
+            named.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+
+        let mut plain_first = ScanIndex::default();
+        plain_first.mark_bounded_sweep_unsettled();
+        plain_first.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        let mut named_first = ScanIndex::default();
+        named_first.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        named_first.mark_bounded_sweep_unsettled();
+        for index in [&plain_first, &named_first] {
+            assert!(index.bounded_sweep_had_unsettled_upload);
+            assert_eq!(
+                index.bounded_sweep_unsettled_cause_names(),
+                ["shed", "unattributed"]
+            );
+        }
+
+        // An older daemon's flag, then a named mark on this daemon.
+        let mut legacy = serde_json::to_value(ScanIndex::default()).unwrap();
+        legacy["bounded_sweep_had_unsettled_upload"] = json!(true);
+        let mut legacy: ScanIndex = serde_json::from_value(legacy).unwrap();
+        legacy.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+        assert_eq!(
+            legacy.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict", "unattributed"]
+        );
+        let mut restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let started = start(&mut restored, T0, BACKFILL_WINDOW_DAYS);
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["deferred_conflict", "unattributed"])
+        );
+
+        // A newer daemon's unknown bit stays beside later marks and a reload.
+        let flagged = ScanIndex {
+            bounded_sweep_had_unsettled_upload: true,
+            ..ScanIndex::default()
+        };
+        let mut newer = with_unsettled_causes(&flagged, 1 << 15);
+        assert_eq!(newer.bounded_sweep_unsettled_cause_names(), ["unknown"]);
+        newer.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        let newer: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&newer).unwrap()).unwrap();
+        assert_eq!(
+            newer.bounded_sweep_unsettled_cause_names(),
+            ["shed", "unknown"]
+        );
+
+        // The flag is authoritative: stored bits without it name nothing.
+        let mut stray = with_unsettled_causes(&ScanIndex::default(), u16::MAX);
+        assert!(stray.bounded_sweep_unsettled_cause_names().is_empty());
+        stray.mark_bounded_sweep_unsettled();
+        assert_eq!(
+            stray.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
+
+        // The retiring line names a plain mark too.
+        let mut index = ScanIndex::default();
+        start(&mut index, T1, BACKFILL_WINDOW_DAYS);
+        index.mark_bounded_sweep_unsettled();
+        let (_, rows) = capture(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                &[],
+                &mut index,
+                T1,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap()
+        });
+        let retired = rows
+            .iter()
+            .find(|row| row["counts"]["event"] == "retiring")
+            .unwrap();
+        assert_eq!(retired["counts"]["reason"], "complete_needs_clean_followup");
+        assert_eq!(
+            retired["counts"]["unsettled_causes"],
+            json!(["unattributed"])
+        );
+    }
+
+    /// The causes are diagnostics only. An index that differs only in them
+    /// takes the same census, start and epoch decisions.
+    #[test]
+    fn unsettled_causes_alone_change_no_gate() {
+        // Terminal: no clean follow-up is owed for causes without the flag.
+        for (flag, reason) in [(false, "complete"), (true, "complete_needs_clean_followup")] {
+            let mut plain = ScanIndex::default();
+            start(&mut plain, T0, BACKFILL_WINDOW_DAYS);
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            let mut outcomes = Vec::new();
+            for index in [&mut plain, &mut tagged] {
+                let (scan, rows) = capture(|| {
+                    scan_source_roots(SnapshotSource::Pi, &[], index, T0, BACKFILL_WINDOW_DAYS)
+                        .unwrap()
+                });
+                let retired = rows
+                    .iter()
+                    .find(|row| row["counts"]["event"] == "retiring")
+                    .unwrap();
+                assert_eq!(retired["counts"]["reason"], reason);
+                outcomes.push((
+                    scan.census_complete,
+                    retired["counts"]["gates"].clone(),
+                    without_unsettled_causes(index),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "flag={flag}");
+        }
+
+        // Finalize: the upload-context epoch advances exactly as without them.
+        for flag in [false, true] {
+            let mut plain = ScanIndex::default();
+            let mut scan = scan_source_roots(
+                SnapshotSource::Pi,
+                &[],
+                &mut plain,
+                T0,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            for index in [&mut plain, &mut tagged] {
+                index.activate_upload_context("unsettled-cause-context".into());
+                crate::snapshots::finalize_scan_after_policy_with_body_witness(
+                    SnapshotSource::Pi,
+                    &mut scan,
+                    index,
+                    |_| String::new(),
+                );
+            }
+            assert_eq!(
+                without_unsettled_causes(&plain),
+                without_unsettled_causes(&tagged),
+                "flag={flag}"
+            );
+        }
+
+        // Claude start: the start reads the flag only, except the
+        // custody-backed `Isolated503`, which alone survives it.
+        for flag in [false, true] {
+            let mut plain = ScanIndex::default();
+            plain.files.insert(
+                "/not-logged/private-session.jsonl".into(),
+                serde_json::from_value(json!({
+                    "size_bytes": 1, "modified_unix_seconds": 0,
+                    "source_file_fingerprint": "private-body-witness",
+                    "last_snapshot_fingerprint": null
+                }))
+                .unwrap(),
+            );
+            plain.bounded_sweep_had_unsettled_upload = flag;
+            let mut tagged =
+                with_unsettled_causes(&plain, !UnsettledUploadCause::Isolated503.bit());
+            let mut outcomes = Vec::new();
+            for index in [&mut plain, &mut tagged] {
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(
+                        SnapshotSource::ClaudeCode,
+                        &[],
+                        index,
+                        T1,
+                        BACKFILL_WINDOW_DAYS,
+                    )
+                });
+                let counts = &rows[0]["counts"];
+                outcomes.push((
+                    counts["prior_unsettled_upload"].clone(),
+                    without_unsettled_causes(index),
+                ));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "flag={flag}");
+        }
+    }
+
+    #[test]
+    fn process_snapshot_is_diagnostic_only_and_restored_counts_have_no_backfill() {
+        let mut index = ScanIndex::default();
+        start(&mut index, T0, BACKFILL_WINDOW_DAYS);
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .counts
+            .disappeared_file_count = 7;
+        let saved = serde_json::to_vec(&index).unwrap();
+        let restored: ScanIndex = serde_json::from_slice(&saved).unwrap();
+        let manifest_before =
+            serde_json::to_vec(&restored.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS))
+                .unwrap();
+        let ((starting, rows), events) = disappearance_diagnostics::observe(|| {
+            capture(|| {
+                let starting = Starting::capture(SnapshotSource::Pi, &restored, T1, true, 1);
+                starting.emit(SnapshotSource::Pi, 0, 0, BACKFILL_WINDOW_DAYS);
+                starting
+            })
+        });
+        assert_eq!(
+            events, [[0; 4]; 3],
+            "restoring/copying/emitting is not a producer"
+        );
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), saved);
+        assert_eq!(
+            serde_json::to_vec(&restored.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS))
+                .unwrap(),
+            manifest_before
+        );
+        assert_eq!(starting.previous.unwrap().counts.disappeared_file_count, 7);
+        assert!(!String::from_utf8(saved)
+            .unwrap()
+            .contains("disappearance_process_totals_v1"));
+        assert!(!String::from_utf8(manifest_before)
+            .unwrap()
+            .contains("disappearance_process_totals_v1"));
+        let mut old_row = rows[0].clone();
+        assert!(old_row["counts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("disappearance_process_totals_v1")
+            .is_some());
+        // Absence is preserved, never deserialized into invented zero reasons.
+        let old_row: Value =
+            serde_json::from_str(&serde_json::to_string(&old_row).unwrap()).unwrap();
+        assert!(old_row["counts"]
+            .get("disappearance_process_totals_v1")
+            .is_none());
+        // Neither a first snapshot nor restored aggregate 7 can establish its
+        // historical causes. No global-zero/delta assertion would be valid here.
+    }
+
+    fn max_traversal_counts() -> ScanTraversalCounts {
+        let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        value["causes"] = json!({"contributions": vec![u64::MAX; 8]});
+        for (name, value) in value.as_object_mut().unwrap() {
+            if let Some(object) = value.as_object_mut() {
+                let field = if name == "causes" {
+                    "contributions"
+                } else {
+                    "counts"
+                };
+                for counter in object.get_mut(field).unwrap().as_array_mut().unwrap() {
+                    *counter = json!(u64::MAX);
+                }
+            } else {
+                *value = if name.ends_with("dropped_usage_record_count") {
+                    json!(u64::MAX)
+                } else {
+                    json!(usize::MAX)
+                };
+            }
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn assert_complete_max_row(mut row: Value) {
+        // Start/retire use the real Rust emitter above. Widen wrapper integers
+        // and process totals here without modifying process-global counters.
+        row["process_id"] = json!(u32::MAX);
+        row["observation"]["observed_unix_ms"] = json!(u64::MAX);
+        row["counts"]["window_unix_seconds"] = json!(u64::MAX);
+        row["counts"]["disappearance_process_totals_v1"] =
+            serde_json::to_value(disappearance_diagnostics::Totals::maximum()).unwrap();
+        let totals = &row["counts"]["disappearance_process_totals_v1"];
+        assert_eq!(
+            totals,
+            &json!({"version":1,"scope":"process_lifetime_not_window",
+            "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],
+            "not_found_sites":([[u64::MAX, u64::MAX]; 5]),
+            "vanished_audit_debt_dropped":u64::MAX,
+            "vanished_request_census_removed":u64::MAX,
+            "overflowed":true})
+        );
+        assert_eq!(totals.as_object().unwrap().len(), 7);
+        assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+        for field in [
+            "shared_process_cpu_delta_us",
+            "process_lifetime_max_rss_bytes",
+            "process_lifetime_max_rss_before_bytes",
+            "stage_peak_footprint_bytes",
+            "stage_start_footprint_bytes",
+            "stage_end_footprint_bytes",
+            "footprint_samples",
+            "footprint_sample_failures",
+        ] {
+            assert!(row["observation"][field].is_null());
+        }
+        // false is one byte longer, even though true is the sticky-wrap case.
+        for overflowed in [false, true] {
+            row["counts"]["disappearance_process_totals_v1"]["overflowed"] = json!(overflowed);
+            let json = serde_json::to_string(&row).unwrap();
+            let complete_line = format!("ottto-service: local_resources {json}\n");
+            assert!(
+                complete_line.len() <= 4096,
+                "complete maximum-width row: {} bytes",
+                complete_line.len()
+            );
+            for forbidden in [
+                "private-session",
+                "private-body-witness",
+                "/not-logged/",
+                "source_file_fingerprint",
+            ] {
+                assert!(!complete_line.contains(forbidden));
+            }
+        }
+        // This measures payload, not String additional capacity or allocator peak.
+    }
+
+    #[test]
+    fn complete_transition_rows_serialize_with_maximum_integers_within_budget() {
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
+            index.generation = u64::MAX;
+            let traversal = index.traversal.as_mut().unwrap();
+            traversal.counts = max_traversal_counts();
+            let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+            starting.context_fingerprint = "01234567".into();
+            starting.context_matches = false; // longest boolean spelling
+            starting.prior_unsettled_upload = false;
+            starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
+            assert_eq!(starting.prior_unsettled_causes.len(), 11);
+            starting.retry_due = Some(false);
+            starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
+            let previous = starting.previous.as_mut().unwrap();
+            previous.window_unix_seconds = Some(u64::MAX);
+            previous.pending_directories = usize::MAX;
+            previous.pending_candidates = usize::MAX;
+            previous.retry_attempt = u8::MAX;
+            previous.retry_not_before_unix_seconds = Some(u64::MAX);
+            previous.watcher_overflow = false;
+            previous.retryable_problems = false;
+            previous.unsettled_residue = false;
+            let (_, rows) = capture(|| starting.emit(source, usize::MAX, usize::MAX, u64::MAX));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"], source.api_slug());
+            assert_complete_max_row(rows[0].clone());
+            let (_, rows) = capture(|| {
+                retiring(
+                    source,
+                    u64::MAX,
+                    index.traversal.as_ref().unwrap(),
+                    true,
+                    u16::MAX,
+                    CensusGates {
+                        clean_followup: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"], source.api_slug());
+            assert_eq!(
+                rows[0]["counts"]["unsettled_causes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                11
+            );
+            assert_complete_max_row(rows[0].clone());
+        }
+    }
+}

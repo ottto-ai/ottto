@@ -1,0 +1,41 @@
+{
+  "hash_scheme": "provider-sha256:v1",
+  "schema_version": 1,
+  "vectors": [
+    {
+      "account_identifier_hash": "a7fb5a422c8aa2018602e77d3bbecf512c2579d425d61acdad953c419a65e5fb",
+      "case": "same_user_workspace_a",
+      "provider_workspace_hash": "d1e4312cc6ed17f15b6631546f7abfb225436f4da45c8a3a9b44fa818bce90c3",
+      "user_id": "user-synthetic-0001",
+      "workspace_id": "ws-synthetic-a"
+    },
+    {
+      "account_identifier_hash": "a7fb5a422c8aa2018602e77d3bbecf512c2579d425d61acdad953c419a65e5fb",
+      "case": "same_user_workspace_b",
+      "provider_workspace_hash": "052e2efd282b942af8ee73fd8eb2219f0d52d7ed0e8dbc73f2b79956014e0cdd",
+      "user_id": "user-synthetic-0001",
+      "workspace_id": "ws-synthetic-b"
+    },
+    {
+      "account_identifier_hash": "6f88f924eb631b46895ed8e948e7a723aa4a977b99f5408af1b18b5bb224c33a",
+      "case": "two_users_shared_workspace_first",
+      "provider_workspace_hash": "1617175330a1d35167aaee11c7a8e77356804c1ea3284f1b41e3a68804a4ee9a",
+      "user_id": "user-synthetic-0002",
+      "workspace_id": "ws-synthetic-shared"
+    },
+    {
+      "account_identifier_hash": "7952462a0ec2029f8da044c184bc481b6713306d0045ec9aca677a84fa859a11",
+      "case": "two_users_shared_workspace_second",
+      "provider_workspace_hash": "1617175330a1d35167aaee11c7a8e77356804c1ea3284f1b41e3a68804a4ee9a",
+      "user_id": "user-synthetic-0003",
+      "workspace_id": "ws-synthetic-shared"
+    },
+    {
+      "account_identifier_hash": "a7fb5a422c8aa2018602e77d3bbecf512c2579d425d61acdad953c419a65e5fb",
+      "case": "ascii_case_and_surrounding_whitespace",
+      "provider_workspace_hash": "d1e4312cc6ed17f15b6631546f7abfb225436f4da45c8a3a9b44fa818bce90c3",
+      "user_id": "  User-Synthetic-0001 ",
+      "workspace_id": "\tWS-Synthetic-A "
+    }
+  ]
+}

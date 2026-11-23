@@ -1,0 +1,19 @@
+{
+  "request_id": "req_cli_provider_impact_fixture",
+  "protocol_version": 15,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "agent_provider_impact",
+  "query": {
+    "date_from": "2026-06-01",
+    "date_to": "2026-06-08",
+    "provider": "openai",
+    "app": "codex",
+    "kind": "quota",
+    "confidence": "high",
+    "impact_priority": "critical",
+    "status": "verified",
+    "q": "subscription",
+    "limit": 25
+  }
+}

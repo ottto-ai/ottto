@@ -1,0 +1,219 @@
+{
+  "artifact_id": 13031099044,
+  "artifact_name": "v1-goldens-53d05a43",
+  "artifact": {
+    "id": null,
+    "name": "v1-goldens-53d05a43"
+  },
+  "cases": [
+    {
+      "byte_length": 1031,
+      "case_id": "claude-three-request",
+      "envelope_version": 1,
+      "expected": {
+        "byte_length": 7498,
+        "path": "expected/claude-three-request.json",
+        "sha256": "752e41dcd85fa1cd8a45e6c78a423397022922260c5416bc6e0270c3309053b0"
+      },
+      "expected_facts": {
+        "accepted_body_witness": true,
+        "cache_creation_1h_tokens": 6,
+        "cache_creation_5m_tokens": 15,
+        "cache_read_tokens": 9,
+        "cli_version": null,
+        "counting_version": "not_applicable",
+        "input_tokens": 60,
+        "opening_output_tokens": 30,
+        "opening_request_count": 3,
+        "output_tokens": 60,
+        "protected_tier_receipt_present": false,
+        "request_2_context_tokens": 30,
+        "request_3_context_tokens": 40,
+        "request_count": 3,
+        "selector_context": {},
+        "selector_sources": {},
+        "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "telemetry_cost_micros": 600,
+        "tier_replay_finished": false,
+        "tier_replay_persisted": false
+      },
+      "historical_allowlist": "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+      "index_generation": 1,
+      "input": {
+        "byte_length": 1149,
+        "path": "inputs/claude-three-request.jsonl",
+        "sha256": "da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
+      },
+      "path": "claude-three-request.rec",
+      "selector_span": null,
+      "sha256": "b758fc296d1d4392735c0fad4eac79642f612b3fc2d92bcd8127956e640ccde5",
+      "source_tag": 1
+    },
+    {
+      "byte_length": 1086,
+      "case_id": "claude-selector-unequal",
+      "envelope_version": 1,
+      "expected": {
+        "byte_length": 7830,
+        "path": "expected/claude-selector-unequal.json",
+        "sha256": "8f4784431e4f0226f1f17a7493b91f497ea56d524c233394282c44cb920a2caa"
+      },
+      "expected_facts": {
+        "accepted_body_witness": true,
+        "cache_creation_1h_tokens": 6,
+        "cache_creation_5m_tokens": 15,
+        "cache_read_tokens": 9,
+        "cli_version": null,
+        "counting_version": "not_applicable",
+        "input_tokens": 60,
+        "opening_output_tokens": 30,
+        "opening_request_count": 3,
+        "output_tokens": 60,
+        "protected_tier_receipt_present": false,
+        "request_2_context_tokens": 30,
+        "request_3_context_tokens": 40,
+        "request_count": 3,
+        "selector_context": {
+          "service_tier": "priority"
+        },
+        "selector_sources": {
+          "service_tier": "derived_from_logs_2"
+        },
+        "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "telemetry_cost_micros": 600,
+        "tier_replay_finished": false,
+        "tier_replay_persisted": false
+      },
+      "historical_allowlist": "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+      "index_generation": 1,
+      "input": {
+        "byte_length": 1149,
+        "path": "inputs/claude-selector-unequal.jsonl",
+        "sha256": "da726a6b2be20a8de719e0302ab5d5bfa7c076d8b117a54e6000eac892282184"
+      },
+      "path": "claude-selector-unequal.rec",
+      "selector_span": {
+        "body_offset": 115,
+        "context": {
+          "length": 23,
+          "offset": 439
+        },
+        "field": "SnapshotAccumulator.current_selector",
+        "length": 57,
+        "offset": 439,
+        "sources": {
+          "length": 34,
+          "offset": 462
+        }
+      },
+      "sha256": "d5e204f1986f0c9905da4cf3bfa8923682c89e930312dd9a932d770c09bdc77b",
+      "source_tag": 1
+    },
+    {
+      "byte_length": 1398,
+      "case_id": "codex-legacy-acked",
+      "envelope_version": 1,
+      "expected": {
+        "byte_length": 6548,
+        "path": "expected/codex-legacy-acked.json",
+        "sha256": "c2df64d48d551ff89fc7579b1e9227dd5c979149d72bffe4579dcbf2b12764ed"
+      },
+      "expected_facts": {
+        "accepted_body_witness": true,
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_read_tokens": 0,
+        "cli_version": null,
+        "counting_version": "Legacy",
+        "input_tokens": 30,
+        "opening_output_tokens": null,
+        "opening_request_count": null,
+        "output_tokens": 4,
+        "protected_tier_receipt_present": false,
+        "request_2_context_tokens": null,
+        "request_3_context_tokens": null,
+        "request_count": 2,
+        "selector_context": {
+          "model_provider": "openai"
+        },
+        "selector_sources": {
+          "model_provider": "derived_from_codex_source"
+        },
+        "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "telemetry_cost_micros": null,
+        "tier_replay_finished": true,
+        "tier_replay_persisted": false
+      },
+      "historical_allowlist": "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+      "index_generation": 2,
+      "input": {
+        "byte_length": 2160,
+        "path": "inputs/codex-legacy-acked.jsonl",
+        "sha256": "4517f2265ee311b5e9a246ab2e81432ccbdf078233ee0eedcbe6e85bec256fe9"
+      },
+      "path": "codex-legacy-acked.rec",
+      "selector_span": null,
+      "sha256": "bb91ff463c8b857fce256042bc5a685d95a810fc342fa77845f20e892f1c2d31",
+      "source_tag": 2
+    },
+    {
+      "byte_length": 2449,
+      "case_id": "codex-v2-24b",
+      "envelope_version": 1,
+      "expected": {
+        "byte_length": 5330,
+        "path": "expected/codex-v2-24b.json",
+        "sha256": "ae45435f525f918e407c6b54850fe01fccc300fd1e6f0308e631856a8bafaf80"
+      },
+      "expected_facts": {
+        "accepted_body_witness": true,
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_read_tokens": 0,
+        "cli_version": "0.148.9",
+        "counting_version": "V2",
+        "input_tokens": 10,
+        "opening_output_tokens": null,
+        "opening_request_count": null,
+        "output_tokens": 2,
+        "protected_tier_receipt_present": false,
+        "request_2_context_tokens": null,
+        "request_3_context_tokens": null,
+        "request_count": 1,
+        "selector_context": {
+          "model_provider": "openai"
+        },
+        "selector_sources": {
+          "model_provider": "derived_from_codex_source"
+        },
+        "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "telemetry_cost_micros": null,
+        "tier_replay_finished": true,
+        "tier_replay_persisted": false
+      },
+      "historical_allowlist": "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+      "index_generation": 1,
+      "input": {
+        "byte_length": 1183,
+        "path": "inputs/codex-v2-24b.jsonl",
+        "sha256": "0ffadb1dd1fdc6be216ecfc0e4c39c40daa6d8d1c0a96d177e624eb20182861b"
+      },
+      "path": "codex-v2-24b.rec",
+      "selector_span": null,
+      "sha256": "12cb895a2a5eedce39b83e216ad2028f3a3be0a41dd6e0e2c271b75fdb05bc2d",
+      "source_tag": 2
+    }
+  ],
+  "generator_commit": "412cf7a6b8a90f64e5370e70c7011c71fd722dc2",
+  "repo": "ottto-ai/ottto",
+  "run_attempt": "1",
+  "run_id": "41171662029",
+  "run_url": "https://github.com/ottto-ai/ottto/actions/runs/41171662029",
+  "runner_arch": "X64",
+  "runner_os": "Linux",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+  "schema_version": 1,
+  "source_sha": "53d05a4304f2e87effbaa48661e10286bff01c58",
+  "toolchain": "1.95.0",
+  "workflow_path": ".github/workflows/linux-tests.yml"
+}

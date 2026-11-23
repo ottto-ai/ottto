@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NOTARIZE="$ROOT/scripts/macos_notarize.sh"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Required command not found: $1" >&2
+    exit 2
+  }
+}
+
+require_command jq
+require_command shasum
+
+FAKE_BIN="$TMP_DIR/bin"
+mkdir -p "$FAKE_BIN"
+
+cat > "$FAKE_BIN/xcrun" <<'SH'
+#!/usr/bin/env sh
+printf 'xcrun %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+if [ -n "${OTTTO_NOTARIZE_TEST_XCRUN_SLEEP:-}" ]; then
+  sleep "$OTTTO_NOTARIZE_TEST_XCRUN_SLEEP"
+fi
+exit 0
+SH
+chmod +x "$FAKE_BIN/xcrun"
+
+cat > "$FAKE_BIN/codesign" <<'SH'
+#!/usr/bin/env sh
+printf 'codesign %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+exit 0
+SH
+chmod +x "$FAKE_BIN/codesign"
+
+cat > "$FAKE_BIN/spctl" <<'SH'
+#!/usr/bin/env sh
+printf 'spctl %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+exit 0
+SH
+chmod +x "$FAKE_BIN/spctl"
+
+cat > "$FAKE_BIN/ditto" <<'SH'
+#!/usr/bin/env sh
+printf 'ditto %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+dest=""
+for arg in "$@"; do
+  dest="$arg"
+done
+src=""
+prev=""
+for arg in "$@"; do
+  src="$prev"
+  prev="$arg"
+done
+case "$dest" in
+  *.zip)
+    printf 'fake zip\n' > "$dest"
+    ;;
+  *)
+    if [ -d "$src" ]; then
+      cp -R "$src" "$dest"
+      # A copy without extended attributes was never launched.
+      rm -f "$dest/.test-launched"
+    else
+      mkdir -p "$dest"
+    fi
+    ;;
+esac
+exit 0
+SH
+chmod +x "$FAKE_BIN/ditto"
+
+cat > "$FAKE_BIN/touch" <<'SH'
+#!/usr/bin/env sh
+printf 'touch %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+if [ "${OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL:-}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */Ottto.app/Contents/CodeResources)
+        state="${OTTTO_NOTARIZE_TEST_TOUCH_STATE:?touch state required}"
+        if [ ! -f "$state" ]; then
+          printf 'failed-once\n' > "$state"
+          exit 1
+        fi
+        ;;
+    esac
+  done
+fi
+if [ "${OTTTO_NOTARIZE_TEST_TOUCH_LAUNCHED_FAIL:-}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */Ottto.app/Contents/CodeResources)
+        if [ -f "${arg%/Contents/CodeResources}/.test-launched" ]; then
+          exit 1
+        fi
+        ;;
+    esac
+  done
+fi
+exec /usr/bin/touch "$@"
+SH
+chmod +x "$FAKE_BIN/touch"
+
+cat > "$FAKE_BIN/xattr" <<'SH'
+#!/usr/bin/env sh
+printf 'xattr %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+exit 0
+SH
+chmod +x "$FAKE_BIN/xattr"
+
+cat > "$FAKE_BIN/hdiutil" <<'SH'
+#!/usr/bin/env sh
+printf 'hdiutil %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+case "${1:-}" in
+  info)
+    if [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:-}" ] && [ -f "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE" ]; then
+      cat "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE"
+    fi
+    exit 0
+    ;;
+  detach)
+    if [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP:-}" ]; then
+      sleep "$OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP"
+    fi
+    : > "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:?hdiutil state required}"
+    exit 0
+    ;;
+esac
+dest=""
+for arg in "$@"; do
+  dest="$arg"
+done
+printf 'rebuilt dmg\n' > "$dest"
+if [ "${1:-}" = "create" ] && [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:-}" ]; then
+  printf '================================================\nimage-path      : %s\n/dev/disk99\tGUID_partition_scheme\n' "$dest" > "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE"
+fi
+exit 0
+SH
+chmod +x "$FAKE_BIN/hdiutil"
+
+make_artifact() {
+  local path="$1"
+  printf 'artifact:%s\n' "$(basename "$path")" > "$path"
+}
+
+APP_DMG="$TMP_DIR/Ottto-macos-arm64.dmg"
+APP_BUNDLE="$TMP_DIR/Ottto.app"
+CLI_ZIP="$TMP_DIR/ottto-macos-arm64.zip"
+CLI_BIN="$TMP_DIR/ottto"
+DAEMON_ZIP="$TMP_DIR/ottto-service-macos-arm64.zip"
+DAEMON_BIN="$TMP_DIR/ottto-service"
+mkdir -p "$APP_BUNDLE/Contents"
+make_artifact "$APP_DMG"
+make_artifact "$APP_BUNDLE/Ottto"
+make_artifact "$CLI_ZIP"
+make_artifact "$CLI_BIN"
+make_artifact "$DAEMON_ZIP"
+make_artifact "$DAEMON_BIN"
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+write_manifest() {
+  local manifest="$1"
+  jq -n \
+    --arg app_dmg "$APP_DMG" \
+    --arg app_bundle "$APP_BUNDLE" \
+    --arg app_sha "$(sha256_file "$APP_DMG")" \
+    --arg cli_zip "$CLI_ZIP" \
+    --arg cli_bin "$CLI_BIN" \
+    --arg cli_sha "$(sha256_file "$CLI_ZIP")" \
+    --arg daemon_zip "$DAEMON_ZIP" \
+    --arg daemon_bin "$DAEMON_BIN" \
+    --arg daemon_sha "$(sha256_file "$DAEMON_ZIP")" \
+    '{
+      schema_version: 1,
+      product: "ottto-local-platform",
+      version: "0.1.0",
+      channel: "stable",
+      commit: "abcdef123456",
+      generated_at: "2026-05-20T00:00:00Z",
+      artifacts: [
+        {
+          name: "Ottto.app",
+          kind: "macos_app",
+          platform: "macos",
+          arch: "arm64",
+          path: $app_dmg,
+          url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/Ottto-macos-arm64.dmg",
+          verification_path: $app_bundle,
+          sha256: $app_sha,
+          signed: true,
+          notarized: false,
+          gatekeeper_assessed: false
+        },
+        {
+          name: "ottto",
+          kind: "cli",
+          platform: "macos",
+          arch: "arm64",
+          path: $cli_zip,
+          url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-macos-arm64.zip",
+          verification_path: $cli_bin,
+          sha256: $cli_sha,
+          signed: true,
+          notarized: false,
+          gatekeeper_assessed: false
+        },
+        {
+          name: "ottto-service",
+          kind: "daemon",
+          platform: "macos",
+          arch: "arm64",
+          path: $daemon_zip,
+          url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-service-macos-arm64.zip",
+          verification_path: $daemon_bin,
+          sha256: $daemon_sha,
+          signed: true,
+          notarized: false,
+          gatekeeper_assessed: false
+        }
+      ]
+    }' > "$manifest"
+}
+
+MANIFEST="$TMP_DIR/release-manifest.json"
+LOG="$TMP_DIR/commands.log"
+write_manifest "$MANIFEST"
+
+OTTTO_NOTARIZE_TEST_LOG="$LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-kind cli \
+    --artifact-name ottto-service >/dev/null
+
+if [[ "$(jq -r '.artifacts[0].notarized' "$MANIFEST")" != "false" ]]; then
+  echo "Expected unselected app artifact to remain not notarized" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[1].notarized' "$MANIFEST")" != "true" ]]; then
+  echo "Expected CLI artifact to be marked notarized" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[2].gatekeeper_assessed' "$MANIFEST")" != "true" ]]; then
+  echo "Expected daemon artifact to be marked Gatekeeper assessed" >&2
+  exit 1
+fi
+if grep -q "Ottto-macos-arm64.dmg" "$LOG"; then
+  echo "Expected artifact filter to avoid resubmitting app DMG" >&2
+  exit 1
+fi
+if ! grep -q "ottto-macos-arm64.zip" "$LOG"; then
+  echo "Expected artifact filter to submit CLI ZIP" >&2
+  exit 1
+fi
+if ! grep -q "ottto-service-macos-arm64.zip" "$LOG"; then
+  echo "Expected artifact filter to submit daemon ZIP" >&2
+  exit 1
+fi
+if ! grep -q "spctl --assess --type install .*ottto$" "$LOG"; then
+  echo "Expected CLI Gatekeeper assessment to use install policy" >&2
+  exit 1
+fi
+if ! grep -q "spctl --assess --type install .*ottto-service$" "$LOG"; then
+  echo "Expected daemon Gatekeeper assessment to use install policy" >&2
+  exit 1
+fi
+
+APP_MANIFEST="$TMP_DIR/app-manifest.json"
+APP_LOG="$TMP_DIR/app.log"
+APP_TOUCH_STATE="$TMP_DIR/app-touch-state"
+APP_HDIUTIL_STATE="$TMP_DIR/app-hdiutil-state"
+write_manifest "$APP_MANIFEST"
+OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL=1 \
+  OTTTO_NOTARIZE_TEST_TOUCH_STATE="$APP_TOUCH_STATE" \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$APP_HDIUTIL_STATE" \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=30 \
+  OTTTO_NOTARIZE_TEST_LOG="$APP_LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$APP_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --timeout 1m \
+    --artifact-name Ottto.app >/dev/null
+
+if ! grep -q "ditto -c -k --keepParent .*Ottto.app .*ottto-app-notary.*\\.zip" "$APP_LOG"; then
+  echo "Expected app bundle to be zipped for notarization before DMG rebuild" >&2
+  exit 1
+fi
+if ! grep -q "touch .*Ottto.app/Contents/CodeResources" "$APP_LOG"; then
+  echo "Expected app staple preparation to create a CodeResources placeholder" >&2
+  exit 1
+fi
+if ! grep -q "xattr -d com.apple.provenance .*Ottto.app/Contents" "$APP_LOG"; then
+  echo "Expected app staple preparation to clear provenance xattr after placeholder creation failure" >&2
+  exit 1
+fi
+if grep -q "noextattr" "$APP_LOG"; then
+  echo "Expected no unlaunched-copy restage when clearing provenance makes the app writable" >&2
+  exit 1
+fi
+
+LAUNCHED_DIR="$TMP_DIR/launched"
+LAUNCHED_BUNDLE="$LAUNCHED_DIR/Ottto.app"
+LAUNCHED_MANIFEST="$TMP_DIR/launched-manifest.json"
+LAUNCHED_LOG="$TMP_DIR/launched.log"
+mkdir -p "$LAUNCHED_BUNDLE/Contents"
+make_artifact "$LAUNCHED_BUNDLE/Ottto"
+make_artifact "$LAUNCHED_DIR/Ottto-macos-arm64.dmg"
+: > "$LAUNCHED_BUNDLE/.test-launched"
+jq --arg dir "$LAUNCHED_DIR" \
+  '.artifacts |= map(if .name == "Ottto.app" then .path = ($dir + "/Ottto-macos-arm64.dmg") | .verification_path = ($dir + "/Ottto.app") else . end)' \
+  "$APP_MANIFEST" > "$LAUNCHED_MANIFEST"
+OTTTO_NOTARIZE_TEST_TOUCH_LAUNCHED_FAIL=1 \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$TMP_DIR/launched-hdiutil-state" \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=30 \
+  OTTTO_NOTARIZE_TEST_LOG="$LAUNCHED_LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$LAUNCHED_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --timeout 1m \
+    --artifact-name Ottto.app >/dev/null
+if ! grep -q "ditto --noextattr --noacl .*launched/Ottto.app .*launched/Ottto.app.staple-fresh" "$LAUNCHED_LOG"; then
+  echo "Expected a launched app bundle to be restaged from an unlaunched copy before stapling" >&2
+  exit 1
+fi
+if [[ ! -f "$LAUNCHED_BUNDLE/Contents/CodeResources" || -e "$LAUNCHED_BUNDLE/.test-launched" ]]; then
+  echo "Expected the unlaunched copy to replace the launched bundle and receive the staple placeholder" >&2
+  exit 1
+fi
+if [[ -e "$LAUNCHED_DIR/Ottto.app.launched" || -e "$LAUNCHED_DIR/Ottto.app.staple-fresh" ]]; then
+  echo "Expected restage scratch bundles to be removed" >&2
+  exit 1
+fi
+restage_line="$(grep -n "ditto --noextattr" "$LAUNCHED_LOG" | head -1 | cut -d: -f1)"
+staple_line="$(grep -n "stapler staple .*launched/Ottto.app$" "$LAUNCHED_LOG" | head -1 | cut -d: -f1)"
+if [[ -z "$restage_line" || -z "$staple_line" || "$restage_line" -ge "$staple_line" ]]; then
+  echo "Expected the restage to happen before the app is stapled" >&2
+  exit 1
+fi
+if ! grep -q "hdiutil create -volname Ottto -srcfolder .* -ov -format UDZO .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
+  echo "Expected app DMG to be rebuilt after app stapling" >&2
+  exit 1
+fi
+if ! grep -q "codesign --force --timestamp --sign Developer ID Application: Test .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
+  echo "Expected rebuilt app DMG to be signed before notarization" >&2
+  exit 1
+fi
+if ! grep -q "hdiutil detach /dev/disk99" "$APP_LOG"; then
+  echo "Expected a leaked rebuilt DMG attachment to be detached before notarization" >&2
+  exit 1
+fi
+detach_line="$(grep -n "hdiutil detach /dev/disk99" "$APP_LOG" | head -1 | cut -d: -f1)"
+dmg_submit_line="$(grep -n "notarytool submit .*Ottto-macos-arm64.dmg" "$APP_LOG" | head -1 | cut -d: -f1)"
+if [[ -z "$detach_line" || -z "$dmg_submit_line" || "$detach_line" -ge "$dmg_submit_line" ]]; then
+  echo "Expected leaked DMG attachment cleanup before notarytool submission" >&2
+  exit 1
+fi
+if [[ "$(grep -c "notarytool submit" "$APP_LOG")" -ne 2 ]]; then
+  echo "Expected app bundle zip and rebuilt DMG to be submitted for notarization" >&2
+  exit 1
+fi
+if ! grep -q "notarytool submit .* --wait --timeout 1m" "$APP_LOG"; then
+  echo "Expected notarytool wait timeout to be preserved inside the whole-process bound" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[0].notarized' "$APP_MANIFEST")" != "true" ]]; then
+  echo "Expected app artifact to be marked notarized" >&2
+  exit 1
+fi
+
+TIMEOUT_MANIFEST="$TMP_DIR/timeout-manifest.json"
+write_manifest "$TIMEOUT_MANIFEST"
+if OTTTO_NOTARIZE_TEST_XCRUN_SLEEP=5 \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=1 \
+  OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/timeout.log" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$TIMEOUT_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-kind cli >/dev/null 2>&1; then
+  echo "Expected whole-process timeout to terminate a stuck notarytool preflight" >&2
+  exit 1
+fi
+
+DETACH_TIMEOUT_MANIFEST="$TMP_DIR/detach-timeout-manifest.json"
+DETACH_TIMEOUT_STATE="$TMP_DIR/detach-timeout-hdiutil-state"
+write_manifest "$DETACH_TIMEOUT_MANIFEST"
+if OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$DETACH_TIMEOUT_STATE" \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP=5 \
+  OTTTO_DISK_IMAGE_COMMAND_TIMEOUT_SECONDS=1 \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/detach-timeout.log" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$DETACH_TIMEOUT_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-name Ottto.app >/dev/null 2>&1; then
+  echo "Expected a stuck disk image detach to hit its process-group timeout" >&2
+  exit 1
+fi
+
+NO_MATCH_MANIFEST="$TMP_DIR/no-match-manifest.json"
+write_manifest "$NO_MATCH_MANIFEST"
+if OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/no-match.log" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$NO_MATCH_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-name missing >/dev/null 2>&1; then
+  echo "Expected missing artifact filter to fail" >&2
+  exit 1
+fi
+
+VALIDATE_ONLY_MANIFEST="$TMP_DIR/validate-only-manifest.json"
+VALIDATE_ONLY_LOG="$TMP_DIR/validate-only.log"
+write_manifest "$VALIDATE_ONLY_MANIFEST"
+OTTTO_NOTARIZE_TEST_LOG="$VALIDATE_ONLY_LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$VALIDATE_ONLY_MANIFEST" \
+    --artifact-name Ottto.app \
+    --validate-only >/dev/null
+
+if grep -q "notarytool submit" "$VALIDATE_ONLY_LOG"; then
+  echo "Expected validate-only mode not to submit to notarytool" >&2
+  exit 1
+fi
+if ! grep -q "stapler staple .*Ottto-macos-arm64.dmg" "$VALIDATE_ONLY_LOG"; then
+  echo "Expected validate-only mode to staple the selected app DMG" >&2
+  exit 1
+fi
+if ! grep -q "spctl --assess --type execute .*Ottto.app$" "$VALIDATE_ONLY_LOG"; then
+  echo "Expected app Gatekeeper assessment to use execute policy" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[0].notarized' "$VALIDATE_ONLY_MANIFEST")" != "true" ]]; then
+  echo "Expected validate-only app artifact to be marked notarized" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[1].notarized' "$VALIDATE_ONLY_MANIFEST")" != "false" ]]; then
+  echo "Expected unselected CLI artifact to remain not notarized" >&2
+  exit 1
+fi
+
+echo "macos_notarize artifact filter tests passed"

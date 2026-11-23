@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GUARD="$ROOT/scripts/pr_merge_when_mac_green.sh"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+command -v jq >/dev/null 2>&1 || {
+  echo "Required command not found: jq" >&2
+  exit 2
+}
+
+SHA="1111111111111111111111111111111111111111"
+NEW_SHA="2222222222222222222222222222222222222222"
+FAKE_BIN="$TMP_DIR/bin"
+mkdir -p "$FAKE_BIN"
+
+# Fake gh: replays canned responses. <kind>.<n> answers the n-th call of that
+# kind; <kind> answers every other call. A missing file makes the call fail.
+cat > "$FAKE_BIN/gh" <<'SH'
+#!/usr/bin/env sh
+d="${MERGE_GUARD_TEST_DIR:?}"
+# The enqueue mutation logs as "gh enqueue pr_id=.. head=..", so graphql counts
+# stay queue polls; it exits with enqueue_exit (default 0).
+case "$*" in
+  *enqueuePullRequest*)
+    args=""
+    for a in "$@"; do
+      case "$a" in pr_id=*|head=*) args="$args $a" ;; esac
+    done
+    printf 'gh enqueue%s\n' "$args" >> "$d/log"
+    exit "$(cat "$d/enqueue_exit" 2>/dev/null || echo 0)" ;;
+esac
+printf 'gh %s\n' "$*" >> "$d/log"
+reply() {
+  n=$(( $(cat "$d/count.$1" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$d/count.$1"
+  if [ -f "$d/$1.$n" ]; then cat "$d/$1.$n"; else cat "$d/$1"; fi
+}
+case "$1 $2" in
+  "pr view") reply pr ;;
+  "pr ready") exit 0 ;;
+  api\ *rules/branches*)
+    if [ -f "$d/rules" ]; then cat "$d/rules"; else printf '[{"type":"merge_queue"}]\n'; fi ;;
+  "api graphql") reply queue ;;
+  api\ *check-runs/*/annotations*) reply annotations ;;
+  api\ *check-runs*) reply checks ;;
+  api\ *actions/runs/*/jobs*) reply jobs ;;
+  api\ *actions/runs/[0-9]*) reply run ;;
+  api\ *actions/runs*event=merge_group*) reply queue_runs ;;
+  api\ *actions/runs*) reply runs ;;
+  *) echo "unexpected gh call: $*" >&2; exit 1 ;;
+esac
+SH
+chmod +x "$FAKE_BIN/gh"
+
+cat > "$FAKE_BIN/sleep" <<'SH'
+#!/usr/bin/env sh
+printf 'sleep %s\n' "$*" >> "${MERGE_GUARD_TEST_DIR:?}/log"
+SH
+chmod +x "$FAKE_BIN/sleep"
+
+failures=0
+case_dir=""
+
+fail() {
+  echo "FAIL [$case_name]: $*" >&2
+  failures=$((failures + 1))
+}
+
+new_case() {
+  case_name="$1"
+  case_dir="$TMP_DIR/case-$1"
+  mkdir -p "$case_dir"
+  : > "$case_dir/log"
+}
+
+# pr_json <file> <state> <isDraft> <sha> <mergeable> [<fork-owner>]
+pr_json() {
+  jq -n --arg s "$2" --argjson d "$3" --arg h "$4" --arg m "$5" --arg fork "${6:-}" \
+    '{id: "PR_node7", state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
+      title: "fix: a change", baseRefName: "main", headRefName: "feature",
+      isCrossRepository: ($fork != ""),
+      headRepository: {name: "repo"},
+      headRepositoryOwner: {login: (if $fork == "" then "example" else $fork end)}}' \
+    > "$case_dir/$1"
+}
+
+# check_runs <file> [<id>|<name>|<status>|<conclusion>|<suite>]...
+# Always starts with green Linux tests checks in suite 510 (linux-tests.yml);
+# a later spec with a higher id replaces one (the newest run counts).
+check_runs() {
+  local file="$1" spec id name status conclusion suite
+  shift
+  printf '[]' > "$case_dir/$file.tmp"
+  for spec in "1|Rust tests (Linux)|completed|success|510" \
+      "2|Rust format (Linux)|completed|success|510" "$@"; do
+    IFS='|' read -r id name status conclusion suite <<EOF_SPEC
+$spec
+EOF_SPEC
+    jq --argjson id "$id" --arg n "$name" --arg s "$status" --arg c "$conclusion" \
+      --arg h "$SHA" --argjson suite "$suite" \
+      '. + [{id: $id, name: $n, head_sha: $h, status: $s,
+             conclusion: (if $c == "" then null else $c end),
+             check_suite: {id: $suite}}]' \
+      "$case_dir/$file.tmp" > "$case_dir/$file.next"
+    mv "$case_dir/$file.next" "$case_dir/$file.tmp"
+  done
+  jq '{total_count: length, check_runs: .}' "$case_dir/$file.tmp" > "$case_dir/$file"
+  rm -f "$case_dir/$file.tmp"
+}
+
+# pr_checks <file> <suite> [<spec>]...: check_runs with <spec>s plus a success
+# for each required Linux check ("Public surface checks", "Rust advisory
+# audit", "Dependency review") in <suite>, so a case only spells out the checks
+# it is about.
+pr_checks() {
+  local file="$1" suite="$2"
+  shift 2
+  check_runs "$file" "$@" \
+    "91|Public surface checks|completed|success|$suite" \
+    "92|Rust advisory audit|completed|success|$suite" \
+    "93|Dependency review|completed|success|$suite"
+}
+
+# workflow_runs [<suite>|<event>[|<pr>|<base>|<head-owner>[|<path>]]]...
+# <pr> defaults to 7 and <base> to main; an empty <pr> leaves pull_requests
+# empty, as GitHub does for fork PR runs. <head-owner> defaults to example,
+# <path> to .github/workflows/ci.yml.
+workflow_runs() {
+  local spec suite event prnum base owner path
+  printf '[]' > "$case_dir/runs.tmp"
+  for spec in "$@"; do
+    IFS='|' read -r suite event prnum base owner path <<EOF_SPEC
+$spec
+EOF_SPEC
+    case "$spec" in
+      *'|'*'|'*) ;;
+      *) prnum=7 ;;
+    esac
+    jq --argjson s "$suite" --arg e "$event" --arg h "$SHA" \
+      --arg pr "$prnum" --arg base "${base:-main}" --arg owner "${owner:-example}" \
+      --arg path "${path:-.github/workflows/ci.yml}" \
+      '. + [{check_suite_id: $s, event: $e, head_sha: $h, path: $path,
+             head_branch: "feature",
+             head_repository: {full_name: "\($owner)/repo"},
+             pull_requests: (if $pr == "" then []
+               else [{number: ($pr | tonumber), base: {ref: $base}}] end)}]' \
+      "$case_dir/runs.tmp" > "$case_dir/runs.next"
+    mv "$case_dir/runs.next" "$case_dir/runs.tmp"
+  done
+  jq '{total_count: length, workflow_runs: .}' "$case_dir/runs.tmp" > "$case_dir/runs"
+  rm -f "$case_dir/runs.tmp"
+}
+
+run_guard() {
+  local expected="$1" status=0
+  shift
+  MERGE_GUARD_TEST_DIR="$case_dir" PATH="$FAKE_BIN:$PATH" \
+    OTTTO_PR_TITLE_DENY_FILE="${DENY_FILE:-$TMP_DIR/no-title-deny-file}" \
+    bash "$GUARD" "$@" > "$case_dir/out" 2>&1 || status=$?
+  if [ "$status" -ne "$expected" ]; then
+    fail "exit $status, expected $expected; output:"
+    sed 's/^/  /' "$case_dir/out" >&2
+  fi
+}
+
+expect_log() {
+  grep -F -q -- "$1" "$case_dir/log" || fail "log lacks: $1"
+}
+
+expect_no_log() {
+  if grep -F -q -- "$1" "$case_dir/log"; then
+    fail "log unexpectedly has: $1"
+  fi
+}
+
+expect_output() {
+  grep -F -q -- "$1" "$case_dir/out" || fail "output lacks: $1"
+}
+
+expect_count() {
+  local got
+  got="$(grep -c -F -- "$1" "$case_dir/log" || true)"
+  [ "$got" -eq "$2" ] || fail "expected $2 x '$1', got $got"
+}
+
+# queue_json <file> <state> <sha> <entry-state-or-empty>
+queue_json() {
+  jq -n --arg state "$2" --arg sha "$3" --arg entry "$4" --arg merge "$NEW_SHA" '
+    {data: {repository: {pullRequest: {
+      state: $state, headRefOid: $sha,
+      mergeCommit: (if $state == "MERGED" then {oid: $merge} else null end),
+      mergeQueueEntry: (if $entry == "" then null else {state: $entry, position: 1} end)
+    }}}}' > "$case_dir/$1"
+}
+
+# green_case <name>: an open, mergeable PR whose pull_request run passed (the
+# macOS "Rust contracts" job skipped, as on every PR) on a base with a queue.
+green_case() {
+  new_case "$1"
+  pr_json pr OPEN false "$SHA" MERGEABLE
+  workflow_runs "500|pull_request" "510|pull_request|7|main||.github/workflows/linux-tests.yml"
+  pr_checks checks 500 "10|Rust contracts|completed|skipped|500"
+}
+
+ENQUEUE_CALL="gh enqueue pr_id=PR_node7 head=$SHA"
+
+green_case pending-then-merged
+pr_json pr OPEN true "$SHA" MERGEABLE
+check_runs checks.1 "10|Rust contracts|completed|skipped|500" \
+  "11|Public surface checks|in_progress||500" \
+  "12|Rust advisory audit|completed|success|500" \
+  "13|Dependency review|completed|success|500"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_log 'gh pr ready 7'
+expect_output '"Public surface checks" pending'
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'gh pr merge'
+expect_count 'sleep 60' 2
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+green_case red-check-refused
+check_runs checks "10|Rust contracts|completed|skipped|500" \
+  "11|Public surface checks|completed|failure|500" \
+  "12|Rust advisory audit|completed|success|500" \
+  "13|Dependency review|completed|success|500"
+run_guard 4 7
+expect_output '"Public surface checks" concluded failure'
+expect_no_log 'sleep'
+expect_no_log 'gh enqueue'
+
+green_case head-moved
+pr_json pr.1 OPEN false "$SHA" MERGEABLE
+pr_json pr OPEN false "$NEW_SHA" MERGEABLE
+run_guard 5 7
+expect_output "head moved from $SHA to $NEW_SHA"
+expect_no_log 'gh enqueue'
+
+# Neither another PR's run, a fork run from another repository, nor a
+# workflow_dispatch run on the same commit is evidence for this PR.
+green_case other-runs-are-not-evidence
+pr_json pr OPEN false "$SHA" MERGEABLE contributor
+workflow_runs "500|pull_request|8|main" "600|pull_request||main|someone-else" "700|workflow_dispatch"
+check_runs checks "10|Rust contracts|completed|skipped|500" \
+  "11|Public surface checks|completed|success|500" \
+  "12|Rust advisory audit|completed|success|600" \
+  "13|Dependency review|completed|success|700"
+run_guard 6 --timeout 0 7
+expect_output '"Public surface checks" missing'
+expect_no_log 'gh enqueue'
+
+# The Linux tests gate the enqueue, and only from a linux-tests.yml run.
+green_case linux-red-refused
+pr_checks checks 500 "10|Rust contracts|completed|skipped|500" "97|Rust tests (Linux)|completed|failure|510"
+run_guard 4 7
+expect_output '"Rust tests (Linux)" concluded failure'
+expect_no_log 'gh enqueue'
+
+green_case linux-run-required
+workflow_runs "500|pull_request"
+run_guard 6 --timeout 0 7
+expect_output '"Rust tests (Linux)" missing'
+expect_no_log 'gh enqueue'
+
+# A busy commit lists its check runs over several pages: the guard reads them
+# all (a run repeated on two pages counts once) and judges the whole listing.
+green_case pages-are-judged-together
+jq -c '{total_count, check_runs: .check_runs[0:2]},
+       {total_count, check_runs: .check_runs[1:]}' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_log 'check-runs?filter=all&per_page=100 --paginate'
+expect_count "$ENQUEUE_CALL" 1
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# A run repeated on two pages must not make an incomplete listing look complete.
+green_case overlap-does-not-fill-listing
+jq -c '{total_count: 7, check_runs: .check_runs[0:2]},
+       {total_count: 7, check_runs: .check_runs[1:]}' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+run_guard 6 --timeout 0 7
+expect_output "commit has 7 check runs, listing returned 6"
+expect_no_log 'gh enqueue'
+
+green_case incomplete-listing-is-not-judged
+jq '.total_count = 150' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+run_guard 6 --timeout 0 7
+expect_output "commit has 150 check runs, listing returned"
+expect_no_log 'gh enqueue'
+
+green_case removed-from-queue
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue OPEN "$SHA" ""
+printf '%s' '{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}' > "$case_dir/queue_runs"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'rechecking before reporting removal'
+expect_output 'removed from merge queue'
+expect_output 'merge_group run 800: failure https://example.invalid/actions/runs/800 (head queue-sha)'
+
+# GitHub never started the queue's Mac job: enqueue the same head again.
+QUEUE_RUN='{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}'
+NOT_ACQUIRED_JOBS='{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":92,"status":"completed","conclusion":"success","steps":[{"conclusion":"success"}]}]}'
+NOT_ACQUIRED_NOTE='[{"message":"The job was not acquired by Runner of type hosted even after multiple attempts"}]'
+
+# removed_case <name> <jobs json> <annotations json>: queued once, then gone.
+removed_case() {
+  green_case "$1"
+  queue_json queue.1 OPEN "$SHA" QUEUED
+  queue_json queue OPEN "$SHA" ""
+  # The first runs read, before the enqueue, finds no earlier queue run.
+  printf '%s' '{"workflow_runs":[]}' > "$case_dir/queue_runs.1"
+  printf '%s' "$QUEUE_RUN" > "$case_dir/queue_runs"
+  printf '%s' '{"status":"completed"}' > "$case_dir/run"
+  printf '%s' "$2" > "$case_dir/jobs"
+  printf '%s' "$3" > "$case_dir/annotations"
+}
+
+removed_case not-acquired-requeues "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+queue_json queue.4 OPEN "$SHA" QUEUED
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 2
+expect_log 'actions/runs/800/jobs'
+expect_log 'check-runs/91/annotations'
+expect_no_log 'check-runs/92/annotations'
+expect_output 'never got a runner (GitHub capacity); enqueuing PR #7 again (1 of 2)'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# At most two re-enqueues, each on a newer run; then the removal is reported.
+removed_case not-acquired-gives-up "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 801' > "$case_dir/queue_runs.3"
+printf '%s' "$QUEUE_RUN" | jq '.workflow_runs[0].id = 802' > "$case_dir/queue_runs.4"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 3
+expect_output '(2 of 2)'
+expect_output 'removed from merge queue'
+
+# A removal with no newer run than the one already used is not re-enqueued.
+removed_case stale-run-is-not-reused "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 2
+expect_output '(1 of 2)'
+expect_count 'actions/runs/800/jobs' 1
+
+# An unfinished job (it may still fail) defers the verdict; a partial job
+# list is never evidence.
+removed_case unfinished-job-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' "$NOT_ACQUIRED_JOBS" | jq '.jobs[1].status = "in_progress" | .jobs[1].conclusion = null' > "$case_dir/jobs.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_output '(1 of 2)'
+expect_count "$ENQUEUE_CALL" 2
+expect_count 'actions/runs/800/jobs' 2
+removed_case partial-job-list-is-not-requeued \
+  "$(printf '%s' "$NOT_ACQUIRED_JOBS" | jq -c '.total_count = 3')" "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'annotations'
+
+# A job that ran a step failed for real: no re-enqueue, no annotation read.
+removed_case started-job-is-not-requeued \
+  '{"total_count":1,"jobs":[{"id":91,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_log 'actions/runs/800/jobs'
+expect_no_log 'annotations'
+
+# A not-acquired job beside a job that really failed: no re-enqueue.
+removed_case mixed-failure-is-not-requeued \
+  '{"total_count":2,"jobs":[{"id":91,"status":"completed","conclusion":"cancelled","steps":[]},{"id":93,"status":"completed","conclusion":"failure","steps":[{"conclusion":"failure"}]}]}' \
+  "$NOT_ACQUIRED_NOTE"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A queue run that existed before this guard run enqueued says nothing about it.
+removed_case earlier-run-is-not-used "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+rm "$case_dir/queue_runs.1"
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log 'actions/runs/800/jobs'
+
+# A run that is still in progress defers the verdict until it finishes.
+removed_case unfinished-run-waits "$NOT_ACQUIRED_JOBS" "$NOT_ACQUIRED_NOTE"
+printf '%s' '{"status":"in_progress"}' > "$case_dir/run.1"
+queue_json queue.5 MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'still has unfinished jobs'
+expect_count "$ENQUEUE_CALL" 2
+
+# A cancelled job without GitHub's note may be anything: no re-enqueue.
+removed_case cancelled-without-note-is-not-requeued "$NOT_ACQUIRED_JOBS" \
+  '[{"message":"The operation was canceled."}]'
+run_guard 4 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'removed from merge queue'
+
+# A rerun after a timeout: GitHub refuses to enqueue a PR that is already queued.
+green_case rerun-resumes-queued-wait
+printf '1' > "$case_dir/enqueue_exit"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'already in the merge queue or merged; resuming the wait'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+green_case no-queue-fails-fast
+pr_json pr OPEN true "$SHA" MERGEABLE
+printf '[]' > "$case_dir/rules"
+run_guard 3 7
+expect_output 'no merge queue on main'
+expect_no_log 'gh pr ready'
+expect_no_log 'check-runs'
+
+# set_title <file> <title>
+set_title() {
+  jq --arg t "$2" '.title = $t' "$case_dir/$1" > "$case_dir/$1.next"
+  mv "$case_dir/$1.next" "$case_dir/$1"
+}
+
+DENY_FILE="$TMP_DIR/deny.ere"
+printf '# internal tags\n\nnever-matches-anything\n\\(TAG[0-9]\\)\n' > "$DENY_FILE"
+
+# A draft whose title matches the list is refused before it is marked ready or
+# any check is read, and the message does not print the list.
+green_case denied-title-refused
+pr_json pr OPEN true "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG1)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+if grep -F -q 'TAG[0-9]' "$case_dir/out"; then
+  fail "output prints the deny pattern"
+fi
+expect_no_log 'gh pr ready'
+expect_no_log 'check-runs'
+expect_no_log 'gh enqueue'
+
+# A title edited to a denied one while checks are pending is refused at the
+# next PR read, before enqueue.
+green_case title-denied-while-waiting
+pr_json pr.1 OPEN false "$SHA" MERGEABLE
+set_title pr "fix: a change (TAG2)"
+run_guard 3 7
+expect_output 'title matches the title deny list'
+expect_no_log 'gh enqueue'
+
+# Comment and blank lines never match: a clean title passes the same list.
+green_case clean-title-with-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A list with only comments and blank lines, or an empty file, checks nothing.
+printf '# nothing yet\n\n   \n' > "$DENY_FILE"
+green_case comment-only-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+: > "$DENY_FILE"
+green_case empty-deny-list
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+
+# A pattern grep cannot evaluate refuses instead of letting the title through.
+printf 'fix: [unclosed\n' > "$DENY_FILE"
+green_case invalid-deny-pattern-refused
+run_guard 3 7
+expect_output 'could not be evaluated'
+expect_no_log 'gh enqueue'
+unset DENY_FILE
+
+new_case usage-errors
+run_guard 2
+run_guard 2 abc
+run_guard 2 --interval 30 7
+run_guard 2 7 8
+expect_no_log "gh "
+
+if [ "$failures" -ne 0 ]; then
+  echo "pr-merge-guard tests: $failures failure(s)" >&2
+  exit 1
+fi
+echo "pr-merge-guard tests passed"

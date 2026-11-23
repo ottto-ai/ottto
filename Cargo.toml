@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ottto-protocol",
+  "crates/ottto-core",
+  "crates/ottto-service",
+  "crates/ottto-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.99"
+authors = ["Ottto Team"]
+repository = "https://github.com/ottto-ai/ottto"
+homepage = "https://ottto.net"
+publish = false
+
+# CI runs clippy with -D warnings, so "warn" fails the build. Every member
+# crate opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# Raising rust-version to 1.95 turns on these MSRV-gated lints across
+# existing code (~190 `map_or(true|false, ..)` calls, plus `% n == 0`,
+# `repeat().take()` and the boolean forms they suggest). Migrating to
+# `is_none_or` / `is_some_and` / `is_multiple_of` / `repeat_n` is a separate
+# mechanical cleanup.
+manual_is_multiple_of = "allow"
+manual_repeat_n = "allow"
+nonminimal_bool = "allow"
+unnecessary_map_or = "allow"
+# Edition 2024 extends collapsible_if to nested `if let`, suggesting let
+# chains. Keep the lint disabled until the affected code uses let chains.
+collapsible_if = "allow"
+# Rust 1.99 Clippy suggests `as_chunks` for constant `chunks_exact` sizes in
+# the digest and fingerprint codecs; that rewrite is a separate cleanup too.
+chunks_exact_to_as_chunks = "allow"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+cc = "1"
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+hmac = "0.12"
+libc = "0.2"
+# Compile debug/trace records out of every crate in any build that links
+# ottto-service. Pinned ureq logs each request prelude at debug level and
+# redacts only Authorization and Cookie, so a host logger would otherwise
+# receive custom credential headers verbatim. Both caps are needed: the
+# release_* features take precedence in release builds.
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+notify = "8"
+notify-debouncer-full = "0.6"
+plist = "1"
+prost = "0.14"
+security-framework = "3.7"
+security-framework-sys = "2.17"
+# 0.41.1 bundles SQLite 3.54.1 (libsqlite3-sys 0.39.1), which fixes
+# RUSTSEC-2026-0459 and keeps the 3.51.3 WAL-reset fix.
+rusqlite = { version = "=0.41.1", features = ["bundled", "fallible_uint"] }
+rustls = { version = "0.23.19", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serial_test = "4"
+sha2 = "0.10"
+ring = "0.17.14"
+subtle = "2.6.1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+toml_edit = "0.22"
+unicode-normalization = "0.1"
+unicode-general-category = "0.6"
+ureq = { version = "2", default-features = false, features = ["gzip", "json"] }
+webpki-roots = "1.0.10"
+zeroize = { version = "1", features = ["alloc"] }
+zstd = { version = "0.14.3", default-features = false, features = ["experimental"] }
+
+# Optimise dependencies (not workspace crates) in test builds; debug
+# assertions and overflow checks stay on.
+[profile.test.package."*"]
+opt-level = 2

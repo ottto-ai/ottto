@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "--watch requires --json",
+    "retryable": false,
+    "details": {}
+  }
+}

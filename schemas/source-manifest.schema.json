@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ottto.net/schemas/source-manifest.schema.json",
+  "title": "Ottto source manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_id",
+    "app_slug",
+    "display_name",
+    "publisher",
+    "review_tier",
+    "maturity",
+    "operations",
+    "collectors"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "source_manifest.v1"
+    },
+    "source_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "app_slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "publisher": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "review_tier": {
+      "type": "string",
+      "enum": [
+        "official",
+        "ottto_labs",
+        "reviewed_community",
+        "community",
+        "custom_local"
+      ]
+    },
+    "maturity": {
+      "type": "string",
+      "enum": [
+        "stable",
+        "beta",
+        "experimental",
+        "undocumented_surface",
+        "writes_config",
+        "local_only"
+      ]
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "detect",
+          "verify",
+          "repair",
+          "collect_usage",
+          "monitor_quota",
+          "upload_snapshot",
+          "diagnostics",
+          "uninstall_restore"
+        ]
+      }
+    },
+    "collectors": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+      }
+    }
+  }
+}

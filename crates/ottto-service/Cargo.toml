@@ -1,0 +1,65 @@
+[package]
+name = "ottto-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Per-user Ottto daemon that owns local state, setup, repair, diagnostics, and updates."
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[[bin]]
+name = "ottto-service"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+flate2.workspace = true
+hmac.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+log.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+ottto-core = { path = "../ottto-core" }
+ottto-protocol = { path = "../ottto-protocol" }
+plist.workspace = true
+prost.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+security-framework.workspace = true
+security-framework-sys.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+ring.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml_edit.workspace = true
+unicode-normalization.workspace = true
+unicode-general-category.workspace = true
+ureq.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+# Route bundled zstd allocations through the test counting allocator.
+zstd = { workspace = true, features = ["with-rust-allocator"] }
+ottto-core = { path = "../ottto-core", features = ["test-secret-store"] }
+serial_test.workspace = true
+
+[build-dependencies]
+cc.workspace = true

@@ -1,0 +1,34 @@
+[package]
+name = "ottto-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Platform-neutral local logic for the Ottto CLI and service: health summaries, repair planning, diagnostics redaction, and stable errors."
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Enabled only by test targets through dev-dependencies. Keeps dependency
+# builds (where cfg(test) is false) away from the host credential stores.
+[features]
+test-secret-store = []
+
+[dependencies]
+anyhow.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+ottto-protocol = { path = "../ottto-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+security-framework-sys.workspace = true

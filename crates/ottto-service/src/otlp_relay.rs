@@ -1,0 +1,2849 @@
+use crate::control::handle_request;
+use crate::local_resource_diagnostics::cache_lifecycle::{record as refused, Event};
+use crate::local_resource_diagnostics::StageWindow;
+use crate::snapshot_client::load_snapshot_device_credentials;
+use crate::snapshots::SnapshotSource;
+use crate::LocalDaemon;
+use anyhow::{anyhow, Context, Result};
+use ottto_core::{FileConnectionStore, FileDeviceStore};
+use ottto_protocol::{
+    LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, IntoRawFd};
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
+pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
+pub const CODEX_RELAY_SOURCE: &str = "codex";
+pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
+
+// Direct API host. The apex `ottto.net/backend` proxy is retired with the
+// marketing-site cutover; paths append to this base identically.
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+const LOCAL_RELAY_FALLBACK_BASE_PORT: u16 = 44120;
+const LOCAL_RELAY_FALLBACK_SPAN: u16 = 2000;
+const LOCAL_RELAY_FALLBACK_ATTEMPTS: u16 = 24;
+const MAX_OTLP_BODY_BYTES: usize = 25 * 1024 * 1024;
+/// Per-connection read/write timeout. A local client that never finishes
+/// sending its request line + headers (classic slowloris) — or that stops
+/// reading our response — trips this and is dropped instead of pinning a
+/// worker thread forever.
+const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum bytes accepted for a single request line or header line. Caps the
+/// per-line heap allocation a client can force with one unterminated line.
+const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+/// Maximum cumulative bytes accepted across all header lines (request line
+/// excluded). Caps total head allocation independent of per-line size.
+const MAX_HEADER_TOTAL_BYTES: usize = 64 * 1024;
+/// Maximum number of header lines accepted before the terminating blank line.
+const MAX_HEADER_COUNT: usize = 100;
+/// Chunked bodies keep independent encoded-framing budgets so a client cannot
+/// monopolize a worker with millions of tiny chunks or large extensions while
+/// remaining under the decoded body cap and continuously avoiding I/O timeout.
+const MAX_CHUNK_COUNT: usize = 8 * 1024;
+const MAX_CHUNK_FRAMING_BYTES: usize = 256 * 1024;
+/// Maximum number of relay connections handled at once. Bounds the blast
+/// radius of a local flood: connections over the cap are rejected with 503
+/// without spawning an unbounded worker.
+const MAX_CONCURRENT_RELAY_CONNECTIONS: usize = 16;
+
+/// Per-connection `accept` failures in a row, with no accepted connection in
+/// between, after which the listener is presumed broken and bound again.
+const RELAY_ACCEPT_FAILURE_LIMIT: u32 = 16;
+/// Pause between per-connection `accept` failures after the first, so a
+/// listener that fails instantly cannot spin the accept thread.
+const RELAY_ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(10);
+/// Bounded backoff after `accept` runs out of descriptors, buffers or memory.
+const RELAY_ACCEPT_BACKOFF_START: Duration = Duration::from_millis(50);
+const RELAY_ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// Bounded backoff between attempts to bind a replacement listener.
+const RELAY_REBIND_BACKOFF_START: Duration = Duration::from_millis(250);
+const RELAY_REBIND_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Writes one relay line to the daemon's error log with a UTC timestamp. The
+/// log has no timestamps of its own, so without one a relay failure cannot be
+/// matched to the gap it left in captured telemetry.
+macro_rules! relay_log {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", relay_log_timestamp(), format_args!($($arg)*))
+    };
+}
+
+pub(crate) mod legacy;
+
+fn relay_log_timestamp() -> String {
+    let now = OffsetDateTime::now_utc();
+    now.replace_nanosecond(u32::from(now.millisecond()) * 1_000_000)
+        .unwrap_or(now)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
+}
+
+/// Live count of in-flight relay connections, released via [`ConnectionGuard`].
+static ACTIVE_RELAY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that reserves one in-flight connection slot on construction and
+/// releases it on drop, so the count is always restored on handler exit even
+/// across early returns, errors, or panics.
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    /// Reserves a connection slot. Returns `None` (and reserves nothing) when
+    /// the cap is already reached, so the caller can reject without spawning.
+    fn acquire() -> Option<Self> {
+        // Reserve optimistically, then roll back if we exceeded the cap. This
+        // keeps acquisition lock-free; the brief over-count is bounded by the
+        // number of concurrent acquirers and never leaks a slot.
+        if ACTIVE_RELAY_CONNECTIONS.fetch_add(1, Ordering::SeqCst)
+            >= MAX_CONCURRENT_RELAY_CONNECTIONS
+        {
+            ACTIVE_RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(ConnectionGuard)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        ACTIVE_RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
+    spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
+}
+
+fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
+    let listener = match bind_startup_local_relay_listener() {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = daemon.set_relay_state_for_trusted_client(RelayState {
+                state: RelayRuntimeState::Failed,
+                endpoint: Some(default_local_relay_base_url()),
+                last_connected_at: None,
+                last_error: Some(StableMessage {
+                    code: "relay_bind_failed".to_string(),
+                    text: format!(
+                        "Could not bind local OTLP relay on 127.0.0.1:{LOCAL_RELAY_DEFAULT_PORT} or a per-user fallback port."
+                    ),
+                }),
+            });
+            return Err(error);
+        }
+    };
+    let local_addr = listener.local_addr()?;
+    let _ = daemon.set_relay_state_for_trusted_client(relay_connected_state(local_addr));
+
+    let primary_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(local_addr.port()));
+    let recovery_port = primary_port.clone();
+    let legacy_daemon = daemon.clone();
+    let state_daemon = daemon.clone();
+    thread::Builder::new()
+        .name("ottto-otlp-relay".to_string())
+        .spawn(move || {
+            supervise_relay_listener(
+                listener,
+                bind_replacement_local_relay_listener,
+                |state| {
+                    recovery_port.store(
+                        state
+                            .endpoint
+                            .as_deref()
+                            .and_then(local_relay_port_from_endpoint)
+                            .unwrap_or(0),
+                        Ordering::Relaxed,
+                    );
+                    let _ = state_daemon.set_relay_state_for_trusted_client(state);
+                },
+                |stream| dispatch_relay_connection(stream, source, &daemon),
+            )
+        })
+        .context("spawn local OTLP relay accept thread")?;
+
+    legacy::spawn(legacy_daemon, source, primary_port);
+    Ok(local_addr)
+}
+
+/// Hands one accepted relay connection to a worker thread.
+fn dispatch_relay_connection(stream: TcpStream, source: SnapshotSource, daemon: &LocalDaemon) {
+    dispatch_relay_connection_with_activity(stream, source, daemon, None);
+}
+
+fn dispatch_relay_connection_with_activity(
+    mut stream: TcpStream,
+    source: SnapshotSource,
+    daemon: &LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+) {
+    // Bound per-connection I/O time before doing anything else so a slow or
+    // stalled client trips the timeout instead of blocking a worker thread
+    // forever.
+    apply_relay_io_timeouts(&stream);
+
+    // Cap simultaneously-handled connections. Over the cap we reject with 503
+    // on the accept thread without spawning an unbounded worker, so a local
+    // flood can't exhaust threads or memory. The guard releases the slot on
+    // handler exit.
+    let Some(guard) = ConnectionGuard::acquire() else {
+        // Counted, not logged: a busy burst would be one line per connection.
+        refused(Event::OtlpRelayBusy503);
+        let _ = write_json_response(
+            &mut stream,
+            503,
+            json!({"error":"relay_busy","message":"Too many concurrent local relay connections"}),
+        );
+        return;
+    };
+
+    let client_daemon = daemon.clone();
+    // `thread::spawn` panics when the OS refuses a thread, and that panic
+    // would end the accept thread with it. A refused worker drops only its
+    // own connection (and its guard, releasing the slot).
+    let spawned = thread::Builder::new().spawn(move || {
+        let _guard = guard;
+        if let Err(error) = handle_client(stream, source, client_daemon, legacy_activity) {
+            // BrokenPipe / ConnectionReset are routine when the exporting agent
+            // (Codex / Claude Code) times out before we finish writing the
+            // response — drop those silently so we don't fill the daemon log
+            // with one line per disconnected client. Slow-client I/O timeouts
+            // are likewise routine. Everything else still surfaces.
+            if !client_disconnect_during_write(&error) {
+                relay_log!("local OTLP relay request failed: {error}");
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        relay_log!("local OTLP relay dropped a connection: no worker thread: {error}");
+    }
+}
+
+/// Keeps the relay port served for the life of the daemon.
+///
+/// The accept loop used to end on the first failed `accept`, which dropped the
+/// listener while the relay state still read `Connected`: every OTLP request
+/// after that was refused until the daemon restarted. Now the loop only gives
+/// up when the listening socket itself is unusable. The relay then reads
+/// `Failed` until a fresh listener is bound, on the same port when possible so
+/// agents configured for it reconnect without any change.
+fn supervise_relay_listener(
+    mut listener: TcpListener,
+    mut rebind: impl FnMut(u16, u32) -> Result<TcpListener>,
+    mut report: impl FnMut(RelayState),
+    mut dispatch: impl FnMut(TcpStream),
+) {
+    loop {
+        let bound_addr = listener.local_addr().ok();
+        #[cfg(unix)]
+        let fd = listener.as_raw_fd();
+        let failure = run_relay_accept_loop(&mut listener, &mut dispatch);
+        relay_log!("local OTLP relay listener stopped: {failure}; binding a new listener");
+        #[cfg(unix)]
+        relay_log!(
+            "local OTLP relay listener {}; {}",
+            crate::control_plane_health::describe_descriptor(fd),
+            crate::control_plane_health::descriptor_census()
+        );
+        report(relay_listener_failed_state(bound_addr));
+        release_relay_listener(listener, bound_addr);
+        let port = bound_addr.map_or(LOCAL_RELAY_DEFAULT_PORT, |addr| addr.port());
+        listener = rebind_relay_listener(port, &mut rebind);
+        match listener.local_addr() {
+            Ok(addr) => {
+                relay_log!("local OTLP relay listening again at http://{addr}");
+                report(relay_connected_state(addr));
+            }
+            Err(error) => relay_log!("local OTLP relay rebound on an unknown address: {error}"),
+        }
+    }
+}
+
+/// Why [`run_relay_accept_loop`] gave up on its listener.
+#[derive(Debug)]
+enum RelayListenerFailure {
+    /// `accept` failed in a way that only a broken listening socket produces.
+    Unusable(io::Error),
+    /// XNU's `SS_DRAINING` is set on the listener: a descriptor for it was
+    /// closed while a thread was blocked on it. From then on a blocking
+    /// `accept` fails with `ECONNABORTED` once per incoming connection, so the
+    /// socket never serves again (see `unix_socket::serve_listener`).
+    Draining(io::Error),
+    /// Per-connection failures kept coming without a single accepted
+    /// connection in between, the pattern of a drained listener where the
+    /// drain cannot be read directly.
+    RepeatedFailures { count: u32, last: io::Error },
+}
+
+impl std::fmt::Display for RelayListenerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unusable(error) => write!(formatter, "listener unusable ({error})"),
+            Self::Draining(error) => write!(formatter, "listener draining ({error})"),
+            Self::RepeatedFailures { count, last } => {
+                write!(formatter, "{count} accept failures in a row (last: {last})")
+            }
+        }
+    }
+}
+
+/// What the accept loop does after one failed `accept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// A per-connection failure, such as a client that hung up before the
+    /// connection was accepted. The listener is fine: accept the next one.
+    Retry,
+    /// The process or the kernel ran out of descriptors, buffers or memory.
+    /// Pause briefly so the loop does not spin, then accept again.
+    Backoff,
+    /// The listening socket itself is gone or broken: bind a new one.
+    Rebind,
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptErrorAction {
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        match code {
+            libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => {
+                return AcceptErrorAction::Backoff;
+            }
+            libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EOPNOTSUPP | libc::EFAULT => {
+                return AcceptErrorAction::Rebind;
+            }
+            _ => {}
+        }
+    }
+    match error.kind() {
+        io::ErrorKind::OutOfMemory => AcceptErrorAction::Backoff,
+        io::ErrorKind::InvalidInput => AcceptErrorAction::Rebind,
+        // ConnectionAborted, ConnectionReset, Interrupted, WouldBlock,
+        // TimedOut, and anything unrecognised. Unrecognised errors still
+        // count toward RELAY_ACCEPT_FAILURE_LIMIT, so a listener that fails
+        // them forever is rebound rather than retried forever.
+        _ => AcceptErrorAction::Retry,
+    }
+}
+
+/// The accept side of a relay listener, split out so tests can inject
+/// `accept` failures.
+trait RelayAcceptor {
+    fn accept_stream(&mut self) -> io::Result<TcpStream>;
+    /// `Some(true)` when the listener is drained; `None` when that cannot be
+    /// measured on this platform.
+    fn draining(&self) -> Option<bool>;
+}
+
+impl RelayAcceptor for TcpListener {
+    fn accept_stream(&mut self) -> io::Result<TcpStream> {
+        self.accept().map(|(stream, _)| stream)
+    }
+
+    fn draining(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            crate::control_plane_health::tcp_listener_draining(self.as_raw_fd())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
+/// Accepts relay connections until the listener cannot continue. It never
+/// returns because of one connection's failure.
+///
+/// On macOS a close or `dup2` of the listener's descriptor by another thread
+/// wakes a sleeping accept (drain, then `ECONNABORTED`). A close that lands
+/// after accept takes the descriptor but before it sleeps is not woken: both
+/// threads wait until the next connection arrives.
+fn run_relay_accept_loop(
+    acceptor: &mut impl RelayAcceptor,
+    dispatch: &mut impl FnMut(TcpStream),
+) -> RelayListenerFailure {
+    let mut failures_in_a_row = 0_u32;
+    let mut retries_in_a_row = 0_u32;
+    loop {
+        let error = match acceptor.accept_stream() {
+            Ok(stream) => {
+                failures_in_a_row = 0;
+                retries_in_a_row = 0;
+                dispatch(stream);
+                continue;
+            }
+            Err(error) => error,
+        };
+        failures_in_a_row = failures_in_a_row.saturating_add(1);
+        match classify_accept_error(&error) {
+            AcceptErrorAction::Retry => {
+                retries_in_a_row = retries_in_a_row.saturating_add(1);
+                if error.kind() == io::ErrorKind::ConnectionAborted
+                    && acceptor.draining() == Some(true)
+                {
+                    return RelayListenerFailure::Draining(error);
+                }
+                if retries_in_a_row >= RELAY_ACCEPT_FAILURE_LIMIT {
+                    return RelayListenerFailure::RepeatedFailures {
+                        count: retries_in_a_row,
+                        last: error,
+                    };
+                }
+                relay_log!("local OTLP relay accept failed; still listening: {error}");
+                if retries_in_a_row > 1 {
+                    thread::sleep(RELAY_ACCEPT_RETRY_PAUSE);
+                }
+            }
+            AcceptErrorAction::Backoff => {
+                let pause = relay_accept_backoff(failures_in_a_row);
+                relay_log!("local OTLP relay accept failed; retrying in {pause:?}: {error}");
+                thread::sleep(pause);
+            }
+            AcceptErrorAction::Rebind => return RelayListenerFailure::Unusable(error),
+        }
+    }
+}
+
+fn relay_accept_backoff(failures_in_a_row: u32) -> Duration {
+    let doublings = failures_in_a_row.saturating_sub(1).min(16);
+    RELAY_ACCEPT_BACKOFF_START
+        .saturating_mul(1 << doublings)
+        .min(RELAY_ACCEPT_BACKOFF_MAX)
+}
+
+/// Binds a replacement listener, retrying with a bounded backoff for as long
+/// as it takes. The relay reads `Failed` in the meantime.
+pub(crate) fn rebind_relay_listener(
+    port: u16,
+    rebind: &mut impl FnMut(u16, u32) -> Result<TcpListener>,
+) -> TcpListener {
+    let mut pause = RELAY_REBIND_BACKOFF_START;
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match rebind(port, attempt) {
+            Ok(listener) => return listener,
+            Err(error) => {
+                relay_log!("local OTLP relay rebind failed; retrying in {pause:?}: {error:#}");
+                thread::sleep(pause);
+                pause = pause.saturating_mul(2).min(RELAY_REBIND_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// Closes a listener the accept loop gave up on, so its port can be bound
+/// again.
+///
+/// A drained listener can mean that something closed this listener's
+/// descriptor underneath it. The number may then already belong to another
+/// file, and closing it would close that file. So the descriptor is closed only
+/// while it still names this listening socket, and abandoned otherwise.
+fn release_relay_listener(listener: TcpListener, bound_addr: Option<SocketAddr>) {
+    let still_ours = bound_addr.is_some() && names_bound_listener(&listener, bound_addr);
+    if still_ours {
+        drop(listener);
+        return;
+    }
+    relay_log!(
+        "local OTLP relay listener descriptor no longer names the relay socket; leaving it open"
+    );
+    #[cfg(unix)]
+    {
+        let _ = listener.into_raw_fd();
+    }
+    #[cfg(not(unix))]
+    {
+        std::mem::forget(listener);
+    }
+}
+
+/// Whether the listener's descriptor still names the relay socket bound at
+/// `bound_addr`: same local address and still listening.
+fn names_bound_listener(listener: &TcpListener, bound_addr: Option<SocketAddr>) -> bool {
+    listener.local_addr().ok() == bound_addr && is_listening(listener)
+}
+
+/// Whether the listener's descriptor still names a listening TCP socket.
+fn is_listening(listener: &TcpListener) -> bool {
+    // macOS refuses `getsockopt(SO_ACCEPTCONN)` with ENOPROTOOPT. The drain
+    // probe reads the same flag from kernel bookkeeping and answers only for
+    // a listening TCP socket.
+    #[cfg(target_os = "macos")]
+    {
+        crate::control_plane_health::tcp_listener_draining(listener.as_raw_fd()).is_some()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut accepting: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `length` bytes into `accepting`,
+        // which is a live c_int of exactly that size.
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        rc == 0 && accepting != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listener;
+        true
+    }
+}
+
+fn relay_connected_state(addr: SocketAddr) -> RelayState {
+    RelayState {
+        state: RelayRuntimeState::Connected,
+        endpoint: Some(format!("http://{addr}")),
+        last_connected_at: Some(current_rfc3339()),
+        last_error: None,
+    }
+}
+
+fn relay_listener_failed_state(bound_addr: Option<SocketAddr>) -> RelayState {
+    RelayState {
+        state: RelayRuntimeState::Failed,
+        endpoint: Some(
+            bound_addr
+                .map(|addr| format!("http://{addr}"))
+                .unwrap_or_else(default_local_relay_base_url),
+        ),
+        last_connected_at: None,
+        last_error: Some(StableMessage {
+            code: "relay_listener_failed".to_string(),
+            text:
+                "The local OTLP relay stopped accepting connections and is binding a new listener."
+                    .to_string(),
+        }),
+    }
+}
+
+fn approved_candidate_relay_port() -> Option<u16> {
+    let endpoint =
+        crate::control::approved_managed_claude_relay_endpoint().unwrap_or_else(|error| {
+            relay_log!("could not read approved Claude relay endpoint: {error}");
+            None
+        });
+    // Existing exporters keep their startup endpoint across daemon restarts.
+    // Only reuse an address the daemon itself could have selected for this user.
+    endpoint
+        .as_deref()
+        .filter(|endpoint| endpoint.starts_with("http://127.0.0.1:"))
+        .and_then(local_relay_port_from_endpoint)
+        .filter(|port| candidate_relay_ports(current_uid()).contains(port))
+}
+
+pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
+    bind_local_relay_listener(approved_candidate_relay_port())
+}
+
+// Give exporters a brief chance to keep their approved endpoint, then restore
+// availability for every source and the control/health routes on this listener.
+const APPROVED_RELAY_REBIND_ATTEMPTS: u32 = 3;
+
+pub(crate) fn bind_replacement_local_relay_listener(
+    old_port: u16,
+    attempt: u32,
+) -> Result<TcpListener> {
+    // Re-read consent/settings every attempt. The attempt budget belongs to one
+    // listener failure, so settings changes cannot restart it indefinitely.
+    if let Some(port) = approved_candidate_relay_port() {
+        legacy::release_for_primary(port);
+        if attempt <= APPROVED_RELAY_REBIND_ATTEMPTS {
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return Ok(listener),
+                Err(error) if attempt < APPROVED_RELAY_REBIND_ATTEMPTS => {
+                    return Err(error).context("rebind approved local OTLP relay port");
+                }
+                Err(_) => {} // Budget exhausted: recover on the existing chain now.
+            }
+        }
+    }
+    bind_local_relay_listener(Some(old_port))
+}
+
+pub(crate) const RELAY_ENDPOINT_MISMATCH_CODE: &str = "claude_relay_endpoint_mismatch";
+
+/// A restart or rebind can briefly disagree with settings. Report a mismatch
+/// only once the same one is seen again at least this long after first.
+#[cfg(not(test))]
+const RELAY_MISMATCH_PERSIST: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const RELAY_MISMATCH_PERSIST: Duration = Duration::ZERO;
+
+pub(crate) fn listener_failure(relay: &RelayState) -> Option<StableMessage> {
+    relay
+        .last_error
+        .as_ref()
+        .filter(|error| {
+            relay.state == RelayRuntimeState::Failed && error.code == "relay_listener_failed"
+        })
+        .cloned()
+}
+
+/// In-memory streak shared by the mutually exclusive mismatch and listener
+/// failure findings, cleared by the first evaluation without either.
+#[derive(Debug, Default)]
+pub(crate) struct RelayMismatchDebounce(std::sync::Mutex<Option<(Instant, StableMessage)>>);
+
+impl RelayMismatchDebounce {
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&self, elapsed: Duration) {
+        if let Some((since, _)) = self.0.lock().unwrap().as_mut() {
+            *since = Instant::now() - elapsed;
+        }
+    }
+
+    pub(crate) fn observe(&self, finding: Option<StableMessage>) -> Option<StableMessage> {
+        let mut seen = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(finding) = finding else {
+            *seen = None;
+            return None;
+        };
+        match seen.as_ref() {
+            Some((since, previous)) if *previous == finding => {
+                let grace = if finding.code == "relay_listener_failed" {
+                    Duration::from_secs(60)
+                } else {
+                    RELAY_MISMATCH_PERSIST
+                };
+                (since.elapsed() >= grace).then_some(finding)
+            }
+            _ => {
+                *seen = Some((Instant::now(), finding));
+                None
+            }
+        }
+    }
+}
+
+pub(crate) fn approved_endpoint_mismatch(relay: &RelayState) -> Option<StableMessage> {
+    if relay.state != RelayRuntimeState::Connected {
+        return None;
+    }
+    // A default inferred from missing state is not a live listener address.
+    let live_port = relay
+        .endpoint
+        .as_deref()
+        .and_then(local_relay_port_from_endpoint)?;
+    let approved_port = crate::control::approved_managed_claude_relay_endpoint().ok()??;
+    let approved_port = local_relay_port_from_endpoint(&approved_port)?;
+    (approved_port != live_port).then(|| StableMessage {
+        code: RELAY_ENDPOINT_MISMATCH_CODE.to_string(),
+        text: format!(
+            "Relay connected (127.0.0.1:{live_port}) but Claude settings point at 127.0.0.1:{approved_port}."
+        ),
+    })
+}
+
+/// Binds the relay listener. `preferred_port` (from approved settings or a
+/// failed listener) is tried first, then the default and per-user fallbacks.
+fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener> {
+    let mut ports = Vec::new();
+    if let Some(port) = preferred_port {
+        ports.push(port);
+    }
+    for port in candidate_relay_ports(current_uid()) {
+        push_unique_port(&mut ports, port);
+    }
+    let mut last_error = None;
+    for port in ports {
+        match bind_relay_port(port) {
+            Ok(listener) => {
+                if port != LOCAL_RELAY_DEFAULT_PORT {
+                    relay_log!("local OTLP relay using per-user port {port}");
+                }
+                return Ok(listener);
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let error = last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("no local OTLP relay ports were available"));
+    Err(error).context("bind local OTLP relay")
+}
+
+fn bind_relay_port(port: u16) -> io::Result<TcpListener> {
+    #[cfg(test)]
+    if let Some(result) = tests::planned_bind(port) {
+        return result;
+    }
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+}
+
+/// Apply the read and write timeout to an accepted relay stream. A best-effort
+/// operation: if the platform rejects the timeout we proceed without it rather
+/// than dropping an otherwise-valid connection.
+fn apply_relay_io_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(RELAY_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RELAY_IO_TIMEOUT));
+}
+
+pub fn default_local_relay_base_url() -> String {
+    local_relay_base_url_for_port(LOCAL_RELAY_DEFAULT_PORT)
+}
+
+pub fn local_relay_base_url_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+pub fn local_relay_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    let without_scheme = endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| endpoint.strip_prefix("http://localhost:"))?;
+    let port = without_scheme
+        .split('/')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())?;
+    Some(port)
+}
+
+/// A port the relay could have chosen for this user: the default port or one
+/// of this user's fallback ports.
+pub(crate) fn is_candidate_relay_port(port: u16) -> bool {
+    candidate_relay_ports(current_uid()).contains(&port)
+}
+
+pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {
+    let mut ports = Vec::with_capacity(usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
+    push_unique_port(&mut ports, LOCAL_RELAY_DEFAULT_PORT);
+    let start = fallback_relay_port_for_uid(uid);
+    for offset in 0..LOCAL_RELAY_FALLBACK_ATTEMPTS {
+        let relative =
+            ((start - LOCAL_RELAY_FALLBACK_BASE_PORT) + offset) % LOCAL_RELAY_FALLBACK_SPAN;
+        push_unique_port(&mut ports, LOCAL_RELAY_FALLBACK_BASE_PORT + relative);
+    }
+    ports
+}
+
+fn push_unique_port(ports: &mut Vec<u16>, port: u16) {
+    if !ports.contains(&port) {
+        ports.push(port);
+    }
+}
+
+fn fallback_relay_port_for_uid(uid: u32) -> u16 {
+    LOCAL_RELAY_FALLBACK_BASE_PORT + (uid % u32::from(LOCAL_RELAY_FALLBACK_SPAN)) as u16
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and does not mutate Rust-managed memory.
+        unsafe { libc::getuid() as u32 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn serve_test_connection(stream: TcpStream, daemon: LocalDaemon) {
+    apply_relay_io_timeouts(&stream);
+    handle_client(stream, SnapshotSource::ClaudeCode, daemon, None)
+        .expect("serve test relay connection");
+}
+
+fn handle_client(
+    stream: TcpStream,
+    source: SnapshotSource,
+    daemon: LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+) -> Result<()> {
+    let _stage = StageWindow::begin(source.api_slug(), "offpass_telemetry");
+    handle_client_at(
+        stream,
+        source,
+        daemon,
+        legacy_activity,
+        &ottto_core::default_support_dir(),
+    )
+}
+
+fn handle_client_at(
+    mut stream: TcpStream,
+    source: SnapshotSource,
+    daemon: LocalDaemon,
+    legacy_activity: Option<legacy::Activity>,
+    support_dir: &Path,
+) -> Result<()> {
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            refused(Event::OtlpRelayBadFraming400);
+            relay_log!("local OTLP relay refused a request: bad_framing");
+            write_json_response(
+                &mut stream,
+                400,
+                json!({"error":"bad_request","message": error.to_string()}),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if legacy_activity.is_none() && request.path == "/control" {
+        return handle_control_request(&mut stream, &daemon, request);
+    }
+
+    if legacy_activity.is_none() && request.path == "/whoami" {
+        return handle_whoami_request(&mut stream, &daemon, request);
+    }
+
+    if legacy_activity.is_none() && request.path == "/local-health" {
+        return handle_local_health_request(&mut stream, &daemon, request);
+    }
+
+    if legacy_activity.is_none() && request.method == "GET" && request.path == "/healthz" {
+        return write_json_response(&mut stream, 200, relay_health_payload(source));
+    }
+
+    if request.method != "POST"
+        || !matches!(
+            request.path.as_str(),
+            "/v1/logs" | "/v1/metrics" | "/v1/traces"
+        )
+    {
+        return write_json_response(
+            &mut stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local relay endpoint"}),
+        );
+    }
+
+    let request_source = source_from_request(&request).unwrap_or(source);
+    let export = || local_otlp_export_response(request_source, &request, support_dir);
+    let response = if let Some(activity) = legacy_activity.as_ref() {
+        let Some(response) = activity.export_if_approved(|| {
+            let response = export();
+            // Keep success bookkeeping inside admission so retirement/rebind
+            // drains the complete export before taking its final idle clock.
+            if (200..300).contains(&response.status) {
+                activity.accepted();
+            }
+            response
+        }) else {
+            return write_json_response(
+                &mut stream,
+                403,
+                json!({"error":"legacy_relay_approval_revoked"}),
+            );
+        };
+        response
+    } else {
+        export()
+    };
+    write_raw_response(
+        &mut stream,
+        response.status,
+        response.content_type,
+        &response.body,
+    )
+}
+
+struct LocalExportResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+/// Ottto's server retired OTLP ingest, so the relay forwards nothing upstream
+/// and requests no relay token. It keeps only the content-free local Claude
+/// evidence that session snapshots and accounting read, then answers the
+/// exporter itself. Other sources and signals have no local consumer and are
+/// acknowledged without being stored. A failed local reduction is reported
+/// with a non-retryable OTLP status instead of being hidden behind success.
+fn local_otlp_export_response(
+    source: SnapshotSource,
+    request: &HttpRequest,
+    support_dir: &Path,
+) -> LocalExportResponse {
+    match capture_local_evidence(source, request, support_dir) {
+        Ok(()) => otlp_export_success(request),
+        Err(LocalCaptureFailure::Undecodable) => {
+            relay_log!("local Claude OTLP reduction could not decode a request body");
+            json_export_response(
+                400,
+                json!({"error":"bad_request","message":"OTLP body could not be decoded"}),
+            )
+        }
+        Err(LocalCaptureFailure::NotStored) => {
+            relay_log!("local Claude OTLP evidence could not be stored");
+            json_export_response(
+                500,
+                json!({"error":"local_capture_failed","message":"local evidence was not stored"}),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCaptureFailure {
+    /// The body (or its content encoding) could not be decoded.
+    Undecodable,
+    /// The body decoded but the reduced evidence could not be stored.
+    NotStored,
+}
+
+fn capture_local_evidence(
+    source: SnapshotSource,
+    request: &HttpRequest,
+    support_dir: &Path,
+) -> std::result::Result<(), LocalCaptureFailure> {
+    if source != SnapshotSource::ClaudeCode
+        || !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces")
+    {
+        return Ok(());
+    }
+    if !claude_collection_enabled(support_dir) {
+        refused(Event::OtlpRelayCollectionDisabled);
+        return Ok(());
+    }
+    let body = decoded_request_body(request).ok_or(LocalCaptureFailure::Undecodable)?;
+    let content_type = request_content_type(request);
+    let captured = if request.path == "/v1/logs" {
+        // Claude Code transcripts do not persist the applied effort tier, so
+        // the official per-request log carries it.
+        crate::claude_local_otel::capture_claude_api_request_logs(support_dir, &body, content_type)
+    } else {
+        crate::claude_local_otel::capture_claude_llm_request_traces(
+            support_dir,
+            &body,
+            content_type,
+        )
+    };
+    match captured {
+        Ok(_) => Ok(()),
+        Err(error) if crate::claude_local_otel::is_undecodable_body(&error) => {
+            Err(LocalCaptureFailure::Undecodable)
+        }
+        Err(_) => Err(LocalCaptureFailure::NotStored),
+    }
+}
+
+/// Claude is granted to this device and not paused. While it is off, the
+/// relay acknowledges and stores nothing: the user stopped collection for that
+/// source, so the local writer refuses the whole request (consent, not a
+/// per-record failure). Data already stored is kept. Read per request, with no
+/// lock held, so a pause or resume applies to the next export.
+fn claude_collection_enabled(support_dir: &Path) -> bool {
+    ottto_core::FileDeviceStore::new(support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME))
+        .load()
+        .ok()
+        .flatten()
+        .is_some_and(|device| {
+            crate::snapshot_sync::enabled_snapshot_sources_in(&device, support_dir)
+                .contains(&SnapshotSource::ClaudeCode)
+        })
+}
+
+/// The request body with its OTLP content encoding removed. OTLP/HTTP allows
+/// gzip; the inflated size keeps the same cap as a raw body.
+fn decoded_request_body(request: &HttpRequest) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let encoding = request
+        .headers
+        .get("content-encoding")
+        .map(|value| value.trim().to_ascii_lowercase());
+    match encoding.as_deref() {
+        None | Some("") | Some("identity") => Some(std::borrow::Cow::Borrowed(&request.body)),
+        Some("gzip") => {
+            let mut inflated = Vec::new();
+            flate2::read::MultiGzDecoder::new(request.body.as_slice())
+                .take(MAX_OTLP_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut inflated)
+                .ok()?;
+            (inflated.len() <= MAX_OTLP_BODY_BYTES).then_some(std::borrow::Cow::Owned(inflated))
+        }
+        Some(_) => {
+            refused(Event::OtlpRelayUnknownContentEncoding);
+            None
+        }
+    }
+}
+
+/// An empty OTLP export response: full success with no partial rejection, in
+/// the encoding the exporter used so it never retries an accepted request.
+fn otlp_export_success(request: &HttpRequest) -> LocalExportResponse {
+    if request_content_type(request)
+        .to_ascii_lowercase()
+        .contains("json")
+    {
+        LocalExportResponse {
+            status: 200,
+            content_type: "application/json",
+            body: b"{}".to_vec(),
+        }
+    } else {
+        LocalExportResponse {
+            status: 200,
+            content_type: "application/x-protobuf",
+            body: Vec::new(),
+        }
+    }
+}
+
+fn json_export_response(status: u16, body: serde_json::Value) -> LocalExportResponse {
+    LocalExportResponse {
+        status,
+        content_type: "application/json",
+        body: body.to_string().into_bytes(),
+    }
+}
+
+fn request_content_type(request: &HttpRequest) -> &str {
+    request
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("application/octet-stream")
+}
+
+fn handle_control_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if let Some(forbidden) =
+        forbidden_local_request_body(&request, stream.local_addr()?.port(), "control")
+    {
+        return write_json_response(stream, 403, forbidden);
+    }
+    let cors_headers = control_cors_headers(origin);
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "POST" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local control endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    let control_request = match serde_json::from_slice::<LocalControlRequest>(&request.body) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_json_response_with_headers(
+                stream,
+                400,
+                json!({"error":"bad_request","message": format!("Invalid local control request: {error}")}),
+                &cors_headers,
+            )
+        }
+    };
+    if !matches!(
+        &control_request.command,
+        LocalControlCommand::TelemetryControl { .. }
+            | LocalControlCommand::ProviderDailyReferenceControl { .. }
+    ) {
+        return write_json_response_with_headers(
+            stream,
+            400,
+            json!({"error":"unsupported_command","message":"Browser local control only accepts approved control-token commands"}),
+            &cors_headers,
+        );
+    }
+
+    let response = handle_request(daemon, control_request);
+    write_json_response_with_headers(stream, 200, serde_json::to_value(response)?, &cors_headers)
+}
+
+/// Loopback identity probe. Allowed Origin and Host enable identity details;
+/// other callers receive liveness and version only.
+fn handle_whoami_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "identity").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
+    }
+    let cors_headers = cors_headers(origin, "GET, OPTIONS");
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "GET" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local identity endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    match daemon.machine_for_trusted_client() {
+        Ok(machine) => write_json_response_with_headers(
+            stream,
+            200,
+            json!({
+                "machine_id": machine.machine_id,
+                "machine_name": machine.display_name,
+            }),
+            &cors_headers,
+        ),
+        Err(_) => write_json_response_with_headers(
+            stream,
+            503,
+            json!({"error":"unavailable","message":"Machine identity is not available"}),
+            &cors_headers,
+        ),
+    }
+}
+
+/// Loopback health probe. Allowed Origin and Host enable canonical health;
+/// other callers receive liveness and version only. Account ids are omitted.
+fn handle_local_health_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "health").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
+    }
+    let cors_headers = cors_headers(origin, "GET, OPTIONS");
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "GET" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local health endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    let device_id = local_health_browser_device_id(origin, || {
+        FileDeviceStore::default()
+            .load()
+            .ok()
+            .flatten()
+            .map(|device| device.device_id)
+    });
+
+    match local_health_response_payload(daemon, device_id) {
+        Ok(payload) => write_json_response_with_headers(stream, 200, payload, &cors_headers),
+        Err(_) => write_json_response_with_headers(
+            stream,
+            503,
+            json!({"error":"unavailable","message":"Local health is not available"}),
+            &cors_headers,
+        ),
+    }
+}
+
+fn local_health_browser_device_id(
+    origin: Option<&str>,
+    load_device_id: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    origin.and_then(|_| load_device_id())
+}
+
+fn local_health_response_payload(
+    daemon: &LocalDaemon,
+    device_id: Option<String>,
+) -> Result<serde_json::Value> {
+    let status = daemon.status_for_trusted_client()?;
+    let Some(mut health) = status.canonical_health else {
+        return Err(anyhow!("local health is not available"));
+    };
+    health.device_id = device_id;
+    health.org_id = None;
+    health.user_id = None;
+    Ok(json!({
+        "machine_id": status.machine.machine_id,
+        "machine_name": status.machine.display_name,
+        "health": health,
+    }))
+}
+
+fn probe_liveness_payload() -> serde_json::Value {
+    json!({"ok": true, "version": crate::compiled_release_version()})
+}
+
+fn forbidden_local_request_body(
+    request: &HttpRequest,
+    port: u16,
+    noun: &str,
+) -> Option<serde_json::Value> {
+    if let Some(body) =
+        forbidden_origin_body(request.headers.get("origin").map(String::as_str), noun)
+    {
+        return Some(body);
+    }
+    if request.headers.get("host").is_some_and(|host| {
+        ["localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .any(|name| host.eq_ignore_ascii_case(&format!("{name}:{port}")))
+    }) {
+        return None;
+    }
+    Some(
+        json!({"error": "host_forbidden", "message": "Host is not allowed for local Ottto control"}),
+    )
+}
+
+/// Browser routes require an Origin from the control allowlist.
+fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
+    if origin.is_some_and(is_allowed_control_origin) {
+        return None;
+    }
+    Some(json!({
+        "error": "origin_forbidden",
+        "message": format!("Origin is not allowed for local Ottto {noun}"),
+    }))
+}
+
+fn control_cors_headers(origin: Option<&str>) -> Vec<(String, String)> {
+    cors_headers(origin, "POST, OPTIONS")
+}
+
+fn cors_headers(origin: Option<&str>, allow_methods: &str) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            allow_methods.to_string(),
+        ),
+        (
+            "Access-Control-Allow-Headers".to_string(),
+            "Content-Type, Authorization".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Private-Network".to_string(),
+            "true".to_string(),
+        ),
+        ("Access-Control-Max-Age".to_string(), "300".to_string()),
+        (
+            "Vary".to_string(),
+            "Origin, Access-Control-Request-Private-Network".to_string(),
+        ),
+    ];
+    if let Some(origin) = origin {
+        headers.push((
+            "Access-Control-Allow-Origin".to_string(),
+            origin.to_string(),
+        ));
+    }
+    headers
+}
+
+fn is_allowed_control_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "https://ottto.net" | "https://www.ottto.net" | "https://app.ottto.net"
+    )
+}
+
+fn source_from_request(request: &HttpRequest) -> Option<SnapshotSource> {
+    request
+        .headers
+        .get(&LOCAL_RELAY_HEADER.to_ascii_lowercase())
+        .and_then(|value| source_from_relay_header(value))
+}
+
+fn source_from_relay_header(value: &str) -> Option<SnapshotSource> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        CODEX_RELAY_SOURCE => Some(SnapshotSource::Codex),
+        CLAUDE_CODE_RELAY_SOURCE => Some(SnapshotSource::ClaudeCode),
+        _ => None,
+    }
+}
+
+fn current_api_base_url() -> String {
+    FileConnectionStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .map(|binding| binding.api_base_url)
+        .or_else(|| std::env::var("OTTTO_API_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
+}
+
+fn relay_health_payload(source: SnapshotSource) -> serde_json::Value {
+    let api_base_url = current_api_base_url();
+    let device_id = load_snapshot_device_credentials()
+        .ok()
+        .map(|(device, _)| device.device_id)
+        .unwrap_or_else(|| "missing".to_string());
+    json!({
+        "ok": device_id != "missing",
+        "source": source.api_slug(),
+        "state_fingerprint": state_fingerprint(source, &api_base_url, &device_id),
+        "legacy_relay": legacy::counts(),
+    })
+}
+
+fn state_fingerprint(source: SnapshotSource, api_base_url: &str, device_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.api_slug().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(api_base_url.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_id.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+    let mut reader = BufReader::new(stream);
+    read_http_request_from(&mut reader)
+}
+
+/// Parse an HTTP request from any buffered reader. Split out from
+/// [`read_http_request`] so the bounded request-line/header parsing can be
+/// unit-tested without a socket. The request line and every header line are
+/// read with [`read_line_limited`] (per-line cap), the header section is
+/// bounded by cumulative byte and count caps, and the body keeps the existing
+/// [`MAX_OTLP_BODY_BYTES`] cap.
+fn read_http_request_from<R: BufRead>(reader: &mut R) -> Result<HttpRequest> {
+    let mut request_line = String::new();
+    let read = read_line_limited(reader, &mut request_line, MAX_HEADER_LINE_BYTES)
+        .context("read request line")?;
+    if read == 0 {
+        return Err(anyhow!("empty request"));
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or_else(|| anyhow!("missing method"))?;
+    let path = parts.next().ok_or_else(|| anyhow!("missing path"))?;
+    if !path.starts_with('/') {
+        return Err(anyhow!("invalid path"));
+    }
+    let method = method.to_ascii_uppercase();
+    let path = path.to_string();
+
+    let mut headers = BTreeMap::new();
+    let mut header_bytes_total: usize = 0;
+    let mut header_count: usize = 0;
+    loop {
+        let mut line = String::new();
+        let read =
+            read_line_limited(reader, &mut line, MAX_HEADER_LINE_BYTES).context("read header")?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            // A zero-length read means EOF before the terminating blank line;
+            // an empty trimmed line is the blank line itself. Either way the
+            // header section ends here.
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_HEADER_COUNT {
+            return Err(anyhow!("too many request headers"));
+        }
+        header_bytes_total = header_bytes_total.saturating_add(read);
+        if header_bytes_total > MAX_HEADER_TOTAL_BYTES {
+            return Err(anyhow!("request headers too large"));
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "content-length" | "transfer-encoding" | "host" | "origin" | "authorization"
+            ) && headers.contains_key(&name)
+            {
+                return Err(anyhow!("duplicate HTTP message framing header"));
+            }
+            headers.insert(name, value.trim().to_string());
+        }
+    }
+
+    let body = read_http_request_body(reader, &headers)?;
+
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// Read and normalize the HTTP/1.1 message body into a de-chunked payload; the
+/// local reducers never see client-controlled transfer framing.
+fn read_http_request_body<R: BufRead>(
+    reader: &mut R,
+    headers: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    if let Some(transfer_encoding) = headers.get("transfer-encoding") {
+        // Reject ambiguous framing rather than applying precedence rules. This
+        // loopback server has no compatibility need for TE+CL and failing
+        // closed avoids request-smuggling differentials.
+        if headers.contains_key("content-length") {
+            return Err(anyhow!(
+                "transfer-encoding and content-length cannot be combined"
+            ));
+        }
+        let codings = transfer_encoding
+            .split(',')
+            .map(|coding| coding.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if codings.as_slice() != ["chunked"] {
+            return Err(anyhow!("unsupported transfer-encoding"));
+        }
+        return read_chunked_body(reader);
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .context("parse content-length")?
+        .unwrap_or(0);
+    if content_length > MAX_OTLP_BODY_BYTES {
+        return Err(anyhow!("request body too large"));
+    }
+    let mut body = vec![0; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).context("read body")?;
+    }
+    Ok(body)
+}
+
+/// Decode RFC 9112 chunked transfer coding while preserving the relay's
+/// existing body, line, trailer-count, and cumulative-trailer bounds.
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk_count = 0_usize;
+    let mut framing_bytes = 0_usize;
+    loop {
+        let mut line = String::new();
+        let read = read_line_limited(reader, &mut line, MAX_HEADER_LINE_BYTES)
+            .context("read chunk size")?;
+        if read == 0 {
+            return Err(anyhow!("unexpected EOF before chunk size"));
+        }
+        chunk_count += 1;
+        if chunk_count > MAX_CHUNK_COUNT {
+            return Err(anyhow!("too many chunks"));
+        }
+        framing_bytes = framing_bytes
+            .checked_add(read)
+            .ok_or_else(|| anyhow!("chunk framing too large"))?;
+        if framing_bytes > MAX_CHUNK_FRAMING_BYTES {
+            return Err(anyhow!("chunk framing too large"));
+        }
+        let line = line
+            .strip_suffix("\r\n")
+            .ok_or_else(|| anyhow!("chunk size line must end with CRLF"))?;
+        let size_text = line.split_once(';').map_or(line, |(size, _)| size);
+        if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!("invalid chunk size"));
+        }
+        let chunk_size = usize::from_str_radix(size_text, 16).context("parse chunk size")?;
+        if chunk_size == 0 {
+            read_chunked_trailers(reader)?;
+            return Ok(body);
+        }
+        let new_len = body
+            .len()
+            .checked_add(chunk_size)
+            .ok_or_else(|| anyhow!("request body too large"))?;
+        if new_len > MAX_OTLP_BODY_BYTES {
+            return Err(anyhow!("request body too large"));
+        }
+        let old_len = body.len();
+        body.resize(new_len, 0);
+        reader
+            .read_exact(&mut body[old_len..])
+            .context("read chunk data")?;
+        let mut terminator = [0_u8; 2];
+        reader
+            .read_exact(&mut terminator)
+            .context("read chunk data terminator")?;
+        if terminator != *b"\r\n" {
+            return Err(anyhow!("chunk data must end with CRLF"));
+        }
+        framing_bytes = framing_bytes
+            .checked_add(terminator.len())
+            .ok_or_else(|| anyhow!("chunk framing too large"))?;
+        if framing_bytes > MAX_CHUNK_FRAMING_BYTES {
+            return Err(anyhow!("chunk framing too large"));
+        }
+    }
+}
+
+fn read_chunked_trailers<R: BufRead>(reader: &mut R) -> Result<()> {
+    let mut trailer_bytes_total = 0_usize;
+    let mut trailer_count = 0_usize;
+    loop {
+        let mut line = String::new();
+        let read = read_line_limited(reader, &mut line, MAX_HEADER_LINE_BYTES)
+            .context("read chunk trailer")?;
+        if read == 0 {
+            return Err(anyhow!("unexpected EOF before chunk trailer terminator"));
+        }
+        if line == "\r\n" {
+            return Ok(());
+        }
+        if !line.ends_with("\r\n") {
+            return Err(anyhow!("chunk trailer line must end with CRLF"));
+        }
+        trailer_count += 1;
+        if trailer_count > MAX_HEADER_COUNT {
+            return Err(anyhow!("too many chunk trailer fields"));
+        }
+        trailer_bytes_total = trailer_bytes_total.saturating_add(read);
+        if trailer_bytes_total > MAX_HEADER_TOTAL_BYTES {
+            return Err(anyhow!("chunk trailers too large"));
+        }
+        if !line[..line.len() - 2].contains(':') {
+            return Err(anyhow!("invalid chunk trailer field"));
+        }
+    }
+}
+
+/// Read a single line (up to and including the terminating `\n`) into `buf`,
+/// but fail once more than `max` bytes have been consumed without reaching the
+/// newline. This bounds the per-line heap allocation an unbounded
+/// `BufRead::read_line` would otherwise allow, closing the "stream one giant
+/// header line" memory-exhaustion path. Returns the number of bytes appended;
+/// `0` means EOF was reached with no bytes read.
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max: usize,
+) -> io::Result<usize> {
+    let start_len = buf.len();
+    // Cap the reader at `max` bytes for this line. A well-formed line of at
+    // most `max` bytes (including its trailing `\n`) is read in full; a longer
+    // line is truncated before its newline, so the missing terminator below
+    // signals "over-long" without ever allocating past the cap.
+    let mut limited = reader.take(max as u64);
+    let read = limited.read_line(buf)?;
+    if read == 0 {
+        return Ok(0);
+    }
+    let line = &buf[start_len..];
+    if !line.ends_with('\n') {
+        // We pulled at least one byte but never reached a newline within the
+        // cap. Either the line is over-long or the stream ended mid-line;
+        // either way the request head is malformed/oversized — reject it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line exceeds maximum length",
+        ));
+    }
+    Ok(read)
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) -> Result<()> {
+    write_json_response_with_headers(stream, status, body, &[])
+}
+
+fn write_json_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    body: serde_json::Value,
+    headers: &[(String, String)],
+) -> Result<()> {
+    let body = serde_json::to_vec(&body)?;
+    write_raw_response_with_headers(stream, status, "application/json", &body, headers)
+}
+
+fn write_raw_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    write_raw_response_with_headers(stream, status, content_type, body, &[])
+}
+
+fn write_raw_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        status,
+        reason_phrase(status),
+        content_type,
+        body.len()
+    )?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
+fn current_rfc3339() -> String {
+    Command::new("/bin/date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Walk the anyhow chain looking for an `io::Error` that's a routine
+/// "client went away or stalled" pattern. Used to decide whether to bother
+/// logging a relay failure — these happen any time an OTLP client closes the
+/// socket before we finish writing the response, or trickles/stalls its
+/// request until the per-connection [`RELAY_IO_TIMEOUT`] fires. A socket
+/// read/write timeout surfaces as `WouldBlock` on Unix and `TimedOut` on
+/// Windows, so both are treated as routine.
+fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| {
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            )
+        })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::ControlToken;
+    use ottto_protocol::{
+        LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
+        MachineIdentity, OperatingSystem,
+    };
+
+    const TOKEN: &str = "test-control-token";
+
+    // The relay candidates are fixed numbers inside the Linux ephemeral range,
+    // so a parallel test's ephemeral listener or outbound connection can hold
+    // one at any moment. A plan feeds each candidate bind its result in order.
+    type BindPlan = std::collections::VecDeque<(u16, io::Result<TcpListener>)>;
+
+    thread_local! {
+        static BIND_PLAN: std::cell::RefCell<Option<BindPlan>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn planned_bind(port: u16) -> Option<io::Result<TcpListener>> {
+        BIND_PLAN.with(|plan| {
+            let mut plan = plan.borrow_mut();
+            let (expected, result) = plan.as_mut()?.pop_front().expect("unexpected relay bind");
+            assert_eq!(port, expected, "relay binds follow the candidate order");
+            Some(result)
+        })
+    }
+
+    pub(crate) fn with_bind_plan<T>(
+        plan: impl IntoIterator<Item = (u16, io::Result<TcpListener>)>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<BindPlan>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BIND_PLAN.with(|plan| *plan.borrow_mut() = self.0.take());
+            }
+        }
+        let plan = plan.into_iter().collect();
+        let _reset = Reset(BIND_PLAN.with(|slot| slot.replace(Some(plan))));
+        let value = run();
+        BIND_PLAN.with(|plan| {
+            assert!(
+                plan.borrow().as_ref().unwrap().is_empty(),
+                "every planned relay bind must be attempted"
+            );
+        });
+        value
+    }
+
+    pub(super) fn test_daemon() -> LocalDaemon {
+        LocalDaemon::new(
+            MachineIdentity {
+                machine_id: "machine_test".to_string(),
+                installation_id: "install_test".to_string(),
+                display_name: "Test Mac".to_string(),
+                hostname: "test-mac.local".to_string(),
+                os: OperatingSystem::Macos,
+                arch: "arm64".to_string(),
+                local_platform_version: "0.1.31-rc1".to_string(),
+                hardware_uuid: None,
+                account_scope: None,
+            },
+            ControlToken::new(TOKEN).expect("token should be valid"),
+            "2026-06-15T19:12:48Z",
+        )
+    }
+
+    #[test]
+    fn control_origin_allowlist_accepts_production_only() {
+        assert!(is_allowed_control_origin("https://ottto.net"));
+        assert!(is_allowed_control_origin("https://www.ottto.net"));
+        assert!(is_allowed_control_origin("https://app.ottto.net"));
+        assert!(!is_allowed_control_origin("http://localhost:3000"));
+        assert!(!is_allowed_control_origin("http://127.0.0.1:3001"));
+        assert!(!is_allowed_control_origin("https://ottto.net.evil"));
+        assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn control_preflight_refuses_loopback_origins_before_cors() {
+        let daemon = test_daemon();
+        for (origin, allowed) in [
+            ("http://localhost:3000", false),
+            ("http://127.0.0.1:3001", false),
+            ("https://app.ottto.net", true),
+        ] {
+            let (mut client, mut server) = loopback_pair();
+            let port = server.local_addr().unwrap().port();
+            let request = HttpRequest {
+                method: "OPTIONS".into(),
+                path: "/control".into(),
+                headers: BTreeMap::from([
+                    ("host".into(), format!("127.0.0.1:{port}")),
+                    ("origin".into(), origin.into()),
+                ]),
+                body: vec![],
+            };
+            handle_control_request(&mut server, &daemon, request).unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            if allowed {
+                assert!(headers.starts_with("HTTP/1.1 204"), "{response}");
+                assert!(headers.contains(&format!("Access-Control-Allow-Origin: {origin}")));
+            } else {
+                assert!(headers.starts_with("HTTP/1.1 403"), "{response}");
+                assert!(
+                    !headers.to_ascii_lowercase().contains("access-control-"),
+                    "{response}"
+                );
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(payload["error"], "origin_forbidden");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn forbidden_origin_body_keeps_each_message_verbatim() {
+        fn keys(value: &serde_json::Value) -> Vec<&str> {
+            let mut keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        }
+        let files = crate::control::tests::ControlFilesFixture::new();
+        FileDeviceStore::default()
+            .save(&ottto_core::LocalDeviceBinding {
+                device_id: "device_probe".into(),
+                machine_id: None,
+                sources: vec![],
+            })
+            .unwrap();
+        for noun in ["control", "identity", "health"] {
+            for (origin, host_kind, error) in [
+                (None, "loopback", Some("origin_forbidden")),
+                (Some("null"), "loopback", Some("origin_forbidden")),
+                (
+                    Some("https://ottto.net.evil"),
+                    "loopback",
+                    Some("origin_forbidden"),
+                ),
+                // A loopback dev page gets liveness only from the probes.
+                (
+                    Some("http://localhost:3000"),
+                    "loopback",
+                    Some("origin_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "remote",
+                    Some("host_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "missing",
+                    Some("host_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "wrong_port",
+                    Some("host_forbidden"),
+                ),
+                (Some("https://app.ottto.net"), "loopback", None),
+                (Some("https://app.ottto.net"), "localhost", None),
+                (Some("https://app.ottto.net"), "ipv6", None),
+            ] {
+                for method in ["OPTIONS", "GET", "POST"] {
+                    if method == "GET" && noun == "control" {
+                        continue;
+                    }
+                    if method == "POST" && (noun != "control" || error.is_none()) {
+                        continue;
+                    }
+                    for token in [None, Some("wrong-token"), Some(TOKEN)] {
+                        let (mut client, mut server) = loopback_pair();
+                        let port = server.local_addr().unwrap().port();
+                        let mut headers = BTreeMap::new();
+                        if let Some(origin) = origin {
+                            headers.insert("origin".into(), origin.into());
+                        }
+                        let host = match host_kind {
+                            "missing" => None,
+                            "remote" => Some(format!("example.test:{port}")),
+                            "wrong_port" => Some(format!("127.0.0.1:{}", port.saturating_sub(1))),
+                            "localhost" => Some(format!("localhost:{port}")),
+                            "ipv6" => Some(format!("[::1]:{port}")),
+                            _ => Some(format!("127.0.0.1:{port}")),
+                        };
+                        if let Some(host) = host {
+                            headers.insert("host".into(), host);
+                        }
+                        if let Some(token) = token {
+                            headers.insert("authorization".into(), format!("Bearer {token}"));
+                        }
+                        let request = HttpRequest {
+                            method: method.into(),
+                            path: match noun {
+                                "control" => "/control",
+                                "identity" => "/whoami",
+                                _ => "/local-health",
+                            }
+                            .into(),
+                            headers,
+                            body: vec![],
+                        };
+                        files
+                            .assert_unchanged(|| match noun {
+                                "control" => {
+                                    handle_control_request(&mut server, &test_daemon(), request)
+                                }
+                                "identity" => {
+                                    handle_whoami_request(&mut server, &test_daemon(), request)
+                                }
+                                _ => handle_local_health_request(
+                                    &mut server,
+                                    &test_daemon(),
+                                    request,
+                                ),
+                            })
+                            .unwrap();
+                        drop(server);
+                        let mut response = String::new();
+                        client.read_to_string(&mut response).unwrap();
+                        let status = if error.is_some() && noun == "control" {
+                            403
+                        } else if error.is_some() {
+                            200
+                        } else if method == "OPTIONS" {
+                            204
+                        } else {
+                            200
+                        };
+                        assert!(
+                            response.starts_with(&format!("HTTP/1.1 {status}")),
+                            "{response}"
+                        );
+                        if status == 204 {
+                            continue;
+                        }
+                        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                        if let Some(error) = error.filter(|_| noun == "control") {
+                            assert_eq!(payload["error"], error);
+                            if error == "origin_forbidden" {
+                                assert_eq!(
+                                    payload["message"],
+                                    format!("Origin is not allowed for local Ottto {noun}")
+                                );
+                            }
+                        } else if error.is_some() {
+                            assert_eq!(
+                                payload,
+                                json!({"ok":true, "version":crate::compiled_release_version()})
+                            );
+                        } else {
+                            assert_eq!(payload["machine_id"], "machine_test");
+                            assert_eq!(payload["machine_name"], "Test Mac");
+                            if noun == "health" {
+                                assert_eq!(
+                                    keys(&payload),
+                                    ["health", "machine_id", "machine_name"]
+                                );
+                                assert_eq!(
+                                    keys(&payload["health"]),
+                                    [
+                                        "account",
+                                        "blockers",
+                                        "capabilities",
+                                        "computed_at",
+                                        "device_id",
+                                        "event_schema_version",
+                                        "evidence",
+                                        "fresh_until",
+                                        "machine_id",
+                                        "observed_at",
+                                        "overall",
+                                        "projection_revision",
+                                        "projection_version",
+                                        "protocol_version",
+                                        "revision",
+                                        "runtime",
+                                        "schema_version",
+                                        "schema_version_name",
+                                        "sources",
+                                    ]
+                                );
+                                assert_eq!(payload["health"]["device_id"], "device_probe");
+                                assert_eq!(payload["health"]["machine_id"], "machine_test");
+                            } else {
+                                assert_eq!(keys(&payload), ["machine_id", "machine_name"]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Past the Origin and Host gate, the browser route forwards only its two
+    /// backend-token commands, and never as a trusted Companion.
+    #[test]
+    #[serial_test::serial]
+    fn browser_control_forwards_only_backend_token_commands_untrusted() {
+        use crate::test_effects::{Effect, Recording, Scalar};
+        use ottto_protocol::{
+            CliErrorCode, LocalClientKind, LocalControlResponse, SourceKind, TelemetryControlAction,
+        };
+        let files = crate::control::tests::ControlFilesFixture::new();
+        // A loopback stub stands in for the public release manifest, so a
+        // regressed allowlist cannot reach the network; it must see no request.
+        let manifest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind manifest stub");
+        manifest.set_nonblocking(true).unwrap();
+        let _manifest_url = crate::control::tests::EnvVarGuard::set_str(
+            "OTTTO_RELEASE_MANIFEST_URL",
+            &format!("http://{}/manifest.json", manifest.local_addr().unwrap()),
+        );
+        let launch = || LocalControlCommand::SessionLaunchPrepare {
+            schema_version: 1,
+            provider: ottto_protocol::SessionLaunchProviderV1::Codex,
+            slot_id: "missing".into(),
+            expected_account_identifier_hash: "".into(),
+            expected_organization_identifier_hash: None,
+            folder: ottto_protocol::SessionLaunchFolderV1 {
+                path: None,
+                recent_id: None,
+            },
+            terminal: None,
+        };
+        let status = || LocalControlCommand::Status {
+            refresh_agent_status: true,
+            retry_relay_authorization: true,
+        };
+        let telemetry = || LocalControlCommand::TelemetryControl {
+            action: TelemetryControlAction::Status,
+            source: SourceKind::Codex,
+            control_token: String::new(),
+            api_base_url: None,
+            key_id: None,
+            organization_id: None,
+            otlp_endpoint: None,
+            ingest_key: None,
+        };
+        let mut cases = Vec::new();
+        // Even the daemon's own token cannot widen the browser route.
+        for token in ["forged-token", TOKEN] {
+            for (command, mismatched) in [
+                (status(), false),
+                (LocalControlCommand::UpdateCheck, false),
+                (LocalControlCommand::UpdateCheck, true),
+                (launch(), false),
+            ] {
+                let error = if mismatched {
+                    "bad_request"
+                } else {
+                    "unsupported_command"
+                };
+                cases.push((command, mismatched, Some(token), Err(error)));
+            }
+        }
+        // A mismatched protocol version fails request parsing, before command
+        // filtering, so even an allowed command is a bad request.
+        cases.push((telemetry(), true, None, Err("bad_request")));
+        // A Companion claim without a token reaches dispatch untrusted.
+        cases.push((
+            telemetry(),
+            false,
+            None,
+            Ok(CliErrorCode::LocalClientNotTrusted),
+        ));
+        for (command, mismatched, token, expected) in cases {
+            let context = format!("{command:?} mismatched={mismatched}");
+            let version = ottto_protocol::expected_local_control_protocol_version(&command);
+            let body = serde_json::to_vec(&LocalControlRequest {
+                request_id: "browser-allowlist".into(),
+                protocol_version: version + u16::from(mismatched),
+                token: token.map(str::to_owned),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command,
+            })
+            .unwrap();
+            let (mut client, mut server) = loopback_pair();
+            let port = server.local_addr().unwrap().port();
+            let request = HttpRequest {
+                method: "POST".into(),
+                path: "/control".into(),
+                headers: BTreeMap::from([
+                    ("origin".to_string(), "https://app.ottto.net".to_string()),
+                    ("host".to_string(), format!("127.0.0.1:{port}")),
+                ]),
+                body,
+            };
+            let recording = Recording::start();
+            files
+                .assert_unchanged(|| handle_control_request(&mut server, &test_daemon(), request))
+                .unwrap();
+            let entered = recording.take();
+            drop(recording);
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (_, payload) = response.split_once("\r\n\r\n").unwrap();
+            let expected = match expected {
+                Ok(code) => code,
+                Err(error) => {
+                    assert!(
+                        response.starts_with("HTTP/1.1 400"),
+                        "{context}: {response}"
+                    );
+                    let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert_eq!(payload["error"], error, "{context}");
+                    assert!(entered.is_empty(), "{context}");
+                    continue;
+                }
+            };
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{context}: {response}"
+            );
+            let payload: LocalControlResponse = serde_json::from_str(payload).unwrap();
+            assert_eq!(payload.error.unwrap().code, expected, "{context}");
+            let dispatched = vec![Effect {
+                label: "control_dispatch_entered",
+                fields: vec![("trusted_companion", Scalar::Bool(false))],
+            }];
+            assert_eq!(entered, dispatched, "{context}");
+        }
+        let hits = manifest.accept();
+        assert!(
+            matches!(&hits, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the release manifest stub saw a request: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn control_cors_headers_allow_private_network_preflight() {
+        let headers = control_cors_headers(Some("https://ottto.net"))
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("https://ottto.net")
+        );
+        assert_eq!(
+            headers
+                .get("Access-Control-Allow-Private-Network")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            headers.get("Vary").map(String::as_str),
+            Some("Origin, Access-Control-Request-Private-Network")
+        );
+    }
+
+    #[test]
+    fn local_health_response_payload_strips_account_identifiers() {
+        let daemon = test_daemon().with_account(LocalAccountBinding {
+            state: LocalAccountState::Connected,
+            user: Some(LocalAccountUser {
+                id: "user_1".to_string(),
+                email: "ron@example.com".to_string(),
+                display_name: Some("Alex".to_string()),
+            }),
+            organization: Some(LocalAccountOrganization {
+                id: "org_1".to_string(),
+                name: "Ottto".to_string(),
+            }),
+            connected_at: Some("2026-06-15T19:00:00Z".to_string()),
+            last_refreshed_at: Some("2026-06-15T19:10:00Z".to_string()),
+            message: None,
+            can_reconnect: None,
+        });
+
+        let payload = local_health_response_payload(&daemon, None).expect("payload");
+
+        assert_eq!(payload["machine_id"], "machine_test");
+        assert_eq!(payload["machine_name"], "Test Mac");
+        assert_eq!(payload["health"]["machine_id"], "machine_test");
+        assert!(payload["health"].get("user_id").is_none());
+        assert!(payload["health"].get("org_id").is_none());
+        assert!(payload["health"].get("device_id").is_none());
+        assert_eq!(payload["health"]["account"]["state"], "connected");
+    }
+
+    #[test]
+    fn local_health_device_identity_requires_a_validated_browser_origin() {
+        assert_eq!(
+            local_health_browser_device_id(None, || {
+                panic!("origin-less callers must not load device identity")
+            }),
+            None
+        );
+        assert_eq!(
+            local_health_browser_device_id(Some("https://app.ottto.net"), || {
+                Some("device_current_installation".to_string())
+            }),
+            Some("device_current_installation".to_string())
+        );
+    }
+
+    #[test]
+    fn read_http_request_parses_well_formed_post() {
+        let body = b"hello-otlp";
+        let raw = format!(
+            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut bytes = raw.into_bytes();
+        bytes.extend_from_slice(body);
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        let request = read_http_request_from(&mut reader).expect("request parses");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/logs");
+        assert_eq!(
+            request.headers.get("content-type").map(String::as_str),
+            Some("application/x-protobuf")
+        );
+        assert_eq!(request.body, body);
+    }
+
+    #[test]
+    fn read_http_request_decodes_chunked_claude_logs_with_extensions_and_trailers() {
+        let body = br#"{"resourceLogs":[{"scopeLogs":[]}] }"#;
+        let split = 17;
+        let raw = format!(
+            concat!(
+                "POST /v1/logs HTTP/1.1\r\n",
+                "Host: 127.0.0.1\r\n",
+                "Content-Type: application/json\r\n",
+                "Transfer-Encoding: chunked\r\n\r\n",
+                "{:x};source=claude\r\n{}\r\n",
+                "{:x}\r\n{}\r\n",
+                "0\r\nX-Exporter-Finished: true\r\n\r\n"
+            ),
+            split,
+            String::from_utf8_lossy(&body[..split]),
+            body.len() - split,
+            String::from_utf8_lossy(&body[split..]),
+        );
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let request = read_http_request_from(&mut reader).expect("chunked request parses");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/logs");
+        assert_eq!(request.body, body);
+    }
+
+    #[test]
+    fn read_http_request_rejects_over_long_header_line() {
+        for (raw, expected) in [
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
+                raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
+                raw.push_str("\r\n\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
+                let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
+                for index in 0..lines_needed {
+                    raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            {
+                let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+                for index in 0..(MAX_HEADER_COUNT + 5) {
+                    raw.push_str(&format!("X-H-{index}: v\r\n"));
+                }
+                raw.push_str("\r\n");
+                raw
+            },
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            format!(
+                "POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_OTLP_BODY_BYTES + 1
+            ),
+            {
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..MAX_CHUNK_COUNT {
+                    raw.push_str("1\r\na\r\n");
+                }
+                raw.push_str("1\r\nb\r\n0\r\n\r\n");
+                raw
+            },
+            {
+                let extension = "a".repeat(MAX_HEADER_LINE_BYTES - 4);
+                let mut raw =
+                    String::from("POST /v1/logs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for _ in 0..=(MAX_CHUNK_FRAMING_BYTES / MAX_HEADER_LINE_BYTES) {
+                    raw.push_str(&format!("1;{extension}\r\na\r\n"));
+                }
+                raw.push_str("0\r\n\r\n");
+                raw
+            },
+        ]
+        .into_iter()
+        .zip([
+            "read header",
+            "headers too large",
+            "too many request headers",
+            "request body too large",
+            "request body too large",
+            "too many chunks",
+            "chunk framing too large",
+        ]) {
+            let mut reader = BufReader::new(raw.as_bytes());
+            let error =
+                read_http_request_from(&mut reader).expect_err("oversized HTTP framing rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_http_request_rejects_ambiguous_or_unsupported_transfer_framing() {
+        for (header, value) in [
+            ("Host", "127.0.0.1:43119"),
+            ("Origin", "https://app.ottto.net"),
+            ("Authorization", "Bearer synthetic-token"),
+        ] {
+            let raw =
+                format!("GET /whoami HTTP/1.1\r\n{header}: {value}\r\n{header}: {value}\r\n\r\n");
+            let mut reader = BufReader::new(raw.as_bytes());
+            read_http_request_from(&mut reader).expect_err("duplicate request header");
+        }
+        for raw in [
+            concat!(
+                "POST /v1/logs HTTP/1.1\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Content-Length: 5\r\n\r\n0\r\n\r\n"
+            ),
+            concat!(
+                "POST /v1/logs HTTP/1.1\r\n",
+                "Transfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
+            ),
+            concat!(
+                "POST /v1/logs HTTP/1.1\r\n",
+                "Content-Length: 0\r\n",
+                "Content-Length: 0\r\n\r\n"
+            ),
+        ] {
+            let mut reader = BufReader::new(raw.as_bytes());
+            read_http_request_from(&mut reader).expect_err("unsafe framing rejected");
+        }
+    }
+
+    #[test]
+    fn connection_guard_rejects_over_the_cap_without_leaking_slots() {
+        let baseline = ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst);
+        // Saturate the remaining slots up to the cap.
+        let mut guards = Vec::new();
+        while ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst) < MAX_CONCURRENT_RELAY_CONNECTIONS {
+            guards.push(ConnectionGuard::acquire().expect("slot available below cap"));
+        }
+        assert_eq!(
+            ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RELAY_CONNECTIONS
+        );
+
+        // At the cap, acquisition is refused and the rejected attempt must not
+        // leave the counter inflated.
+        assert!(ConnectionGuard::acquire().is_none());
+        assert_eq!(
+            ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RELAY_CONNECTIONS
+        );
+        let (_client, server) = loopback_pair();
+        let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            dispatch_relay_connection(server, SnapshotSource::ClaudeCode, &test_daemon())
+        });
+        assert_eq!(counts.otlp_relay_busy_503, 1);
+
+        drop(guards);
+        assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
+    }
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        (client, listener.accept().expect("accept").0)
+    }
+
+    /// [behaviour] A refused or unstored relay request counts its closed reason.
+    #[test]
+    fn refused_relay_requests_count_their_reason() {
+        let dir = crate::test_scratch::ScratchDir::new("relay-refusal-reasons");
+        let mut encoded = otlp_post("/v1/traces", "application/json", CLAUDE_LLM_REQUEST_TRACE);
+        encoded
+            .headers
+            .insert("content-encoding".to_string(), "br".to_string());
+        let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            let (mut client, server) = loopback_pair();
+            client.write_all(b"POST v1/logs HTTP/1.1\r\n\r\n").unwrap();
+            handle_client_at(
+                server,
+                SnapshotSource::ClaudeCode,
+                test_daemon(),
+                None,
+                &dir,
+            )
+            .unwrap();
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &encoded, &dir);
+            assert_eq!(
+                response.status, 200,
+                "not granted: acknowledged, not stored"
+            );
+            grant_claude(&dir);
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &encoded, &dir);
+            assert_eq!(response.status, 400);
+        });
+        assert_eq!(counts.otlp_relay_bad_framing_400, 1);
+        assert_eq!(counts.otlp_relay_collection_disabled, 1);
+        assert_eq!(counts.otlp_relay_unknown_content_encoding, 1);
+    }
+
+    /// One scripted `accept` result for [`ScriptedAcceptor`].
+    enum AcceptStep {
+        /// Fail with this errno, as the kernel would.
+        Fail(i32),
+        /// Accept a real pending connection.
+        Accept,
+    }
+
+    /// A relay acceptor whose `accept` fails on cue, in front of a real
+    /// listener. Running out of script is a test failure: it means the loop
+    /// kept going after it should have given up.
+    struct ScriptedAcceptor {
+        listener: TcpListener,
+        steps: std::collections::VecDeque<AcceptStep>,
+        draining: Option<bool>,
+    }
+
+    impl ScriptedAcceptor {
+        fn new(steps: Vec<AcceptStep>, draining: Option<bool>) -> Self {
+            Self {
+                listener: TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test listener"),
+                steps: steps.into(),
+                draining,
+            }
+        }
+
+        fn connect_client(&self) -> TcpStream {
+            let stream = TcpStream::connect(self.listener.local_addr().expect("local addr"))
+                .expect("connect to the test listener");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("client read timeout");
+            stream
+        }
+    }
+
+    impl RelayAcceptor for ScriptedAcceptor {
+        fn accept_stream(&mut self) -> io::Result<TcpStream> {
+            match self
+                .steps
+                .pop_front()
+                .expect("the accept loop kept going after its script ended")
+            {
+                AcceptStep::Fail(code) => Err(io::Error::from_raw_os_error(code)),
+                AcceptStep::Accept => self.listener.accept().map(|(stream, _)| stream),
+            }
+        }
+
+        fn draining(&self) -> Option<bool> {
+            self.draining
+        }
+    }
+
+    fn serve_marker(mut stream: TcpStream) {
+        let _ = stream.write_all(b"served");
+    }
+
+    fn read_marker(mut client: TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let _ = client.read_to_end(&mut received);
+        received
+    }
+
+    #[test]
+    fn accept_loop_keeps_serving_after_per_connection_and_resource_errors() {
+        // The incident: one ECONNABORTED ended the loop and the port stayed
+        // dead until the daemon restarted. Every error before the final EBADF
+        // must leave the loop serving.
+        let mut acceptor = ScriptedAcceptor::new(
+            vec![
+                AcceptStep::Fail(libc::ECONNABORTED),
+                AcceptStep::Accept,
+                AcceptStep::Fail(libc::ECONNRESET),
+                AcceptStep::Fail(libc::EINTR),
+                AcceptStep::Fail(libc::EAGAIN),
+                AcceptStep::Fail(libc::EMFILE),
+                AcceptStep::Fail(libc::ENOBUFS),
+                AcceptStep::Accept,
+                AcceptStep::Fail(libc::EBADF),
+            ],
+            Some(false),
+        );
+        let first = acceptor.connect_client();
+        let second = acceptor.connect_client();
+
+        let mut served = 0;
+        let failure = run_relay_accept_loop(&mut acceptor, &mut |stream| {
+            served += 1;
+            serve_marker(stream);
+        });
+
+        assert_eq!(served, 2);
+        assert_eq!(read_marker(first), b"served");
+        assert_eq!(read_marker(second), b"served");
+        assert!(acceptor.steps.is_empty());
+        assert!(
+            matches!(&failure, RelayListenerFailure::Unusable(error) if error.raw_os_error() == Some(libc::EBADF)),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn accept_loop_gives_up_on_a_draining_listener() {
+        let mut acceptor = ScriptedAcceptor::new(
+            vec![AcceptStep::Accept, AcceptStep::Fail(libc::ECONNABORTED)],
+            Some(true),
+        );
+        let client = acceptor.connect_client();
+
+        let failure = run_relay_accept_loop(&mut acceptor, &mut serve_marker);
+
+        assert_eq!(read_marker(client), b"served");
+        assert!(
+            matches!(failure, RelayListenerFailure::Draining(_)),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn accept_loop_rebinds_only_after_failures_with_no_success_between() {
+        // Where the drain cannot be read, a run of failures with no accepted
+        // connection is the signal. Aborts from clients that hung up early
+        // are interleaved with successes and must never add up to it.
+        let aborts = |count| (0..count).map(|_| AcceptStep::Fail(libc::ECONNABORTED));
+        let limit = RELAY_ACCEPT_FAILURE_LIMIT as usize;
+        let mut steps: Vec<AcceptStep> = aborts(limit - 1).collect();
+        steps.push(AcceptStep::Accept);
+        steps.extend(aborts(limit));
+        let mut acceptor = ScriptedAcceptor::new(steps, None);
+        let client = acceptor.connect_client();
+
+        let failure = run_relay_accept_loop(&mut acceptor, &mut serve_marker);
+
+        assert_eq!(read_marker(client), b"served");
+        assert!(acceptor.steps.is_empty());
+        assert!(
+            matches!(
+                failure,
+                RelayListenerFailure::RepeatedFailures { count, .. }
+                    if count == RELAY_ACCEPT_FAILURE_LIMIT
+            ),
+            "{failure}"
+        );
+    }
+
+    /// Drains a live relay listener the way XNU does (see
+    /// `unix_socket::tests::drain_listener`) and proves the supervisor reports
+    /// `Failed`, binds a fresh listener on the same port, reports `Connected`
+    /// again, and serves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervisor_rebinds_a_drained_listener_on_the_same_port() {
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        // SAFETY: dup of a descriptor we own; the copy is closed below.
+        let duplicate = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(duplicate >= 0, "dup listener");
+
+        let (state_tx, state_rx) = mpsc::channel();
+        thread::spawn(move || {
+            supervise_relay_listener(
+                listener,
+                |port, _attempt| {
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("rebind test relay")
+                },
+                move |state| {
+                    let _ = state_tx.send(state);
+                },
+                serve_marker,
+            )
+        });
+        let served = || {
+            TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+                .ok()
+                .map(|client| {
+                    let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+                    read_marker(client) == b"served"
+                })
+                .unwrap_or(false)
+        };
+        assert!(served(), "the relay serves before the drain");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            // SAFETY: accept on an open listening descriptor; the peer address
+            // is not requested.
+            let rc = unsafe { libc::accept(duplicate, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let _ = done_tx.send((rc, io::Error::last_os_error().raw_os_error()));
+        });
+        thread::sleep(Duration::from_millis(200));
+        // SAFETY: closes only the duplicate, while the thread above is blocked
+        // in accept on it.
+        unsafe { libc::close(duplicate) };
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closing the descriptor wakes the blocked accept"),
+            (-1, Some(libc::ECONNABORTED)),
+            "the listener must now be draining for this test to mean anything"
+        );
+
+        // A connection that reaches the drained listener is lost; the next
+        // one must reach its replacement.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !served() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay never served again after the drain"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let failed = state_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed state");
+        assert_eq!(failed.state, RelayRuntimeState::Failed);
+        assert_eq!(
+            failed.last_error.map(|error| error.code).as_deref(),
+            Some("relay_listener_failed")
+        );
+        let connected = state_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("connected state");
+        assert_eq!(connected.state, RelayRuntimeState::Connected);
+        assert_eq!(connected.endpoint, Some(format!("http://{addr}")));
+    }
+
+    pub(super) const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+    const CLAUDE_LLM_REQUEST_TRACE: &[u8] = br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeSpans":[{"spans":[{"name":"claude_code.llm_request","startTimeUnixNano":"1783728000000000000","attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"client_request_id","value":{"stringValue":"client-req-retired-forward"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+
+    fn otlp_post(path: &str, content_type: &str, body: &[u8]) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            headers: BTreeMap::from([("content-type".to_string(), content_type.to_string())]),
+            body: body.to_vec(),
+        }
+    }
+
+    /// Grant Claude to this support dir's device, as a connected install has.
+    pub(super) fn grant_claude(support_dir: &Path) {
+        ottto_core::FileDeviceStore::new(
+            support_dir.join(ottto_core::account_store::DEVICE_FILE_NAME),
+        )
+        .save(&ottto_core::LocalDeviceBinding {
+            device_id: "device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        })
+        .expect("save device grant");
+    }
+
+    /// [behaviour] Collection stops while Claude is not granted or is paused:
+    /// the export is acknowledged and nothing is appended. Once the pause
+    /// marker is gone, appends resume.
+    #[test]
+    fn claude_capture_stores_nothing_while_the_source_is_off() {
+        let dir = crate::test_scratch::ScratchDir::new("relay-capture-off");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+        let export = || {
+            let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &dir);
+            assert_export_success(&response, "application/json", b"{}");
+            crate::claude_local_otel::load_claude_effort_evidence(
+                &dir,
+                ["retired-forward-session".to_string()],
+            )
+            .ok()
+            .and_then(|evidence| evidence.get("retired-forward-session").map(Vec::len))
+            .unwrap_or(0)
+        };
+        assert_eq!(export(), 0, "not granted");
+        grant_claude(&dir);
+        crate::snapshot_sync::disable_snapshot_source(&dir, SnapshotSource::ClaudeCode)
+            .expect("pause Claude");
+        assert_eq!(export(), 0, "paused");
+        std::fs::remove_file(dir.join("snapshots/claude_code.source-disabled"))
+            .expect("clear the pause marker");
+        assert_eq!(export(), 1, "resumed");
+    }
+
+    fn assert_export_success(response: &LocalExportResponse, content_type: &str, body: &[u8]) {
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, content_type);
+        assert_eq!(response.body, body);
+    }
+
+    #[test]
+    fn retired_forward_keeps_claude_log_evidence_identical_to_direct_capture() {
+        let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs");
+        grant_claude(&relay_dir);
+        let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs-direct");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+
+        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &relay_dir);
+        crate::claude_local_otel::capture_claude_api_request_logs(
+            &direct_dir,
+            CLAUDE_API_REQUEST_LOG,
+            "application/json",
+        )
+        .expect("direct capture succeeds");
+
+        assert_export_success(&response, "application/json", b"{}");
+        let session = ["retired-forward-session".to_string()];
+        let relayed =
+            crate::claude_local_otel::load_claude_effort_evidence(&relay_dir, session.clone())
+                .expect("relayed evidence loads");
+        let direct = crate::claude_local_otel::load_claude_effort_evidence(&direct_dir, session)
+            .expect("direct evidence loads");
+        assert_eq!(relayed["retired-forward-session"].len(), 1);
+        assert_eq!(
+            serde_json::to_value(&relayed).expect("serialize relayed"),
+            serde_json::to_value(&direct).expect("serialize direct")
+        );
+        assert!(!serde_json::to_string(&relayed)
+            .expect("serialize relayed")
+            .contains("must-not-persist"));
+    }
+
+    #[test]
+    fn retired_forward_keeps_claude_trace_ownership_identical_to_direct_capture() {
+        let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces");
+        grant_claude(&relay_dir);
+        let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces-direct");
+        let request = otlp_post(
+            "/v1/traces",
+            "application/x-protobuf",
+            CLAUDE_LLM_REQUEST_TRACE,
+        );
+        let json_request = otlp_post("/v1/traces", "application/json", CLAUDE_LLM_REQUEST_TRACE);
+
+        // A protobuf exporter sending a JSON body is undecodable, not stored.
+        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &relay_dir);
+        assert_eq!(response.status, 400);
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &json_request, &relay_dir);
+        crate::claude_local_otel::capture_claude_llm_request_traces(
+            &direct_dir,
+            CLAUDE_LLM_REQUEST_TRACE,
+            "application/json",
+        )
+        .expect("direct capture succeeds");
+
+        assert_export_success(&response, "application/json", b"{}");
+        let session = ["retired-forward-session".to_string()];
+        let relayed = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+            &relay_dir,
+            session.clone(),
+        );
+        let direct =
+            crate::claude_local_otel::load_claude_trace_ownership_evidence(&direct_dir, session);
+        assert_eq!(relayed.evidence["retired-forward-session"].len(), 1);
+        assert_eq!(relayed, direct);
+    }
+
+    #[test]
+    fn retired_forward_acknowledges_protobuf_exports_without_a_local_consumer() {
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-ack");
+        for (source, path) in [
+            (SnapshotSource::ClaudeCode, "/v1/metrics"),
+            (SnapshotSource::Codex, "/v1/logs"),
+            (SnapshotSource::Codex, "/v1/traces"),
+        ] {
+            let request = otlp_post(path, "application/x-protobuf", b"\x0a\x00");
+            let response = local_otlp_export_response(source, &request, &support_dir);
+            assert_export_success(&response, "application/x-protobuf", b"");
+        }
+        assert_eq!(
+            std::fs::read_dir(&*support_dir)
+                .expect("scratch dir lists")
+                .count(),
+            0,
+            "exports without a local consumer store nothing"
+        );
+    }
+
+    #[test]
+    fn retired_forward_reports_local_failures_with_non_retryable_statuses() {
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-failures");
+        grant_claude(&support_dir);
+        let malformed = otlp_post("/v1/logs", "application/json", b"{not json");
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &malformed, &support_dir);
+        assert_eq!(response.status, 400);
+
+        // A regular file where the evidence directory should be makes the
+        // evidence append fail after a successful decode.
+        std::fs::write(support_dir.join("local-otel"), b"").expect("write blocking file");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_eq!(response.status, 500);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("JSON error body");
+        assert_eq!(body["error"], "local_capture_failed");
+    }
+
+    #[test]
+    fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
+        use std::io::Write as _;
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
+        grant_claude(&support_dir);
+        let gzip_member = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).expect("compress fixture");
+            encoder.finish().expect("finish gzip")
+        };
+        // An empty first member must not hide the export in the next one.
+        let mut body = gzip_member(b"");
+        body.extend(gzip_member(CLAUDE_API_REQUEST_LOG));
+        let mut request = otlp_post("/v1/logs", "application/json", &body);
+        request
+            .headers
+            .insert("content-encoding".to_string(), "gzip".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_export_success(&response, "application/json", b"{}");
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
+            &support_dir,
+            ["retired-forward-session".to_string()],
+        )
+        .expect("gzip evidence loads");
+        assert_eq!(evidence["retired-forward-session"].len(), 1);
+
+        request
+            .headers
+            .insert("content-encoding".to_string(), "br".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_eq!(response.status, 400);
+    }
+}

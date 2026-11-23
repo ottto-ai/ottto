@@ -1,0 +1,40 @@
+{
+  "five_hour": {
+    "utilization": 12.0,
+    "resets_at": "2026-10-01T15:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 40.0,
+    "resets_at": "2026-10-04T05:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "iguana_necktie": null,
+  "cinder_cove": null,
+  "wattle_ember": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": "org_spend_cap_reached",
+    "user_disabled": false,
+    "spend_limit_reached": true,
+    "credits_ever_enabled": true
+  },
+  "spend": {
+    "enabled": false,
+    "disabled_reason": "org_spend_cap_reached",
+    "used": null,
+    "limit": null,
+    "percent": null,
+    "severity": null,
+    "balance": null
+  }
+}

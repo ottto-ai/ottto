@@ -1,0 +1,26 @@
+{
+  "request_id": "req_cli_sessions_fixture",
+  "protocol_version": 15,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "agent_sessions",
+  "query": {
+    "limit": 25,
+    "cursor": "next_fixture",
+    "range": "today",
+    "start_date": "2026-06-01",
+    "end_date": "2026-06-05",
+    "timezone": "America/Los_Angeles",
+    "source": "codex",
+    "model": "gpt-5.3-codex",
+    "billing_provider": "openai",
+    "billing_channel": "subscription",
+    "source_plan_profile_id": "profile_fixture",
+    "min_cost": "1.25",
+    "max_cost": "7.5",
+    "sort_by": "cost",
+    "sort_dir": "desc",
+    "search": "roadmap",
+    "all_machines": true
+  }
+}

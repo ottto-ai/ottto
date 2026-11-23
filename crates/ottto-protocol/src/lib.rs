@@ -1,0 +1,9239 @@
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+use zeroize::Zeroize;
+
+mod credit_amount;
+mod session_launch;
+pub use credit_amount::{scale_decimal, scale_minor, CreditAmount};
+pub use session_launch::*;
+
+pub const PROTOCOL_VERSION: u16 = 15;
+pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+/// Command-scoped version for `provider_daily_reference_control`. Older daemons
+/// reject it outright, so a UI that can drive this consent is told to update
+/// rather than silently doing nothing. Every unrelated command stays on the
+/// base version for mixed-owner upgrade compatibility.
+pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 18;
+/// Command-scoped version for the machine-local Claude account registry
+/// operations. Additive v18 fields are presence-gated by newer clients so old
+/// status callers and commands remain valid during a rolling upgrade.
+pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
+/// Command-scoped version for mutations that bind a daemon-authored anchor
+/// target to an exact account+organization pair.
+pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
+/// Command-scoped version for provider-owned Claude browser authentication.
+/// The v18/v19 prepare and reconnect commands retain their terminal-only side
+/// effects; only explicit v23 commands may start `claude auth login`.
+pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
+/// Retired command-scoped version of the former Claude authorization-code
+/// submission. It is recognized only so a request from an older client gets a
+/// structured, authorized rejection; no command at this version is accepted.
+pub const CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION: u16 = 25;
+/// Command-scoped version for the machine-local Codex durable-account registry.
+/// v21 adds daemon-authored workspace targets and target-bound setup. v24 makes
+/// a setup check nonterminal while provider sign-in is still pending, allowing
+/// clients to poll safely until the exact account/workspace proof is ready.
+/// The base protocol remains unchanged so older clients continue to use every
+/// unrelated command during a rolling local-runtime upgrade.
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
+/// Command-scoped version for a Codex sign-in the daemon runs itself: it
+/// starts `codex login` for the managed home of the current setup operation,
+/// supervises it and checks the account once when it ends. The v24 commands
+/// keep their meaning; clients send v26 only when the status carries
+/// `daemon_sign_in_supported`.
+pub const CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION: u16 = 26;
+/// Command-scoped version for the Codex background limit refresh switch
+/// (`codex_account_set_quota_refresh_consent`). An older daemon rejects it
+/// instead of accepting a switch it would not honor; clients send v27 only
+/// when the status carries `background_quota_refresh`.
+pub const CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION: u16 = 27;
+/// Destructive installation reset is command-scoped so an older daemon cannot
+/// accept the request while silently ignoring `forget_installation`.
+pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
+pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
+pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
+pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
+    "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
+
+pub type Rfc3339Timestamp = String;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretString(<redacted>)")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingSystem {
+    Macos,
+    Windows,
+    Linux,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Codex,
+    ClaudeCode,
+    Pi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthGrade {
+    Ok,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    Healthy,
+    NeedsRepair,
+    NeedsConfirmation,
+    NotFound,
+    Verifying,
+    Failed,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineIdentity {
+    pub machine_id: String,
+    pub installation_id: String,
+    pub display_name: String,
+    pub hostname: String,
+    pub os: OperatingSystem,
+    pub arch: String,
+    pub local_platform_version: String,
+    /// One-way hardware id: `oth_` + the first 32 hex characters of
+    /// `sha256("ottto-hardware:v1:" + <IOPlatformUUID>)`, never the raw
+    /// platform identifier. Populated when available so the backend can dedup
+    /// the same physical machine even if `machine_id` differs across
+    /// reinstalls (ioreg-fallback vs. canonical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_uuid: Option<String>,
+    /// Privacy-safe discriminator for the OS account this install runs under.
+    ///
+    /// WHY IT EXISTS: `machine_id` is per-Mac (`sha256("macos:<IOPlatformUUID>")`),
+    /// so several installs on one Mac share it — each macOS user account keeps
+    /// its own agent config (e.g. its own `~/.codex/config.toml`). Without this
+    /// field a product surface cannot tell "a different macOS user account on
+    /// this Mac" apart from "the same account after a reinstall".
+    ///
+    /// WHAT IT IS: `otu_` + the first 32 hex characters of
+    /// `sha256("account:<machine_id>:<posix uid>")`, so it is display-safe.
+    ///
+    /// WHAT IT IS NOT: not a username, not a home directory, not a path, not
+    /// the uid — the uid is digest input only and never appears in the value.
+    /// The derivation is one-way, so the value is not reversible to a person.
+    ///
+    /// GUARANTEE: identical for the same OS account on the same machine across
+    /// daemon restarts AND across reinstalls, because it is derived rather than
+    /// generated-and-stored (that is what `installation_id` already does);
+    /// distinct for a different OS account on the same machine; distinct for
+    /// the same uid on a different machine. `None` when no POSIX uid can be
+    /// determined — never a fabricated value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub protocol_version: u16,
+    pub daemon_version: String,
+    pub machine: MachineIdentity,
+    pub account: LocalAccountBinding,
+    pub daemon: DaemonRuntimeState,
+    #[serde(default)]
+    pub service_owner: ServiceOwnerState,
+    pub relay: RelayState,
+    pub sources: Vec<SourceHealth>,
+    pub update: UpdateState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_health: Option<CanonicalLocalHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_heartbeat: Option<MachineRuntimeHeartbeatV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_health_events: Vec<LocalHealthEventV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_ledger: Vec<LocalHealthCommandResultV1>,
+    pub generated_at: Rfc3339Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthContractFixture {
+    pub fixture_schema_version: String,
+    pub case_id: String,
+    pub title: String,
+    pub contract_version: String,
+    pub stable_runtime_version: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_stable_input: Option<serde_json::Value>,
+    pub health: LocalMachineHealthV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<MachineRuntimeHeartbeatV1>,
+    #[serde(default)]
+    pub events: Vec<LocalHealthEventV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<LocalHealthCommandV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_result: Option<LocalHealthCommandResultV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_job: Option<BackfillJobV1>,
+    pub expected: LocalHealthFixtureExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthFixtureExpectation {
+    pub overall_state: LocalHealthOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<String>,
+    #[serde(default)]
+    pub preserved_login: bool,
+    #[serde(default)]
+    pub preserved_sources: Vec<SourceKind>,
+    #[serde(default)]
+    pub requires_public_runtime_followup: bool,
+    #[serde(default)]
+    pub requires_private_consumer_followup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalMachineHealthV1 {
+    pub schema_version: u16,
+    pub schema_version_name: String,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub revision: u64,
+    pub projection_revision: u64,
+    pub protocol_version: String,
+    pub projection_version: String,
+    pub event_schema_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub observed_at: Rfc3339Timestamp,
+    pub computed_at: Rfc3339Timestamp,
+    pub fresh_until: Rfc3339Timestamp,
+    pub overall: LocalHealthOverall,
+    pub runtime: RuntimeIdentityV1,
+    pub account: LocalHealthAccountV1,
+    #[serde(default)]
+    pub sources: Vec<LocalHealthSourceV1>,
+    #[serde(default)]
+    pub blockers: Vec<LocalHealthBlockerV1>,
+    #[serde(default)]
+    pub evidence: Vec<LocalHealthEvidenceRefV1>,
+}
+
+pub type CanonicalLocalHealth = LocalMachineHealthV1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthOverall {
+    pub state: LocalHealthOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<String>,
+    pub severity: LocalHealthSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthOverallState {
+    Healthy,
+    Degraded,
+    Blocked,
+    UpgradeRequired,
+    ReconnectRequired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthSeverity {
+    Info,
+    Warning,
+    Blocking,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeIdentityV1 {
+    pub install_owner: InstallOwner,
+    pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_pid: Option<u32>,
+    pub service_executable_path_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_executable_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_loaded_program_hash: Option<String>,
+    pub started_at: Rfc3339Timestamp,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub version_match: bool,
+    pub protocol_match: bool,
+    pub schema_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthAccountV1 {
+    pub state: LocalHealthAccountState,
+    pub device_state: LocalDeviceState,
+    pub setup_run_state: LocalSetupRunState,
+    pub setup_token_state: LocalSetupTokenState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_controls: Option<OrgTelemetryControlState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgTelemetryControlState {
+    pub read_only: bool,
+    pub can_mutate_sources: bool,
+    pub can_enable_telemetry: bool,
+    pub can_disable_telemetry: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthAccountState {
+    Connected,
+    ReconnectRequired,
+    NotConnected,
+    ClaimPending,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDeviceState {
+    Active,
+    Inactive,
+    StaleHeartbeat,
+    CollisionSuspected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSetupRunState {
+    Complete,
+    Pending,
+    RefreshRequired,
+    RebindRequired,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSetupTokenState {
+    Valid,
+    Expired,
+    RefreshRequired,
+    Rebound,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthSourceV1 {
+    pub source_id: String,
+    pub app: SourceKind,
+    pub state: LocalHealthSourceState,
+    pub authority: LocalHealthAuthority,
+    pub authority_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    pub projection_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthSourceState {
+    Healthy,
+    RepairRequired,
+    VerifyFailed,
+    PendingSetup,
+    Removed,
+    DisabledByPolicy,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthAuthority {
+    Runtime,
+    Heartbeat,
+    Backend,
+    Verify,
+    Command,
+    Backfill,
+    Diagnostics,
+    Setup,
+    Reducer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthBlockerV1 {
+    pub code: String,
+    pub severity: LocalHealthSeverity,
+    pub owner: String,
+    // Existing wire string: authority for machine blockers, slug for source blockers.
+    pub source: String,
+    pub since: Rfc3339Timestamp,
+    pub clear_condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthEvidenceRefV1 {
+    pub event_id: String,
+    pub event_type: String,
+    pub authority: LocalHealthAuthority,
+    pub observed_at: Rfc3339Timestamp,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthEventV1 {
+    pub event_id: String,
+    pub event_schema_version: String,
+    pub event_type: String,
+    pub machine_id: String,
+    pub observed_at: Rfc3339Timestamp,
+    pub sequence: u64,
+    pub authority: LocalHealthAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineRuntimeHeartbeatV1 {
+    pub schema_version: String,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_bundle_version: Option<String>,
+    pub protocol_version: String,
+    pub health_schema_version: String,
+    pub executable_path: String,
+    pub install_owner: InstallOwner,
+    pub launchd_label: String,
+    pub started_at: Rfc3339Timestamp,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub health_projection_revision: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthCommandV1 {
+    pub action_id: String,
+    pub idempotency_key: String,
+    pub actor: LocalHealthCommandActor,
+    pub target: LocalHealthCommandTarget,
+    pub expected_projection_revision: u64,
+    pub command_schema_version: String,
+    pub command: String,
+    pub issued_at: Rfc3339Timestamp,
+    pub expires_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthCommandActor {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthCommandTarget {
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<SourceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthCommandResultV1 {
+    pub action_id: String,
+    pub idempotency_key: String,
+    pub command_schema_version: String,
+    pub status: LocalHealthCommandStatus,
+    pub terminal: bool,
+    pub started_projection_revision: u64,
+    pub completed_projection_revision: u64,
+    pub observed_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthCommandStatus {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Rejected,
+    Deduped,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackfillJobV1 {
+    pub job_id: String,
+    pub machine_id: String,
+    pub source_id: String,
+    pub app_id: SourceKind,
+    pub from: Rfc3339Timestamp,
+    pub to: Rfc3339Timestamp,
+    pub reason: String,
+    pub schema_version: String,
+    pub priority: String,
+    pub retention_limit: String,
+    pub created_at: Rfc3339Timestamp,
+    pub expires_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<BackfillJobProgressV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillJobProgressV1 {
+    pub status: String,
+    pub accepted_chunks: u64,
+    pub deduped_chunks: u64,
+    pub rejected_chunks: u64,
+    pub completed_at: Rfc3339Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAccountBinding {
+    pub state: LocalAccountState,
+    pub user: Option<LocalAccountUser>,
+    pub organization: Option<LocalAccountOrganization>,
+    pub connected_at: Option<Rfc3339Timestamp>,
+    pub last_refreshed_at: Option<Rfc3339Timestamp>,
+    pub message: Option<StableMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_reconnect: Option<bool>,
+}
+
+impl LocalAccountBinding {
+    pub fn not_connected() -> Self {
+        Self {
+            state: LocalAccountState::NotConnected,
+            user: None,
+            organization: None,
+            connected_at: None,
+            last_refreshed_at: None,
+            message: None,
+            can_reconnect: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalAccountState {
+    NotConnected,
+    ClaimPending,
+    ReattachRequired,
+    Connected,
+    ResetRequired,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAccountUser {
+    pub id: String,
+    pub email: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAccountOrganization {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStartResponse {
+    pub account: LocalAccountBinding,
+    pub claim_code: String,
+    pub claim_url: String,
+    pub nonce: String,
+    pub expires_at: Rfc3339Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCompleteResponse {
+    pub account: LocalAccountBinding,
+    pub setup_run_id: String,
+    pub setup_run_token_expires_at: Rfc3339Timestamp,
+    pub machine_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthResetResponse {
+    pub account: LocalAccountBinding,
+    pub removed_account: Option<LocalAccountBinding>,
+    pub local_only: bool,
+    pub cloud_disconnected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
+    pub message: StableMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonRuntimeState {
+    Running,
+    Starting,
+    Stopping,
+    RepairLocked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayState {
+    pub state: RelayRuntimeState,
+    pub endpoint: Option<String>,
+    pub last_connected_at: Option<Rfc3339Timestamp>,
+    pub last_error: Option<StableMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRuntimeState {
+    Connected,
+    Disconnected,
+    Starting,
+    Stopping,
+    Disabled,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceHealth {
+    pub source: SourceKind,
+    pub descriptor: SourceDescriptor,
+    pub state: SourceState,
+    pub grade: HealthGrade,
+    pub account_binding: AccountBindingState,
+    pub config: SourceConfigState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<LocalCollectorHealth>,
+    /// This run's local scan health. Absent means unknown, never healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<SourceCollectionHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatusSnapshot>,
+    #[serde(default)]
+    pub plan_observations: Vec<AgentStatusPlanObservation>,
+    /// Per-billing-destination usage detected from local session snapshots,
+    /// grouped by `(gateway_provider, plan_fingerprint, account_identifier_hash)`.
+    /// Populated by the daemon from the snapshot scan; the Companion renders
+    /// these in its "Detected Uses" panel. Empty when nothing has been
+    /// observed yet (the field is omitted from the wire in that case).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_uses: Vec<DetectedUse>,
+    /// Sessions whose transcript activity advanced during the most recent
+    /// successful local reconciliation and is still recent enough to be
+    /// considered active. This is machine-local status, not historical
+    /// analysis; older daemons omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_reconciliation: Option<ActiveSessionReconciliation>,
+    /// Local observation after Repair; independent of backend/config health.
+    /// `confirmed` is persisted and terminal until the next Repair (or an eligibility clear).
+    /// Apps read `state`, never derive it from timestamps, and treat confirmation as a
+    /// one-time acknowledgement before falling back to the ordinary source row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_confirmation: Option<TrackingConfirmation>,
+    pub last_seen_at: Option<Rfc3339Timestamp>,
+    pub last_verified_at: Option<Rfc3339Timestamp>,
+    pub problems: Vec<HealthProblem>,
+    pub recommended_actions: Vec<RepairAction>,
+    /// When this source was first observed on this machine (persisted daemon
+    /// first-seen, not the in-memory session start). The Companion App v2 shows
+    /// it on the source row. Absent on daemons that predate the field, so the
+    /// Swift decoder treats it as optional and falls back to an honest blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<Rfc3339Timestamp>,
+    /// Whether a local telemetry key is configured for this source (Codex /
+    /// Claude Code only). `None` for sources without local telemetry (e.g. Pi)
+    /// and for daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_configured: Option<bool>,
+    /// Whether local usage reconciliation is enabled for this source, per the
+    /// most recent workspace activity hint the daemon fetched. `None` when the
+    /// daemon has not yet learned the policy (the Companion renders an honest
+    /// "managed by workspace" state) and for daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_enabled: Option<bool>,
+    /// This source alone is paused on this Mac (Pause, or the web's per-source
+    /// off), as opposed to the machine-wide collection switch. Always sent;
+    /// absent only from daemons that predate per-source pause.
+    #[serde(default)]
+    pub source_paused: bool,
+}
+
+/// RAM-only local collection observation; independent of upload settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCollectionHealth {
+    pub state: SourceCollectionState,
+    /// Last completed scan observed by this daemon run, including empty scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_at: Option<Rfc3339Timestamp>,
+    /// Present only for server_backoff; wall time projected from its awake deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCollectionState {
+    Collecting,
+    Stalled,
+    ServerBackoff,
+    Offline,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackingConfirmation {
+    pub state: TrackingConfirmationState,
+    pub since: Rfc3339Timestamp,
+    pub confirmed_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingConfirmationState {
+    Waiting,
+    Confirmed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Bounded machine-local status from the latest completed incremental
+/// transcript scan. `sessions` lists every session with recent activity, kept
+/// across scans until that activity ages out; `changed_session_count` counts
+/// only the sessions whose activity advanced in the latest scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionReconciliation {
+    /// Start of the completed Claude activity scan. Absent for other sources,
+    /// cleared lists, and older caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_started_at: Option<Rfc3339Timestamp>,
+    pub reconciled_at: Rfc3339Timestamp,
+    /// Maximum parsed session activity time for this source on this Mac,
+    /// filtered to at most five minutes after reconciliation before taking the
+    /// maximum, then carried forward across scans and cleared active lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+    /// Recency window used by the daemon; older caches used fifteen minutes.
+    #[serde(default = "default_active_window_seconds")]
+    pub active_window_seconds: u64,
+    pub changed_session_count: u64,
+    #[serde(default)]
+    pub sessions: Vec<ActiveSession>,
+}
+
+fn default_active_window_seconds() -> u64 {
+    15 * 60
+}
+
+/// One recently changed local coding-agent session. Every field is
+/// content-free or already part of the usage snapshot contract. Account hashes
+/// are present only when the scan captured direct session/account evidence or
+/// a matching current-login observation at the same reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_display_name: Option<String>,
+    /// Provider-native session start, when the local transcript exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_started_at: Option<Rfc3339Timestamp>,
+    pub source_last_activity_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_context_fill_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_timestamps: Vec<Rfc3339Timestamp>,
+    /// Context sizes around each compaction: the same newest-64 list as
+    /// `compaction_timestamps`, `at` byte-identical to an entry of it. Sizes
+    /// use the measure of the first/latest context fields below. Empty when
+    /// the source states no sizes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_events: Vec<ActiveSessionCompaction>,
+    /// Prompt size of the session's first counted request (session start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn_context_tokens: Option<u64>,
+    /// Prompt size of the session's latest counted request ("now").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
+    /// Recorded context points for the Sessions graph, oldest first, unique
+    /// by time: the first request, the latest timed request, the last request
+    /// of each 15-minute slot, and big changes in between; at most 64,
+    /// thinned evenly so the whole session
+    /// span stays visible. Not every request. Local only, never uploaded;
+    /// present only while the session was active within the last 75 minutes
+    /// when it was read. Each point is a `[unix_seconds, tokens]` pair (whole
+    /// seconds, UTC). A request without a usable timestamp adds no point;
+    /// while only the pinned first point exists, another request in that
+    /// same second also adds no point, so the last point can differ from Last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_points: Vec<ActiveSessionContextPoint>,
+    /// Cumulative observed session counters. Optional keeps older daemons and
+    /// sources that cannot prove a counter honest in the Companion UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Subset of output tokens spent on reasoning, when the source reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+    /// Provider total that could not be assigned to a named counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattributed_total_tokens: Option<u64>,
+    /// Whether `input_tokens` excludes or includes cached input. Free-form and
+    /// additive so provider semantics can evolve without breaking old apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_scope: Option<String>,
+    /// Content-free role used only for a truthful fallback title, when no
+    /// provider title exists: `subagent`, `automation`, or `headless`.
+    ///
+    /// `headless` says only that the provider recorded a non-interactive entry
+    /// point for this run. It does not claim a parent, an agent, or a finished
+    /// run, and a person can produce it by typing `codex exec` themselves. Apps
+    /// must word it that way and must never read it as a relationship. Values
+    /// are additive; treat an unknown one as no role rather than failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
+    /// Canonical provider client that ran the session, when direct transcript
+    /// evidence proves it (for example `codex_desktop` or `codex_cli`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_surface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_attribution_source: Option<String>,
+    /// Content-free reason the daemon withheld this session's account, so an
+    /// app can say why instead of a bare "unknown". Closed values:
+    /// `multiple_accounts` (the session's own request evidence names more than
+    /// one account), `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness) and `too_many_accounts`
+    /// (more accounts than one upload may carry, so the session is held and
+    /// not uploaded). Only ever set while
+    /// `account_identifier_hash` is absent, and never names an account. Apps
+    /// must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_withheld_reason: Option<String>,
+    /// Model the session was MOST RECENTLY seen running, not its lifetime
+    /// primary. An active session's card answers "what is it running right
+    /// now", so a long session that switched models must not keep showing the
+    /// model it retired hours ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_model: Option<String>,
+    /// Reasoning-effort tier co-located with `latest_model`, on the same
+    /// most-recent basis. `None` when the source stamped no tier - never a
+    /// configured default standing in for observed evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reasoning_effort: Option<String>,
+    /// Pi only: the provider route of the same newest usage row as
+    /// `latest_model`, as the transcript names it (normalized, for example
+    /// `google_vertex`). A display label for a source with no account; it
+    /// never names an account or an auth kind. Absent for other sources and
+    /// when the row records no provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<String>,
+    /// The account handling this session NOW: the identity of the session's
+    /// newest own request, never the current login or a lifetime payer.
+    /// Absent when the daemon could not compute it (older daemon, source
+    /// without per-request identity); apps must not substitute the cumulative
+    /// account fields above for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_account: Option<ActiveSessionCurrentAccount>,
+    /// The session's usage per distinct (account, workspace, subscription),
+    /// compared on the full triple. Empty when not computed. When present the
+    /// entries' counters sum to the session's counted usage; an entry without
+    /// an account is usage no request evidence names. Local display only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_history: Vec<ActiveSessionAccountUse>,
+}
+
+/// The account of an active session's newest own request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCurrentAccount {
+    /// `known` or `unknown`. Apps must treat any other value as `unknown`.
+    pub status: String,
+    /// Present exactly when `status` is `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    /// The workspace that request's own evidence names; absent when it names
+    /// none. Never borrowed from the login or another request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    /// When the newest own request ran, known or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_request_at: Option<Rfc3339Timestamp>,
+    /// Content-free reason, only while `unknown`: `latest_request_unidentified`,
+    /// `conflicting_latest_requests`, `request_order_unavailable` or
+    /// `identity_withheld`. Apps must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
+}
+
+/// One (account, workspace, subscription) an active session used, with its
+/// exact counted usage. No money: local display only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionAccountUse {
+    /// Absent: usage no request evidence names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Newest own transcript request of this triple, when provable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<Rfc3339Timestamp>,
+    /// This triple is exactly `current_account`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current: bool,
+}
+
+/// One compaction of an active session. Sizes are prompt sizes, never billed
+/// tokens: `before_tokens` is the last owned request before the compaction,
+/// `after_tokens` the first owned request after it (absent until seen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCompaction {
+    pub at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tokens: Option<u64>,
+    /// Closed values `auto`, `manual` or `idle` when the source states them
+    /// (Claude Code). Codex states none. Apps must hide an unknown value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// One recorded prompt size of an active session at the request's own time,
+/// on the wire as a compact `[unix_seconds, tokens]` pair: whole seconds since
+/// the Unix epoch (UTC), then the prompt size in tokens. A plain tuple alias,
+/// not a tuple struct, so source-derived decode guards keep reading the
+/// protocol's named-field structs unchanged.
+pub type ActiveSessionContextPoint = (i64, u64);
+
+/// One detected billing destination for a source, as observed from local
+/// session telemetry. The Companion keys rows on
+/// `[gateway_provider, plan_fingerprint ?? "", account_identifier_hash ?? ""]`
+/// (see `DetectedUse.id` in the Swift client), so that triple is the grouping
+/// key the daemon produces one entry per. Optionals use
+/// `skip_serializing_if = "Option::is_none"` to match the Swift lenient
+/// decoder, which tolerates absent keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedUse {
+    pub gateway_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub token_volume_recent: Vec<DetectedUseTokenSample>,
+    pub quota_window_state: DetectedUseQuotaWindowState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_used_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_resets_at: Option<Rfc3339Timestamp>,
+}
+
+/// One point in a `DetectedUse` token-volume sparkline: the bucket start time
+/// and the total tokens attributed to that destination within the bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedUseTokenSample {
+    pub at: Rfc3339Timestamp,
+    pub tokens: u64,
+}
+
+/// Live quota state for the destination that matches the source's current
+/// plan. Historical destinations stay `Unknown` (the daemon never smears the
+/// current plan's quota across destinations it does not belong to). Matches
+/// the Swift `DetectedUseQuotaWindowState` snake_case cases exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectedUseQuotaWindowState {
+    Ok,
+    NearLimit,
+    Exhausted,
+    RateLimited,
+    Stale,
+    Error,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalSnapshot {
+    pub schema_version: String,
+    pub generated_at: Rfc3339Timestamp,
+    pub machine_id: String,
+    #[serde(default)]
+    pub sources: Vec<PersonalMeterLocalSourceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalSourceSnapshot {
+    pub source: SourceKind,
+    pub app: String,
+    /// Local runtime evidence is never a backend-owned meter total. Consumers
+    /// must reconcile it as local freshness/pending evidence only.
+    pub included_in_totals: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<PersonalMeterLocalAccount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    pub pending_local_delta: PersonalMeterLocalDelta,
+    pub freshness: PersonalMeterLocalFreshness,
+    pub collector: PersonalMeterLocalCollector,
+    #[serde(default)]
+    pub confidence: AgentStatusConfidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalAccount {
+    pub login_state: AgentLoginState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default)]
+    pub confidence: AgentStatusConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalDelta {
+    pub status: PersonalMeterLocalValueStatus,
+    pub included_in_totals: bool,
+    pub basis: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_micros: Option<u64>,
+    #[serde(default)]
+    pub detected_use_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_token_volume: Vec<DetectedUseTokenSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalFreshness {
+    pub status: PersonalMeterLocalFreshnessStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_last_success_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalCollector {
+    pub status: PersonalMeterLocalCollectorStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<LocalCollectorState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_usage_reconciliation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_started_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_finished_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub last_uploaded_count: u64,
+    #[serde(default)]
+    pub last_scanned_session_count: u64,
+    #[serde(default)]
+    pub last_scanned_file_count: u64,
+    #[serde(default)]
+    pub last_scan_cap_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalValueStatus {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalFreshnessStatus {
+    Fresh,
+    Stale,
+    Error,
+    Unsupported,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalCollectorStatus {
+    Ok,
+    Disabled,
+    Failing,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceDescriptor {
+    pub source: SourceKind,
+    pub display_name: String,
+    pub operations: Vec<SourceOperationDescriptor>,
+    pub review_tier: ConnectorReviewTier,
+    pub maturity: ConnectorMaturity,
+    pub collectors: Vec<CollectorDescriptor>,
+    pub local_state_owner: SourceStateOwner,
+    pub telemetry_owner: SourceStateOwner,
+    pub repair_owner: SourceStateOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorDescriptor {
+    pub collector_id: String,
+    pub display_name: String,
+    pub operations: Vec<SourceOperation>,
+    pub data_source_kind: CollectorDataSourceKind,
+    pub default_state: CollectorDefaultState,
+    pub review_tier: ConnectorReviewTier,
+    pub maturity: ConnectorMaturity,
+    pub risk_classes: Vec<CollectorRiskClass>,
+    pub uploads_raw_content: bool,
+    pub emits: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorReviewTier {
+    Official,
+    OtttoLabs,
+    ReviewedCommunity,
+    Community,
+    CustomLocal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorMaturity {
+    Stable,
+    Beta,
+    Experimental,
+    UndocumentedSurface,
+    WritesConfig,
+    LocalOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorDataSourceKind {
+    LocalEnriched,
+    LiveTelemetry,
+    IntegrationConnector,
+    CloudBillingConnector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorDefaultState {
+    Enabled,
+    RequiresSetup,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorRiskClass {
+    AuthAdjacent,
+    NetworkCalls,
+    HiddenCredentialRead,
+    RawPromptOrOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStateOwner {
+    LocalDaemon,
+    Backend,
+    CompanionClient,
+    ExternalApp,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceOperationDescriptor {
+    pub operation: SourceOperation,
+    pub supported: bool,
+    pub state: SourceOperationState,
+    pub requires_approval: bool,
+    pub destructive: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOperation {
+    Detect,
+    Verify,
+    Repair,
+    CollectUsage,
+    MonitorQuota,
+    UploadSnapshot,
+    Diagnostics,
+    UninstallRestore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOperationState {
+    Available,
+    RequiresSetup,
+    Degraded,
+    Unsupported,
+    Disabled,
+}
+
+/// Display-safe default settings captured for an agent runtime.
+///
+/// These are config/CLI defaults, not proof that a completed session ran with
+/// the same values. The backend keeps them separate from per-session selector
+/// evidence (`AgentRuntimeDefaultsSnapshot`), and surfaces them on the apps
+/// page, session-start defaults, and Advisor facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentRuntimeDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Effort saved per model (Claude Code `modelSettings`), keyed by model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_effort_by_model: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selector_context: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selector_sources: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusSnapshot {
+    pub source: SourceKind,
+    pub status: AgentStatusState,
+    pub collection_method: AgentStatusCollectionMethod,
+    pub captured_at: Rfc3339Timestamp,
+    pub expires_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AgentAccountStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<AgentModelStatus>,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    pub credit_balances: Vec<AgentCreditBalance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<AgentContextStatus>,
+    #[serde(default)]
+    pub capabilities: Vec<AgentCapabilityGap>,
+    #[serde(default)]
+    pub plan_observations: Vec<AgentStatusPlanObservation>,
+    #[serde(default)]
+    pub diagnostics: Vec<AgentStatusDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_defaults: Option<AgentRuntimeDefaults>,
+}
+
+impl AgentStatusSnapshot {
+    /// Whether this is a Codex snapshot of a failed usage read: the probe
+    /// failed, or a registered account could not be verified.
+    fn is_codex_failed_usage_read(&self) -> bool {
+        self.source == SourceKind::Codex
+            && self.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "codex_usage_probe_failed" | "codex_configured_account_unavailable"
+                )
+            })
+    }
+
+    pub fn redacted_for_backend(mut self) -> Self {
+        if self.is_codex_failed_usage_read() {
+            // A failed Codex usage read is uploaded as a failure only. The
+            // daemon's last-known reading (stale meters) is local display; the
+            // backend owns carry-forward of its own last good reading. Plan
+            // words and the subscription period on such a row come from the
+            // local credential, not from the provider, so they are not
+            // uploaded either. `billing_channel` stays: it is the registered
+            // route of the account, part of the identity the backend files
+            // the row under, not a plan fact.
+            self.quota_windows
+                .retain(|window| window.freshness != AgentQuotaWindowFreshness::Stale);
+            self.credit_balances.clear();
+            self.plan_observations.clear();
+            if let Some(account) = self.account.as_mut() {
+                account.plan_type = None;
+                account.subscription_product = None;
+                account.subscription_period_start = None;
+                account.subscription_period_end = None;
+                account.subscription_period_last_checked_at = None;
+            }
+        }
+        if let Some(account) = self.account.as_mut() {
+            // Display text travels only on this status carrier. Raw provider
+            // account and selected organization/workspace ids are identifiers,
+            // not credentials, and are uploaded beside their domain-separated
+            // hashes so the backend can recompute the hashes from the original
+            // roles. Anything that is not a plain provider id is dropped.
+            account.email = safe_status_display_text(account.email.take(), 320);
+            account.account_id = safe_provider_identifier(account.account_id.take());
+            account.organization_id = safe_provider_identifier(account.organization_id.take());
+            account.organization_label =
+                safe_status_display_text(account.organization_label.take(), 255);
+            account.provider = safe_optional_text(account.provider.take());
+            account.auth_method = safe_optional_text(account.auth_method.take());
+            account.plan_type = safe_optional_text(account.plan_type.take());
+            account.subscription_product = safe_optional_text(account.subscription_product.take());
+            account.billing_channel = safe_optional_text(account.billing_channel.take());
+            account.account_identifier_hash =
+                safe_optional_text(account.account_identifier_hash.take());
+            account.organization_identifier_hash =
+                safe_optional_text(account.organization_identifier_hash.take());
+            account.credential_fingerprint_hash =
+                safe_optional_text(account.credential_fingerprint_hash.take());
+            account.billing_identity_evidence =
+                safe_optional_text(account.billing_identity_evidence.take());
+        }
+
+        if let Some(model) = self.model.as_mut() {
+            model.active_model = safe_optional_text(model.active_model.take());
+            model.default_model = safe_optional_text(model.default_model.take());
+            model.provider = safe_optional_text(model.provider.take());
+            model.available_models = model
+                .available_models
+                .drain(..)
+                .filter(|value| is_safe_backend_text(value))
+                .collect();
+            model.available_model_details = model
+                .available_model_details
+                .drain(..)
+                .filter_map(redact_available_model_for_backend)
+                .collect();
+        }
+
+        if let Some(context) = self.context.as_mut() {
+            // The posture summary is Companion-facing, machine-local data; the
+            // backend derives its own posture read-model from uploaded
+            // snapshots, so the agent-status upload copy never carries it.
+            context.posture = None;
+        }
+
+        self.capabilities = self
+            .capabilities
+            .drain(..)
+            .filter_map(redact_capability_for_backend)
+            .collect();
+        for window in &mut self.quota_windows {
+            window.rate_limit_reached_type =
+                safe_optional_text(window.rate_limit_reached_type.take());
+            window.limit_id = safe_optional_text(window.limit_id.take());
+        }
+        self.credit_balances = self
+            .credit_balances
+            .drain(..)
+            .filter_map(redact_credit_balance_for_backend)
+            .collect();
+        self.plan_observations = self
+            .plan_observations
+            .drain(..)
+            .map(redact_plan_observation_for_backend)
+            .collect();
+        self.diagnostics = self
+            .diagnostics
+            .drain(..)
+            .filter(|diagnostic| !is_local_only_diagnostic(&diagnostic.code))
+            .map(redact_diagnostic_for_backend)
+            .collect();
+
+        if let Some(defaults) = self.runtime_defaults.as_mut() {
+            defaults.model = safe_optional_text(defaults.model.take());
+            defaults.service_tier = safe_optional_text(defaults.service_tier.take());
+            defaults.speed_mode = safe_optional_text(defaults.speed_mode.take());
+            defaults.reasoning_effort = safe_optional_text(defaults.reasoning_effort.take());
+            defaults.approval_policy = safe_optional_text(defaults.approval_policy.take());
+            defaults.sandbox_mode = safe_optional_text(defaults.sandbox_mode.take());
+            defaults.machine_id = safe_optional_text(defaults.machine_id.take());
+            defaults.provenance = safe_optional_text(defaults.provenance.take());
+            defaults.reasoning_effort_by_model =
+                std::mem::take(&mut defaults.reasoning_effort_by_model)
+                    .into_iter()
+                    .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                    .collect();
+            defaults.selector_context = std::mem::take(&mut defaults.selector_context)
+                .into_iter()
+                .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                .collect();
+            defaults.selector_sources = std::mem::take(&mut defaults.selector_sources)
+                .into_iter()
+                .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                .collect();
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusState {
+    Available,
+    Degraded,
+    AuthRequired,
+    NotInstalled,
+    Unsupported,
+    Error,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusCollectionMethod {
+    AppServer,
+    CliJson,
+    CliText,
+    ConfigFile,
+    StatusLine,
+    CommandProbe,
+    ManualFallback,
+    Unsupported,
+}
+
+/// Backend-safe summary of whether one strongly bound Claude account can
+/// currently provide its full quota bundle.
+///
+/// This is intentionally smaller than the machine-local config-slot state
+/// machine. It carries no slot identifier, config path, credential metadata,
+/// or free-form diagnostic text, and it is absent for legacy producers and
+/// account observations that do not come from an exact Claude Code slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeQuotaAccessState {
+    Full,
+    Partial,
+    TemporarilyUnavailable,
+    ReconnectRequired,
+    Paused,
+    AttentionRequired,
+}
+
+/// Machine-local durability of one strongly account-and-organization-bound
+/// Claude observation. This is orthogonal to meter freshness and access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorDurabilityV1 {
+    Anchored,
+    DefaultOnly,
+    Unresolved,
+}
+
+/// Current health of the registered anchor that supplies continuity. Absent
+/// means the observation is not anchored or came from an older daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorHealthV1 {
+    Healthy,
+    TemporarilyUnavailable,
+    ReconnectRequired,
+    Paused,
+    AttentionRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAccountStatus {
+    pub login_state: AgentLoginState,
+    pub provider: Option<String>,
+    pub auth_method: Option<String>,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub organization_label: Option<String>,
+    pub plan_type: Option<String>,
+    pub subscription_product: Option<String>,
+    pub billing_channel: Option<String>,
+    /// Reported boundaries and provider verification time for the account's
+    /// current subscription period.
+    ///
+    /// Provider-neutral on purpose: any provider that publishes real period
+    /// boundaries fills these same fields rather than growing a
+    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire payload
+    /// byte-identical when the provider reports nothing, and the backend
+    /// contract is "reported or absent" - a producer never substitutes `now`,
+    /// a calendar month, or a first-seen date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_start: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_end: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_last_checked_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Hashes this same account and organization produced under the previous
+    /// derivation scheme. See `AgentStatusPlanObservation` for the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_identity_evidence: Option<String>,
+    /// Present only for an exact, strongly account-and-organization-bound
+    /// Claude Code slot. Older daemons and weaker observations omit it, so a
+    /// consumer must treat absence as unknown rather than setup-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_quota_access_state: Option<ClaudeQuotaAccessState>,
+    /// Backend-safe continuity evidence. Producers set these only when both
+    /// strong account and organization hashes are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_anchor_durability: Option<ClaudeAccountAnchorDurabilityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_anchor_health: Option<ClaudeAccountAnchorHealthV1>,
+    #[serde(default)]
+    pub billing_identity_confidence: AgentStatusConfidence,
+    pub confidence: AgentStatusConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusPlanObservation {
+    /// Local-only recent Desktop request activity for this exact account + org.
+    /// Expires 15 minutes after event time, evaluated when serving the response.
+    /// Never uploaded or exported in diagnostics; does not imply current login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_recent_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// The hashes THIS SAME account and workspace produced under the previous
+    /// derivation scheme, when the collector can still compute both from the
+    /// live credential.
+    ///
+    /// Changing what a hash is derived from silently orphans every identity a
+    /// server already stored: the old and new digests conflict on every field,
+    /// so nothing downstream can tell that one account became two. Only the
+    /// collector holds the raw values, so only it can assert the equivalence.
+    /// A consumer may use these to recognize a stored identity as this one and
+    /// adopt the current hashes; it must never treat them as a second account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_identity_evidence: Option<String>,
+    #[serde(default)]
+    pub billing_identity_confidence: AgentStatusConfidence,
+    pub confidence: AgentStatusConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_current: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoginState {
+    SignedIn,
+    SignedOut,
+    Unknown,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusConfidence {
+    High,
+    Medium,
+    Low,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelStatus {
+    pub active_model: Option<String>,
+    pub default_model: Option<String>,
+    pub provider: Option<String>,
+    pub available_models: Vec<String>,
+    #[serde(default)]
+    pub available_model_details: Vec<AgentAvailableModelStatus>,
+    pub context_window_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAvailableModelStatus {
+    pub id: String,
+    pub provider: Option<String>,
+    pub model_provider: Option<String>,
+    pub billing_provider: Option<String>,
+    pub billing_channel: Option<String>,
+    pub auth_mode: Option<String>,
+    pub gateway_provider: Option<String>,
+    pub subscription_product: Option<String>,
+    pub source_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_identity_evidence: Option<String>,
+    #[serde(default)]
+    pub billing_identity_confidence: AgentStatusConfidence,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub supports_thinking: Option<bool>,
+    pub supports_images: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentQuotaWindow {
+    pub name: String,
+    pub scope: AgentQuotaWindowScope,
+    pub status: AgentQuotaWindowStatus,
+    pub freshness: AgentQuotaWindowFreshness,
+    /// When the provider/cache actually observed this quota value. This is
+    /// distinct from the later agent-status check that merely read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    pub window_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Rfc3339Timestamp>,
+    /// Whether the start uses a reported or nominal recurring duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_basis: Option<String>,
+    pub resets_at: Option<Rfc3339Timestamp>,
+    pub quota: Option<u64>,
+    pub remaining: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub left_percent: Option<u8>,
+    /// Window dollar budget in integer minor units (cents), when the provider
+    /// reports one (Claude `five_hour`/`seven_day` `limit_dollars`). Additive;
+    /// old backends tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_cents: Option<u64>,
+    /// Window dollars spent so far in integer minor units (cents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_cents: Option<u64>,
+    /// Window dollars remaining in integer minor units (cents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_cents: Option<u64>,
+    /// Provider grouping key for scoped limits (e.g. `weekly`, `session`).
+    /// Free-form string, not an enum, so upstream drift never bricks parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Provider-reported severity (e.g. `normal`, `warning`, `critical`).
+    /// Free-form string, not an enum, for the same drift-safety reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Whether the provider marks this limit currently active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    /// Provider-reported spend-control state for the snapshot containing this
+    /// window. `None` means unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_control_reached: Option<bool>,
+    /// Provider-reported capacity-reached reason for this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reached_type: Option<String>,
+    /// Stable provider limit identifier that owns this window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQuotaWindowScope {
+    Source,
+    Account,
+    Organization,
+    Model,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQuotaWindowStatus {
+    Ok,
+    NearLimit,
+    Exhausted,
+    RateLimited,
+    Unsupported,
+    Stale,
+    Error,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentQuotaWindowFreshness {
+    Fresh,
+    Stale,
+    Unsupported,
+    Error,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditBalance {
+    pub name: String,
+    pub status: AgentCreditBalanceStatus,
+    pub freshness: AgentQuotaWindowFreshness,
+    #[serde(default)]
+    pub unit: AgentCreditBalanceUnit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Amounts in the balance's native unit (`unit`), exact to six fractional
+    /// digits: a whole amount is a JSON integer, a fraction a decimal string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub remaining: Option<CreditAmount>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub used: Option<CreditAmount>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "CreditAmount::deserialize_optional"
+    )]
+    pub quota: Option<CreditAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<Rfc3339Timestamp>,
+    /// ISO 4217 currency code for money-denominated balances (e.g. `USD`).
+    /// Free-form string; additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// When the balance's budget window resets, if the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<Rfc3339Timestamp>,
+    /// Provider-reported utilization percentage (0..=100), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u8>,
+    /// Whether the provider marks usage credits as enabled for the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Whether the provider reports the account's spend control (spend cap) as
+    /// reached. When `true` the balance is effectively spend-capped even if a
+    /// nominal credit figure remains. Additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_control_reached: Option<bool>,
+    /// Provider-reported capacity-reached classifier (for example,
+    /// `workspaceMemberCreditsDepleted`). Free-form string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reached_type: Option<String>,
+    /// Provider-reported limit identifier the balance is scoped to (e.g.
+    /// `codex`). Free-form string; additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
+    // Quota contract v2.1 §2.2 and v2.2 §11.1. Every field below is additive
+    // and skipped when `None`, so a balance without them serializes exactly as
+    // before. Times are provider read/expiry instants, never `updated_at`.
+    /// Provider read time of this balance. A re-sent cached section keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Expiry of a one-time balance. Never a recurring `resets_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    /// Provider reason the balance is off; only with `enabled: Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Total grant records in the provider's enumeration scope; `None` is
+    /// unknown. Never the returned list length and never available uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_count: Option<u64>,
+    /// Individual grants. `None` = not observed in this reading; `Some(vec![])`
+    /// is authoritative-empty only with `grants_state: complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<AgentCreditGrant>>,
+    /// Completeness of `grants`; the only completeness signal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_optional"
+    )]
+    pub grants_state: Option<CreditGrantsState>,
+    /// Provider read time of the grants list. A re-sent cached list keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_observed_at: Option<Rfc3339Timestamp>,
+    /// What this balance is, set by the provider adapter. Never part of the
+    /// meter identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CreditBalanceKind>,
+    /// Provider label for the pool, bounded like a grant title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Soonest grant expiry among available/paused grants (no clock filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_expires_at: Option<Rfc3339Timestamp>,
+    /// Latest provider grant time over every grant of a complete list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_granted_at: Option<Rfc3339Timestamp>,
+    /// Provider readiness passthrough; only with `unit: resets`. Never derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_limit: Option<bool>,
+    /// `^[a-z0-9_.-]{1,64}$` provider reason code (e.g. `tenure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<Rfc3339Timestamp>,
+    /// Quota contract v2.2 §11.10: why this saved-resets balance's grants are
+    /// unavailable. Only with the shape
+    /// [`credit_grants_unavailable_cause_allowed`] accepts; absent otherwise.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_optional"
+    )]
+    pub grants_unavailable_cause: Option<CreditGrantsUnavailableCause>,
+}
+
+/// Why a saved-resets balance's grants are unavailable (quota contract v2.2
+/// §11.10). An unrecognized value decodes as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantsUnavailableCause {
+    /// The reader that took this reading cannot see the grants (Claude
+    /// `ineligible_reason` `surface` or `cli_version`): "not visible to this
+    /// reader", never "no resets".
+    Reader,
+}
+
+/// The only balance shape that may carry `grants_unavailable_cause` (quota
+/// contract v2.2 §11.10): saved resets with `grants_state: unavailable` and
+/// no `grants`, `remaining` or `grant_count`.
+pub fn credit_grants_unavailable_cause_allowed(credit: &AgentCreditBalance) -> bool {
+    credit.kind == Some(CreditBalanceKind::SavedResets)
+        && credit.unit == AgentCreditBalanceUnit::Resets
+        && credit.grants_state == Some(CreditGrantsState::Unavailable)
+        && credit.grants.is_none()
+        && credit.remaining.is_none()
+        && credit.grant_count.is_none()
+}
+
+/// One provider credit grant inside an [`AgentCreditBalance`] (quota contract
+/// v2.1 §5 plus v2.2 `usable_now`). No per-grant amount: no provider reports one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditGrant {
+    /// `credit-grant-sha256:v1`: lowercase hex SHA-256 of
+    /// `"<provider>:credit_grant:<id>"`, id case-preserving.
+    pub grant_key: String,
+    #[serde(default)]
+    pub grant_type: CreditGrantType,
+    #[serde(default)]
+    pub status: CreditGrantStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<Rfc3339Timestamp>,
+    /// `None` = no expiry reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_included: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<u64>,
+    /// Window names this grant resets, as given by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clears: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Provider readiness passthrough; volatile, never used for `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_now: Option<bool>,
+}
+
+/// What a credit balance is. Lenient: an unrecognized value decodes as
+/// `Unknown` instead of failing the whole snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditBalanceKind {
+    UsageCredits,
+    PlanCredits,
+    SavedResets,
+    OneTimeCredit,
+    WorkspaceAllowance,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Completeness of a balance's `grants` list (quota contract v2.1 §4). There
+/// is no `unknown` value on the wire; an unrecognized value decodes as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantsState {
+    Complete,
+    Capped,
+    Partial,
+    Unavailable,
+    NotSupported,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantType {
+    RateLimitReset,
+    Credit,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantStatus {
+    Available,
+    Redeeming,
+    Redeemed,
+    Paused,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Decode an optional value, mapping any value `T` does not accept to `None`
+/// so one drifted enum never fails the surrounding snapshot.
+fn lenient_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCreditBalanceStatus {
+    Ok,
+    Low,
+    Exhausted,
+    Unlimited,
+    Unsupported,
+    Stale,
+    Error,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCreditBalanceUnit {
+    Credits,
+    Usd,
+    Tokens,
+    Resets,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextStatus {
+    pub status: AgentContextState,
+    pub active_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub remaining_tokens: Option<u64>,
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_samples: Vec<AgentContextPressureSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<AgentContextCompleteness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Machine-local context-posture summary over recent sessions (Claude Code
+    /// only today). Additive optional field: absent on older daemons and
+    /// ignored by older apps. Stripped from the backend-upload copy — this is
+    /// Companion-facing, machine-local data (see `redacted_for_backend`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture: Option<AgentContextPostureSummary>,
+}
+
+/// Aggregate context posture over the recent local session window, derived by
+/// the daemon from the same transcript parse that feeds snapshot sync. All
+/// quantities are measured (token counts, session counts) — the daemon has no
+/// pricing, so no dollar figures are emitted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextPostureSummary {
+    /// Sessions with any activity inside the summary window.
+    pub sessions_analyzed: u64,
+    /// Width of the summary window in days (currently 7).
+    pub window_days: u64,
+    /// Median first-turn context (`first_turn_context_tokens`) across analyzed
+    /// sessions that reported one. This includes the first user input; it is
+    /// not presented as a pure static-context measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_first_turn_tokens: Option<u64>,
+    /// Sessions that reported a measured peak. This is the evidence denominator
+    /// for peak-derived counts when some analyzed sessions had no usage sample.
+    pub peak_session_count: u64,
+    /// Peak sessions whose exact context-window size was evidenced locally.
+    /// Claude's base model identifier does not distinguish standard and 1M
+    /// variants, so this can be lower than `peak_session_count`.
+    pub window_evidenced_session_count: u64,
+    /// Peak-evidenced sessions whose fill exceeded the 200k long-context
+    /// threshold. None when no session reported a peak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_session_count: Option<u64>,
+    /// Sessions whose peak exceeded the exact evidenced window. Omitted unless
+    /// every peak session has exact window evidence; partial evidence must not
+    /// become a misleading aggregate zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_window_session_count: Option<u64>,
+    /// Per-session peak fill, oldest → newest, most recent sessions last.
+    /// Capped by the producer at a small count (14) for display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_peaks: Vec<AgentContextSessionPeak>,
+    /// Total transcript compaction events across analyzed sessions. `Some(0)`
+    /// means "observed, none happened"; `None` means the sessions carried no
+    /// compaction evidence at all — the consumer must hide the figure rather
+    /// than show a fake 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
+    /// Total cache-read tokens across analyzed sessions: the measured
+    /// re-read volume (context replayed from prompt cache), not an estimate
+    /// of anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_tokens: Option<u64>,
+}
+
+/// One session's peak context fill relative to its model window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextSessionPeak {
+    /// Raw measured high-water effective input context.
+    pub peak_fill_tokens: u64,
+    /// Exact context window when evidenced. Claude transcript model identifiers
+    /// normally omit the 1M variant, so this is intentionally optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    /// Peak fill relative to an exact evidenced window. Raw value may exceed
+    /// 100; consumers cap the drawn bar. Omitted when the window is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_fill_percent: Option<u16>,
+    /// Whether the peak exceeded the exact evidenced window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_window: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextPressureSample {
+    pub at: Rfc3339Timestamp,
+    pub active_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub remaining_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextState {
+    Available,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextCompleteness {
+    FullPressure,
+    WindowSizeOnly,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCapabilityGap {
+    pub capability: String,
+    pub status: AgentCapabilityStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCapabilityStatus {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusDiagnostic {
+    pub code: String,
+    pub severity: AgentDiagnosticSeverity,
+    pub message: String,
+    /// Time this collector outcome occurred, not a quota observation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Earliest eligible provider retry after an evidenced rate-limit hold.
+    /// Not a scheduled attempt or a quota observation time. Older diagnostics
+    /// omit this; consumers must not infer a hold from stale readings alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<Rfc3339Timestamp>,
+    /// Exact quota binding; display labels remain local-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Account/subscription this diagnostic is about. `None` means the
+    /// diagnostic is provider-wide (applies to the whole source / all accounts).
+    /// Populated only for account-attributed diagnostics. Stripped from the
+    /// backend-upload copy (see `redact_diagnostic_for_backend`), so the backend
+    /// wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    /// Scope hint for the local Companion. Absent on older daemons; a missing
+    /// value is treated as provider-wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AgentDiagnosticScope>,
+}
+
+impl AgentStatusDiagnostic {
+    /// Provider-wide diagnostic. `scope`/`account_label` are left absent: an
+    /// absent scope already means provider-wide, so the wire format is identical
+    /// to before these fields existed.
+    pub fn source(
+        code: impl Into<String>,
+        severity: AgentDiagnosticSeverity,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity,
+            message: message.into(),
+            observed_at: None,
+            retry_after: None,
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
+            account_label: None,
+            scope: None,
+        }
+    }
+
+    /// Diagnostic attributed to a specific account/subscription. Reserved for
+    /// future per-account diagnostics — today every daemon diagnostic is
+    /// provider-wide (see `source`).
+    pub fn for_account(
+        code: impl Into<String>,
+        severity: AgentDiagnosticSeverity,
+        message: impl Into<String>,
+        account_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity,
+            message: message.into(),
+            observed_at: None,
+            retry_after: None,
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
+            account_label: Some(account_label.into()),
+            scope: Some(AgentDiagnosticScope::Account),
+        }
+    }
+
+    pub fn with_observed_at(mut self, observed_at: Option<Rfc3339Timestamp>) -> Self {
+        self.observed_at = observed_at;
+        self
+    }
+
+    pub fn with_quota_binding(
+        mut self,
+        account: Option<String>,
+        organization: Option<String>,
+    ) -> Self {
+        self.account_identifier_hash = account;
+        self.organization_identifier_hash = organization;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDiagnosticScope {
+    Source,
+    Account,
+    Organization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalCollectorState {
+    Hot,
+    Warm,
+    Idle,
+    Cold,
+    Failing,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCollectorHealth {
+    pub state: LocalCollectorState,
+    pub last_scan_started_at: Option<Rfc3339Timestamp>,
+    pub last_scan_finished_at: Option<Rfc3339Timestamp>,
+    pub last_success_at: Option<Rfc3339Timestamp>,
+    pub last_uploaded_count: u64,
+    pub last_scanned_session_count: u64,
+    pub last_scanned_file_count: u64,
+    pub last_backfill_window_days: u64,
+    pub last_backfill_file_limit: u64,
+    pub last_discovered_file_count: u64,
+    pub last_skipped_file_count_due_to_limit: u64,
+    pub last_scan_cap_hit: bool,
+    pub next_retry_at: Option<Rfc3339Timestamp>,
+    pub collector_version: Option<String>,
+    pub parser_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerificationResult {
+    pub source: SourceKind,
+    pub config: SourceConfigState,
+    pub status: SourceVerificationStatus,
+    pub verified: bool,
+    pub records_seen: u64,
+    pub last_record_id: Option<String>,
+    pub last_received_at: Option<Rfc3339Timestamp>,
+    pub smoke_after: Option<Rfc3339Timestamp>,
+    pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_results: Vec<SourceRouteVerificationResult>,
+    /// What kind of check ran and what it established. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRouteVerificationResult {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
+    pub billing_provider: Option<String>,
+    pub billing_channel: Option<String>,
+    pub auth_mode: Option<String>,
+    pub gateway_provider: Option<String>,
+    pub subscription_product: Option<String>,
+    pub source_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_identity_evidence: Option<String>,
+    #[serde(default)]
+    pub billing_identity_confidence: AgentStatusConfidence,
+    pub status: SourceVerificationStatus,
+    pub verified: bool,
+    pub records_seen: u64,
+    pub last_record_id: Option<String>,
+    pub last_received_at: Option<Rfc3339Timestamp>,
+    pub smoke_after: Option<Rfc3339Timestamp>,
+    pub command_found: bool,
+    pub command_succeeded: bool,
+    pub exit_status: Option<i32>,
+    pub duration_ms: u64,
+    pub diagnostic: Option<String>,
+    pub error_code: Option<String>,
+    pub local_session_observed: Option<bool>,
+    pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
+}
+
+/// The kind of check a Verify used and what it established. `scope` never
+/// names an account: no verification result binds accepted usage to one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerificationCheck {
+    /// Absent when no route was evaluated, so the kind is not determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<SourceVerificationMethod>,
+    pub scope: SourceVerificationScope,
+}
+
+/// The kind of check. It does not say the check sent a prompt or finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationMethod {
+    /// Local configuration, source registration and CLI presence only.
+    ConfigurationCheck,
+    /// A small provider prompt, then a check for fresh usage.
+    LivePrompt,
+    /// No prompt: recent usage and local route evidence.
+    PassiveRecentUsage,
+    /// Routes used different methods; each route carries its own.
+    Mixed,
+    /// A value from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a completed check established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationScope {
+    NotEstablished,
+    /// Local configuration is ready; upload was not checked.
+    Configuration,
+    /// Local session or route evidence only; upload was not confirmed.
+    LocalEvidence,
+    /// Ottto received fresh matching usage.
+    UsageReceived,
+    /// Some routes established something and others did not, or they differ.
+    Partial,
+    /// A value from a newer daemon; never success.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationStatus {
+    Verified,
+    Warning,
+    NoFreshTelemetry,
+    AccountNotConnected,
+    ReconnectRequired,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBindingState {
+    pub expected_account_id: Option<String>,
+    pub observed_account_id: Option<String>,
+    pub matched: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceConfigState {
+    pub discovered: bool,
+    pub path_hint: Option<String>,
+    pub fingerprint: Option<String>,
+    pub drift: Vec<ConfigDrift>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDrift {
+    pub key: String,
+    pub expected: RedactedValue,
+    pub observed: RedactedValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthProblem {
+    pub code: StableProblemCode,
+    pub title: String,
+    pub detail: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StableProblemCode {
+    ConfigMissing,
+    ConfigDrift,
+    SecretMissing,
+    SecretExpired,
+    RelayUnavailable,
+    TelemetryNotVerified,
+    TelemetryDisabledByAdmin,
+    SourceNotInstalled,
+    /// Data/config for the source is present on this machine but its CLI
+    /// binary cannot be found or executed (for example a desktop-app-only
+    /// install). Local session data keeps syncing; only live CLI checks are
+    /// unavailable, so this is a soft, non-blocking problem.
+    AgentCliUnavailable,
+    UnsupportedPlatform,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupRun {
+    pub setup_run_id: String,
+    pub machine_id: String,
+    pub sources: Vec<SourceKind>,
+    pub status: SetupStatus,
+    pub events: Vec<SetupEvent>,
+    pub created_at: Rfc3339Timestamp,
+    pub updated_at: Rfc3339Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStatus {
+    Pending,
+    Running,
+    WaitingForApproval,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupEvent {
+    pub event_id: String,
+    pub step: SetupStep,
+    pub status: EventStatus,
+    pub source: Option<String>,
+    pub message: StableMessage,
+    pub occurred_at: Rfc3339Timestamp,
+    pub metadata: BTreeMap<String, RedactedValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStep {
+    ClaimMachine,
+    DetectSources,
+    RequestApproval,
+    WriteConfig,
+    RotateSecret,
+    StartRelay,
+    VerifyTelemetry,
+    ImportHistory,
+    PublishStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventStatus {
+    Pending,
+    Running,
+    Waiting,
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairPlan {
+    pub plan_id: String,
+    pub machine_id: String,
+    pub source: SourceKind,
+    pub dry_run: bool,
+    pub status: RepairPlanStatus,
+    pub authority: RepairAuthority,
+    pub actions: Vec<RepairAction>,
+    pub created_at: Rfc3339Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairPlanStatus {
+    Proposed,
+    Running,
+    Succeeded,
+    Failed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairAction {
+    pub action: RepairActionKind,
+    pub title: String,
+    pub detail: String,
+    pub requires_approval: bool,
+    pub destructive: bool,
+    pub approval: RepairActionApproval,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<RepairBackupMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairAuthority {
+    pub mode: RepairAuthorityMode,
+    pub server_backed: bool,
+    pub terminal_approval_allowed: bool,
+    pub browser_approval_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_run_id: Option<String>,
+    pub message: StableMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairAuthorityMode {
+    ServerBackedSetupAction,
+    BrowserApprovalRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairActionApproval {
+    pub surface: RepairApprovalSurface,
+    pub setup_safe: bool,
+    pub server_backed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairApprovalSurface {
+    None,
+    Terminal,
+    Browser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairBackupMetadata {
+    pub scope: RepairBackupScope,
+    pub required: bool,
+    pub restore_available: bool,
+    pub backup_id: Option<String>,
+    pub target_fingerprint: Option<String>,
+    pub restore_operation: Option<SourceOperation>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairBackupScope {
+    SourceConfig,
+    RelayCredential,
+    LocalState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairActionKind {
+    WriteConfig,
+    RotateSecret,
+    RestartRelay,
+    StartRelay,
+    StopRelay,
+    VerifyTelemetry,
+    ImportHistory,
+    RevokeSecret,
+    RemoveLocalState,
+    RestoreBackup,
+    /// Guide the user to re-authenticate a failing provider that the daemon
+    /// cannot repair on its own (e.g. a Pi route whose provider OAuth token has
+    /// expired or been consumed). Advisory: the daemon does not perform the
+    /// re-auth itself.
+    ReauthProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsBundle {
+    pub bundle_id: String,
+    pub machine_id: String,
+    pub created_at: Rfc3339Timestamp,
+    pub upload: DiagnosticsUploadReport,
+    pub redaction: RedactionReport,
+    pub sections: Vec<DiagnosticsSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsSection {
+    pub name: String,
+    pub status: EventStatus,
+    pub items: BTreeMap<String, RedactedValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsUploadApproval {
+    pub approved: bool,
+    pub retention_disclosure_accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_claim: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsUploadReport {
+    pub requested: bool,
+    pub status: DiagnosticsUploadStatus,
+    pub approval_required: bool,
+    pub approved: bool,
+    pub retention: DiagnosticsRetentionDisclosure,
+    pub authorization: DiagnosticsUploadAuthorization,
+    #[serde(default)]
+    pub support_claim_provided: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsRetentionDisclosure {
+    pub accepted: bool,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsUploadStatus {
+    LocalOnly,
+    Uploaded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsUploadAuthorization {
+    NotRequested,
+    ConnectedAccount,
+    SupportClaim,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UninstallPlan {
+    pub plan_id: String,
+    pub service_label: String,
+    pub launchd_target: String,
+    pub actions: Vec<UninstallAction>,
+    pub warnings: Vec<String>,
+    pub requires_confirmation: bool,
+    pub cloud_credentials_untouched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UninstallAction {
+    pub action: String,
+    pub target: String,
+    pub kind: String,
+    pub requires_confirmation: bool,
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UninstallExecutionResult {
+    pub status: String,
+    pub plan: UninstallPlan,
+    pub credential_status: String,
+    pub removed_paths: Vec<String>,
+    pub missing_paths: Vec<String>,
+    pub warnings: Vec<String>,
+    pub failed_operations: Vec<String>,
+    pub cloud_credentials_untouched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionSurface {
+    Diagnostics,
+    SupportOutput,
+    AgentOutput,
+    SetupError,
+    CommandOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionCategory {
+    LocalPath,
+    SecretToken,
+    AccountIdentifier,
+    MachineIdentifier,
+    RawPrompt,
+    CommandOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionReport {
+    pub policy_version: u16,
+    pub covered_surfaces: Vec<RedactionSurface>,
+    pub redacted_categories: Vec<RedactionCategory>,
+    pub redacted_fields: Vec<String>,
+    pub preserved_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RedactedValue {
+    String(String),
+    Bool(bool),
+    Number(i64),
+    List(Vec<RedactedValue>),
+    Object(BTreeMap<String, RedactedValue>),
+    Null,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateState {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub channel: ReleaseChannel,
+    pub status: UpdateStatus,
+    #[serde(default)]
+    pub gate: UpdateGate,
+    #[serde(default)]
+    pub install_owner: InstallOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_supported_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_protocol_version: Option<u16>,
+    pub checked_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ServiceOwnerState {
+    #[serde(default)]
+    pub daemon_owner: InstallOwner,
+    #[serde(default)]
+    pub plist_owner: InstallOwner,
+    #[serde(default)]
+    pub loaded_owner: InstallOwner,
+    #[serde(default)]
+    pub client_owner: InstallOwner,
+    #[serde(default)]
+    pub owner_drift: bool,
+    #[serde(default)]
+    pub plist_exists: bool,
+    #[serde(default)]
+    pub launchd_loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseChannel {
+    Dev,
+    Preview,
+    #[serde(rename = "stable-candidate")]
+    StableCandidate,
+    Stable,
+}
+
+#[cfg(test)]
+mod release_channel_tests {
+    use super::ReleaseChannel;
+
+    #[test]
+    fn stable_candidate_uses_public_channel_slug() {
+        let encoded = serde_json::to_string(&ReleaseChannel::StableCandidate)
+            .expect("serialize stable-candidate channel");
+        assert_eq!(encoded, "\"stable-candidate\"");
+        let decoded: ReleaseChannel = serde_json::from_str("\"stable-candidate\"")
+            .expect("deserialize stable-candidate channel");
+        assert_eq!(decoded, ReleaseChannel::StableCandidate);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStatus {
+    Current,
+    UpdateAvailable,
+    Downloading,
+    Installing,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateGate {
+    Current,
+    SoftWarn,
+    HardBlock,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallOwner {
+    Homebrew,
+    HostedInstaller,
+    AppBundle,
+    Dev,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableMessage {
+    pub code: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliErrorResponse {
+    pub error: CliError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliError {
+    pub code: CliErrorCode,
+    pub message: String,
+    pub retryable: bool,
+    pub details: BTreeMap<String, RedactedValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalControlRequest {
+    pub request_id: String,
+    pub protocol_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<LocalClientKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_install_owner: Option<InstallOwner>,
+    #[serde(flatten)]
+    pub command: LocalControlCommand,
+}
+
+#[derive(Deserialize)]
+struct LocalControlRequestWire {
+    request_id: String,
+    protocol_version: u16,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    client_kind: Option<LocalClientKind>,
+    #[serde(default)]
+    client_install_owner: Option<InstallOwner>,
+    #[serde(flatten)]
+    command: LocalControlCommand,
+}
+
+impl<'de> Deserialize<'de> for LocalControlRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let request = LocalControlRequestWire::deserialize(deserializer)?;
+        validate_local_control_protocol_version(request.protocol_version, &request.command)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            request_id: request.request_id,
+            protocol_version: request.protocol_version,
+            token: request.token,
+            client_kind: request.client_kind,
+            client_install_owner: request.client_install_owner,
+            command: request.command,
+        })
+    }
+}
+
+pub fn expected_local_control_protocol_version(command: &LocalControlCommand) -> u16 {
+    match command {
+        LocalControlCommand::SessionLaunchPrepare { .. }
+        | LocalControlCommand::SessionLaunchConsume { .. }
+        | LocalControlCommand::SessionLaunchReport { .. }
+        | LocalControlCommand::SessionLaunchStatus { .. }
+        | LocalControlCommand::SessionLaunchCancel { .. }
+        | LocalControlCommand::SessionLaunchRecentFolders { .. }
+        | LocalControlCommand::AccountNicknames
+        | LocalControlCommand::AccountNicknameSet { .. } => SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::ProviderDailyReferenceControl { .. } => {
+            PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::ClaudeAccountsStatus
+        | LocalControlCommand::ClaudeAccountSetUpkeepConsent { .. }
+        | LocalControlCommand::ClaudeAccountRemove { .. }
+        | LocalControlCommand::ClaudeAccountRegisterPath { .. }
+        | LocalControlCommand::ClaudeAccountPrepare { .. }
+        | LocalControlCommand::ClaudeAccountReconnect { .. }
+        | LocalControlCommand::ClaudeAccountCheck { .. }
+        | LocalControlCommand::ClaudeAccountStopWaiting { .. } => {
+            CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::ClaudeAccountPrepareTarget { .. }
+        | LocalControlCommand::ClaudeAccountReconnectTarget { .. } => {
+            CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::ClaudeAccountStartBrowserLogin { .. }
+        | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. } => {
+            CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {} => {
+            CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::CodexAccountsStatus
+        | LocalControlCommand::CodexAccountPrepare { .. }
+        | LocalControlCommand::CodexAccountPrepareTarget { .. }
+        | LocalControlCommand::CodexAccountPrepareOpen { .. }
+        | LocalControlCommand::CodexAccountReconnect { .. }
+        | LocalControlCommand::CodexAccountCheck { .. }
+        | LocalControlCommand::CodexAccountStopWaiting { .. }
+        | LocalControlCommand::CodexAccountRemove { .. } => CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::CodexAccountStartSignIn { .. } => {
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent { .. } => {
+            CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION
+        }
+        LocalControlCommand::AuthReset {
+            forget_installation: true,
+            ..
+        } => INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+        _ => LOCAL_CONTROL_PROTOCOL_VERSION,
+    }
+}
+
+pub fn validate_local_control_protocol_version(
+    version: u16,
+    command: &LocalControlCommand,
+) -> Result<(), String> {
+    let expected = expected_local_control_protocol_version(command);
+    if version != expected {
+        return Err(format!(
+            "unsupported local control protocol_version {version}; expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalClientKind {
+    Cli,
+    CompanionApp,
+    WebUi,
+}
+
+/// Whether the daemon may keep Claude logins current in the background: renew
+/// their sign-in and, where the status carries `consent_covers_limit_reads`,
+/// read their usage limits on its own schedule, for every Claude login on this
+/// Mac (the default login and each registered slot). Consent applies to the
+/// whole registry; a slot never acquires a separate hidden or inferred grant.
+/// A person's Refresh and setup checks read regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountUpkeepConsentState {
+    ConsentRequired,
+    Granted,
+}
+
+/// Whether the daemon may read Codex usage limits in the background (its
+/// scheduled `codex app-server` reads, each of which lets Codex refresh the
+/// home's sign-in when due), for every Codex home on this Mac. On until the
+/// owner chooses. A person's Refresh and setup checks read regardless. Same
+/// wire values as [`ClaudeAccountUpkeepConsentState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexQuotaRefreshConsentState {
+    ConsentRequired,
+    Granted,
+}
+
+/// Daemon-owned observation state for one provider-owned Claude Code login.
+/// Legacy setup only prepares and registers the exact directory. Explicit v23
+/// browser-auth commands may supervise the official CLI login process, but
+/// Claude owns the browser ceremony, credentials, callback, and persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountSetupOperationState {
+    Idle,
+    Preparing,
+    WaitingForUserLogin,
+    Validating,
+    Reading,
+    Complete,
+    SetupStopped,
+    SetupFailed,
+    IdentityMismatch,
+}
+
+/// Why the persisted Claude account operation exists. Both variants leave
+/// Anthropic authentication to the customer in an official Claude Code
+/// session; the distinction prevents a reconnect from ever allocating a new
+/// managed directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountSetupOperationKind {
+    #[default]
+    ConnectManagedAccount,
+    ReconnectRegisteredSlot,
+}
+
+/// Safe, local-only progress for an explicitly requested provider-owned Claude
+/// browser login. This is nested in an additive optional field so older strict
+/// clients can ignore the entire contract without decoding new enum values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthPhaseV1 {
+    Prepared,
+    Launching,
+    WaitingForProvider,
+    /// Legacy value from the retired in-app code entry. Still decoded from
+    /// persisted operations and older daemons; never emitted.
+    WaitingForCode,
+    /// Legacy value from the retired in-app code entry. Still decoded from
+    /// persisted operations and older daemons; never emitted.
+    SubmittingCode,
+    Validating,
+    Reading,
+    Complete,
+}
+
+/// Legacy UI feedback from the retired in-app code entry. Kept so older daemon
+/// payloads still decode; current daemons never emit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthCodeErrorV1 {
+    InvalidCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthOutcomeV1 {
+    Complete,
+    AlreadyConnected,
+    IdentityMismatch,
+    BrowserFallbackRequired,
+    LoginFailed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthIdentityMismatchV1 {
+    Account,
+    Organization,
+    AccountAndOrganization,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeBrowserAuthOperationV1 {
+    pub phase: ClaudeBrowserAuthPhaseV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ClaudeBrowserAuthOutcomeV1>,
+    #[serde(default)]
+    pub retryable: bool,
+    /// Retrying a terminal browser ceremony requires a freshly generated
+    /// operation id. Replaying the terminal id is read-only and can never
+    /// relaunch or rebind its original root.
+    #[serde(default)]
+    pub retry_requires_new_operation_id: bool,
+    #[serde(default)]
+    pub terminal_fallback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_error: Option<ClaudeBrowserAuthCodeErrorV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_mismatch: Option<ClaudeBrowserAuthIdentityMismatchV1>,
+    /// Opaque canonical local slot selected for an `already_connected`
+    /// resolution. Never an account identifier, provider identifier, or path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountSetupOperationV1 {
+    #[serde(default)]
+    pub kind: ClaudeAccountSetupOperationKind,
+    pub state: ClaudeAccountSetupOperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    /// Daemon-authored opaque local setup target. It contains no path or raw
+    /// provider identifier and is stable across status -> prepare replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Exact copyable command returned only by authenticated local control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    /// Additive v23 provider-owned browser-login progress. Absent for every
+    /// legacy v18/v19 operation and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_auth: Option<ClaudeBrowserAuthOperationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Who owns lifecycle changes for a Claude config slot. Registering an
+/// existing Advanced path records `external`; only a later setup workflow may
+/// create `managed` slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotOwnership {
+    Managed,
+    External,
+}
+
+/// One resolved Claude credential slot exposed over authenticated local
+/// control. `config_dir` is the exact registered string for custom slots and
+/// is absent for Claude Code's true default (unset `CLAUDE_CONFIG_DIR`) slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotDescriptorV1 {
+    pub slot_id: String,
+    pub ownership: ClaudeConfigSlotOwnership,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+    pub service_name: String,
+    /// Collector-owned verification state for this exact slot. This is only
+    /// returned over authenticated local control; it is never copied into an
+    /// agent-status backend payload.
+    #[serde(default)]
+    pub collection: ClaudeConfigSlotCollectionStatusV1,
+}
+
+/// Safe local result of the most recent normal quota-collection attempt for a
+/// registered Claude credential slot. Setup/login lifecycle phases are owned
+/// by a later contract; this state only says whether Slice B could prove and
+/// read the already-registered slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotCollectionStatusV1 {
+    #[serde(default)]
+    pub state: ClaudeConfigSlotCollectionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Safe local label derived only from a strong account hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    /// Last exact-slot account labels, kept only on this machine. The embedded
+    /// binding prevents labels surviving an account or organization switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile: Option<ClaudeConfigSlotAccountProfileV1>,
+    /// Credential deadlines read by the existing read-only exact-slot helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relogin_required_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_full_quota_read_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub has_account_windows: bool,
+    #[serde(default)]
+    pub has_scoped_limits: bool,
+    #[serde(default)]
+    pub has_credit_balances: bool,
+    /// Safe full-meter values for this exact slot, available only through
+    /// authenticated machine-local control. The backend snapshot wire remains
+    /// unchanged and raw credential material is never represented here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_snapshot: Option<ClaudeConfigSlotQuotaSnapshotV1>,
+    /// Safe, machine-local witness for the most recent consented upkeep
+    /// decision. This never contains credential material or a config path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep: Option<ClaudeConfigSlotUpkeepStatusV1>,
+    /// Orthogonal relationship to the daemon-selected durable anchor. Older
+    /// clients ignore this additive field and continue decoding `state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<ClaudeConfigSlotRelationshipV1>,
+    /// Safe exact-binding collector outcomes, retained without replacing their
+    /// original clocks with a later slot or snapshot capture time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_check_diagnostics: Vec<AgentStatusDiagnostic>,
+    #[serde(default)]
+    pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+    /// Machine-local notice that this registered connection's approved
+    /// account was taken from the login observed on it (trust on first use)
+    /// rather than a verified setup or reconnect. Names a plan, never an
+    /// email, and is never uploaded. Older clients ignore this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_notice: Option<String>,
+    /// The default home, and a registered slot whose `.claude.json` names
+    /// another account than its approved one: the account and organization
+    /// proven to own the stored token, and the ones its `.claude.json` cache
+    /// names. Hashes and a time only; older clients ignore these additive
+    /// fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_owner_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_account_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_organization_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_proven_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotAccountProfileV1 {
+    pub account_identifier_hash: String,
+    pub organization_identifier_hash: String,
+    /// Oldest contributing verified local account-label capture;
+    /// this is neither a quota observation nor a successful quota-check clock.
+    pub captured_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotQuotaSnapshotV1 {
+    pub state: ClaudeConfigSlotQuotaSnapshotStateV1,
+    /// When the daemon assembled this local snapshot.
+    pub captured_at: Rfc3339Timestamp,
+    /// Oldest provider/cache observation represented by the returned values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    pub credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotQuotaSnapshotStateV1 {
+    Fresh,
+    Stale,
+    Partial,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotUpkeepStatusV1 {
+    pub result: ClaudeConfigSlotUpkeepResultV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_access_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempted_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_allowed_attempt_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotUpkeepResultV1 {
+    #[default]
+    NotRequired,
+    RefreshDue,
+    Refreshed,
+    UpkeepNotConsented,
+    CollectionPaused,
+    UpkeepDisabled,
+    Backoff,
+    MissingBinary,
+    SpawnFailed,
+    TimedOut,
+    NonzeroExit,
+    CredentialUnreadable,
+    ExpiryUnchanged,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
+    InProgress,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotCollectionStateV1 {
+    #[default]
+    Unverified,
+    Fresh,
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+    ProviderUnavailable,
+    CollectionPaused,
+    CollectionInProgress,
+    DuplicateAccount,
+    CapacityExceeded,
+    RefreshDue,
+    UpkeepNotConsented,
+    StaleAccessToken,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotDiagnosticV1 {
+    pub code: ClaudeConfigSlotDiagnosticCodeV1,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotDiagnosticCodeV1 {
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+    ProviderUnavailable,
+    CollectionPaused,
+    CollectionInProgress,
+    DuplicateAccount,
+    CapacityExceeded,
+    RefreshDue,
+    UpkeepNotConsented,
+    StaleAccessToken,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
+    UpkeepDisabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotRelationshipV1 {
+    CanonicalAnchor,
+    ShadowedByAnchor,
+    DuplicateAnchor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorTransitionKindV1 {
+    DefaultIdentityChanged,
+    AnchorRemainedBound,
+    AnchorGrantDisappeared,
+    RefreshDeadlineAdvanced,
+    OfficialReconnectCompleted,
+    DefaultShadowObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorTransitionV1 {
+    pub kind: ClaudeAccountAnchorTransitionKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
+/// Safe evidence for an account that cannot yet be associated with a config
+/// slot. It intentionally has no path, slot identifier, or Keychain service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeUnresolvedAccountEvidenceKind {
+    CliIdentity,
+    DesktopSession,
+    StatusLine,
+    UsageCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeUnresolvedAccountDescriptorV1 {
+    pub unresolved_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    /// Present only for one exact Claude Desktop account/organization session
+    /// folder pair; such a row is a daemon-selectable connect target. Absent
+    /// for account-only evidence, which never names an organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Display only, on an exact pair row: the labels that folder pair's own
+    /// Desktop metadata states. Never identity or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub evidence: Vec<ClaudeUnresolvedAccountEvidenceKind>,
+}
+
+/// Machine-local continuity state for one strongly observed Claude account.
+/// This projection is derived by the daemon from the default observer,
+/// explicitly registered slots, and unresolved strong evidence. It never
+/// contains a config path, Keychain service, raw provider identifier, or
+/// credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorSetupBlockerV1 {
+    CapacityReached,
+    AmbiguousIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorDescriptorV1 {
+    /// Present only for a strongly bound, daemon-selectable local target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub account_identifier_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    pub durability: ClaudeAccountAnchorDurabilityV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ClaudeAccountAnchorHealthV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_blockers: Vec<ClaudeAccountAnchorSetupBlockerV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
+/// Daemon-owned account-set arithmetic for the machine. Clients may render or
+/// count these typed rows, but must not re-derive anchor coverage from slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorCoverageV1 {
+    #[serde(default)]
+    pub accounts: Vec<ClaudeAccountAnchorDescriptorV1>,
+    #[serde(default)]
+    pub observed_accounts: u8,
+    #[serde(default)]
+    pub anchored_accounts: u8,
+    #[serde(default)]
+    pub default_only_accounts: u8,
+    #[serde(default)]
+    pub unresolved_accounts: u8,
+    #[serde(default)]
+    pub capacity_blocked_accounts: u8,
+    #[serde(default)]
+    pub ambiguous_identity_accounts: u8,
+}
+
+/// Capacity of the bounded Claude snapshot registry. The default slot always
+/// consumes one slot even when it has no resolved account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountCapacityV1 {
+    pub max_slots: u8,
+    pub used_slots: u8,
+    pub remaining_slots: u8,
+}
+
+/// Complete machine-local account registry returned by the daemon. Raw custom
+/// paths are local-control-only and must never be copied into backend payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountsStatusV1 {
+    pub schema_version: u16,
+    pub consent: ClaudeAccountUpkeepConsentState,
+    pub setup_operation: ClaudeAccountSetupOperationV1,
+    pub default_slot: ClaudeConfigSlotDescriptorV1,
+    #[serde(default)]
+    pub managed_slots: Vec<ClaudeConfigSlotDescriptorV1>,
+    #[serde(default)]
+    pub external_slots: Vec<ClaudeConfigSlotDescriptorV1>,
+    /// Reserved for account discovery performed by a later slice. Slice A
+    /// never probes additional Claude paths or infers registrations.
+    #[serde(default)]
+    pub unresolved_accounts: Vec<ClaudeUnresolvedAccountDescriptorV1>,
+    /// Shared machine-local continuity projection. Additive and empty when an
+    /// older persisted/local fixture does not carry anchor evidence.
+    #[serde(default)]
+    pub anchor_coverage: ClaudeAccountAnchorCoverageV1,
+    /// Bounded, secret-free local continuity evidence. Contains only opaque
+    /// slot identifiers and typed transitions, never account hashes or paths.
+    #[serde(default)]
+    pub anchor_transitions: Vec<ClaudeAccountAnchorTransitionV1>,
+    pub capacity: ClaudeAccountCapacityV1,
+    /// Presence is the capability bit for the additive v23 browser flow.
+    /// Older daemons omit it; older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_auth_supported: Option<bool>,
+    /// Legacy capability bit for the retired v25 in-app authorization-code
+    /// entry. Older clients still gate browser reopen/retry on it, so daemons
+    /// keep reporting it; current clients ignore it and no code is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_code_entry_supported: Option<bool>,
+    /// Identifier-free count of unclaimed provisional roots retained for safe
+    /// browser-auth retry. Advanced UI may show the count, never identities,
+    /// root aliases, paths, or destructive account actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_provisional_login_count: Option<u16>,
+    /// Presence: `consent` also covers background usage-limit reads. With it
+    /// off this daemon reads no Claude limits on its own schedule for any
+    /// login, the default login included; a person's Refresh and setup checks
+    /// still read. Older daemons omit it (their consent covers sign-in
+    /// renewal and expired saved slots only); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_covers_limit_reads: Option<bool>,
+}
+
+/// Provider-owned Codex sign-in observation for one daemon-created home. The
+/// daemon creates and validates local state, while Codex owns OAuth, browser
+/// callbacks, token persistence, and token refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSetupOperationStateV1 {
+    #[default]
+    Idle,
+    WaitingForUserLogin,
+    Validating,
+    Complete,
+    SetupStopped,
+    SetupFailed,
+    IdentityMismatch,
+    DuplicateAccount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSetupOperationV1 {
+    pub state: CodexAccountSetupOperationStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_workspace_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    /// Exact local command returned only through authenticated local control.
+    /// Clients launch it but do not display or upload it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The daemon-run sign-in of this operation (v26), if one was started.
+    /// Older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<CodexAccountSignInV1>,
+}
+
+/// Where a daemon-run Codex sign-in is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInPhaseV1 {
+    /// `codex login` is being started.
+    Starting,
+    /// `codex login` runs and waits for the person to finish in the browser.
+    WaitingForBrowser,
+    /// The sign-in saved a credential; the daemon reads the account once.
+    CheckingAccount,
+    /// The run ended; `outcome` says how.
+    Done,
+}
+
+/// How a daemon-run Codex sign-in ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInOutcomeV1 {
+    /// The account and workspace were accepted.
+    Complete,
+    /// Another account or workspace signed in; the same operation may start a
+    /// sign-in again.
+    IdentityMismatch,
+    /// That account and workspace is already connected.
+    DuplicateAccount,
+    /// The workspace restriction did not hold in a fresh provider session.
+    WorkspaceNotKept,
+    /// The sign-in saved a credential, but the account could not be read
+    /// (twice, about 15 s apart).
+    CheckFailed,
+    /// `codex login` ended without saving a new credential.
+    LoginFailed,
+    /// Another Codex sign-in holds the local sign-in port, so none started.
+    PortBusy,
+    /// The sign-in did not finish within the time limit and was stopped.
+    TimedOut,
+    /// Stopped on request.
+    Cancelled,
+    /// The daemon restarted during the sign-in, and no new credential was
+    /// saved.
+    Interrupted,
+    /// The Codex CLI could not be found or started.
+    CodexUnavailable,
+}
+
+/// A daemon-run `codex login` for the operation's managed home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSignInV1 {
+    pub phase: CodexAccountSignInPhaseV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CodexAccountSignInOutcomeV1>,
+    pub started_at: Rfc3339Timestamp,
+    /// When the daemon stops a sign-in that has not finished.
+    pub deadline_at: Rfc3339Timestamp,
+    /// The provider's sign-in page for this run, as `codex login` printed it,
+    /// so a client can open it again or copy it (the CLI opens it in the
+    /// default browser once). Only while the run waits for the browser, only
+    /// through authenticated local control, never stored on disk. Clients
+    /// must not log, upload or show it as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_url: Option<SecretString>,
+}
+
+impl Default for CodexAccountSetupOperationV1 {
+    fn default() -> Self {
+        Self {
+            state: CodexAccountSetupOperationStateV1::Idle,
+            operation_id: None,
+            slot_id: None,
+            expected_account_identifier_hash: None,
+            expected_workspace_identifier_hash: None,
+            account_identifier_hash: None,
+            workspace_identifier_hash: None,
+            launch_command: None,
+            message: None,
+            sign_in: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotOwnershipV1 {
+    Default,
+    Managed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotCollectionStateV1 {
+    #[default]
+    Unverified,
+    Fresh,
+    NeedsLogin,
+    IdentityUnknown,
+    IdentityMismatch,
+    ProviderUnavailable,
+    DuplicateAccount,
+    /// Local status only: the slot's last read failed and its
+    /// `quota_snapshot` is the account's last-known reading, marked stale.
+    /// Every shipped local client decodes a quota snapshot on this state and
+    /// grants it no slot authority; shipped clients do not show that reading.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotRelationshipV1 {
+    CanonicalAnchor,
+    ShadowedByAnchor,
+    DuplicateAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotDiagnosticV1 {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotQuotaSnapshotV1 {
+    pub captured_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    pub credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotCollectionStatusV1 {
+    #[serde(default)]
+    pub state: CodexAccountSlotCollectionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_snapshot: Option<CodexAccountSlotQuotaSnapshotV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<CodexAccountSlotRelationshipV1>,
+    #[serde(default)]
+    pub diagnostics: Vec<CodexAccountSlotDiagnosticV1>,
+}
+
+/// One Codex credential home. The path is deliberately absent from this
+/// authenticated status contract; it is deterministic daemon-owned state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotDescriptorV1 {
+    pub slot_id: String,
+    pub ownership: CodexAccountSlotOwnershipV1,
+    #[serde(default)]
+    pub collection: CodexAccountSlotCollectionStatusV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountCapacityV1 {
+    pub max_slots: u8,
+    pub used_slots: u8,
+    pub remaining_slots: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetDurabilityV1 {
+    Durable,
+    Current,
+    ObservedOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetHealthV1 {
+    Healthy,
+    Unverified,
+    NeedsLogin,
+    IdentityUnknown,
+    IdentityMismatch,
+    ProviderUnavailable,
+    DuplicateAccount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetSetupBlockerV1 {
+    IdentityUnconfirmed,
+    CapacityReached,
+}
+
+/// One display-safe, daemon-selectable Codex account+workspace identity. Raw
+/// provider identifiers, email addresses, credential material, and local paths
+/// are deliberately absent from this local-control contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountTargetDescriptorV1 {
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    pub account_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_label: Option<String>,
+    /// The subscription the provider claims for this exact target, in the same
+    /// `chatgpt_pro` product vocabulary the rest of the status uses, so clients
+    /// render it exactly as they render every other plan. Present only where the
+    /// credential actually claims it: a workspace merely observed in the ID token
+    /// has no claimed plan, and guessing one from a sibling workspace would state
+    /// something the provider never said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    pub durability: CodexAccountTargetDurabilityV1,
+    #[serde(default)]
+    pub is_current: bool,
+    #[serde(default)]
+    pub connectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<CodexAccountTargetHealthV1>,
+    /// Always serialized, empty included. Omitting it saved a few bytes and
+    /// cost the entire Codex accounts panel: a client decoding this list as
+    /// required fails on every healthy target, and one failed target fails the
+    /// whole status. A list that is part of the contract is cheaper to send
+    /// than to explain.
+    #[serde(default)]
+    pub setup_blockers: Vec<CodexAccountTargetSetupBlockerV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
+/// Daemon-owned target-set arithmetic for Codex workspace coverage. Clients
+/// render these rows and pass `target_id` back verbatim; they must not derive
+/// target identity or durability from the slot list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountTargetCoverageV1 {
+    #[serde(default)]
+    pub targets: Vec<CodexAccountTargetDescriptorV1>,
+    #[serde(default)]
+    pub observed_targets: u8,
+    #[serde(default)]
+    pub durable_targets: u8,
+    #[serde(default)]
+    pub current_targets: u8,
+    #[serde(default)]
+    pub connectable_targets: u8,
+    #[serde(default)]
+    pub blocked_targets: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountsStatusV1 {
+    pub schema_version: u16,
+    pub setup_operation: CodexAccountSetupOperationV1,
+    pub default_slot: CodexAccountSlotDescriptorV1,
+    #[serde(default)]
+    pub managed_slots: Vec<CodexAccountSlotDescriptorV1>,
+    #[serde(default)]
+    pub target_coverage: CodexAccountTargetCoverageV1,
+    pub capacity: CodexAccountCapacityV1,
+    /// Presence is the capability bit for the v26 daemon-run sign-in
+    /// (`codex_account_start_sign_in`). Older daemons omit it; older clients
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_sign_in_supported: Option<bool>,
+    /// The background limit refresh switch for every Codex home on this Mac.
+    /// Presence is the capability bit for the v27
+    /// `codex_account_set_quota_refresh_consent`. Older daemons omit it (they
+    /// always read in the background); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_quota_refresh: Option<CodexQuotaRefreshConsentState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub all_machines: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCostsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub all_machines: bool,
+    /// Comma-separated grouped families for `mode=full`; Ottto owns the list
+    /// and its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<String>,
+    /// Include the selected families' daily/hourly series (`mode=full`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub daily: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub all_machines: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRecommendationsQuery {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProviderImpactQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum LocalControlCommand {
+    SessionLaunchPrepare {
+        schema_version: u16,
+        provider: SessionLaunchProviderV1,
+        slot_id: String,
+        expected_account_identifier_hash: String,
+        #[serde(default)]
+        expected_organization_identifier_hash: Option<String>,
+        folder: SessionLaunchFolderV1,
+        #[serde(default)]
+        terminal: Option<String>,
+    },
+    SessionLaunchConsume {
+        schema_version: u16,
+        launch_id: String,
+        secret: SecretString,
+    },
+    SessionLaunchReport {
+        schema_version: u16,
+        launch_id: String,
+        attempt_id: SecretString,
+        reason: SessionLaunchBlockReasonV1,
+    },
+    SessionLaunchStatus {
+        schema_version: u16,
+        launch_id: String,
+    },
+    SessionLaunchCancel {
+        schema_version: u16,
+        launch_id: String,
+    },
+    SessionLaunchRecentFolders {
+        schema_version: u16,
+        #[serde(default)]
+        provider: Option<SessionLaunchProviderV1>,
+        #[serde(default)]
+        slot_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    AccountNicknames,
+    AccountNicknameSet {
+        source: SessionLaunchProviderV1,
+        account_identifier_hash: String,
+        #[serde(default)]
+        organization_identifier_hash: Option<String>,
+        #[serde(default)]
+        nickname: Option<SecretString>,
+        #[serde(default)]
+        base_revision: Option<u64>,
+    },
+    Status {
+        #[serde(default)]
+        refresh_agent_status: bool,
+        /// Explicit doctor recovery; ordinary status reads do not reset backoff.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retry_relay_authorization: bool,
+    },
+    /// Read one page of the daemon's privacy-safe snapshot upload receipts,
+    /// newest first. `before` is the previous page's `next_before` cursor.
+    Receipts {
+        limit: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SourceKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+    },
+    AuthStatus,
+    /// Agent status for one source or all. On its own it serves the daemon's
+    /// saved quota readings and starts no provider read; the daemon's own
+    /// schedule keeps them current.
+    AgentStatusRefresh {
+        source: Option<SourceKind>,
+        /// Explicit refresh (a user's Refresh action): read provider quota
+        /// now for every account of the source(s), at most once a minute per
+        /// account, then answer as above. Holds, breakers and Retry-After
+        /// still apply.
+        #[serde(default, skip_serializing_if = "is_false")]
+        quota_refresh: bool,
+    },
+    /// Read only the status owner's process memory. Never refresh, load a disk
+    /// cache, or hydrate general status. An empty array means no saved reading.
+    /// A distinct verb makes older daemons reject rather than refresh.
+    AgentStatusCached {
+        source: Option<SourceKind>,
+    },
+    PersonalMeterLocalSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SourceKind>,
+    },
+    AgentContext {
+        #[serde(default)]
+        query: AgentContextQuery,
+    },
+    AgentCosts {
+        #[serde(default)]
+        query: AgentCostsQuery,
+    },
+    AgentSessions {
+        #[serde(default)]
+        query: AgentSessionsQuery,
+    },
+    AgentRecommendations {
+        #[serde(default)]
+        query: AgentRecommendationsQuery,
+    },
+    AgentProviderImpact {
+        #[serde(default)]
+        query: AgentProviderImpactQuery,
+    },
+    CloudStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    AuthStart,
+    AuthComplete {
+        claim_code: String,
+        nonce: String,
+    },
+    AuthCompletePending {
+        claim_code: String,
+    },
+    /// Confirmed account switch: atomically clear the old local binding
+    /// (best-effort cloud disconnect of the previous account) and install the
+    /// staged claim completion for the new account. Only valid after an
+    /// `auth_complete`/`auth_complete_pending` returned an
+    /// `account_reset_required` error carrying `switch_candidate` details for
+    /// this `claim_code`. Additive command: older daemons reject it as an
+    /// unknown command, and older clients never send it.
+    AuthSwitchAccount {
+        claim_code: String,
+    },
+    AuthReset {
+        #[serde(default)]
+        local_only: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        forget_installation: bool,
+    },
+    Account,
+    /// Read machine-local Claude account registration state.
+    ClaudeAccountsStatus,
+    /// Explicitly grant or revoke daemon background-upkeep consent.
+    ClaudeAccountSetUpkeepConsent {
+        schema_version: u16,
+        consent: bool,
+    },
+    /// Remove one custom registration by its opaque local slot identifier.
+    ClaudeAccountRemove {
+        schema_version: u16,
+        slot_id: String,
+    },
+    /// Advanced: register the exact raw string used for `CLAUDE_CONFIG_DIR`.
+    ClaudeAccountRegisterPath {
+        schema_version: u16,
+        config_dir: String,
+    },
+    /// Prepare and atomically register one daemon-owned exact config directory.
+    ClaudeAccountPrepare {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_identifier_hash: Option<String>,
+    },
+    /// v19 target-bound prepare. The daemon resolves `target_id` from its own
+    /// current projection and persists the exact composite binding atomically.
+    ClaudeAccountPrepareTarget {
+        schema_version: u16,
+        operation_id: String,
+        target_id: String,
+    },
+    /// Begin observing customer-owned official `/login` for one already
+    /// registered custom slot. No directory or credential is created.
+    ClaudeAccountReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        expected_account_identifier_hash: String,
+    },
+    /// v19 target-bound reconnect for one exact already-registered anchor.
+    ClaudeAccountReconnectTarget {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        target_id: String,
+    },
+    /// Advance one persisted setup observation using the existing collector.
+    ClaudeAccountCheck {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_identifier_hash: Option<String>,
+    },
+    /// Stop only Ottto's observation; registration and Claude stay untouched.
+    ClaudeAccountStopWaiting {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// v23 explicit provider-owned browser login. `target_id` is present for
+    /// a known daemon-selected composite and absent for generic discovery.
+    ClaudeAccountStartBrowserLogin {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// v23 provider-owned browser reauthentication for one exact durable root.
+    ClaudeAccountStartBrowserReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        target_id: String,
+    },
+    /// Retired v25 authorization-code submission. It carries no fields: any
+    /// fields an older client still sends are ignored, never retained. The
+    /// daemon answers an authorized request with a structured rejection.
+    #[serde(rename = "claude_account_submit_auth_code")]
+    RetiredClaudeAccountSubmitAuthCode {},
+    /// Read machine-local Codex durable-account state.
+    CodexAccountsStatus,
+    /// Create one opaque Codex home and return its official CLI login command.
+    CodexAccountPrepare {
+        schema_version: u16,
+        operation_id: String,
+        expected_account_identifier_hash: String,
+        expected_workspace_identifier_hash: String,
+    },
+    /// v23 open prepare, for a workspace the client cannot name in advance.
+    ///
+    /// Other ChatGPT workspaces are not enumerable - the ID token names only the
+    /// signed-in one and `account/read` carries no workspace list - so the only
+    /// honest way to add one is to let the provider's own picker choose and
+    /// adopt whatever comes back. The daemon reserves a home, and registers the
+    /// slot only once the sign-in yields an identity that is not already
+    /// connected.
+    CodexAccountPrepareOpen {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// v21 target-bound prepare. The daemon resolves `target_id` from its own
+    /// current projection and persists the exact composite binding atomically.
+    CodexAccountPrepareTarget {
+        schema_version: u16,
+        operation_id: String,
+        target_id: String,
+    },
+    /// Reuse one accepted durable home for provider-owned sign-in again.
+    CodexAccountReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        expected_account_identifier_hash: String,
+        expected_workspace_identifier_hash: String,
+    },
+    /// Re-read the prepared home and accept only its exact expected composite.
+    CodexAccountCheck {
+        schema_version: u16,
+        operation_id: String,
+        /// A person's check (a button), not a client's poll. While the setup
+        /// waits for sign-in, the daemon spaces provider reads after a failed
+        /// one; an explicit check reads at most once per few seconds instead.
+        /// Clients set it only for a person's action, never on a timer.
+        #[serde(default, skip_serializing_if = "is_false")]
+        explicit: bool,
+    },
+    /// v26: run `codex login` for the managed home of the current setup
+    /// operation (after prepare, prepare-open, prepare-target or reconnect, or
+    /// after an identity mismatch). The daemon supervises it, stops it after
+    /// ten minutes, and checks the account once when it ends; progress is in
+    /// `setup_operation.sign_in`. `codex_account_stop_waiting` cancels it.
+    /// Replaying the command while the run is active only returns status.
+    CodexAccountStartSignIn {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// Stop setup observation without signing out or deleting provider state.
+    CodexAccountStopWaiting {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// Remove a daemon-managed durable registration and permanently delete its
+    /// daemon-managed credential home. The default Codex home and external
+    /// user-owned directories are never deletion targets.
+    CodexAccountRemove {
+        schema_version: u16,
+        slot_id: String,
+    },
+    /// v27: turn background Codex limit reads on or off for every Codex home
+    /// on this Mac. Off stops the daemon's scheduled reads (and the sign-in
+    /// renewal they do); a person's Refresh and setup checks still read.
+    CodexAccountSetQuotaRefreshConsent {
+        schema_version: u16,
+        consent: bool,
+    },
+    Detect {
+        source: SourceKind,
+    },
+    Setup {
+        sources: Vec<SourceKind>,
+        claim_code: Option<String>,
+        setup_run_id: Option<String>,
+        api_base_url: Option<String>,
+    },
+    SetupAnswer {
+        source: SourceKind,
+        answer_type: String,
+        api_base_url: Option<String>,
+    },
+    SetupAction {
+        source: SourceKind,
+        action_type: String,
+        api_base_url: Option<String>,
+    },
+    /// Pause (`enabled: false`) or resume one source's collection on this
+    /// Mac and save it to the account. Replies
+    /// `{source, source_paused, server_saved}`.
+    SourceCollection {
+        source: SourceKind,
+        enabled: bool,
+    },
+    TelemetryControl {
+        action: TelemetryControlAction,
+        source: SourceKind,
+        control_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        key_id: Option<String>,
+        organization_id: Option<String>,
+        otlp_endpoint: Option<String>,
+        ingest_key: Option<SecretString>,
+    },
+    /// One short-lived, backend-authorized mutation/read of the local Codex
+    /// daily-aggregates (`provider_daily_reference.v1`) consent state.
+    ///
+    /// It packages consent the operator explicitly asked for in the UI; it
+    /// never creates consent on its own, and it changes none of the five
+    /// collection gates. Browser JWTs never cross this boundary.
+    ProviderDailyReferenceControl {
+        action: ProviderDailyReferenceControlAction,
+        control_token: SecretString,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+        /// Opaque account attribution observed by the browser's immediately
+        /// preceding status read. Required only for current-account privacy
+        /// controls so an account switch cannot retarget the mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_fingerprint: Option<String>,
+    },
+    Repair {
+        source: SourceKind,
+        dry_run: bool,
+    },
+    Verify {
+        source: SourceKind,
+        #[serde(default)]
+        repair: bool,
+    },
+    RelayStart,
+    RelayStop,
+    DiagnosticsCollect {
+        #[serde(default)]
+        upload: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upload_approval: Option<DiagnosticsUploadApproval>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+    },
+    UpdateCheck,
+    UninstallPlan,
+    UninstallExecute {
+        confirm: bool,
+    },
+    Uninstall,
+}
+
+/// One privacy-safe entity acknowledgement in a local upload receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptEntityV1 {
+    pub source_session_id_hash: String,
+    pub snapshot_fingerprint_prefix: String,
+    pub occurrence_count: u64,
+}
+
+/// Result of one snapshot batch upload attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadReceiptOutcomeV1 {
+    Accepted,
+    Partial,
+    Shed,
+    Rejected,
+    AuthRejected,
+    TransportError,
+}
+
+/// Persisted, privacy-safe summary of one snapshot batch upload attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptV1 {
+    pub uploaded_at: String,
+    pub outcome: UploadReceiptOutcomeV1,
+    pub http_status: Option<u16>,
+    pub server_request_id: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub source: SourceKind,
+    /// User-facing device label already exposed by local `status`; never an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+    /// Current local account binding state already exposed by local `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_binding: Option<LocalAccountState>,
+    pub batch_item_count: u64,
+    pub accepted_count: u64,
+    pub accepted_entities: Vec<UploadReceiptEntityV1>,
+    pub unchanged_entities: Vec<UploadReceiptEntityV1>,
+    pub conflict_entities: Vec<UploadReceiptEntityV1>,
+    pub rejected_entities: Vec<UploadReceiptEntityV1>,
+}
+
+/// Stable JSON payload returned by `ottto receipts --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptsResponseV1 {
+    pub schema: String,
+    pub receipts: Vec<UploadReceiptV1>,
+    /// The most receipts one page returns.
+    pub ring_capacity: u16,
+    pub state_path_present: bool,
+    /// Present when older receipts may follow: pass it as `before` to read
+    /// the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<u64>,
+    /// History rows the daemon process could not write since it started.
+    /// Present only when at least one was lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_rows_not_written: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryControlAction {
+    EnableTelemetry,
+    DisableTelemetry,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDailyReferenceControlAction {
+    Prepare,
+    Bind,
+    Revoke,
+    ConfirmRevoked,
+    Status,
+    ExcludeCurrentAccount,
+    IncludeCurrentAccount,
+}
+
+/// Server policy for one `provider_daily_reference` grant.
+///
+/// Defaults closed, so a binding written before the field existed - or a
+/// response that omits it - can never be read as approval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDailyReferenceServerPolicyState {
+    Approved,
+    #[default]
+    Disabled,
+    RolloutDisabled,
+}
+
+/// Strict identity-bearing subset of the backend's
+/// `provider_daily_reference` grant response that the daemon binds against.
+/// Provider content and credentials are never represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDailyReferenceBackendGrantResponseV1 {
+    pub id: String,
+    pub installation_id: String,
+    pub source: String,
+    pub collector_id: String,
+    pub schema_version: String,
+    pub collector_version: String,
+    pub release_lane: String,
+    pub disclosure_version: String,
+    pub grant_scope_fingerprint: String,
+    pub account_fingerprint: String,
+    pub status: String,
+    pub grant_version: u64,
+    #[serde(default)]
+    pub server_policy_state: ProviderDailyReferenceServerPolicyState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInstallationDetection {
+    pub source: SourceKind,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_docs_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResult {
+    pub action: TelemetryControlAction,
+    pub source: SourceKind,
+    pub status: ControlResultStatus,
+    pub key_id: Option<String>,
+    pub requires_restart: bool,
+    pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<AgentInstallationDetection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlResultStatus {
+    Accepted,
+    Rejected,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalControlResponse {
+    pub request_id: String,
+    pub ok: bool,
+    pub payload: Option<serde_json::Value>,
+    pub error: Option<CliError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliErrorCode {
+    DaemonUnavailable,
+    LocalAuthFailed,
+    LocalClientNotTrusted,
+    AccountResetRequired,
+    BackendUnreachable,
+    BackendRejected,
+    BackendUnavailable,
+    BackendResponseUnexpected,
+    SourceUnsupported,
+    SourceNotFound,
+    RepairLocked,
+    NetworkUnavailable,
+    PermissionDenied,
+    ManualFenceReviewRequired,
+    NeedsUserAction,
+    TimedOut,
+    InvalidRequest,
+    Internal,
+}
+
+impl CliErrorCode {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            CliErrorCode::InvalidRequest => 2,
+            CliErrorCode::DaemonUnavailable => 10,
+            CliErrorCode::LocalAuthFailed => 11,
+            CliErrorCode::LocalClientNotTrusted => 12,
+            CliErrorCode::AccountResetRequired => 13,
+            CliErrorCode::BackendUnreachable => 14,
+            CliErrorCode::BackendRejected => 15,
+            CliErrorCode::BackendUnavailable => 16,
+            CliErrorCode::BackendResponseUnexpected => 17,
+            CliErrorCode::SourceUnsupported => 20,
+            CliErrorCode::SourceNotFound => 21,
+            CliErrorCode::RepairLocked => 30,
+            CliErrorCode::NetworkUnavailable => 40,
+            CliErrorCode::PermissionDenied => 50,
+            CliErrorCode::ManualFenceReviewRequired => 50,
+            CliErrorCode::NeedsUserAction => 60,
+            CliErrorCode::TimedOut => 61,
+            CliErrorCode::Internal => 70,
+        }
+    }
+}
+
+fn safe_optional_text(value: Option<String>) -> Option<String> {
+    value.filter(|text| is_safe_backend_text(text))
+}
+
+/// Longest raw provider account or organization/workspace id sent to the
+/// backend. The backend account schema caps these fields at 128 characters and
+/// rejects the whole snapshot above that, so a longer value is dropped here.
+const BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS: usize = 128;
+
+/// Keep a raw provider account or organization/workspace id for the backend.
+///
+/// The documented producers emit UUIDs (Anthropic account and organization,
+/// ChatGPT workspace) or `user-...` ids (ChatGPT user), so only ASCII letters,
+/// digits and `-` are accepted. That excludes emails, paths, URLs, whitespace
+/// and every secret-shaped fragment by construction; the shared backend-text
+/// guard still runs as a second check. Anything else is dropped, never
+/// rewritten, so the backend can only see the exact value the hash was made
+/// from.
+fn safe_provider_identifier(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        || !is_safe_backend_text(trimmed)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Only already-acquired status display fields may contain email addresses.
+/// Keep exact text for weak member identity; reject unsafe/overlong values
+/// rather than trimming, truncating, or borrowing another account's label.
+fn safe_status_display_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value.filter(|text| {
+        let normalized = text.to_ascii_lowercase();
+        text.chars().count() <= max_chars
+            && !text.chars().any(char::is_control)
+            && is_safe_backend_text_without_email_guard(text.trim())
+            && ![
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "api_key",
+                "password=",
+                "password:",
+                "cookie:",
+                "-----begin",
+                "transcript_path",
+                "workspace_path",
+                "http://",
+                "https://",
+                "file:/",
+            ]
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+            && !text
+                .split(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '=' | ':'
+                                | '\"'
+                                | '\''
+                                | '('
+                                | ')'
+                                | '['
+                                | ']'
+                                | '{'
+                                | '}'
+                                | ','
+                                | ';'
+                                | '|'
+                        )
+                })
+                .any(|part| {
+                    let part = part.trim_start_matches(['\"', '\'', '(', '[', '{']);
+                    part.starts_with('/')
+                        || part.starts_with("~/")
+                        || part.starts_with('\\')
+                        || (part.as_bytes().get(1) == Some(&b':')
+                            && matches!(part.as_bytes().get(2), Some(b'/' | b'\\')))
+                })
+    })
+}
+
+fn is_safe_backend_text(value: &str) -> bool {
+    !value.contains('@') && is_safe_backend_text_without_email_guard(value)
+}
+
+fn is_safe_backend_text_without_email_guard(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.trim().is_empty() {
+        return false;
+    }
+    let forbidden_fragments = [
+        "/users/",
+        "\\users\\",
+        "/home/",
+        "\\home\\",
+        "/.codex",
+        "\\.codex",
+        "/.claude",
+        "\\.claude",
+        "/.pi/",
+        "\\.pi\\",
+        "authorization:",
+        "bearer ",
+        "otdev_",
+        "otsi_",
+        "otsr_",
+        "otsct_",
+        "otel_",
+        "otrelay_",
+        "sk-",
+    ];
+    if forbidden_fragments
+        .iter()
+        .any(|fragment| normalized.contains(fragment))
+    {
+        return false;
+    }
+    let trimmed = normalized.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+        )
+    });
+    !(trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("file:/")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://"))
+}
+
+fn redact_available_model_for_backend(
+    mut detail: AgentAvailableModelStatus,
+) -> Option<AgentAvailableModelStatus> {
+    if !is_safe_backend_text(&detail.id) {
+        return None;
+    }
+    detail.provider = safe_optional_text(detail.provider.take());
+    detail.model_provider = safe_optional_text(detail.model_provider.take());
+    detail.billing_provider = safe_optional_text(detail.billing_provider.take());
+    detail.billing_channel = safe_optional_text(detail.billing_channel.take());
+    detail.auth_mode = safe_optional_text(detail.auth_mode.take());
+    detail.gateway_provider = safe_optional_text(detail.gateway_provider.take());
+    detail.subscription_product = safe_optional_text(detail.subscription_product.take());
+    detail.source_category = safe_optional_text(detail.source_category.take());
+    detail.account_identifier_hash = safe_optional_text(detail.account_identifier_hash.take());
+    detail.organization_identifier_hash =
+        safe_optional_text(detail.organization_identifier_hash.take());
+    detail.credential_fingerprint_hash =
+        safe_optional_text(detail.credential_fingerprint_hash.take());
+    detail.billing_identity_evidence = safe_optional_text(detail.billing_identity_evidence.take());
+    Some(detail)
+}
+
+fn redact_capability_for_backend(mut capability: AgentCapabilityGap) -> Option<AgentCapabilityGap> {
+    if !is_safe_backend_text(&capability.capability) {
+        return None;
+    }
+    capability.detail = safe_optional_text(capability.detail.take());
+    Some(capability)
+}
+
+fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<AgentCreditBalance> {
+    if !is_safe_backend_text(&credit.name) {
+        return None;
+    }
+    credit.account_label = None;
+    // `spend_control_reached` is a boolean flag and safe to forward as-is; the
+    // free-form provider strings pass the backend-text guard so a leaked path or
+    // secret never rides along.
+    credit.rate_limit_reached_type = safe_optional_text(credit.rate_limit_reached_type.take());
+    credit.limit_id = safe_optional_text(credit.limit_id.take());
+    // Quota contract v2.2: every new field is checked on the way out and an
+    // invalid value is dropped field by field, never the whole balance.
+    credit.title = credit
+        .title
+        .take()
+        .filter(|title| is_backend_safe_credit_text(title));
+    credit.disabled_reason = credit.disabled_reason.take().filter(|reason| {
+        credit.enabled == Some(false)
+            && is_credit_reason_code(reason)
+            && is_safe_backend_text(reason)
+    });
+    credit.ineligible_reason = credit
+        .ineligible_reason
+        .take()
+        .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
+    if credit.unit != AgentCreditBalanceUnit::Resets {
+        // Readiness is only meaningful for saved resets.
+        credit.eligible = None;
+        credit.at_limit = None;
+        credit.ineligible_reason = None;
+        credit.cooldown_until = None;
+    }
+    for time in [
+        &mut credit.observed_at,
+        &mut credit.expires_at,
+        &mut credit.grants_observed_at,
+        &mut credit.next_expires_at,
+        &mut credit.latest_granted_at,
+        &mut credit.cooldown_until,
+    ] {
+        *time = time.take().filter(|value| is_rfc3339_instant(value));
+    }
+    let mut list_degraded = false;
+    if let Some(grants) = credit.grants.as_mut() {
+        let before = grants.len();
+        grants.retain(|grant| is_credit_grant_key(&grant.grant_key));
+        list_degraded |= grants.len() != before;
+        for grant in grants.iter_mut() {
+            grant.title = grant
+                .title
+                .take()
+                .filter(|title| is_backend_safe_credit_text(title));
+            grant.clears = grant.clears.take().filter(|clears| {
+                clears
+                    .iter()
+                    .all(|name| is_credit_reason_code(name) && is_safe_backend_text(name))
+            });
+            for time in [
+                &mut grant.granted_at,
+                &mut grant.starts_at,
+                &mut grant.expires_at,
+            ] {
+                if time
+                    .as_deref()
+                    .is_some_and(|value| !is_rfc3339_instant(value))
+                {
+                    *time = None;
+                    list_degraded = true;
+                }
+            }
+        }
+    }
+    if list_degraded {
+        // A dropped grant or refused grant time means the list may now miss
+        // something: never claim completeness, and drop the complete-gated
+        // summaries with it.
+        if matches!(
+            credit.grants_state,
+            Some(CreditGrantsState::Complete | CreditGrantsState::Capped)
+        ) {
+            credit.grants_state = Some(CreditGrantsState::Partial);
+        }
+        credit.next_expires_at = None;
+        credit.latest_granted_at = None;
+    }
+    if !credit_grants_unavailable_cause_allowed(&credit) {
+        credit.grants_unavailable_cause = None;
+    }
+    Some(credit)
+}
+
+/// `^[a-z0-9_.-]{1,64}$`: the closed shape of provider reason codes and grant
+/// `clears` window names (quota contract v2.1 §5, v2.2 §11.1).
+pub fn is_credit_reason_code(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// `grant_key` shape: 64 lowercase hex characters.
+fn is_credit_grant_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Strict RFC 3339 instant (`YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`) with
+/// calendar ranges checked. The protocol crate has no time dependency, so the
+/// shape is checked by hand.
+fn is_rfc3339_instant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.len() > 64 || !value.is_ascii() {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let part = &value[range];
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let separators = [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, ch)| bytes[*at] != *ch) || !matches!(bytes[10], b'T' | b't') {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0..4),
+        number(5..7),
+        number(8..10),
+        number(11..13),
+        number(14..16),
+        number(17..19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=9).contains(&digits) {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    match rest.as_bytes() {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit())
+                && (h1 - b'0') * 10 + (h2 - b'0') <= 23
+                && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
+        _ => false,
+    }
+}
+
+/// The backend-upload privacy guard for provider credit display text (balance
+/// and grant `title`). It checks the value as given and a lookalike-folded
+/// copy (see [`fold_for_privacy_match`]), so `／Users／…` or a zero-width
+/// split `be\u{200b}arer` fails like its ASCII form. The daemon credit model
+/// runs it on the full value before any truncation, so a cut never hides a leak.
+pub fn is_backend_safe_credit_text(value: &str) -> bool {
+    // The fold also runs on ASCII: it collapses whitespace runs, so
+    // `bearer\tx` matches the `bearer ` fragment as on the backend.
+    is_safe_backend_text(value) && is_safe_backend_text(&fold_for_privacy_match(value))
+}
+
+/// Matching-only fold of Unicode lookalikes, mirroring the backend's privacy
+/// match without a Unicode-tables dependency: full-width ASCII forms and the
+/// slash/solidus lookalikes become ASCII, invisible format characters are
+/// dropped, every whitespace run becomes one space, and letters are lowercased.
+fn fold_for_privacy_match(value: &str) -> String {
+    let mut folded = String::with_capacity(value.len());
+    let mut in_space = false;
+    for ch in value.chars() {
+        let mapped = match ch {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
+            '\u{2044}' | '\u{2215}' | '\u{29F8}' => '/',
+            '\u{FE6B}' => '@',
+            '\u{2216}' | '\u{29F5}' | '\u{29F9}' | '\u{FE68}' => '\\',
+            _ if is_format_char(ch) => continue,
+            _ => ch,
+        };
+        if mapped.is_whitespace() {
+            if !in_space {
+                folded.push(' ');
+            }
+            in_space = true;
+            continue;
+        }
+        in_space = false;
+        folded.extend(mapped.to_lowercase());
+    }
+    folded
+}
+
+/// Unicode `Cf` (format) characters that render invisibly.
+fn is_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+fn redact_plan_observation_for_backend(
+    mut observation: AgentStatusPlanObservation,
+) -> AgentStatusPlanObservation {
+    observation.desktop_recent_at = None;
+    observation.evidence_method = safe_optional_text(observation.evidence_method.take());
+    observation.source_session_id = safe_optional_text(observation.source_session_id.take());
+    observation.provider = safe_optional_text(observation.provider.take());
+    observation.billing_provider = safe_optional_text(observation.billing_provider.take());
+    observation.model_provider = safe_optional_text(observation.model_provider.take());
+    observation.billing_channel = safe_optional_text(observation.billing_channel.take());
+    observation.auth_mode = safe_optional_text(observation.auth_mode.take());
+    observation.gateway_provider = safe_optional_text(observation.gateway_provider.take());
+    observation.subscription_product = safe_optional_text(observation.subscription_product.take());
+    observation.plan_type = safe_optional_text(observation.plan_type.take());
+    observation.account_label = safe_status_display_text(observation.account_label.take(), 255);
+    observation.account_id = safe_provider_identifier(observation.account_id.take());
+    observation.organization_label =
+        safe_status_display_text(observation.organization_label.take(), 255);
+    observation.organization_id = safe_provider_identifier(observation.organization_id.take());
+    observation.account_identifier_hash =
+        safe_optional_text(observation.account_identifier_hash.take());
+    observation.organization_identifier_hash =
+        safe_optional_text(observation.organization_identifier_hash.take());
+    observation.credential_fingerprint_hash =
+        safe_optional_text(observation.credential_fingerprint_hash.take());
+    observation.billing_identity_evidence =
+        safe_optional_text(observation.billing_identity_evidence.take());
+    observation
+}
+
+/// A Claude usage read Claude answered with 429: names the read and the
+/// wait. Local status only (Companion and CLI); never uploaded, so a per-429
+/// time never becomes a backend row.
+pub const CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE: &str = "claude_oauth_usage_rate_limited";
+
+/// Diagnostics kept in local status and dropped from the backend upload.
+fn is_local_only_diagnostic(code: &str) -> bool {
+    code == CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE
+}
+
+fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> AgentStatusDiagnostic {
+    if !is_safe_backend_text(&diagnostic.code) {
+        diagnostic.code = "redacted".to_string();
+    }
+    if !is_safe_backend_text(&diagnostic.message) {
+        diagnostic.message = "diagnostic redacted".to_string();
+    }
+    // `account_label`/`scope` are Companion-local hints (and the label may carry
+    // account/org text); strip them so the backend-upload wire format is
+    // unchanged from before these fields existed.
+    diagnostic.account_label = None;
+    diagnostic.scope = None;
+    diagnostic.account_identifier_hash =
+        safe_optional_text(diagnostic.account_identifier_hash.take());
+    diagnostic.organization_identifier_hash =
+        safe_optional_text(diagnostic.organization_identifier_hash.take());
+    diagnostic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_retry_relay_authorization_is_additive_and_explicit() {
+        let legacy = serde_json::json!({"command":"status", "refresh_agent_status":false});
+        let command: LocalControlCommand = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            command,
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            }
+        );
+        assert_eq!(serde_json::to_value(command).unwrap(), legacy);
+        let doctor = LocalControlCommand::Status {
+            refresh_agent_status: false,
+            retry_relay_authorization: true,
+        };
+        assert_eq!(
+            serde_json::to_value(doctor).unwrap()["retry_relay_authorization"],
+            true
+        );
+    }
+
+    #[test]
+    fn cli_exit_codes_are_stable() {
+        assert_eq!(CliErrorCode::InvalidRequest.exit_code(), 2);
+        assert_eq!(CliErrorCode::DaemonUnavailable.exit_code(), 10);
+        assert_eq!(CliErrorCode::BackendUnavailable.exit_code(), 16);
+        assert_eq!(CliErrorCode::BackendResponseUnexpected.exit_code(), 17);
+        assert_eq!(CliErrorCode::PermissionDenied.exit_code(), 50);
+        assert_eq!(CliErrorCode::ManualFenceReviewRequired.exit_code(), 50);
+        assert_eq!(CliErrorCode::NeedsUserAction.exit_code(), 60);
+        assert_eq!(CliErrorCode::TimedOut.exit_code(), 61);
+        assert_eq!(CliErrorCode::Internal.exit_code(), 70);
+    }
+
+    #[test]
+    fn desktop_recent_is_optional_and_redacted_for_backend() {
+        let mut snapshot: AgentStatusSnapshot = serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/display-carrier.json"
+        ))
+        .unwrap();
+        assert!(snapshot
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("desktop_recent_at"));
+        snapshot.plan_observations[0].desktop_recent_at = Some("2026-10-25T10:00:00Z".into());
+        let local = serde_json::to_string(&snapshot).unwrap();
+        assert!(local.contains("desktop_recent_at"));
+        assert!(!serde_json::to_string(&snapshot.redacted_for_backend())
+            .unwrap()
+            .contains("desktop_recent_at"));
+    }
+
+    #[test]
+    fn agent_status_cached_is_a_distinct_wire_command() {
+        let command = LocalControlCommand::AgentStatusCached {
+            source: Some(SourceKind::ClaudeCode),
+        };
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"command": "agent_status_cached", "source": "claude_code"})
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn agent_status_refresh_keeps_its_wire_form_and_adds_an_optional_quota_refresh() {
+        let plain: LocalControlCommand = serde_json::from_value(
+            serde_json::json!({"command": "agent_status_refresh", "source": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"command": "agent_status_refresh", "source": null})
+        );
+
+        let refresh = LocalControlCommand::AgentStatusRefresh {
+            source: Some(SourceKind::Codex),
+            quota_refresh: true,
+        };
+        let wire = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "command": "agent_status_refresh",
+                "source": "codex",
+                "quota_refresh": true
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            refresh
+        );
+    }
+
+    #[test]
+    fn setup_answer_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_setup_answer",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "setup_answer",
+            "source": "pi",
+            "answer_type": "skip_source"
+        }))
+        .expect("setup answer request");
+
+        assert_eq!(request.request_id, "req_setup_answer");
+        assert_eq!(request.client_kind, Some(LocalClientKind::CompanionApp));
+        assert_eq!(
+            request.command,
+            LocalControlCommand::SetupAnswer {
+                source: SourceKind::Pi,
+                answer_type: "skip_source".to_string(),
+                api_base_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn setup_action_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_setup_action",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "setup_action",
+            "source": "codex",
+            "action_type": "install_source"
+        }))
+        .expect("setup action request");
+
+        assert_eq!(request.request_id, "req_setup_action");
+        assert_eq!(request.client_kind, Some(LocalClientKind::CompanionApp));
+        assert_eq!(
+            request.command,
+            LocalControlCommand::SetupAction {
+                source: SourceKind::Codex,
+                action_type: "install_source".to_string(),
+                api_base_url: None,
+            }
+        );
+    }
+
+    /// [format] The Companion's Pause/Resume command: exact wire JSON.
+    #[test]
+    fn source_collection_command_wire_shape() {
+        let command = LocalControlCommand::SourceCollection {
+            source: SourceKind::ClaudeCode,
+            enabled: false,
+        };
+        let wire = serde_json::json!({
+            "command": "source_collection",
+            "source": "claude_code",
+            "enabled": false
+        });
+        assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn claude_account_commands_round_trip_exact_registered_strings() {
+        let status: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_accounts_status",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "claude_accounts_status"
+        }))
+        .expect("account status request");
+        assert_eq!(status.command, LocalControlCommand::ClaudeAccountsStatus);
+
+        let register: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_account_register",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "claude_account_register_path",
+            "schema_version": 1,
+            "config_dir": "/tmp/claude-work/"
+        }))
+        .expect("account register request");
+        assert_eq!(
+            register.command,
+            LocalControlCommand::ClaudeAccountRegisterPath {
+                schema_version: 1,
+                config_dir: "/tmp/claude-work/".to_string(),
+            }
+        );
+
+        for command in [
+            serde_json::json!({
+                "command": "claude_account_set_upkeep_consent",
+                "schema_version": 1,
+                "consent": true
+            }),
+            serde_json::json!({
+                "command": "claude_account_remove",
+                "schema_version": 1,
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_prepare",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
+                "command": "claude_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
+                "command": "claude_account_check",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_account_mutation");
+            request["protocol_version"] =
+                serde_json::json!(CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION);
+            request["client_kind"] = serde_json::json!("companion_app");
+            serde_json::from_value::<LocalControlRequest>(request).expect("account mutation");
+        }
+    }
+
+    #[test]
+    fn codex_account_commands_round_trip_exact_registered_strings() {
+        for command in [
+            serde_json::json!({"command": "codex_accounts_status"}),
+            serde_json::json!({
+                "command": "codex_account_prepare",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            serde_json::json!({
+                "command": "codex_account_prepare_open",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_prepare_target",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "target_id": "codex_account_target_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "codex_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            serde_json::json!({
+                "command": "codex_account_check",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_check",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "explicit": true
+            }),
+            serde_json::json!({
+                "command": "codex_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_remove",
+                "schema_version": 1,
+                "slot_id": "codex_slot_0123456789abcdef0123456789abcdef"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_codex_account");
+            request["protocol_version"] =
+                serde_json::json!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION);
+            request["client_kind"] = serde_json::json!("companion_app");
+            serde_json::from_value::<LocalControlRequest>(request).expect("Codex account command");
+        }
+    }
+
+    #[test]
+    fn codex_target_always_serializes_setup_blockers_even_when_empty() {
+        // Skipping this list when empty took the whole Codex accounts panel
+        // down for two releases: the companion decoded it as required, so the
+        // healthy case - no blockers - failed, and one failed target failed the
+        // entire status. Every target must carry the key.
+        let status = CodexAccountsStatusV1 {
+            schema_version: CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            setup_operation: Default::default(),
+            default_slot: CodexAccountSlotDescriptorV1 {
+                slot_id: "default".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Default,
+                collection: Default::default(),
+            },
+            managed_slots: Vec::new(),
+            target_coverage: CodexAccountTargetCoverageV1 {
+                targets: vec![CodexAccountTargetDescriptorV1 {
+                    target_id: "codex_account_target_healthy".to_string(),
+                    account_identifier_hash: Some("a".repeat(64)),
+                    workspace_identifier_hash: Some("b".repeat(64)),
+                    account_label: "owner@example.test".to_string(),
+                    workspace_label: Some("Personal".to_string()),
+                    subscription_product: Some("chatgpt_pro".to_string()),
+                    durability: CodexAccountTargetDurabilityV1::Current,
+                    is_current: true,
+                    connectable: true,
+                    health: Some(CodexAccountTargetHealthV1::Healthy),
+                    setup_blockers: Vec::new(),
+                    observed_at: None,
+                }],
+                observed_targets: 1,
+                durable_targets: 0,
+                current_targets: 1,
+                connectable_targets: 1,
+                blocked_targets: 0,
+            },
+            capacity: CodexAccountCapacityV1 {
+                max_slots: 10,
+                used_slots: 1,
+                remaining_slots: 9,
+            },
+            daemon_sign_in_supported: None,
+            background_quota_refresh: None,
+        };
+
+        let wire = serde_json::to_value(&status).expect("serialize");
+        let target = &wire["target_coverage"]["targets"][0];
+        assert!(
+            target.get("setup_blockers").is_some(),
+            "an empty blocker list must still be sent: {target}"
+        );
+        assert_eq!(target["setup_blockers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn codex_start_sign_in_is_v26_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_sign_in",
+            "protocol_version": CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_start_sign_in",
+            "schema_version": 1,
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v26 sign-in");
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::CodexAccountStartSignIn { ref operation_id, schema_version: 1 }
+                if operation_id == "codex_setup_0123456789abcdef0123456789abcdef"
+        ));
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize")["command"],
+            "codex_account_start_sign_in"
+        );
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the daemon-run sign-in rejects every other protocol");
+            assert!(error.to_string().contains("expected 26"));
+        }
+        assert_eq!(CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
+    fn codex_quota_refresh_consent_is_v27_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_quota_refresh",
+            "protocol_version": CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_set_quota_refresh_consent",
+            "schema_version": 1,
+            "consent": false
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v27 consent");
+        assert_eq!(
+            request.command,
+            LocalControlCommand::CodexAccountSetQuotaRefreshConsent {
+                schema_version: 1,
+                consent: false,
+            }
+        );
+        let round_trip = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            round_trip["command"],
+            "codex_account_set_quota_refresh_consent"
+        );
+        assert_eq!(round_trip["consent"], false);
+        // An older client's version, or any other command family's, is
+        // rejected: the switch never lands on a daemon that would ignore it.
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the switch rejects every other protocol");
+            assert!(error.to_string().contains("expected 27"), "{error}");
+        }
+        assert_eq!(CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION, 27);
+
+        // A daemon that predates the command cannot decode it at all.
+        let error = serde_json::from_value::<LocalControlCommand>(serde_json::json!({
+            "command": "codex_account_set_quota_refresh_consents",
+            "schema_version": 1,
+            "consent": true
+        }))
+        .expect_err("unknown commands are rejected, never ignored");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn background_quota_refresh_status_fields_are_additive() {
+        // An older daemon's statuses carry neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "idle"},
+            "default_slot": {"slot_id": "default", "ownership": "default"},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v26 status decodes");
+        assert_eq!(legacy.background_quota_refresh, None);
+        let mut status = legacy.clone();
+        let wire = serde_json::to_value(&status).expect("serialize");
+        assert!(wire.get("background_quota_refresh").is_none(), "{wire}");
+
+        for (state, value) in [
+            (CodexQuotaRefreshConsentState::Granted, "granted"),
+            (
+                CodexQuotaRefreshConsentState::ConsentRequired,
+                "consent_required",
+            ),
+        ] {
+            status.background_quota_refresh = Some(state);
+            let wire = serde_json::to_value(&status).expect("serialize");
+            assert_eq!(wire["background_quota_refresh"], value);
+            let decoded: CodexAccountsStatusV1 = serde_json::from_value(wire).expect("decode");
+            assert_eq!(decoded.background_quota_refresh, Some(state));
+        }
+
+        let claude = serde_json::json!({
+            "schema_version": 1,
+            "consent": "granted",
+            "setup_operation": {"state": "idle"},
+            "default_slot": {
+                "slot_id": "default",
+                "ownership": "external",
+                "service_name": "Claude Code-credentials"
+            },
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        });
+        let legacy: ClaudeAccountsStatusV1 =
+            serde_json::from_value(claude.clone()).expect("older Claude status decodes");
+        assert_eq!(legacy.consent_covers_limit_reads, None);
+        let mut covered = claude;
+        covered["consent_covers_limit_reads"] = serde_json::json!(true);
+        let covered: ClaudeAccountsStatusV1 =
+            serde_json::from_value(covered).expect("newer Claude status decodes");
+        assert_eq!(covered.consent_covers_limit_reads, Some(true));
+        assert_eq!(
+            serde_json::to_value(&covered).expect("serialize")["consent_covers_limit_reads"],
+            true
+        );
+    }
+
+    #[test]
+    fn codex_sign_in_status_is_additive_and_keeps_the_url_out_of_debug() {
+        // A v24 status (older daemon) has neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "waiting_for_user_login"},
+            "default_slot": {"slot_id": "default", "ownership": "default", "collection": {"state": "unverified"}},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v24 status decodes");
+        assert_eq!(legacy.daemon_sign_in_supported, None);
+        assert_eq!(legacy.setup_operation.sign_in, None);
+
+        let operation: CodexAccountSetupOperationV1 = serde_json::from_value(serde_json::json!({
+            "state": "waiting_for_user_login",
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+            "sign_in": {
+                "phase": "waiting_for_browser",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z",
+                "sign_in_url": "https://auth.example.test/oauth/authorize?state=synthetic-state"
+            }
+        }))
+        .expect("v26 sign-in decodes");
+        let sign_in = operation.sign_in.clone().expect("sign-in");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::WaitingForBrowser);
+        assert_eq!(sign_in.outcome, None);
+        assert_eq!(
+            sign_in
+                .sign_in_url
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("https://auth.example.test/oauth/authorize?state=synthetic-state")
+        );
+        assert!(!format!("{operation:?}").contains("synthetic-state"));
+
+        let done = serde_json::to_value(CodexAccountSignInV1 {
+            phase: CodexAccountSignInPhaseV1::Done,
+            outcome: Some(CodexAccountSignInOutcomeV1::PortBusy),
+            started_at: "2026-10-15T12:00:00Z".to_string(),
+            deadline_at: "2026-10-15T12:10:00Z".to_string(),
+            sign_in_url: None,
+        })
+        .expect("serialize");
+        assert_eq!(
+            done,
+            serde_json::json!({
+                "phase": "done",
+                "outcome": "port_busy",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z"
+            })
+        );
+    }
+
+    #[test]
+    fn codex_account_commands_fail_closed_on_every_older_protocol_version() {
+        // Each superseded version is rejected by name, so a stale companion says
+        // "update Ottto" instead of quietly rendering a payload it cannot read.
+        for stale in [20, 21, 22, 23] {
+            let request = serde_json::json!({
+                "request_id": "req_codex_account",
+                "protocol_version": stale,
+                "client_kind": "companion_app",
+                "command": "codex_accounts_status"
+            });
+            let error = serde_json::from_value::<LocalControlRequest>(request)
+                .expect_err("a superseded client must get an explicit incompatibility signal");
+            assert!(error.to_string().contains(&format!(
+                "unsupported local control protocol_version {stale}; expected 24"
+            )));
+        }
+        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 24);
+    }
+
+    #[test]
+    fn codex_workspace_target_coverage_is_additive_typed_and_secret_free() {
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "idle"},
+            "default_slot": {"slot_id": "default", "ownership": "default"},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("legacy status without target coverage");
+        assert_eq!(
+            legacy.target_coverage,
+            CodexAccountTargetCoverageV1::default()
+        );
+
+        let coverage = CodexAccountTargetCoverageV1 {
+            targets: vec![CodexAccountTargetDescriptorV1 {
+                target_id: "codex_account_target_0123456789abcdef0123456789abcdef".to_string(),
+                account_identifier_hash: Some("a".repeat(64)),
+                workspace_identifier_hash: Some("b".repeat(64)),
+                account_label: "Codex account".to_string(),
+                workspace_label: Some("Acme".to_string()),
+                subscription_product: None,
+                durability: CodexAccountTargetDurabilityV1::ObservedOnly,
+                is_current: false,
+                connectable: true,
+                health: None,
+                setup_blockers: Vec::new(),
+                observed_at: Some("2026-08-27T00:00:00Z".to_string()),
+            }],
+            observed_targets: 1,
+            durable_targets: 0,
+            current_targets: 0,
+            connectable_targets: 1,
+            blocked_targets: 0,
+        };
+        let wire = serde_json::to_value(coverage).expect("serialize target coverage");
+        assert_eq!(wire["targets"][0]["workspace_label"], "Acme");
+        assert_eq!(wire["targets"][0]["connectable"], true);
+        let encoded = wire.to_string();
+        for forbidden in [
+            "\"account_id\"",
+            "\"workspace_id\"",
+            "\"organization_id\"",
+            "\"email\"",
+            "\"access_token\"",
+            "\"refresh_token\"",
+        ] {
+            assert!(!encoded.contains(forbidden), "coverage leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn claude_slot_collection_status_is_typed_and_backward_compatible() {
+        let legacy: ClaudeConfigSlotDescriptorV1 = serde_json::from_value(serde_json::json!({
+            "slot_id": "default",
+            "ownership": "external",
+            "service_name": "Claude Code-credentials"
+        }))
+        .expect("legacy descriptor without collection state");
+        assert_eq!(
+            legacy.collection.state,
+            ClaudeConfigSlotCollectionStateV1::Unverified
+        );
+        assert!(legacy.collection.account_profile.is_none());
+        let profile = ClaudeConfigSlotAccountProfileV1 {
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            captured_at: "2026-09-01T10:00:00Z".to_string(),
+            email: Some("test@example.invalid".to_string()),
+            organization_label: None,
+            plan_type: None,
+            subscription_product: None,
+        };
+        let local = ClaudeConfigSlotCollectionStatusV1 {
+            account_profile: Some(profile.clone()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(local).expect("local profile wire");
+        assert_eq!(wire["account_profile"]["email"], "test@example.invalid");
+        assert!(wire["account_profile"].get("plan_type").is_none());
+        let decoded: ClaudeConfigSlotCollectionStatusV1 =
+            serde_json::from_value(wire).expect("profile round trip");
+        assert_eq!(decoded.account_profile, Some(profile));
+
+        let value = serde_json::to_value(ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+            observed_at: Some("2026-08-04T12:00:00Z".to_string()),
+            diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+                code: ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
+                message: "Exact-slot identity did not agree.".to_string(),
+            }],
+            ..Default::default()
+        })
+        .expect("serialize typed collection state");
+        assert_eq!(value["state"], "identity_mismatch");
+        assert_eq!(value["diagnostics"][0]["code"], "identity_mismatch");
+        assert!(value.get("account_identifier_hash").is_none());
+        assert!(value.get("organization_identifier_hash").is_none());
+
+        let shadow = serde_json::to_value(ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            relationship: Some(ClaudeConfigSlotRelationshipV1::ShadowedByAnchor),
+            ..Default::default()
+        })
+        .expect("serialize neutral default shadow");
+        assert_eq!(shadow["state"], "fresh");
+        assert_eq!(shadow["relationship"], "shadowed_by_anchor");
+    }
+
+    #[test]
+    fn claude_anchor_coverage_is_additive_typed_and_secret_free() {
+        let legacy: ClaudeAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "consent": "consent_required",
+            "setup_operation": {"state": "idle"},
+            "default_slot": {
+                "slot_id": "default",
+                "ownership": "external",
+                "service_name": "Claude Code-credentials"
+            },
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("legacy status without anchor coverage");
+        assert_eq!(
+            legacy.anchor_coverage,
+            ClaudeAccountAnchorCoverageV1::default()
+        );
+
+        let coverage = ClaudeAccountAnchorCoverageV1 {
+            accounts: (0..5)
+                .map(|index| ClaudeAccountAnchorDescriptorV1 {
+                    target_id: Some(format!("claude_anchor_target_{index:032x}")),
+                    account_identifier_hash: format!("account-hash-{index}"),
+                    organization_identifier_hash: Some(format!("organization-hash-{index}")),
+                    durability: if index == 4 {
+                        ClaudeAccountAnchorDurabilityV1::DefaultOnly
+                    } else {
+                        ClaudeAccountAnchorDurabilityV1::Anchored
+                    },
+                    health: (index != 4).then_some(ClaudeAccountAnchorHealthV1::Healthy),
+                    setup_blockers: Vec::new(),
+                    observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                })
+                .collect(),
+            observed_accounts: 5,
+            anchored_accounts: 4,
+            default_only_accounts: 1,
+            unresolved_accounts: 0,
+            capacity_blocked_accounts: 0,
+            ambiguous_identity_accounts: 0,
+        };
+        let wire = serde_json::to_value(coverage).expect("serialize anchor coverage");
+        assert_eq!(wire["observed_accounts"], 5);
+        assert_eq!(wire["accounts"][4]["durability"], "default_only");
+        let encoded = wire.to_string();
+        for forbidden in [
+            "config_dir",
+            "service_name",
+            "access_token",
+            "refresh_token",
+            "credential",
+        ] {
+            assert!(!encoded.contains(forbidden), "coverage leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn claude_quota_access_state_is_additive_and_account_only() {
+        let legacy: AgentAccountStatus = serde_json::from_value(serde_json::json!({
+            "login_state": "signed_in",
+            "provider": "anthropic",
+            "confidence": "high"
+        }))
+        .expect("legacy account without quota access state");
+        assert_eq!(legacy.claude_quota_access_state, None);
+
+        let mut account = legacy;
+        account.account_identifier_hash = Some("account-hash".to_string());
+        account.organization_identifier_hash = Some("organization-hash".to_string());
+        account.claude_quota_access_state = Some(ClaudeQuotaAccessState::ReconnectRequired);
+        let value = serde_json::to_value(account).expect("serialize account access witness");
+        assert_eq!(value["claude_quota_access_state"], "reconnect_required");
+        assert!(value.get("slot_id").is_none());
+        assert!(value.get("config_dir").is_none());
+        assert!(value.get("quota_snapshot").is_none());
+    }
+
+    #[test]
+    fn claude_quota_access_witness_fixture_is_meterless_planless_and_backend_safe() {
+        let snapshots: Vec<AgentStatusSnapshot> = serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/claude-quota-access-witness.json"
+        ))
+        .expect("Claude quota access witness fixture");
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = snapshots[0].clone().redacted_for_backend();
+        assert_eq!(snapshot.source, SourceKind::ClaudeCode);
+        assert_eq!(snapshot.status, AgentStatusState::Degraded);
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+        assert!(snapshot.plan_observations.is_empty());
+        assert_eq!(
+            snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+        );
+        assert!(snapshot.capabilities.iter().any(|capability| {
+            capability.capability == "claude_quota_access_state_v1"
+                && capability.status == AgentCapabilityStatus::Supported
+        }));
+        let wire = serde_json::to_string(&snapshot).expect("serialize redacted fixture");
+        for forbidden in [
+            "config_dir",
+            "slot_id",
+            "service_name",
+            "access_expires_at",
+            "refresh_token",
+            "quota_snapshot",
+        ] {
+            assert!(!wire.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
+    fn w3_multi_anchor_snapshot(
+        account_identifier_hash: &str,
+        organization_identifier_hash: &str,
+        durability: ClaudeAccountAnchorDurabilityV1,
+        health: Option<ClaudeAccountAnchorHealthV1>,
+    ) -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            source: SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::CliJson,
+            captured_at: "2026-08-23T08:00:00Z".to_string(),
+            expires_at: "2026-08-23T08:05:00Z".to_string(),
+            account: Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                provider: Some("anthropic".to_string()),
+                auth_method: Some("oauth".to_string()),
+                email: None,
+                account_id: None,
+                organization_id: None,
+                organization_label: None,
+                plan_type: None,
+                subscription_product: None,
+                billing_channel: Some("subscription".to_string()),
+                subscription_period_start: None,
+                subscription_period_end: None,
+                subscription_period_last_checked_at: None,
+                account_identifier_hash: Some(account_identifier_hash.to_string()),
+                organization_identifier_hash: Some(organization_identifier_hash.to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: Some("provider_account_id".to_string()),
+                claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
+                claude_anchor_durability: Some(durability),
+                claude_anchor_health: health,
+                billing_identity_confidence: AgentStatusConfidence::High,
+                confidence: AgentStatusConfidence::High,
+            }),
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        }
+        .redacted_for_backend()
+    }
+
+    #[test]
+    fn backend_status_body_carries_raw_provider_ids_and_scoped_display() {
+        let raw_account = "00000000-0000-4000-8000-0000000000a1";
+        let raw_organization = "00000000-0000-4000-8000-0000000000b2";
+        let mut snapshot = w3_multi_anchor_snapshot(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            Some(ClaudeAccountAnchorHealthV1::Healthy),
+        );
+        let account = snapshot.account.as_mut().expect("account");
+        account.email = Some("owner@example.test".to_string());
+        account.account_id = Some(format!("  {raw_account}  "));
+        account.organization_id = Some(raw_organization.to_string());
+        account.organization_label = Some("Private Org Label".to_string());
+        snapshot.plan_observations.push(
+            serde_json::from_value(serde_json::json!({
+                "account_label": "owner@example.test",
+                "account_id": raw_account,
+                "organization_label": "Private Org Label",
+                "organization_id": raw_organization,
+                "account_identifier_hash": "a".repeat(64),
+                "confidence": "high"
+            }))
+            .expect("observation"),
+        );
+        let body = |item: AgentStatusSnapshot| {
+            serde_json::json!({"machine_id": "machine-test", "snapshots": [item]}).to_string()
+        };
+        let local_body = body(snapshot.clone());
+        assert!(local_body.contains("owner@example.test"));
+        assert!(local_body.contains("Private Org Label"));
+
+        let redacted = snapshot.redacted_for_backend();
+        let account = redacted.account.as_ref().expect("account");
+        assert_eq!(account.account_id.as_deref(), Some(raw_account));
+        assert_eq!(account.organization_id.as_deref(), Some(raw_organization));
+        assert_eq!(account.email.as_deref(), Some("owner@example.test"));
+        assert_eq!(
+            account.organization_label.as_deref(),
+            Some("Private Org Label")
+        );
+        let observation = redacted.plan_observations.last().expect("observation");
+        assert_eq!(observation.account_id.as_deref(), Some(raw_account));
+        assert_eq!(
+            observation.organization_id.as_deref(),
+            Some(raw_organization)
+        );
+        assert_eq!(
+            observation.account_label.as_deref(),
+            Some("owner@example.test")
+        );
+        assert_eq!(
+            observation.organization_label.as_deref(),
+            Some("Private Org Label")
+        );
+
+        let safe_body = body(redacted);
+        assert!(safe_body.contains("owner@example.test"));
+        assert!(safe_body.contains("Private Org Label"));
+        assert!(safe_body.contains(raw_account));
+        assert!(safe_body.contains(raw_organization));
+        assert!(safe_body.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn backend_redaction_drops_raw_ids_that_are_not_plain_provider_ids() {
+        let unsafe_ids = [
+            "owner@example.test".to_string(),
+            "/Users/owner/.claude/account".to_string(),
+            "https://example.test/account".to_string(),
+            "Bearer abcdef".to_string(),
+            "sk-ant-synthetic".to_string(),
+            "otdev_synthetic".to_string(),
+            "google-oauth2|1234567890".to_string(),
+            "has space".to_string(),
+            "   ".to_string(),
+            "a".repeat(BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS + 1),
+        ];
+        for unsafe_id in unsafe_ids {
+            let mut snapshot = w3_multi_anchor_snapshot(
+                &"a".repeat(64),
+                &"b".repeat(64),
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                Some(ClaudeAccountAnchorHealthV1::Healthy),
+            );
+            let account = snapshot.account.as_mut().expect("account");
+            account.account_id = Some(unsafe_id.clone());
+            account.organization_id = Some(unsafe_id.clone());
+            snapshot.plan_observations.push(
+                serde_json::from_value(serde_json::json!({
+                    "account_id": unsafe_id,
+                    "organization_id": unsafe_id,
+                    "confidence": "high"
+                }))
+                .expect("observation"),
+            );
+            let redacted = snapshot.redacted_for_backend();
+            let account = redacted.account.as_ref().expect("account");
+            assert_eq!(account.account_id, None, "{unsafe_id}");
+            assert_eq!(account.organization_id, None, "{unsafe_id}");
+            let observation = redacted.plan_observations.last().expect("observation");
+            assert_eq!(observation.account_id, None, "{unsafe_id}");
+            assert_eq!(observation.organization_id, None, "{unsafe_id}");
+        }
+        let longest = "a".repeat(BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS);
+        assert_eq!(
+            safe_provider_identifier(Some(longest.clone())).as_deref(),
+            Some(longest.as_str())
+        );
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct GoldenLeafType {
+        path: String,
+        value_type: &'static str,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct GoldenLeafManifest {
+        schema_version: u16,
+        leaves: Vec<GoldenLeafType>,
+    }
+
+    fn collect_golden_leaf_types(
+        value: &serde_json::Value,
+        path: &str,
+        leaves: &mut Vec<GoldenLeafType>,
+    ) {
+        match value {
+            serde_json::Value::Null => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "null",
+            }),
+            serde_json::Value::Bool(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "boolean",
+            }),
+            serde_json::Value::Number(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "number",
+            }),
+            serde_json::Value::String(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "string",
+            }),
+            serde_json::Value::Array(values) if values.is_empty() => {
+                leaves.push(GoldenLeafType {
+                    path: path.to_string(),
+                    value_type: "array",
+                });
+            }
+            serde_json::Value::Array(values) => {
+                for (index, item) in values.iter().enumerate() {
+                    collect_golden_leaf_types(item, &format!("{path}[{index}]"), leaves);
+                }
+            }
+            serde_json::Value::Object(values) if values.is_empty() => {
+                leaves.push(GoldenLeafType {
+                    path: path.to_string(),
+                    value_type: "object",
+                });
+            }
+            serde_json::Value::Object(values) => {
+                for (key, item) in values {
+                    collect_golden_leaf_types(item, &format!("{path}.{key}"), leaves);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quota_check_diagnostic_fixture_and_leaf_manifest_match_backend_wire() {
+        let diagnostics = [
+            (
+                "claude_oauth_usage_check_succeeded",
+                "Successful supported quota response.",
+            ),
+            (
+                "claude_oauth_usage_check_failed",
+                "Latest quota request failed; local fallback may remain.",
+            ),
+            (
+                "claude_oauth_usage_check_suppressed",
+                "Local breaker suppressed this request.",
+            ),
+            (
+                "claude_oauth_usage_cache_reused",
+                "A local cached reading was reused; no provider request was made.",
+            ),
+            (
+                "claude_statusline_read_succeeded",
+                "Read the supported local cache; original observation time preserved.",
+            ),
+            (
+                "claude_statusline_newer_exact_binding_selected",
+                "Newer supported local reading selected for this account/workspace.",
+            ),
+        ]
+        .into_iter()
+        .map(|(code, message)| {
+            redact_diagnostic_for_backend(
+                AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Info, message)
+                    .with_observed_at(Some("2026-09-29T10:05:00Z".to_string()))
+                    .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string())),
+            )
+        })
+        .collect::<Vec<_>>();
+        let value = serde_json::to_value(diagnostics).expect("typed diagnostic wire");
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../fixtures/agent-status/quota-check-diagnostics.v1.json"
+            ))
+            .expect("fixture")
+        );
+        let mut leaves = Vec::new();
+        collect_golden_leaf_types(&value, "$", &mut leaves);
+        leaves.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = serde_json::to_value(GoldenLeafManifest {
+            schema_version: 1,
+            leaves,
+        })
+        .expect("manifest");
+        assert_eq!(
+            manifest,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../fixtures/agent-status/quota-check-diagnostics-leaf-types.v1.json"
+            ))
+            .expect("manifest fixture")
+        );
+    }
+
+    #[test]
+    fn quota_retry_deadline_is_optional_and_preserved_by_backend_redaction() {
+        let old = serde_json::json!({"code": "claude_oauth_usage_cache_reused", "severity": "info", "message": "Cached quota"});
+        let diagnostic: AgentStatusDiagnostic =
+            serde_json::from_value(old.clone()).expect("old wire");
+        assert!(diagnostic.retry_after.is_none());
+        assert_eq!(serde_json::to_value(&diagnostic).unwrap(), old);
+        let mut null = old.clone();
+        null["retry_after"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AgentStatusDiagnostic>(null)
+            .unwrap()
+            .retry_after
+            .is_none());
+        let mut current = diagnostic
+            .with_observed_at(Some("2026-10-07T15:30:00Z".to_string()))
+            .with_quota_binding(
+                Some("account".to_string()),
+                Some("organization".to_string()),
+            );
+        current.retry_after = Some("2026-10-07T16:02:21Z".to_string());
+        let upload = redact_diagnostic_for_backend(current.clone());
+        assert_eq!(upload.retry_after, current.retry_after);
+        assert_eq!(upload.observed_at, current.observed_at);
+        let decoded: AgentStatusDiagnostic =
+            serde_json::from_value(serde_json::to_value(upload).unwrap()).unwrap();
+        assert_eq!(decoded, current);
+    }
+
+    #[test]
+    fn quota_check_binding_is_redacted_if_it_contains_secret_text() {
+        let diagnostic =
+            AgentStatusDiagnostic::source("check", AgentDiagnosticSeverity::Info, "Outcome")
+                .with_quota_binding(
+                    Some("sk-ant-secret-value".to_string()),
+                    Some("Bearer secret-value".to_string()),
+                );
+        let redacted = redact_diagnostic_for_backend(diagnostic);
+        assert!(redacted.account_identifier_hash.is_none());
+        assert!(redacted.organization_identifier_hash.is_none());
+    }
+
+    #[test]
+    fn w3_multi_anchor_backend_fixture_and_leaf_manifest_match_typed_wire() {
+        let snapshots = vec![
+            w3_multi_anchor_snapshot(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                Some(ClaudeAccountAnchorHealthV1::Healthy),
+            ),
+            w3_multi_anchor_snapshot(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ClaudeAccountAnchorDurabilityV1::DefaultOnly,
+                None,
+            ),
+        ];
+        let value = serde_json::to_value(&snapshots).expect("serialize typed W3 snapshots");
+        let fixture = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).expect("pretty-print typed W3 snapshots")
+        );
+        assert_eq!(
+            fixture,
+            include_str!("../../../fixtures/agent-status/claude-multi-anchor-snapshots.v1.json")
+        );
+
+        let mut leaves = Vec::new();
+        collect_golden_leaf_types(&value, "$", &mut leaves);
+        leaves.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = GoldenLeafManifest {
+            schema_version: 1,
+            leaves,
+        };
+        let manifest = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&manifest).expect("pretty-print W3 leaf manifest")
+        );
+        assert_eq!(
+            manifest,
+            include_str!("../../../fixtures/agent-status/claude-multi-anchor-leaf-types.v1.json")
+        );
+
+        let wire = serde_json::to_string(&snapshots).expect("serialize W3 backend fixture");
+        for forbidden in [
+            "config_dir",
+            "slot_id",
+            "service_name",
+            "credential",
+            "access_token",
+            "refresh_token",
+            "/Users/",
+        ] {
+            assert!(!wire.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn claude_account_commands_fail_closed_on_base_protocol_version() {
+        for command in [
+            serde_json::json!({"command": "claude_accounts_status"}),
+            serde_json::json!({
+                "command": "claude_account_set_upkeep_consent",
+                "schema_version": 1,
+                "consent": true
+            }),
+            serde_json::json!({
+                "command": "claude_account_remove",
+                "schema_version": 1,
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_register_path",
+                "schema_version": 1,
+                "config_dir": "/tmp/claude-work"
+            }),
+            serde_json::json!({
+                "command": "claude_account_prepare",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
+                "command": "claude_account_check",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_claude_v15");
+            request["protocol_version"] = serde_json::json!(LOCAL_CONTROL_PROTOCOL_VERSION);
+            let error = serde_json::from_value::<LocalControlRequest>(request)
+                .expect_err("Claude account command must reject protocol version 15");
+            assert!(error.to_string().contains(&format!(
+                "expected {CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION}"
+            )));
+        }
+
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v18",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect_err("ordinary status must reject the Claude account protocol version");
+        assert!(error
+            .to_string()
+            .contains(&format!("expected {LOCAL_CONTROL_PROTOCOL_VERSION}")));
+        assert_eq!(CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 18);
+        assert_eq!(CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION, 19);
+
+        let target: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_target_v19",
+            "protocol_version": CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_prepare_target",
+            "schema_version": 1,
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+            "target_id": "claude_anchor_target_0123456789abcdef0123456789abcdef"
+        }))
+        .expect("target mutation accepts only its command-scoped version");
+        assert!(matches!(
+            target.command,
+            LocalControlCommand::ClaudeAccountPrepareTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_browser_auth_commands_are_isolated_to_protocol_v23() {
+        let login = serde_json::json!({
+            "request_id": "req_browser_login",
+            "protocol_version": CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_start_browser_login",
+            "schema_version": 1,
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+        });
+        let request = serde_json::from_value::<LocalControlRequest>(login.clone())
+            .expect("generic browser login accepts v23");
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::ClaudeAccountStartBrowserLogin {
+                target_id: None,
+                ..
+            }
+        ));
+
+        let reconnect = serde_json::json!({
+            "request_id": "req_browser_reconnect",
+            "protocol_version": CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_start_browser_reconnect",
+            "schema_version": 1,
+            "operation_id": "claude_setup_fedcba9876543210fedcba9876543210",
+            "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+            "target_id": "claude_anchor_target_0123456789abcdef0123456789abcdef"
+        });
+        assert!(matches!(
+            serde_json::from_value::<LocalControlRequest>(reconnect)
+                .expect("browser reconnect accepts v23")
+                .command,
+            LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. }
+        ));
+
+        for older in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = login.clone();
+            stale["protocol_version"] = serde_json::json!(older);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("older protocol must not start provider login");
+            assert!(error.to_string().contains("expected 23"));
+        }
+    }
+
+    #[test]
+    fn retired_claude_auth_code_command_is_fieldless_and_v25_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_claude_code",
+            "protocol_version": CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_submit_auth_code",
+            "schema_version": 1,
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+            "code": "fixture-one-time-code"
+        });
+        let request = serde_json::from_value::<LocalControlRequest>(wire.clone())
+            .expect("an older client's v25 request still decodes");
+        assert_eq!(
+            request.command,
+            LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {}
+        );
+        assert!(!format!("{request:?}").contains("fixture-one-time-code"));
+        let reserialized = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(reserialized["command"], "claude_account_submit_auth_code");
+        for dropped in ["code", "operation_id", "schema_version"] {
+            assert!(reserialized.get(dropped).is_none(), "kept {dropped}");
+        }
+        assert!(!reserialized.to_string().contains("fixture-one-time-code"));
+
+        let mut fieldless = wire.clone();
+        for field in ["code", "operation_id", "schema_version"] {
+            fieldless.as_object_mut().expect("object").remove(field);
+        }
+        assert_eq!(
+            serde_json::from_value::<LocalControlRequest>(fieldless)
+                .expect("fieldless retired request")
+                .command,
+            LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {}
+        );
+
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the retired command keeps its exact v25 scope");
+            assert!(error.to_string().contains("expected 25"));
+            assert!(!error.to_string().contains("fixture-one-time-code"));
+        }
+    }
+
+    #[test]
+    fn claude_browser_auth_metadata_is_additive_and_safe() {
+        let wire = serde_json::json!({
+            "kind": "connect_managed_account",
+            "state": "waiting_for_user_login",
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+            "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+            "browser_auth": {
+                "phase": "waiting_for_provider",
+                "retryable": false,
+                "terminal_fallback_available": false
+            }
+        });
+        let operation = serde_json::from_value::<ClaudeAccountSetupOperationV1>(wire)
+            .expect("additive browser metadata decodes");
+        assert_eq!(
+            operation.browser_auth.expect("browser metadata").phase,
+            ClaudeBrowserAuthPhaseV1::WaitingForProvider
+        );
+        assert_eq!(CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION, 23);
+    }
+
+    #[test]
+    fn claude_browser_auth_v23_fixture_is_exact_and_sanitized() {
+        let raw = include_str!("../../../fixtures/control/claude-browser-auth-operation-v23.json");
+        let operation = serde_json::from_str::<ClaudeBrowserAuthOperationV1>(raw)
+            .expect("v23 browser auth fixture");
+        assert_eq!(
+            operation.outcome,
+            Some(ClaudeBrowserAuthOutcomeV1::LoginFailed)
+        );
+        assert!(operation.retryable);
+        assert!(operation.retry_requires_new_operation_id);
+        assert!(!operation.terminal_fallback_available);
+        let canonical = serde_json::to_string_pretty(&operation).expect("canonical fixture") + "\n";
+        assert_eq!(canonical, raw);
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "config_dir",
+            "account_identifier_hash",
+            "organization_identifier_hash",
+            "/Users/",
+        ] {
+            assert!(!raw.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn claude_auth_code_v25_fixture_is_exact_and_sanitized() {
+        let raw = include_str!("../../../fixtures/control/claude-auth-code-operation-v25.json");
+        let operation = serde_json::from_str::<ClaudeBrowserAuthOperationV1>(raw)
+            .expect("v25 auth code fixture");
+        assert_eq!(operation.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
+        assert_eq!(
+            operation.code_error,
+            Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
+        );
+        assert!(!operation.terminal_fallback_available);
+        let canonical = serde_json::to_string_pretty(&operation).expect("canonical fixture") + "\n";
+        assert_eq!(canonical, raw);
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "authorization_code",
+            "provider_output",
+            "config_dir",
+            "/Users/",
+        ] {
+            assert!(!raw.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn claude_setup_operation_phases_and_safe_metadata_are_typed() {
+        for (state, expected) in [
+            (ClaudeAccountSetupOperationState::Preparing, "preparing"),
+            (
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+                "waiting_for_user_login",
+            ),
+            (ClaudeAccountSetupOperationState::Validating, "validating"),
+            (ClaudeAccountSetupOperationState::Reading, "reading"),
+            (ClaudeAccountSetupOperationState::Complete, "complete"),
+            (
+                ClaudeAccountSetupOperationState::SetupStopped,
+                "setup_stopped",
+            ),
+            (
+                ClaudeAccountSetupOperationState::SetupFailed,
+                "setup_failed",
+            ),
+            (
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+                "identity_mismatch",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(state).expect("state"), expected);
+        }
+
+        let status = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some("a".repeat(64)),
+            display_label: Some("Claude account aaaaaaaa".to_string()),
+            access_expires_at: Some("2026-08-05T08:00:00Z".to_string()),
+            relogin_required_at: Some("2026-09-01T08:00:00Z".to_string()),
+            last_full_quota_read_at: Some("2026-08-05T00:00:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            has_credit_balances: false,
+            quota_snapshot: Some(ClaudeConfigSlotQuotaSnapshotV1 {
+                state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+                captured_at: "2026-08-05T00:01:00Z".to_string(),
+                observed_at: Some("2026-08-05T00:00:00Z".to_string()),
+                quota_windows: vec![AgentQuotaWindow {
+                    name: "weekly_sonnet".to_string(),
+                    scope: AgentQuotaWindowScope::Model,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: Some("claude-sonnet".to_string()),
+                    account_identifier_hash: Some("a".repeat(64)),
+                    organization_identifier_hash: Some("b".repeat(64)),
+                    used_percent: Some(42),
+                    ..Default::default()
+                }],
+                credit_balances: vec![AgentCreditBalance {
+                    name: "Usage credits".to_string(),
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    account_identifier_hash: Some("a".repeat(64)),
+                    organization_identifier_hash: Some("b".repeat(64)),
+                    remaining: CreditAmount::whole(1234),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(status).expect("safe local status");
+        assert_eq!(wire["has_credit_balances"], false);
+        assert_eq!(wire["quota_snapshot"]["state"], "fresh");
+        assert_eq!(
+            wire["quota_snapshot"]["quota_windows"][0]["used_percent"],
+            42
+        );
+        assert_eq!(
+            wire["quota_snapshot"]["credit_balances"][0]["remaining"],
+            1234
+        );
+        for forbidden in ["access_token", "refresh_token", "config_dir"] {
+            assert!(wire.get(forbidden).is_none());
+        }
+    }
+
+    #[test]
+    fn unresolved_claude_account_evidence_has_no_slot_path_or_service_requirement() {
+        let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
+            unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
+            account_identifier_hash: Some("display-safe-hash".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
+            observed_at: Some("2026-08-04T12:00:00Z".to_string()),
+            evidence: vec![
+                ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
+                ClaudeUnresolvedAccountEvidenceKind::StatusLine,
+            ],
+        };
+        let wire = serde_json::to_value(descriptor).expect("unresolved descriptor");
+        assert_eq!(
+            wire["evidence"],
+            serde_json::json!(["cli_identity", "status_line"])
+        );
+        for forbidden in ["slot_id", "config_dir", "service_name"] {
+            assert!(wire.get(forbidden).is_none(), "unexpected {forbidden}");
+        }
+    }
+
+    #[test]
+    fn agent_context_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_context",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_context",
+            "query": {
+                "days": 14,
+                "range": "last_7_days",
+                "timezone": "America/New_York",
+                "source": "codex",
+                "machine_id": "otm_test",
+                "source_plan_profile_id": "018fe251-b6f3-7cc8-9f82-01a76449d111",
+                "max_tokens": 4000,
+                "all_machines": false
+            }
+        }))
+        .expect("agent context request");
+
+        assert_eq!(request.request_id, "req_agent_context");
+        assert_eq!(request.client_kind, Some(LocalClientKind::Cli));
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: None,
+                    end_date: None,
+                    timezone: Some("America/New_York".to_string()),
+                    source: Some("codex".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    max_tokens: Some(4000),
+                    all_machines: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_costs_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_costs",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_costs",
+            "query": {
+                "days": 14,
+                "range": "last_7_days",
+                "timezone": "America/New_York",
+                "source": "codex",
+                "machine_id": "otm_test",
+                "source_plan_profile_id": "018fe251-b6f3-7cc8-9f82-01a76449d111",
+                "bucket": "day",
+                "mode": "full",
+                "all_machines": false
+            }
+        }))
+        .expect("agent costs request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentCosts {
+                query: AgentCostsQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: None,
+                    end_date: None,
+                    timezone: Some("America/New_York".to_string()),
+                    source: Some("codex".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    bucket: Some("day".to_string()),
+                    mode: Some("full".to_string()),
+                    all_machines: false,
+                    dimensions: None,
+                    daily: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_sessions_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_sessions",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_sessions",
+            "query": {
+                "limit": 25,
+                "range": "today",
+                "source": "claude_code",
+                "model": "claude-opus-4-8",
+                "machine_id": "otm_test",
+                "sort_by": "cost",
+                "sort_dir": "desc",
+                "search": "expensive",
+                "all_machines": false
+            }
+        }))
+        .expect("agent sessions request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentSessions {
+                query: AgentSessionsQuery {
+                    limit: Some(25),
+                    range: Some("today".to_string()),
+                    source: Some("claude_code".to_string()),
+                    model: Some("claude-opus-4-8".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    sort_by: Some("cost".to_string()),
+                    sort_dir: Some("desc".to_string()),
+                    search: Some("expensive".to_string()),
+                    all_machines: false,
+                    ..AgentSessionsQuery::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_recommendations_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_recommendations",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_recommendations"
+        }))
+        .expect("agent recommendations request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentRecommendations {
+                query: AgentRecommendationsQuery::default()
+            }
+        );
+    }
+
+    #[test]
+    fn agent_provider_impact_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_provider_impact",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_provider_impact",
+            "query": {
+                "date_from": "2026-06-01",
+                "date_to": "2026-06-08",
+                "provider": "openai",
+                "app": "codex",
+                "kind": "quota",
+                "confidence": "high",
+                "impact_priority": "critical",
+                "status": "verified",
+                "q": "subscription",
+                "limit": 25
+            }
+        }))
+        .expect("agent provider impact request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentProviderImpact {
+                query: AgentProviderImpactQuery {
+                    date_from: Some("2026-06-01".to_string()),
+                    date_to: Some("2026-06-08".to_string()),
+                    provider: Some("openai".to_string()),
+                    app: Some("codex".to_string()),
+                    kind: Some("quota".to_string()),
+                    confidence: Some("high".to_string()),
+                    impact_priority: Some("critical".to_string()),
+                    status: Some("verified".to_string()),
+                    q: Some("subscription".to_string()),
+                    limit: Some(25),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn auth_complete_pending_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_complete_pending",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_complete_pending",
+            "claim_code": "claim_123"
+        }))
+        .expect("auth complete pending request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AuthCompletePending {
+                claim_code: "claim_123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn auth_switch_account_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_switch_account",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "auth_switch_account",
+            "claim_code": "claim_123"
+        }))
+        .expect("auth switch account request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AuthSwitchAccount {
+                claim_code: "claim_123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn auth_reset_defaults_to_cloud_first() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_reset",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "auth_reset"
+        }))
+        .expect("legacy auth reset request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AuthReset {
+                local_only: false,
+                forget_installation: false,
+            }
+        );
+
+        let local_only: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_reset_local",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_reset",
+            "local_only": true
+        }))
+        .expect("local-only auth reset request");
+
+        assert_eq!(
+            local_only.command,
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: false,
+            }
+        );
+
+        let legacy_forget = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_auth_reset_forget_legacy",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_reset",
+            "local_only": true,
+            "forget_installation": true
+        }));
+        assert!(legacy_forget
+            .expect_err("destructive reset must reject the legacy protocol")
+            .to_string()
+            .contains(&format!(
+                "expected {INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION}"
+            )));
+
+        let forget: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_reset_forget",
+            "protocol_version": INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_reset",
+            "local_only": true,
+            "forget_installation": true
+        }))
+        .expect("command-scoped installation reset");
+        assert_eq!(
+            forget.command,
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: true,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_command_defaults_repair_to_false() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_verify_legacy",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "verify",
+            "source": "codex"
+        }))
+        .expect("legacy verify request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::Verify {
+                source: SourceKind::Codex,
+                repair: false,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_command_round_trips_repair_flags() {
+        for (repair, source) in [(false, SourceKind::Codex), (true, SourceKind::ClaudeCode)] {
+            let request = LocalControlRequest {
+                request_id: format!("req_verify_{repair}"),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: source.clone(),
+                    repair,
+                },
+            };
+            let value = serde_json::to_value(&request).expect("verify request serializes");
+            let parsed: LocalControlRequest =
+                serde_json::from_value(value).expect("verify request parses");
+            assert_eq!(
+                parsed.command,
+                LocalControlCommand::Verify { source, repair }
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_control_command_round_trips_with_redacted_secret_debug() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_telemetry_enable",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "web_ui",
+            "command": "telemetry_control",
+            "action": "enable_telemetry",
+            "source": "codex",
+            "control_token": "header.payload.signature",
+            "api_base_url": "https://api.ottto.net",
+            "key_id": "key_123",
+            "organization_id": "org_123",
+            "otlp_endpoint": "https://api.ottto.net",
+            "ingest_key": "transit_secret_for_tests"
+        }))
+        .expect("telemetry control request");
+
+        assert_eq!(request.client_kind, Some(LocalClientKind::WebUi));
+        assert_eq!(
+            request.command,
+            LocalControlCommand::TelemetryControl {
+                action: TelemetryControlAction::EnableTelemetry,
+                source: SourceKind::Codex,
+                control_token: "header.payload.signature".to_string(),
+                api_base_url: Some("https://api.ottto.net".to_string()),
+                key_id: Some("key_123".to_string()),
+                organization_id: Some("org_123".to_string()),
+                otlp_endpoint: Some("https://api.ottto.net".to_string()),
+                ingest_key: Some(SecretString::new("transit_secret_for_tests")),
+            }
+        );
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("transit_secret_for_tests"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn agent_status_backend_redaction_preserves_display_plan_fields() {
+        let snapshot = AgentStatusSnapshot {
+            source: SourceKind::Codex,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::CliText,
+            captured_at: "2026-05-07T00:00:00Z".to_string(),
+            expires_at: "2026-05-07T00:05:00Z".to_string(),
+            account: Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                provider: Some("openai".to_string()),
+                auth_method: Some("oauth".to_string()),
+                email: Some("ron@example.com".to_string()),
+                account_id: Some("user-SyntheticUser01".to_string()),
+                organization_id: Some("00000000-0000-4000-8000-00000000a001".to_string()),
+                organization_label: Some("Private Org".to_string()),
+                plan_type: Some("individual".to_string()),
+                subscription_product: Some("ChatGPT Pro".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                subscription_period_start: None,
+                subscription_period_end: None,
+                subscription_period_last_checked_at: None,
+                account_identifier_hash: Some("abc123hash".to_string()),
+                organization_identifier_hash: Some("def456hash".to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: Some("provider_account_id".to_string()),
+                claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
+                claude_anchor_durability: None,
+                claude_anchor_health: None,
+                billing_identity_confidence: AgentStatusConfidence::High,
+                confidence: AgentStatusConfidence::High,
+            }),
+            model: Some(AgentModelStatus {
+                active_model: Some("/Users/example/.codex/private".to_string()),
+                default_model: Some("gpt-5.4".to_string()),
+                provider: Some("openai".to_string()),
+                available_models: vec!["gpt-5.4".to_string(), "/Users/example/model".to_string()],
+                available_model_details: vec![AgentAvailableModelStatus {
+                    id: "gpt-5.4".to_string(),
+                    provider: Some("openai".to_string()),
+                    model_provider: Some("openai".to_string()),
+                    billing_provider: Some("openai".to_string()),
+                    billing_channel: Some("subscription".to_string()),
+                    auth_mode: Some("oauth".to_string()),
+                    gateway_provider: None,
+                    subscription_product: Some("chatgpt".to_string()),
+                    source_category: Some("chatgpt_openai_subscription".to_string()),
+                    account_identifier_hash: Some("abc123hash".to_string()),
+                    organization_identifier_hash: None,
+                    credential_fingerprint_hash: None,
+                    billing_identity_evidence: Some("provider_account_id".to_string()),
+                    billing_identity_confidence: AgentStatusConfidence::High,
+                    context_window_tokens: Some(128000),
+                    max_output_tokens: Some(16384),
+                    supports_thinking: Some(true),
+                    supports_images: Some(false),
+                }],
+                context_window_tokens: Some(128000),
+            }),
+            quota_windows: Vec::new(),
+            credit_balances: vec![AgentCreditBalance {
+                name: "credits".to_string(),
+                status: AgentCreditBalanceStatus::Exhausted,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                unit: AgentCreditBalanceUnit::Credits,
+                account_label: Some("ron@example.com".to_string()),
+                remaining: Some(CreditAmount::ZERO),
+                used: None,
+                quota: None,
+                unlimited: Some(false),
+                updated_at: Some("2026-05-07T00:00:00Z".to_string()),
+                spend_control_reached: Some(true),
+                rate_limit_reached_type: Some("primary".to_string()),
+                limit_id: Some("codex".to_string()),
+                ..Default::default()
+            }],
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: vec![AgentStatusPlanObservation {
+                desktop_recent_at: None,
+                observed_at: Some("2026-05-07T00:00:00Z".to_string()),
+                evidence_method: Some("cli_text".to_string()),
+                source_session_id: Some("session-safe".to_string()),
+                provider: Some("openai".to_string()),
+                billing_provider: Some("openai".to_string()),
+                model_provider: Some("openai".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                auth_mode: Some("oauth".to_string()),
+                gateway_provider: None,
+                subscription_product: Some("ChatGPT Pro".to_string()),
+                plan_type: Some("individual".to_string()),
+                account_label: Some("ron@example.com".to_string()),
+                account_id: Some("user-SyntheticUser01".to_string()),
+                organization_label: Some("Private Org".to_string()),
+                organization_id: Some("00000000-0000-4000-8000-00000000a001".to_string()),
+                account_identifier_hash: Some("abc123hash".to_string()),
+                organization_identifier_hash: Some("def456hash".to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: Some("provider_account_id".to_string()),
+                billing_identity_confidence: AgentStatusConfidence::High,
+                confidence: AgentStatusConfidence::High,
+                is_current: Some(true),
+            }],
+            diagnostics: vec![AgentStatusDiagnostic::source(
+                "stderr",
+                AgentDiagnosticSeverity::Warning,
+                "failed reading /Users/example/.codex/config",
+            )],
+            runtime_defaults: Some(AgentRuntimeDefaults {
+                provenance: Some("config_file".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                service_tier: Some("default".to_string()),
+                fast_mode_enabled: Some(false),
+                selector_context: BTreeMap::from([
+                    ("service_tier".to_string(), "default".to_string()),
+                    // Path-like value must be stripped by redaction.
+                    (
+                        "leaked".to_string(),
+                        "/Users/example/.codex/config".to_string(),
+                    ),
+                ]),
+                selector_sources: BTreeMap::from([(
+                    "service_tier".to_string(),
+                    "codex.config.service_tier".to_string(),
+                )]),
+                reasoning_effort_by_model: BTreeMap::from([
+                    ("claude-opus-5-5".to_string(), "medium".to_string()),
+                    ("/Users/example/.claude".to_string(), "high".to_string()),
+                ]),
+                ..Default::default()
+            }),
+        }
+        .redacted_for_backend();
+
+        let account = snapshot.account.expect("account");
+        assert_eq!(account.provider.as_deref(), Some("openai"));
+        assert_eq!(account.auth_method.as_deref(), Some("oauth"));
+        assert_eq!(account.subscription_product.as_deref(), Some("ChatGPT Pro"));
+        assert_eq!(account.email.as_deref(), Some("ron@example.com"));
+        // Raw provider ids are identifiers, not credentials: they survive so
+        // the backend can recompute the hashes independently of display text.
+        assert_eq!(account.account_id.as_deref(), Some("user-SyntheticUser01"));
+        assert_eq!(
+            account.organization_id.as_deref(),
+            Some("00000000-0000-4000-8000-00000000a001")
+        );
+        assert_eq!(account.organization_label.as_deref(), Some("Private Org"));
+        assert_eq!(
+            account.account_identifier_hash.as_deref(),
+            Some("abc123hash")
+        );
+        assert_eq!(
+            account.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+        assert_eq!(
+            account.claude_quota_access_state,
+            Some(ClaudeQuotaAccessState::Full)
+        );
+        let model = snapshot.model.expect("model");
+        assert_eq!(model.active_model, None);
+        assert_eq!(model.default_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(model.available_models, vec!["gpt-5.4"]);
+        assert_eq!(
+            snapshot.plan_observations[0]
+                .subscription_product
+                .as_deref(),
+            Some("ChatGPT Pro")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].account_label.as_deref(),
+            Some("ron@example.com")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].organization_label.as_deref(),
+            Some("Private Org")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].account_id.as_deref(),
+            Some("user-SyntheticUser01")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].organization_id.as_deref(),
+            Some("00000000-0000-4000-8000-00000000a001")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0]
+                .account_identifier_hash
+                .as_deref(),
+            Some("abc123hash")
+        );
+        assert_eq!(snapshot.credit_balances[0].account_label, None);
+        assert_eq!(
+            snapshot.credit_balances[0].remaining,
+            Some(CreditAmount::ZERO)
+        );
+        // Safe provider metadata survives redaction; the spend-cap flag forwards.
+        assert_eq!(
+            snapshot.credit_balances[0].spend_control_reached,
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.credit_balances[0]
+                .rate_limit_reached_type
+                .as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            snapshot.credit_balances[0].limit_id.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(snapshot.diagnostics[0].message, "diagnostic redacted");
+        let runtime_defaults = snapshot.runtime_defaults.expect("runtime_defaults");
+        assert_eq!(runtime_defaults.service_tier.as_deref(), Some("default"));
+        assert_eq!(runtime_defaults.fast_mode_enabled, Some(false));
+        assert_eq!(
+            runtime_defaults
+                .selector_context
+                .get("service_tier")
+                .map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            runtime_defaults
+                .selector_sources
+                .get("service_tier")
+                .map(String::as_str),
+            Some("codex.config.service_tier")
+        );
+        // Path-like config value is stripped by backend redaction.
+        assert!(!runtime_defaults.selector_context.contains_key("leaked"));
+        assert_eq!(
+            runtime_defaults.reasoning_effort_by_model,
+            BTreeMap::from([("claude-opus-5-5".to_string(), "medium".to_string())])
+        );
+    }
+
+    fn status_display_fixture() -> AgentStatusSnapshot {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/display-carrier.json"
+        ))
+        .expect("synthetic account display fixture")
+    }
+
+    #[test]
+    fn status_display_serialization_preserves_own_roles_and_weak_text() {
+        let original = status_display_fixture();
+        let redacted = original.clone().redacted_for_backend();
+        // Includes a distinct previous slot, weak-only current observation and
+        // a route without acquired text: no root fallback or identity rewrite.
+        assert_eq!(redacted, original);
+        let wire = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(wire["account"]["email"], "root@example.invalid");
+        assert_eq!(
+            wire["plan_observations"][0]["account_label"],
+            "member@example.invalid"
+        );
+        assert_eq!(
+            wire["plan_observations"][0]["organization_label"],
+            "Member workspace"
+        );
+        assert_eq!(wire["plan_observations"][0]["is_current"], false);
+        assert_eq!(
+            wire["plan_observations"][1]["account_label"],
+            "  Weak account @ workspace  "
+        );
+        assert!(wire["plan_observations"][2].get("account_label").is_none());
+        assert!(wire["plan_observations"][2]
+            .get("organization_label")
+            .is_none());
+        assert_eq!(redacted.clone().redacted_for_backend(), redacted);
+    }
+
+    #[test]
+    fn status_display_rejects_adversarial_text_without_widening_other_fields() {
+        for forbidden in [
+            "",
+            "   ",
+            "/Users/test@example.invalid/private",
+            "\\Users\\test\\private",
+            "/tmp/private",
+            " /tmp/private",
+            "Label /tmp/private",
+            "directory=/tmp/private",
+            "workspace=C:\\private",
+            "workspace:C:/private",
+            "directory|/tmp/private",
+            "C:\\private",
+            "Name https://example.invalid",
+            "~/private",
+            "https://test@example.invalid",
+            "file:/private",
+            "Bearer synthetic",
+            "authorization: synthetic",
+            "sk-synthetic",
+            "otdev_synthetic",
+            "otsi_synthetic",
+            "otsr_synthetic",
+            "otsct_synthetic",
+            "otel_synthetic",
+            "otrelay_synthetic",
+            "access_token=synthetic",
+            "refresh_token=synthetic",
+            "id_token=synthetic",
+            "password=synthetic",
+            "Cookie: synthetic",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            "name\n@example.invalid",
+            "name\r@example.invalid",
+            "name\0@example.invalid",
+        ] {
+            let mut snapshot = status_display_fixture();
+            let account = snapshot.account.as_mut().unwrap();
+            account.email = Some(forbidden.into());
+            account.organization_label = Some(forbidden.into());
+            for observation in &mut snapshot.plan_observations {
+                observation.account_label = Some(forbidden.into());
+                observation.organization_label = Some(forbidden.into());
+            }
+            let redacted = snapshot.redacted_for_backend();
+            let wire = serde_json::to_value(redacted).unwrap();
+            assert!(wire["account"]["email"].is_null());
+            assert!(wire["account"]["organization_label"].is_null());
+            for observation in wire["plan_observations"].as_array().unwrap() {
+                assert!(observation.get("account_label").is_none());
+                assert!(observation.get("organization_label").is_none());
+            }
+        }
+        let mut snapshot = status_display_fixture();
+        snapshot.account.as_mut().unwrap().provider = Some("provider@example.invalid".into());
+        snapshot.plan_observations[0].evidence_method = Some("method@example.invalid".into());
+        let mut diagnostic = AgentStatusDiagnostic::source(
+            "email@example.invalid",
+            AgentDiagnosticSeverity::Warning,
+            "root@example.invalid",
+        );
+        diagnostic.account_label = Some("member@example.invalid".into());
+        diagnostic.scope = Some(AgentDiagnosticScope::Account);
+        snapshot.diagnostics.push(diagnostic);
+        let redacted = snapshot.redacted_for_backend();
+        assert!(redacted.account.unwrap().provider.is_none());
+        assert!(redacted.plan_observations[0].evidence_method.is_none());
+        assert_eq!(redacted.diagnostics[0].code, "redacted");
+        assert_eq!(redacted.diagnostics[0].message, "diagnostic redacted");
+        assert!(redacted.diagnostics[0].account_label.is_none());
+        assert!(redacted.diagnostics[0].scope.is_none());
+    }
+
+    #[test]
+    fn status_display_bounds_and_absence_keep_existing_wire_semantics() {
+        let mut snapshot = status_display_fixture();
+        snapshot.account.as_mut().unwrap().email = Some("a".repeat(320));
+        snapshot.account.as_mut().unwrap().organization_label = Some("é".repeat(255));
+        snapshot.plan_observations[0].account_label = Some("é".repeat(255));
+        snapshot.plan_observations[0].organization_label = Some("a".repeat(255));
+        assert_eq!(snapshot.clone().redacted_for_backend(), snapshot);
+        snapshot.account.as_mut().unwrap().email = Some("a".repeat(321));
+        snapshot.account.as_mut().unwrap().organization_label = Some("é".repeat(256));
+        snapshot.plan_observations[0].account_label = Some("é".repeat(256));
+        snapshot.plan_observations[0].organization_label = Some("a".repeat(256));
+        let wire = serde_json::to_value(snapshot.redacted_for_backend()).unwrap();
+        assert!(wire["account"]["email"].is_null());
+        assert!(wire["account"]["organization_label"].is_null());
+        assert!(wire["plan_observations"][0].get("account_label").is_none());
+        assert!(wire["plan_observations"][0]
+            .get("organization_label")
+            .is_none());
+        let mut absent = status_display_fixture();
+        absent.account = None;
+        for observation in &mut absent.plan_observations {
+            observation.account_label = None;
+            observation.organization_label = None;
+        }
+        assert_eq!(absent.clone().redacted_for_backend(), absent);
+    }
+
+    fn context_status_with_posture() -> AgentContextStatus {
+        AgentContextStatus {
+            status: AgentContextState::Available,
+            active_tokens: Some(120_000),
+            max_tokens: Some(1_000_000),
+            used_percent: Some(12),
+            remaining_tokens: Some(880_000),
+            source: Some("claude_statusline_context_window".to_string()),
+            recent_samples: Vec::new(),
+            observed_at: None,
+            completeness: Some(AgentContextCompleteness::FullPressure),
+            reason: None,
+            posture: Some(AgentContextPostureSummary {
+                sessions_analyzed: 21,
+                window_days: 7,
+                typical_first_turn_tokens: Some(72_400),
+                peak_session_count: 2,
+                window_evidenced_session_count: 1,
+                deep_session_count: Some(8),
+                over_window_session_count: None,
+                session_peaks: vec![
+                    AgentContextSessionPeak {
+                        peak_fill_tokens: 68_000,
+                        context_window_tokens: None,
+                        peak_fill_percent: None,
+                        over_window: None,
+                    },
+                    AgentContextSessionPeak {
+                        peak_fill_tokens: 1_040_000,
+                        context_window_tokens: Some(1_000_000),
+                        peak_fill_percent: Some(104),
+                        over_window: Some(true),
+                    },
+                ],
+                compaction_count: Some(5),
+                reread_tokens: Some(18_000_000),
+            }),
+        }
+    }
+
+    #[test]
+    fn agent_context_posture_summary_round_trips_and_is_additive() {
+        let context = context_status_with_posture();
+        let json = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(json["posture"]["sessions_analyzed"], 21);
+        assert_eq!(json["posture"]["typical_first_turn_tokens"], 72_400);
+        assert_eq!(json["posture"]["session_peaks"][1]["over_window"], true);
+        assert!(json["posture"]["session_peaks"][0]
+            .get("peak_fill_percent")
+            .is_none());
+        assert!(json["posture"].get("over_window_session_count").is_none());
+        let round_tripped: AgentContextStatus =
+            serde_json::from_value(json).expect("deserialize context");
+        assert_eq!(round_tripped, context);
+
+        // A posture with unknown compactions omits the key entirely (the
+        // consumer must distinguish "observed 0" from unknown).
+        let mut unknown_compactions = context_status_with_posture();
+        unknown_compactions
+            .posture
+            .as_mut()
+            .expect("posture")
+            .compaction_count = None;
+        let json = serde_json::to_value(&unknown_compactions).expect("serialize context");
+        assert!(json["posture"].get("compaction_count").is_none());
+
+        // Older-daemon payloads (no posture key) decode with posture = None.
+        let legacy = serde_json::json!({
+            "status": "available",
+            "active_tokens": null,
+            "max_tokens": 200_000,
+            "used_percent": null,
+            "remaining_tokens": null,
+            "source": "claude_statusline_context_window"
+        });
+        let decoded: AgentContextStatus =
+            serde_json::from_value(legacy).expect("decode legacy context");
+        assert_eq!(decoded.posture, None);
+        // And a None posture never serializes the key (older apps see the
+        // exact pre-change wire shape).
+        let json = serde_json::to_value(&decoded).expect("serialize legacy context");
+        assert!(json.get("posture").is_none());
+    }
+
+    #[test]
+    fn agent_status_backend_redaction_strips_context_posture() {
+        let mut snapshot = AgentStatusSnapshot {
+            source: SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::StatusLine,
+            captured_at: "2026-07-12T00:00:00Z".to_string(),
+            expires_at: "2026-07-12T00:05:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: Some(context_status_with_posture()),
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        };
+        snapshot = snapshot.redacted_for_backend();
+        let context = snapshot.context.expect("context survives redaction");
+        assert_eq!(context.posture, None);
+        // The rest of the context payload is untouched.
+        assert_eq!(context.max_tokens, Some(1_000_000));
+        assert_eq!(context.used_percent, Some(12));
+    }
+
+    fn machine_identity_sample() -> MachineIdentity {
+        MachineIdentity {
+            machine_id: "otm_00000000000000000000000000000001".to_string(),
+            installation_id: "oti_00000000000000000000000000000002".to_string(),
+            display_name: "Test Mac".to_string(),
+            hostname: "test-mac.local".to_string(),
+            os: OperatingSystem::Macos,
+            arch: "arm64".to_string(),
+            local_platform_version: "0.1.0".to_string(),
+            hardware_uuid: None,
+            account_scope: None,
+        }
+    }
+
+    /// Older daemons never send `account_scope`, and newer daemons omit it when
+    /// no POSIX uid is available. Both must serialize to the pre-existing shape
+    /// so peers on either side of the change stay compatible.
+    #[test]
+    fn machine_identity_omits_account_scope_when_absent() {
+        let value = serde_json::to_value(machine_identity_sample()).expect("serialize identity");
+
+        assert!(value.get("account_scope").is_none());
+
+        let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
+        assert_eq!(decoded.account_scope, None);
+    }
+
+    #[test]
+    fn machine_identity_round_trips_account_scope_when_present() {
+        let scope = "otu_d8b0c573acd0c2b5f822065edfd4ec58";
+        let identity = MachineIdentity {
+            account_scope: Some(scope.to_string()),
+            ..machine_identity_sample()
+        };
+
+        let value = serde_json::to_value(&identity).expect("serialize identity");
+        assert_eq!(
+            value
+                .get("account_scope")
+                .and_then(serde_json::Value::as_str),
+            Some(scope)
+        );
+
+        let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.account_scope.as_deref(), Some(scope));
+    }
+
+    #[test]
+    fn source_collection_is_additive_and_round_trips() {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/codex-needs-repair.json"
+        ))
+        .unwrap();
+        // Shared with consumers: each named case contains SourceHealth fields.
+        let cases: BTreeMap<String, serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/collection.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            cases.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "absent",
+                "collecting",
+                "offline",
+                "server_backoff",
+                "stalled"
+            ]
+        );
+        for (case, fields) in cases {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let health: SourceHealth = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(&health).unwrap();
+            assert_eq!(
+                encoded.get("collection"),
+                fields.get("collection"),
+                "{case}"
+            );
+            assert_eq!(
+                serde_json::from_value::<SourceHealth>(encoded).unwrap(),
+                health,
+                "{case}"
+            );
+        }
+        let unknown: SourceCollectionHealth =
+            serde_json::from_value(serde_json::json!({"state": "future"})).unwrap();
+        assert_eq!(unknown.state, SourceCollectionState::Unknown);
+    }
+
+    #[test]
+    fn golden_fixtures_match_protocol_models() {
+        let status = serde_json::from_str::<DaemonStatus>(include_str!(
+            "../../../fixtures/status/macos-empty.json"
+        ))
+        .expect("daemon status fixture should deserialize");
+        assert_eq!(status.protocol_version, PROTOCOL_VERSION);
+
+        let source_health = serde_json::from_str::<SourceHealth>(include_str!(
+            "../../../fixtures/source-health/codex-needs-repair.json"
+        ))
+        .expect("source health fixture should deserialize");
+        assert_eq!(
+            source_health.descriptor.review_tier,
+            ConnectorReviewTier::Official
+        );
+        assert_eq!(source_health.descriptor.maturity, ConnectorMaturity::Stable);
+        assert_eq!(source_health.descriptor.collectors.len(), 3);
+
+        serde_json::from_str::<SetupRun>(include_str!("../../../fixtures/setup/claim-run.json"))
+            .expect("setup run fixture should deserialize");
+
+        serde_json::from_str::<DiagnosticsBundle>(include_str!(
+            "../../../fixtures/diagnostics/redacted-bundle.json"
+        ))
+        .expect("diagnostics fixture should deserialize");
+
+        serde_json::from_str::<LocalControlRequest>(include_str!(
+            "../../../fixtures/control/status-request.json"
+        ))
+        .expect("control request fixture should deserialize");
+
+        let receipts_request = serde_json::from_str::<LocalControlRequest>(include_str!(
+            "../../../fixtures/control/receipts-request.json"
+        ))
+        .expect("receipts control request fixture should deserialize");
+        assert_eq!(
+            receipts_request.command,
+            LocalControlCommand::Receipts {
+                limit: 25,
+                since: Some("2026-09-10T00:00:00Z".to_string()),
+                source: Some(SourceKind::Codex),
+                before: None,
+            }
+        );
+
+        let response = serde_json::from_str::<LocalControlResponse>(include_str!(
+            "../../../fixtures/control/status-response.json"
+        ))
+        .expect("control response fixture should deserialize");
+        assert_eq!(
+            response
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("protocol_version"))
+                .and_then(serde_json::Value::as_u64),
+            Some(PROTOCOL_VERSION as u64)
+        );
+
+        let receipts_response = serde_json::from_str::<LocalControlResponse>(include_str!(
+            "../../../fixtures/control/receipts-response.json"
+        ))
+        .expect("receipts control response fixture should deserialize");
+        let payload: UploadReceiptsResponseV1 = serde_json::from_value(
+            receipts_response
+                .payload
+                .expect("receipts response payload"),
+        )
+        .expect("typed receipts payload");
+        assert_eq!(payload.schema, "ottto.upload_receipts.v1");
+        assert_eq!(payload.receipts.len(), 1);
+    }
+
+    #[test]
+    fn local_health_contract_matrix_matches_protocol_models() {
+        let fixtures = local_health_contract_fixtures();
+        let case_ids: std::collections::BTreeSet<_> = fixtures
+            .iter()
+            .map(|fixture| fixture.case_id.as_str())
+            .collect();
+        let required_case_ids = [
+            "current_healthy_v1",
+            "upgrade_0_1_27_login_sources_preserved",
+            "runtime_app_daemon_mismatch_red",
+            "protocol_schema_mismatch_upgrade_required",
+            "stale_heartbeat_red",
+            "inactive_device_red",
+            "verify_failure_wins_over_old_green",
+            "all_verify_failures_win_over_old_green",
+            "source_removed_sync_revision",
+            "backfill_success_cannot_green_current_failure",
+            "homebrew_owner_conflict_red",
+            "dev_owner_no_production_repair",
+            "read_only_org_telemetry_controls_disabled",
+            "setup_token_refresh_rebind",
+            "command_idempotency_terminal_result",
+            "object_authorization_rejection",
+            "machine_identity_collision_reconnect",
+            "corrupt_local_state_recovery",
+            "clock_skew_warning",
+            "diagnostics_redaction",
+        ];
+
+        assert_eq!(fixtures.len(), required_case_ids.len());
+        for case_id in required_case_ids {
+            assert!(
+                case_ids.contains(case_id),
+                "missing local health case {case_id}"
+            );
+        }
+
+        for fixture in &fixtures {
+            assert_eq!(
+                fixture.fixture_schema_version,
+                "local_health_contract_fixture.v1"
+            );
+            assert_eq!(fixture.contract_version, "local_machine_health.v1");
+            assert_eq!(fixture.health.schema_version, 1);
+            assert_eq!(
+                fixture.health.schema_version_name,
+                "local_machine_health.v1"
+            );
+            assert_eq!(fixture.health.projection_version, "health_projection.v1");
+            assert_eq!(fixture.health.event_schema_version, "local_health_event.v1");
+            assert!(
+                fixture
+                    .health
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "health.v1"),
+                "{} must advertise health.v1",
+                fixture.case_id
+            );
+            assert_eq!(fixture.expected.overall_state, fixture.health.overall.state);
+            assert_eq!(
+                fixture.expected.primary_blocker,
+                fixture.health.overall.primary_blocker
+            );
+            assert_eq!(
+                fixture.health.revision, fixture.health.projection_revision,
+                "{} uses one canonical projection revision in Phase 0",
+                fixture.case_id
+            );
+            for source in &fixture.health.sources {
+                assert!(
+                    source.projection_revision <= fixture.health.projection_revision,
+                    "{} source projection revision moved past health projection",
+                    fixture.case_id
+                );
+            }
+            for event in &fixture.events {
+                assert_eq!(event.machine_id, fixture.health.machine_id);
+                assert_eq!(event.event_schema_version, "local_health_event.v1");
+            }
+            if let Some(heartbeat) = &fixture.heartbeat {
+                assert_eq!(heartbeat.schema_version, "machine_runtime_heartbeat.v1");
+                assert_eq!(heartbeat.machine_id, fixture.health.machine_id);
+                assert_eq!(
+                    heartbeat.health_projection_revision,
+                    fixture.health.projection_revision
+                );
+            }
+            if let Some(command) = &fixture.command {
+                assert_eq!(command.command_schema_version, "local_command.v1");
+                assert!(
+                    command.expires_at > command.issued_at,
+                    "{} command expiry should be after issue time",
+                    fixture.case_id
+                );
+            }
+            if let Some(result) = &fixture.command_result {
+                assert_eq!(result.command_schema_version, "local_command.v1");
+                assert!(
+                    result.terminal,
+                    "{} result should be terminal",
+                    fixture.case_id
+                );
+                let command = fixture
+                    .command
+                    .as_ref()
+                    .expect("command result must include command fixture");
+                assert_eq!(command.action_id, result.action_id);
+                assert_eq!(command.idempotency_key, result.idempotency_key);
+                assert!(
+                    result.completed_projection_revision >= result.started_projection_revision,
+                    "{} command result projection revision regressed",
+                    fixture.case_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_health_fixture_contract_pins_phase_zero_edge_cases() {
+        let fixtures = local_health_contract_fixtures();
+        let by_id = |case_id: &str| -> &LocalHealthContractFixture {
+            fixtures
+                .iter()
+                .find(|fixture| fixture.case_id == case_id)
+                .unwrap_or_else(|| panic!("missing local health fixture {case_id}"))
+        };
+
+        let upgrade = by_id("upgrade_0_1_27_login_sources_preserved");
+        assert!(upgrade.previous_stable_input.is_some());
+        assert!(upgrade.expected.preserved_login);
+        assert_eq!(
+            upgrade.expected.preserved_sources,
+            vec![SourceKind::Codex, SourceKind::ClaudeCode]
+        );
+
+        let mismatch = by_id("runtime_app_daemon_mismatch_red");
+        assert!(!mismatch.health.runtime.version_match);
+        assert_eq!(
+            mismatch.health.overall.primary_blocker.as_deref(),
+            Some("service_outdated")
+        );
+
+        let protocol = by_id("protocol_schema_mismatch_upgrade_required");
+        assert!(!protocol.health.runtime.protocol_match);
+        assert!(!protocol.health.runtime.schema_match);
+        assert_eq!(
+            protocol.health.overall.state,
+            LocalHealthOverallState::UpgradeRequired
+        );
+
+        let stale = by_id("stale_heartbeat_red");
+        assert_eq!(
+            stale.health.account.device_state,
+            LocalDeviceState::StaleHeartbeat
+        );
+
+        let inactive = by_id("inactive_device_red");
+        assert_eq!(
+            inactive.health.account.device_state,
+            LocalDeviceState::Inactive
+        );
+        assert_eq!(
+            inactive.health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+
+        let verify = by_id("verify_failure_wins_over_old_green");
+        assert_eq!(
+            verify.health.sources[0].authority,
+            LocalHealthAuthority::Verify
+        );
+        assert_eq!(
+            verify.health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+
+        let all_verify = by_id("all_verify_failures_win_over_old_green");
+        assert_eq!(all_verify.health.sources.len(), 3);
+        assert!(all_verify
+            .health
+            .sources
+            .iter()
+            .all(|source| source.authority == LocalHealthAuthority::Verify
+                && source.state == LocalHealthSourceState::VerifyFailed));
+
+        let backfill = by_id("backfill_success_cannot_green_current_failure");
+        assert!(backfill.backfill_job.is_some());
+        assert_eq!(
+            backfill.health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+
+        let homebrew = by_id("homebrew_owner_conflict_red");
+        assert_eq!(
+            homebrew.health.runtime.install_owner,
+            InstallOwner::Homebrew
+        );
+
+        let dev = by_id("dev_owner_no_production_repair");
+        assert_eq!(dev.health.runtime.install_owner, InstallOwner::Dev);
+
+        let read_only = by_id("read_only_org_telemetry_controls_disabled");
+        let controls = read_only
+            .health
+            .account
+            .telemetry_controls
+            .as_ref()
+            .expect("read-only fixture should include telemetry controls");
+        assert!(controls.read_only);
+        assert!(!controls.can_enable_telemetry);
+        assert!(!controls.can_disable_telemetry);
+
+        let setup = by_id("setup_token_refresh_rebind");
+        assert_eq!(
+            setup.health.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+
+        let source_removed = by_id("source_removed_sync_revision");
+        assert_eq!(
+            source_removed.health.sources[0].state,
+            LocalHealthSourceState::Removed
+        );
+
+        let command = by_id("command_idempotency_terminal_result");
+        assert_eq!(
+            command
+                .command_result
+                .as_ref()
+                .expect("command result")
+                .status,
+            LocalHealthCommandStatus::Deduped
+        );
+
+        let object_auth = by_id("object_authorization_rejection");
+        assert_eq!(
+            object_auth
+                .command_result
+                .as_ref()
+                .expect("command result")
+                .status,
+            LocalHealthCommandStatus::Rejected
+        );
+
+        let collision = by_id("machine_identity_collision_reconnect");
+        assert_eq!(
+            collision.health.account.device_state,
+            LocalDeviceState::CollisionSuspected
+        );
+
+        let corrupt = by_id("corrupt_local_state_recovery");
+        assert_eq!(
+            corrupt.health.overall.primary_blocker.as_deref(),
+            Some("local_state_recovery_required")
+        );
+
+        let skew = by_id("clock_skew_warning");
+        assert_eq!(skew.health.overall.state, LocalHealthOverallState::Degraded);
+
+        let diagnostics = by_id("diagnostics_redaction");
+        assert_eq!(
+            diagnostics.health.sources[0].authority,
+            LocalHealthAuthority::Diagnostics
+        );
+    }
+
+    #[test]
+    fn diagnostics_local_health_fixture_is_redacted() {
+        let fixtures = local_health_contract_fixtures();
+        let diagnostics = fixtures
+            .iter()
+            .find(|fixture| fixture.case_id == "diagnostics_redaction")
+            .expect("diagnostics fixture");
+        let encoded =
+            serde_json::to_string(diagnostics).expect("diagnostics fixture should serialize");
+        for forbidden in [
+            "sk-",
+            "ghp_",
+            "password=",
+            concat!("BEGIN ", "PRIVATE KEY"),
+            "raw_cookie",
+            "hardware_serial_value",
+            "setup_secret_value",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostics fixture leaked forbidden marker {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_bundle_fixture_declares_identifier_redactions() {
+        let bundle = serde_json::from_str::<DiagnosticsBundle>(include_str!(
+            "../../../fixtures/diagnostics/redacted-bundle.json"
+        ))
+        .expect("diagnostics fixture should deserialize");
+        assert_eq!(bundle.machine_id, "[machine_id]");
+
+        let redacted_fields: std::collections::BTreeSet<_> = bundle
+            .redaction
+            .redacted_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for field in [
+            "account_id",
+            "device_id",
+            "installation_id",
+            "machine_id",
+            "org_id",
+            "user_id",
+        ] {
+            assert!(
+                redacted_fields.contains(field),
+                "diagnostics fixture redaction report must cover {field}"
+            );
+        }
+
+        let encoded = serde_json::to_string(&bundle).expect("diagnostics fixture should serialize");
+        for forbidden in [
+            "acct_private",
+            "dev_private",
+            "install_private",
+            "mach_private",
+            "org_private",
+            "usr_private",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostics fixture leaked raw identifier marker {forbidden}"
+            );
+        }
+    }
+
+    fn local_health_contract_fixtures() -> Vec<LocalHealthContractFixture> {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/local-health/contract-matrix.v1.json"
+        ))
+        .expect("local health contract matrix should deserialize")
+    }
+
+    #[test]
+    fn repair_plan_requires_authority_metadata() {
+        let error = serde_json::from_value::<RepairPlan>(serde_json::json!({
+            "plan_id": "plan_clean_cutover",
+            "machine_id": "machine_clean_cutover",
+            "source": "codex",
+            "dry_run": true,
+            "status": "proposed",
+            "actions": [],
+            "created_at": "2026-05-21T00:00:00Z"
+        }))
+        .expect_err("repair plans without authority metadata should be rejected");
+
+        assert!(error.to_string().contains("authority"));
+    }
+
+    #[test]
+    fn repair_actions_require_approval_metadata() {
+        let error = serde_json::from_value::<RepairPlan>(serde_json::json!({
+            "plan_id": "plan_clean_cutover",
+            "machine_id": "machine_clean_cutover",
+            "source": "codex",
+            "dry_run": true,
+            "status": "proposed",
+            "authority": {
+                "mode": "browser_approval_required",
+                "server_backed": false,
+                "terminal_approval_allowed": false,
+                "browser_approval_required": true,
+                "message": {
+                    "code": "browser_approval_required",
+                    "text": "Open Ottto in your browser to approve this repair."
+                }
+            },
+            "actions": [
+                {
+                    "action": "write_config",
+                    "title": "Write config",
+                    "detail": "Prepare a source config repair.",
+                    "requires_approval": true,
+                    "destructive": false
+                }
+            ],
+            "created_at": "2026-05-21T00:00:00Z"
+        }))
+        .expect_err("repair actions without approval metadata should be rejected");
+
+        assert!(error.to_string().contains("approval"));
+    }
+
+    #[test]
+    fn diagnostics_collect_without_upload_fields_defaults_to_local_only() {
+        let request = serde_json::from_str::<LocalControlRequest>(&format!(
+            r#"{{"request_id":"req_test","protocol_version":{PROTOCOL_VERSION},"command":"diagnostics_collect"}}"#
+        ))
+        .expect("current local-only diagnostics request should deserialize");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::DiagnosticsCollect {
+                upload: false,
+                upload_approval: None,
+                api_base_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn personal_meter_local_snapshot_command_round_trips() {
+        let request = serde_json::from_str::<LocalControlRequest>(&format!(
+            r#"{{"request_id":"req_meter","protocol_version":{PROTOCOL_VERSION},"command":"personal_meter_local_snapshot","source":"codex"}}"#
+        ))
+        .expect("personal meter local snapshot request should deserialize");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::PersonalMeterLocalSnapshot {
+                source: Some(SourceKind::Codex),
+            }
+        );
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(
+            encoded["command"],
+            serde_json::json!("personal_meter_local_snapshot")
+        );
+        assert_eq!(encoded["source"], serde_json::json!("codex"));
+    }
+
+    #[test]
+    fn local_control_request_requires_protocol_version() {
+        let error = serde_json::from_str::<LocalControlRequest>(
+            r#"{"request_id":"req_missing","command":"status"}"#,
+        )
+        .expect_err("missing protocol version should be rejected");
+
+        assert!(error.to_string().contains("protocol_version"));
+    }
+
+    #[test]
+    fn local_control_status_accepts_base_protocol_version() {
+        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v15",
+            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect("base local-control status request should be accepted");
+
+        assert_eq!(request.protocol_version, LOCAL_CONTROL_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn provider_daily_reference_control_command_round_trips_without_credentials() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_pdr_bind",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "web_ui",
+            "command": "provider_daily_reference_control",
+            "action": "bind",
+            "control_token": "header.payload.signature",
+            "api_base_url": "https://api.ottto.net",
+            "backend_grant": {
+                "id": "00000000-0000-4000-8000-000000000002",
+                "installation_id": "00000000-0000-4000-8000-000000000001",
+                "source": "codex",
+                "collector_id": "provider_daily_reference",
+                "schema_version": "provider_daily_reference.v1",
+                "collector_version": "0.1.98",
+                "release_lane": "supported",
+                "disclosure_version": "provider_daily_reference_disclosure.v2",
+                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+                "status": "enabled",
+                "grant_version": 1,
+                "server_policy_state": "approved"
+            }
+        }))
+        .expect("provider daily reference bind control request");
+
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::ProviderDailyReferenceControl {
+                action: ProviderDailyReferenceControlAction::Bind,
+                backend_grant: Some(ProviderDailyReferenceBackendGrantResponseV1 {
+                    grant_version: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("header.payload.signature"));
+        assert!(debug.contains("<redacted>"));
+
+        let mut confirm_wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        confirm_wire["request_id"] = serde_json::json!("req_pdr_confirm");
+        confirm_wire["action"] = serde_json::json!("confirm_revoked");
+        confirm_wire["backend_grant"]["status"] = serde_json::json!("revoked");
+        let confirm: LocalControlRequest = serde_json::from_value(confirm_wire).unwrap();
+        assert!(matches!(
+            confirm.command,
+            LocalControlCommand::ProviderDailyReferenceControl {
+                action: ProviderDailyReferenceControlAction::ConfirmRevoked,
+                ..
+            }
+        ));
+
+        for (wire_action, expected) in [
+            (
+                "exclude_current_account",
+                ProviderDailyReferenceControlAction::ExcludeCurrentAccount,
+            ),
+            (
+                "include_current_account",
+                ProviderDailyReferenceControlAction::IncludeCurrentAccount,
+            ),
+        ] {
+            let privacy_control: LocalControlRequest = serde_json::from_value(serde_json::json!({
+                "request_id": format!("req_pdr_{wire_action}"),
+                "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+                "client_kind": "web_ui",
+                "command": "provider_daily_reference_control",
+                "action": wire_action,
+                "control_token": "header.payload.signature",
+                "api_base_url": "https://api.ottto.net",
+                "expected_account_fingerprint": format!(
+                    "hmac-sha256:{}",
+                    "c".repeat(64)
+                )
+            }))
+            .expect("provider daily reference privacy control request");
+            assert!(matches!(
+                privacy_control.command,
+                LocalControlCommand::ProviderDailyReferenceControl {
+                    action,
+                    expected_account_fingerprint: Some(ref fingerprint),
+                    ..
+                } if action == expected
+                    && fingerprint == &format!("hmac-sha256:{}", "c".repeat(64))
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_daily_reference_server_policy_defaults_closed() {
+        let response: ProviderDailyReferenceBackendGrantResponseV1 =
+            serde_json::from_value(serde_json::json!({
+                "id": "00000000-0000-4000-8000-000000000002",
+                "installation_id": "00000000-0000-4000-8000-000000000001",
+                "source": "codex",
+                "collector_id": "provider_daily_reference",
+                "schema_version": "provider_daily_reference.v1",
+                "collector_version": "0.1.98",
+                "release_lane": "supported",
+                "disclosure_version": "provider_daily_reference_disclosure.v1",
+                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+                "status": "enabled",
+                "grant_version": 1
+            }))
+            .expect("policy-less grant response");
+
+        assert_eq!(
+            response.server_policy_state,
+            ProviderDailyReferenceServerPolicyState::Disabled
+        );
+    }
+
+    #[test]
+    fn provider_daily_reference_control_is_scoped_to_its_own_protocol_version() {
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_pdr_v15",
+            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "command": "provider_daily_reference_control",
+            "action": "status",
+            "control_token": "header.payload.signature"
+        }))
+        .expect_err("provider daily reference control must reject the base protocol version");
+        assert!(error.to_string().contains(&format!(
+            "expected {PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION}"
+        )));
+
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v17",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect_err("ordinary status must reject the provider daily reference version");
+        assert!(error.to_string().contains(&format!(
+            "unsupported local control protocol_version {PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION}"
+        )));
+
+        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_pdr_v17",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "command": "provider_daily_reference_control",
+            "action": "status",
+            "control_token": "header.payload.signature"
+        }))
+        .expect("command protocol version should be accepted");
+        assert_eq!(
+            request.protocol_version,
+            PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION, 18);
+    }
+
+    #[test]
+    fn detected_use_serializes_to_swift_contract_keys() {
+        let detected = DetectedUse {
+            gateway_provider: "vertex".to_string(),
+            plan_fingerprint: Some("pro::20604".to_string()),
+            account_identifier_hash: Some("hash123".to_string()),
+            subscription_product: Some("pro".to_string()),
+            account_label: Some("Pro".to_string()),
+            last_seen_at: "2026-05-28T10:00:00Z".to_string(),
+            token_volume_recent: vec![DetectedUseTokenSample {
+                at: "2026-05-28T09:00:00Z".to_string(),
+                tokens: 4096,
+            }],
+            quota_window_state: DetectedUseQuotaWindowState::NearLimit,
+            quota_used_percent: Some(82),
+            quota_resets_at: Some("2026-06-01T00:00:00Z".to_string()),
+        };
+        let value = serde_json::to_value(&detected).expect("detected use serializes");
+        let object = value.as_object().expect("detected use is a JSON object");
+        // Every key the Swift `DetectedUse.CodingKeys` contract decodes, in
+        // snake_case. If any drifts the Companion panel silently empties.
+        let expected_keys = [
+            "gateway_provider",
+            "plan_fingerprint",
+            "account_identifier_hash",
+            "subscription_product",
+            "account_label",
+            "last_seen_at",
+            "token_volume_recent",
+            "quota_window_state",
+            "quota_used_percent",
+            "quota_resets_at",
+        ];
+        for key in expected_keys {
+            assert!(object.contains_key(key), "missing JSON key {key}");
+        }
+        assert_eq!(object.len(), expected_keys.len(), "unexpected extra keys");
+        assert_eq!(object["gateway_provider"], serde_json::json!("vertex"));
+        assert_eq!(
+            object["quota_window_state"],
+            serde_json::json!("near_limit")
+        );
+        assert_eq!(object["quota_used_percent"], serde_json::json!(82));
+        assert_eq!(
+            object["token_volume_recent"],
+            serde_json::json!([{"at": "2026-05-28T09:00:00Z", "tokens": 4096}])
+        );
+
+        let parsed: DetectedUse = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(parsed, detected);
+    }
+
+    #[test]
+    fn active_session_accounts_are_optional_and_round_trip() {
+        let old: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z"
+        }))
+        .expect("older session");
+        assert_eq!(old.current_account, None);
+        assert!(old.account_history.is_empty());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("current_account").is_none());
+        assert!(value.get("account_history").is_none());
+
+        let session: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z",
+            "current_account": {"status": "unknown", "unknown_reason": "future_reason"},
+            "account_history": [
+                {"account_identifier_hash": "a", "subscription_product": "max",
+                 "request_count": 2, "input_tokens": 5, "current": true},
+                {"request_count": 1}
+            ]
+        }))
+        .expect("new session");
+        let current = session.current_account.as_ref().unwrap();
+        assert_eq!(current.status, "unknown");
+        assert_eq!(current.account_identifier_hash, None);
+        assert_eq!(session.account_history[1].account_identifier_hash, None);
+        assert_eq!(session.account_history[1].output_tokens, 0);
+        assert!(!session.account_history[1].current);
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["account_history"][0]["current"], true);
+        assert!(value["account_history"][1].get("current").is_none());
+        assert!(value["account_history"][1].get("last_used_at").is_none());
+        assert!(value["current_account"]
+            .get("account_identifier_hash")
+            .is_none());
+    }
+
+    #[test]
+    fn old_active_session_reconciliation_without_scan_start_still_parses() {
+        let reconciliation: ActiveSessionReconciliation =
+            serde_json::from_value(serde_json::json!({
+                "reconciled_at": "2026-07-19T18:00:00Z",
+                "changed_session_count": 0,
+                "sessions": []
+            }))
+            .expect("older reconciliation");
+        assert_eq!(reconciliation.last_activity_at, None);
+        assert_eq!(reconciliation.scan_started_at, None);
+        assert_eq!(reconciliation.active_window_seconds, 900);
+        let value = serde_json::to_value(reconciliation).unwrap();
+        assert!(value.get("scan_started_at").is_none());
+        assert!(value.get("last_activity_at").is_none());
+    }
+
+    #[test]
+    fn active_session_reconciliation_serializes_to_swift_contract_keys() {
+        let reconciliation = ActiveSessionReconciliation {
+            scan_started_at: Some("2026-07-19T17:55:00Z".to_string()),
+            reconciled_at: "2026-07-19T18:00:00Z".to_string(),
+            last_activity_at: Some("2026-07-19T17:59:00Z".to_string()),
+            active_window_seconds: 900,
+            changed_session_count: 1,
+            sessions: vec![ActiveSession {
+                source_session_id: "session-a".to_string(),
+                session_display_name: Some("Active task".to_string()),
+                source_started_at: Some("2026-07-19T17:00:00Z".to_string()),
+                source_last_activity_at: "2026-07-19T17:59:00Z".to_string(),
+                workspace_display_label: Some("workspace".to_string()),
+                repository_label: Some("repository".to_string()),
+                peak_context_fill_tokens: Some(186_000),
+                compaction_count: Some(2),
+                compaction_timestamps: vec![
+                    "2026-07-19T17:30:00Z".to_string(),
+                    "2026-07-19T17:50:00Z".to_string(),
+                ],
+                compaction_events: vec![
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:30:00Z".to_string(),
+                        before_tokens: Some(186_000),
+                        after_tokens: Some(41_000),
+                        trigger: Some("auto".to_string()),
+                    },
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:50:00Z".to_string(),
+                        before_tokens: Some(120_000),
+                        after_tokens: None,
+                        trigger: None,
+                    },
+                ],
+                first_turn_context_tokens: Some(24_000),
+                last_turn_context_tokens: Some(120_000),
+                // 2026-07-19T17:00:00Z and 17:59:00Z.
+                context_points: vec![(1_784_480_400, 24_000), (1_784_483_940, 120_000)],
+                input_tokens: Some(1_000),
+                cache_read_tokens: Some(800),
+                cache_creation_5m_tokens: Some(50),
+                cache_creation_1h_tokens: Some(25),
+                output_tokens: Some(200),
+                reasoning_output_tokens: Some(20),
+                unattributed_total_tokens: None,
+                input_token_scope: Some("inclusive_cached".to_string()),
+                session_kind: Some("subagent".to_string()),
+                provider_surface: Some("codex_desktop".to_string()),
+                account_identifier_hash: Some("account-hash".to_string()),
+                organization_identifier_hash: Some("org-hash".to_string()),
+                subscription_product: Some("chatgpt_pro".to_string()),
+                account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                account_withheld_reason: None,
+                latest_model: Some("claude-opus-5".to_string()),
+                latest_reasoning_effort: Some("high".to_string()),
+                provider_route: None,
+                current_account: None,
+                account_history: Vec::new(),
+            }],
+        };
+
+        let value = serde_json::to_value(&reconciliation).expect("serialize reconciliation");
+        assert_eq!(value["scan_started_at"], "2026-07-19T17:55:00Z");
+        assert_eq!(value["active_window_seconds"].as_u64(), Some(900));
+        assert_eq!(value["changed_session_count"], 1);
+        assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
+        assert_eq!(value["sessions"][0]["compaction_count"], 2);
+        assert_eq!(
+            value["sessions"][0]["source_started_at"],
+            "2026-07-19T17:00:00Z"
+        );
+        assert_eq!(value["sessions"][0]["input_tokens"], 1_000);
+        assert_eq!(value["sessions"][0]["session_kind"], "subagent");
+        assert_eq!(value["sessions"][0]["provider_surface"], "codex_desktop");
+        assert_eq!(
+            value["sessions"][0]["compaction_timestamps"][1],
+            "2026-07-19T17:50:00Z"
+        );
+        // Snake-case keys the Swift Companion decodes for the session card.
+        assert_eq!(
+            value["sessions"][0]["compaction_events"],
+            serde_json::json!([
+                {"at": "2026-07-19T17:30:00Z", "before_tokens": 186_000, "after_tokens": 41_000, "trigger": "auto"},
+                {"at": "2026-07-19T17:50:00Z", "before_tokens": 120_000}
+            ])
+        );
+        assert_eq!(value["sessions"][0]["first_turn_context_tokens"], 24_000);
+        assert_eq!(value["sessions"][0]["last_turn_context_tokens"], 120_000);
+        assert_eq!(
+            value["sessions"][0]["context_points"],
+            serde_json::json!([[1_784_480_400, 24_000], [1_784_483_940, 120_000]])
+        );
+        assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
+        assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
+        // Absent, not null, when the daemon has no withheld reason.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("account_withheld_reason")));
+        // Absent, not null, outside Pi.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("provider_route")));
+        assert_eq!(value["last_activity_at"], "2026-07-19T17:59:00Z");
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize reconciliation");
+        assert_eq!(round_tripped, reconciliation);
+
+        let mut pi = reconciliation.clone();
+        pi.sessions[0].provider_route = Some("google_vertex".to_string());
+        let value = serde_json::to_value(&pi).expect("serialize pi reconciliation");
+        assert_eq!(value["sessions"][0]["provider_route"], "google_vertex");
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize pi reconciliation");
+        assert_eq!(round_tripped, pi);
+
+        let mut withheld = reconciliation.clone();
+        withheld.sessions[0].account_identifier_hash = None;
+        withheld.sessions[0].organization_identifier_hash = None;
+        withheld.sessions[0].subscription_product = None;
+        withheld.sessions[0].account_attribution_source = None;
+        withheld.sessions[0].account_withheld_reason = Some("multiple_accounts".to_string());
+        let value = serde_json::to_value(&withheld).expect("serialize withheld reconciliation");
+        assert_eq!(
+            value["sessions"][0]["account_withheld_reason"],
+            "multiple_accounts"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize withheld reconciliation");
+        assert_eq!(round_tripped, withheld);
+
+        // Empty lists and unknown sizes are absent, never `[]` or null, and an
+        // older daemon's row without the keys decodes to empty.
+        let mut bare = reconciliation.clone();
+        bare.sessions[0].compaction_events.clear();
+        bare.sessions[0].context_points.clear();
+        bare.sessions[0].first_turn_context_tokens = None;
+        bare.sessions[0].last_turn_context_tokens = None;
+        let value = serde_json::to_value(&bare).expect("serialize bare reconciliation");
+        let session = value["sessions"][0].as_object().expect("session object");
+        for key in [
+            "compaction_events",
+            "context_points",
+            "first_turn_context_tokens",
+            "last_turn_context_tokens",
+        ] {
+            assert!(!session.contains_key(key), "{key}");
+        }
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize bare reconciliation");
+        assert_eq!(round_tripped, bare);
+    }
+
+    #[test]
+    fn detected_use_quota_window_state_uses_snake_case_slugs() {
+        for (variant, slug) in [
+            (DetectedUseQuotaWindowState::Ok, "ok"),
+            (DetectedUseQuotaWindowState::NearLimit, "near_limit"),
+            (DetectedUseQuotaWindowState::Exhausted, "exhausted"),
+            (DetectedUseQuotaWindowState::RateLimited, "rate_limited"),
+            (DetectedUseQuotaWindowState::Stale, "stale"),
+            (DetectedUseQuotaWindowState::Error, "error"),
+            (DetectedUseQuotaWindowState::Unsupported, "unsupported"),
+            (DetectedUseQuotaWindowState::Unknown, "unknown"),
+        ] {
+            let encoded = serde_json::to_string(&variant).expect("state serializes");
+            assert_eq!(encoded, format!("\"{slug}\""));
+            let decoded: DetectedUseQuotaWindowState =
+                serde_json::from_str(&encoded).expect("state deserializes");
+            assert_eq!(decoded, variant);
+        }
+    }
+
+    #[test]
+    fn detected_use_omits_none_optionals_and_empty_samples() {
+        let detected = DetectedUse {
+            gateway_provider: "anthropic".to_string(),
+            plan_fingerprint: None,
+            account_identifier_hash: None,
+            subscription_product: None,
+            account_label: None,
+            last_seen_at: "2026-05-28T10:00:00Z".to_string(),
+            token_volume_recent: Vec::new(),
+            quota_window_state: DetectedUseQuotaWindowState::Unknown,
+            quota_used_percent: None,
+            quota_resets_at: None,
+        };
+        let object = serde_json::to_value(&detected)
+            .expect("serializes")
+            .as_object()
+            .cloned()
+            .expect("object");
+        // Lenient-decoder contract: None optionals are omitted entirely; the
+        // required keys remain so the Swift decoder never falls back blindly.
+        assert!(!object.contains_key("plan_fingerprint"));
+        assert!(!object.contains_key("quota_used_percent"));
+        assert_eq!(object["token_volume_recent"], serde_json::json!([]));
+        assert_eq!(object["quota_window_state"], serde_json::json!("unknown"));
+    }
+
+    #[test]
+    fn personal_meter_snapshot_keeps_local_evidence_out_of_totals() {
+        let snapshot = PersonalMeterLocalSnapshot {
+            schema_version: "personal_meter.local_snapshot.v1".to_string(),
+            generated_at: "2026-06-17T09:00:00Z".to_string(),
+            machine_id: "machine_test".to_string(),
+            sources: vec![PersonalMeterLocalSourceSnapshot {
+                source: SourceKind::Codex,
+                app: "codex".to_string(),
+                included_in_totals: false,
+                provider: Some("openai".to_string()),
+                account: Some(PersonalMeterLocalAccount {
+                    login_state: AgentLoginState::SignedIn,
+                    label: Some("ron@example.com".to_string()),
+                    account_identifier_hash: Some("acct_hash".to_string()),
+                    confidence: AgentStatusConfidence::High,
+                }),
+                model: Some("gpt-5-codex".to_string()),
+                plan: Some("ChatGPT Plus".to_string()),
+                quota_windows: Vec::new(),
+                pending_local_delta: PersonalMeterLocalDelta {
+                    status: PersonalMeterLocalValueStatus::Unknown,
+                    included_in_totals: false,
+                    basis: "backend_inclusion_watermark_unavailable".to_string(),
+                    since: None,
+                    until: None,
+                    total_tokens: None,
+                    request_count: None,
+                    estimated_cost_usd_micros: None,
+                    detected_use_count: 1,
+                    recent_token_volume: vec![DetectedUseTokenSample {
+                        at: "2026-06-17T08:00:00Z".to_string(),
+                        tokens: 2048,
+                    }],
+                },
+                freshness: PersonalMeterLocalFreshness {
+                    status: PersonalMeterLocalFreshnessStatus::Fresh,
+                    captured_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    expires_at: Some("2026-06-17T09:10:00Z".to_string()),
+                    last_seen_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    last_verified_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    collector_last_success_at: Some("2026-06-17T08:56:00Z".to_string()),
+                },
+                collector: PersonalMeterLocalCollector {
+                    status: PersonalMeterLocalCollectorStatus::Ok,
+                    state: Some(LocalCollectorState::Warm),
+                    local_usage_reconciliation_enabled: Some(true),
+                    last_scan_started_at: Some("2026-06-17T08:55:30Z".to_string()),
+                    last_scan_finished_at: Some("2026-06-17T08:56:00Z".to_string()),
+                    last_success_at: Some("2026-06-17T08:56:00Z".to_string()),
+                    last_uploaded_count: 1,
+                    last_scanned_session_count: 1,
+                    last_scanned_file_count: 1,
+                    last_scan_cap_hit: false,
+                    collector_version: Some("local-enriched/1".to_string()),
+                    parser_version: Some("codex-jsonl/1".to_string()),
+                },
+                confidence: AgentStatusConfidence::High,
+                warnings: Vec::new(),
+                recommendation: None,
+            }],
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        assert_eq!(
+            value["sources"][0]["included_in_totals"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["included_in_totals"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["status"],
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["basis"],
+            serde_json::json!("backend_inclusion_watermark_unavailable")
+        );
+
+        let parsed: PersonalMeterLocalSnapshot =
+            serde_json::from_value(value).expect("snapshot round-trips");
+        assert_eq!(parsed, snapshot);
+    }
+
+    /// A balance from before quota contract v2.2, with every older field set.
+    const LEGACY_CREDIT_BALANCE_JSON: &str = concat!(
+        r#"{"name":"credits","status":"low","freshness":"fresh","unit":"credits","#,
+        r#""account_label":"Synthetic","account_identifier_hash":"aaaa","#,
+        r#""organization_identifier_hash":"bbbb","remaining":12,"used":3,"quota":15,"#,
+        r#""unlimited":false,"updated_at":"2026-10-01T12:00:05Z","currency":"USD","#,
+        r#""resets_at":"2026-11-01T00:00:00Z","used_percent":20,"enabled":true,"#,
+        r#""spend_control_reached":false,"#,
+        r#""rate_limit_reached_type":"workspaceMemberCreditsDepleted","limit_id":"codex"}"#
+    );
+
+    #[test]
+    fn legacy_credit_balance_bytes_are_unchanged() {
+        let balance: AgentCreditBalance =
+            serde_json::from_str(LEGACY_CREDIT_BALANCE_JSON).expect("legacy balance");
+        assert_eq!(
+            serde_json::to_string(&balance).unwrap(),
+            LEGACY_CREDIT_BALANCE_JSON
+        );
+        let minimal = AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: CreditAmount::whole(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&minimal).unwrap(),
+            r#"{"name":"reset_bank","status":"unknown","freshness":"unknown","unit":"resets","remaining":2}"#
+        );
+        // The backend-upload copy of a legacy balance only loses the label.
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(
+            serde_json::to_string(&redacted).unwrap(),
+            LEGACY_CREDIT_BALANCE_JSON.replace(r#""account_label":"Synthetic","#, "")
+        );
+    }
+
+    /// One exact scaler: half-even to six digits over every discarded digit,
+    /// overflow after the carry is absent, bare cents stay cents, and amounts
+    /// round-trip as integers when whole and ≤6-dp strings otherwise.
+    #[test]
+    fn credit_amounts_scale_exactly_and_round_trip() {
+        for (text, micros) in [
+            ("49591.7041935000", Some(49_591_704_194)),
+            ("1.2345665000", Some(1_234_566)),
+            ("1.2345675000", Some(1_234_568)),
+            ("1.23456650001", Some(1_234_567)),
+            ("0.40", Some(400_000)),
+            ("18446744073709.551615", Some(u64::MAX)),
+            ("18446744073709.5516155", None),
+            ("18446744073710", None),
+            ("1.5e2", None),
+            ("1.", None),
+        ] {
+            let parsed = CreditAmount::from_decimal(text);
+            assert_eq!(parsed.map(CreditAmount::micros), micros, "{text}");
+        }
+        assert_eq!(CreditAmount::whole(18_446_744_073_710), None);
+        // A bare amount already in cents is not read as dollars.
+        assert_eq!(scale_decimal("700", 0), Some(700));
+        assert_eq!(scale_decimal("700", 2), Some(70_000));
+
+        for (amount, wire) in [
+            (CreditAmount::whole(123), "123"),
+            (Some(CreditAmount::ZERO), "0"),
+            (CreditAmount::from_decimal("0.40"), r#""0.4""#),
+            (
+                CreditAmount::from_decimal("49591.7041935"),
+                r#""49591.704194""#,
+            ),
+        ] {
+            let balance = AgentCreditBalance {
+                remaining: amount,
+                ..Default::default()
+            };
+            let body = serde_json::to_string(&balance).unwrap();
+            assert!(body.contains(&format!(r#""remaining":{wire}"#)), "{body}");
+            let back: AgentCreditBalance = serde_json::from_str(&body).unwrap();
+            assert_eq!(back.remaining, amount);
+        }
+        // An older daemon's integer decodes; a bad amount drops only itself.
+        let old: AgentCreditBalance = serde_json::from_str(
+            r#"{"name":"credits","status":"ok","freshness":"fresh","remaining":12,"used":-5,"quota":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.remaining, old.used, old.quota),
+            (CreditAmount::whole(12), None, None)
+        );
+    }
+
+    fn v22_credit_balance() -> AgentCreditBalance {
+        AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            status: AgentCreditBalanceStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: CreditAmount::whole(1),
+            observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            enabled: Some(false),
+            disabled_reason: Some("out_of_credits".to_string()),
+            grant_count: Some(1),
+            grants: Some(vec![AgentCreditGrant {
+                grant_key: "a".repeat(64),
+                grant_type: CreditGrantType::RateLimitReset,
+                status: CreditGrantStatus::Available,
+                expires_at: Some("2026-10-22T16:00:00Z".to_string()),
+                resets_left: Some(1),
+                clears: Some(vec!["five_hour".to_string()]),
+                title: Some("Synthetic reset".to_string()),
+                usable_now: Some(true),
+                ..Default::default()
+            }]),
+            grants_state: Some(CreditGrantsState::Complete),
+            grants_observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            kind: Some(CreditBalanceKind::SavedResets),
+            title: Some("Synthetic pool".to_string()),
+            next_expires_at: Some("2026-10-22T16:00:00Z".to_string()),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("tenure".to_string()),
+            cooldown_until: Some("2026-10-02T00:00:00Z".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v22_credit_balance_round_trips_with_snake_case_values() {
+        let balance = v22_credit_balance();
+        let value = serde_json::to_value(&balance).unwrap();
+        assert_eq!(value["kind"], "saved_resets");
+        assert_eq!(value["grants_state"], "complete");
+        assert_eq!(value["grants"][0]["grant_type"], "rate_limit_reset");
+        assert_eq!(value["grants"][0]["status"], "available");
+        assert!(value["grants"][0].get("granted_at").is_none());
+        let parsed: AgentCreditBalance = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, balance);
+        // Clean values pass the backend redaction untouched.
+        let mut expected = balance.clone();
+        expected.account_label = None;
+        assert_eq!(redact_credit_balance_for_backend(balance), Some(expected));
+    }
+
+    #[test]
+    fn v22_credit_enums_decode_leniently() {
+        let parsed: AgentCreditBalance = serde_json::from_value(serde_json::json!({
+            "name": "future",
+            "status": "ok",
+            "freshness": "fresh",
+            "kind": "brand_new_kind",
+            "grants_state": "brand_new_state",
+            "grants": [{
+                "grant_key": "b".repeat(64),
+                "grant_type": "brand_new_type",
+                "status": "brand_new_status"
+            }]
+        }))
+        .expect("drifted enum values never fail the balance");
+        assert_eq!(parsed.kind, Some(CreditBalanceKind::Unknown));
+        assert_eq!(parsed.grants_state, None);
+        let grant = &parsed.grants.as_ref().unwrap()[0];
+        assert_eq!(grant.grant_type, CreditGrantType::Unknown);
+        assert_eq!(grant.status, CreditGrantStatus::Unknown);
+        let missing: AgentCreditBalance = serde_json::from_value(serde_json::json!({
+            "name": "old",
+            "status": "ok",
+            "freshness": "fresh",
+            "grants_state": null
+        }))
+        .unwrap();
+        assert_eq!(missing.grants_state, None);
+        assert_eq!(missing.kind, None);
+    }
+
+    fn reader_unavailable_saved_resets() -> AgentCreditBalance {
+        AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            grants_state: Some(CreditGrantsState::Unavailable),
+            kind: Some(CreditBalanceKind::SavedResets),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("surface".to_string()),
+            grants_unavailable_cause: Some(CreditGrantsUnavailableCause::Reader),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grants_unavailable_cause_is_optional_and_lenient() {
+        let balance = reader_unavailable_saved_resets();
+        let value = serde_json::to_value(&balance).unwrap();
+        assert_eq!(value["grants_unavailable_cause"], "reader");
+        assert_eq!(value["status"], "unknown");
+        for absent in ["remaining", "grant_count", "grants", "grants_observed_at"] {
+            assert!(value.get(absent).is_none(), "{absent}");
+        }
+        let parsed: AgentCreditBalance = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, balance);
+        // Absent: omitted, never `null`.
+        let without = AgentCreditBalance {
+            grants_unavailable_cause: None,
+            ..balance.clone()
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(value.get("grants_unavailable_cause").is_none());
+        // `null`, a drifted value or another type decodes as absent.
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!("brand_new_cause"),
+            serde_json::json!(1),
+        ] {
+            let mut value = serde_json::to_value(&balance).unwrap();
+            value["grants_unavailable_cause"] = raw.clone();
+            let parsed: AgentCreditBalance =
+                serde_json::from_value(value).expect("a drifted cause never fails the balance");
+            assert_eq!(parsed.grants_unavailable_cause, None, "{raw}");
+        }
+        // The upload copy keeps it on its one allowed shape.
+        assert_eq!(
+            redact_credit_balance_for_backend(balance.clone())
+                .unwrap()
+                .grants_unavailable_cause,
+            Some(CreditGrantsUnavailableCause::Reader)
+        );
+    }
+
+    type BalanceShape = (&'static str, fn(&mut AgentCreditBalance));
+
+    #[test]
+    fn grants_unavailable_cause_is_dropped_from_every_other_shape() {
+        let shapes: [BalanceShape; 8] = [
+            ("remaining", |b| b.remaining = Some(CreditAmount::ZERO)),
+            ("grant_count", |b| b.grant_count = Some(0)),
+            ("grants", |b| b.grants = Some(Vec::new())),
+            ("complete", |b| {
+                b.grants_state = Some(CreditGrantsState::Complete);
+                b.grants = Some(Vec::new());
+            }),
+            ("no state", |b| b.grants_state = None),
+            ("other kind", |b| {
+                b.kind = Some(CreditBalanceKind::UsageCredits)
+            }),
+            ("no kind", |b| b.kind = None),
+            ("other unit", |b| b.unit = AgentCreditBalanceUnit::Usd),
+        ];
+        for (label, mutate) in shapes {
+            let mut balance = reader_unavailable_saved_resets();
+            mutate(&mut balance);
+            assert!(
+                !credit_grants_unavailable_cause_allowed(&balance),
+                "{label}"
+            );
+            let redacted = redact_credit_balance_for_backend(balance).expect("balance kept");
+            assert_eq!(redacted.grants_unavailable_cause, None, "{label}");
+        }
+        assert!(credit_grants_unavailable_cause_allowed(
+            &reader_unavailable_saved_resets()
+        ));
+    }
+
+    #[test]
+    fn credit_redaction_strips_unsafe_text_in_every_new_field() {
+        for unsafe_text in [
+            "/Users/someone/Library/Application Support/x",
+            "~/.claude/credentials.json",
+            "bearer synthetic",
+            "sk-synthetic",
+            "someone@example.com",
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.title = Some(unsafe_text.to_string());
+            balance.disabled_reason = Some(unsafe_text.to_string());
+            balance.ineligible_reason = Some(unsafe_text.to_string());
+            let grant = &mut balance.grants.as_mut().unwrap()[0];
+            grant.title = Some(unsafe_text.to_string());
+            grant.clears = Some(vec!["five_hour".to_string(), unsafe_text.to_string()]);
+            let redacted = redact_credit_balance_for_backend(balance).expect("balance kept");
+            assert_eq!(redacted.title, None, "{unsafe_text}");
+            assert_eq!(redacted.disabled_reason, None, "{unsafe_text}");
+            assert_eq!(redacted.ineligible_reason, None, "{unsafe_text}");
+            let grant = &redacted.grants.as_ref().unwrap()[0];
+            assert_eq!(grant.title, None, "{unsafe_text}");
+            assert_eq!(grant.clears, None, "{unsafe_text}");
+            // Everything else in the balance survives.
+            assert_eq!(redacted.grants_state, Some(CreditGrantsState::Complete));
+            assert_eq!(grant.usable_now, Some(true));
+        }
+        // Reason codes keep their closed shape on the way out.
+        let mut balance = v22_credit_balance();
+        balance.ineligible_reason = Some("Not A Code".to_string());
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(redacted.ineligible_reason, None);
+    }
+
+    #[test]
+    fn credit_redaction_checks_times_keys_and_reason_codes() {
+        // Malformed instants are dropped field by field.
+        let mut balance = v22_credit_balance();
+        balance.observed_at = Some("yesterday".to_string());
+        balance.cooldown_until = Some("2026-02-30T00:00:00Z".to_string());
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(redacted.observed_at, None);
+        assert_eq!(redacted.cooldown_until, None);
+        assert_eq!(
+            redacted.grants_observed_at.as_deref(),
+            Some("2026-10-01T12:00:00Z")
+        );
+        assert_eq!(redacted.grants_state, Some(CreditGrantsState::Complete));
+
+        // A malformed grant key drops the grant; a malformed grant time drops
+        // the time. Either way the list is no longer complete and loses its
+        // complete-gated summaries.
+        for mutate in [
+            (|grant: &mut AgentCreditGrant| grant.grant_key = "A".repeat(64))
+                as fn(&mut AgentCreditGrant),
+            |grant| grant.grant_key = "abc".to_string(),
+            |grant| grant.expires_at = Some("2026-10-22 16:00".to_string()),
+        ] {
+            let mut balance = v22_credit_balance();
+            mutate(&mut balance.grants.as_mut().unwrap()[0]);
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.grants_state, Some(CreditGrantsState::Partial));
+            assert_eq!(redacted.next_expires_at, None);
+            assert_eq!(redacted.latest_granted_at, None);
+        }
+
+        // disabled_reason: a reason code, at most 64 characters, only when off.
+        for (enabled, reason, kept) in [
+            (Some(false), "out_of_credits".to_string(), true),
+            (Some(false), "x".repeat(65), false),
+            (Some(false), "Out of credits".to_string(), false),
+            (Some(true), "out_of_credits".to_string(), false),
+            (None, "out_of_credits".to_string(), false),
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.enabled = enabled;
+            balance.disabled_reason = Some(reason.clone());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.disabled_reason.is_some(), kept, "{reason}");
+        }
+
+        // Readiness rides only on saved resets.
+        let mut balance = v22_credit_balance();
+        balance.unit = AgentCreditBalanceUnit::Usd;
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(
+            (
+                redacted.eligible,
+                redacted.at_limit,
+                redacted.ineligible_reason,
+                redacted.cooldown_until
+            ),
+            (None, None, None, None)
+        );
+
+        // Unicode lookalikes of a path or secret are stripped from titles.
+        for lookalike in [
+            "see \u{FF0F}Users\u{FF0F}someone",
+            "be\u{200B}arer synthetic",
+            "\u{FF53}\u{FF4B}-synthetic",
+            // ASCII whitespace variants fold too, as on the backend.
+            "Bearer\tsynthetic",
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.title = Some(lookalike.to_string());
+            balance.grants.as_mut().unwrap()[0].title = Some(lookalike.to_string());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.title, None, "{lookalike}");
+            assert_eq!(redacted.grants.as_ref().unwrap()[0].title, None);
+        }
+        assert!(is_backend_safe_credit_text("Réinitialisation offerte"));
+        // Only the fold catches the tab: the raw guard looks for `bearer `.
+        assert!(is_safe_backend_text("Bearer\tsynthetic"));
+        assert!(!is_backend_safe_credit_text("Bearer\tsynthetic"));
+    }
+
+    #[test]
+    fn rfc3339_instant_shape() {
+        for valid in [
+            "2026-10-01T12:00:00Z",
+            "2026-10-01T12:00:00.69185Z",
+            "2026-10-01T12:00:00+02:00",
+            "2024-02-29T23:59:60-05:30",
+        ] {
+            assert!(is_rfc3339_instant(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "2026-10-01",
+            "2026-10-01 12:00:00Z",
+            "2026-13-01T12:00:00Z",
+            "2025-02-29T12:00:00Z",
+            "2026-10-01T24:00:00Z",
+            "2026-10-01T12:00:00",
+            "2026-10-01T12:00:00.Z",
+            "2026-10-01T12:00:00+2:00",
+            "２026-10-01T12:00:00Z",
+        ] {
+            assert!(!is_rfc3339_instant(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn credit_reason_code_shape() {
+        assert!(is_credit_reason_code("tenure"));
+        assert!(is_credit_reason_code("seven_day.overage-1"));
+        assert!(!is_credit_reason_code(""));
+        assert!(!is_credit_reason_code("Tenure"));
+        assert!(!is_credit_reason_code(&"a".repeat(65)));
+        assert!(!is_credit_reason_code("five hour"));
+    }
+
+    #[test]
+    fn verification_check_is_optional_and_unknown_values_stay_unknown() {
+        let old = serde_json::json!({
+            "source": "codex",
+            "config": {"discovered": true, "path_hint": null, "fingerprint": null, "drift": []},
+            "status": "warning",
+            "verified": false,
+            "records_seen": 0,
+            "last_record_id": null,
+            "last_received_at": null,
+            "smoke_after": null,
+            "message": {"code": "codex_local_import", "text": "checked"},
+        });
+        let decoded: SourceVerificationResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.check, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let mut future = old;
+        future["check"] = serde_json::json!({"method": "quantum_probe", "scope": "future_scope"});
+        let decoded: SourceVerificationResult = serde_json::from_value(future).unwrap();
+        assert_eq!(
+            decoded.check,
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::Unknown),
+                scope: SourceVerificationScope::Unknown,
+            })
+        );
+
+        let check = SourceVerificationCheck {
+            method: None,
+            scope: SourceVerificationScope::NotEstablished,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            serde_json::json!({"scope": "not_established"})
+        );
+    }
+}

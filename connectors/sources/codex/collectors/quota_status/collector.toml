@@ -1,0 +1,18 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "quota_status"
+display_name = "Quota and status"
+
+operations = ["detect", "monitor_quota", "diagnostics"]
+data_source_kind = "local_enriched"
+default_state = "requires_setup"
+
+review_tier = "official"
+maturity = "undocumented_surface"
+risk_classes = ["auth_adjacent", "network_calls", "hidden_credential_read"]
+
+uploads_raw_content = false
+emits = [
+  "agent_status_snapshots",
+  "source_plan_profiles"
+]

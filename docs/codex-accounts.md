@@ -1,0 +1,245 @@
+# How Ottto keeps Codex limits available
+
+One Mac can use several ChatGPT subscriptions through Codex. Ottto treats the
+normal Codex login as the **default connection** and leaves it under the user's
+control. Durable connections are additive: changing the default login never
+replaces them.
+
+The identity key is the exact composite of the ChatGPT user and active ChatGPT
+workspace. Email is display evidence, not an identity key. The same user in a
+personal workspace and a business workspace therefore represents two valid
+subscriptions; two durable connections for the same exact composite are a
+duplicate. A default connection may temporarily shadow a matching durable
+connection without becoming a duplicate registration.
+
+Authenticated local-control protocol v24 exposes every workspace already
+observed in the Codex ID token as a typed `target_coverage.targets` row. Each
+row has a daemon-authored opaque target id, hashed account/workspace identity,
+the provider-supplied workspace title, durability and health, and explicit
+setup blockers. A membership without both hashes remains visible as
+`identity_unconfirmed`; it is never silently omitted or accepted for setup.
+Clients pass the opaque id back through `codex_account_prepare_target` and do
+not send identity hashes selected or reconstructed from UI state.
+
+OpenAI has two unrelated workspace namespaces, and only one of them carries
+subscriptions. `platform.openai.com` organizations govern API keys and are what
+the ID token's `organizations[]` claim lists. `chatgpt.com` workspaces carry
+ChatGPT and Codex subscriptions, and the signed-in one is `chatgpt_account_id`.
+The id spaces differ even where the names match: a target built from an
+`organizations[].id` is rejected with `identity_mismatch` when the same-named
+ChatGPT workspace is signed into, and a platform organization can be absent from
+the ChatGPT workspace picker entirely.
+
+Because of that split, a platform organization never witnesses a subscription.
+It contributes workspace-target evidence and nothing else: no plan observation,
+no plan name, no billing channel. One carrying a plan title used to be uploaded
+as a subscription-bearing observation with no account identifier attached, which
+materialized into a separate priced subscription row keyed on the account label
+- a plan the operator does not hold, added to their monthly total. The signed-in
+workspace's real plan still arrives through the app-server probe, which reads
+the subscription instead of inferring it from a title.
+
+Adding one of those unnameable workspaces is `codex_account_prepare_open`
+(protocol v23). It reserves a Codex home, the owner picks any workspace in the
+provider's own picker, and the daemon adopts whatever comes back. The slot is
+deliberately not registered at reserve time: a registered slot must carry a
+strong binding, and a placeholder would make an unfinished sign-in look like a
+connection. It registers on adoption, still refuses a workspace that already has
+a durable connection, and releases its reservation if the setup is abandoned or
+refused - so an abandoned sign-in never consumes capacity.
+
+Target coverage therefore describes only workspaces the daemon can prove: the
+signed-in one, and any already-connected durable ones. Other ChatGPT workspaces
+are **not enumerable** — the ID token names only the signed-in workspace, and
+`account/read` returns type, email, and plan with no workspace list. Connecting a
+different workspace is an unbound flow whose selection is made in the provider's
+own picker, not a pick from a list this daemon invented.
+
+The default organization's TITLE is still used to name the signed-in workspace,
+and its hash is aliased onto the binding so one workspace does not render twice.
+That is naming only; the binding hash remains the identity.
+
+One workspace is named two ways by the provider: a credential is bound by
+`chatgpt_account_id`, which is what a durable slot registers, while the same
+credential's ID token lists `organizations[].id`. Those are different identifier
+spaces, so the organization flagged `is_default` - the one the credential is
+actually signed into - is aliased onto the binding identity before targets are
+assembled. Without that alias the current login and every durable connection
+appear twice, and the duplicate offers to connect a subscription that is already
+connected. Aliases are collected across all candidates, so a workspace seen as
+non-default on one credential still collapses onto the slot that connected it.
+
+`account_label` carries the signed-in email from the ID token, and
+`subscription_product` the plan the provider claims, in the same `chatgpt_pro`
+vocabulary the rest of the status uses, so two connected Codex accounts are
+distinguishable on screen. A plan is attached only where it is actually claimed:
+`chatgpt_plan_type` describes the workspace its credential is signed into, and
+an organization that names its own plan keeps that one. A workspace merely
+observed in the token has no plan of its own and is left blank rather than
+inheriting a sibling's. It is the only raw provider string
+in this payload: `codex_accounts_status` answers the local Unix socket only and
+is never uploaded, and raw account ids, workspace ids, and token material stay
+absent. Credentials that claim no email fall back to a generic label.
+
+A strongly bound identity also carries `superseded_account_identifier_hash` and
+`superseded_organization_identifier_hash`: what this same account and workspace
+hashed to before the derivation changed. The account was keyed on
+`chatgpt_account_id` rather than the user id, and the organization on
+`organizations[].id` under the `organization` kind rather than the workspace id
+under `workspace`. Old and new digests conflict on every field, so a server
+holding the old ones sees an unrelated account and prices it as a second
+subscription. Only this collector holds the raw values, so only it can assert
+the equivalence; the superseded organization comes from the `is_default`
+membership alone, because that is the one the credential is signed into. A
+consumer may use the pair to recognize a stored identity as this one and adopt
+the current hashes. It must never treat them as a second account, and it must
+never merge on a non-default membership.
+
+`hasCredits: false` states that the credits program does not apply to an
+account, not that a balance ran out. The `balance: "0"` the provider sends
+alongside it is filler, so no credit row is emitted for that case; a positive
+balance, an `unlimited` grant, and a reached spend control are all still shown.
+
+## Connecting another subscription
+
+Authenticated local control creates one opaque, owner-only Codex home and
+returns an exact launch command for the official `codex login` flow. The user
+completes OpenAI's browser login and workspace selection; Ottto never receives
+or types an email, password, MFA code, cookie, access token, or refresh token.
+
+Warning: `codex login` revokes and deletes the existing login of the home it
+runs in (`CODEX_HOME`, by default `~/.codex`) before the browser opens, even if
+the sign-in is then cancelled. Never run a plain `codex login`; use the launch
+command, which always names an Ottto-managed home.
+
+So a sign-in for a named account and workspace (prepare, prepare-target,
+reconnect, or a sign-in again after a mismatch) runs in a fresh staging home
+next to that connection's home, and the launch command names the staging home.
+Setup checks read the staging home. Once the final check passes, only the
+`auth.json` it read (with the verified `config.toml`) is published into the
+connection's home, and then the acceptance is saved; a login replaced after the
+check is refused. A stopped, timed-out, failed, duplicate or mismatched sign-in
+deletes the staging home and leaves the connection's existing login and
+identity as they were. A new connection ("connect another workspace") signs in
+in its own new, empty home.
+
+While the provider-owned browser flow is open, Companion polls a nonterminal
+setup check. An incomplete sign-in stays `waiting_for_user_login`; it is not
+converted into a failed connection. As soon as the provider exposes complete
+identity and fresh quota, the same check advances automatically and accepts the
+connection only when all of these are true:
+
+- the signed-in ChatGPT user hash matches the selected target;
+- the active ChatGPT workspace hash matches the selected target;
+- Codex App Server returns fresh quota for that exact home;
+- another accepted durable connection does not own the same composite; and
+- after Ottto writes Codex's supported `forced_chatgpt_workspace_id`
+  restriction, a new App Server process reports the same identity and quota.
+
+An incorrect account or workspace remains unaccepted and can be retried in the
+same setup, in a fresh staging home. An accepted binding cannot be prepared
+again. Removing an Ottto-managed connection
+permanently deletes only that daemon-created credential home; recovery requires
+a fresh provider login. The default Codex home is never a deletion target.
+
+The default connection plus up to nine durable connections can coexist. Every
+directory and settings file is owner-only. Settings persist only opaque slot
+ids and hashed account/workspace bindings; the raw workspace id is written only
+to that slot's local Codex config because Codex requires it for the workspace
+restriction.
+
+## Quota collection and failure isolation
+
+Each collection pass probes the default and durable homes independently using
+the installed Codex binary with exact per-slot `CODEX_HOME` and
+`CODEX_SQLITE_HOME` values, a cleared environment, and no ambient provider API
+keys. Every home, default and durable, reads quota only from the local Codex
+App Server; there is no HTTP fallback. Collection uses the documented
+`account/rateLimits/read` method and treats its `rateLimits` field as the
+effective subscription snapshot. `rateLimitsByLimitId` is retained only as a
+compatibility fallback when no usable effective snapshot is present, because
+current app-server versions may include inactive model/internal pools in that
+map. Every emitted window key combines its limit id, field, reported duration,
+and reset availability; unknown durations remain unique and no bucket meaning
+is inferred from position.
+
+Homes are probed concurrently under the ten-slot cap, so one provider timeout
+does not serialize or suppress healthy siblings. One backend-safe snapshot is
+emitted for each distinct strong user/workspace composite. Every quota window
+and credit balance carries the same hashed composite as its account record.
+Raw ids, token material, provider responses, credential paths, and local slot
+ids are not uploaded.
+
+Canonicalization follows these rules:
+
+- a healthy durable connection wins an exact tie with the default connection;
+- the matching default is locally marked `shadowed_by_anchor`;
+- two workspaces under one user remain separate subscriptions;
+- a second durable connection for the same composite is locally actionable as
+  `duplicate_account`; and
+- a signed-out, mismatched, or unavailable sibling degrades source health but
+  does not remove healthy subscription snapshots.
+
+Codex owns OAuth token persistence and refresh. Ottto does not refresh tokens
+directly and does not promise that a provider-revoked login will remain valid.
+When Codex reports that a durable home needs login, the app should offer the
+same provider-owned reconnect flow for that exact home.
+
+## Background limit refresh
+
+The daemon reads each Codex home's limits on its own schedule (every 5 minutes
+for a home in use on this Mac, every 30 minutes otherwise, and once a day for a
+second home signed into the same login) and every status read serves the saved
+reading. A saved reading older than 60 minutes is shown stale; the account slot
+then shows its limits as unavailable and is not used to start a session until it
+is read again. Each scheduled read is one `codex app-server` run, which also lets
+Codex renew that home's sign-in. The scheduler sleeps until the next home is
+due, and at most a minute, whether or not any app is in front, so a login
+switched outside the daemon is read within a minute (and at least a minute
+after that home's previous read). Between wakes it reuses what it derived from
+the settings, credential and saved files while they are unchanged.
+
+"Background limit refresh" turns these scheduled reads off for every Codex home
+on this Mac at once, the default home included. It is on until the owner
+chooses; nothing changes for anyone who never touches it. The setting is stored
+in the Codex account settings (`background_quota_refresh_consent` and
+`background_quota_refresh_consent_chosen`); an older daemon ignores both, and a
+downgrade that rewrites the file returns the setting to on. A settings file the
+daemon cannot read counts as off.
+
+While it is off:
+
+- the scheduler reads no home: no `codex app-server` run, no running-process
+  scan, and no once-a-day same-login read. The setting is read on every
+  scheduler wake and checked again under the settings lock right before each
+  read; switching it back on wakes the scheduler at once;
+- a person's **Refresh limits**, setup and sign-in checks still read;
+- saved readings are still served and age as usual: shown stale after 60
+  minutes (the account slot then shows as unavailable and starts no session),
+  and not shown past the last-known cap;
+- a home with no usable saved reading reports
+  `codex_quota_background_refresh_off` instead of `codex_quota_not_read_yet`;
+- an idle home is not renewed, so after a long idle period its next read may
+  ask to sign in again.
+
+Nothing new is read, stored or uploaded; the switch only removes reads. The
+accounts status carries the setting as `background_quota_refresh`
+(`granted` or `consent_required`); its presence means the daemon supports the
+switch. A client sets it with `codex_account_set_quota_refresh_consent`
+(`schema_version`, `consent`) at protocol version 27; older daemons reject that
+command.
+
+## Product language
+
+The shared Claude Code and Codex action should be phrased as **Keep limits
+available**. The supporting text explains that it adds a durable connection
+without changing the account currently used for new sessions. Provider names
+remain visible in the flow, but both providers use the same concepts: default
+connection, exact account/workspace target, provider-owned sign-in, identity
+validation, duplicate rejection, independent health, and explicit removal.
+
+This feature is for subscriptions the user is authorized to use. It does not
+pool entitlements, bypass provider limits, automate account rotation, share
+credentials with another person, scrape browser state, or call undocumented
+ChatGPT endpoints. Ottto reports each provider-owned quota independently and
+the provider remains the authority for subscription and acceptable-use rules.

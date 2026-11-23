@@ -1,0 +1,250 @@
+{
+  "schema_version": 6,
+  "source": "claude_code",
+  "machine_id": "machine-session-identity-w0",
+  "collector_version": "local-enriched/1",
+  "entity_ack_contract": "snapshot_entity_ack:v1",
+  "snapshots": [
+    {
+      "session_account_evidence": {
+        "provider": "anthropic",
+        "identity_hash_scheme": "provider-sha256:v1",
+        "evidence_source": "claude_desktop_original:v1",
+        "identity_disposition": "missing"
+      },
+      "source_session_id": "w0-pending",
+      "snapshot_fingerprint": "b7b027143dba8d1748666e8656f34afb312de84276a0b06b5f06ba886061643e",
+      "status": "final",
+      "input_tokens": 350,
+      "output_tokens": 35,
+      "cache_read_tokens": 0,
+      "cache_creation_5m_tokens": 0,
+      "cache_creation_1h_tokens": 0,
+      "reasoning_output_tokens": 0,
+      "request_count": 4,
+      "peak_context_fill_tokens": 100,
+      "first_turn_context_tokens": 100,
+      "last_turn_context_tokens": 100,
+      "compaction_count": 0,
+      "context_curve": {
+        "contract_version": "session_context_curve:v1",
+        "parser_revision": "claude_code_jsonl:v37",
+        "ownership_revision": "claude_owned_request_start_proof:v2",
+        "sampling_revision": "deterministic_even_gap:v1",
+        "coverage": "ownership_unresolved",
+        "total_owned_request_count": 0,
+        "retained_point_count": 0,
+        "total_compaction_boundary_count": 0,
+        "retained_boundary_count": 0,
+        "points": [],
+        "boundaries": [],
+        "model_windows": []
+      },
+      "activity_summary": {
+        "capability_collection_version": "agent_capability_usage:v1",
+        "tool_calls": 0,
+        "shell_commands": 0,
+        "patch_operations": 0,
+        "changed_files": 0,
+        "lines_added": 0,
+        "lines_deleted": 0,
+        "web_searches": 0,
+        "mcp_calls": 0,
+        "subagent_spawns": 0
+      },
+      "tool_usage": [],
+      "model_usage": [
+        {
+          "model": "claude-haiku-4-5",
+          "input_tokens": 350,
+          "output_tokens": 35,
+          "cache_read_tokens": 0,
+          "cache_creation_5m_tokens": 0,
+          "cache_creation_1h_tokens": 0,
+          "reasoning_output_tokens": 0,
+          "request_count": 4,
+          "selector_context": {
+            "context_bucket": "short"
+          },
+          "selector_sources": {
+            "context_bucket": "derived_from_effective_input_volume"
+          },
+          "gateway_provider": "anthropic",
+          "model_provider": "anthropic",
+          "cost_usd": "3.50",
+          "identity_parts": [
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 0,
+              "input_tokens": 300,
+              "output_tokens": 30,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 3,
+              "cost_usd": "3.00"
+            },
+            {
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 1,
+              "input_tokens": 50,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "unattributed_total_tokens": 0,
+              "request_count": 1,
+              "cost_usd": "0.50"
+            }
+          ]
+        }
+      ],
+      "usage_buckets": [
+        {
+          "bucket_start": "2026-09-01T10:00:00Z",
+          "model_usage": [
+            {
+              "model": "claude-haiku-4-5",
+              "input_tokens": 100,
+              "output_tokens": 10,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "selector_context": {
+                "context_bucket": "short"
+              },
+              "selector_sources": {
+                "context_bucket": "derived_from_effective_input_volume"
+              },
+              "gateway_provider": "anthropic",
+              "model_provider": "anthropic",
+              "cost_usd": "1.00",
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 0
+            }
+          ],
+          "first_activity_at": "2026-09-01T10:00:04Z",
+          "last_activity_at": "2026-09-01T10:00:50Z"
+        },
+        {
+          "bucket_start": "2026-09-01T11:00:00Z",
+          "model_usage": [
+            {
+              "model": "claude-haiku-4-5",
+              "input_tokens": 200,
+              "output_tokens": 20,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "request_count": 2,
+              "selector_context": {
+                "context_bucket": "short"
+              },
+              "selector_sources": {
+                "context_bucket": "derived_from_effective_input_volume"
+              },
+              "gateway_provider": "anthropic",
+              "model_provider": "anthropic",
+              "cost_usd": "2.00",
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 0
+            }
+          ],
+          "first_activity_at": "2026-09-01T11:00:04Z",
+          "last_activity_at": "2026-09-01T11:00:50Z"
+        },
+        {
+          "bucket_start": "2026-09-01T12:00:00Z",
+          "model_usage": [
+            {
+              "model": "claude-haiku-4-5",
+              "input_tokens": 50,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "selector_context": {
+                "context_bucket": "short"
+              },
+              "selector_sources": {
+                "context_bucket": "derived_from_effective_input_volume"
+              },
+              "gateway_provider": "anthropic",
+              "model_provider": "anthropic",
+              "cost_usd": "0.50",
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 1
+            }
+          ],
+          "first_activity_at": "2026-09-01T12:00:04Z",
+          "last_activity_at": "2026-09-01T12:00:50Z"
+        }
+      ],
+      "cost": {
+        "total_cost_usd": "3.50",
+        "evidence_source": "synthetic_reported"
+      },
+      "session_display_name": null,
+      "session_display_name_source": null,
+      "source_started_at": "2026-09-01T10:00:04Z",
+      "source_ended_at": null,
+      "source_last_activity_at": "2026-09-01T12:00:50Z",
+      "collected_at": "2026-09-01T12:05:50Z",
+      "workspace_hash": null,
+      "source_file_fingerprint": "f52bdbd38d5d1500fbe2b0a1948b1e8c12fbb6b9f6629248809b8351c2d5617e",
+      "provenance": {
+        "collector": "claude_code_jsonl:own_request_identity_rows:v1",
+        "source_file_count": 1,
+        "input_token_scope": "uncached"
+      },
+      "origin": {
+        "entrypoint": "cli",
+        "is_sidechain": false,
+        "used_workflow_orchestration": false
+      },
+      "attribution_facts": [],
+      "request_evidence": [
+        {
+          "identity_basis": "telemetry",
+          "provider_workspace_hash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+        },
+        {
+          "identity_basis": "transcript_email",
+          "provider_workspace_hash": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+        }
+      ],
+      "semantic_envelope": {
+        "component_contract_version": "snapshot_semantic:v1",
+        "revision_contract_version": "snapshot_revision:v1",
+        "upload_policy": {
+          "session_titles_enabled": true,
+          "workspace_labels_enabled": true,
+          "session_artifacts_enabled": false,
+          "session_attribution_enabled": false,
+          "session_attribution_labels_enabled": false
+        },
+        "component_hashes": {
+          "activity_summary": "348307e04856d6c750d45c50ceda5974e7f256ad6111c437f459b1a3345ef97f",
+          "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+          "attribution": "1ca505a581f00cbb9f431f7637dfaaa524491b0cfe6a4f3eab24ecaa29e941de",
+          "context_posture": "0753cf7f13925f184d21bc9a005629d1fee4db3b556470a388706623afd0db0b",
+          "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+          "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+          "lifecycle_activity": "407f9863c33b5261754f2636231f4b735d7e0a6542d7799817d40867838f9248",
+          "usage_accounting": "5f5b3878800e440f8dc8a265289b9faadfcf1616b52db5101265da052cd60cdb"
+        },
+        "revision_hash": "5002754d40af983bc2ea328ded9e3c1edc8a6515e9359d1d38125d5ac6bbeb25",
+        "content_hash": "c4f1a37385ba3c480b647fb3649f570716470fde86414254d1432da6cb0e8760",
+        "hash_epoch": 1
+      }
+    }
+  ]
+}

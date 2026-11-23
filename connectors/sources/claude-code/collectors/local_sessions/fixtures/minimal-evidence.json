@@ -1,0 +1,73 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "claude_code",
+  "collector_id": "local_sessions",
+  "input_fixture_paths": [
+    "../../../fixtures/local_sessions/minimal-session.jsonl"
+  ],
+  "emitted_records": [
+    {
+      "record_type": "local_usage_snapshots",
+      "sample": {
+        "source_id": "claude_code",
+        "session_hash": "claude_fixture_session_hash",
+        "workspace_hash": "workspace_sha256_fixture",
+        "started_at": "2026-05-20T08:05:00Z",
+        "input_tokens": 900,
+        "cache_read_input_tokens": 250,
+        "cache_creation_ephemeral_5m_input_tokens": 80,
+        "cache_creation_ephemeral_1h_input_tokens": 20,
+        "output_tokens": 180,
+        "selector_context": {
+          "speed": "standard"
+        }
+      }
+    },
+    {
+      "record_type": "local_usage_session_titles",
+      "sample": {
+        "source_id": "claude_code",
+        "session_hash": "claude_fixture_session_hash",
+        "session_display_name": "Fixture session",
+        "session_display_name_source": "summary",
+        "metadata_policy": "organization_and_user_enabled"
+      }
+    },
+    {
+      "record_type": "local_usage_workspace_labels",
+      "sample": {
+        "source_id": "claude_code",
+        "workspace_hash": "workspace_sha256_fixture",
+        "workspace_display_label": "Fixture workspace",
+        "workspace_label_source": "user_approved",
+        "metadata_policy": "organization_and_user_enabled"
+      }
+    },
+    {
+      "record_type": "local_usage_collector_statuses",
+      "sample": {
+        "source_id": "claude_code",
+        "collector_id": "local_sessions",
+        "status": "ok",
+        "last_collected_at": "2026-05-20T08:06:00Z",
+        "records_emitted": 1
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Aggregate project usage, selector metadata, hashed workspace/session identifiers, and collector health only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

@@ -1,0 +1,498 @@
+name: macOS Stable Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable or stable-candidate version to build.
+        required: true
+        type: string
+      channel:
+        description: Release channel to package.
+        required: true
+        type: choice
+        options:
+          - stable-candidate
+          - stable
+      artifact_base_url:
+        description: Immutable HTTPS release prefix for workflow artifacts.
+        required: true
+        type: string
+      release_notes:
+        description: User-facing What's new text for the manifest and Sparkle appcast.
+        required: true
+        type: string
+      publish_intent:
+        description: Public workflow output only; CDN publication is manual and private.
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+      release_mode:
+        description: Standard release, or an explicitly approved manual-only stable without QA/Sparkle publication.
+        required: true
+        default: standard
+        type: choice
+        options:
+          - standard
+          - manual-no-sparkle
+      operator_approval:
+        description: Required approval phrase for manual-no-sparkle releases.
+        required: false
+        default: ""
+        type: string
+      github_release_mirror:
+        description: Mirror the stable build to a public GitHub Release for verification only. Never touches the CDN or channel promotion.
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: macos-stable-release-${{ github.ref }}-${{ inputs.channel }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  # contents: write is required only so the optional, input-gated GitHub Release
+  # verification mirror can publish a release for the existing tag. It never
+  # publishes to the CDN or promotes a channel; the CDN remains the install/update
+  # source of truth.
+  contents: write
+  # Read the Public CI run and jobs that tested the tagged commit.
+  actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build-sign-notarize:
+    name: Build, sign, notarize, attest
+    environment: macos-stable-release
+    timeout-minutes: 180
+    # After AWS EC2 Mac migration, set OTTTO_MACOS_STABLE_RUNNER_LABELS to
+    # ["self-hosted","macOS","ottto-signing-mac","ottto-cloud-mac"].
+    runs-on: ${{ fromJSON(vars.OTTTO_MACOS_STABLE_RUNNER_LABELS || '["self-hosted","macOS","ottto-signing-mac","ottto-release-bootstrap"]') }}
+    env:
+      OTTTO_MACOS_CODESIGN_IDENTITY: ${{ secrets.OTTTO_MACOS_CODESIGN_IDENTITY }}
+      OTTTO_NOTARY_PROFILE: ${{ secrets.OTTTO_NOTARY_PROFILE }}
+      OTTTO_NOTARY_WAIT_TIMEOUT: ${{ vars.OTTTO_NOTARY_WAIT_TIMEOUT || '30m' }}
+      OTTTO_RELEASE_REPOSITORY: ${{ github.repository }}
+      OTTTO_MACOS_APP_SOURCE_REPOSITORY: ${{ secrets.OTTTO_MACOS_APP_SOURCE_REPOSITORY }}
+      OTTTO_RELEASE_SIGNER_WORKFLOW: .github/workflows/macos-stable-release.yml
+      OTTTO_RELEASE_SOURCE_REF: ${{ github.ref }}
+      OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
+      OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          persist-credentials: false
+          # Full history for the first-parent check on main.
+          fetch-depth: 0
+
+      - name: Enforce dispatch policy
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          PUBLISH_INTENT: ${{ inputs.publish_intent }}
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          OPERATOR_APPROVAL: ${{ inputs.operator_approval }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "macOS stable releases are workflow_dispatch only." >&2
+            exit 1
+          fi
+          if [[ ! "$OTTTO_MACOS_APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY must be configured in owner/name form." >&2
+            exit 1
+          fi
+          # Releases build only from a v<X.Y.Z> release tag; any other ref fails.
+          if [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "macOS stable releases must run from a v<X.Y.Z> release tag, not $GITHUB_REF." >&2
+            exit 1
+          fi
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          # Reject any version that is not formula/installer-safe before it can
+          # reach a run: block. Uses the SAME bash `[[ =~ ]]` construct as the
+          # downstream scripts/homebrew_formula.sh and
+          # scripts/hosted_native_installer.sh so the accepted set is byte
+          # identical — unlike a line-oriented `grep`, the bash regex anchors the
+          # whole string and so also rejects multiline `inputs.version` values.
+          # Validation tests the env-bound shell variable "$VERSION", never the
+          # raw input expression, so the check is not itself injectable.
+          if [[ ! "$VERSION" =~ ^[0-9]+([.][0-9]+){1,3}([_+.-][A-Za-z0-9]+)?$ ]]; then
+            echo "Invalid version input: $VERSION" >&2
+            exit 1
+          fi
+          if [[ "$PUBLISH_INTENT" != "none" ]]; then
+            echo "The public workflow never publishes or promotes release channels." >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_MODE" == "manual-no-sparkle" ]]; then
+            if [[ "$CHANNEL" != "stable" ]]; then
+              echo "manual-no-sparkle is valid only for a stable release." >&2
+              exit 1
+            fi
+            if [[ "$OPERATOR_APPROVAL" != "RON_APPROVED_FASTLANE_MANUAL_STABLE" ]]; then
+              echo "manual-no-sparkle requires the exact operator approval phrase." >&2
+              exit 1
+            fi
+          elif [[ "$RELEASE_MODE" != "standard" ]]; then
+            echo "Unsupported release_mode: $RELEASE_MODE" >&2
+            exit 1
+          fi
+          if [[ -z "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+            echo "release_notes is required for macOS stable release artifacts." >&2
+            exit 1
+          fi
+          # Literal string compares, so the dots in the tag are not regex wildcards.
+          case "$CHANNEL" in
+            stable)
+              if [[ "$VERSION" != "$tag_version" ]]; then
+                echo "Stable version $VERSION does not match tag v$tag_version." >&2
+                exit 1
+              fi
+              ;;
+            stable-candidate)
+              if [[ "$VERSION" != "$tag_version"-rc* || ! "${VERSION#"$tag_version"-rc}" =~ ^[0-9]+$ ]]; then
+                echo "Stable-candidate version $VERSION must be $tag_version-rc<N> for tag v$tag_version." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported release channel: $CHANNEL" >&2
+              exit 1
+              ;;
+          esac
+          case "$ARTIFACT_BASE_URL" in
+            https://*)
+              if [[ "$ARTIFACT_BASE_URL" == *"/latest"* ]]; then
+                echo "artifact_base_url must be an immutable versioned prefix." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "artifact_base_url must use HTTPS." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/macos_release_source_check.sh release
+
+      - name: Check signing runner readiness
+        run: |
+          set -euo pipefail
+          for command in jq shasum swift cargo ditto hdiutil plutil codesign spctl xcrun gh security; do
+            command -v "$command" >/dev/null 2>&1 || {
+              echo "Required command not found: $command" >&2
+              exit 2
+            }
+          done
+          test -n "$OTTTO_MACOS_CODESIGN_IDENTITY" || {
+            echo "OTTTO_MACOS_CODESIGN_IDENTITY is required." >&2
+            exit 2
+          }
+          test -n "$OTTTO_NOTARY_PROFILE" || {
+            echo "OTTTO_NOTARY_PROFILE is required." >&2
+            exit 2
+          }
+          security find-identity -v -p codesigning | grep -F "$OTTTO_MACOS_CODESIGN_IDENTITY" >/dev/null
+          xcrun notarytool history --keychain-profile "$OTTTO_NOTARY_PROFILE" >/dev/null
+
+      - name: Package signed macOS artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          scripts/macos_package.sh \
+            --app-root "${OTTTO_MACOS_APP_ROOT:?}" \
+            --app-source-commit "$OTTTO_MACOS_APP_SOURCE_COMMIT" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --artifact-base-url "$ARTIFACT_BASE_URL" \
+            --release-notes "$RELEASE_NOTES"
+
+      - name: Notarize and staple artifacts
+        run: |
+          set -euo pipefail
+          scripts/macos_notarize.sh \
+            --manifest dist/macos/release-manifest.json \
+            --keychain-profile "$OTTTO_NOTARY_PROFILE" \
+            --timeout "$OTTTO_NOTARY_WAIT_TIMEOUT"
+
+      - name: Record manual release waiver
+        if: inputs.channel == 'stable' && inputs.release_mode == 'manual-no-sparkle'
+        run: |
+          set -euo pipefail
+          checked_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          jq \
+            --arg checked_at "$checked_at" \
+            '.release_mode = "manual-no-sparkle"
+             | .quality_gates.stable_candidate_rc = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator-approved manual release lane"
+               }
+             | .quality_gates.stable_clean_machine_qa = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator explicitly waived QA for this manual release"
+               }
+             | .quality_gates.sparkle_appcast = {
+                 status: "disabled",
+                 checked_at: $checked_at,
+                 reason: "Existing Sparkle private key unavailable on the release host"
+               }
+             | .quality_gates.artifact_attestations = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator-approved manual release; signed and notarized artifacts remain required"
+               }' \
+            dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
+          mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
+
+      - name: Bind stable-candidate RC evidence
+        if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
+        run: |
+          set -euo pipefail
+          test -n "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
+            echo "OTTTO_STABLE_CANDIDATE_RC_EVIDENCE must point to redacted stable-candidate RC evidence for stable releases." >&2
+            exit 1
+          }
+          test -f "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
+            echo "Stable-candidate RC evidence file does not exist: $OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" >&2
+            exit 1
+          }
+          cp "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" dist/macos/stable-candidate-rc-qa.json
+          candidate_sha="$(jq -r '.candidate_manifest.sha256 // empty' dist/macos/stable-candidate-rc-qa.json)"
+          if [[ ! "$candidate_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Stable-candidate RC evidence is missing candidate_manifest.sha256." >&2
+            exit 1
+          fi
+          # The template's unfilled placeholder is not a supplied sampler scorecard.
+          if jq -e '.resource_scorecard != null and .resource_scorecard != {
+            schema_version: 1, policy: "resource-stage1-v1", status: "not_run"
+          }' dist/macos/stable-candidate-rc-qa.json > /dev/null; then
+            python3 scripts/resource_scorecard.py dist/macos/stable-candidate-rc-qa.json > /dev/null
+          else
+            echo "resource scorecard: absent"
+          fi
+          jq -e --slurpfile evidence dist/macos/stable-candidate-rc-qa.json \
+            '.commit == $evidence[0].candidate_manifest.commit' dist/macos/release-manifest.json > /dev/null
+          jq \
+            --arg evidence_path "stable-candidate-rc-qa.json" \
+            --arg candidate_sha "$candidate_sha" \
+            --arg checked_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            '.quality_gates.stable_candidate_rc = {
+              status: "passed",
+              checked_at: $checked_at,
+              evidence_path: $evidence_path,
+              candidate_manifest_sha256: $candidate_sha
+            }' \
+            dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
+          mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
+
+      - name: Generate stable install artifacts
+        if: inputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          scripts/homebrew_formula.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/homebrew/ottto.rb
+          scripts/hosted_native_installer.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/install-macos.sh \
+            --record-sha256
+
+      - name: Generate attestation subject checksums
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist/macos
+            subjects=(
+              Ottto-macos-*.dmg
+              ottto-macos-*.zip
+              ottto-service-macos-*.zip
+              ottto-local-platform-sbom.cdx.json
+              release-manifest.json
+            )
+            if [[ "$CHANNEL" == "stable" ]]; then
+              subjects+=(install-macos.sh)
+            fi
+            shasum -a 256 "${subjects[@]}" > subject.checksums.txt
+          )
+
+      - name: Create provenance attestation
+        if: inputs.release_mode == 'standard'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+
+      - name: Create SBOM attestation
+        if: inputs.release_mode == 'standard'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+
+      - name: Bind verified attestation metadata
+        if: inputs.release_mode == 'standard'
+        run: |
+          set -euo pipefail
+          scripts/macos_attestation_bind.sh \
+            --manifest dist/macos/release-manifest.json \
+            --subject-checksums dist/macos/subject.checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow .github/workflows/macos-stable-release.yml
+
+      - name: Regenerate checksums for bound manifest
+        if: inputs.release_mode == 'standard'
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist/macos
+            subjects=(
+              Ottto-macos-*.dmg
+              ottto-macos-*.zip
+              ottto-service-macos-*.zip
+              ottto-local-platform-sbom.cdx.json
+              release-manifest.json
+            )
+            if [[ "$CHANNEL" == "stable" ]]; then
+              subjects+=(install-macos.sh)
+            fi
+            shasum -a 256 "${subjects[@]}" > subject.checksums.txt
+          )
+
+      - name: Create final provenance attestation
+        if: inputs.release_mode == 'standard'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+
+      - name: Create final SBOM attestation
+        if: inputs.release_mode == 'standard'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+
+      - name: Verify final attestations and manifest binding
+        if: inputs.release_mode == 'standard'
+        run: |
+          set -euo pipefail
+          scripts/macos_attestation_bind.sh \
+            --manifest dist/macos/release-manifest.json \
+            --subject-checksums dist/macos/subject.checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow .github/workflows/macos-stable-release.yml
+          scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
+
+      - name: Sign and verify release manifest
+        if: inputs.release_mode == 'standard'
+        run: |
+          set -euo pipefail
+          scripts/macos_manifest_signature.sh sign \
+            --manifest dist/macos/release-manifest.json \
+            --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"
+          scripts/macos_manifest_signature.sh verify \
+            --manifest dist/macos/release-manifest.json
+
+      - name: Sign and verify release manifest from manual keychain
+        if: inputs.release_mode == 'manual-no-sparkle'
+        run: |
+          set -euo pipefail
+          test -n "$OTTTO_MANUAL_SIGNING_KEYCHAIN" || {
+            echo "OTTTO_MANUAL_SIGNING_KEYCHAIN is required for a manual release." >&2
+            exit 2
+          }
+          test -f "$OTTTO_MANUAL_SIGNING_KEYCHAIN" || {
+            echo "Manual signing keychain does not exist." >&2
+            exit 2
+          }
+          scripts/macos_manifest_signature.sh sign \
+            --manifest dist/macos/release-manifest.json \
+            --identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
+            --keychain "$OTTTO_MANUAL_SIGNING_KEYCHAIN"
+          scripts/macos_manifest_signature.sh verify \
+            --manifest dist/macos/release-manifest.json \
+            --identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
+            --keychain "$OTTTO_MANUAL_SIGNING_KEYCHAIN"
+
+      - name: Run stable preflight
+        if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
+        run: |
+          set -euo pipefail
+          scripts/macos_stable_preflight.sh \
+            --manifest dist/macos/release-manifest.json \
+            --require-installer-sha256 \
+            --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
+            --keychain-profile "$OTTTO_NOTARY_PROFILE"
+
+      - name: Upload release workflow artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}
+          if-no-files-found: error
+          # These are manual-download build outputs only; CDN publication is separate
+          # and manual, so artifacts need only a short window to be fetched. Keep stable
+          # builds long enough for the operator to publish; expire throwaway candidates fast.
+          # Prevents the org's 0.5 GB free Actions/Packages storage from filling up.
+          retention-days: ${{ inputs.channel == 'stable' && 7 || 1 }}
+          path: |
+            dist/macos/Ottto-macos-*.dmg
+            dist/macos/ottto-macos-*.zip
+            dist/macos/ottto-service-macos-*.zip
+            dist/macos/ottto-local-platform-sbom.cdx.json
+            dist/macos/packaged-app-launch-smoke.json
+            dist/macos/stable-candidate-rc-qa.json
+            dist/macos/release-manifest.json
+            dist/macos/release-manifest.json.sig
+            dist/macos/subject.checksums.txt
+            dist/macos/install-macos.sh
+            dist/macos/homebrew/ottto.rb
+
+      - name: Mirror stable build to GitHub Release (verification only)
+        if: inputs.channel == 'stable' && inputs.github_release_mirror == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          tag="${GITHUB_REF#refs/tags/}"
+          # Verification mirror only: the CDN at install.ottto.net stays the install and
+          # update source of truth. This step never promotes a channel pointer or writes
+          # to the CDN; it only publishes signed verification assets to a GitHub Release.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists; refusing to overwrite a published release." >&2
+            exit 1
+          fi
+          # Publish a release for the existing release tag only; never create a tag.
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Ottto ${version}" \
+            --notes "Public verification mirror for Ottto ${version}. Install and update source of truth is the CDN; these assets exist for signature and checksum verification only." \
+            dist/macos/Ottto-macos-*.dmg \
+            dist/macos/ottto-macos-*.zip \
+            dist/macos/ottto-service-macos-*.zip \
+            dist/macos/ottto-local-platform-sbom.cdx.json \
+            dist/macos/release-manifest.json \
+            dist/macos/release-manifest.json.sig \
+            dist/macos/subject.checksums.txt

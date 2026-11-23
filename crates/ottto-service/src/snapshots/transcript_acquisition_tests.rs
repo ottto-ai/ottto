@@ -1,0 +1,2548 @@
+//! Offline shared-reader, native-reducer and production-scanner regression tests.
+//! No fixture content comes from a provider account.
+use super::*;
+use crate::transcript_acquisition::{ReadMode, Scope};
+use crate::transcript_cache::Retained;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+const NOW: &str = "2026-10-07T12:00:00Z";
+static NEXT: AtomicU64 = AtomicU64::new(0);
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new(source: SnapshotSource) -> Self {
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path("ottto-native-tail").with_extension("jsonl");
+        let value = match source {
+            SnapshotSource::Codex => {
+                json!({"type":"session_meta","payload":{"id":"native-tail-fixture"}})
+            }
+            SnapshotSource::ClaudeCode => {
+                json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}})
+            }
+            SnapshotSource::Pi => json!({"type":"session", "version":3,
+                "id":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z",
+                "cwd":"/synthetic/pi"}),
+        };
+        let fixture = Self(path);
+        fixture.append(&value);
+        fixture
+    }
+    fn append(&self, value: &Value) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.0)
+            .unwrap();
+        serde_json::to_writer(&mut file, value).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+pub(super) fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
+    let timestamp = format!("2026-10-07T{:02}:00:00Z", 10 + id % 3);
+    match source {
+        SnapshotSource::Codex => json!({"type":"event_msg", "timestamp":timestamp,
+            "payload":{"type":"token_count", "info":{"model":model,
+            "total_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10},
+            "last_token_usage":{"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10}}}}),
+        SnapshotSource::ClaudeCode => {
+            json!({"type":"assistant", "sessionId":"native-tail-fixture", "timestamp":timestamp,
+            "requestId":format!("req-{id}"), "message":{"id":format!("response-{id}"), "model":model,
+            "usage":{"input_tokens":n,"cache_read_input_tokens":n/2,"output_tokens":n/10}}})
+        }
+        SnapshotSource::Pi => json!({"type":"message", "timestamp":timestamp,
+            "message":{"role":"assistant", "responseId":format!("response-{id}"),
+            "model":model, "timestamp":timestamp,
+            "usage":{"input":n,"output":n/10,"cacheRead":n/2}}}),
+    }
+}
+
+fn native_parser(fixture: &Fixture, source: SnapshotSource) -> (OwnedJsonlParser, String, Scope) {
+    native_parser_with(fixture, source, &CodexTitleMetadata::default())
+}
+fn native_parser_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+) -> (OwnedJsonlParser, String, Scope) {
+    let mut file = File::open(&fixture.0).unwrap();
+    let expected = opened_object_identity(source, &mut file).unwrap();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let parser = OwnedJsonlParser::new(
+        file,
+        &fixture.0,
+        source,
+        match source {
+            SnapshotSource::Codex => apply_codex_line,
+            SnapshotSource::ClaudeCode => apply_claude_code_line,
+            SnapshotSource::Pi => apply_pi_line,
+        },
+        Some(metadata),
+    )
+    .unwrap();
+    (parser, expected, scope)
+}
+fn acquire(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Value,
+) {
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    acquire_with(
+        fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        old,
+        now,
+        true,
+    )
+}
+/// `acquire` under explicit Codex sidecar metadata and reduction scope;
+/// `complete` is the expected `ParsedJsonlFile::complete()`.
+fn acquire_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Value,
+) {
+    let (retained, mode, guards, items) =
+        acquire_items_with(fixture, source, metadata, scope, old, now, complete);
+    (retained, mode, guards, serde_json::to_value(items).unwrap())
+}
+/// `acquire_with`, returning the items themselves so local-only (`serde(skip)`)
+/// fields can be compared too.
+fn acquire_items_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Vec<SnapshotItem>,
+) {
+    let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
+    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
+    let mode = parser
+        .prepare_acquisition(old.map(Box::new), scope, debt, now)
+        .unwrap();
+    let guards = parser
+        .reader
+        .acquisition
+        .as_ref()
+        .unwrap()
+        .guard_bytes_read();
+    while !parser.step().unwrap() {}
+    // The reduction a stored Tail head continues: the completed parse
+    // without this cycle's live inputs, through a sealed checkpoint only.
+    let state = parser.durable_test_reduction_copy();
+    let acquisition = parser.retain_reduction(scope, now).unwrap().unwrap();
+    let retained = (!acquisition.unsealed).then_some(Retained {
+        checkpoint: acquisition.checkpoint,
+        state,
+    });
+    let parsed = parser
+        .finish(
+            &expected,
+            &fixture.0,
+            NOW,
+            "native-fixture".into(),
+            Some(metadata),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(parsed.progress_complete(), complete);
+    let mut items = parsed.snapshots;
+    apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
+    (retained, mode, guards, items)
+}
+fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
+    let mut items = match source {
+        SnapshotSource::Codex => {
+            parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
+        SnapshotSource::ClaudeCode => {
+            parse_claude_code_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
+        SnapshotSource::Pi => {
+            parse_pi_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap()
+        }
+    };
+    apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
+    serde_json::to_value(items).unwrap()
+}
+#[test]
+fn sampled_native_both_providers_match_full_snapshot_across_append_batches() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        // Render consumes native state. Independent bounded runs check every
+        // prefix without introducing a duplicate native-accounting clone path.
+        for count in [1, 2, 4, 8, 16] {
+            let fixture = Fixture::new(source);
+            let (mut retained, _, _, _) = acquire(&fixture, source, None, 100);
+            for id in 0..count {
+                let model = if source == SnapshotSource::Codex {
+                    "gpt-5.6"
+                } else {
+                    "claude-opus-4-8"
+                };
+                fixture.append(&usage(source, 100 + id as u64 * 30, id, model));
+                // Exact repeats and Claude progressive corrections retain native
+                // per-response semantics across separate acquisition boundaries.
+                if id % 2 == 0 {
+                    fixture.append(&usage(source, 100 + id as u64 * 30, id, model));
+                }
+                let reusable = retained.is_some();
+                let (next, mode, guards, _) = acquire(&fixture, source, retained, 101 + id as u64);
+                assert_eq!(
+                    mode,
+                    if reusable {
+                        ReadMode::Tail
+                    } else {
+                        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+                    }
+                );
+                assert!(guards <= 8192);
+                retained = next;
+            }
+            assert_eq!(
+                acquire(&fixture, source, retained, 200).3,
+                oracle(&fixture, source),
+                "{source:?}, count={count}"
+            );
+        }
+    }
+}
+#[test]
+fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = Fixture::new(source);
+        let (mut retained, _, _, _) = acquire(&fixture, source, None, 100);
+        for (sequence, n) in [100, 140, 80, 110, 180].into_iter().enumerate() {
+            let id = if source == SnapshotSource::ClaudeCode {
+                0
+            } else {
+                sequence
+            };
+            fixture.append(&usage(
+                source,
+                n,
+                id,
+                if source == SnapshotSource::Codex {
+                    "gpt-5.6"
+                } else {
+                    "claude-opus-4-8"
+                },
+            ));
+            (retained, _, _, _) = acquire(&fixture, source, retained, 101 + sequence as u64);
+        }
+        assert_eq!(
+            acquire(&fixture, source, retained, 200).3,
+            oracle(&fixture, source)
+        );
+    }
+}
+#[test]
+fn sampled_native_claude_compaction_pairs_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "uuid":"tail-boundary", "parentUuid":null,
+        "compactMetadata":{"trigger":"auto","preTokens":900000}}));
+    let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+    assert!(retained.is_some());
+    // The summary arrives in a later pass, 5 s from its boundary, so only the
+    // parent chain carried in the cached accumulator can pair it.
+    fixture.append(
+        &json!({"type":"attachment", "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:05.001Z", "uuid":"tail-attachment",
+        "parentUuid":"tail-boundary"}),
+    );
+    fixture.append(&json!({"type":"user", "isCompactSummary":true,
+        "isVisibleInTranscriptOnly":true, "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:00Z", "uuid":"tail-summary",
+        "parentUuid":"tail-attachment",
+        "message":{"role":"user","content":"Synthetic summary"}}));
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body[0]["compaction_count"], json!(1));
+    assert_eq!(body, oracle(&fixture, source));
+}
+/// The Codex context windows ride the retained accumulator, so every
+/// real incremental Tail pass (one record per pass, so each window rule meets
+/// a record boundary: change, equal-peak tie, missing window, fill) renders
+/// what a full re-read renders.
+#[test]
+fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    // (last-turn context, window) per record; cumulative input grows.
+    let records: [(u64, Option<u64>); 7] = [
+        (100, Some(1_000)),
+        (200, Some(1_000)),
+        (200, Some(2_000)),
+        (150, None),
+        (300, None),
+        (300, Some(3_000)),
+        (120, Some(2_000)),
+    ];
+    let expected = [
+        // (first, peak, last) windows after each record.
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(2_000)),
+        (Some(1_000), Some(1_000), None),
+        (Some(1_000), None, None),
+        (Some(1_000), Some(3_000), Some(3_000)),
+        (Some(1_000), Some(3_000), Some(2_000)),
+    ];
+    let mut total = 0;
+    let mut retained = None;
+    for (step, ((context, window), want)) in records.into_iter().zip(expected).enumerate() {
+        total += context;
+        let mut record = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count", "info":{"model":"gpt-6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":step},
+            "last_token_usage":{"input_tokens":context,"cached_input_tokens":context/2,"output_tokens":1}}}});
+        if let Some(window) = window {
+            record["payload"]["info"]["model_context_window"] = json!(window);
+        }
+        fixture.append(&record);
+        let (next, mode, _, body) = acquire(&fixture, source, retained, 100 + step as u64);
+        // The first pass builds the retained state; every later pass is a
+        // real incremental Tail from it.
+        if step > 0 {
+            assert_eq!(mode, ReadMode::Tail, "step {step}");
+        }
+        assert!(next.is_some(), "step {step}: the reduction is retained");
+        assert_eq!(body, oracle(&fixture, source), "step {step}");
+        let window = |key: &str| body[0].get(key).and_then(Value::as_u64);
+        assert_eq!(
+            (
+                window("first_turn_context_window_tokens"),
+                window("peak_context_fill_window_tokens"),
+                window("last_turn_context_window_tokens"),
+            ),
+            want,
+            "step {step}"
+        );
+        retained = next;
+    }
+}
+
+/// [behaviour] A hidden same-width edit can leave a sampled Tail prefix stale.
+#[test]
+fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let fixture = Fixture::new(source);
+        fixture.append(&json!({"type":"ignored", "padding":"a".repeat(12 * 1024)}));
+        let model = if source == SnapshotSource::Codex {
+            "gpt-5.6"
+        } else {
+            "claude-opus-4-8"
+        };
+        fixture.append(&usage(source, 100, 0, model));
+        fixture.append(&json!({"type":"ignored", "padding":"b".repeat(12 * 1024)}));
+        let (old, _, _, _) = acquire(&fixture, source, None, 100);
+        assert!(old.is_some());
+        fixture.append(&usage(source, 140, 1, model));
+        let unedited = oracle(&fixture, source);
+        let original = fs::read_to_string(&fixture.0).unwrap();
+        let field = if source == SnapshotSource::Pi {
+            "input"
+        } else {
+            "input_tokens"
+        };
+        let edited = original.replace(&format!("\"{field}\":100"), &format!("\"{field}\":900"));
+        assert_ne!(original, edited);
+        assert_eq!(original.len(), edited.len());
+        fs::write(&fixture.0, edited).unwrap();
+        let (tail, mode, _, interim) = acquire(&fixture, source, old, 101);
+        assert_eq!(mode, ReadMode::Tail);
+        assert_eq!(interim, unedited, "Tail retains the pre-edit prefix");
+        let full = oracle(&fixture, source);
+        if source == SnapshotSource::Pi {
+            assert_eq!(interim[0]["input_tokens"], 240);
+            assert_eq!(full[0]["input_tokens"], 1040);
+        }
+        assert_ne!(interim, full, "accepted sampled limitation must be visible");
+        let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
+        assert_eq!(mode, ReadMode::Unchanged);
+        assert_eq!(guards, 0);
+        assert_eq!(later, interim);
+        assert_ne!(later, oracle(&fixture, source));
+    }
+}
+#[test]
+fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        100,
+        0,
+        "claude-opus-4-8",
+    ));
+    let (old, mode, _, body) = acquire(&fixture, SnapshotSource::ClaudeCode, None, 100);
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert_eq!(body, oracle(&fixture, SnapshotSource::ClaudeCode));
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        140,
+        1,
+        "claude-opus-4-8",
+    ));
+    let (mut parser, expected, scope) = native_parser(&fixture, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
+        ReadMode::Tail
+    );
+    while !parser.step().unwrap() {}
+    let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
+    assert_eq!(
+        certificate
+            .checkpoint
+            .audit_debt()
+            .unwrap()
+            .due_unix_seconds,
+        3700
+    );
+    let parsed = parser
+        .finish(
+            &expected,
+            &fixture.0,
+            NOW,
+            "native-fixture".into(),
+            Some(&CodexTitleMetadata::default()),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .unwrap();
+    assert!(parsed.progress_complete());
+    let mut items = parsed.snapshots;
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    assert_eq!(
+        serde_json::to_value(items).unwrap(),
+        oracle(&fixture, SnapshotSource::ClaudeCode)
+    );
+}
+
+#[test]
+fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for partial in [true, false] {
+            let fixture = Fixture::new(source);
+            let (old, _, _, _) = acquire(&fixture, source, None, 100);
+            fixture.append(&usage(
+                source,
+                100,
+                0,
+                if source == SnapshotSource::Codex {
+                    "gpt-5.6"
+                } else {
+                    "claude-opus-4-8"
+                },
+            ));
+            if partial {
+                let file = OpenOptions::new().write(true).open(&fixture.0).unwrap();
+                file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            }
+            let (mut parser, expected, scope) = native_parser(&fixture, source);
+            assert_eq!(
+                parser
+                    .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+                    .unwrap(),
+                ReadMode::Tail
+            );
+            assert_eq!(
+                parser
+                    .reader
+                    .acquisition
+                    .as_ref()
+                    .unwrap()
+                    .audit_obligation()
+                    .unwrap()
+                    .due_unix_seconds,
+                3700
+            );
+            while !parser.step().unwrap() {}
+            let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
+            // A partial final row stays past the sealed checkpoint.
+            assert_eq!(certificate.unsealed, partial);
+            assert_eq!(
+                certificate
+                    .checkpoint
+                    .audit_debt()
+                    .unwrap()
+                    .due_unix_seconds,
+                3700
+            );
+            let mut items = parser
+                .finish(
+                    &expected,
+                    &fixture.0,
+                    NOW,
+                    "native-fixture".into(),
+                    Some(&CodexTitleMetadata::default()),
+                    Some(&ClaudeTitleMetadata::default()),
+                    None,
+                )
+                .unwrap()
+                .snapshots;
+            apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
+            assert_eq!(
+                serde_json::to_value(items).unwrap(),
+                oracle(&fixture, source)
+            );
+        }
+    }
+}
+#[test]
+fn sampled_native_wrong_provider_cache_refuses_reuse() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    let (old, _, _, _) = acquire(&fixture, SnapshotSource::ClaudeCode, None, 100);
+    // Even if the caller mistakenly reuses a scope, provider meaning is checked
+    // by the native adapter before applying any retained reduction.
+    let (mut parser, _, _) = native_parser(&fixture, SnapshotSource::Codex);
+    let scope = Scope("synthetic-native-ClaudeCode".into());
+    assert!(matches!(
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
+}
+
+// Codex forks whose ownership boundary is decided from in-file
+// header fields alone continue from a retained native reduction.
+fn lineage_fixture(values: &[Value]) -> Fixture {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fs::write(
+        &fixture.0,
+        values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fixture
+}
+/// Codex token totals: input, cached input, output, reasoning output.
+type LineageUsage = (u64, u64, u64, u64);
+fn lineage_tokens(
+    second: u64,
+    ordinal: Option<u64>,
+    total: LineageUsage,
+    last: LineageUsage,
+) -> Value {
+    let mut value = json!({"timestamp":format!("2026-10-07T10:00:{second:02}Z"), "type":"event_msg",
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total.0,"cached_input_tokens":total.1,"output_tokens":total.2,"reasoning_output_tokens":total.3},
+        "last_token_usage":{"input_tokens":last.0,"cached_input_tokens":last.1,"output_tokens":last.2,"reasoning_output_tokens":last.3}}}});
+    if let Some(ordinal) = ordinal {
+        value["ordinal"] = json!(ordinal);
+    }
+    value
+}
+/// Appended owned usage after a fixture whose last total is (140, 110, 18, 3).
+const LINEAGE_APPENDS: [(LineageUsage, LineageUsage); 2] = [
+    ((200, 150, 30, 5), (60, 40, 12, 2)),
+    ((230, 170, 35, 6), (30, 20, 5, 1)),
+];
+/// The reduction a sampled full read retains, before `retain_reduction`.
+fn lineage_state(fixture: &Fixture, metadata: &CodexTitleMetadata) -> SnapshotAccumulator {
+    let (mut parser, _, scope) = native_parser_with(fixture, SnapshotSource::Codex, metadata);
+    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+    while !parser.step().unwrap() {}
+    parser.accumulator.clone()
+}
+fn lineage_oracle(fixture: &Fixture, metadata: &CodexTitleMetadata) -> Value {
+    let mut items = parse_codex_jsonl_file_with_title_metadata(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        metadata,
+    )
+    .unwrap();
+    apply_upload_policy(
+        SnapshotSource::Codex,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    serde_json::to_value(items).unwrap()
+}
+#[test]
+fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let parent = "019fa111-2222-7333-8444-0000000000b1";
+    let spawn = json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+    let cases = [
+        (
+            "ordinal-with-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal","forked_from_id":parent,"thread_source":"subagent","source":spawn,"subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "ordinal-without-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-headless","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "history-base",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-history-base","forked_from_id":parent,"thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
+                lineage_tokens(1, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+        (
+            "legacy-trigger-subagent",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-legacy","forked_from_id":parent,"thread_source":"subagent","source":spawn}}),
+                lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+                json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+                lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+    ];
+    for (case, values, ordinals) in cases {
+        let fixture = lineage_fixture(&values);
+        let (mut retained, mode, _, body) = acquire(&fixture, source, None, 100);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: first read");
+        assert!(retained.is_some(), "{case}: an in-file fork is retained");
+        {
+            let accumulator = lineage_state(&fixture, &CodexTitleMetadata::default());
+            assert!(accumulator.codex_is_fork, "{case}");
+            assert!(
+                matches!(
+                    accumulator.codex_ownership_boundary,
+                    CodexOwnershipBoundary::Ordinal { .. } | CodexOwnershipBoundary::AllLocal
+                ),
+                "{case}: {:?}",
+                accumulator.codex_ownership_boundary
+            );
+            assert!(!accumulator.codex_created_thread_native_only, "{case}");
+        }
+        for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
+            let next_ordinal = (values.len() + step) as u64;
+            fixture.append(&lineage_tokens(
+                10 + step as u64,
+                ordinals.then_some(next_ordinal),
+                total,
+                last,
+            ));
+            let (next, mode, _, body) = acquire(&fixture, source, retained, 101 + step as u64);
+            assert_eq!(mode, ReadMode::Tail, "{case}: append {step}");
+            assert_eq!(body, oracle(&fixture, source), "{case}: append {step}");
+            assert!(next.is_some(), "{case}: append {step} stays retained");
+            retained = next;
+        }
+        assert_eq!(
+            acquire(&fixture, source, retained, 200).3,
+            oracle(&fixture, source),
+            "{case}"
+        );
+    }
+}
+#[test]
+fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    // After a retained `Ordinal` copy, a gap or a backward step breaks the
+    // ordinal stream: the tail is held exactly as a full parse holds it.
+    for (case, broken) in [("gap", 4), ("backward", 1)] {
+        let fixture = lineage_fixture(&[
+            json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-break","forked_from_id":"019fa111-2222-7333-8444-0000000000b1","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+            lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+            lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+        ]);
+        let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+        assert!(retained.is_some(), "{case}: the fork is retained first");
+        let (total, last) = LINEAGE_APPENDS[0];
+        fixture.append(&lineage_tokens(10, Some(broken), total, last));
+        let (_, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, retained, 101, false);
+        assert_eq!(mode, ReadMode::Tail, "{case}");
+        assert_eq!(body, oracle(&fixture, source), "{case}: tail parity");
+        assert_eq!(body, json!([]), "{case}: held, never partial");
+    }
+}
+#[test]
+fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let child = format!(
+        "019fa111-2222-7333-8444-{:012x}",
+        (u64::from(std::process::id()) << 16) | NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    );
+    let parent = "019fa111-2222-7333-8444-0000000000c1";
+    let grandparent = "019fa111-2222-7333-8444-0000000000c2";
+    // The sidecar parent binds only through a rollout path that names the child.
+    let fixture = Fixture(std::env::temp_dir().join(format!("rollout-{child}.jsonl")));
+    let _ = fs::remove_file(&fixture.0);
+    for value in [
+        json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":child,"forked_from_id":parent,"thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}}),
+        lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+        json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+        json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+        lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+    ] {
+        fixture.append(&value);
+    }
+    let mut family = CodexTitleMetadata::default();
+    family
+        .spawn_parents
+        .insert(child.clone(), parent.to_string());
+    // The production reduction scope folds in this fingerprint, which carries
+    // the family position (`reduction_dependencies`, `file_scope`).
+    let scope =
+        |metadata: &CodexTitleMetadata| Scope(metadata.path_reduction_fingerprint(&fixture.0));
+
+    let (retained, mode, _, body) =
+        acquire_with(&fixture, source, &family, &scope(&family), None, 100, true);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(
+        retained.is_some(),
+        "a legacy-trigger subagent with a sidecar parent is retained"
+    );
+    {
+        let accumulator = lineage_state(&fixture, &family);
+        assert_eq!(
+            accumulator
+                .codex_sidecar_parent
+                .as_ref()
+                .map(|(_, parent)| parent.as_str()),
+            Some(parent)
+        );
+        assert_eq!(
+            accumulator.codex_ownership_boundary,
+            CodexOwnershipBoundary::AllLocal
+        );
+        assert!(accumulator.codex_legacy_trigger_seen);
+    }
+
+    let (total, last) = LINEAGE_APPENDS[0];
+    fixture.append(&lineage_tokens(10, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &family,
+        &scope(&family),
+        retained,
+        101,
+        true,
+    );
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(retained.is_some());
+
+    // A family change (a newly recorded grandparent) changes the reduction
+    // scope, so the retained copy is not continued.
+    let mut changed = family.clone();
+    changed
+        .spawn_parents
+        .insert(parent.to_string(), grandparent.to_string());
+    assert_ne!(scope(&changed), scope(&family));
+    let (total, last) = LINEAGE_APPENDS[1];
+    fixture.append(&lineage_tokens(11, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &changed,
+        &scope(&changed),
+        retained,
+        102,
+        true,
+    );
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &changed));
+    assert!(retained.is_some());
+}
+
+struct ScanFixture {
+    dir: PathBuf,
+    root: PathBuf,
+    file: Fixture,
+}
+impl ScanFixture {
+    // Claude audit fixtures need no private prompt. Codex discovery requires
+    // its real session_meta header, which also carries a private replay window.
+    fn without_prompt(self) -> Self {
+        let header: Value =
+            serde_json::from_str(&fs::read_to_string(&self.file.0).unwrap()).unwrap();
+        if header["type"] == "user" {
+            fs::write(&self.file.0, b"").unwrap();
+        }
+        self
+    }
+
+    fn new(source: SnapshotSource) -> Self {
+        let file = Fixture::new(source);
+        let dir = file.0.with_extension("scan-fixture");
+        let root = match source {
+            SnapshotSource::Codex => dir.join("home/.codex/sessions"),
+            SnapshotSource::ClaudeCode => dir.join("home/.claude/projects"),
+            SnapshotSource::Pi => dir.join("home/.pi/agent/sessions"),
+        };
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(if source == SnapshotSource::Codex {
+            "rollout-2026-10-07T10-00-00-019fa111-2222-7333-8444-555555555555.jsonl"
+        } else {
+            "native-tail-fixture.jsonl"
+        });
+        fs::rename(&file.0, &path).unwrap();
+        if source == SnapshotSource::Codex {
+            let text = fs::read_to_string(&path).unwrap().replace(
+                "native-tail-fixture",
+                "019fa111-2222-7333-8444-555555555555",
+            );
+            fs::write(&path, text).unwrap();
+        }
+        Self {
+            dir,
+            root,
+            file: Fixture(path),
+        }
+    }
+}
+impl Drop for ScanFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+fn production_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let (index, result, modes, _) =
+        production_scan_with_metrics(fixture, source, index, cache, namespace);
+    (index, result, modes)
+}
+fn production_scan_with_metrics(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+) {
+    production_scan_at(fixture, source, index, cache, namespace, NOW)
+}
+fn production_scan_at(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+) {
+    production_scan_at_with_setup(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        |_| {},
+    )
+}
+fn production_scan_at_with_setup(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+) {
+    let (index, raw, _, modes, metrics) = production_scan_page_at_with_setup(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        setup,
+    );
+    (index, raw, modes, metrics)
+}
+
+// Keep native output and the finalized upload candidates distinct. Production
+// applies policy and body-witness no-op suppression before offering a POST.
+type ProductionScanPage = (
+    ScanIndex,
+    SourceScanResult,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+);
+
+fn production_scan_page_at_with_setup(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> ProductionScanPage {
+    production_scan_page_hinted(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        &[],
+        setup,
+    )
+}
+
+/// `production_scan` with watcher hints, as the daemon passes them.
+fn production_scan_hinted(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    hinted_paths: &[PathBuf],
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let (index, raw, _, modes, _) = production_scan_page_hinted(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        NOW,
+        hinted_paths,
+        |_| {},
+    );
+    (index, raw, modes)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the page fixture plus its watcher hints"
+)]
+fn production_scan_page_hinted(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    mut index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    hinted_paths: &[PathBuf],
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> ProductionScanPage {
+    index =
+        crate::snapshots::e2_pipeline_scan_fixture::route_for_test(source, cache.as_deref(), index);
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(cache) = &cache {
+            cache.bind_withheld(&mut index);
+        }
+    }
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        hinted_paths,
+        false,
+    );
+    if let Some(cache) = cache {
+        scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
+    }
+    setup(&mut scan);
+    finish_production_scan_page(scan, source)
+}
+
+/// The collector's post-scan for a finished page: upload policy and
+/// finalization on a projected copy, then exact acceptance into `index`.
+/// Returns the projected scan; `scan` stays the raw native output.
+pub(super) fn accept_after_policy(
+    source: SnapshotSource,
+    scan: &SourceScanResult,
+    index: &mut ScanIndex,
+) -> SourceScanResult {
+    let mut projected = scan.clone();
+    apply_upload_policy(
+        source,
+        &mut projected.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(source, &mut projected, index);
+    let accepted = projected
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+        .collect();
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    projected
+}
+
+// Also drive scans constructed with multiple roots through the same native
+// finalization and acceptance path as the ordinary single-root fixtures.
+fn finish_production_scan_page(
+    mut scan: OwnedSourceScan,
+    source: SnapshotSource,
+) -> ProductionScanPage {
+    withheld_account::support::clock(&scan.index.withheld_memo);
+    let mut modes = (0, 0, 0);
+    let mut metrics = (0, 0);
+    loop {
+        if let Some(context) = scan.sampling.as_ref() {
+            metrics = (context.native_bytes, context.sample_bytes);
+            modes = (
+                context.full_files,
+                context.tail_files,
+                context.unchanged_files,
+            );
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                // Exercise existing native post-policy finalization and exact
+                // acceptance before testing durable no-op suppression. Preserve
+                // raw native output separately for full-oracle comparisons.
+                let projected = accept_after_policy(source, &scan, &mut index);
+                return (index, scan, projected, modes, metrics);
+            }
+        }
+    }
+}
+
+fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
+    apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+    serde_json::to_value(scan.snapshots).unwrap()
+}
+
+#[test]
+fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, scan, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "account-a",
+        );
+        assert_eq!(modes, (1, 0, 0), "first full {source:?}");
+        assert!(!scan.snapshots.is_empty(), "native first import {source:?}");
+        let (_, full, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
+        assert_eq!(production_body(source, scan), production_body(source, full));
+        for id in 1..5 {
+            fixture
+                .file
+                .append(&usage(source, 100 + id as u64 * 30, id, "fixture-model"));
+            let (next, scan, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+            assert_eq!(modes, (0, 1, 0), "real scanner tail {source:?} append {id}");
+            let (_, full, _) =
+                production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
+            assert_eq!(
+                production_body(source, scan),
+                production_body(source, full),
+                "native scanner parity {source:?}"
+            );
+            index = next;
+        }
+        let key = local_index_key(&fixture.file.0);
+        let due = index.files[&key].unverified_deadline().unwrap();
+        let index_path = fixture.dir.join("index.json");
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
+        // RAM loss: a restart keeps only the state database.
+        let restarted = Arc::new(sampled_scan::SharedCache::default());
+        *restarted.test_route.lock().unwrap() = cache.test_route.lock().unwrap().take();
+        let cache = restarted;
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
+        // A cold unchanged no-op may wait until its due hour, but RAM loss must
+        // not erase the independent deadline. Due selection overrides skip.
+        let (mut loaded, idle, _) =
+            production_scan(&fixture, source, loaded, Some(cache.clone()), "account-a");
+        assert!(idle.snapshots.is_empty());
+        assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
+        loaded
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .set_unverified_deadline(1);
+        let (audited, corrected, modes) =
+            production_scan(&fixture, source, loaded, Some(cache), "account-a");
+        assert_eq!(modes, (1, 0, 0));
+        assert!(!audited.files[&key].has_unverified_source());
+        let (_, full, _) =
+            production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
+        assert_eq!(
+            production_body(source, corrected),
+            production_body(source, full)
+        );
+    }
+}
+
+/// [money] An ordinary Codex page over an unchanged file keeps a future
+/// exact-body refusal cooldown: it emits nothing, the cooldown survives, and
+/// the retained refusal settles before its deadline and blocks at it.
+#[test]
+fn ordinary_codex_page_preserves_future_exact_body_cooldown_and_settlement() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    for id in 1..=3 {
+        fixture
+            .file
+            .append(&usage(source, id as u64 * 100, id, "fixture-model"));
+    }
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut settled, first, _) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "cooldown-fixture",
+    );
+    assert!(!first.snapshots.is_empty(), "page 1 parsed the file");
+    let fingerprint = settled.file_snapshot_fingerprints[&local_index_key(&fixture.file.0)]
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let body = "synthetic-refused-body";
+    let now = time::OffsetDateTime::parse(NOW, &time::format_description::well_known::Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    let deadline = now + 86_400;
+    let mut record = snapshot_quarantine_record(source);
+    record.retry_after_unix_seconds = 0; // ordinary retry is due; only the exact-body cooldown defers it
+    record.upload_body_witness = Some(body.into());
+    settled.accepted_snapshot_fingerprints.remove(&fingerprint);
+    settled
+        .quarantined_snapshot_fingerprints
+        .insert(fingerprint.clone(), record.clone());
+    settled.activate_quarantine_witness_for_test(source);
+    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(
+        fingerprint.clone(),
+        body.to_string(),
+    )]));
+    assert!(settled.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(settled.reason_reoffer_cooldown_deferred_count(), 1);
+    let (index, control, _) =
+        production_scan(&fixture, source, settled, Some(cache), "cooldown-fixture");
+    assert!(
+        control.snapshots.is_empty(),
+        "ordinary selection skips the unchanged cooldown body"
+    );
+    assert!(index.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert!(
+        crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record.clone(),
+            body,
+            now,
+            deadline
+        ),
+        "future reservation remains nonblocking for settlement"
+    );
+    assert!(
+        !crate::snapshot_sync::retained_refusal_settles_for_test(
+            &index,
+            &fingerprint,
+            record,
+            body,
+            deadline,
+            deadline
+        ),
+        "the same retained refusal blocks at its actual deadline"
+    );
+}
+
+/// One sampled Claude page of `fixture` through `cache`: (index, modes).
+fn codec_page(
+    source: SnapshotSource,
+    fixture: &ScanFixture,
+    cache: &Arc<sampled_scan::SharedCache>,
+    mut index: ScanIndex,
+) -> (ScanIndex, (usize, usize, usize)) {
+    if source == SnapshotSource::ClaudeCode {
+        cache.bind_withheld(&mut index);
+    }
+    let scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(cache.clone(), Scope("account-a".into()));
+    let (index, _, _, modes, _) = finish_production_scan_page(scan, source);
+    (index, modes)
+}
+
+/// [regress] A source with a Tail codec keeps no reduction in RAM, on a
+/// state database route or off one: retention and the take key on the codec
+/// alone. The old split rule kept an unused copy and forced every Codex read
+/// in the sample to be Full. That copy also duplicated the database continuation.
+#[test]
+fn an_unrouted_codec_source_keeps_no_ram_copy() {
+    use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let unrouted = || tail_counter_for_test("tail_bootstrap_full", "unrouted");
+        let before = unrouted();
+        let (index, modes) = codec_page(source, &fixture, &cache, ScanIndex::default());
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert_eq!(unrouted(), before, "a new file is no unrouted growth");
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let _ = codec_page(source, &fixture, &cache, index);
+        assert!(unrouted() > before, "the growth Full is counted by why");
+    }
+}
+
+/// [regress] A codec source's route that cannot be read now (a poisoned
+/// session: `DbUnavailable`) is kept as an error, never read as "no route":
+/// the file is held for its next selection, unread, and RAM is no fallback
+/// (conformance B2). The page holds before it reaches the candidate.
+#[test]
+fn a_codec_route_error_holds_the_file_without_ram() {
+    use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let routed = route_for_test(source, Some(cache.as_ref()), ScanIndex::default());
+        let (index, modes) = codec_page(source, &fixture, &cache, routed);
+        assert_eq!(modes, (1, 0, 0), "first read {source:?}");
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_some());
+        let key = local_index_key(&fixture.file.0);
+        let size = index.files[&key].size_bytes;
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        crate::snapshots::state_v2::poison_route_for_test(&index);
+        assert!(crate::snapshots::state_v2::tail_route_path(&index).is_err());
+        let (index, modes) = codec_page(source, &fixture, &cache, index);
+        assert_eq!(modes, (0, 0, 0), "the held file is not read {source:?}");
+        assert_eq!(
+            index.files[&key].size_bytes, size,
+            "the file stays owed {source:?}"
+        );
+    }
+}
+
+/// [money] An account-witness change, then a destination change, after a
+/// restart: each production namespace (`cycle_sampled_scope`) is new, and
+/// every source's head continues from Tail with no reconstruction
+/// (account evidence is applied from stored facts and live evidence, never by
+/// a re-read). The body equals a cold Full under the new namespace, Codex's
+/// creator placement included. A new priority still replays for real.
+#[test]
+fn sampled_production_account_scope_change_and_new_priority_force_real_full_replay() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let namespace = |witness: u8, destination: &str| {
+        crate::snapshot_sync::cycle_sampled_scope(
+            &[witness; 32],
+            destination,
+            Path::new("/synthetic/scan-index.json"),
+            false,
+        )
+        .0
+    };
+    let (first, witness_changed, destination_changed) = (
+        namespace(1, "destination-a"),
+        namespace(2, "destination-a"),
+        namespace(2, "destination-b"),
+    );
+    assert!(first != witness_changed && witness_changed != destination_changed);
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            &first,
+        );
+        for (n, namespace) in [&witness_changed, &destination_changed]
+            .into_iter()
+            .enumerate()
+        {
+            #[cfg(unix)]
+            let reconstructions = || {
+                crate::snapshots::tail_source::counters::totals()
+                    .into_iter()
+                    .filter(|((name, _), _)| name.starts_with("tail_reconstruct"))
+                    .map(|(_, count)| count)
+                    .sum::<u64>()
+            };
+            #[cfg(unix)]
+            let before = reconstructions();
+            fixture
+                .file
+                .append(&usage(source, 140 + 20 * n as u64, 1 + n, "fixture-model"));
+            let (next, scan, modes) =
+                production_scan(&fixture, source, index, Some(cache.clone()), namespace);
+            assert_eq!(modes, (0, 1, 0), "{source:?} continues from Tail ({n})");
+            #[cfg(unix)]
+            assert_eq!(
+                reconstructions(),
+                before,
+                "{source:?}: no reconstruction ({n})"
+            );
+            let (_, full, _) =
+                production_scan(&fixture, source, ScanIndex::default(), None, namespace);
+            assert_eq!(
+                production_body(source, scan),
+                production_body(source, full),
+                "{source:?} ({n})"
+            );
+            index = next;
+        }
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let (index, _, _) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "account-a",
+    );
+    let mut priority = usage(source, 140, 1, "fixture-model");
+    priority["payload"]["service_tier"] = json!("priority");
+    fixture.file.append(&priority);
+    let (index, scan, modes) = production_scan(&fixture, source, index, Some(cache), "account-a");
+    assert_eq!(
+        modes,
+        (1, 1, 0),
+        "sampled discovery followed by actual full replay"
+    );
+    let key = local_index_key(&fixture.file.0);
+    assert!(index.files[&key].codex_applied_tier_receipt_required);
+    assert!(!index.files[&key].has_unverified_source());
+    let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
+    assert_eq!(production_body(source, scan), production_body(source, full));
+}
+#[test]
+fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let (mut index, _, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
+    let key = local_index_key(&fixture.file.0);
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &key,
+        &fingerprint,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 1
+        }
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&fixture.file.0)
+        .unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+        .unwrap();
+    let (audited, scan, _) = production_scan(&fixture, source, index, None, "a");
+    assert!(
+        !scan.snapshots.is_empty(),
+        "all three native age gates must permit due verification"
+    );
+    assert!(!audited.files[&key].has_unverified_source());
+}
+/// [money] A retained reduction whose priority decisions all hold reuses; one
+/// holding a priority decision an earlier build applied from Codex logs re-reads
+/// in full, where its protected tier receipt keeps the tier.
+#[test]
+fn sampled_native_logs_priority_decision_rereads_in_full() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&json!({"type":"turn_context", "payload":{"turn_id":"this-turn"}}));
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
+    let (old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
+    let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
+    assert_eq!(
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
+        ReadMode::Unchanged
+    );
+    let (mut old, _, _, _) = acquire(&fixture, SnapshotSource::Codex, None, 100);
+    old.as_mut()
+        .unwrap()
+        .state
+        .accumulator_for_test()
+        .codex_observed_priority_turns
+        .get_or_insert_with(Default::default)
+        .insert("this-turn".into(), true);
+    let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
+    assert!(matches!(
+        parser
+            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .unwrap(),
+        ReadMode::Full(_)
+    ));
+}
+
+#[test]
+fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        for n in 0..150 {
+            let mut row = usage(source, 100 + n as u64, n, &format!("model-{n}"));
+            if source == SnapshotSource::ClaudeCode && n == 0 {
+                // The old fixture relied on traversing 150 response objects.
+                // Those are now incrementally charged; exceed the real entry
+                // byte cap with one valid, retained response identity instead.
+                row["message"]["id"] =
+                    Value::String("x".repeat(crate::transcript_cache::ENTRY_BYTES + 1));
+            }
+            large.file.append(&row);
+        }
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "fixture must trigger per-file optional-layout refusal {source:?}"
+        );
+        let (_, large_scan, _) = production_scan(
+            &large,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        let (_, large_full, _) =
+            production_scan(&large, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full)
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated full-file refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+/// L-A1: the `sampled_production_unretainable_full_file_preserves_other_native_tails`
+/// rows, read with the sidecar census incomplete, so the large file is an
+/// unsampled synchronous native read rather than a sampled `Full` one.
+fn append_unretainable_rows(large: &ScanFixture, source: SnapshotSource) {
+    for n in 0..150 {
+        let mut row = usage(source, 100 + n as u64, n, &format!("model-{n}"));
+        if source == SnapshotSource::ClaudeCode && n == 0 {
+            row["message"]["id"] =
+                Value::String("x".repeat(crate::transcript_cache::ENTRY_BYTES + 1));
+        }
+        large.file.append(&row);
+    }
+}
+fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
+    scan.sidecar_census_complete = false;
+}
+
+/// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
+/// limit, with the sidecar census incomplete) owns no optimization state. Its
+/// copy refusal must not wipe an unrelated, independently bounded resident
+/// reduction, and must not insert one of its own. Both sources continue on
+/// their route; a codec source keeps no RAM resident to check.
+#[test]
+fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        append_unretainable_rows(&large, source);
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "precondition: the fixture refuses optional copies {source:?}"
+        );
+        let (_, large_scan, large_modes, _) = production_scan_at_with_setup(
+            &large,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+            NOW,
+            incomplete_sidecar_census,
+        );
+        assert_eq!(
+            large_modes,
+            (0, 0, 0),
+            "precondition: the large file is read unsampled {source:?}"
+        );
+        let (_, large_full, _, _) = production_scan_at_with_setup(
+            &large,
+            source,
+            ScanIndex::default(),
+            None,
+            "mixed-files",
+            NOW,
+            incomplete_sidecar_census,
+        );
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full),
+            "precondition: native output {source:?}"
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated unsampled refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+/// A cached production scan object, stepped by the caller.
+fn cached_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> OwnedSourceScan {
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        None,
+        &[],
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("mixed-files".into()));
+    setup(&mut scan);
+    scan
+}
+/// Steps `scan` until `stop` holds between two steps.
+fn step_until(
+    mut scan: OwnedSourceScan,
+    mut stop: impl FnMut(&mut OwnedSourceScan) -> bool,
+) -> OwnedSourceScan {
+    for _ in 0..10_000 {
+        if stop(&mut scan) {
+            return scan;
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { .. } => panic!("the scan completed first"),
+        }
+    }
+    panic!("the scan did not reach the expected step");
+}
+
+#[test]
+fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "a",
+        );
+        let seed = index.files[&local_index_key(&fixture.file.0)].clone();
+        let (index, baseline_growth) = crate::retry_allocation_probe::measure(|| {
+            for n in 0..5000 {
+                index.files.insert(
+                    local_index_key(&fixture.root.join(format!("retired-{n}.jsonl"))),
+                    seed.clone(),
+                );
+            }
+            index
+        });
+        eprintln!("SAMPLED_LARGE_INDEX source={source:?} added_5000_baseline_entries_live={} added_5000_baseline_entries_peak={}; per-test-thread requested allocations, existing first-entry/cache excluded", baseline_growth.requested_live, baseline_growth.requested_peak);
+        assert!(
+            crate::heap_layout_bound::bound(&index, 32 * 1024 * 1024).is_none(),
+            "whole-index admission would wrongly force cold reads"
+        );
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "a");
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "large unchanged baseline, tiny native active state {source:?}"
+        );
+        let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
+        assert_eq!(production_body(source, scan), production_body(source, full));
+    }
+}
+
+#[test]
+fn sampled_production_long_owning_header_change_cannot_hide_outside_samples() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    let mut header: Value =
+        serde_json::from_str(fs::read_to_string(&fixture.file.0).unwrap().trim()).unwrap();
+    header["aa_padding"] = json!("h".repeat(12 * 1024));
+    fs::write(&fixture.file.0, format!("{header}\n")).unwrap();
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    fixture
+        .file
+        .append(&json!({"type":"ignored", "padding":"z".repeat(12 * 1024)}));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, _, _) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "a",
+    );
+    let old = fs::read_to_string(&fixture.file.0).unwrap();
+    let rewritten = old.replace(
+        "019fa111-2222-7333-8444-555555555555",
+        "019fa111-2222-7333-8444-666666666666",
+    );
+    assert_eq!(old.len(), rewritten.len());
+    assert_ne!(old, rewritten);
+    assert_eq!(&old.as_bytes()[..4096], &rewritten.as_bytes()[..4096]);
+    assert_eq!(
+        &old.as_bytes()[old.len() - 4096..],
+        &rewritten.as_bytes()[rewritten.len() - 4096..]
+    );
+    fs::write(&fixture.file.0, rewritten).unwrap();
+    fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+    let (_, scan, modes) = production_scan(&fixture, source, index, Some(cache), "a");
+    assert_eq!(
+        modes,
+        (1, 0, 0),
+        "owning-header authority overrides sampled prefix matching"
+    );
+    let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
+    assert_eq!(production_body(source, scan), production_body(source, full));
+}
+
+#[test]
+fn sampled_production_missing_index_entry_requires_full_even_with_warm_ram() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let _ = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "a",
+        );
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, recovered, modes) =
+            production_scan(&fixture, source, ScanIndex::default(), Some(cache), "a");
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "missing durable entry must use actual full proof {source:?}"
+        );
+        let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
+        assert_eq!(
+            production_body(source, recovered),
+            production_body(source, full)
+        );
+    }
+}
+
+#[test]
+fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit() {
+    for blocked in [false, true] {
+        let f = ScanFixture::new(SnapshotSource::ClaudeCode);
+        f.file
+            .append(&usage(SnapshotSource::ClaudeCode, 100, 0, "fixture-model"));
+        let ((_, scan, _, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan_at_with_setup(
+                &f,
+                SnapshotSource::ClaudeCode,
+                ScanIndex::default(),
+                Some(Arc::new(sampled_scan::SharedCache::default())),
+                "absence-fixture",
+                NOW,
+                |scan| scan.state_census_complete = !blocked,
+            )
+        });
+        let pages = rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        let counts = &pages[0]["counts"]["sampled_acquisition"]["acquisition_admission"];
+        assert_eq!(counts["attempts"], 1);
+        assert_eq!(
+            counts["state_census_complete"],
+            json!({"assessed":1,"matched":usize::from(!blocked)})
+        );
+        for field in [
+            "reduction_dependencies_available",
+            "index_entry_present",
+            "sampling_allowed",
+        ] {
+            assert_eq!(counts[field]["assessed"], usize::from(!blocked));
+        }
+        assert_eq!(counts["index_entry_present"]["matched"], 0);
+        assert_eq!(counts["sampling_allowed"]["matched"], 0);
+        assert_eq!(counts["prepare_started"], usize::from(!blocked));
+        assert_eq!(counts["prepare_failed"], 0);
+        let (_, control, _, _) = production_scan_at_with_setup(
+            &f,
+            SnapshotSource::ClaudeCode,
+            ScanIndex::default(),
+            None,
+            "absence-fixture",
+            NOW,
+            |scan| scan.state_census_complete = !blocked,
+        );
+        assert_eq!(
+            production_body(SnapshotSource::ClaudeCode, scan),
+            production_body(SnapshotSource::ClaudeCode, control)
+        );
+        let encoded = serde_json::to_string(pages[0]).unwrap();
+        assert!(!encoded.contains(f.dir.to_str().unwrap()));
+        let admission = serde_json::to_string(counts).unwrap();
+        assert!(!admission.contains("expired"));
+        assert!(!admission.contains("evicted"));
+        assert!(rows
+            .iter()
+            .all(|row| row["stage"] != "sampled_audit_pace_alarm"));
+    }
+}
+
+#[test]
+fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let f = ScanFixture::new(source);
+        f.file
+            .append(&json!({"type":"ignored", "padding":"x".repeat(16 * 1024)}));
+        f.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        for pass in 0..3 {
+            let before = fs::metadata(&f.file.0).unwrap().len();
+            if pass == 1 {
+                f.file.append(&usage(source, 150, 1, "fixture-model"));
+            }
+            let after = fs::metadata(&f.file.0).unwrap().len();
+            let ((next, scan, modes, bytes), records) =
+                crate::local_resource_diagnostics::capture(|| {
+                    production_scan_with_metrics(
+                        &f,
+                        source,
+                        index,
+                        Some(cache.clone()),
+                        "resource-fixture",
+                    )
+                });
+            let records = records
+                .into_iter()
+                .filter(|record| record["stage"] == "native_collection_page")
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "one completed collection page");
+            let record = &records[0];
+            assert_eq!(record["stage"], "native_collection_page");
+            assert_eq!(record["source"], source.api_slug());
+            let counters = &record["counts"]["sampled_acquisition"];
+            assert_eq!(counters["full_selections"], modes.0);
+            assert_eq!(counters["tail_selections"], modes.1);
+            assert_eq!(counters["unchanged_selections"], modes.2);
+            assert_eq!(counters["completed_native_bytes"], bytes.0);
+            assert_eq!(counters["completed_guard_bytes"], bytes.1);
+            assert_eq!(record["schema_version"], 2);
+            let events = &counters["page_events"];
+            let reasons = events["full_reasons"].as_object().unwrap();
+            assert_eq!(
+                reasons.values().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                modes.0 as u64
+            );
+            if pass == 0 {
+                assert_eq!(events["full_reasons"], json!({"state_missing": modes.0}));
+                println!("RESOURCE_V2_COLD_FIXTURE {record}");
+            }
+            let gauges = &counters["index_state_at_page_end"];
+            assert_eq!(
+                gauges["pending_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.has_unverified_source())
+                    .count()
+            );
+            let now = sampled_scan::now_seconds();
+            assert_eq!(
+                gauges["overdue_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.audit_requires_full(now))
+                    .count()
+            );
+            assert_eq!(
+                gauges["oldest_due_age_seconds"],
+                next.files
+                    .values()
+                    .filter_map(|entry| entry.audit_obligation(now))
+                    .map(|debt| now.saturating_sub(debt.due_unix_seconds))
+                    .max()
+                    .unwrap_or(0)
+            );
+            for key in ["pending_audits", "overdue_audits", "oldest_due_age_seconds"] {
+                assert!(events.get(key).is_none());
+                assert!(counters.get(key).is_none());
+            }
+            for key in [
+                "priority_full_replays",
+                "audits_started",
+                "audits_completed",
+                "max_start_overdue_seconds",
+                "max_completion_overdue_seconds",
+            ] {
+                assert!(events[key].is_u64());
+                assert!(gauges.get(key).is_none());
+            }
+
+            assert_eq!(
+                bytes.0,
+                match pass {
+                    0 => after,
+                    1 => after - before,
+                    _ => 0,
+                }
+            );
+            let text = serde_json::to_string(record).unwrap();
+            assert!(text.len() < crate::local_resource_diagnostics::NATIVE_PAGE_RECORD_TEST_LIMIT);
+            assert!(!text.contains("fixture-model") && !text.contains("padding"));
+            let (_, full, _) =
+                production_scan(&f, source, ScanIndex::default(), None, "resource-fixture");
+            if pass < 2 {
+                assert_eq!(production_body(source, scan), production_body(source, full));
+            } else {
+                assert!(scan.snapshots.is_empty());
+            }
+            index = next;
+        }
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
+        });
+        let records = records
+            .into_iter()
+            .filter(|record| record["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one completed collection page");
+        assert!(
+            records[0]["counts"]["sampled_acquisition"].is_null(),
+            "uncovered read counts are unknown"
+        );
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("page_events")
+            .is_none());
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("index_state_at_page_end")
+            .is_none());
+    }
+}
+
+#[test]
+fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let live = ScanFixture::new(source);
+        live.file.append(&usage(source, 100, 0, "fixture-model"));
+        live.file
+            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, _) = production_scan(
+            &live,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "scan-pressure",
+        );
+        // More cold admissions than the shared count cap. Their old source
+        // timestamps must not promote them over the recent active session.
+        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+            let historical = ScanFixture::new(source);
+            historical
+                .file
+                .append(&usage(source, 100, 0, "fixture-model"));
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&historical.file.0)
+                .unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1791370000)),
+            )
+            .unwrap();
+            let (_, scan, modes) = production_scan(
+                &historical,
+                source,
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "scan-pressure",
+            );
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!scan.snapshots.is_empty());
+        }
+        live.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes, bytes) =
+            production_scan_with_metrics(&live, source, index, Some(cache), "scan-pressure");
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "recent tail after old full admissions {source:?}"
+        );
+        let full_bytes = live.file.0.metadata().unwrap().len();
+        assert!(bytes.0 + bytes.1 < full_bytes);
+        assert!(bytes.1 > 0 && bytes.1 <= 8192);
+        eprintln!("SAMPLED_SCAN_PRESSURE source={source:?} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
+        let (_, full, _) =
+            production_scan(&live, source, ScanIndex::default(), None, "scan-pressure");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+/// U1a-2a: `unsealed` is set on both `retain_reduction` returns, and a side
+/// certificate carries the same bit without a retained copy or any
+/// `cache_lifecycle` event (U-T64(d)).
+#[test]
+fn side_certificate_reports_unsealed_without_cache_events() {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
+    let certify = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        assert!(matches!(
+            parser.prepare_acquisition(None, &scope, None, 100).unwrap(),
+            ReadMode::Full(_)
+        ));
+        while !parser.step().unwrap() {}
+        parser.certify_without_retention(&scope, 100).unwrap()
+    };
+    let retain = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+        while !parser.step().unwrap() {}
+        parser.retain_reduction(&scope, 100).unwrap().unwrap()
+    };
+    let len = fixture.0.metadata().unwrap().len();
+    let sealed = retain(&fixture);
+    assert!(!sealed.unsealed);
+    let certificate = certify(&fixture);
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("a complete loss-free read is certified");
+    };
+    assert_eq!(held, len);
+    assert!(!completed.unsealed);
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+
+    // A valid final row without its newline is applied at native EOF.
+    let mut file = OpenOptions::new().append(true).open(&fixture.0).unwrap();
+    serde_json::to_writer(&mut file, &usage(SnapshotSource::Codex, 140, 1, "gpt-5.5")).unwrap();
+    drop(file);
+    let grown = fixture.0.metadata().unwrap().len();
+    let unsealed = retain(&fixture);
+    assert!(unsealed.unsealed);
+    let certificate = certify(&fixture);
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("an unsealed read is still certified through its sealed prefix");
+    };
+    assert_eq!(held, grown);
+    assert!(completed.unsealed);
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+}
+
+mod stage2pre_in_page_tail_tests;
+
+/// Codex rollout with two compaction shapes: a marker followed by an exact
+/// repeat of the last record (not counted) and a zero-size record (skipped)
+/// before the next counted request, then two markers with no request between.
+fn codex_compaction_lines() -> Vec<Value> {
+    let token = |at: &str, total: u64, last: u64| {
+        json!({"type":"event_msg", "timestamp":at,
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+        "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+    };
+    let compacted =
+        |at: &str| json!({"timestamp":at,"type":"compacted","payload":{"replacement_history":[]}});
+    let before = token("2026-10-07T11:05:00Z", 490_000, 250_000);
+    vec![
+        token("2026-10-07T11:00:00Z", 240_000, 240_000),
+        before.clone(),
+        compacted("2026-10-07T11:10:00Z"),
+        before,
+        token("2026-10-07T11:11:00Z", 490_000, 0),
+        token("2026-10-07T11:20:00Z", 549_000, 59_000),
+        token("2026-10-07T11:40:00Z", 619_000, 70_000),
+        compacted("2026-10-07T11:45:00Z"),
+        compacted("2026-10-07T11:46:00Z"),
+        token("2026-10-07T11:50:00Z", 649_000, 30_000),
+    ]
+}
+fn local_points(item: &SnapshotItem) -> Vec<(String, u32)> {
+    item.local_context_points
+        .iter()
+        .map(|point| {
+            let at = OffsetDateTime::from_unix_timestamp(i64::from(point.at_unix_seconds))
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap();
+            (at, point.prompt_tokens)
+        })
+        .collect()
+}
+#[test]
+fn codex_compaction_events_take_last_before_and_first_counted_after() {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    for line in codex_compaction_lines() {
+        fixture.append(&line);
+    }
+    let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
+    let item = &items[0];
+    let event = |at: &str, before: u64, after: u64| SnapshotCompactionEvent {
+        at: at.to_string(),
+        before: Some(before),
+        after: Some(after),
+        trigger: None,
+    };
+    assert_eq!(
+        item.compaction_events,
+        [
+            event("2026-10-07T11:10:00Z", 250_000, 59_000),
+            event("2026-10-07T11:45:00Z", 70_000, 30_000),
+            event("2026-10-07T11:46:00Z", 70_000, 30_000),
+        ]
+    );
+    assert_eq!(
+        item.compaction_events
+            .iter()
+            .map(|event| event.at.clone())
+            .collect::<Vec<_>>(),
+        item.compaction_timestamps
+    );
+    // Points come from the first/peak/last block: first == First,
+    // last == Last, none above Peak; one per 15-minute slot.
+    assert_eq!(
+        local_points(item),
+        [
+            ("2026-10-07T11:00:00Z".to_string(), 240_000),
+            ("2026-10-07T11:05:00Z".to_string(), 250_000),
+            ("2026-10-07T11:20:00Z".to_string(), 59_000),
+            ("2026-10-07T11:40:00Z".to_string(), 70_000),
+            ("2026-10-07T11:50:00Z".to_string(), 30_000),
+        ]
+    );
+    assert_eq!(item.first_turn_context_tokens, Some(240_000));
+    assert_eq!(item.last_turn_context_tokens, Some(30_000));
+    assert_eq!(item.peak_context_fill_tokens, Some(250_000));
+    let wire = serde_json::to_value(item).unwrap();
+    assert!(wire.get("local_context_points").is_none());
+    assert_eq!(wire["compaction_events"][0]["before"], json!(250_000));
+
+    // Output gate: two hours after the last activity the item carries no
+    // points; compaction sizes are unaffected.
+    let late = parse_codex_jsonl_file(&fixture.0, "2026-10-07T13:50:00Z", "native-fixture".into())
+        .unwrap();
+    assert!(late[0].local_context_points.is_empty());
+    assert_eq!(late[0].compaction_events, item.compaction_events);
+}
+#[test]
+fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let lines = codex_compaction_lines();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let metadata = CodexTitleMetadata::default();
+    let whole = Fixture::new(source);
+    for line in &lines {
+        whole.append(line);
+    }
+    let expected = parse_codex_jsonl_file(&whole.0, NOW, "native-fixture".into()).unwrap();
+    for split in 0..lines.len() {
+        let fixture = Fixture::new(source);
+        for line in &lines[..split] {
+            fixture.append(line);
+        }
+        let (mut retained, _, _, _) =
+            acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+        let mut items = Vec::new();
+        for (step, line) in lines[split..].iter().enumerate() {
+            fixture.append(line);
+            let reusable = retained.is_some();
+            let (next, mode, _, next_items) = acquire_items_with(
+                &fixture,
+                source,
+                &metadata,
+                &scope,
+                retained,
+                101 + step as u64,
+                true,
+            );
+            if reusable {
+                assert_eq!(mode, ReadMode::Tail, "split {split}, step {step}");
+            }
+            retained = next;
+            items = next_items;
+        }
+        assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "split {split}"
+        );
+        assert_eq!(
+            items[0].compaction_events, expected[0].compaction_events,
+            "split {split}"
+        );
+        assert_eq!(
+            local_points(&items[0]),
+            local_points(&expected[0]),
+            "split {split}"
+        );
+    }
+}
+
+fn codex_cache_break_lines(index: usize) -> [Value; 2] {
+    let timestamp = format!("2026-10-07T10:{:02}:{:02}Z", index / 60, index % 60);
+    let read = if index % 2 == 0 { 90_000 } else { 0 };
+    let warm = (index / 2 + 1) as u64 * 90_000;
+    let requests = index as u64 + 1;
+    [
+        json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_{index}"),
+            "usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
+        json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":100_000 * requests,"cached_input_tokens":warm,"output_tokens":requests},
+            "last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}),
+    ]
+}
+
+fn uploaded_cache_breaks(body: &Value) -> Vec<String> {
+    let wire = &body[0]["cache_observations"];
+    assert_eq!(wire["coverage"], json!("complete"));
+    assert_eq!(wire["omitted_observation_count"], Value::Null);
+    wire["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| {
+            assert_eq!(operation["op"], json!("upsert"));
+            operation["observation"]["affected_request_ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A Codex session past one upload patch of cache breaks keeps tailing with
+/// full-read parity, and every pass keeps every break in session order.
+#[test]
+fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    fixture.append(&json!({"type":"turn_context","payload":{"model":"gpt-test","effort":"high","current_date":"2026-10-07"}}));
+    for index in 0..130 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let breaks = |count: usize| {
+        (0..count)
+            .map(|n| format!("resp_{}", 2 * n + 1))
+            .collect::<Vec<_>>()
+    };
+    let (retained, mode, _, body) = acquire(&fixture, source, None, 100);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(65));
+    assert!(retained.is_some(), "the over-cap session is retained");
+    for index in 130..140 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), breaks(70));
+}
+
+#[cfg(unix)]
+#[path = "sampled_audit/quiet_retirement_tests.rs"]
+mod audit_retirement_tests;
+
+/// [regress] A new file was incorrectly counted as a recordless content change.
+#[test]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    ignore = "needs macOS heap layout"
+)]
+fn pi_new_file_reads_once_without_transitional_full_count() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let source = SnapshotSource::Pi;
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let index = ScanIndex::default();
+    let key = local_index_key(&fixture.file.0);
+    assert!(!index.files.contains_key(&key));
+    let (((index, scan, modes), _counts), reads) =
+        terminal_contract_retry::source_acquisitions(|| {
+            observe(|| production_scan(&fixture, source, index, Some(cache.clone()), "pi-new-file"))
+        });
+    assert_eq!(modes, (1, 0, 0));
+    assert!(!scan.snapshots.is_empty());
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads.get(&fixture.file.0), Some(&1));
+    assert!(index.files.contains_key(&key));
+    let (((_, _, modes), _counts), reads) = terminal_contract_retry::source_acquisitions(|| {
+        observe(|| production_scan(&fixture, source, index, Some(cache), "pi-new-file"))
+    });
+    assert_eq!(modes, (0, 0, 0));
+    assert!(
+        reads.is_empty(),
+        "the new Pi file is settled after one read"
+    );
+}
+
+mod codex_mcp_version_tests;
+
+#[test]
+fn rearm_full_cause_counts_native_bytes_without_changing_selection_or_uploads() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use rearm_cause::Cause;
+    let source = SnapshotSource::ClaudeCode;
+    for (cause, label) in [
+        (Cause::NoRetainedTraversal, "no_retained_traversal"),
+        (Cause::ContextChanged, "context_changed"),
+        (Cause::TerminalUnhealthyRetry, "terminal_unhealthy_retry"),
+        (Cause::CarryInvalidation, "carry_invalidation"),
+    ] {
+        let f = ScanFixture::new(source);
+        f.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) =
+            production_scan(&f, source, ScanIndex::default(), None, "rearm-cause");
+        let key = local_index_key(&f.file.0);
+        rearm_cause::retain(&index);
+        rearm_cause::clear(&key, index.files.get_mut(&key).unwrap(), cause);
+        // The actual sync path reloads an index between pages in one process.
+        let encoded = serde_json::to_vec(&index).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("rearm_cleared"));
+        let loaded: ScanIndex = serde_json::from_slice(&encoded).unwrap();
+        let ((next, tagged, tagged_modes, tagged_bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded.clone(),
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(tagged_modes, (1, 0, 0));
+        assert_eq!(tagged_bytes.0, fs::metadata(&f.file.0).unwrap().len());
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["page_events"]["full_cause"],
+            json!({format!("rearm_cleared{{{label}}}"): {
+                "count": 1, "completed_native_bytes": tagged_bytes.0,
+            }})
+        );
+        // Completion consumed the process-local tag. Same cleared index,
+        // identical Full selection/read/body, with no clear-cause annotation.
+        let ((plain_next, plain, modes, bytes), records) =
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_with_metrics(
+                    &f,
+                    source,
+                    loaded,
+                    Some(Arc::new(sampled_scan::SharedCache::default())),
+                    "rearm-cause",
+                )
+            });
+        assert_eq!(modes, tagged_modes);
+        assert_eq!(bytes, tagged_bytes);
+        // The routed fixture's walk stamps its wall-clock completion (G7 debt);
+        // the two scans may straddle a second. Everything else is identical.
+        let unstamped = |index: ScanIndex| {
+            let mut value = serde_json::to_value(index).unwrap();
+            if let Some(discovery) = value.get_mut("tail_discovery") {
+                discovery["last_complete_discovery_at"] = serde_json::Value::Null;
+            }
+            value
+        };
+        assert_eq!(unstamped(next), unstamped(plain_next));
+        let tagged_body = production_body(source, tagged);
+        assert_eq!(tagged_body, production_body(source, plain));
+        let wire = tagged_body.to_string();
+        assert!(!wire.contains("full_cause") && !wire.contains("rearm_cleared"));
+        let page = records
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert!(page["counts"]["sampled_acquisition"]["page_events"]
+            .get("full_cause")
+            .is_none());
+    }
+}
+
+/// [regress] Every source publishes usage on a real line above the former 16 MiB boundary,
+/// delivered once, with its line buffer freed.
+#[test]
+fn whole_large_usage_line_is_published_for_each_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let fixture = ScanFixture::new(source);
+        let mut row = usage(source, 100, 0, "fixture-model");
+        row["padding"] = json!("x".repeat(16 * 1024 * 1024 + 1));
+        fixture.file.append(&row);
+        drop(row);
+        let ((_, scan, _), observations) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(&fixture, source, ScanIndex::default(), None, "large-line")
+        });
+        assert_eq!(scan.over_line_cap_count, 0);
+        assert_eq!(scan.dropped_usage_record_count, 0);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].input_tokens > 0);
+        assert_eq!(scan.snapshots[0].output_tokens, 10);
+        let counts = observations
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_jsonl_lines")
+            .map(|row| &row["counts"])
+            .find(|counts| counts["max_line_bytes"].as_u64() > Some(16 * 1024 * 1024))
+            .unwrap();
+        assert!(counts["max_line_bytes"].as_u64().unwrap() > 16 * 1024 * 1024);
+        assert!(
+            counts["max_line_buffer_bytes"].as_u64().unwrap()
+                >= counts["max_line_bytes"].as_u64().unwrap()
+        );
+    }
+    let mut bytes =
+        format!("{{\"padding\":\"{}\"}}\n", "x".repeat(16 * 1024 * 1024 + 1)).into_bytes();
+    let first_end = bytes.len() as u64;
+    bytes.extend_from_slice(b"{\"next\":true}\n");
+    let mut reader = BoundedJsonlReader::new(BufReader::with_capacity(8192, bytes.as_slice()));
+    let mut delivered = 0;
+    assert_eq!(
+        reader.step(|_| delivered += 1).unwrap(),
+        JsonlReaderStep::Line
+    );
+    assert_eq!(delivered, 1);
+    assert_eq!(reader.consumed_bytes(), first_end);
+    assert_eq!(
+        reader.buf.capacity(),
+        0,
+        "the large record's buffer is freed"
+    );
+    assert_eq!(
+        reader.step(|_| delivered += 1).unwrap(),
+        JsonlReaderStep::Line
+    );
+    assert_eq!(delivered, 2);
+    assert!(reader.report.complete());
+}

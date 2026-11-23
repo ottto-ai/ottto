@@ -1,0 +1,196 @@
+{
+  "rateLimitResetCredits": {
+    "availableCount": 21,
+    "credits": [
+      {
+        "id": "rc_synth_c21",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": null,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c20",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": null,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c19",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791619200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c18",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791619200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c17",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1792310400,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c16",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1792224000,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c15",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1792137600,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c14",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1792051200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c13",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791964800,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c12",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791878400,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c11",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791792000,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c10",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791705600,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c09",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791619200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c08",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791532800,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c07",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1789459200,
+        "expiresAt": 1791446400,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c06",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791360000,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c05",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791273600,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c04",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791187200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c03",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791100800,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c02",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1791014400,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      },
+      {
+        "id": "rc_synth_c01",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1788249600,
+        "expiresAt": 1790928000,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      }
+    ]
+  }
+}

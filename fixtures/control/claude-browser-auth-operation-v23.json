@@ -1,0 +1,7 @@
+{
+  "phase": "complete",
+  "outcome": "login_failed",
+  "retryable": true,
+  "retry_requires_new_operation_id": true,
+  "terminal_fallback_available": false
+}

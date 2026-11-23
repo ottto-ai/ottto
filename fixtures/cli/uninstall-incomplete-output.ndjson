@@ -1,0 +1,2 @@
+{"command":"uninstall","event":"progress","protocol_version":15,"request_id":"req_cli_uninstall_incomplete_fixture","stage":"request_started"}
+{"error":{"code":"internal","details":{"failed_operations":["remove /tmp/ottto-home/Library/Application Support/Ottto/account.json","unload gui/501/com.ottto.locald"],"status":"incomplete"},"message":"Ottto local platform uninstall incomplete","retryable":true},"event":"final","exit_code":70,"ok":false,"request_id":"req_cli_uninstall_incomplete_fixture"}

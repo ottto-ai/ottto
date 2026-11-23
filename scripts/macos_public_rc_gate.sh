@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_GATE="$ROOT/scripts/macos_release_gate.sh"
+CANDIDATE_MANIFEST=""
+EVIDENCE=""
+STABLE_MANIFEST=""
+
+usage() {
+  cat <<'USAGE'
+Usage: macos_public_rc_gate.sh --candidate-manifest <release-manifest.json> --evidence <stable-candidate-rc-qa.json> [--stable-manifest <release-manifest.json>]
+
+Validates stable-candidate RC evidence before stable public-v1 promotion.
+The stable-candidate manifest must pass the release gate, the evidence must be
+redacted and fully passed, and an optional stable manifest must point at the
+same stable-candidate evidence and commit. The evidence must name the
+candidate's app source commit.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --candidate-manifest)
+      CANDIDATE_MANIFEST="${2:?--candidate-manifest requires a value}"
+      shift 2
+      ;;
+    --evidence)
+      EVIDENCE="${2:?--evidence requires a value}"
+      shift 2
+      ;;
+    --stable-manifest)
+      STABLE_MANIFEST="${2:?--stable-manifest requires a value}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$CANDIDATE_MANIFEST" || -z "$EVIDENCE" ]]; then
+  usage >&2
+  exit 2
+fi
+if [[ ! -f "$CANDIDATE_MANIFEST" ]]; then
+  echo "Stable-candidate release manifest is missing: $CANDIDATE_MANIFEST" >&2
+  exit 1
+fi
+if [[ ! -f "$EVIDENCE" ]]; then
+  echo "Stable-candidate RC evidence is missing: $EVIDENCE" >&2
+  exit 1
+fi
+if [[ -n "$STABLE_MANIFEST" && ! -f "$STABLE_MANIFEST" ]]; then
+  echo "Stable release manifest is missing: $STABLE_MANIFEST" >&2
+  exit 1
+fi
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Required command not found: $1" >&2
+    exit 2
+  }
+}
+
+require_command jq
+require_command shasum
+require_command python3
+
+"$RELEASE_GATE" --manifest "$CANDIDATE_MANIFEST" >/dev/null
+
+python3 - "$CANDIDATE_MANIFEST" "$EVIDENCE" "$STABLE_MANIFEST" "$ROOT/scripts" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, sys.argv[-1])
+from release_evidence_placeholders import contains_placeholder, strip_optional_not_run
+
+candidate_manifest_path = Path(sys.argv[1]).resolve()
+evidence_path = Path(sys.argv[2]).resolve()
+stable_manifest_path = Path(sys.argv[3]).resolve() if sys.argv[3] else None
+
+REQUIRED_CHECKS = [
+    "release_gate",
+    "public_surface_ci",
+    "candidate_manifest_download",
+    "artifact_checksums",
+    "artifact_signatures",
+    "notarization",
+    "gatekeeper_assessment",
+    "hosted_candidate_installer",
+    "app_launch",
+    "service_ready",
+    "status_json",
+    "setup_browser_claim",
+    "verify_codex",
+    "diagnostics_redaction",
+    "update_check",
+    "mixed_owner_app_version_truth",
+    "mixed_owner_sparkle_autonomous_lifecycle",
+    "rollback_notes",
+    "stable_formula_static",
+    "stable_hosted_installer_static",
+]
+
+PRIVATE_REPO_NAME = "coding-agents-" "observability"
+SECRET_PATTERN = re.compile(
+    r"/Users/|" + re.escape(PRIVATE_REPO_NAME) + r"|docs/dev|\.agents|\.claude|"
+    r"Bearer\s+|claim_code|setup_run_token|account_id|machine_id|"
+    r"api[_-]?key|password",
+    re.IGNORECASE,
+)
+
+
+def die(message: str) -> None:
+    print(f"stable-candidate-rc-gate: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        die(f"{label} must be an object")
+    return value
+
+
+def require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        die(f"{label} must be a non-empty string")
+    return value
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        die(f"{label} has invalid JSON: {error}")
+    return require_object(value, label)
+
+
+def resolve_reference(base_dir: Path, reference: str) -> Path:
+    path = Path(reference)
+    if path.is_absolute():
+        return path.resolve()
+    return (base_dir / path).resolve()
+
+
+def app_source_commit(manifest: dict[str, Any], label: str) -> str:
+    materials = require_object(manifest.get("supply_chain"), f"{label} supply_chain").get("materials")
+    commits = [
+        material.get("commit")
+        for material in (materials if isinstance(materials, list) else [])
+        if isinstance(material, dict) and material.get("kind") == "git_subtree"
+    ]
+    if len(commits) != 1:
+        die(f"{label} must record exactly one app source commit in supply_chain.materials")
+    return require_string(commits[0], f"{label} app source commit")
+
+
+candidate_manifest = load_json(candidate_manifest_path, "stable-candidate manifest")
+evidence = load_json(evidence_path, "stable-candidate RC evidence")
+candidate_sha = hashlib.sha256(candidate_manifest_path.read_bytes()).hexdigest()
+
+if SECRET_PATTERN.search(evidence_path.read_text(encoding="utf-8")):
+    die(f"evidence contains private path or secret-like material: {evidence_path}")
+if contains_placeholder(strip_optional_not_run(evidence)):
+    die("evidence still contains template placeholders")
+
+if candidate_manifest.get("product") != "ottto-local-platform":
+    die("stable-candidate manifest product must be ottto-local-platform")
+if candidate_manifest.get("channel") != "stable-candidate":
+    die("stable-candidate manifest channel must be stable-candidate")
+candidate_version = require_string(candidate_manifest.get("version"), "stable-candidate manifest version")
+candidate_commit = require_string(candidate_manifest.get("commit"), "stable-candidate manifest commit")
+if candidate_manifest.get("min_protocol_version") != 15:
+    die("stable-candidate manifest min_protocol_version must be 15")
+if not re.fullmatch(r"[0-9a-f]{7,40}", candidate_commit):
+    die("stable-candidate manifest commit is not a git SHA prefix")
+candidate_app_commit = app_source_commit(candidate_manifest, "stable-candidate manifest")
+
+raw_artifacts = candidate_manifest.get("artifacts", [])
+if not isinstance(raw_artifacts, list) or not raw_artifacts:
+    die("stable-candidate manifest artifacts must be a non-empty array")
+macos_artifacts = [
+    artifact
+    for artifact in raw_artifacts
+    if isinstance(artifact, dict) and artifact.get("platform") == "macos"
+]
+kinds = {artifact.get("kind") for artifact in macos_artifacts}
+for required_kind in ("macos_app", "cli", "daemon"):
+    if required_kind not in kinds:
+        die(f"stable-candidate manifest is missing macOS artifact kind: {required_kind}")
+for artifact in macos_artifacts:
+    name = require_string(artifact.get("name"), "stable-candidate manifest artifact name")
+    if artifact.get("signed") is not True:
+        die(f"stable-candidate macOS artifact is not marked signed: {name}")
+    if artifact.get("notarized") is not True:
+        die(f"stable-candidate macOS artifact is not marked notarized: {name}")
+    if artifact.get("gatekeeper_assessed") is not True:
+        die(f"stable-candidate macOS artifact is not marked Gatekeeper-assessed: {name}")
+
+candidate_evidence = require_object(evidence.get("candidate_manifest"), "evidence candidate_manifest")
+environment = require_object(evidence.get("environment"), "evidence environment")
+local_platform = require_object(evidence.get("local_platform"), "evidence local_platform")
+update_lifecycle = require_object(
+    evidence.get("update_lifecycle"),
+    "evidence update_lifecycle",
+)
+checks = require_object(evidence.get("checks"), "evidence checks")
+
+if evidence.get("schema_version") != 1:
+    die("evidence schema_version must be 1")
+if evidence.get("gate") != "stable_candidate_rc":
+    die("evidence gate must be stable_candidate_rc")
+if evidence.get("status") != "passed":
+    die("stable-candidate RC evidence did not pass")
+if candidate_evidence.get("product") != "ottto-local-platform":
+    die("evidence product must be ottto-local-platform")
+if candidate_evidence.get("channel") != "stable-candidate":
+    die("evidence stable-candidate channel must be stable-candidate")
+if candidate_evidence.get("version") != candidate_version:
+    die("evidence stable-candidate version does not match stable-candidate manifest")
+if candidate_evidence.get("commit") != candidate_commit:
+    die("evidence stable-candidate commit does not match stable-candidate manifest")
+if candidate_evidence.get("app_source_commit") != candidate_app_commit:
+    die("evidence stable-candidate app_source_commit does not match stable-candidate manifest")
+if candidate_evidence.get("sha256") != candidate_sha:
+    die("evidence stable-candidate manifest SHA does not match stable-candidate manifest")
+if local_platform.get("runtime") != "ottto-service":
+    die("evidence local_platform.runtime must be ottto-service")
+if local_platform.get("service_label") != "net.ottto.service":
+    die("evidence local_platform.service_label must be net.ottto.service")
+if local_platform.get("version") != candidate_version:
+    die("evidence local_platform.version does not match stable-candidate manifest")
+if local_platform.get("release_channel") != "stable-candidate":
+    die("evidence local_platform.release_channel must be stable-candidate")
+if local_platform.get("protocol_version") != 15:
+    die("evidence local_platform.protocol_version must be 15")
+if local_platform.get("release_manifest_sha256") != candidate_sha:
+    die("evidence local_platform.release_manifest_sha256 does not match stable-candidate manifest")
+if environment.get("host_kind") not in {"trusted_internal_macos", "clean_macos"}:
+    die("evidence host_kind must be trusted_internal_macos or clean_macos")
+if environment.get("arch") not in {"arm64", "x86_64", "universal"}:
+    die("evidence arch must be arm64, x86_64, or universal")
+require_string(environment.get("macos_version"), "evidence macos_version")
+
+required_lifecycle_values = {
+    "launch_provenance": "launchservices_bundle",
+    "user_update_actions": 1,
+    "homebrew_service_reached_target": True,
+    "lower_gui_remained_running_after_homebrew_update": True,
+    "sparkle_terminated_old_process": True,
+    "sparkle_relaunched_target_bundle": True,
+    "process_id_changed": True,
+    "manual_process_termination": False,
+    "manual_app_launch": False,
+    "account_continuity_verified": True,
+    "source_continuity_verified": True,
+    "diagnostics_via_homebrew_socket": True,
+    "verify_via_homebrew_socket": True,
+    "owner_prefix_protocol_schema_version_converged": True,
+}
+for field, expected in required_lifecycle_values.items():
+    actual = update_lifecycle.get(field)
+    if type(actual) is not type(expected) or actual != expected:
+        die(f"evidence update_lifecycle.{field} must be {expected!r}")
+
+for check in REQUIRED_CHECKS:
+    if checks.get(check) != "passed":
+        die(f"stable-candidate RC evidence is missing passed check: {check}")
+
+if stable_manifest_path is not None:
+    stable_manifest = load_json(stable_manifest_path, "stable manifest")
+    if stable_manifest.get("product") != "ottto-local-platform":
+        die("stable manifest product must be ottto-local-platform")
+    if stable_manifest.get("channel") != "stable":
+        die("stable manifest channel must be stable")
+    stable_commit = require_string(stable_manifest.get("commit"), "stable manifest commit")
+    if stable_manifest.get("min_protocol_version") != 15:
+        die("stable manifest min_protocol_version must be 15")
+    if stable_commit != candidate_commit:
+        die("stable manifest commit must match the stable-candidate RC commit")
+    quality_gates = require_object(stable_manifest.get("quality_gates"), "stable quality_gates")
+    gate = require_object(
+        quality_gates.get("stable_candidate_rc"),
+        "stable quality_gates.stable_candidate_rc",
+    )
+    if gate.get("status") != "passed":
+        die("stable_candidate_rc gate did not pass")
+    stable_evidence_path = require_string(
+        gate.get("evidence_path"),
+        "stable_candidate_rc evidence_path",
+    )
+    if resolve_reference(stable_manifest_path.parent, stable_evidence_path) != evidence_path:
+        die("stable_candidate_rc evidence_path does not match the evidence file")
+    if gate.get("candidate_manifest_sha256") != candidate_sha:
+        die("stable_candidate_rc candidate_manifest_sha256 does not match evidence")
+
+print(f"stable-candidate-rc-gate: passed for {candidate_version} ({candidate_commit})")
+PY
+
+# The template's unfilled placeholder is not a supplied sampler scorecard.
+if jq -e '.resource_scorecard != null and .resource_scorecard != {
+  schema_version: 1, policy: "resource-stage1-v1", status: "not_run"
+}' "$EVIDENCE" >/dev/null; then
+  python3 "$ROOT/scripts/resource_scorecard.py" "$EVIDENCE" >/dev/null
+else
+  echo "resource scorecard: absent"
+fi

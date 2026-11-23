@@ -1,0 +1,5587 @@
+use crate::snapshots::{
+    snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
+    SnapshotItem, SnapshotSource, SnapshotSourceManifest,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
+};
+use anyhow::{anyhow, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use ottto_core::{
+    compiled_release_version, ControlTokenStore, FileDeviceStore, FilePendingDeviceCredentialStore,
+    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+};
+use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::borrow::Borrow;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
+
+const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A payload rejection carries only validated request-local locations, never
+/// response text. Locations are transient and are not acknowledgement evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BatchRejected {
+    pub status: u16,
+    pub snapshot_indexes: Option<Vec<usize>>,
+}
+
+impl BatchRejected {
+    pub(crate) fn from_response(status: u16, reader: impl std::io::Read, count: usize) -> Self {
+        let snapshot_indexes = if status == 422 {
+            serde_json::from_reader::<_, Value>(reader)
+                .ok()
+                .and_then(|body| snapshot_error_indexes(&body, count))
+        } else {
+            None
+        };
+        Self {
+            status,
+            snapshot_indexes,
+        }
+    }
+}
+
+/// The request-local items an error body names in `errors[].loc`
+/// (`["body", "snapshots", i, ...]`, three or more elements), deduplicated.
+/// `None` unless every entry names an index of this `count`-item request.
+fn snapshot_error_indexes(body: &Value, count: usize) -> Option<Vec<usize>> {
+    let errors = body.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let mut indexes = std::collections::BTreeSet::new();
+    for error in errors {
+        let loc = error.get("loc")?.as_array()?;
+        if loc.first()?.as_str()? != "body" || loc.get(1)?.as_str()? != "snapshots" {
+            return None;
+        }
+        let index = usize::try_from(loc.get(2)?.as_u64()?).ok()?;
+        if index >= count {
+            return None;
+        }
+        indexes.insert(index);
+    }
+    Some(indexes.into_iter().collect())
+}
+
+impl std::fmt::Display for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reason=validation_reject status={}", self.status)?;
+        if let Some(indexes) = &self.snapshot_indexes {
+            write!(f, " count={}", indexes.len())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for BatchRejected {}
+
+/// A successful HTTP exchange with an invalid ACK is a backend-response
+/// failure, never a transport failure. Only fixed validator messages are exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotAckRejected {
+    pub(crate) reason: &'static str,
+}
+
+impl SnapshotAckRejected {
+    fn from_validation(error: &anyhow::Error) -> Self {
+        if let Some(rejected) = error.downcast_ref::<Self>() {
+            return *rejected;
+        }
+        let message = error.to_string();
+        const SAFE_REASONS: &[&str] = &[
+            "disabled snapshot response contains entity outcomes",
+            "snapshot ACK returned head tokens for a request without the head-CAS contract",
+            "snapshot head-CAS ACK lacks an exclusive accepted head etag",
+            "snapshot head-CAS conflict lacks an exclusive head challenge",
+            "snapshot evidence has no supported body witness version",
+            "snapshot request contains conflicting snapshot evidence body witnesses",
+            BODY_WITNESS_REFUSED,
+            "snapshot ACK accepted count overflow",
+            "snapshot ACK contains invalid rejection",
+            "snapshot ACK does not cover the request exactly",
+            "snapshot ACK accepted count mismatch",
+            "snapshot ACK contains a foreign entity",
+            "snapshot ACK occurrence_count must be positive",
+            "snapshot ACK contains a duplicate outcome identity",
+            "snapshot ACK occurrence_count overflow",
+            "snapshot ACK over-counts an entity",
+            "snapshot ACK entity identity is malformed",
+            "snapshot ACK body witness proof is malformed",
+        ];
+        let reason = SAFE_REASONS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == message)
+            .unwrap_or("snapshot ACK validation failed");
+        Self { reason }
+    }
+}
+
+impl std::fmt::Display for SnapshotAckRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for SnapshotAckRejected {}
+
+/// Gzip is enabled until the backend refuses an encoded snapshot batch.
+/// Size budgets and encoding failures still fall back to identity per request.
+static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn snapshot_upload_gzip_enabled() -> bool {
+    SNAPSHOT_UPLOAD_GZIP.load(Ordering::Relaxed)
+}
+
+fn disable_snapshot_upload_gzip() {
+    if SNAPSHOT_UPLOAD_GZIP.swap(false, Ordering::Relaxed) {
+        eprintln!(
+            "ottto-service: snapshot upload gzip disabled for this process — the backend refused \
+             the encoded body; falling back to identity encoding."
+        );
+    }
+}
+
+/// gzip `body`, or `None` if the encoder failed (in which case the caller sends
+/// identity encoding rather than nothing).
+fn gzip(body: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).ok()?;
+    encoder.finish().ok()
+}
+
+/// Keep encoded requests inside the backend's independent gzip budgets. A
+/// receiver advertising items over 2 MiB decodes a whole request; an older one
+/// decodes 1 MiB, so larger bodies keep identity encoding and the exact preflight.
+fn gzip_snapshot_batch(body: &[u8], enabled: bool, item_cap: usize) -> Option<Vec<u8>> {
+    const OLDER_RECEIVER_ITEM_BYTES: usize = 2 * 1024 * 1024;
+    const OLDER_RECEIVER_DECODED_BYTES: usize = 1024 * 1024;
+    let max_decoded = if item_cap > OLDER_RECEIVER_ITEM_BYTES {
+        crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES
+    } else {
+        OLDER_RECEIVER_DECODED_BYTES
+    };
+    if !enabled || body.len() > max_decoded {
+        return None;
+    }
+    gzip(body).filter(|encoded| encoded.len() <= 2 * max_decoded)
+}
+
+/// A rejection that means "I could not read your encoding", as opposed to "your
+/// payload is wrong". A server without request decompression cannot parse the
+/// body at all, so it answers 400 (unreadable JSON) or 415 (unsupported media
+/// type) — never 422, which requires having parsed the body first.
+fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
+    matches!(outcome, Err(ureq::Error::Status(400 | 415, _)))
+}
+
+/// The backend shed this request instead of failing it: 429 or 503, with the
+/// server's `Retry-After` when it sent one.
+///
+/// This is a distinct class from every other upload error on purpose. A shed
+/// request is not a validation failure (the payload is fine), not an auth
+/// failure, and not a network failure (the server answered). Treating it as any
+/// of those produces an identical re-upload on the next tick, forever, which is
+/// exactly what the deployed daemon does today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadShed {
+    pub status: u16,
+    pub retry_after: Option<Duration>,
+    /// The backend's error code when it is one the daemon recognizes. Only
+    /// this fixed name and an identity deferral's named items
+    /// (`ShedSnapshotIndexes`) survive; the rest of the body is discarded.
+    pub code: Option<UploadShedCode>,
+}
+
+/// The request-local items an identity-deferral shed names: only those wait
+/// for the identity. Carried as context on its `UploadShed` error; a shed
+/// without it keeps the whole-pass path.
+pub struct ShedSnapshotIndexes(pub Vec<usize>);
+
+impl std::fmt::Display for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reason=identity_deferred count={}", self.0.len())
+    }
+}
+
+impl std::fmt::Debug for ShedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+const BODY_WITNESS_REFUSED: &str =
+    "snapshot ACK lacks exact durable context curve body witness proof";
+
+/// The request-local items whose ACK refs echoed another body witness: the
+/// validator's error, then context on its `SnapshotAckRejected`. Every other
+/// invalid ACK names none and keeps the whole-pass path.
+#[derive(Debug)]
+pub struct RefusedSnapshotIndexes(pub Vec<usize>);
+
+impl std::fmt::Display for RefusedSnapshotIndexes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(BODY_WITNESS_REFUSED)
+    }
+}
+
+impl std::error::Error for RefusedSnapshotIndexes {}
+
+/// The backend error code of the 503 that defers a batch while an original
+/// session identity cannot be evaluated.
+pub const SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE: &str = "snapshot_original_identity_unavailable";
+
+/// A shed's backend error code, kept only when it is one of these fixed names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadShedCode {
+    /// `snapshot_original_identity_unavailable`: the decision waits for the
+    /// identity, not for the request, so it keeps its own backoff whatever
+    /// `Retry-After` accompanies it and is never resent in place.
+    OriginalIdentityUnavailable,
+}
+
+impl UploadShedCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalIdentityUnavailable => SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE,
+        }
+    }
+
+    fn recognize(code: &str) -> Option<Self> {
+        (code == SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE)
+            .then_some(Self::OriginalIdentityUnavailable)
+    }
+}
+
+impl UploadShed {
+    /// The identity deferral, recognized by its fixed backend code.
+    pub fn is_original_identity_unavailable(&self) -> bool {
+        self.code == Some(UploadShedCode::OriginalIdentityUnavailable)
+    }
+}
+
+impl std::fmt::Display for UploadShed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(retry_after) => write!(
+                f,
+                "backend shed the snapshot upload: HTTP {} retry_after={}s",
+                self.status,
+                retry_after.as_secs()
+            ),
+            None => write!(f, "backend shed the snapshot upload: HTTP {}", self.status),
+        }
+    }
+}
+
+impl std::error::Error for UploadShed {}
+
+/// Ceiling on an honoured `Retry-After`. A server that asks for a day off is
+/// still asking for freshness the product promises in minutes, so the daemon
+/// caps the wait and keeps reporting instead of going silent.
+pub const MAX_HONOURED_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// Parse a `Retry-After` header value: delta-seconds or an HTTP-date.
+///
+/// Both forms are in the spec and real load balancers send both. An unparsable
+/// or absent value returns `None`, which the caller turns into its own jittered
+/// backoff rather than retrying immediately.
+pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_HONOURED_RETRY_AFTER));
+    }
+    // IMF-fixdate, the only date form HTTP requires a client to produce and the
+    // one every proxy in this path emits. RFC 2822 parsing covers it; the
+    // `GMT` zone name is the one difference, so normalise it to the numeric
+    // offset RFC 2822 expects rather than hand-rolling a second date parser.
+    let normalized = value.strip_suffix("GMT").map(|head| format!("{head}+0000"));
+    let deadline = OffsetDateTime::parse(
+        normalized.as_deref().unwrap_or(value),
+        &time::format_description::well_known::Rfc2822,
+    )
+    .ok()?;
+    let delta = deadline - now;
+    if delta.is_negative() {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
+}
+
+/// Bytes of a shed body read to recognize its code. The backend's error
+/// envelope is a few hundred bytes; a longer body is not recognized.
+const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
+
+fn response_retry_after(response: &ureq::Response) -> Option<Duration> {
+    response
+        .header("Retry-After")
+        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()))
+}
+
+fn small_upload_error(
+    error: ureq::Error,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let diagnostics =
+                UploadFailureDiagnostics::http(operation, endpoint, status, &response);
+            if matches!(status, 408 | 429 | 503) {
+                anyhow::Error::new(UploadShed {
+                    status,
+                    retry_after: response_retry_after(&response),
+                    code: None,
+                })
+                .context(diagnostics)
+            } else {
+                anyhow::Error::new(diagnostics)
+            }
+        }
+        other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+            operation, endpoint, &other,
+        )),
+    }
+}
+
+fn shed_from_response(status: u16, response: ureq::Response, count: usize) -> anyhow::Error {
+    let retry_after = response_retry_after(&response);
+    let mut excerpt = Vec::new();
+    let (code, named) = match response
+        .into_reader()
+        .take(SHED_BODY_EXCERPT_BYTES)
+        .read_to_end(&mut excerpt)
+    {
+        Ok(_) => shed_body(&excerpt, count),
+        Err(_) => (None, None),
+    };
+    let shed = anyhow::Error::new(UploadShed {
+        status,
+        retry_after,
+        code,
+    });
+    match named {
+        Some(indexes) => shed.context(ShedSnapshotIndexes(indexes)),
+        None => shed,
+    }
+}
+
+/// The recognized top-level `code` of a backend error envelope, which must be
+/// a JSON object, and the items an identity deferral names (see
+/// `snapshot_error_indexes`). Any other code, a malformed or truncated body,
+/// a non-object body or a non-string code is `None`, as are the items of any
+/// other shed; no body text outlives this call.
+fn shed_body(excerpt: &[u8], count: usize) -> (Option<UploadShedCode>, Option<Vec<usize>>) {
+    let Ok(envelope @ Value::Object(_)) = serde_json::from_slice::<Value>(excerpt) else {
+        return (None, None);
+    };
+    let code = envelope
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(UploadShedCode::recognize);
+    let named = if code == Some(UploadShedCode::OriginalIdentityUnavailable) {
+        snapshot_error_indexes(&envelope, count)
+    } else {
+        None
+    };
+    (code, named)
+}
+
+/// The backend refused a snapshot batch before payload validation because the
+/// relay authorization was missing, stale, or not permitted for this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for BatchAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected snapshot batch authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for BatchAuthorizationRejected {}
+
+/// The dedicated cloud-session ingest route rejected the relay principal.
+/// Kept typed so the transport can refresh once without inspecting response
+/// bodies or logging token-adjacent material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected cloud-session relay authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionAuthorizationRejected {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionContractRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionContractRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected cloud-session observation contract: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionContractRejected {}
+
+/// The server refused a cloud-task request as a whole (HTTP 409: listing
+/// off, a policy mismatch, an unavailable predecessor). No body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudTaskRefused {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudTaskRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend refused cloud tasks: HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for CloudTaskRefused {}
+
+/// The server does not offer this cloud-task route (an older server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionRouteUnsupported {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionRouteUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend does not offer this cloud-session route: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionRouteUnsupported {}
+
+/// The provider-daily-reference ingest route refused the principal or the
+/// build. Kept typed and distinct from a contract rejection because
+/// "this collector version is not admitted yet" is the expected steady state
+/// until a reviewed server change admits a shipped build - it must not read as
+/// a provider fault or count against any circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderDailyReferenceUploadRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderDailyReferenceUploadRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend refused provider daily reference upload: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for ProviderDailyReferenceUploadRejected {}
+
+/// Closed reason vocabulary for provider-daily-reference contract refusals.
+/// Only the bounded `detail.code` is retained; the response body is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDailyReferenceContractRejection {
+    AccountExcluded,
+    GrantEpochConflict,
+    Other,
+}
+
+/// The provider-daily-reference ingest route rejected the batch as shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderDailyReferenceContractRejected {
+    pub status: u16,
+    pub reason: ProviderDailyReferenceContractRejection,
+}
+
+impl std::fmt::Display for ProviderDailyReferenceContractRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected provider daily reference contract: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for ProviderDailyReferenceContractRejected {}
+
+/// The backend refused to mint a relay token for this local device. Keep this
+/// typed so the daemon can mark canonical local health as an auth/rebind issue
+/// instead of treating the projection as merely delayed by a transient upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayTokenAuthorizationRejected {
+    pub status: u16,
+    pub suppressed: bool,
+}
+
+impl std::fmt::Display for RelayTokenAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected relay token authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for RelayTokenAuthorizationRejected {}
+
+/// The backend rejected the local-health contract payload. Keep this distinct
+/// from transport failures so the daemon never calls schema drift "unreachable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalHealthProjectionRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for LocalHealthProjectionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected local health projection: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for LocalHealthProjectionRejected {}
+
+/// The backend refused the relay token on a local-health upload endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalHealthAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for LocalHealthAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected local health authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for LocalHealthAuthorizationRejected {}
+
+/// Redacted upload failure classification for field diagnostics. This never
+/// carries raw response bodies, request IDs, tokens, account IDs, or machine IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFailureDiagnostics {
+    operation: &'static str,
+    endpoint: &'static str,
+    status_family: &'static str,
+    // Retain the exact HTTP status only for in-process retry policy. It never
+    // appears in the redacted field diagnostic, so log cardinality and the
+    // privacy-safe public error surface remain unchanged.
+    http_status: Option<u16>,
+    retryable: bool,
+    request_id_present: bool,
+}
+
+impl UploadFailureDiagnostics {
+    fn http(
+        operation: &'static str,
+        endpoint: &'static str,
+        status: u16,
+        response: &ureq::Response,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: http_status_family(status),
+            http_status: Some(status),
+            retryable: http_status_retryable(status),
+            request_id_present: response_has_request_id(response),
+        }
+    }
+
+    pub(crate) fn transport(
+        operation: &'static str,
+        endpoint: &'static str,
+        error: &ureq::Error,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: transport_status_family(error),
+            http_status: None,
+            retryable: true,
+            request_id_present: false,
+        }
+    }
+
+    /// The redacted failure family (`transport_connection`, `http_5xx`, ...).
+    /// `net_resilience` keys the transport-layer outage streak on this.
+    pub(crate) fn status_family(&self) -> &'static str {
+        self.status_family
+    }
+
+    /// A batch HTTP response proves a send; transport/token failures do not.
+    pub(crate) fn is_snapshot_batch_response(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status.is_some()
+    }
+
+    /// Whether a snapshot page exceeded the client or gateway read deadline.
+    ///
+    /// Keep this endpoint-scoped: a relay-token timeout happened before the
+    /// snapshot page reached the backend, so splitting that page only fans out
+    /// more token requests. A batch transport timeout or HTTP 504 can be
+    /// workload-shaped, and the resumable uploader can safely retry it in
+    /// smaller idempotent subsets.
+    pub(crate) fn is_snapshot_batch_deadline(&self) -> bool {
+        self.endpoint == "snapshot_batch"
+            && (self.status_family == "transport_timeout" || self.http_status == Some(504))
+    }
+
+    /// A transport failure (no HTTP answer) or an HTTP 5xx.
+    pub(crate) fn is_outage(&self) -> bool {
+        self.http_status.is_none_or(|status| status >= 500)
+    }
+
+    pub(crate) fn is_snapshot_batch_too_large(&self) -> bool {
+        self.endpoint == "snapshot_batch" && self.http_status == Some(413)
+    }
+
+    /// The status of a snapshot-batch server error that a prompt resend of
+    /// the same idempotent page may clear: 500 or 502 only. Other endpoints,
+    /// other statuses and transport failures never qualify.
+    pub(crate) fn transient_batch_status(&self) -> Option<u16> {
+        self.http_status
+            .filter(|status| self.endpoint == "snapshot_batch" && matches!(status, 500 | 502))
+    }
+
+    pub fn safe_message(&self) -> String {
+        format!(
+            "{} failed (endpoint={}, status_family={}, retryable={}, request_id={})",
+            self.operation,
+            self.endpoint,
+            self.status_family,
+            self.retryable,
+            if self.request_id_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: &'static str,
+        endpoint: &'static str,
+        status_family: &'static str,
+        retryable: bool,
+        request_id_present: bool,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family,
+            http_status: None,
+            retryable,
+            request_id_present,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_http_test(
+        operation: &'static str,
+        endpoint: &'static str,
+        status: u16,
+        request_id_present: bool,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: http_status_family(status),
+            http_status: Some(status),
+            retryable: http_status_retryable(status),
+            request_id_present,
+        }
+    }
+}
+
+impl std::fmt::Display for UploadFailureDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.safe_message())
+    }
+}
+
+impl std::error::Error for UploadFailureDiagnostics {}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ActivityHintResponse {
+    pub source: String,
+    #[serde(skip_serializing)]
+    pub server_time: String,
+    #[serde(skip_serializing)]
+    pub last_data_at: Option<String>,
+    #[serde(skip_serializing)]
+    pub record_count_15m: u64,
+    #[serde(skip_serializing)]
+    pub record_count_24h: u64,
+    pub local_usage_reconciliation_enabled: bool,
+    pub backfill_window_days: u64,
+    #[serde(default = "default_true")]
+    pub session_titles_enabled: bool,
+    #[serde(default = "default_true")]
+    pub workspace_labels_enabled: bool,
+    /// `workspace_labels_enabled` exactly as sent; `None` when the response
+    /// omitted it (the field above then defaults to on). Set only by
+    /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
+    #[serde(skip_deserializing)]
+    pub workspace_labels_explicit: Option<bool>,
+    #[serde(default)]
+    pub session_artifacts_enabled: bool,
+    // Opt-out (default on). The backend resolves the full cascade (telemetry-off
+    // / source-disabled / harvest-off ⇒ false); the daemon honors it per cycle.
+    // Defaults true so an older backend that omits the field keeps harvesting.
+    #[serde(default = "default_true")]
+    pub mcp_inventory_harvest_enabled: bool,
+    #[serde(default = "default_true")]
+    pub context_footprint_harvest_enabled: bool,
+    /// Exact additive composition detail contract; missing/null/unknown stays legacy.
+    #[serde(default)]
+    pub context_composition_details_contract: Option<String>,
+    /// Exact additive contract for withheld totals; missing/null/unknown sends none.
+    #[serde(default)]
+    pub names_withheld_contract: Option<String>,
+    #[serde(default)]
+    pub session_attribution_enabled: bool,
+    /// Additive server capability for bounded private labels on opaque
+    /// attribution facts. Defaults false so a new daemon never sends nested
+    /// fields to an older backend. The backend derives this from the existing
+    /// `session_titles_enabled` privacy choice; it is not a second consent.
+    #[serde(default)]
+    pub session_attribution_labels_enabled: bool,
+    #[serde(default, skip_serializing)]
+    pub session_attribution_hmac_key: Option<String>,
+    #[serde(default)]
+    pub session_attribution_hmac_key_version: Option<String>,
+    /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
+    #[serde(default)]
+    pub session_cache_observations_contract: Option<String>,
+    /// Exact cache full-replacement capability; effective only beside the
+    /// cache contract above. Missing/null/unknown never marks a patch.
+    #[serde(default)]
+    pub cache_full_replacement_contract: Option<String>,
+    /// Provisional class-N copy disclosure contract. Missing/null/unknown OFF.
+    #[serde(default)]
+    pub copy_unproven_contract: Option<String>,
+    /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
+    #[serde(skip_deserializing)]
+    pub max_snapshot_item_bytes: Option<u64>,
+    #[serde(skip_deserializing)]
+    pub claude_otel_only_sessions_contract: Option<String>,
+    #[serde(skip_deserializing)]
+    pub claude_otel_only_pairing_floor: Option<String>,
+    #[serde(skip_deserializing)]
+    pub claude_otel_only_pairing_ceiling: Option<String>,
+    /// Additive head-CAS capability; absent stays disabled.
+    #[serde(default)]
+    pub snapshot_head_cas_enabled: bool,
+    /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
+    #[serde(default)]
+    pub snapshot_head_cas_required: bool,
+    /// Backend admission of the `census_residue` collector error code
+    /// (`CENSUS_RESIDUE_STATUS_CONTRACT`). The backend's error-code set is a
+    /// closed list and its forward tolerance covers unknown FIELDS, never
+    /// unknown VALUES, so a daemon that emitted the code against a backend
+    /// which does not admit it would have its ENTIRE terminal receipt rejected
+    /// — no journal append, no census counters, no manifest. Missing / null /
+    /// any other token is fail-closed: the receipt keeps the legacy
+    /// `parse_error` shape and still carries the additive residue counters,
+    /// which every backend accepts.
+    #[serde(default)]
+    pub census_residue_status_contract: Option<String>,
+    /// Retired per-account cohort token for contract-5 request identity rows.
+    /// Contract 5 is always on for Claude Code, so this daemon decodes the
+    /// field for compatibility and never reads it; the server keeps sending
+    /// it for permit-era daemons.
+    #[serde(default)]
+    pub session_request_identity_contract: Option<String>,
+    /// Codex only: the user's "List my Codex cloud tasks" setting as this
+    /// server resolves it. An older server omits it, which means off. This
+    /// and the next one are set only by `decode_activity_hint`, tolerantly:
+    /// a missing or malformed value is off and never fails the hint.
+    #[serde(skip_deserializing)]
+    pub codex_cloud_tasks_enabled: bool,
+    /// Codex only: the task-list contract the server accepts.
+    #[serde(skip_deserializing)]
+    pub codex_cloud_tasks_contract: Option<String>,
+    #[serde(skip_serializing)]
+    pub recommended_scan_after: String,
+}
+
+/// Decodes an activity hint and records whether `workspace_labels_enabled`
+/// was actually sent.
+pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
+    let mut hint = ActivityHintResponse::deserialize(&value)
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.max_snapshot_item_bytes = value.get("max_snapshot_item_bytes").and_then(Value::as_u64);
+    let text = |key| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    hint.claude_otel_only_sessions_contract = text("claude_otel_only_sessions_contract");
+    hint.claude_otel_only_pairing_floor = text("claude_otel_only_pairing_floor");
+    hint.claude_otel_only_pairing_ceiling = text("claude_otel_only_pairing_ceiling");
+    // A present non-string ceiling cannot be mistaken for an open window.
+    if value
+        .get("claude_otel_only_pairing_ceiling")
+        .is_some_and(|v| !v.is_null() && !v.is_string())
+    {
+        hint.claude_otel_only_sessions_contract = None;
+    }
+    hint.workspace_labels_explicit = value
+        .get("workspace_labels_enabled")
+        .and_then(Value::as_bool);
+    hint.codex_cloud_tasks_enabled = value
+        .get("codex_cloud_tasks_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    hint.codex_cloud_tasks_contract = text("codex_cloud_tasks_contract");
+    Ok(hint)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotBatchResponse {
+    pub accepted: u64,
+    pub sessions_reconciled: u64,
+    pub session_ids: Vec<String>,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+    #[serde(default)]
+    pub entity_ack_contract: Option<String>,
+    #[serde(default)]
+    pub accepted_entities: Vec<SnapshotEntityRef>,
+    #[serde(default)]
+    pub unchanged_entities: Vec<SnapshotEntityRef>,
+    #[serde(default)]
+    pub rejected_entities: Vec<SnapshotEntityRejection>,
+    #[serde(default)]
+    pub conflict_entities: Vec<SnapshotEntityRef>,
+    /// Local-only, keyed by conflicted snapshot fingerprint. Bound from the
+    /// request at the network boundary; never read from the response wire.
+    #[serde(skip)]
+    pub(crate) conflict_rescans: std::collections::BTreeMap<String, SnapshotConflictRescan>,
+}
+
+/// The exact refused request body a head-CAS challenge was minted over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotConflictRescan {
+    pub(crate) revision_v2_hash: String,
+    /// The refused body already carried an answer to an earlier challenge.
+    pub(crate) answered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SnapshotEntityRef {
+    pub source_session_id: String,
+    pub snapshot_fingerprint: String,
+    #[serde(default = "default_occurrence_count")]
+    pub occurrence_count: u64,
+    #[serde(default)]
+    pub body_witness_version: Option<u64>,
+    #[serde(default)]
+    pub body_witness_digest: Option<String>,
+    #[serde(default)]
+    pub head_etag: Option<String>,
+    #[serde(default)]
+    pub head_challenge: Option<String>,
+    /// Set only on an `unchanged` ref the server settled because its stored
+    /// head already covers this body's usage (`usage_identical`,
+    /// `dominated_by_head`). The server did NOT store this body, so no
+    /// body-scoped state may be recorded as stored. Read, never persisted.
+    #[serde(default)]
+    pub unchanged_basis: Option<String>,
+    /// `cache_state_ack:v1`, stored-body refs only: the server-completed
+    /// cache state behind this ref's witness. Adopted only after it
+    /// reproduces that witness with this body's own parts. Older servers
+    /// never send it.
+    #[serde(default)]
+    pub cache_observations_state: Option<Value>,
+}
+
+/// `cache_state_ack:v1`: the server's stored cache state for a cache-bearing
+/// body whose digest differs from the local witness because that state holds
+/// rows this daemon never learned. Some only when the echo is a valid state
+/// and this body's own account and tool parts with it hash to the server's
+/// digest exactly.
+pub(crate) fn settled_cache_state_echo(
+    reference: &SnapshotEntityRef,
+    item: &crate::snapshots::SnapshotItem,
+) -> Option<Value> {
+    let state =
+        crate::snapshots::cache_state_from_echo(reference.cache_observations_state.as_ref()?)?;
+    let witness = crate::snapshots::snapshot_upload_body_witness_with_cache_state(item, &state)?;
+    (reference.body_witness_digest.as_deref() == Some(witness.as_str())).then_some(state)
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SnapshotEntityRejection {
+    pub source_session_id: String,
+    pub snapshot_fingerprint: String,
+    pub reason: String,
+    pub detail: String,
+    #[serde(default = "default_true")]
+    pub permanent: bool,
+    #[serde(default = "default_occurrence_count")]
+    pub occurrence_count: u64,
+}
+
+impl SnapshotEntityRejection {
+    /// `usage_decrease_hold_ack:v1`: the backend kept the old head and holds
+    /// this body for review. These known holds require their declared contract.
+    pub(crate) fn usage_decrease_hold(&self) -> bool {
+        matches!(
+            self.safe_reason(),
+            USAGE_DECREASE_HELD_FOR_REVIEW | USAGE_DECREASE_REFUSED_AFTER_REVIEW
+        )
+    }
+
+    pub(crate) fn ordinary_retryable(&self) -> bool {
+        matches!(
+            self.safe_reason(),
+            "accepted_log_stale_older_mixed" | "other"
+        )
+    }
+
+    pub(crate) fn safe_reason(&self) -> &'static str {
+        match self.reason.as_str() {
+            "reserved_session_identity_separator" => "reserved_session_identity_separator",
+            "occurred_at_beyond_future_horizon" => "occurred_at_beyond_future_horizon",
+            "hour_bucket_count_above_cap" => "hour_bucket_count_above_cap",
+            "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
+            "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
+            "accepted_log_stale_older_upload" => "accepted_log_stale_older_upload",
+            "accepted_log_stale_older_mixed" => "accepted_log_stale_older_mixed",
+            "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
+            "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
+            "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
+            "occurred_at_requires_timezone" => "occurred_at_requires_timezone",
+            "occurred_at_utc_normalization_out_of_range" => {
+                "occurred_at_utc_normalization_out_of_range"
+            }
+            "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            // Logged by name; persisted as the old enum value `other`.
+            "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
+            // Logged by name; persisted as `other` when permanent.
+            USAGE_DECREASE_HELD_FOR_REVIEW => USAGE_DECREASE_HELD_FOR_REVIEW,
+            USAGE_DECREASE_REFUSED_AFTER_REVIEW => USAGE_DECREASE_REFUSED_AFTER_REVIEW,
+            _ => "other",
+        }
+    }
+}
+
+const USAGE_DECREASE_HELD_FOR_REVIEW: &str = "usage_decrease_held_for_review";
+const USAGE_DECREASE_REFUSED_AFTER_REVIEW: &str = "usage_decrease_refused_after_review";
+
+fn default_occurrence_count() -> u64 {
+    1
+}
+
+/// Cache patches (legal only under CAS), telemetry-only bodies and bodies
+/// whose session has a saved head declare head CAS for their whole request.
+/// An accepted CAS write returns a fresh head with or without a patch, so a
+/// headed session keeps it.
+pub(crate) fn declares_head_cas(item: &crate::snapshots::SnapshotItem) -> bool {
+    item.cache_observations.is_some()
+        || item.cache_base_head_etag.is_some()
+        || item.evidence_basis == Some("otel_only")
+}
+
+/// The existing public ACK version for additive body evidence. Keep synthetic
+/// transport responses on the same contract as the production ACK validator;
+/// internal envelope versions are not public ACK versions.
+pub(crate) fn snapshot_ack_body_witness_version(
+    item: &crate::snapshots::SnapshotItem,
+) -> Result<Option<u64>> {
+    if item.session_account_evidence.is_none() && item.cache_observations.is_none() {
+        return Ok(None);
+    }
+    let version = snapshot_upload_body_witness_version(item)
+        .filter(|version| {
+            matches!(
+                *version,
+                15 | 16
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
+                    | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            )
+        })
+        .ok_or_else(|| anyhow!("snapshot evidence has no supported body witness version"))?;
+    let public_version = match version {
+        15 => 13,
+        16 => 14,
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                13
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+            }
+        }
+        SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
+            if item.cache_observations.is_some() {
+                14
+            } else {
+                SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+            }
+        }
+        _ => unreachable!("the supported-version filter is exhaustive"),
+    };
+    Ok(Some(public_version))
+}
+
+impl SnapshotBatchResponse {
+    /// Bind each challenged head-CAS conflict to the revision v2 hash its
+    /// request body carried, recomputed with the same envelope function the
+    /// serializer used. A later upload answers the challenge through the
+    /// backend's existing rescan handshake. Call after ACK validation.
+    pub(crate) fn bind_conflict_rescans(
+        &mut self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) {
+        let Some(source) = crate::snapshots::snapshot_source_from_api_slug(&request.source) else {
+            return;
+        };
+        for reference in &self.conflict_entities {
+            if !valid_snapshot_head_token(reference.head_challenge.as_deref()) {
+                continue;
+            }
+            let Some(item) = request.items().find(|item| {
+                item.source_session_id == reference.source_session_id
+                    && item.snapshot_fingerprint == reference.snapshot_fingerprint
+            }) else {
+                continue;
+            };
+            let envelope =
+                crate::snapshots::snapshot_semantic_envelope(source, item, request.upload_policy);
+            self.conflict_rescans.insert(
+                reference.snapshot_fingerprint.clone(),
+                SnapshotConflictRescan {
+                    revision_v2_hash: envelope.revision_v2_hash,
+                    answered: envelope.conflict_head_challenge.is_some(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn require_entity_ack_contract(&self) -> Result<(), SnapshotAckRejected> {
+        let reason = match self.entity_ack_contract.as_deref() {
+            Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => return Ok(()),
+            None => "snapshot response lacks the entity ACK contract",
+            Some(_) => "snapshot response uses an unsupported entity ACK contract",
+        };
+        Err(SnapshotAckRejected { reason })
+    }
+
+    /// Reject malformed, short, duplicated, foreign, overlapping, or partial
+    /// ACKs before any local checkpoint can advance.
+    pub fn validate_entity_ack(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
+        self.validate_entity_ack_with_head_cas(request, false)
+    }
+
+    pub fn validate_entity_ack_with_head_cas(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        enforce_head_cas: bool,
+    ) -> Result<()> {
+        self.validate_entity_ack_with_head_cas_inner(request, enforce_head_cas)
+            .map_err(|error| {
+                let rejected = anyhow::Error::new(SnapshotAckRejected::from_validation(&error));
+                match error.downcast::<RefusedSnapshotIndexes>() {
+                    Ok(named) => rejected.context(named),
+                    Err(_) => rejected,
+                }
+            })
+    }
+
+    fn validate_entity_ack_with_head_cas_inner(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        enforce_head_cas: bool,
+    ) -> Result<()> {
+        let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
+        if self.disabled {
+            if self.accepted != 0
+                || !self.accepted_entities.is_empty()
+                || !self.unchanged_entities.is_empty()
+                || !self.rejected_entities.is_empty()
+                || !self.conflict_entities.is_empty()
+            {
+                return Err(anyhow!(
+                    "disabled snapshot response contains entity outcomes"
+                ));
+            }
+            return Ok(());
+        }
+        self.require_entity_ack_contract()?;
+        self.validate_entity_ack_identities(request.items().map(|item| {
+            (
+                item.source_session_id.as_str(),
+                item.snapshot_fingerprint.as_str(),
+            )
+        }))?;
+        self.validate_head_cas_ack(enforce_head_cas)?;
+        self.validate_usage_decrease_holds(request)?;
+        self.validate_body_witness_ack(request)
+    }
+
+    /// A retryable hold names a request-owned literal body of a batch that
+    /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
+    fn validate_usage_decrease_holds(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
+        let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
+        for rejection in self
+            .rejected_entities
+            .iter()
+            .filter(|r| !r.permanent && r.usage_decrease_hold())
+        {
+            let held_literal = declared
+                && request.items().any(|item| {
+                    item.source_session_id == rejection.source_session_id
+                        && item.snapshot_fingerprint == rejection.snapshot_fingerprint
+                        && crate::snapshots::claude_request_money::is_request_owned_literal(item)
+                });
+            if !held_literal {
+                return Err(anyhow!(
+                    "snapshot ACK holds a body that did not declare the hold contract"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_head_cas_ack(&self, enforce_head_cas: bool) -> Result<()> {
+        let all_refs = self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+            .chain(&self.conflict_entities);
+        if !enforce_head_cas {
+            if all_refs.clone().any(|reference| {
+                reference.head_etag.is_some() || reference.head_challenge.is_some()
+            }) {
+                return Err(anyhow!(
+                    "snapshot ACK returned head tokens for a request without the head-CAS contract"
+                ));
+            }
+            return Ok(());
+        }
+        for reference in self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+        {
+            if !valid_snapshot_head_token(reference.head_etag.as_deref())
+                || reference.head_challenge.is_some()
+            {
+                return Err(anyhow!(
+                    "snapshot head-CAS ACK lacks an exclusive accepted head etag"
+                ));
+            }
+        }
+        for reference in &self.conflict_entities {
+            if reference.head_etag.is_some()
+                || !valid_snapshot_head_token(reference.head_challenge.as_deref())
+            {
+                return Err(anyhow!(
+                    "snapshot head-CAS conflict lacks an exclusive head challenge"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_body_witness_ack(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
+        let mut expected = std::collections::BTreeMap::new();
+        let mut answered = std::collections::BTreeSet::new();
+        for item in request.items() {
+            let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
+                continue;
+            };
+            let key = (
+                item.source_session_id.clone(),
+                item.snapshot_fingerprint.clone(),
+            );
+            if item.cache_conflict_answer.is_some() {
+                answered.insert(key.clone());
+            }
+            let proof = (public_version, snapshot_upload_body_witness(item));
+            if expected
+                .insert(key, (proof.clone(), item))
+                .is_some_and(|(previous, _)| previous != proof)
+            {
+                return Err(anyhow!(
+                    "snapshot request contains conflicting snapshot evidence body witnesses"
+                ));
+            }
+        }
+        let mut first = None;
+        let mut bad_refs = 0_usize;
+        let mut echo_settled = 0_usize;
+        let mut named = std::collections::BTreeSet::new();
+        let accepted = self.accepted_entities.iter().map(|r| ("accepted", r));
+        let unchanged = self.unchanged_entities.iter().map(|r| ("unchanged", r));
+        for (class, reference) in accepted.chain(unchanged) {
+            let key = (
+                reference.source_session_id.clone(),
+                reference.snapshot_fingerprint.clone(),
+            );
+            let Some(((expected_version, expected_digest), item)) = expected.get(&key) else {
+                continue;
+            };
+            let Some(reason) =
+                body_witness_refusal_reason(reference, *expected_version, expected_digest)
+            else {
+                continue;
+            };
+            if reason == "digest_mismatch" && settled_cache_state_echo(reference, item).is_some() {
+                echo_settled += 1;
+                continue;
+            }
+            // Keep walking after the first refusal: every bad ref is named,
+            // and the one diagnostic line counts them all.
+            bad_refs += 1;
+            named.insert((
+                reference.source_session_id.as_str(),
+                reference.snapshot_fingerprint.as_str(),
+            ));
+            if first.is_none() {
+                first = Some((
+                    reason,
+                    class,
+                    reference,
+                    *expected_version,
+                    answered.contains(&key),
+                    *item,
+                ));
+            }
+        }
+        if echo_settled > 0 {
+            eprintln!(
+                "local snapshot ACK settled {echo_settled} body witness(es) through the server's echoed cache state"
+            );
+        }
+        let Some((reason, class, reference, expected_version, answered, item)) = first else {
+            return Ok(());
+        };
+        warn_body_witness_refusal(
+            reason,
+            class,
+            reference,
+            expected_version,
+            answered,
+            bad_refs,
+            item,
+        );
+        Err(anyhow::Error::new(RefusedSnapshotIndexes(
+            request
+                .items()
+                .enumerate()
+                .filter(|(_, item)| {
+                    named.contains(&(
+                        item.source_session_id.as_str(),
+                        item.snapshot_fingerprint.as_str(),
+                    ))
+                })
+                .map(|(index, _)| index)
+                .collect(),
+        )))
+    }
+
+    pub(crate) fn validate_entity_ack_identities<'a>(
+        &self,
+        identities: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<()> {
+        let mut requested = std::collections::BTreeMap::new();
+        for (source_session_id, snapshot_fingerprint) in identities {
+            *requested
+                .entry((
+                    source_session_id.to_string(),
+                    snapshot_fingerprint.to_string(),
+                ))
+                .or_insert(0_u64) += 1;
+        }
+        let mut covered = std::collections::BTreeMap::new();
+        let mut classifications = std::collections::BTreeMap::new();
+        let mut accepted_or_unchanged = 0_u64;
+        for (classification, references) in [
+            ("accepted", self.accepted_entities.as_slice()),
+            ("unchanged", self.unchanged_entities.as_slice()),
+        ] {
+            for reference in references {
+                validate_snapshot_entity_ref(reference)?;
+                record_snapshot_ack_occurrences(
+                    &requested,
+                    &mut covered,
+                    &mut classifications,
+                    reference.source_session_id.as_str(),
+                    reference.snapshot_fingerprint.as_str(),
+                    reference.occurrence_count,
+                    classification,
+                )?;
+                accepted_or_unchanged = accepted_or_unchanged
+                    .checked_add(reference.occurrence_count)
+                    .ok_or_else(|| anyhow!("snapshot ACK accepted count overflow"))?;
+            }
+        }
+        for rejection in &self.rejected_entities {
+            let reference = SnapshotEntityRef {
+                source_session_id: rejection.source_session_id.clone(),
+                snapshot_fingerprint: rejection.snapshot_fingerprint.clone(),
+                occurrence_count: rejection.occurrence_count,
+                body_witness_version: None,
+                body_witness_digest: None,
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: None,
+                cache_observations_state: None,
+            };
+            validate_snapshot_entity_ref(&reference)?;
+            if !rejection.permanent
+                && !rejection.usage_decrease_hold()
+                && !rejection.ordinary_retryable()
+            {
+                return Err(anyhow!("snapshot ACK contains invalid rejection"));
+            }
+            record_snapshot_ack_occurrences(
+                &requested,
+                &mut covered,
+                &mut classifications,
+                rejection.source_session_id.as_str(),
+                rejection.snapshot_fingerprint.as_str(),
+                rejection.occurrence_count,
+                "rejected",
+            )?;
+        }
+        for reference in &self.conflict_entities {
+            validate_snapshot_entity_ref(reference)?;
+            record_snapshot_ack_occurrences(
+                &requested,
+                &mut covered,
+                &mut classifications,
+                reference.source_session_id.as_str(),
+                reference.snapshot_fingerprint.as_str(),
+                reference.occurrence_count,
+                "conflict",
+            )?;
+        }
+        if covered != requested {
+            return Err(anyhow!("snapshot ACK does not cover the request exactly"));
+        }
+        if self.accepted != accepted_or_unchanged {
+            return Err(anyhow!("snapshot ACK accepted count mismatch"));
+        }
+        Ok(())
+    }
+}
+
+/// The first check an ACK reference fails against its request body witness.
+fn body_witness_refusal_reason(
+    reference: &SnapshotEntityRef,
+    expected_version: u64,
+    expected_digest: &str,
+) -> Option<&'static str> {
+    match (
+        reference.body_witness_version,
+        reference.body_witness_digest.as_deref(),
+    ) {
+        (None, _) => Some("missing_version"),
+        (Some(version), _) if version != expected_version => Some("version_mismatch"),
+        (_, None) => Some("missing_digest"),
+        (_, Some(digest)) if digest != expected_digest => Some("digest_mismatch"),
+        _ => None,
+    }
+}
+
+/// One line per refused body-witness ACK, naming the first failing reference
+/// and how many failed. An answered head-CAS challenge recovers through the
+/// next conflict. Only hashes, digest prefixes and versions are logged.
+fn warn_body_witness_refusal(
+    reason: &str,
+    class: &str,
+    reference: &SnapshotEntityRef,
+    expected_version: u64,
+    answered: bool,
+    bad_refs: usize,
+    item: &crate::snapshots::SnapshotItem,
+) {
+    use sha2::Digest;
+    let parts = [
+        json!(&item.session_account_evidence),
+        json!((&item.tool_usage, item.tool_usage_truncated)),
+        json!((&item.cache_observations, &item.cache_observations_state)),
+    ]
+    .map(|part| {
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).expect("witness part"))
+        )
+    });
+    let line = format!(
+        "warning: local snapshot ACK body witness refused: reason={reason} class={class} \
+         session_hash={} fingerprint={} witness_version={expected_version} echoed_digest={} \
+         echoed_witness_version={} bad_refs={bad_refs} answered={answered} \
+         expected_digest={} account_part={} tool_part={} cache_part={}",
+        crate::snapshot_sync::SessionHash::of(&reference.source_session_id),
+        reference.snapshot_fingerprint.get(..8).unwrap_or_default(),
+        reference
+            .body_witness_digest
+            .as_deref()
+            .and_then(|digest| digest.get(..8))
+            .unwrap_or("none"),
+        reference
+            .body_witness_version
+            .map_or_else(|| "none".to_string(), |version| version.to_string()),
+        &snapshot_upload_body_witness(item)[..8],
+        &parts[0][..8],
+        &parts[1][..8],
+        &parts[2][..8],
+    );
+    eprintln!("{line}");
+    #[cfg(test)]
+    BODY_WITNESS_REFUSALS.with(|lines| lines.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BODY_WITNESS_REFUSALS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn valid_snapshot_head_token(value: Option<&str>) -> bool {
+    value.is_some_and(crate::hex::is_sha256_lower)
+}
+
+fn record_snapshot_ack_occurrences(
+    requested: &std::collections::BTreeMap<(String, String), u64>,
+    covered: &mut std::collections::BTreeMap<(String, String), u64>,
+    classifications: &mut std::collections::BTreeMap<(String, String), &'static str>,
+    source_session_id: &str,
+    snapshot_fingerprint: &str,
+    occurrence_count: u64,
+    classification: &'static str,
+) -> Result<()> {
+    let key = (
+        source_session_id.to_string(),
+        snapshot_fingerprint.to_string(),
+    );
+    let Some(expected) = requested.get(&key) else {
+        return Err(anyhow!("snapshot ACK contains a foreign entity"));
+    };
+    if occurrence_count == 0 {
+        return Err(anyhow!("snapshot ACK occurrence_count must be positive"));
+    }
+    if classifications
+        .insert(key.clone(), classification)
+        .is_some()
+    {
+        return Err(anyhow!(
+            "snapshot ACK contains a duplicate outcome identity"
+        ));
+    }
+    let observed = covered.entry(key).or_insert(0);
+    *observed = observed
+        .checked_add(occurrence_count)
+        .ok_or_else(|| anyhow!("snapshot ACK occurrence_count overflow"))?;
+    if *observed > *expected {
+        return Err(anyhow!("snapshot ACK over-counts an entity"));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
+    if reference.source_session_id.trim().is_empty()
+        || reference.occurrence_count == 0
+        || reference.snapshot_fingerprint.len() != 64
+        || !reference
+            .snapshot_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(anyhow!("snapshot ACK entity identity is malformed"));
+    }
+    match (
+        reference.body_witness_version,
+        reference.body_witness_digest.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(version), Some(digest))
+            if matches!(version, 3..=20) && crate::hex::is_sha256_lower(digest) => {}
+        _ => return Err(anyhow!("snapshot ACK body witness proof is malformed")),
+    }
+    Ok(())
+}
+
+/// What a collector-status submission IS, declared by the collector instead of
+/// inferred by the backend from the payload's shape.
+///
+/// The backend used to answer "is this a liveness beat?" by looking at the
+/// wire: `last_scan_finished_at is None` and no error/retry/failure fields. That
+/// inference is a shape coincidence, not a statement of intent, and it silently
+/// re-classifies a receipt the moment the collector's liveness shape changes.
+/// This enum makes the collector say what it means, and the two variants are
+/// produced at exactly two construction sites — one per meaning — never
+/// computed from the fields being sent.
+///
+/// `Deserialize` is not wire-inbound: nothing ever parses a report kind off a
+/// response. It exists because the terminal status journal writes
+/// the exact `SnapshotStatusRequest` it is about to POST to disk and reads it
+/// back, so every field of that struct — this one included — must survive the
+/// round trip rather than being silently dropped from the replayed receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStatusReportKind {
+    /// A liveness beat. It asserts only "this collector is alive"; every
+    /// scan-result field it carries is either absent or evidence the backend
+    /// has already accepted. It may never disclose something new.
+    Checkin,
+    /// A scan-result report: a completed traversal, a scan or upload failure, a
+    /// changed loss census, a cap-hit change, or an enabled/disabled
+    /// transition.
+    ScanStatus,
+}
+
+/// Activity-hint token under which the backend admits `census_residue` as a
+/// collector error code and declares the residue counters beside it. Compared
+/// exactly; a different version, `null`, or an absent field keeps the legacy
+/// receipt shape.
+pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
+
+/// Collector error code for a census that COMPLETED and whose every disclosed
+/// loss class is exactly the loss the daemon settled as non-progressing. Not a
+/// failure: the receipt carrying it also carries `last_success_at` and zero
+/// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
+pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
+
+/// Content-free first failed census gate, in the shared receipt builder's order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusBlockCause {
+    UnreadableEvents,
+    DisappearedFiles,
+    CarryAdmission,
+    StateLoader,
+    TransportReservation,
+    OwnershipIncomplete,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotStatusRequest {
+    pub schema_version: u16,
+    pub source: String,
+    pub machine_id: String,
+    /// Declared submission kind. Additive and optional on the wire contract:
+    /// a backend that predates it ignores the field (its status model is
+    /// forward-tolerant), and one that reads it gets the collector's own
+    /// classification instead of a shape guess.
+    pub report_kind: SnapshotStatusReportKind,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub last_scan_started_at: Option<String>,
+    pub last_scan_finished_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub last_uploaded_count: u64,
+    pub last_scanned_session_count: u64,
+    pub last_scanned_file_count: u64,
+    pub last_zero_snapshot_confirmed_count: u64,
+    pub last_zero_snapshot_usage_evidence_count: u64,
+    pub last_dropped_usage_record_count: u64,
+    pub last_ownership_incomplete_file_count: u64,
+    pub last_snapshot_unproven_terminal_count: u64,
+    pub last_snapshot_superseded_terminal_count: u64,
+    pub last_backfill_window_days: u64,
+    /// First census end minus the fixed first-read window; terminal status only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_read_cutoff: Option<String>,
+    pub last_backfill_file_limit: u64,
+    pub last_discovered_file_count: u64,
+    pub last_skipped_file_count_due_to_limit: u64,
+    pub last_scan_cap_hit: bool,
+    /// Sessions the local semantic fuse classified as no-ops and therefore did
+    /// not upload. Without it, "the collector suppressed 718 unchanged
+    /// sessions" and "the collector did nothing" are the same receipt.
+    pub last_semantic_noop_count: u64,
+    /// Whether the last traversal saw the whole corpus. Present only on a scan
+    /// result; ABSENT on a liveness beat.
+    ///
+    /// The distinction is load-bearing on the wire, not a style choice. The
+    /// backend merges a check-in's census into what it already retained, and
+    /// completeness has no arithmetic identity the way a counter's zero does:
+    /// it resolves an omitted value by RETAINING the accepted one and an
+    /// explicitly declared `false` by LOWERING it, because only a real census
+    /// can assert incompleteness. A beat has run no census, so a hardcoded
+    /// `false` here would be a measurement it never took — and would retract a
+    /// complete census on every heartbeat. Omission is the honest wire shape,
+    /// so this is an `Option` that a beat leaves `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_census_complete: Option<bool>,
+    pub last_symlink_rejected_count: u64,
+    pub last_unreadable_path_count: u64,
+    pub last_oversized_file_count: u64,
+    pub last_disappeared_file_count: u64,
+    pub last_malformed_json_line_count: u64,
+    pub last_invalid_utf8_line_count: u64,
+    pub last_over_line_cap_count: u64,
+    pub last_recognized_usage_drop_count: u64,
+    /// The daemon's own SETTLED, non-progressing share of each public loss
+    /// counter above (`ScanTraversalCounts::terminal_*`): the part of the loss
+    /// it proved a later traversal of the same bytes cannot change. Each is a
+    /// DECOMPOSITION of the public counter it is named after, never an addend
+    /// beside it, so `terminal <= public` always holds and a completed census
+    /// may legitimately carry a nonzero value. A backend can therefore prove
+    /// class by class, by equality, that every loss a receipt discloses is
+    /// exactly the loss the daemon settled — instead of taking an opaque error
+    /// code on faith. Additive: a backend that predates them ignores them.
+    /// `#[serde(default)]` so a body that predates them still deserializes.
+    #[serde(default)]
+    pub last_terminal_ownership_incomplete_file_count: u64,
+    #[serde(default)]
+    pub last_terminal_zero_snapshot_usage_evidence_count: u64,
+    #[serde(default)]
+    pub last_terminal_recognized_usage_drop_count: u64,
+    #[serde(default)]
+    pub last_terminal_dropped_usage_record_count: u64,
+    #[serde(default)]
+    pub last_terminal_over_line_cap_count: u64,
+    /// True when this receipt's census completed with disclosed loss and every
+    /// nonzero loss class equals its terminal counterpart above: the residue
+    /// was settled as non-progressing this generation. False on a clean census
+    /// (nothing to settle), on an incomplete one, and whenever a retryable
+    /// problem or an unsettled class remains. Sent regardless of whether the
+    /// backend admits `census_residue`, so the disclosure is journaled even
+    /// while the error code still reads `parse_error`.
+    #[serde(default)]
+    pub last_census_residue_settled: bool,
+    /// Cardinalities of the local residue witness, COUNTS ONLY. The witness
+    /// itself holds local filesystem index keys; they never reach the wire.
+    #[serde(default)]
+    pub last_census_residue_index_key_count: u64,
+    #[serde(default)]
+    pub last_census_residue_archived_rollout_count: u64,
+    /// Census-member queue plus carry replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_pending_file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_census_block_cause: Option<CensusBlockCause>,
+    pub consecutive_failures: u64,
+    pub next_retry_at: Option<String>,
+    pub collector_version: Option<String>,
+    pub parser_version: Option<String>,
+    /// `{source, entity_count, rolling_hash}` over this source's scan index, as
+    /// of the most recent completed scan on this machine. On a terminal status,
+    /// absence explicitly withdraws prior agreement; on a nonterminal check-in,
+    /// absence is liveness-only/unknown. Never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<SnapshotSourceManifest>,
+    /// Local control-plane health, carried only by
+    /// check-ins; every other body leaves it `None`, which omits the key, so
+    /// their wire shape is unchanged. Additive: the backend's status model is
+    /// forward-tolerant, and `default` keeps journals written before the field
+    /// reloading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<crate::control_plane_health::ControlPlaneHealth>,
+}
+
+impl SnapshotStatusRequest {
+    /// Name the first field that makes a `checkin` declaration false, if any.
+    ///
+    /// This is NOT a classifier: it never decides what a receipt is. It only
+    /// falsifies a claim the collector already made. A liveness beat says "I
+    /// have nothing new"; if the payload beside that claim discloses a scan
+    /// result the backend has not accepted yet, the claim is a lie and the
+    /// receipt must not travel.
+    ///
+    /// The exhaustive destructure is the point: a new wire field cannot be
+    /// added without deciding, at compile time, whether a liveness beat is
+    /// allowed to carry it.
+    fn checkin_contradicting_evidence(&self) -> Option<&'static str> {
+        let Self {
+            schema_version: _,
+            source: _,
+            machine_id: _,
+            report_kind: _,
+            enabled,
+            disabled_reason,
+            // The one clock a beat may legitimately carry. It declares an
+            // in-progress traversal — a cycle-start marker — which is a
+            // liveness statement, not a result.
+            last_scan_started_at: _,
+            last_scan_finished_at,
+            last_success_at,
+            last_error_code,
+            last_error_message,
+            last_uploaded_count,
+            last_scanned_session_count,
+            last_scanned_file_count,
+            last_zero_snapshot_confirmed_count,
+            last_zero_snapshot_usage_evidence_count,
+            last_dropped_usage_record_count,
+            last_ownership_incomplete_file_count,
+            last_snapshot_unproven_terminal_count,
+            last_snapshot_superseded_terminal_count,
+            // Server-negotiated policy width, not scan evidence: the beat
+            // reports back the hint the server just gave it.
+            last_backfill_window_days: _,
+            first_read_cutoff,
+            last_backfill_file_limit,
+            last_discovered_file_count,
+            last_skipped_file_count_due_to_limit,
+            last_scan_cap_hit,
+            last_semantic_noop_count,
+            last_census_complete,
+            last_symlink_rejected_count,
+            last_unreadable_path_count,
+            last_oversized_file_count,
+            last_disappeared_file_count,
+            last_malformed_json_line_count,
+            last_invalid_utf8_line_count,
+            last_over_line_cap_count,
+            last_recognized_usage_drop_count,
+            last_terminal_ownership_incomplete_file_count,
+            last_terminal_zero_snapshot_usage_evidence_count,
+            last_terminal_recognized_usage_drop_count,
+            last_terminal_dropped_usage_record_count,
+            last_terminal_over_line_cap_count,
+            last_census_residue_settled,
+            last_census_residue_index_key_count,
+            last_census_residue_archived_rollout_count,
+            last_census_pending_file_count,
+            last_census_block_cause,
+            consecutive_failures,
+            next_retry_at,
+            // Build identity, unrelated to any scan.
+            collector_version: _,
+            parser_version: _,
+            // A cached witness from the last COMPLETED terminal report — the
+            // backend has already accepted it. Repeating it discloses nothing
+            // new, and a beat that says "alive" while the entity sets disagree
+            // is exactly what the manifest exists to expose.
+            manifest: _,
+            // Daemon process health, not scan evidence: a beat is exactly the
+            // cadence it is meant to travel on.
+            control_plane: _,
+        } = self;
+        // A collector reporting itself disabled is making a durable state
+        // report, which is the opposite of a liveness beat. The backend
+        // rejects `checkin` + disabled outright; never build one.
+        if !*enabled {
+            return Some("enabled=false");
+        }
+        if disabled_reason.is_some() {
+            return Some("disabled_reason");
+        }
+        if last_scan_finished_at.is_some() {
+            return Some("last_scan_finished_at");
+        }
+        if last_success_at.is_some() {
+            return Some("last_success_at");
+        }
+        if last_error_code.is_some() {
+            return Some("last_error_code");
+        }
+        if last_error_message.is_some() {
+            return Some("last_error_message");
+        }
+        if first_read_cutoff.is_some() {
+            return Some("first_read_cutoff");
+        }
+        if last_census_pending_file_count.is_some() {
+            return Some("last_census_pending_file_count");
+        }
+        if last_census_block_cause.is_some() {
+            return Some("last_census_block_cause");
+        }
+        if next_retry_at.is_some() {
+            return Some("next_retry_at");
+        }
+        if *last_scan_cap_hit {
+            return Some("last_scan_cap_hit");
+        }
+        // Completeness is a claim only a real census can make — in EITHER
+        // direction. `true` asserts a complete census; an explicit `false`
+        // asserts an incomplete one, which the backend reads as a fresh
+        // disclosure and uses to lower a retained `true`. A beat has taken no
+        // census, so the only honest wire shape is absence. This mirrors the
+        // backend's own `model_fields_set` rule: present means declared.
+        if last_census_complete.is_some() {
+            return Some("last_census_complete");
+        }
+        // Settled residue is a census verdict; only a scan result can claim it.
+        if *last_census_residue_settled {
+            return Some("last_census_residue_settled");
+        }
+        for (name, value) in [
+            ("last_uploaded_count", *last_uploaded_count),
+            ("last_scanned_session_count", *last_scanned_session_count),
+            ("last_scanned_file_count", *last_scanned_file_count),
+            (
+                "last_zero_snapshot_confirmed_count",
+                *last_zero_snapshot_confirmed_count,
+            ),
+            (
+                "last_zero_snapshot_usage_evidence_count",
+                *last_zero_snapshot_usage_evidence_count,
+            ),
+            (
+                "last_dropped_usage_record_count",
+                *last_dropped_usage_record_count,
+            ),
+            (
+                "last_ownership_incomplete_file_count",
+                *last_ownership_incomplete_file_count,
+            ),
+            (
+                "last_snapshot_unproven_terminal_count",
+                *last_snapshot_unproven_terminal_count,
+            ),
+            (
+                "last_snapshot_superseded_terminal_count",
+                *last_snapshot_superseded_terminal_count,
+            ),
+            ("last_backfill_file_limit", *last_backfill_file_limit),
+            ("last_discovered_file_count", *last_discovered_file_count),
+            (
+                "last_skipped_file_count_due_to_limit",
+                *last_skipped_file_count_due_to_limit,
+            ),
+            ("last_semantic_noop_count", *last_semantic_noop_count),
+            ("last_symlink_rejected_count", *last_symlink_rejected_count),
+            ("last_unreadable_path_count", *last_unreadable_path_count),
+            ("last_oversized_file_count", *last_oversized_file_count),
+            ("last_disappeared_file_count", *last_disappeared_file_count),
+            (
+                "last_malformed_json_line_count",
+                *last_malformed_json_line_count,
+            ),
+            (
+                "last_invalid_utf8_line_count",
+                *last_invalid_utf8_line_count,
+            ),
+            ("last_over_line_cap_count", *last_over_line_cap_count),
+            (
+                "last_recognized_usage_drop_count",
+                *last_recognized_usage_drop_count,
+            ),
+            (
+                "last_terminal_ownership_incomplete_file_count",
+                *last_terminal_ownership_incomplete_file_count,
+            ),
+            (
+                "last_terminal_zero_snapshot_usage_evidence_count",
+                *last_terminal_zero_snapshot_usage_evidence_count,
+            ),
+            (
+                "last_terminal_recognized_usage_drop_count",
+                *last_terminal_recognized_usage_drop_count,
+            ),
+            (
+                "last_terminal_dropped_usage_record_count",
+                *last_terminal_dropped_usage_record_count,
+            ),
+            (
+                "last_terminal_over_line_cap_count",
+                *last_terminal_over_line_cap_count,
+            ),
+            (
+                "last_census_residue_index_key_count",
+                *last_census_residue_index_key_count,
+            ),
+            (
+                "last_census_residue_archived_rollout_count",
+                *last_census_residue_archived_rollout_count,
+            ),
+            ("consecutive_failures", *consecutive_failures),
+        ] {
+            if value != 0 {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Refuse to send a receipt whose declared kind its own payload falsifies.
+    ///
+    /// Placed on the single egress so no future caller can route around it.
+    pub fn validate_declared_report_kind(&self) -> Result<()> {
+        if self.report_kind != SnapshotStatusReportKind::Checkin {
+            return Ok(());
+        }
+        match self.checkin_contradicting_evidence() {
+            None => Ok(()),
+            Some(field) => Err(anyhow!(
+                "collector status declared report_kind=checkin while disclosing new scan evidence: {field}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotStatusResponse {
+    pub accepted: bool,
+    pub source: String,
+    pub machine_id: String,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStatusSnapshotUploadRequest {
+    pub machine_id: String,
+    pub snapshots: Vec<AgentStatusSnapshot>,
+}
+
+// Missing org is unknown; only an explicitly uploaded empty component can
+// admit personal-account display metadata from the response.
+fn uploaded_nickname_identity_matches(
+    pair: &ottto_protocol::AccountNicknamePairV1,
+    account: &Option<String>,
+    organization: &Option<String>,
+) -> bool {
+    pair.account_identifier_hash.is_some()
+        && pair.organization_identifier_hash.is_some()
+        && &pair.account_identifier_hash == account
+        && &pair.organization_identifier_hash == organization
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentStatusSnapshotUploadResponse {
+    /// Optional display metadata: absent/malformed must never fail ingest.
+    #[serde(default, deserialize_with = "decode_account_nicknames")]
+    pub account_nicknames: Option<Vec<ottto_protocol::AccountNicknameV1>>,
+    pub accepted: u64,
+    pub machine_id: String,
+    pub sources: Vec<String>,
+    /// AI-generated machine icon the web shows, echoed back by the backend so the
+    /// daemon can surface it on `status.machine.icon_url`. Absent on older
+    /// backends (serde default → None).
+    #[serde(default)]
+    pub machine_icon_url: Option<String>,
+    #[serde(default)]
+    pub machine_icon_version: Option<i64>,
+}
+
+fn decode_account_nicknames<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<ottto_protocol::AccountNicknameV1>>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_array().map(|values| {
+        values
+            .iter()
+            .filter(|value| value.get("nickname").is_some())
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .collect()
+    }))
+}
+
+#[derive(Deserialize)]
+struct RelayTokenResponse {
+    token: String,
+    expires_at: Option<String>,
+}
+
+pub fn relay_token_request_payload(device: &LocalDeviceBinding, source: &str) -> Value {
+    let mut payload = json!({
+        "source": source,
+        "platform": std::env::consts::OS,
+        "client_name": "ottto-service",
+        "client_version": compiled_release_version(),
+    });
+    if let Some(machine_id) = device.machine_id.as_deref().map(str::trim) {
+        if !machine_id.is_empty() {
+            payload["machine_id"] = json!(machine_id);
+        }
+    }
+    payload
+}
+
+fn require_cloud_session_success(
+    response: ureq::Response,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> Result<ureq::Response> {
+    let status = response.status();
+    if (200..300).contains(&status) {
+        Ok(response)
+    } else {
+        Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+            operation, endpoint, status, &response,
+        )))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("config upload refused: source_disabled")]
+pub(crate) struct UploadRefused;
+
+#[expect(clippy::result_large_err, reason = "preserve ureq's send result")]
+fn relay_sent(
+    token: &str,
+    result: std::result::Result<ureq::Response, ureq::Error>,
+) -> std::result::Result<ureq::Response, ureq::Error> {
+    if matches!(&result, Err(ureq::Error::Status(401 | 403, _))) {
+        crate::relay_auth::evict(token);
+    }
+    result
+}
+
+/// A relay-token upload's outcome. A 401/403 surfaces as a relay-authorization
+/// error so the caller can refresh credentials; 400/422 means the `label`
+/// contract drifted.
+fn relay_token_upload_response(
+    sent: std::result::Result<ureq::Response, ureq::Error>,
+    label: &str,
+) -> Result<Value> {
+    match sent {
+        Ok(response) => {
+            let body: Value = response
+                .into_json()
+                .map_err(|error| anyhow!("parse {label} response failed: {error}"))?;
+            if body.get("accepted").and_then(Value::as_bool) == Some(false)
+                && body.get("reason").and_then(Value::as_str) == Some("source_disabled")
+            {
+                return Err(UploadRefused.into());
+            }
+            Ok(body)
+        }
+        Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+            Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                status: code,
+                suppressed: false,
+            }))
+        }
+        Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+            Err(anyhow!("backend rejected {label}: HTTP {code}"))
+        }
+        Err(error) => Err(anyhow!("upload {label} failed: {error}")),
+    }
+}
+
+/// A failed cloud-session request: 401/403 is an authorization rejection;
+/// 404/405/410 means this server does not offer the route (410: not this
+/// contract any more); 409 a refusal; 400/415/422 a contract rejection; 408/429/503 a
+/// shed with its `Retry-After`; any other status or a transport failure
+/// carries upload diagnostics. No other response body is read.
+fn cloud_session_request_error(
+    error: ureq::Error,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(code @ (401 | 403), _response) => {
+            anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
+        }
+        ureq::Error::Status(code @ (404 | 405 | 410), _response) => {
+            anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
+        }
+        ureq::Error::Status(409, _response) => anyhow::Error::new(CloudTaskRefused { status: 409 }),
+        ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
+            anyhow::Error::new(CloudSessionContractRejected { status: code })
+        }
+        ureq::Error::Status(status @ (408 | 429 | 503), response) => {
+            anyhow::Error::new(UploadShed {
+                status,
+                retry_after: response_retry_after(&response),
+                code: None,
+            })
+        }
+        ureq::Error::Status(code, response) => anyhow::Error::new(UploadFailureDiagnostics::http(
+            operation, endpoint, code, &response,
+        )),
+        error => anyhow::Error::new(UploadFailureDiagnostics::transport(
+            operation, endpoint, &error,
+        )),
+    }
+}
+
+type NicknameGenerations = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>>,
+>;
+
+#[derive(Debug, Clone)]
+pub struct SnapshotApiClient {
+    nickname_generations: NicknameGenerations,
+    api_base_url: String,
+    agent: ureq::Agent,
+    batch_agent: ureq::Agent,
+    receipt_state_dir: Option<PathBuf>,
+    receipt_destination_namespace: Option<String>,
+    receipt_context: crate::upload_receipts::UploadReceiptContext,
+}
+
+impl SnapshotApiClient {
+    pub(crate) fn relay_auth_binding(
+        &self,
+        device: &LocalDeviceBinding,
+        secret: &str,
+        source: SnapshotSource,
+    ) -> [u8; 32] {
+        crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
+    }
+
+    pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
+        self.api_base_url == expected
+    }
+
+    pub fn new(api_base_url: impl Into<String>) -> Self {
+        // Clients are constructed per sync/upload cycle, but the underlying
+        // agents (and their connection pools) are process-wide and shared with
+        // every other upload path, so a warm connection anywhere benefits all
+        // subsystems and a sustained DNS outage rebuilds them in one place.
+        // See `net_resilience` for the 2026-07-15 incident this hardens against.
+        let (agent, batch_agent) = crate::net_resilience::shared_agents();
+        Self {
+            nickname_generations: Default::default(),
+            api_base_url: api_base_url.into(),
+            agent,
+            batch_agent,
+            receipt_state_dir: None,
+            receipt_destination_namespace: None,
+            receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
+        }
+    }
+
+    /// Enable privacy-safe local receipts for snapshot batch attempts.
+    pub fn with_receipt_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.receipt_state_dir = Some(state_dir.into());
+        self
+    }
+
+    /// Explicit one-way destination binding for internal diagnostic ACK proof.
+    pub(crate) fn with_receipt_destination_namespace(mut self, namespace: String) -> Self {
+        self.receipt_destination_namespace = Some(namespace);
+        self
+    }
+
+    /// Attach only the user-facing device label and account state already
+    /// exposed by local status. Raw account or device ids are never accepted.
+    pub fn with_receipt_context(
+        mut self,
+        device_label: Option<String>,
+        account_binding: Option<ottto_protocol::LocalAccountState>,
+    ) -> Self {
+        self.receipt_context = crate::upload_receipts::UploadReceiptContext {
+            device_label,
+            account_binding,
+        };
+        self
+    }
+
+    /// Status uploads alone carry the optional nickname projection. Tag the
+    /// token before its network request; all other relay clients stay unchanged.
+    pub(crate) fn issue_status_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+    ) -> Result<String> {
+        let nickname_generation = if crate::snapshot_sync::snapshot_api_base_url()
+            .is_ok_and(|base| self.matches_api_base(&base))
+        {
+            crate::account_nicknames::generation_for_device(device)
+        } else {
+            None
+        };
+        let token = self.issue_relay_token(device, device_secret, source)?;
+        if let Some(generation) = nickname_generation {
+            use sha2::Digest;
+            let key: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+            if let Ok(mut generations) = self.nickname_generations.lock() {
+                if generations.len() >= 32 {
+                    generations.clear();
+                }
+                generations.insert(key, generation);
+            }
+        }
+        Ok(token)
+    }
+
+    pub fn issue_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+    ) -> Result<String> {
+        // The shared upload agent follows redirects and pools nothing (see
+        // `timeout_agent`), so a per-call credential agent loses no warm socket.
+        self.issue_relay_token_with_agent(
+            &credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
+            device,
+            device_secret,
+            source,
+            SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
+        )
+    }
+
+    pub fn issue_relay_token_with_timeout(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
+    }
+
+    fn issue_relay_token_with_agent(
+        &self,
+        agent: &ureq::Agent,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+        response_cap: Option<usize>,
+    ) -> Result<String> {
+        let key = self.relay_auth_binding(device, device_secret, source);
+        if let Some(token) = crate::relay_auth::lookup(key, OffsetDateTime::now_utc()) {
+            return Ok(token);
+        }
+        let mut probe = crate::relay_auth::Probe::begin(
+            &self.api_base_url,
+            device,
+            device_secret,
+            source.api_slug(),
+        )?;
+        let url = self.api_url(&format!(
+            "/api/v1/telemetry/devices/{}/relay-token",
+            device.device_id
+        ));
+        let response = agent
+            .post(&url)
+            .timeout(timeout)
+            .set("Accept", "application/json")
+            .set("X-Ottto-Device-Secret", device_secret)
+            .send_json(relay_token_request_payload(device, source.api_slug()))
+            .map_err(|error| match error {
+                ureq::Error::Status(status @ (401 | 403), _response) => {
+                    probe.reject(status);
+                    anyhow::Error::new(RelayTokenAuthorizationRejected {
+                        status,
+                        suppressed: false,
+                    })
+                }
+                ureq::Error::Status(status, response) => {
+                    anyhow::Error::new(UploadFailureDiagnostics::http(
+                        "relay token request",
+                        "relay_token",
+                        status,
+                        &response,
+                    ))
+                }
+                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "relay token request",
+                    "relay_token",
+                    &other,
+                )),
+            })?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        probe.success();
+        let now = OffsetDateTime::now_utc();
+        if let Some(expires_at) = response
+            .expires_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .filter(|expires_at| now + time::Duration::seconds(60) < *expires_at)
+        {
+            crate::relay_auth::publish(key, &response.token, expires_at, now);
+        }
+        Ok(response.token)
+    }
+
+    /// The one activity-hint GET every caller sends.
+    fn activity_hint_request(&self, agent: &ureq::Agent, relay_token: &str) -> ureq::Request {
+        agent
+            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
+
+    pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
+        relay_sent(
+            relay_token,
+            self.activity_hint_request(&self.agent, relay_token).call(),
+        )
+        // Typed diagnostics (not a plain string) so a transport-layer
+        // failure on this early per-source call feeds the outage streak.
+        .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?
+        .into_json::<Value>()
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
+        .and_then(decode_activity_hint)
+    }
+
+    #[cfg(test)]
+    pub fn upload_batch(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        enforce_head_cas: bool,
+    ) -> Result<SnapshotBatchResponse> {
+        self.upload_batch_with_item_cap(
+            relay_token,
+            request,
+            enforce_head_cas,
+            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+        )
+    }
+
+    /// `item_cap` is this pass's receiver limit; it selects the gzip budget.
+    pub(crate) fn upload_batch_with_item_cap(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        enforce_head_cas: bool,
+        item_cap: usize,
+    ) -> Result<SnapshotBatchResponse> {
+        let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
+        let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
+        let body = if enforce_head_cas {
+            serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
+        } else {
+            serde_json::to_vec(request).map_err(anyhow::Error::from)
+        }
+        .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+        resources.serialized(body.len());
+        let compressed = gzip_snapshot_batch(&body, snapshot_upload_gzip_enabled(), item_cap);
+        // Counts only for the server's logs: why each item is sent.
+        let version = crate::snapshots::collector_version();
+        let reasons = crate::local_resource_diagnostics::change_reason::request_header(
+            &request.source,
+            request
+                .items()
+                .map(|item| item.snapshot_fingerprint.as_str()),
+        );
+        let request_builder = || {
+            let request = self
+                .batch_agent
+                .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
+                .set("Accept", "application/json")
+                .set("Content-Type", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .set("X-Ottto-Daemon-Version", &version);
+            if reasons.is_empty() {
+                request
+            } else {
+                request.set("X-Ottto-Upload-Reason", &reasons)
+            }
+        };
+        // Sent inline rather than through a closure: a closure returning
+        // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
+        // the duplication here is two lines.
+        let mut outcome = match compressed.as_ref() {
+            Some(encoded) => {
+                let post = request_builder().set("Content-Encoding", "gzip");
+                resources.attempt(encoded.len(), true);
+                relay_sent(relay_token, post.send_bytes(encoded))
+            }
+            None => {
+                let post = request_builder();
+                resources.attempt(body.len(), false);
+                relay_sent(relay_token, post.send_bytes(&body))
+            }
+        };
+        // A server that does not decompress request bodies cannot tell us so in
+        // advance; it just fails to parse. Fall back to identity encoding once,
+        // remember it for the process, and let the batch through instead of
+        // stalling every upload behind a capability mismatch.
+        let refused_gzip = compressed.is_some() && encoding_was_refused(&outcome);
+        if refused_gzip {
+            disable_snapshot_upload_gzip();
+            let post = request_builder();
+            resources.attempt(body.len(), false);
+            outcome = relay_sent(relay_token, post.send_bytes(&body));
+        }
+        match outcome {
+            Ok(response) => {
+                let status = response.status();
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                match response.into_json::<SnapshotBatchResponse>() {
+                    Ok(response) => {
+                        self.record_batch_success(
+                            request,
+                            status,
+                            server_request_id.as_deref(),
+                            &response,
+                            enforce_head_cas,
+                        );
+                        self.record_composition_start_verdicts(
+                            request,
+                            &response,
+                            enforce_head_cas,
+                        );
+                        Ok(response)
+                    }
+                    Err(_) => {
+                        self.record_batch_http_failure(
+                            request,
+                            ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                            status,
+                            server_request_id.as_deref(),
+                            None,
+                        );
+                        Err(anyhow::Error::new(SnapshotAckRejected {
+                            reason: "snapshot batch response could not be decoded",
+                        }))
+                    }
+                }
+            }
+            // A shed request is not a failed request. Keep it typed and carry the
+            // server's own backoff so the caller can honour it instead of
+            // re-uploading identical bytes on the next tick.
+            Err(ureq::Error::Status(code @ (408 | 429 | 503), response)) => {
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                let shed = shed_from_response(code, response, request.snapshots.len());
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Shed,
+                    code,
+                    server_request_id.as_deref(),
+                    shed.downcast_ref::<UploadShed>()
+                        .and_then(|shed| shed.retry_after)
+                        .map(|retry_after| retry_after.as_secs()),
+                );
+                Err(shed)
+            }
+            // 401/403 means relay authorization failed, not schema drift.
+            // Keep it typed and body-free so the caller can surface an auth
+            // diagnostic without leaking backend details or token-adjacent text.
+            Err(ureq::Error::Status(code @ (401 | 403), response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::AuthRejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
+                Err(anyhow::Error::new(BatchAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            // A validation response supplies no ACK. Parse complete locations
+            // before discarding all backend text, which may contain user values.
+            Err(ureq::Error::Status(code @ (400 | 422), response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
+                // Keep the HTTP client's existing complete-body size bound.
+                // A failed read has no usable locations and stays whole-batch.
+                let body = response.into_string().ok();
+                Err(anyhow::Error::new(BatchRejected::from_response(
+                    code,
+                    body.as_deref().unwrap_or_default().as_bytes(),
+                    request.snapshots.len(),
+                )))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => {
+                self.record_batch_transport_error(request);
+                Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    &error,
+                )))
+            }
+        }
+    }
+
+    fn record_composition_start_verdicts(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(support) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        let Some(namespace) = self.receipt_destination_namespace.as_deref() else {
+            return;
+        };
+        let destination = crate::snapshots::start_verdict_store::destination(
+            namespace,
+            &self.api_base_url,
+            &request.machine_id,
+        );
+        if response.disabled
+            || response
+                .validate_entity_ack_with_head_cas(request, enforce_head_cas)
+                .is_err()
+        {
+            return;
+        }
+        // This is the final folded, budget-trimmed wire item. A well-formed
+        // ACK can still reject or conflict individual items: record only the
+        // accepted/unchanged bodies, never those other outcomes.
+        let acknowledged: std::collections::BTreeSet<_> = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .map(|r| {
+                (
+                    r.source_session_id.as_str(),
+                    r.snapshot_fingerprint.as_str(),
+                )
+            })
+            .collect();
+        let items = request.items().filter(|item| {
+            acknowledged.contains(&(
+                item.source_session_id.as_str(),
+                item.snapshot_fingerprint.as_str(),
+            ))
+        });
+        match crate::snapshots::start_verdict_store::record(
+            support,
+            &destination,
+            &request.source,
+            items,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ) {
+            Ok(bytes) if bytes > 0 => {
+                eprintln!("ottto-service: composition_start_verdict bytes_appended={bytes}")
+            }
+            Ok(_) => {}
+            Err(_) => eprintln!("ottto-service: composition start verdict persistence failed"),
+        }
+    }
+
+    fn record_batch_success(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        status: u16,
+        server_request_id: Option<&str>,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        let api_destination_hash = crate::upload_receipts::full_hash(
+            b"ottto.validated_receipt.api_destination:v1",
+            &self.api_base_url,
+        );
+        if crate::upload_receipts::append_success_with_evidence_context(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+            status,
+            server_request_id,
+            response,
+            &self.receipt_context,
+            self.receipt_destination_namespace
+                .as_deref()
+                .map(|namespace| {
+                    (
+                        request,
+                        namespace,
+                        api_destination_hash.as_str(),
+                        enforce_head_cas,
+                    )
+                }),
+        )
+        .is_err()
+        {
+            crate::upload_receipts::note_append_failure();
+        }
+    }
+
+    fn record_batch_http_failure(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        outcome: ottto_protocol::UploadReceiptOutcomeV1,
+        status: u16,
+        server_request_id: Option<&str>,
+        retry_after_seconds: Option<u64>,
+    ) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if crate::upload_receipts::append_http_failure_with_context(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+            outcome,
+            status,
+            server_request_id,
+            retry_after_seconds,
+            &self.receipt_context,
+        )
+        .is_err()
+        {
+            crate::upload_receipts::note_append_failure();
+        }
+    }
+
+    fn record_batch_transport_error(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if crate::upload_receipts::append_transport_error_with_context(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+            &self.receipt_context,
+        )
+        .is_err()
+        {
+            crate::upload_receipts::note_append_failure();
+        }
+    }
+
+    pub fn report_status(
+        &self,
+        relay_token: &str,
+        request: &SnapshotStatusRequest,
+    ) -> Result<SnapshotStatusResponse> {
+        // Every collector-status receipt leaves through here. A `checkin`
+        // declaration that its own payload falsifies never reaches the wire.
+        request.validate_declared_report_kind()?;
+        relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url("/api/v1/agent-session-snapshots/status"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        )
+        // Typed diagnostics (not a plain string) so a transport-layer
+        // failure on a status receipt feeds the outage streak.
+        .map_err(|error| small_upload_error(error, "snapshot status report", "snapshot_status"))?
+        .into_json()
+        .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
+    }
+
+    /// One explicit write through the existing relay credential. No redirects,
+    /// no body parsing before 2xx admission, no raw error body or request logs.
+    pub(crate) fn put_account_nickname(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> std::result::Result<Option<ottto_protocol::AccountNicknameV1>, u16> {
+        let response = relay_sent(
+            relay_token,
+            credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT)
+                .put(&self.api_url("/api/v1/agent-status/account-nickname"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(body),
+        )
+        .map_err(|error| match error {
+            ureq::Error::Status(code, _) => code,
+            _ => 0,
+        })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(response.status());
+        }
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| 0u16)?;
+        if bytes.len() > 65536 {
+            return Err(0);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| 0u16)?;
+        let value = value
+            .get("account_nickname")
+            .or_else(|| value.get("entry"))
+            .unwrap_or(&value);
+        Ok(serde_json::from_value(value.clone()).ok())
+    }
+
+    pub fn upload_agent_status(
+        &self,
+        relay_token: &str,
+        request: &AgentStatusSnapshotUploadRequest,
+    ) -> Result<AgentStatusSnapshotUploadResponse> {
+        match relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url("/api/v1/agent-status/snapshots"))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
+            Ok(response) => {
+                let response: AgentStatusSnapshotUploadResponse = response
+                    .into_json()
+                    .map_err(|error| anyhow!("parse agent status response failed: {error}"))?;
+                use sha2::Digest;
+                let key: [u8; 32] = sha2::Sha256::digest(relay_token.as_bytes()).into();
+                let generation = self
+                    .nickname_generations
+                    .lock()
+                    .ok()
+                    .and_then(|generations| generations.get(&key).cloned());
+                let admitted = response.account_nicknames.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.pair.as_ref().is_some_and(|pair| {
+                                request.snapshots.iter().any(|snapshot| {
+                                    let source_matches = matches!(
+                                        (&snapshot.source, pair.source),
+                                        (
+                                            ottto_protocol::SourceKind::ClaudeCode,
+                                            ottto_protocol::SessionLaunchProviderV1::ClaudeCode
+                                        ) | (
+                                            ottto_protocol::SourceKind::Codex,
+                                            ottto_protocol::SessionLaunchProviderV1::Codex
+                                        )
+                                    );
+                                    source_matches
+                                        && (snapshot.account.as_ref().is_some_and(|account| {
+                                            uploaded_nickname_identity_matches(
+                                                pair,
+                                                &account.account_identifier_hash,
+                                                &account.organization_identifier_hash,
+                                            )
+                                        }) || snapshot.plan_observations.iter().any(
+                                            |observation| {
+                                                uploaded_nickname_identity_matches(
+                                                    pair,
+                                                    &observation.account_identifier_hash,
+                                                    &observation.organization_identifier_hash,
+                                                )
+                                            },
+                                        ))
+                                })
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                crate::account_nicknames::apply_upload(generation.as_ref(), admitted.as_deref());
+                Ok(response)
+            }
+            Err(error) => Err(small_upload_error(
+                error,
+                "agent status upload",
+                "agent_status",
+            )),
+        }
+    }
+
+    /// POST a configured-MCP inventory capture to the footprint ingest endpoint.
+    ///
+    /// Auth is the same source-scoped relay token used for snapshot batches; the
+    /// backend validates the relay principal and enforces the agent_source
+    /// scope. The body is the pre-built `McpInventoryIngestRequest` JSON. A
+    /// 401/403 surfaces as a relay-authorization error so the caller can refresh
+    /// credentials; 400/422 means the inventory contract drifted.
+    pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/mcp/inventory", relay_token)
+                .send_json(request),
+        );
+        relay_token_upload_response(sent, "mcp inventory")
+    }
+
+    pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/context-footprint/snapshot", relay_token)
+                .send_json(request),
+        );
+        relay_token_upload_response(sent, "context footprint")
+    }
+
+    /// A POST with the source-scoped relay token; see
+    /// `relay_token_upload_response` for its outcome.
+    fn relay_token_post(&self, path: &str, relay_token: &str) -> ureq::Request {
+        self.agent
+            .post(&self.api_url(path))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
+    /// Upload one `cloud_session_changes.v3` request with the same
+    /// source-scoped relay principal as local snapshots. Only the parsed ACK,
+    /// or a refusal's typed code, is returned.
+    pub fn upload_cloud_session_changes_with_timeout(
+        &self,
+        relay_token: &str,
+        request: &Value,
+        timeout: Duration,
+        gzip_enabled: &AtomicBool,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
+        let body = serde_json::to_vec(request)?;
+        if body.len() > 512 * 1024 {
+            return Err(anyhow!(
+                "cloud-session changes exceed the decoded request budget"
+            ));
+        }
+        let compressed = gzip_enabled
+            .load(Ordering::Relaxed)
+            .then(|| gzip(&body))
+            .flatten();
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+        let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
+        let post = agent
+            .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"));
+        let mut outcome = match compressed.as_ref() {
+            Some(encoded) => relay_sent(
+                relay_token,
+                post.set("Content-Encoding", "gzip").send_bytes(encoded),
+            ),
+            None => relay_sent(relay_token, post.send_bytes(&body)),
+        };
+        // 415 explicitly refuses the encoding. A general semantic 400/422
+        // does not negotiate gzip. Never change local snapshot gzip state.
+        if compressed.is_some() && matches!(&outcome, Err(ureq::Error::Status(415, _))) {
+            gzip_enabled.store(false, Ordering::Relaxed);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("cloud-session request deadline exhausted"))?;
+            let (agent, request_timeout) = cloud_session_deadline_agent(remaining)?;
+            outcome = relay_sent(
+                relay_token,
+                agent
+                    .post(&self.api_url("/api/v1/cloud-session-observations/changes"))
+                    .timeout(request_timeout)
+                    .set("Accept", "application/json")
+                    .set("Content-Type", "application/json")
+                    .set("Authorization", &format!("Bearer {relay_token}"))
+                    .send_bytes(&body),
+            );
+        }
+        match outcome {
+            Ok(response) => require_cloud_session_success(
+                response,
+                "cloud-session changes upload",
+                "cloud_session_changes",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse cloud-session changes response failed: {error}")),
+            Err(error) => Err(cloud_session_request_error(
+                error,
+                "cloud-session changes upload",
+                "cloud_session_changes",
+            )),
+        }
+    }
+
+    /// Read the activity hint for the cloud-task collector within its slice
+    /// deadline. Errors map like the other cloud-task requests, so a 401/403
+    /// refreshes the relay token once.
+    pub(crate) fn get_activity_hint_with_timeout(
+        &self,
+        relay_token: &str,
+        timeout: Duration,
+    ) -> Result<ActivityHintResponse> {
+        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        match relay_sent(
+            relay_token,
+            self.activity_hint_request(&agent, relay_token)
+                .timeout(request_timeout)
+                .call(),
+        ) {
+            Ok(response) => bounded_response_json::<Value>(
+                require_cloud_session_success(response, "activity hint request", "activity_hint")?,
+                crate::snapshot_retry::TOKEN_RESPONSE_BYTES,
+            )
+            .and_then(decode_activity_hint),
+            Err(error) => Err(cloud_session_request_error(
+                error,
+                "activity hint request",
+                "activity_hint",
+            )),
+        }
+    }
+
+    /// Rebind an existing enabled grant using the target relay credential.
+    pub(crate) fn rebind_collector_grant(
+        &self,
+        kind: crate::grant_rebind::GrantKind,
+        grant_id: &str,
+        relay_token: &str,
+        request: &crate::grant_rebind::RebindRequest,
+        timeout: Duration,
+    ) -> std::result::Result<Value, crate::grant_rebind::RebindFailure> {
+        use crate::grant_rebind::RebindFailure;
+        if !crate::hex::is_uuid(grant_id) || request.grant_version == 0 {
+            return Err(RebindFailure::http(422, None));
+        }
+        let (agent, request_timeout) =
+            cloud_session_deadline_agent(timeout).map_err(|_| RebindFailure::unavailable())?;
+        let path = format!("/api/v1/{}/grants/{grant_id}/rebind", kind.route());
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url(&path))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
+            Ok(response) if response.status() == 200 => response
+                .into_json()
+                .map_err(|_| RebindFailure::http(422, None)),
+            Ok(response) => Err(RebindFailure::http(response.status(), None)),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_json::<Value>().ok();
+                Err(RebindFailure::http(status, body.as_ref()))
+            }
+            Err(_) => Err(RebindFailure::unavailable()),
+        }
+    }
+
+    /// POST a per-day context-composition capture to the composition ingest
+    /// endpoint. Auth is the same source-scoped relay token used for snapshot
+    /// batches; the backend validates the relay principal and enforces the
+    /// agent_source scope. The body holds aggregates only; the backend rejects
+    /// unknown fields and absolute paths with 422.
+    ///
+    /// Sends the serialized body, so the bytes the run counts are the bytes
+    /// sent (identical to what `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        let sent = relay_sent(
+            relay_token,
+            self.relay_token_post("/api/v1/context-composition/snapshot", relay_token)
+                .set("Content-Type", "application/json")
+                .send_bytes(body),
+        );
+        relay_token_upload_response(sent, "context composition")
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        let (agent, request_timeout) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(10))?;
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&self.api_url("/api/v1/context-composition/run-health"))
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(body),
+        ) {
+            Ok(response) => bounded_response_json(response, 64 * 1024)
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
+        }
+    }
+
+    pub fn upload_local_health_heartbeat(
+        &self,
+        relay_token: &str,
+        request: &MachineRuntimeHeartbeatV1,
+    ) -> Result<Value> {
+        self.upload_local_health(relay_token, "heartbeat", request)
+    }
+
+    pub fn upload_local_health_projection(
+        &self,
+        relay_token: &str,
+        request: &LocalMachineHealthV1,
+    ) -> Result<Value> {
+        self.upload_local_health(relay_token, "projection", request)
+    }
+
+    /// Saves one source's pause/resume; replies with the heartbeat's
+    /// `source_control` block.
+    pub fn upload_source_control(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        self.upload_local_health(relay_token, "source-control", request)
+    }
+
+    /// POST to `/api/v1/apps/health/{kind}` with the relay token.
+    fn upload_local_health(
+        &self,
+        relay_token: &str,
+        kind: &str,
+        request: &impl Serialize,
+    ) -> Result<Value> {
+        match relay_sent(
+            relay_token,
+            self.agent
+                .post(&self.api_url(&format!("/api/v1/apps/health/{kind}")))
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse local health {kind} response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow::Error::new(LocalHealthProjectionRejected {
+                    status: code,
+                }))
+            }
+            Err(error) => Err(anyhow!("upload local health {kind} failed: {error}")),
+        }
+    }
+
+    /// Upload one bounded batch of provider-reported day aggregates.
+    ///
+    /// Relay-device authentication only: the route refuses an ordinary ingest
+    /// API key, and the declared `installation_id` must be this device. The
+    /// same one-shot deadline agent as the other credential-bearing calls is
+    /// used so a blocked resolver cannot outlive the caller's budget and so a
+    /// redirect can never replay the bearer token.
+    pub fn upload_provider_daily_reference_batch_with_timeout(
+        &self,
+        relay_token: &str,
+        request: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        let url = self.api_url("/api/v1/provider-daily-reference/batches");
+        match relay_sent(
+            relay_token,
+            agent
+                .post(&url)
+                .timeout(request_timeout)
+                .set("Accept", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+                .send_json(request),
+        ) {
+            Ok(response) => require_cloud_session_success(
+                response,
+                "provider daily reference upload",
+                "provider_daily_reference_batch",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse provider daily reference response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(ProviderDailyReferenceUploadRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), response)) => {
+                let reason = if code == 409 {
+                    let body = response.into_json::<serde_json::Value>().ok();
+                    match body
+                        .as_ref()
+                        .and_then(|value| value.pointer("/detail/code"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("provider_daily_reference_account_excluded") => {
+                            ProviderDailyReferenceContractRejection::AccountExcluded
+                        }
+                        Some("provider_daily_reference_grant_epoch_mismatch") => {
+                            ProviderDailyReferenceContractRejection::GrantEpochConflict
+                        }
+                        _ => ProviderDailyReferenceContractRejection::Other,
+                    }
+                } else {
+                    ProviderDailyReferenceContractRejection::Other
+                };
+                Err(anyhow::Error::new(ProviderDailyReferenceContractRejected {
+                    status: code,
+                    reason,
+                }))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "provider daily reference upload",
+                    "provider_daily_reference_batch",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "provider daily reference upload",
+                "provider_daily_reference_batch",
+                &error,
+            ))),
+        }
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        format!("{}{}", self.api_base_url.trim_end_matches('/'), path)
+    }
+}
+
+fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
+    match source {
+        "claude_code" => ottto_protocol::SourceKind::ClaudeCode,
+        "pi" => ottto_protocol::SourceKind::Pi,
+        _ => ottto_protocol::SourceKind::Codex,
+    }
+}
+
+pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
+    with_snapshot_timeouts(crate::retry_tls::agent_builder(), read_timeout)
+}
+
+/// `timeout_agent` for a request that carries the device secret: no redirects.
+fn credential_timeout_agent(read_timeout: Duration) -> ureq::Agent {
+    with_snapshot_timeouts(crate::retry_tls::credential_agent_builder(), read_timeout)
+}
+
+fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -> ureq::Agent {
+    builder
+        .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
+        .timeout_read(read_timeout)
+        .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+        // Disable idle keep-alive connection reuse on this shared upload agent.
+        // After a network transition (VPN flap / macOS en0 MAGICWAKE wake) ureq
+        // 2.12.1 pooled a keep-alive socket bound to the now-dead local IP and
+        // reused it — its liveness peek only detects a peer-closed socket, not a
+        // locally-dead one — so every upload failed status_family=
+        // transport_connection until a manual daemon restart (2026-07-17
+        // incident, ~2.75h stall). ureq 2.12.1 exposes no idle-age/TTL knob, so
+        // setting max_idle_connections(0) to disable idle reuse is the only way
+        // to bound stale-socket reuse short of rebuilding the agent: every
+        // request opens a fresh connect and can never reuse a socket bound to a
+        // dead local IP. Intentional tradeoff: this forfeits the shared pool's
+        // ability to keep a warm socket through DNS outages. The FallbackDnsResolver
+        // below still handles DNS outages. The cost
+        // is one extra TCP+TLS handshake per request at the 5-min/60-s upload
+        // cadence (bounded by the 5-s connect timeout) — negligible. Do NOT
+        // apply this to the OTLP UPSTREAM_HTTP_AGENT, whose warm pool is
+        // intentional.
+        .max_idle_connections(0)
+        // Survive process-local resolver breakage (pinned scoped-DNS state
+        // after a VPN/network transition): fall back to an out-of-process
+        // probe, then the last successfully resolved addresses. TLS SNI and
+        // certificate validation still use the URL hostname.
+        .resolver(crate::net_resilience::shared_fallback_resolver())
+        .build()
+}
+
+/// Read a successful optional response through a byte cap before decoding.
+fn bounded_response_json<T: serde::de::DeserializeOwned>(
+    response: ureq::Response,
+    cap: usize,
+) -> Result<T> {
+    let mut bytes = Vec::with_capacity(cap.min(4096));
+    response
+        .into_reader()
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(anyhow!(
+            "optional snapshot response exceeds admission limit"
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+}
+
+// Optional snapshot transport only. Apply the same absolute turn deadline to
+// TLS I/O before ureq installs its request/response DeadlineStream.
+fn bounded_snapshot_deadline_agent(deadline: Instant) -> Result<(ureq::Agent, Duration)> {
+    let connector = crate::retry_tls::connector(deadline);
+    let timeout = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("optional snapshot deadline expired"))?;
+    let dns_timeout = timeout / 2;
+    let request_timeout = timeout.saturating_sub(dns_timeout);
+    if dns_timeout.is_zero() || request_timeout.is_zero() {
+        return Err(anyhow!("optional snapshot deadline is too small"));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
+        .timeout_read(request_timeout)
+        .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
+        .redirects(0)
+        .max_idle_connections(0)
+        .resolver(crate::net_resilience::deadline_fallback_resolver(
+            dns_timeout,
+        ))
+        .tls_connector(connector);
+    let agent = crate::retry_tls::guard_unit_test_egress(agent).build();
+    Ok((agent, request_timeout))
+}
+
+/// Build a one-shot agent whose DNS and HTTP phases share the caller's hard
+/// budget. `ureq::Request::timeout` begins only after resolution, so using the
+/// shared resolver here would let a blocked `getaddrinfo` escape the scan
+/// deadline. Half the budget is reserved for DNS and the remainder for the
+/// request; neither phase can consume the other's allocation.
+fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Duration)> {
+    let dns_timeout = timeout / 2;
+    let request_timeout = timeout.saturating_sub(dns_timeout);
+    if dns_timeout.is_zero() || request_timeout.is_zero() {
+        return Err(anyhow!("cloud-session request deadline is too small"));
+    }
+    // Cloud-session requests carry either the long-lived device secret or
+    // a relay bearer token. Never let ureq replay either credential to a
+    // redirect target; a 3xx is handled as an ordinary non-success status.
+    let agent = crate::retry_tls::credential_agent_builder()
+        .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
+        .timeout_read(request_timeout)
+        .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
+        .max_idle_connections(0)
+        .resolver(crate::net_resilience::deadline_fallback_resolver(
+            dns_timeout,
+        ))
+        .build();
+    Ok((agent, request_timeout))
+}
+
+fn http_status_family(status: u16) -> &'static str {
+    match status {
+        400..=499 => {
+            if status == 429 {
+                "http_429"
+            } else {
+                "http_4xx"
+            }
+        }
+        500..=599 => "http_5xx",
+        300..=399 => "http_3xx",
+        _ => "http_other",
+    }
+}
+
+fn http_status_retryable(status: u16) -> bool {
+    status == 408
+        || status == 409
+        || status == 425
+        || status == 429
+        || (500..=599).contains(&status)
+}
+
+fn transport_status_family(error: &ureq::Error) -> &'static str {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("timeout") {
+        "transport_timeout"
+    } else if text.contains("dns") || text.contains("resolve") {
+        "transport_dns"
+    } else if text.contains("tls") || text.contains("certificate") {
+        "transport_tls"
+    } else if text.contains("connection") || text.contains("connect") {
+        "transport_connection"
+    } else {
+        "transport_error"
+    }
+}
+
+fn response_has_request_id(response: &ureq::Response) -> bool {
+    [
+        "x-request-id",
+        "x-correlation-id",
+        "x-amzn-requestid",
+        "x-amz-request-id",
+        "x-amz-cf-id",
+    ]
+    .iter()
+    .any(|header| response.header(header).is_some())
+}
+
+/// Fence relay admission once confirmation may have reached the server and
+/// until the candidate is fully promoted into local active state. Persisted
+/// pre-confirm guards are the crash boundary immediately before the request:
+/// a transport failure after that cut cannot prove the old authority survived.
+pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
+    let pending = crate::local_resource_diagnostics::credential_file_read(
+        FilePendingDeviceCredentialStore::default().load(),
+    )?;
+    if pending.as_ref().is_some_and(|pending| {
+        pending.confirmed_at.is_some()
+            || (pending.confirmation_authorized && pending.preconfirm_guards_passed)
+    }) {
+        return Err(anyhow!("relay identity commit is incomplete"));
+    }
+    Ok(())
+}
+
+pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
+    ensure_no_incomplete_device_credential_promotion()?;
+    let envelope = crate::local_resource_diagnostics::credential_file_read(
+        FileDeviceStore::default().load_envelope(),
+    )?
+    .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    let secret = crate::local_resource_diagnostics::credential_file_read(
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(anyhow::Error::new),
+    )
+    .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
+    let alias = envelope.continuity.snapshot_namespace.as_ref();
+    crate::snapshot_sync::carry_snapshot_namespace(&envelope.device, &secret, alias);
+    Ok((envelope.device, secret))
+}
+
+#[cfg(test)]
+pub(crate) use tests::config_upload_backend;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
+    use std::io::Read;
+
+    pub(crate) fn config_upload_backend(
+        body: &'static str,
+    ) -> (SnapshotApiClient, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        (client, server)
+    }
+
+    /// [behaviour] Auth rejections evict only the sent token and preserve the result.
+    #[test]
+    #[serial_test::serial]
+    fn relay_send_eviction_preserves_newer_tokens_and_other_failures() {
+        let key = [211; 32];
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        for status in [401, 403, 429, 503] {
+            crate::relay_auth::publish(key, "synthetic-old", now + time::Duration::minutes(5), now);
+            crate::relay_auth::publish(key, "synthetic-new", now + time::Duration::minutes(5), now);
+            let response = ureq::Response::new(status, "Scripted", "synthetic-body").unwrap();
+            let result = relay_sent("synthetic-old", Err(ureq::Error::Status(status, response)));
+            assert!(matches!(result, Err(ureq::Error::Status(code, _)) if code == status));
+            assert!(
+                crate::relay_auth::lookup(key, now).is_some_and(|token| token == "synthetic-new")
+            );
+            let response = ureq::Response::new(status, "Scripted", "synthetic-body").unwrap();
+            let result = relay_sent("synthetic-new", Err(ureq::Error::Status(status, response)));
+            let Err(ureq::Error::Status(code, response)) = result else {
+                panic!("status result changed")
+            };
+            assert_eq!(code, status);
+            assert_eq!(response.into_string().unwrap(), "synthetic-body");
+            assert_eq!(
+                crate::relay_auth::lookup(key, now).is_none(),
+                matches!(status, 401 | 403)
+            );
+        }
+        crate::relay_auth::evict("synthetic-new");
+    }
+
+    #[test]
+    fn source_disabled_refusal_requires_both_fields() {
+        for (body, refused) in [
+            (r#"{"accepted":false,"reason":"source_disabled"}"#, true),
+            (r#"{"accepted":true,"reason":"source_disabled"}"#, false),
+            (r#"{"reason":"source_disabled"}"#, false),
+            (r#"{"accepted":false}"#, false),
+        ] {
+            let response = ureq::Response::new(200, "OK", body).unwrap();
+            let result = relay_token_upload_response(Ok(response), "config");
+            if refused {
+                assert!(result.unwrap_err().is::<UploadRefused>());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    serde_json::from_str::<Value>(body).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_unit_test_agent_refuses_production_before_dns_or_tls() {
+        let (agent, _) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(5)).unwrap();
+        let error = agent.get("https://api.ottto.net").call().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unit tests may only send HTTP requests to loopback fixtures"));
+    }
+
+    #[test]
+    fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let device = LocalDeviceBinding {
+            device_id: "device-synthetic".to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        };
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let secret = format!("synthetic-snapshot-device-secret-{}", &status[..3]);
+            let backend = RedirectingBackend::start(status);
+            assert!(SnapshotApiClient::new(backend.base_url.clone())
+                .issue_relay_token(&device, &secret, SnapshotSource::Codex)
+                .is_err());
+            let request = backend.finish();
+            assert!(
+                request.starts_with("POST /api/v1/telemetry/devices/device-synthetic/relay-token ")
+            );
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
+    }
+
+    #[test]
+    fn nickname_write_keeps_relay_principal_body_private_and_rejects_redirects() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let token = "synthetic-private-relay";
+        let body = json!({"machine_id":"machine-synthetic","source":"codex", "account_identifier_hash":"a".repeat(64), "organization_identifier_hash":"", "nickname":"כינוי 🚀", "base_revision":2});
+        for status in ["302 Found", "307 Temporary Redirect", "401 Unauthorized"] {
+            let backend = RedirectingBackend::start(status);
+            let code = SnapshotApiClient::new(backend.base_url.clone())
+                .put_account_nickname(token, &body)
+                .unwrap_err();
+            assert_eq!(code.to_string(), &status[..3]);
+            let request = backend.finish();
+            assert!(request.starts_with("PUT /api/v1/agent-status/account-nickname "));
+            assert!(request.contains(&format!("Authorization: Bearer {token}")));
+            assert!(!request.contains("X-Ottto-Device-Secret"));
+            let sent: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(sent, body);
+            assert_never_logged(token);
+            assert_never_logged("כינוי 🚀");
+        }
+    }
+
+    #[test]
+    fn nickname_admission_requires_explicit_organization_evidence() {
+        let mut pair = ottto_protocol::AccountNicknamePairV1 {
+            source: ottto_protocol::SessionLaunchProviderV1::Codex,
+            account_identifier_hash: Some("a".repeat(64)),
+            organization_identifier_hash: Some(String::new()),
+        };
+        let account = pair.account_identifier_hash.clone();
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
+        assert!(uploaded_nickname_identity_matches(
+            &pair,
+            &account,
+            &Some(String::new())
+        ));
+        pair.organization_identifier_hash = None;
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
+    }
+
+    #[test]
+    fn optional_nickname_metadata_cannot_fail_ingest() {
+        for extra in [
+            json!(null),
+            json!("unsupported"),
+            json!([{"pair":"malformed"}]),
+            json!([{"revision":1}]),
+        ] {
+            let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(json!({"accepted":1,"machine_id":"synthetic","sources":["codex"],"account_nicknames":extra})).unwrap();
+            assert!(response
+                .account_nicknames
+                .map_or(true, |entries| entries.is_empty()));
+        }
+        let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(
+            json!({"accepted":1,"machine_id":"synthetic","sources":["codex"]}),
+        )
+        .unwrap();
+        assert!(response.account_nicknames.is_none());
+    }
+
+    #[test]
+    fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {
+        let mut rejection = SnapshotEntityRejection {
+            source_session_id: "synthetic".into(),
+            snapshot_fingerprint: "a".repeat(64),
+            reason: "accepted_log_stale_older_upload".into(),
+            detail: "private detail".into(),
+            permanent: false,
+            occurrence_count: 1,
+        };
+        assert_eq!(rejection.safe_reason(), "accepted_log_stale_older_upload");
+        assert!(!rejection.permanent);
+        rejection.reason = "future-private-reason".into();
+        assert_eq!(rejection.safe_reason(), "other");
+    }
+
+    fn activity_hint_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "source":"codex",
+                "server_time":"2026-07-21T10:00:00Z",
+                "last_data_at":null,
+                "record_count_15m":0,
+                "record_count_24h":0,
+                "local_usage_reconciliation_enabled":true,
+                "backfill_window_days":183,
+                "session_titles_enabled":true,
+                "workspace_labels_enabled":true,
+                "session_attribution_enabled":true,
+                "recommended_scan_after":"2026-07-21T10:05:00Z"
+                {extra}
+            }}"#
+        )
+    }
+
+    fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                    if content_length.is_some_and(|length| request.len() >= header_end + 4 + length)
+                    {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    #[test]
+    fn codex_cloud_task_fields_default_off_and_never_fail_the_hint() {
+        let decode = |extra: &str| {
+            decode_activity_hint(serde_json::from_str(&activity_hint_json(extra)).unwrap()).unwrap()
+        };
+        for extra in [
+            "",
+            r#", "codex_cloud_tasks_enabled":"yes", "codex_cloud_tasks_contract":{"v":3}"#,
+        ] {
+            let hint = decode(extra);
+            assert!(!hint.codex_cloud_tasks_enabled);
+            assert_eq!(hint.codex_cloud_tasks_contract, None);
+        }
+        // A stray retired key field is ignored.
+        let hint = decode(
+            r#", "codex_cloud_tasks_enabled":true,
+               "codex_cloud_task_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+               "codex_cloud_tasks_contract":"cloud_session_changes.v3""#,
+        );
+        assert!(hint.codex_cloud_tasks_enabled);
+        assert_eq!(
+            hint.codex_cloud_tasks_contract.as_deref(),
+            Some("cloud_session_changes.v3")
+        );
+    }
+
+    #[test]
+    fn cache_capability_defaults_off_and_requires_exact_contract() {
+        for extra in [
+            "",
+            r#", "session_cache_observations_contract":null"#,
+            r#", "session_cache_observations_contract":"unknown""#,
+        ] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).unwrap();
+            assert_ne!(
+                hint.session_cache_observations_contract.as_deref(),
+                Some("session_cache_observations:v1")
+            );
+        }
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_cache_observations_contract":"session_cache_observations:v1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            hint.session_cache_observations_contract.as_deref(),
+            Some("session_cache_observations:v1")
+        );
+    }
+
+    #[test]
+    fn copy_unproven_capability_defaults_off_and_requires_exact_contract() {
+        for extra in [
+            "",
+            r#", "copy_unproven_contract":null"#,
+            r#", "copy_unproven_contract":"unknown""#,
+        ] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).unwrap();
+            assert_ne!(
+                hint.copy_unproven_contract.as_deref(),
+                Some("copy_unproven:v1")
+            );
+        }
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "copy_unproven_contract":"copy_unproven:v1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            hint.copy_unproven_contract.as_deref(),
+            Some("copy_unproven:v1")
+        );
+    }
+
+    /// The daemon no longer reads the retained-identity capability; a server
+    /// that still sends it decodes as before.
+    #[test]
+    fn removed_identity_retained_capability_still_decodes() {
+        for extra in [
+            "",
+            r#", "session_request_identity_retained_contract":null"#,
+            r#", "session_request_identity_retained_contract":"session_request_identity_retained:v1""#,
+        ] {
+            serde_json::from_str::<ActivityHintResponse>(&activity_hint_json(extra)).unwrap();
+        }
+    }
+
+    #[test]
+    fn activity_hint_requires_a_unsigned_backfill_window() {
+        let missing = activity_hint_json("").replace("\"backfill_window_days\":183,", "");
+        assert!(serde_json::from_str::<ActivityHintResponse>(&missing).is_err());
+
+        let string_value = activity_hint_json("").replace(
+            "\"backfill_window_days\":183",
+            "\"backfill_window_days\":\"183\"",
+        );
+        assert!(serde_json::from_str::<ActivityHintResponse>(&string_value).is_err());
+
+        let negative = activity_hint_json("").replace(
+            "\"backfill_window_days\":183",
+            "\"backfill_window_days\":-1",
+        );
+        assert!(serde_json::from_str::<ActivityHintResponse>(&negative).is_err());
+    }
+
+    #[test]
+    fn harvester_labels_need_a_fetched_hint_that_allows_them() {
+        let hint =
+            |json: String| decode_activity_hint(serde_json::from_str(&json).unwrap()).unwrap();
+        let on = hint(activity_hint_json(""));
+        let off = hint(activity_hint_json("").replace(
+            "\"workspace_labels_enabled\":true",
+            "\"workspace_labels_enabled\":false",
+        ));
+        let omitted =
+            hint(activity_hint_json("").replace("\"workspace_labels_enabled\":true,", ""));
+        use crate::snapshots::SnapshotUploadPolicy as Policy;
+        assert!(Policy::from_hint(&on).workspace());
+        assert!(!Policy::from_hint(&off).workspace());
+        // A fetched hint from an older backend keeps the legacy default.
+        assert!(Policy::from_hint(&omitted).workspace());
+        // A failed fetch leaves the policy unknown: labels stay on the machine.
+        assert!(!Policy::MOST_PRIVATE.workspace());
+    }
+
+    #[test]
+    fn upload_failure_diagnostics_are_classified_and_redacted() {
+        assert_eq!(http_status_family(500), "http_5xx");
+        assert_eq!(http_status_family(429), "http_429");
+        assert_eq!(http_status_family(404), "http_4xx");
+        assert!(http_status_retryable(500));
+        assert!(http_status_retryable(429));
+        assert!(!http_status_retryable(404));
+
+        let diagnostics = UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            true,
+        );
+        assert_eq!(
+            diagnostics.safe_message(),
+            "local snapshot upload failed (endpoint=snapshot_batch, status_family=http_5xx, retryable=true, request_id=present)"
+        );
+        assert!(!diagnostics.safe_message().contains("req_"));
+        assert!(!diagnostics.safe_message().contains("Bearer"));
+    }
+
+    #[test]
+    fn resolver_failure_through_real_agent_classifies_as_transport_dns() {
+        // The 2026-07-15 incident signature: in-process DNS resolution fails
+        // persistently for a long-running daemon. The failure must classify as
+        // transport_dns end-to-end through the real ureq stack so field logs
+        // and the resilience layer key off the right family.
+        let resolver = crate::net_resilience::FallbackDnsResolver::with_hooks(
+            |_| {
+                Err(std::io::Error::other(
+                    "simulated getaddrinfo failure after network transition",
+                ))
+            },
+            |_| None,
+        );
+        let agent = ureq::AgentBuilder::new().resolver(resolver).build();
+
+        let error = agent
+            .post("http://ottto-transport-dns.test/api/v1/telemetry")
+            .call()
+            .expect_err("resolution must fail");
+
+        assert_eq!(transport_status_family(&error), "transport_dns");
+        let diagnostics =
+            UploadFailureDiagnostics::transport("relay token request", "relay_token", &error);
+        assert_eq!(
+            diagnostics.safe_message(),
+            "relay token request failed (endpoint=relay_token, status_family=transport_dns, retryable=true, request_id=absent)"
+        );
+    }
+
+    #[test]
+    fn snapshot_rejection_locations_require_a_complete_entity_local_set() {
+        for body in [
+            r#"{"detail":"synthetic validator text"}"#,
+            r#"{"errors":[]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":[] }]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",2]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","snapshots",-1]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]},{"loc":["body","other"]}]}"#,
+            r#"{"errors":[{"loc":["body","snapshots",0]}]"#,
+        ] {
+            assert!(BatchRejected::from_response(422, body.as_bytes(), 2)
+                .snapshot_indexes
+                .is_none());
+        }
+        let body = br#"{"errors":[{"loc":["body","snapshots",1,"session_artifacts",0]},{"loc":["body","snapshots",1,"session_artifacts",1]}]}"#;
+        assert_eq!(
+            BatchRejected::from_response(422, body.as_slice(), 2).snapshot_indexes,
+            Some(vec![1])
+        );
+        assert!(BatchRejected::from_response(400, body.as_slice(), 2)
+            .snapshot_indexes
+            .is_none());
+    }
+
+    /// [format] A shed keeps only a recognized code and, for the identity
+    /// deferral, the request items it names; anything else names none.
+    #[test]
+    fn shed_code_keeps_only_a_recognized_backend_code() {
+        let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
+        assert_eq!(
+            shed_body(identity, 2),
+            (Some(UploadShedCode::OriginalIdentityUnavailable), None)
+        );
+        let named = |code: &str, locs: &str| {
+            format!(r#"{{"error":"ServiceOverloadedError","code":"{code}","errors":[{locs}]}}"#)
+        };
+        let identity_code = SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE;
+        for (body, indexes) in [
+            // 3-element (this shed) and 4-element (422) locations; a
+            // duplicate occurrence names its item once.
+            (
+                named(
+                    identity_code,
+                    r#"{"loc":["body","snapshots",1]},{"loc":["body","snapshots",1]},{"loc":["body","snapshots",0,"x"]}"#,
+                ),
+                Some(vec![0, 1]),
+            ),
+            (
+                named(
+                    "cursor_allocation_timeout",
+                    r#"{"loc":["body","snapshots",0]}"#,
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(shed_body(body.as_bytes(), 2).1, indexes, "{body}");
+        }
+        assert_eq!(
+            UploadShedCode::OriginalIdentityUnavailable.as_str(),
+            SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
+        );
+        let oversized = format!(
+            r#"{{"detail":"{}","code":"snapshot_original_identity_unavailable"}}"#,
+            "x".repeat(SHED_BODY_EXCERPT_BYTES as usize)
+        );
+        let truncated = &oversized.as_bytes()[..SHED_BODY_EXCERPT_BYTES as usize];
+        let bodies: [&[u8]; 11] = [
+            br#"{"code":"cursor_allocation_timeout"}"#,
+            br#"{"code":"accept_discovery_shared_lock_timeout"}"#,
+            br#"{"detail":"snapshot_original_identity_unavailable"}"#,
+            br#"{"code":"Snapshot_Original_Identity_Unavailable"}"#,
+            br#"{"code":17}"#,
+            br#"{"code":null}"#,
+            br#"["snapshot_original_identity_unavailable"]"#,
+            b"snapshot_original_identity_unavailable",
+            b"<html>503 Service Unavailable</html>",
+            b"",
+            truncated,
+        ];
+        for body in bodies {
+            assert_eq!(
+                shed_body(body, 2).0,
+                None,
+                "{}",
+                String::from_utf8_lossy(&body[..body.len().min(80)])
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_dates() {
+        let now = OffsetDateTime::parse("2026-07-26T10:00:00Z", &Rfc3339).expect("now");
+        assert_eq!(
+            parse_retry_after("120", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after("  30 ", now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 26 Jul 2026 10:02:00 GMT", now),
+            Some(Duration::from_secs(120))
+        );
+        // A date already in the past means "now", not a negative wait.
+        assert_eq!(
+            parse_retry_after("Sun, 26 Jul 2026 09:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        // An absurd wait is capped rather than obeyed: the product promises
+        // freshness in minutes, so going silent for a day is not an option.
+        assert_eq!(
+            parse_retry_after("86400", now),
+            Some(MAX_HONOURED_RETRY_AFTER)
+        );
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("later", now), None);
+    }
+
+    /// [behaviour] A fresh default client sends eligible batches as gzip.
+    #[test]
+    fn default_snapshot_client_sends_gzip() {
+        // Refusals in other tests must not change this process-default proof.
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            let body = r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"entity_ack_contract":"snapshot_entity_ack:v1"}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response.validate_entity_ack(&request).unwrap();
+        let captured = server.join().unwrap();
+        let headers = captured.split_once("\r\n\r\n").unwrap().0;
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")));
+    }
+
+    /// [behaviour] Cloud gzip refusal affects this cloud client only. A
+    /// semantic 400 is never retried as encoding negotiation.
+    #[test]
+    fn cloud_gzip_fallback_is_separate_from_local_uploads() {
+        for status in [400, 415] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                for attempt in 0..if status == 415 { 3 } else { 1 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    captured.push(read_complete_http_request(&mut stream));
+                    let code = if attempt == 0 { status } else { 200 };
+                    let body = "{}";
+                    write!(stream, "HTTP/1.1 {code} Result\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}").unwrap();
+                }
+                captured
+            });
+            let cloud_gzip = AtomicBool::new(true);
+            let local_gzip = snapshot_upload_gzip_enabled();
+            let body = json!({"synthetic": "content-free"});
+            let result = client.upload_cloud_session_changes_with_timeout(
+                "fixture-relay",
+                &body,
+                Duration::from_secs(5),
+                &cloud_gzip,
+            );
+            if status == 415 {
+                result.unwrap();
+                client
+                    .upload_cloud_session_changes_with_timeout(
+                        "fixture-relay",
+                        &body,
+                        Duration::from_secs(5),
+                        &cloud_gzip,
+                    )
+                    .unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .downcast_ref::<CloudSessionContractRejected>()
+                    .is_some());
+            }
+            assert_eq!(snapshot_upload_gzip_enabled(), local_gzip);
+            let captured = server.join().unwrap();
+            for (index, request) in captured.iter().enumerate() {
+                let (headers, bytes) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("Content-Encoding: gzip")),
+                    index == 0
+                );
+                if index > 0 {
+                    assert_eq!(serde_json::from_str::<Value>(bytes).unwrap(), body);
+                }
+            }
+            assert_eq!(cloud_gzip.load(Ordering::Relaxed), status != 415);
+        }
+    }
+
+    /// [behaviour] Every snapshot POST names the daemon version and its
+    /// items' attempted tags; an empty request names no reason.
+    #[test]
+    fn snapshot_post_names_daemon_version_and_item_reasons() {
+        let first = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        let mut second = first.clone();
+        second.source_session_id = "synthetic-second-session".into();
+        second.snapshot_fingerprint = "synthetic-second-fingerprint".into();
+        crate::local_resource_diagnostics::change_reason::attempted(
+            "codex",
+            &first.snapshot_fingerprint,
+            None,
+            Some(crate::local_resource_diagnostics::change_reason::Token::AckRecovery),
+            1,
+        );
+        for (snapshots, reasons) in [
+            (Vec::new(), None),
+            (vec![first, second], Some("ack_recovery=1,unattributed=1")),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "synthetic-machine".into(),
+                collector_version: None,
+                snapshots,
+                upload_policy: Default::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            let head_cas = request.items().any(declares_head_cas);
+            let accepted_entities = request
+                .items()
+                .map(|item| {
+                    let witness_version = snapshot_ack_body_witness_version(item).unwrap();
+                    json!({
+                        "source_session_id": item.source_session_id,
+                        "snapshot_fingerprint": item.snapshot_fingerprint,
+                        "body_witness_version": witness_version,
+                        "body_witness_digest": witness_version.map(|_| snapshot_upload_body_witness(item)),
+                        "head_etag": head_cas.then(|| "e".repeat(64)),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let body = json!({
+                "accepted": accepted_entities.len(),
+                "sessions_reconciled": accepted_entities.len(),
+                "session_ids": [],
+                "disabled": false,
+                "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+                "accepted_entities": accepted_entities,
+            })
+            .to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                request
+            });
+            let _ = client.upload_batch("synthetic-relay", &request, false);
+            let captured = server.join().unwrap();
+            let headers = captured
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .0
+                .to_ascii_lowercase();
+            let header = |name: &str| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+                    .map(str::to_string)
+            };
+            assert_eq!(
+                header("x-ottto-daemon-version"),
+                Some(crate::snapshots::collector_version().to_ascii_lowercase())
+            );
+            assert_eq!(header("x-ottto-upload-reason").as_deref(), reasons);
+        }
+    }
+
+    #[test]
+    fn snapshot_gzip_respects_decoded_and_compressed_budgets() {
+        for size in [128 * 1024, 640 * 1024, 1024 * 1024] {
+            // Deterministic poorly compressible bytes test gzip overhead too.
+            let mut state = 0x12345678u32;
+            let body = (0..size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>();
+            let encoded = gzip_snapshot_batch(&body, true, 655_360).expect("within budgets");
+            assert!(encoded.len() <= 2 * 1024 * 1024);
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(encoded.as_slice())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, body);
+            assert!(gzip_snapshot_batch(&body, false, 655_360).is_none());
+        }
+        for size in [1024 * 1024 + 1, 2 * 640 * 1024, 2 * 1024 * 1024] {
+            assert!(
+                gzip_snapshot_batch(&vec![b'x'; size], true, 2 * 1024 * 1024).is_none(),
+                "identity fallback preserves large packed requests without a gzip 413"
+            );
+        }
+        // Only a receiver advertising over 2 MiB gets a large encoded request.
+        let max = crate::snapshots::MAX_SNAPSHOT_BATCH_WIRE_BYTES;
+        let item_cap = 8 * 1024 * 1024;
+        assert!(gzip_snapshot_batch(&vec![b'x'; 1024 * 1024 + 1], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max], true, item_cap).is_some());
+        assert!(gzip_snapshot_batch(&vec![b'x'; max + 1], true, item_cap).is_none());
+    }
+
+    #[test]
+    fn only_unreadable_encodings_trigger_the_identity_fallback() {
+        // 422 means the server parsed the body and disliked its contents, so the
+        // encoding worked; falling back would hide a real validation failure.
+        // 400/415 are the answers a server without request decompression gives.
+        assert!(encoding_was_refused(&Err(ureq::Error::Status(
+            400,
+            ureq::Response::new(400, "Bad Request", "{}").expect("response")
+        ))));
+        assert!(encoding_was_refused(&Err(ureq::Error::Status(
+            415,
+            ureq::Response::new(415, "Unsupported Media Type", "{}").expect("response")
+        ))));
+        assert!(!encoding_was_refused(&Err(ureq::Error::Status(
+            422,
+            ureq::Response::new(422, "Unprocessable", "{}").expect("response")
+        ))));
+        assert!(!encoding_was_refused(&Ok(ureq::Response::new(
+            200, "OK", "{}"
+        )
+        .expect("response"))));
+    }
+
+    /// A liveness beat exactly as the collector builds it: no scan outcome of
+    /// any kind, only the server-negotiated width and the build identity.
+    fn clean_checkin_request() -> SnapshotStatusRequest {
+        SnapshotStatusRequest {
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::Checkin,
+            enabled: true,
+            disabled_reason: None,
+            last_scan_started_at: Some("2026-06-01T10:00:00Z".to_string()),
+            last_scan_finished_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            last_uploaded_count: 0,
+            last_scanned_session_count: 0,
+            last_scanned_file_count: 0,
+            last_zero_snapshot_confirmed_count: 0,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
+            last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
+            last_backfill_window_days: 183,
+            first_read_cutoff: None,
+            last_backfill_file_limit: 0,
+            last_discovered_file_count: 0,
+            last_skipped_file_count_due_to_limit: 0,
+            last_scan_cap_hit: false,
+            last_semantic_noop_count: 0,
+            last_census_complete: None,
+            last_symlink_rejected_count: 0,
+            last_unreadable_path_count: 0,
+            last_oversized_file_count: 0,
+            last_disappeared_file_count: 0,
+            last_malformed_json_line_count: 0,
+            last_invalid_utf8_line_count: 0,
+            last_over_line_cap_count: 0,
+            last_recognized_usage_drop_count: 0,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 0,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
+            consecutive_failures: 0,
+            next_retry_at: None,
+            collector_version: Some("0.1.123".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: None,
+            control_plane: None,
+        }
+    }
+
+    #[test]
+    fn report_kind_serializes_as_the_backend_contract_tokens() {
+        let checkin = serde_json::to_string(&clean_checkin_request()).expect("serialize beat");
+        assert!(checkin.contains(r#""report_kind":"checkin""#), "{checkin}");
+        let mut scan = clean_checkin_request();
+        scan.report_kind = SnapshotStatusReportKind::ScanStatus;
+        let scan = serde_json::to_string(&scan).expect("serialize scan status");
+        assert!(scan.contains(r#""report_kind":"scan_status""#), "{scan}");
+    }
+
+    #[test]
+    fn first_read_cutoff_is_optional_and_round_trips_on_scan_status() {
+        let mut status = clean_checkin_request();
+        let absent = serde_json::to_value(&status).unwrap();
+        assert!(absent.get("first_read_cutoff").is_none());
+        let old: SnapshotStatusRequest = serde_json::from_value(absent).unwrap();
+        assert!(old.first_read_cutoff.is_none());
+        status.report_kind = SnapshotStatusReportKind::ScanStatus;
+        status.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned());
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+        assert!(value.get("first_read").is_none());
+        let restored: SnapshotStatusRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.first_read_cutoff, status.first_read_cutoff);
+        restored.validate_declared_report_kind().unwrap();
+    }
+
+    /// The guard is a falsifier, not a classifier: it never picks the kind, it
+    /// only refuses a `checkin` the payload contradicts. Every field a beat may
+    /// not disclose is enumerated here; the exhaustive destructure inside
+    /// `checkin_contradicting_evidence` forces a decision for any field added
+    /// later.
+    #[test]
+    fn a_checkin_may_not_disclose_scan_evidence() {
+        type CheckinMutation = (&'static str, Box<dyn Fn(&mut SnapshotStatusRequest)>);
+
+        clean_checkin_request()
+            .validate_declared_report_kind()
+            .expect("a clean liveness beat is truthful");
+
+        let mutations: Vec<CheckinMutation> = vec![
+            (
+                "first_read_cutoff",
+                Box::new(|r| r.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned())),
+            ),
+            ("enabled=false", Box::new(|r| r.enabled = false)),
+            (
+                "disabled_reason",
+                Box::new(|r| r.disabled_reason = Some("disabled_by_admin".to_string())),
+            ),
+            (
+                "last_scan_finished_at",
+                Box::new(|r| r.last_scan_finished_at = Some("2026-06-01T10:05:00Z".to_string())),
+            ),
+            (
+                "last_success_at",
+                Box::new(|r| r.last_success_at = Some("2026-06-01T10:05:00Z".to_string())),
+            ),
+            (
+                "last_error_code",
+                Box::new(|r| r.last_error_code = Some("parse_error".to_string())),
+            ),
+            (
+                "last_error_message",
+                Box::new(|r| r.last_error_message = Some("scan failed".to_string())),
+            ),
+            (
+                "next_retry_at",
+                Box::new(|r| r.next_retry_at = Some("2026-06-01T10:10:00Z".to_string())),
+            ),
+            (
+                "last_scan_cap_hit",
+                Box::new(|r| r.last_scan_cap_hit = true),
+            ),
+            // Both directions, because the backend reads PRESENCE, not truth:
+            // an explicit `true` re-asserts a complete census, and an explicit
+            // `false` lowers a completeness it had already accepted. A beat has
+            // measured neither, so either one is a false declaration.
+            (
+                "last_census_complete",
+                Box::new(|r| r.last_census_complete = Some(true)),
+            ),
+            (
+                "last_census_complete",
+                Box::new(|r| r.last_census_complete = Some(false)),
+            ),
+            (
+                "last_uploaded_count",
+                Box::new(|r| r.last_uploaded_count = 1),
+            ),
+            (
+                "last_scanned_session_count",
+                Box::new(|r| r.last_scanned_session_count = 1),
+            ),
+            (
+                "last_scanned_file_count",
+                Box::new(|r| r.last_scanned_file_count = 1),
+            ),
+            (
+                "last_zero_snapshot_confirmed_count",
+                Box::new(|r| r.last_zero_snapshot_confirmed_count = 1),
+            ),
+            (
+                "last_zero_snapshot_usage_evidence_count",
+                Box::new(|r| r.last_zero_snapshot_usage_evidence_count = 1),
+            ),
+            (
+                "last_dropped_usage_record_count",
+                Box::new(|r| r.last_dropped_usage_record_count = 1),
+            ),
+            (
+                "last_ownership_incomplete_file_count",
+                Box::new(|r| r.last_ownership_incomplete_file_count = 1),
+            ),
+            (
+                "last_snapshot_unproven_terminal_count",
+                Box::new(|r| r.last_snapshot_unproven_terminal_count = 1),
+            ),
+            (
+                "last_snapshot_superseded_terminal_count",
+                Box::new(|r| r.last_snapshot_superseded_terminal_count = 1),
+            ),
+            (
+                "last_backfill_file_limit",
+                Box::new(|r| r.last_backfill_file_limit = 1),
+            ),
+            (
+                "last_discovered_file_count",
+                Box::new(|r| r.last_discovered_file_count = 1),
+            ),
+            (
+                "last_skipped_file_count_due_to_limit",
+                Box::new(|r| r.last_skipped_file_count_due_to_limit = 1),
+            ),
+            (
+                "last_semantic_noop_count",
+                Box::new(|r| r.last_semantic_noop_count = 1),
+            ),
+            (
+                "last_symlink_rejected_count",
+                Box::new(|r| r.last_symlink_rejected_count = 1),
+            ),
+            (
+                "last_unreadable_path_count",
+                Box::new(|r| r.last_unreadable_path_count = 1),
+            ),
+            (
+                "last_oversized_file_count",
+                Box::new(|r| r.last_oversized_file_count = 1),
+            ),
+            (
+                "last_disappeared_file_count",
+                Box::new(|r| r.last_disappeared_file_count = 1),
+            ),
+            (
+                "last_malformed_json_line_count",
+                Box::new(|r| r.last_malformed_json_line_count = 1),
+            ),
+            (
+                "last_invalid_utf8_line_count",
+                Box::new(|r| r.last_invalid_utf8_line_count = 1),
+            ),
+            (
+                "last_over_line_cap_count",
+                Box::new(|r| r.last_over_line_cap_count = 1),
+            ),
+            (
+                "last_recognized_usage_drop_count",
+                Box::new(|r| r.last_recognized_usage_drop_count = 1),
+            ),
+            // The settled-residue counters and verdict are census evidence
+            // like the loss counters they decompose; a beat measured none of
+            // it.
+            (
+                "last_terminal_ownership_incomplete_file_count",
+                Box::new(|r| r.last_terminal_ownership_incomplete_file_count = 1),
+            ),
+            (
+                "last_terminal_zero_snapshot_usage_evidence_count",
+                Box::new(|r| r.last_terminal_zero_snapshot_usage_evidence_count = 1),
+            ),
+            (
+                "last_terminal_recognized_usage_drop_count",
+                Box::new(|r| r.last_terminal_recognized_usage_drop_count = 1),
+            ),
+            (
+                "last_terminal_dropped_usage_record_count",
+                Box::new(|r| r.last_terminal_dropped_usage_record_count = 1),
+            ),
+            (
+                "last_terminal_over_line_cap_count",
+                Box::new(|r| r.last_terminal_over_line_cap_count = 1),
+            ),
+            (
+                "last_census_pending_file_count",
+                Box::new(|r| r.last_census_pending_file_count = Some(0)),
+            ),
+            (
+                "last_census_block_cause",
+                Box::new(|r| r.last_census_block_cause = Some(CensusBlockCause::Other)),
+            ),
+            (
+                "last_census_residue_settled",
+                Box::new(|r| r.last_census_residue_settled = true),
+            ),
+            (
+                "last_census_residue_index_key_count",
+                Box::new(|r| r.last_census_residue_index_key_count = 1),
+            ),
+            (
+                "last_census_residue_archived_rollout_count",
+                Box::new(|r| r.last_census_residue_archived_rollout_count = 1),
+            ),
+            (
+                "consecutive_failures",
+                Box::new(|r| r.consecutive_failures = 1),
+            ),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut beat = clean_checkin_request();
+            mutate(&mut beat);
+            let refused = match beat.validate_declared_report_kind() {
+                Ok(()) => panic!("a beat carrying {field} is a false declaration"),
+                Err(error) => error,
+            };
+            assert!(
+                refused.to_string().contains(field),
+                "{field} was not named: {refused}"
+            );
+
+            // The SAME payload declared truthfully always travels: the guard
+            // constrains the declaration, never the evidence.
+            let mut honest = beat.clone();
+            honest.report_kind = SnapshotStatusReportKind::ScanStatus;
+            honest
+                .validate_declared_report_kind()
+                .expect("a scan status may disclose anything");
+        }
+    }
+
+    /// A beat legitimately carries the cycle-start clock, the server's own
+    /// width hint, the build identity, and the manifest witness the backend
+    /// already accepted. None of those is new scan evidence.
+    #[test]
+    fn a_checkin_may_carry_already_accepted_liveness_evidence() {
+        let mut beat = clean_checkin_request();
+        beat.last_backfill_window_days = 730;
+        beat.collector_version = Some("9.9.9".to_string());
+        beat.parser_version = Some("whatever".to_string());
+        beat.manifest = Some(SnapshotSourceManifest {
+            contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+            scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
+            source: "codex".to_string(),
+            window_start: "2026-01-01T00:00:00Z".to_string(),
+            window_end: "2026-07-03T00:00:00Z".to_string(),
+            entity_count: 3,
+            rolling_hash: "b".repeat(64),
+        });
+        beat.validate_declared_report_kind()
+            .expect("a beat may repeat accepted evidence");
+    }
+
+    #[test]
+    fn status_payload_uses_safe_error_fields() {
+        let status = SnapshotStatusRequest {
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::ScanStatus,
+            enabled: true,
+            disabled_reason: None,
+            last_scan_started_at: None,
+            last_scan_finished_at: None,
+            last_success_at: None,
+            last_error_code: Some("auth_error".to_string()),
+            last_error_message: Some("relay device credentials are missing".to_string()),
+            last_uploaded_count: 0,
+            last_scanned_session_count: 0,
+            last_scanned_file_count: 0,
+            last_backfill_window_days: 183,
+            first_read_cutoff: None,
+            last_backfill_file_limit: 1_000,
+            last_discovered_file_count: 1_100,
+            last_skipped_file_count_due_to_limit: 100,
+            last_scan_cap_hit: true,
+            last_zero_snapshot_confirmed_count: 12,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
+            last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
+            last_semantic_noop_count: 7,
+            last_census_complete: Some(false),
+            last_symlink_rejected_count: 1,
+            last_unreadable_path_count: 2,
+            last_oversized_file_count: 3,
+            last_disappeared_file_count: 4,
+            last_malformed_json_line_count: 5,
+            last_invalid_utf8_line_count: 6,
+            last_over_line_cap_count: 7,
+            last_recognized_usage_drop_count: 8,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 7,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
+            consecutive_failures: 1,
+            next_retry_at: None,
+            collector_version: Some("0.1.0".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: Some(SnapshotSourceManifest {
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
+                source: "codex".to_string(),
+                window_start: "2026-01-01T00:00:00Z".to_string(),
+                window_end: "2026-07-03T00:00:00Z".to_string(),
+                entity_count: 3,
+                rolling_hash: "b".repeat(64),
+            }),
+            control_plane: None,
+        };
+        let serialized = serde_json::to_string(&status).expect("serialize");
+        assert!(!serialized.contains(".codex"));
+        assert!(!serialized.contains("/Users/"));
+    }
+
+    fn terminal_status_request_with_manifest_window(window_days: i64) -> SnapshotStatusRequest {
+        let window_end = time::OffsetDateTime::parse(
+            "2026-08-30T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("window end");
+        let window_start = window_end - time::Duration::days(window_days);
+        SnapshotStatusRequest {
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::ScanStatus,
+            enabled: true,
+            disabled_reason: None,
+            last_scan_started_at: Some("2026-08-30T12:00:00Z".to_string()),
+            last_scan_finished_at: Some("2026-08-30T12:01:00Z".to_string()),
+            last_success_at: Some("2026-08-30T12:01:00Z".to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            last_uploaded_count: 1,
+            last_scanned_session_count: 1,
+            last_scanned_file_count: 1,
+            last_zero_snapshot_confirmed_count: 0,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
+            last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
+            last_backfill_window_days: window_days as u64,
+            first_read_cutoff: None,
+            last_backfill_file_limit: 10_000,
+            last_discovered_file_count: 1,
+            last_skipped_file_count_due_to_limit: 0,
+            last_scan_cap_hit: false,
+            last_semantic_noop_count: 0,
+            last_census_complete: Some(true),
+            last_symlink_rejected_count: 0,
+            last_unreadable_path_count: 0,
+            last_oversized_file_count: 0,
+            last_disappeared_file_count: 0,
+            last_malformed_json_line_count: 0,
+            last_invalid_utf8_line_count: 0,
+            last_over_line_cap_count: 0,
+            last_recognized_usage_drop_count: 0,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 0,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_pending_file_count: None,
+            last_census_block_cause: None,
+            consecutive_failures: 0,
+            next_retry_at: None,
+            collector_version: Some("0.1.120".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: Some(SnapshotSourceManifest {
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
+                source: "codex".to_string(),
+                window_start: window_start
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .expect("window start"),
+                window_end: "2026-08-30T12:00:00Z".to_string(),
+                entity_count: 1,
+                rolling_hash: "b".repeat(64),
+            }),
+            control_plane: None,
+        }
+    }
+
+    #[test]
+    fn backend_422_contract_rejects_replay_width_but_accepts_negotiated_manifest_window() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind contract fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let captured_server = captured.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept status request");
+                let request = read_complete_http_request(&mut stream);
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("");
+                let value: serde_json::Value = serde_json::from_str(body).expect("status JSON");
+                captured_server
+                    .lock()
+                    .expect("capture status fixture")
+                    .push(value.clone());
+                let manifest = &value["manifest"];
+                let start = time::OffsetDateTime::parse(
+                    manifest["window_start"].as_str().expect("window start"),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("parse start");
+                let end = time::OffsetDateTime::parse(
+                    manifest["window_end"].as_str().expect("window end"),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("parse end");
+                let too_wide = end - start > time::Duration::days(183);
+                let (status, response_body) = if too_wide {
+                    (
+                        "422 Unprocessable Entity",
+                        r#"{"detail":"manifest window exceeds the server backfill policy ceiling"}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"accepted":true,"source":"codex","machine_id":"otm_test","disabled":false,"disabled_reason":null}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                use std::io::Write;
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fixture response");
+            }
+        });
+
+        let client = SnapshotApiClient::new(format!("http://{address}"));
+        let legacy = terminal_status_request_with_manifest_window(730);
+        let rejected = client
+            .report_status("relay", &legacy)
+            .expect_err("the backend contract rejects the replay scan width");
+        assert!(rejected.to_string().contains("status_family=http_4xx"));
+
+        let corrected = terminal_status_request_with_manifest_window(183);
+        let accepted = client
+            .report_status("relay", &corrected)
+            .expect("negotiated evidence window is accepted");
+        assert!(accepted.accepted);
+        let requests = captured.lock().expect("captured fixture requests");
+        assert_eq!(requests[0]["last_backfill_window_days"], 730);
+        assert_eq!(requests[1]["last_backfill_window_days"], 183);
+    }
+
+    fn entity_ref(session: &str, fingerprint: &str, occurrence_count: u64) -> SnapshotEntityRef {
+        SnapshotEntityRef {
+            source_session_id: session.to_string(),
+            snapshot_fingerprint: fingerprint.to_string(),
+            occurrence_count,
+            body_witness_version: None,
+            body_witness_digest: None,
+            head_etag: None,
+            head_challenge: None,
+            unchanged_basis: None,
+            cache_observations_state: None,
+        }
+    }
+
+    fn entity_ack(
+        accepted: u64,
+        accepted_entities: Vec<SnapshotEntityRef>,
+    ) -> SnapshotBatchResponse {
+        SnapshotBatchResponse {
+            conflict_rescans: Default::default(),
+            accepted,
+            sessions_reconciled: 0,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
+            accepted_entities,
+            unchanged_entities: Vec::new(),
+            rejected_entities: Vec::new(),
+            conflict_entities: Vec::new(),
+        }
+    }
+
+    /// Two witnessed bodies, one accepted and one unchanged, each echoed exactly.
+    fn witnessed_ack() -> (SnapshotBatchRequest, SnapshotBatchResponse) {
+        let first = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        let mut second = first.clone();
+        second.source_session_id = "synthetic-second-session".into();
+        let echo = |item: &crate::snapshots::SnapshotItem| SnapshotEntityRef {
+            body_witness_version: snapshot_ack_body_witness_version(item).unwrap(),
+            body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(item)),
+            // Cache observations put the request under the head-CAS contract.
+            head_etag: Some("e".repeat(64)),
+            ..entity_ref(&item.source_session_id, &item.snapshot_fingerprint, 1)
+        };
+        let mut ack = entity_ack(2, vec![echo(&first)]);
+        ack.unchanged_entities.push(echo(&second));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![first, second],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        (request, ack)
+    }
+
+    /// The refusal is unchanged; returns its one diagnostic line.
+    fn refused_witness_line(edit: impl FnOnce(&mut SnapshotBatchResponse)) -> String {
+        let (request, mut ack) = witnessed_ack();
+        edit(&mut ack);
+        let error = ack.validate_body_witness_ack(&request).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "snapshot ACK lacks exact durable context curve body witness proof"
+        );
+        let lines = BODY_WITNESS_REFUSALS.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_missing_version() {
+        let line = refused_witness_line(|ack| {
+            let reference = &mut ack.accepted_entities[0];
+            reference.body_witness_version = None;
+            reference.body_witness_digest = None;
+        });
+        assert!(
+            line.contains("reason=missing_version class=accepted "),
+            "{line}"
+        );
+        assert!(
+            line.contains("echoed_witness_version=none bad_refs=1 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_version_mismatch() {
+        let line = refused_witness_line(|ack| {
+            ack.unchanged_entities[0].body_witness_version = Some(3);
+        });
+        assert!(
+            line.contains("reason=version_mismatch class=unchanged "),
+            "{line}"
+        );
+        assert!(
+            line.contains("echoed_witness_version=3 bad_refs=1 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_missing_digest() {
+        let line = refused_witness_line(|ack| {
+            ack.accepted_entities[0].body_witness_digest = None;
+        });
+        assert!(
+            line.contains("reason=missing_digest class=accepted "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn body_witness_refusal_names_a_digest_mismatch_and_counts_every_bad_ref() {
+        let (request, _) = witnessed_ack();
+        let first = &request.snapshots[0];
+        let version = snapshot_ack_body_witness_version(first).unwrap().unwrap();
+        let line = refused_witness_line(|ack| {
+            ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+            ack.unchanged_entities[0].body_witness_version = None;
+        });
+        let parts = [
+            json!(&first.session_account_evidence),
+            json!((&first.tool_usage, first.tool_usage_truncated)),
+            json!((&first.cache_observations, &first.cache_observations_state)),
+        ]
+        .map(|part| {
+            use sha2::Digest;
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(crate::canonical_json::canonicalize(&part).unwrap())
+            )[..8]
+                .to_owned()
+        });
+        assert_eq!(
+            line,
+            format!(
+                "warning: local snapshot ACK body witness refused: reason=digest_mismatch \
+                 class=accepted session_hash={} fingerprint={} witness_version={version} \
+                 echoed_digest=00000000 echoed_witness_version={version} bad_refs=2 answered=false expected_digest={} account_part={} tool_part={} cache_part={}",
+                crate::snapshot_sync::SessionHash::of(&first.source_session_id),
+                &first.snapshot_fingerprint[..8],
+                &crate::snapshots::snapshot_upload_body_witness(first)[..8],
+                parts[0], parts[1], parts[2],
+            )
+        );
+        let (digest, zeros) = (
+            crate::snapshots::snapshot_upload_body_witness(first),
+            "0".repeat(64),
+        );
+        assert!(line.contains(&format!("expected_digest={} ", &digest[..8])));
+        for secret in [&first.source_session_id, &zeros, &digest] {
+            assert!(!line.contains(secret), "{line}");
+        }
+        // Both bad refs are named by request index on the typed refusal.
+        let (request, mut ack) = witnessed_ack();
+        ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+        ack.unchanged_entities[0].body_witness_version = None;
+        // A well-formed missing proof: version and digest both absent.
+        ack.unchanged_entities[0].body_witness_digest = None;
+        let error = ack.validate_entity_ack(&request).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
+        assert_eq!(
+            error
+                .downcast_ref::<RefusedSnapshotIndexes>()
+                .map(|named| &named.0),
+            Some(&vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn exact_body_witness_echo_still_settles_without_a_refusal_line() {
+        let (request, ack) = witnessed_ack();
+        ack.validate_entity_ack(&request).unwrap();
+        assert!(BODY_WITNESS_REFUSALS.with(|lines| lines.borrow().is_empty()));
+    }
+
+    /// `cache_state_ack:v1`: an accepted and an unchanged ref whose digests
+    /// cover server-held cache rows these bodies never sent settle only when
+    /// the echoed state, with each body's own account and tool parts,
+    /// reproduces the digest. Every other echo is refused as before.
+    #[test]
+    fn echoed_cache_state_settles_only_an_exact_digest_reproduction() {
+        let (request, ack) = witnessed_ack();
+        let stored = |item: &crate::snapshots::SnapshotItem, state: &Value| {
+            let mut hashed = item.clone();
+            hashed.cache_observations_state = Some(state.clone());
+            crate::snapshots::snapshot_upload_body_witness(&hashed)
+        };
+        let server = crate::snapshot_sync::head_conflict_answer_tests::with_stray_cache_row(
+            request.snapshots[0]
+                .cache_observations_state
+                .as_ref()
+                .unwrap(),
+        );
+        let digests = [
+            stored(&request.snapshots[0], &server),
+            stored(&request.snapshots[1], &server),
+        ];
+        let echoed = |digest: [&str; 2], echo: Option<&Value>| {
+            let mut ack = ack.clone();
+            for (reference, digest) in [
+                &mut ack.accepted_entities[0],
+                &mut ack.unchanged_entities[0],
+            ]
+            .into_iter()
+            .zip(digest)
+            {
+                reference.body_witness_digest = Some(digest.to_string());
+                reference.cache_observations_state = echo.cloned();
+            }
+            ack
+        };
+        let settled = echoed([digests[0].as_str(), digests[1].as_str()], Some(&server));
+        settled.validate_entity_ack(&request).unwrap();
+        assert!(BODY_WITNESS_REFUSALS.with(|lines| lines.borrow().is_empty()));
+        assert_eq!(
+            settled_cache_state_echo(&settled.accepted_entities[0], &request.snapshots[0]),
+            Some(server.clone())
+        );
+
+        let refused = |ack: SnapshotBatchResponse| {
+            let error = ack.validate_entity_ack(&request).unwrap_err();
+            assert!(error.downcast_ref::<SnapshotAckRejected>().is_some());
+            let lines =
+                BODY_WITNESS_REFUSALS.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().unwrap()
+        };
+        // No echo: today's refusal, now naming the echoed digest prefix.
+        let line = refused(echoed([digests[0].as_str(), digests[1].as_str()], None));
+        assert!(
+            line.contains(&format!(" echoed_digest={} ", &digests[0][..8])),
+            "{line}"
+        );
+        assert!(line.contains(" bad_refs=2 "), "{line}");
+        // Not a state, or a valid state that is not the one hashed.
+        let mut bad = server.clone();
+        bad["observations"][0] = json!({"event_id": "x"});
+        let bad_digests = [
+            stored(&request.snapshots[0], &bad),
+            stored(&request.snapshots[1], &bad),
+        ];
+        let local = request.snapshots[0].cache_observations_state.as_ref();
+        for (digest, echo) in [(&bad_digests, Some(&bad)), (&digests, local)] {
+            refused(echoed([digest[0].as_str(), digest[1].as_str()], echo));
+        }
+    }
+
+    #[test]
+    fn composition_start_verdict_records_only_final_acknowledged_items() {
+        use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
+        let support = crate::test_scratch::canonical_private_dir("composition-ack-verdict");
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.cache_observations = None;
+        item.session_account_evidence = None;
+        item.session_start = Some(Box::new(SnapshotSessionStart {
+            user_turn_count: Some(1),
+            ..Default::default()
+        }));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![item],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client = SnapshotApiClient::new("https://example.invalid")
+            .with_receipt_state_dir(&support)
+            .with_receipt_destination_namespace("synthetic-namespace".into());
+        let id = &request.snapshots[0].source_session_id;
+        let destination = start_verdict_store::destination(
+            "synthetic-namespace",
+            "https://example.invalid",
+            &request.machine_id,
+        );
+        let get = || {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            start_verdict_store::load(&support, &destination, now).get("codex", id, now)
+        };
+        let mut conflict = entity_ack(0, vec![]);
+        conflict.conflict_entities.push(entity_ref(
+            id,
+            &request.snapshots[0].snapshot_fingerprint,
+            1,
+        ));
+        conflict.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &conflict, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let mut disabled = entity_ack(0, vec![]);
+        disabled.disabled = true;
+        client.record_composition_start_verdicts(&request, &disabled, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let accepted = entity_ack(
+            1,
+            vec![entity_ref(
+                id,
+                &request.snapshots[0].snapshot_fingerprint,
+                1,
+            )],
+        );
+        accepted.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &accepted, false);
+        assert_eq!(get(), StartVerdict::Measured);
+        // A later final-body clear (including a payload-budget clear) must
+        // replace the verdict, not retain the earlier folded start.
+        let mut cleared = request.clone();
+        cleared.snapshots[0].session_start = None;
+        client.record_composition_start_verdicts(&cleared, &accepted, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn validated_receipt_transport_is_private_destination_scoped_and_io_noninterfering() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let dir = crate::test_scratch::canonical_private_dir("ottto-validated-receipts");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        let ack = entity_ack(
+            1,
+            vec![SnapshotEntityRef {
+                source_session_id: item.source_session_id.clone(),
+                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: Some(14),
+                body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
+                head_etag: Some("e".repeat(64)),
+                head_challenge: None,
+                unchanged_basis: None,
+                cache_observations_state: None,
+            }],
+        );
+        let reference = &ack.accepted_entities[0];
+        let body = serde_json::json!({
+            "accepted": 1, "sessions_reconciled": 0, "session_ids": [], "disabled": false,
+            "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities": [{"source_session_id": reference.source_session_id,
+                "snapshot_fingerprint": reference.snapshot_fingerprint, "occurrence_count": 1,
+                "body_witness_version": reference.body_witness_version,
+                "body_witness_digest": reference.body_witness_digest, "head_etag": reference.head_etag}],
+            "unchanged_entities": [], "rejected_entities": [], "conflict_entities": []
+        }).to_string();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_complete_http_request(&mut stream);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Request-ID: synthetic-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let mut request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some("0.1.synthetic".into()),
+            snapshots: vec![item],
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        for (source, namespace) in [("codex", "a"), ("claude_code", "b")] {
+            request.source = source.into();
+            let client = SnapshotApiClient::new(format!("http://{address}"))
+                .with_receipt_state_dir(&dir)
+                .with_receipt_destination_namespace(namespace.repeat(64));
+            let response = client
+                .upload_batch("synthetic-relay", &request, false)
+                .unwrap();
+            response
+                .validate_entity_ack_with_head_cas(&request, true)
+                .unwrap();
+        }
+        let rows = crate::upload_receipts::private_rows_for_test(&dir);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(
+            rows[0]["validated_evidence"]["destination_namespace_hash"],
+            rows[1]["validated_evidence"]["destination_namespace_hash"]
+        );
+        assert_eq!(
+            rows[0]["validated_evidence"]["api_destination_hash"],
+            rows[1]["validated_evidence"]["api_destination_hash"]
+        );
+        assert_eq!(rows[0]["server_request_id"], "synthetic-request");
+        let public =
+            serde_json::to_value(crate::upload_receipts::read(&dir, 50, None, None).unwrap())
+                .unwrap();
+        assert!(!public.to_string().contains("validated_evidence"));
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"synthetic").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{address}"))
+            .with_receipt_state_dir(&blocked)
+            .with_receipt_destination_namespace("c".repeat(64));
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response
+            .validate_entity_ack_with_head_cas(&request, true)
+            .unwrap();
+        assert_eq!(response.accepted, 1);
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_batch_transport_records_each_typed_receipt_outcome() {
+        use ottto_protocol::{LocalAccountState, UploadReceiptOutcomeV1};
+        use std::net::TcpListener;
+
+        let state_dir =
+            crate::test_scratch::canonical_private_dir("ottto-snapshot-client-receipts");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind receipt fixture");
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let responses = [
+                (
+                    "200 OK",
+                    Some("request-accepted"),
+                    None,
+                    r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]}"#,
+                ),
+                (
+                    "200 OK",
+                    Some("request-partial"),
+                    None,
+                    r#"{"accepted":1,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[{"source_session_id":"raw-partial-session","snapshot_fingerprint":"abcdef0123456789","reason":"contract","detail":"fixture","permanent":true,"occurrence_count":1}],"conflict_entities":[]}"#,
+                ),
+                (
+                    "408 Request Timeout",
+                    Some("request-shed"),
+                    Some("30"),
+                    "{}",
+                ),
+                (
+                    "429 Too Many Requests",
+                    Some("request-shed"),
+                    Some("30"),
+                    "{}",
+                ),
+                (
+                    "422 Unprocessable Entity",
+                    Some("request-rejected"),
+                    None,
+                    "{}",
+                ),
+                ("401 Unauthorized", Some("request-auth"), None, "{}"),
+            ];
+            for (status, request_id, retry_after, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept batch request");
+                let _ = read_complete_http_request(&mut stream);
+                let request_id = request_id
+                    .map(|value| format!("X-Request-ID: {value}\r\n"))
+                    .unwrap_or_default();
+                let retry_after = retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{request_id}{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                use std::io::Write;
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client = SnapshotApiClient::new(format!("http://{address}"))
+            .with_receipt_state_dir(&state_dir)
+            .with_receipt_context(
+                Some("Test Mac".to_string()),
+                Some(LocalAccountState::Connected),
+            );
+        client.upload_batch("relay", &request, false).unwrap();
+        client.upload_batch("relay", &request, false).unwrap();
+        for status in [408, 429] {
+            let error = client.upload_batch("relay", &request, false).unwrap_err();
+            assert_eq!(error.downcast_ref::<UploadShed>().unwrap().status, status);
+        }
+        assert!(client
+            .upload_batch("relay", &request, false)
+            .unwrap_err()
+            .downcast_ref::<BatchRejected>()
+            .is_some());
+        assert!(client
+            .upload_batch("relay", &request, false)
+            .unwrap_err()
+            .downcast_ref::<BatchAuthorizationRejected>()
+            .is_some());
+
+        let transport =
+            SnapshotApiClient::new("http://127.0.0.1:1").with_receipt_state_dir(&state_dir);
+        assert!(transport.upload_batch("relay", &request, false).is_err());
+
+        let receipt_response = crate::upload_receipts::read(&state_dir, 10, None, None).unwrap();
+        let outcomes = receipt_response
+            .receipts
+            .iter()
+            .map(|receipt| receipt.outcome)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                UploadReceiptOutcomeV1::TransportError,
+                UploadReceiptOutcomeV1::AuthRejected,
+                UploadReceiptOutcomeV1::Rejected,
+                UploadReceiptOutcomeV1::Shed,
+                UploadReceiptOutcomeV1::Shed,
+                UploadReceiptOutcomeV1::Partial,
+                UploadReceiptOutcomeV1::Accepted,
+            ]
+        );
+        assert_eq!(
+            receipt_response.receipts[6].server_request_id.as_deref(),
+            Some("request-accepted")
+        );
+        assert_eq!(
+            receipt_response.receipts[6].device_label.as_deref(),
+            Some("Test Mac")
+        );
+        assert_eq!(
+            receipt_response.receipts[6].account_binding,
+            Some(LocalAccountState::Connected)
+        );
+        assert_eq!(
+            receipt_response.receipts[5].server_request_id.as_deref(),
+            Some("request-partial")
+        );
+        assert_eq!(receipt_response.receipts[4].retry_after_seconds, Some(30));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn head_cas_ack_accepts_only_etags_for_settled_and_challenges_for_conflicts() {
+        let fingerprint = "a".repeat(64);
+        let mut settled = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        settled.accepted_entities[0].head_etag = Some("b".repeat(64));
+        settled
+            .validate_head_cas_ack(true)
+            .expect("accepted CAS identity carries its held-head etag");
+
+        let mut conflicted = entity_ack(0, Vec::new());
+        conflicted.conflict_entities = vec![entity_ref("session", &fingerprint, 1)];
+        conflicted.conflict_entities[0].head_challenge = Some("c".repeat(64));
+        conflicted
+            .validate_head_cas_ack(true)
+            .expect("conflict carries only its non-authorizing challenge");
+
+        conflicted.conflict_entities[0].head_etag = Some("d".repeat(64));
+        conflicted
+            .validate_head_cas_ack(true)
+            .expect_err("a conflict can never disclose an accepted predecessor token");
+    }
+
+    #[test]
+    fn head_cas_ack_fails_closed_on_missing_malformed_or_unsolicited_tokens() {
+        let fingerprint = "a".repeat(64);
+        let missing = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        missing
+            .validate_head_cas_ack(true)
+            .expect_err("CAS settlement requires a returned head etag");
+
+        let mut malformed = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        malformed.accepted_entities[0].head_etag = Some("NOT-A-DIGEST".to_string());
+        malformed
+            .validate_head_cas_ack(true)
+            .expect_err("head tokens are exact lowercase SHA-256-shaped values");
+
+        malformed.accepted_entities[0].head_etag = Some("b".repeat(64));
+        malformed
+            .validate_head_cas_ack(false)
+            .expect_err("ordinary requests cannot silently adopt unsolicited head state");
+    }
+
+    #[test]
+    fn disabled_batch_response_is_not_mistaken_for_a_partial_ack() {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = entity_ack(0, Vec::new());
+        response.disabled = true;
+        response.disabled_reason = Some("disabled_by_admin".to_string());
+        response
+            .validate_entity_ack(&request)
+            .expect("disabled response intentionally has no entity partition");
+
+        response.accepted = 1;
+        response
+            .validate_entity_ack(&request)
+            .expect_err("disabled response cannot settle an entity");
+    }
+
+    #[test]
+    fn unknown_entity_ack_contract_never_falls_back_to_legacy_count_only_ack() {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = entity_ack(0, Vec::new());
+        response.entity_ack_contract = Some("snapshot_entity_ack:v999".to_string());
+        response
+            .validate_entity_ack(&request)
+            .expect_err("future ACK shapes require explicit client support");
+    }
+
+    #[test]
+    fn entity_ack_validates_reordered_duplicate_occurrences_as_a_multiset() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let response = entity_ack(
+            3,
+            vec![
+                entity_ref("session-b", &second, 1),
+                entity_ref("session-a", &first, 2),
+            ],
+        );
+        response
+            .validate_entity_ack_identities([
+                ("session-a", first.as_str()),
+                ("session-b", second.as_str()),
+                ("session-a", first.as_str()),
+            ])
+            .expect("reordered duplicate occurrences are exact");
+    }
+
+    #[test]
+    fn entity_ack_requires_one_compressed_outcome_per_identity() {
+        let fingerprint = "a".repeat(64);
+        let requested = [
+            ("session", fingerprint.as_str()),
+            ("session", fingerprint.as_str()),
+        ];
+
+        entity_ack(
+            2,
+            vec![
+                entity_ref("session", &fingerprint, 1),
+                entity_ref("session", &fingerprint, 1),
+            ],
+        )
+        .validate_entity_ack_identities(requested)
+        .expect_err("duplicate response entries are not a compressed outcome");
+
+        entity_ack(2, vec![entity_ref("session", &fingerprint, 2)])
+            .validate_entity_ack_identities(requested)
+            .expect("one response entry may cover both requested occurrences");
+    }
+
+    #[test]
+    fn entity_ack_allows_divergent_bodies_for_one_session_when_each_is_exact() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        entity_ack(
+            2,
+            vec![
+                entity_ref("same-session", &first, 1),
+                entity_ref("same-session", &second, 1),
+            ],
+        )
+        .validate_entity_ack_identities([
+            ("same-session", first.as_str()),
+            ("same-session", second.as_str()),
+        ])
+        .expect("fingerprint keeps divergent revisions distinct");
+    }
+
+    #[test]
+    fn entity_ack_rejects_partial_foreign_and_inconsistent_duplicate_counts() {
+        let fingerprint = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        assert!(entity_ack(1, vec![entity_ref("session", &fingerprint, 1)])
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+        assert!(entity_ack(2, vec![entity_ref("foreign", &foreign, 2)])
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+
+        let mut inconsistent = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        inconsistent.unchanged_entities = vec![entity_ref("session", &fingerprint, 1)];
+        inconsistent.accepted = 2;
+        assert!(inconsistent
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn entity_ack_decodes_compressed_outcomes_across_all_classes() {
+        let accepted = "a".repeat(64);
+        let unchanged = "b".repeat(64);
+        let rejected = "c".repeat(64);
+        let conflict = "d".repeat(64);
+        let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+            "accepted": 5,
+            "sessions_reconciled": 0,
+            "session_ids": [],
+            "disabled": false,
+            "disabled_reason": null,
+            "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities": [{
+                "source_session_id": "accepted-session",
+                "snapshot_fingerprint": accepted,
+                "occurrence_count": 2
+            }],
+            "unchanged_entities": [{
+                "source_session_id": "unchanged-session",
+                "snapshot_fingerprint": unchanged,
+                "occurrence_count": 3
+            }],
+            "rejected_entities": [{
+                "source_session_id": "rejected-session",
+                "snapshot_fingerprint": rejected,
+                "reason": "schema",
+                "detail": "bounded",
+                "permanent": true,
+                "occurrence_count": 2
+            }],
+            "conflict_entities": [{
+                "source_session_id": "conflict-session",
+                "snapshot_fingerprint": conflict,
+                "occurrence_count": 2
+            }]
+        }))
+        .expect("decode compressed ACK");
+        response
+            .validate_entity_ack_identities(
+                std::iter::repeat_n(("accepted-session", accepted.as_str()), 2)
+                    .chain(std::iter::repeat_n(
+                        ("unchanged-session", unchanged.as_str()),
+                        3,
+                    ))
+                    .chain(std::iter::repeat_n(
+                        ("rejected-session", rejected.as_str()),
+                        2,
+                    ))
+                    .chain(std::iter::repeat_n(
+                        ("conflict-session", conflict.as_str()),
+                        2,
+                    )),
+            )
+            .expect("identity-unique compressed outcomes cover the request exactly");
+    }
+
+    #[test]
+    fn entity_ack_rejects_zero_and_overflow_occurrence_counts() {
+        let fingerprint = "a".repeat(64);
+        entity_ack(0, vec![entity_ref("session", &fingerprint, 0)])
+            .validate_entity_ack_identities([("session", fingerprint.as_str())])
+            .expect_err("zero occurrence count is invalid");
+
+        let key = ("session".to_string(), fingerprint.clone());
+        let requested = std::collections::BTreeMap::from([(key, u64::MAX)]);
+        let mut covered = std::collections::BTreeMap::new();
+        let mut classifications = std::collections::BTreeMap::new();
+        record_snapshot_ack_occurrences(
+            &requested,
+            &mut covered,
+            &mut classifications,
+            "session",
+            &fingerprint,
+            u64::MAX,
+            "accepted",
+        )
+        .expect("first count fits");
+        record_snapshot_ack_occurrences(
+            &requested,
+            &mut covered,
+            &mut classifications,
+            "session",
+            &fingerprint,
+            1,
+            "accepted",
+        )
+        .expect_err("occurrence sum overflow is rejected");
+    }
+}
+
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
+
+impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            nickname_generations,
+            api_base_url,
+            agent: _,
+            batch_agent: _,
+            receipt_state_dir,
+            receipt_destination_namespace,
+            receipt_context,
+        } = self;
+        // Both Agent handles clone the existing process-wide shared_agents pool;
+        // SourcePreparation creates no new pool. Inline handles are charged by
+        // their owning frame, and this bound covers its incremental owned heap.
+        nickname_generations.heap_bound(c)?;
+        api_base_url.heap_bound(c)?;
+        receipt_state_dir.heap_bound(c)?;
+        receipt_destination_namespace.heap_bound(c)?;
+        receipt_context.heap_bound(c)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn retention_gzip_probe(body: &[u8], item_cap: usize) -> Option<Vec<u8>> {
+    gzip_snapshot_batch(body, true, item_cap)
+}

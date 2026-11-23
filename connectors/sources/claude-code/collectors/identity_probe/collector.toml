@@ -1,0 +1,17 @@
+schema_version = "collector_manifest.v1"
+source_id = "claude_code"
+collector_id = "identity_probe"
+display_name = "Identity probe"
+
+operations = ["detect", "verify", "diagnostics"]
+data_source_kind = "local_enriched"
+default_state = "enabled"
+
+review_tier = "official"
+maturity = "beta"
+risk_classes = ["auth_adjacent"]
+
+uploads_raw_content = false
+emits = [
+  "identity_probe_events"
+]

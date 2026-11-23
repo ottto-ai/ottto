@@ -1,0 +1,28 @@
+{
+  "credit_balances": [
+    {
+      "disabled_reason": "out_of_credits",
+      "enabled": false,
+      "freshness": "fresh",
+      "kind": "usage_credits",
+      "name": "Usage credits",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "status": "unknown",
+      "unit": "usd"
+    },
+    {
+      "currency": "USD",
+      "expires_at": "2026-11-05T07:59:00Z",
+      "freshness": "fresh",
+      "kind": "one_time_credit",
+      "limit_id": "iguana_necktie",
+      "name": "one_time_credit",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "quota": 25000,
+      "remaining": 23750,
+      "status": "ok",
+      "unit": "usd",
+      "used": 1250
+    }
+  ]
+}

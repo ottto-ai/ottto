@@ -1,0 +1,2037 @@
+//! R5: real discovery/acquisition, classification and Completed restoration.
+//! Fixtures contain synthetic transcripts only. Existing native Tail assertions
+//! in scan::lines::delivery::tests remain exact and unchanged.
+use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
+use super::*;
+use crate::local_resource_diagnostics::capture;
+use crate::snapshot_watcher::ListingTrigger;
+
+const SESSION: &str = "5e551011-0000-4000-8000-00000000d171";
+
+struct Fixture {
+    root: PathBuf,
+    path: PathBuf,
+    cache: Arc<sampled_scan::SharedCache>,
+    /// Pages record no entity ACK, as when every upload failed.
+    unacked: bool,
+    saves: std::cell::Cell<usize>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = crate::test_scratch::unique_path("discovery-growth-fate");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        Self {
+            path: root.join(format!("{SESSION}.jsonl")),
+            root,
+            cache: Arc::new(sampled_scan::SharedCache::default()),
+            unacked: false,
+            saves: Default::default(),
+        }
+    }
+    /// The latest saved copy. Each save makes a fresh one: a page may
+    /// continue on the previous copy.
+    fn saved_path(&self) -> PathBuf {
+        self.root.join(format!("index-{}.json", self.saves.get()))
+    }
+    fn append(&self, uuid: &str) {
+        let line = json!({"type":"assistant", "sessionId":SESSION, "uuid":uuid,
+            "cwd":"/synthetic", "timestamp":"2026-10-06T10:00:00.000Z",
+            "requestId":format!("req_{uuid}"), "message": {
+                "id":format!("msg_{uuid}"), "model":"claude-opus-4-8", "role":"assistant",
+                "usage":{"input_tokens":10,"output_tokens":20}}});
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+    fn codex_turn(&self, n: u64) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap();
+        if n == 1 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"session_meta",
+                "timestamp":"2026-10-27T09:00:00Z","payload":{"id":SESSION}})
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({"timestamp":"2026-10-27T10:00:00Z",
+            "type":"event_msg", "payload":{"type":"token_count","info":{
+            "model":"gpt-5.2", "total_token_usage":{"input_tokens":n*10,
+                "cached_input_tokens":n*2,"output_tokens":n*3},
+            "last_token_usage":{"input_tokens":10,"cached_input_tokens":2,
+                "output_tokens":3}}}})
+        )
+        .unwrap();
+    }
+    fn retained_codex(&self) -> ScanIndex {
+        self.codex_turn(1);
+        let (mut index, scan, _, _) = self.page(SnapshotSource::Codex, ScanIndex::default());
+        assert_eq!(scan.snapshots.len(), 1);
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&self.root),
+            &mut index,
+            &now,
+            7,
+        );
+        advance_bounded_directory_traversal(SnapshotSource::Codex, &mut index, 7, None);
+        let traversal = index.traversal.as_mut().unwrap();
+        // This known member was already consumed. Saved retryable loss
+        // elsewhere retains the roster; the retry is not due yet.
+        traversal.pending_candidates.clear();
+        traversal.counts.unreadable_path_count = 1;
+        traversal.unhealthy_retry_not_before_unix_seconds =
+            Some(sampled_scan::now_seconds() + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+        index
+    }
+    fn age(&self, days: u64) {
+        let modified = SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        File::options()
+            .write(true)
+            .open(&self.path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    fn page(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            &[],
+            &mut ListingRequest::default(),
+        )
+    }
+    /// One page over `roots` served with a listing request; returns what
+    /// stays unserved.
+    fn page_requesting(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        index: ScanIndex,
+        mut list_all: ListingRequest,
+    ) -> (ScanIndex, Reads, Vec<Value>, ListingRequest) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let (index, _, reads, rows) =
+            self.page_with(source, roots, index, &now, &[], &mut list_all);
+        (index, reads, rows, list_all)
+    }
+    fn page_hinted(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            &now,
+            hints,
+            &mut ListingRequest::default(),
+        )
+    }
+    fn page_at(
+        &self,
+        source: SnapshotSource,
+        index: ScanIndex,
+        now: &str,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        let roots = std::slice::from_ref(&self.root);
+        self.page_with(
+            source,
+            roots,
+            index,
+            now,
+            &[],
+            &mut ListingRequest::default(),
+        )
+    }
+    fn page_with(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        mut index: ScanIndex,
+        now: &str,
+        hints: &[PathBuf],
+        list_all: &mut ListingRequest,
+    ) -> (ScanIndex, SourceScanResult, Reads, Vec<Value>) {
+        index = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
+            source,
+            Some(self.cache.as_ref()),
+            index,
+        );
+        self.cache.bind_withheld(&mut index);
+        let reads = Reads::default();
+        let ((index, result), rows) = capture(|| {
+            let mut scan = OwnedSourceScan::new_selecting(
+                source,
+                roots,
+                index,
+                now,
+                7,
+                10,
+                None,
+                hints,
+                false,
+                list_all,
+                true,
+                &[],
+                None,
+                false,
+            )
+            .with_sampled_acquisition(
+                self.cache.clone(),
+                crate::transcript_acquisition::Scope("growth-fate".into()),
+            )
+            .with_line_observer("test", Box::new(reads.clone()));
+            for _ in 0..100_000 {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        apply_upload_policy(
+                            source,
+                            &mut scan.snapshots,
+                            SnapshotUploadPolicy::default(),
+                        );
+                        finalize_scan_after_policy(source, &mut scan, &mut index);
+                        let accepted = scan
+                            .snapshots
+                            .iter()
+                            .map(|item| item.snapshot_fingerprint.clone())
+                            .collect();
+                        if !self.unacked {
+                            index.record_accepted_snapshot_fingerprints(&accepted);
+                        }
+                        return (index, scan);
+                    }
+                }
+            }
+            panic!("bounded scan did not finish");
+        });
+        (index, result, reads, rows)
+    }
+    fn save_and_report(&self, index: &mut ScanIndex, scan: &SourceScanResult) -> Value {
+        self.saves.set(self.saves.get() + 1);
+        let path = self.saved_path();
+        // Preserve the production save's updated optimistic-concurrency stamp
+        // in the index passed into the next real page.
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &path);
+        let saved = ScanIndex::load(&path).unwrap();
+        let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
+        assert_eq!(rows.len(), 1, "one saved-page observation row");
+        assert_eq!(rows[0]["stage"], "discovery_growth_fate");
+        assert_eq!(rows[0]["source"], scan.source.api_slug());
+        assert_eq!(rows[0]["schema_version"], 2);
+        let encoded = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!encoded.contains(SESSION));
+        assert!(!encoded.contains(&self.root.to_string_lossy().to_string()));
+        assert!(encoded.len() < 2048);
+        rows[0]["counts"].clone()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+#[derive(Clone, Default)]
+struct Reads(Arc<Mutex<(Vec<DeliveryMode>, usize)>>);
+impl LineObserver for Reads {
+    fn begin(&mut self, view: &FileView) -> Want {
+        self.0.lock().unwrap().0.push(view.mode);
+        Want::Lines
+    }
+    fn line(&mut self, _: &FileView, _: &PhysicalLine<'_>) {
+        self.0.lock().unwrap().1 += 1;
+    }
+    fn end(&mut self, _: &FileView, _: &DeliveryEnd) {}
+}
+fn growth_mode() -> DeliveryMode {
+    if crate::heap_layout_bound::layout_supported() {
+        DeliveryMode::Tail
+    } else {
+        DeliveryMode::Full
+    }
+}
+fn fate(counts: &Value, committed: u64, retained: u64) {
+    assert_eq!(
+        counts["discovery_retained_grown_fate"],
+        json!({
+        "committed":committed, "still_retained":retained, "unindexed":0})
+    );
+    assert_eq!(counts["observation_overflow"], 0);
+}
+/// [behaviour] Grown refused then two unchanged passes read no extra body bytes.
+
+#[test]
+fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
+    let f = Fixture::new();
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&f.path);
+    f.append("committed");
+    let (baseline, _, _, _) = f.page(source, ScanIndex::default());
+    let committed_size = baseline.files[&key].size_bytes;
+    f.append("withheld");
+    f.age(91);
+    let live_size = fs::metadata(&f.path).unwrap().len();
+    let (parsed, scan, reads, _) = f.page(source, baseline.clone());
+    assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
+    assert_eq!(parsed.files[&key].size_bytes, live_size);
+    // Real classify filters the withheld body, Completed restores the prior
+    // committed extent, and the completion stamp controls subsequent retries.
+    let mut committed =
+        crate::snapshot_sync::withheld_support::settle_withheld(&baseline, parsed, scan.clone());
+    assert_eq!(committed.files[&key].size_bytes, committed_size);
+    assert!(committed.claude_account_deferred_holds.contains_key(&key));
+    let counts = f.save_and_report(&mut committed, &scan);
+    fate(&counts, 0, 1); // a working parse is not a committed catch-up
+    assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
+    for pass in 0..2 {
+        let (mut idle, scan, reads, rows) = f.page(source, committed);
+        assert!(
+            reads.0.lock().unwrap().0.is_empty(),
+            "pass {pass}: no acquisition"
+        );
+        assert_eq!(reads.0.lock().unwrap().1, 0);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        let page = rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["completed_native_bytes"], 0,
+            "pass {pass}: zero extra body bytes; SOURCE permits existing identity samples"
+        );
+        assert_eq!(idle.files[&key].size_bytes, committed_size);
+        assert!(idle.claude_account_deferred_holds.contains_key(&key));
+        let counts = f.save_and_report(&mut idle, &scan);
+        fate(&counts, 0, 1);
+        assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
+        committed = ScanIndex::load(&f.saved_path()).unwrap();
+    }
+}
+/// [behaviour] Grown catchup reports committed only against saved extent.
+
+#[test]
+fn grown_catchup_reports_committed_only_against_saved_extent() {
+    let f = Fixture::new();
+    f.append("first");
+    let (baseline, _, _, _) = f.page(SnapshotSource::ClaudeCode, ScanIndex::default());
+    f.append("second");
+    f.age(31);
+    let (mut caught_up, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
+    assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
+    let counts = f.save_and_report(&mut caught_up, &scan);
+    fate(&counts, 1, 0);
+    assert_eq!(
+        counts["discovery_retained_grown_age"],
+        json!({"le_30d":0,"d31_90":0,"gt_90d":0,"unknown":0})
+    );
+}
+/// [behaviour] Rewrite control: the same inode is truncated and rewritten past
+/// the committed extent with a changed prefix. Growth retention discovers it;
+/// acquisition's existing prefix samples force the counted Full rebuild.
+#[test]
+fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
+    let f = Fixture::new();
+    f.append("old");
+    let key = local_index_key(&f.path);
+    let (baseline, _, _, _) = f.page(SnapshotSource::ClaudeCode, ScanIndex::default());
+    let prior = baseline.files[&key].size_bytes;
+    File::create(&f.path).unwrap(); // truncate the existing object
+    f.append("replacement");
+    f.append("new-tail");
+    f.age(31);
+    assert!(fs::metadata(&f.path).unwrap().len() > prior);
+    let (mut rewritten, scan, reads, _) = f.page(SnapshotSource::ClaudeCode, baseline);
+    assert_eq!(
+        reads.0.lock().unwrap().0,
+        vec![DeliveryMode::Full],
+        "rewrite must not Tail from the previous committed extent"
+    );
+    assert_eq!(
+        reads.0.lock().unwrap().1,
+        2,
+        "rebuild delivers the entire rewritten file"
+    );
+    fate(&f.save_and_report(&mut rewritten, &scan), 1, 0);
+}
+
+/// [behaviour] Portable certificate/selector seam: the cursor's retained-prefix completion
+/// is reproduced from a real ReadPlan seal, without a supported-layout override.
+/// The subsequent aged discovery and catch-up are ordinary production scans.
+/// Covers the in-memory seam, not the ordinary index-reload boundary: retaining
+/// the fragment witness across source preparations is a separate follow-up.
+#[test]
+fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
+    use crate::transcript_acquisition::{AuditDebt, ReadPlan, Scope};
+    let f = Fixture::new();
+    let source = SnapshotSource::Codex;
+    let token = |n| {
+        json!({"timestamp":"2026-10-06T10:00:00Z", "type":"event_msg",
+        "payload":{"type":"token_count","info":{"model":"fixture-model",
+        "total_token_usage":{"input_tokens":n,"output_tokens":n},
+        "last_token_usage":{"input_tokens":10,"output_tokens":10}}}})
+        .to_string()
+    };
+    let prefix = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta",
+        "timestamp":"2026-10-06T09:00:00Z","payload":{"id":SESSION}}),
+        token(10)
+    );
+    fs::write(&f.path, &prefix).unwrap();
+    #[cfg(target_os = "macos")]
+    let original_birth =
+        crate::transcript_acquisition::birth_unix_nanos(&fs::metadata(&f.path).unwrap());
+    let (mut index, baseline, _, _) = f.page(source, ScanIndex::default());
+    assert_eq!(baseline.snapshots.len(), 1, "real indexed Codex prefix");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(token(20).as_bytes())
+        .unwrap();
+    // Past the 7-day window, inside the 60-day first-read bound used by
+    // the cold Full oracle. Bind after this one backdate for APFS birth clamping.
+    f.age(59);
+    let aged_metadata = fs::metadata(&f.path).unwrap();
+    let aged_modified = aged_metadata.modified().unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(crate::transcript_acquisition::birth_clamped(
+        original_birth,
+        crate::transcript_acquisition::birth_unix_nanos(&aged_metadata),
+        &aged_metadata,
+    ));
+    let key = local_index_key(&f.path);
+    let mut candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: f.root.clone(),
+            path: f.path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        7,
+        &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+    )
+    .unwrap();
+    prepare_owned_scan_candidate(
+        source,
+        &mut candidate,
+        &CodexTitleMetadata::default(),
+        &ClaudeTitleMetadata::default(),
+        None,
+    );
+    // Reopening starts at the prepared-sidecar boundary. The opened result's
+    // fingerprint already includes transcript identity and is not a sidecar.
+    let prepared_candidate = candidate.clone();
+    let (candidate, mut file) = open_and_identify_scan_candidate(
+        source,
+        candidate,
+        &mut ScanCensus::default(),
+        None,
+        7,
+        discovery_retention!(index),
+    )
+    .unwrap();
+    let now = sampled_scan::now_seconds();
+    let scope = Scope("fragment-control".into());
+    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, now).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_record_fragment(&bytes[..prefix.len()], true)
+        .unwrap();
+    plan.observe_record_fragment(&bytes[prefix.len()..], false)
+        .unwrap();
+    let checkpoint = plan
+        .commit_sealed_prefix(&mut file, true, &scope, now, now, false, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(checkpoint.sealed_offset(), prefix.len() as u64);
+    let fragment =
+        sources::codex::eof_fragment::BoundFragment::bind(&candidate, checkpoint.sealed_offset())
+            .expect("known object birth is required; no length-only witness");
+    let mut recorded = candidate.clone();
+    recorded.size_bytes = checkpoint.sealed_offset();
+    index.record(
+        recorded,
+        Some(baseline.snapshots[0].snapshot_fingerprint.clone()),
+        ScanParseOutcome::Snapshot,
+    );
+    index.files.get_mut(&key).unwrap().codex_fragment = Some(Box::new(fragment));
+    index.stage_sampled_audit(
+        &key,
+        &candidate.source_file_fingerprint,
+        AuditDebt {
+            due_unix_seconds: now + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+        },
+    );
+    assert!(
+        index.files[&key].has_unverified_source(),
+        "independent custody kept"
+    );
+    assert!(
+        index.candidate_decision(&candidate) == CandidateDecision::Skip,
+        "a certified unchanged fragment must not select another parse"
+    );
+    let encoded = serde_json::to_value(&index).unwrap();
+    assert!(
+        encoded["files"][&key].get("codex_fragment").is_none(),
+        "RAM only"
+    );
+    // Main reloads the index every pass (snapshot_sync's per-pass load) and
+    // never serializes the RAM-only fragment custody, so each reloaded pass
+    // re-reads the fragment only: a Tail from the committed prefix, bounded
+    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
+    // The existing repeat counter counts each such pass. These passes run
+    // before the metadata-only change below, as production's re-read sees an
+    // unchanged file: once reloaded, the entry has no fragment record to
+    // adopt a stored ctime against.
+    // Money (main's trailing-line rule): a complete unterminated record is
+    // held back only from the sealed prefix, the head and line delivery, so
+    // the re-read counts it exactly as a cold Full of the same bytes does, and
+    // re-applies it idempotently: the next pass adds no usage.
+    let cold_full = |collected_at: &str| {
+        let mut cold_scan = OwnedSourceScan::new(
+            source,
+            std::slice::from_ref(&f.root),
+            ScanIndex::default(),
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            None,
+            &[],
+            false,
+        );
+        loop {
+            match cold_scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => cold_scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut scan,
+                    mut index,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        source,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    finalize_scan_after_policy(source, &mut scan, &mut index);
+                    break (index, scan);
+                }
+            }
+        }
+    };
+    let usage = |items: &[SnapshotItem]| {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    [
+                        item.input_tokens,
+                        item.output_tokens,
+                        item.cache_read_tokens,
+                        item.reasoning_output_tokens,
+                        item.request_count,
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let bound = index.clone();
+    let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
+    let mut first_pass = Vec::new();
+    let mut first_scan = None;
+    for pass in 0..2 {
+        let (next, scan, reads, rows) = f.page(source, index);
+        let modes = reads.0.lock().unwrap().0.clone();
+        let repeats = rows
+            .iter()
+            .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
+            .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
+            .collect::<Vec<_>>();
+        let emitted = usage(&scan.snapshots);
+        if pass == 0 {
+            // The first reloaded pass: one ordinary fragment-only Tail. It
+            // counts the complete record and records the full length.
+            assert_eq!(
+                scan.scanned_file_count, 1,
+                "the reloaded pass re-reads the fragment once"
+            );
+            assert_eq!(modes, vec![growth_mode()], "one read, never a Full");
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(
+                    repeats,
+                    vec![(json!(1), Some(fragment_bytes))],
+                    "one fragment-only Tail, byte-bounded to the fragment"
+                );
+            }
+            assert!(
+                !scan.snapshots.is_empty(),
+                "the complete unterminated record counts on the re-read"
+            );
+            assert_eq!(
+                next.files[&key].size_bytes, candidate.size_bytes,
+                "the ordinary re-read records the full length"
+            );
+            first_pass = emitted;
+            first_scan = Some(scan.clone());
+        } else {
+            // Later passes: the file is unchanged since that read, so nothing
+            // is re-read until it changes.
+            assert_eq!(scan.scanned_file_count, 0, "pass {pass}: no re-read");
+            assert!(modes.is_empty(), "pass {pass}: no read: {modes:?}");
+            assert!(repeats.is_empty(), "pass {pass}: no repeat: {repeats:?}");
+            assert!(scan.snapshots.is_empty(), "pass {pass}: no snapshot");
+            for (session, totals) in &emitted {
+                let first = first_pass
+                    .iter()
+                    .find(|(first, _)| first == session)
+                    .map(|(_, first)| first)
+                    .unwrap_or_else(|| panic!("pass {pass}: new usage for {session}"));
+                assert!(
+                    totals.iter().zip(first).all(|(now, first)| now <= first),
+                    "pass {pass}: no snapshot above the first re-read: {totals:?} > {first:?}"
+                );
+            }
+        }
+        if !scan.snapshots.is_empty() {
+            let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
+            sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+                &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
+                &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
+            );
+        }
+        assert!(next.files[&key].has_unverified_source());
+        index = next;
+    }
+    // Metadata-only change: the certified prefix still names the observed EOF,
+    // so ctime adoption must use that extent, not just the committed prefix.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&f.path).unwrap().permissions().mode();
+    fs::set_permissions(&f.path, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+    let (metadata_only, _) = open_and_identify_scan_candidate(
+        source,
+        prepared_candidate,
+        &mut ScanCensus::default(),
+        None,
+        7,
+        discovery_retention!(bound),
+    )
+    .unwrap();
+    let entry = &bound.files[&key];
+    assert_ne!(
+        entry.size_bytes, metadata_only.size_bytes,
+        "certified prefix"
+    );
+    assert_ne!(
+        metadata_only.opened_object_identity, candidate.opened_object_identity,
+        "chmod changes the live ctime identity, which remains the TOCTOU witness"
+    );
+    assert_eq!(
+        metadata_only.fingerprint_changed_nanos, entry.opened_changed_nanos,
+        "the certified-prefix extent must allow stored-ctime adoption"
+    );
+    assert!(entry.codex_fragment.as_ref().unwrap().matches(
+        entry.size_bytes,
+        metadata_only.size_bytes,
+        sources::codex::eof_fragment::Stamp::candidate(&metadata_only),
+    ));
+    assert_eq!(
+        metadata_only.source_file_fingerprint, candidate.source_file_fingerprint,
+        "the adopted trigger keeps known_fragment bound to the sampled fingerprint"
+    );
+    assert_eq!(
+        bound.candidate_decision_with_reason(&metadata_only),
+        (CandidateDecision::Skip, None),
+        "metadata alone cannot select TranscriptChanged or another acquisition"
+    );
+    // Within one preparation (the index in memory): the bound fragment is
+    // neither growth nor owed growth.
+    let metadata = fs::metadata(&f.path).unwrap();
+    let page = discovery_growth::Page::default();
+    let retention = discovery_retention!(bound, &page);
+    retention.observe_stamped_growth(
+        &f.path,
+        metadata.len(),
+        candidate.modified_unix_seconds,
+        sources::codex::eof_fragment::Stamp::metadata(&metadata),
+    );
+    let (_, rows) = capture(|| {
+        assert!(
+            retention.owes_stamped(
+                source,
+                &f.path,
+                metadata.len(),
+                sources::codex::eof_fragment::Stamp::metadata(&metadata)
+            ),
+            "audit still owes it"
+        )
+    });
+    assert!(!rows
+        .iter()
+        .any(|row| row.to_string().contains("\"grown\":1")));
+    assert_eq!(
+        page.counts(&bound, now)
+            .discovery_retained_grown_fate
+            .still_retained,
+        0,
+        "known fragment is excluded from growth population"
+    );
+    // Portable completion seam: two ordinary index reloads lose only the RAM
+    // witness. A real revalidated Tail plan/native reader consumes the known
+    // fragment only. This does not claim a native cache-owner test on Linux.
+    for _preparation in 0..2 {
+        let reloaded: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&bound).unwrap()).unwrap();
+        let entry = &reloaded.files[&key];
+        assert!(entry.codex_fragment.is_none());
+        let mut file = File::open(&f.path).unwrap();
+        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope, None, now).unwrap();
+        assert_eq!(plan.mode(), crate::transcript_acquisition::ReadMode::Tail);
+        let start = plan.start_offset();
+        assert_eq!(start, entry.size_bytes);
+        let len = candidate.size_bytes - start;
+        let mut reader = BoundedJsonlReader::new(BufReader::new(file));
+        reader.set_extent_limit(len);
+        reader.acquisition = Some(plan);
+        while let JsonlReaderStep::Line = reader
+            .step(|_| panic!("unterminated fragment must remain withheld"))
+            .unwrap()
+        {}
+        assert!(reader.sealed_fragment());
+        assert_eq!(reader.last_complete_line_end(), 0);
+        assert_eq!(reader.consumed_bytes(), len);
+        let (_, rows) = capture(|| {
+            sources::codex::eof_fragment::note_tail_repeat(
+                entry,
+                &candidate,
+                sources::codex::eof_fragment::TailRead {
+                    mode: reader.acquisition.as_ref().unwrap().mode(),
+                    start,
+                    end: start + reader.consumed_bytes(),
+                    terminated_end: reader.last_complete_line_end(),
+                },
+                Some(now),
+                7,
+            );
+            crate::local_resource_diagnostics::Probe::start().collection(
+                "codex",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            );
+        });
+        assert_eq!(
+            rows[0]["counts"]["codex_fragment_tail_repeat"],
+            json!({"files":1,"bytes":len}),
+            "one fragment-only Tail per reloaded preparation"
+        );
+        let (_, rows) = capture(|| {
+            crate::local_resource_diagnostics::Probe::start().collection(
+                "codex",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                    full_causes: Default::default(),
+                },
+            )
+        });
+        assert!(
+            rows[0]["counts"]
+                .get("codex_fragment_tail_repeat")
+                .is_none(),
+            "counter drained per page"
+        );
+    }
+    // Missing binding/object changes must not turn a length heuristic into Skip.
+    let mut without = bound.clone();
+    without.files.get_mut(&key).unwrap().codex_fragment = None;
+    assert_eq!(
+        without.candidate_decision(&candidate),
+        CandidateDecision::Parse
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    // The unterminated read cannot replace the original prefix head. Keep
+    // the backdate that its shared certificate's birth_clamped check admits:
+    // a second age() would move mtime past APFS's already-clamped birth.
+    File::options()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_modified(aged_modified)
+        .unwrap();
+    let (caught, scan, reads, rows) = f.page(source, index);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["counts"].get("codex_fragment_tail_repeat").is_some()),
+        "real terminated growth is not a fragment repeat"
+    );
+    assert!(
+        rows.iter()
+            .map(|row| row["counts"]["discovery_retained"]["grown"]
+                .as_u64()
+                .unwrap_or(0))
+            .sum::<u64>()
+            > 0,
+        "real aged growth has positive grown credit"
+    );
+    assert_eq!(reads.0.lock().unwrap().0, vec![growth_mode()]);
+    assert!(scan.snapshots.is_empty(), "the newline adds no usage");
+    assert_eq!(
+        caught.files[&key].size_bytes,
+        fs::metadata(&f.path).unwrap().len()
+    );
+    // The complete record already counted on the first re-read; its newline
+    // adds no usage. The first re-read's emitted usage equals a cold Full of
+    // the terminated bytes.
+    let emitted = first_scan.expect("the first re-read emitted");
+    let (cold_index, cold) = cold_full(&emitted.snapshots[0].collected_at);
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
+        &sampled_scan::transition_fixture::scan_money(source, &caught, &emitted),
+    );
+    let (_, idle, reads, _) = f.page(source, caught);
+    assert!(idle.snapshots.is_empty(), "emitted once");
+    assert!(reads.0.lock().unwrap().0.is_empty());
+}
+
+/// One usage record (with the session header first) in each source's format.
+fn usage_records(source: SnapshotSource, session: &str, n: u64, header: bool) -> String {
+    let at = "2026-10-06T10:00:00Z";
+    let (head, line) = match source {
+        SnapshotSource::ClaudeCode => (
+            None,
+            json!({"type":"assistant", "sessionId":session, "uuid":format!("{session}-{n}"),
+            "cwd":"/synthetic", "timestamp":at, "requestId":format!("req_{session}_{n}"),
+            "message": {"id":format!("msg_{session}_{n}"), "model":"claude-opus-4-8",
+            "role":"assistant", "usage":{"input_tokens":10,"output_tokens":20}}}),
+        ),
+        SnapshotSource::Codex => (
+            Some(json!({"type":"session_meta", "timestamp":at, "payload":{"id":session}})),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"token_count",
+            "info":{"model":"fixture-model",
+            "total_token_usage":{"input_tokens":10 * n,"output_tokens":10 * n},
+            "last_token_usage":{"input_tokens":10,"output_tokens":10}}}}),
+        ),
+        SnapshotSource::Pi => (
+            Some(json!({"type":"session", "session_id":session, "cwd":"/work", "timestamp":at})),
+            json!({"type":"message_end", "message":{"provider":"openai", "model":"gpt-5.4",
+            "api":"responses", "timestamp":1_791_280_800_000_u64 + n,
+            "usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0}}}),
+        ),
+    };
+    let head = head.filter(|_| header).map(|head| format!("{head}\n"));
+    format!("{}{line}\n", head.unwrap_or_default())
+}
+
+fn append_records(path: &Path, text: &str) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+const UNCHANGED: &str = "0a000000-0000-4000-8000-00000000000a";
+const GROWN: &str = "0b000000-0000-4000-8000-00000000000b";
+const CREATED: &str = "0c000000-0000-4000-8000-00000000000c";
+const REARMED: &str = "0d000000-0000-4000-8000-00000000000d";
+const NESTED: &str = "0e000000-0000-4000-8000-00000000000e";
+/// Root entries once CREATED exists: four files and the `nested` directory.
+const ROOT_ENTRIES: usize = 5;
+
+/// A kept generation whose first walk has finished and whose members were
+/// all served, over four read files (one in `nested/`); `listing_due`
+/// backdates its walk.
+fn kept_generation(f: &Fixture, source: SnapshotSource, listing_due: bool) -> ScanIndex {
+    for session in [UNCHANGED, GROWN, REARMED] {
+        let path = f.root.join(format!("{session}.jsonl"));
+        append_records(&path, &usage_records(source, session, 1, true));
+    }
+    fs::create_dir_all(f.root.join("nested")).unwrap();
+    append_records(
+        &f.root.join("nested").join(format!("{NESTED}.jsonl")),
+        &usage_records(source, NESTED, 1, true),
+    );
+    let (mut index, _, reads, _) = f.page(source, ScanIndex::default());
+    assert_eq!(
+        reads.0.lock().unwrap().0.len(),
+        4,
+        "{source:?}: first reads"
+    );
+    let now = OffsetDateTime::now_utc();
+    let collected_at = now.format(&Rfc3339).unwrap();
+    ensure_bounded_traversal(
+        source,
+        std::slice::from_ref(&f.root),
+        &mut index,
+        &collected_at,
+        7,
+    );
+    advance_bounded_directory_traversal(source, &mut index, 7, None);
+    let traversal = index.traversal.as_mut().unwrap();
+    assert!(traversal.pending_directories.is_empty());
+    traversal.pending_candidates.clear();
+    let due = now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60;
+    traversal.listing_started_unix_seconds = Some(if listing_due {
+        due
+    } else {
+        now.unix_timestamp() as u64
+    });
+    index
+}
+
+fn modes(reads: &Reads) -> Vec<String> {
+    let mut modes = reads
+        .0
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .map(|mode| format!("{mode:?}"))
+        .collect::<Vec<_>>();
+    modes.sort();
+    modes
+}
+
+/// Pages until the generation has nothing queued (or retired).
+struct Run {
+    scans: Vec<SourceScanResult>,
+    modes: Vec<String>,
+    starts: usize,
+}
+
+fn run_pages(f: &Fixture, source: SnapshotSource, mut index: ScanIndex) -> Run {
+    let mut run = Run {
+        scans: Vec::new(),
+        modes: Vec::new(),
+        starts: 0,
+    };
+    for _ in 0..8 {
+        let (next, scan, reads, rows) = f.page(source, index);
+        index = next;
+        run.modes.extend(modes(&reads));
+        run.starts += rows
+            .iter()
+            .filter(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            })
+            .count();
+        run.scans.push(scan);
+        if index.traversal.as_ref().map_or(true, |traversal| {
+            traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
+        }) {
+            run.modes.sort();
+            return run;
+        }
+    }
+    panic!("{source:?}: the re-listing pass must drain within 8 pages");
+}
+
+/// Each indexed file's proven revision; a re-arm clears it.
+fn proven_revisions(index: &ScanIndex) -> BTreeMap<String, String> {
+    index
+        .files
+        .iter()
+        .filter(|(_, entry)| !entry.source_file_fingerprint.is_empty())
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .collect()
+}
+
+/// Every re-arm a diagnostic row names: a `rearm_cleared{…}` Full cause or a
+/// nonzero `rearmed` count.
+fn rearm_labels(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key.starts_with("rearm_cleared{") {
+                    out.push(key.clone());
+                }
+                let zero = value.is_null()
+                    || value == &json!(false)
+                    || value == &json!(0)
+                    || value["count"] == json!(0);
+                if key == "rearmed" && !zero {
+                    out.push(format!("rearmed {value}"));
+                }
+                rearm_labels(value, out);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rearm_labels(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Census completion and every loss count a page reports.
+fn census(scan: &SourceScanResult) -> Value {
+    json!([
+        scan.census_complete,
+        scan.symlink_rejected_count,
+        scan.directory_entry_cap_exceeded_count,
+        scan.unreadable_path_count,
+        scan.oversized_file_count,
+        scan.disappeared_file_count,
+        scan.malformed_json_line_count,
+        scan.invalid_utf8_line_count,
+        scan.over_line_cap_count,
+        scan.recognized_usage_drop_count,
+        scan.ownership_incomplete_file_count,
+        scan.zero_snapshot_usage_evidence_count,
+        scan.dropped_usage_record_count,
+    ])
+}
+
+/// [behaviour] A kept generation's re-listing pass reads exactly the files
+/// that changed (grown by acquisition's growth mode, created by Full) and
+/// nothing settled, for every source, whether the pass fits one page or spans
+/// pages (directory budget below the entry count). It starts no generation,
+/// adds no ownership-incomplete count and leaves census completion and every
+/// loss count equal to the same generation without a pass. After a restart a
+/// pass over a quiet corpus reads zero bytes and emits nothing.
+#[test]
+fn listing_repass_reads_only_changed_files_for_every_source() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let change = |f: &Fixture| {
+            append_records(
+                &f.root.join(format!("{GROWN}.jsonl")),
+                &usage_records(source, GROWN, 2, false),
+            );
+            append_records(
+                &f.root.join(format!("{CREATED}.jsonl")),
+                &usage_records(source, CREATED, 1, true),
+            );
+        };
+        let f = Fixture::new();
+        let index = kept_generation(&f, source, false);
+        change(&f);
+        let without_pass = run_pages(&f, source, index);
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        for budget in [MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK, ROOT_ENTRIES] {
+            let f = Fixture::new();
+            let index = kept_generation(&f, source, true);
+            change(&f);
+            let run = with_test_directory_entries(budget, || run_pages(&f, source, index));
+            assert_eq!(run.modes, expected, "{source:?} budget {budget}");
+            assert_eq!(
+                run.starts, 0,
+                "{source:?} budget {budget}: no new generation"
+            );
+            assert!(
+                budget == MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK || run.scans.len() > 1,
+                "{source:?}: the small budget spans pages"
+            );
+            assert!(run
+                .scans
+                .iter()
+                .all(|scan| scan.ownership_incomplete_file_count == 0));
+            assert_eq!(
+                census(run.scans.last().unwrap()),
+                census(without_pass.scans.last().unwrap()),
+                "{source:?} budget {budget}"
+            );
+        }
+
+        // Quiet corpus after a restart: saved index, no retained checkpoint.
+        // Claude's store is also restarted as release 0.1.217 left it mid-walk
+        // (pending usage evidence, an owed bit on every file, every family
+        // carried with its files queued for replay, full re-arm progress, the
+        // fence and latch set): the upgrade re-arms and reads nothing either.
+        let legacies: &[bool] = if source == SnapshotSource::ClaudeCode {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &legacy in legacies {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, true);
+            let path = f.root.join("index.json");
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+            let index = ScanIndex::load(&path).unwrap();
+            let proven = proven_revisions(&index);
+            assert!(!proven.is_empty(), "{source:?}: a proven corpus");
+            let index = if legacy {
+                // The older release's bytes go to their own unpublished path:
+                // `path` already holds this build's native custody.
+                sampled_scan::transition_fixture::upgrade_from_legacy_store(
+                    &index,
+                    &f.root.join("legacy-index.json"),
+                )
+            } else {
+                index
+            };
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let opens = all_transcript_opens_for_test();
+            let ((quiet_index, scan, reads, rows), consumed) =
+                sampled_scan::transition_fixture::observe_consumed(|| f.page(source, index));
+            // The reloaded generation ran its due pass; no first walk replaced it.
+            assert!(!rows.iter().any(|row| {
+                row["stage"] == "bounded_traversal_transition"
+                    && row["counts"]["event"] == "starting"
+            }));
+            if let Some(traversal) = quiet_index.traversal.as_ref() {
+                assert!(
+                    traversal.counts.listing_generations >= 1,
+                    "{source:?} legacy {legacy}"
+                );
+            }
+            assert!(scan.snapshots.is_empty(), "{source:?} legacy {legacy}");
+            assert_eq!(scan.scanned_file_count, 0, "{source:?} legacy {legacy}");
+            // No file is re-armed: every proven revision survives the load and
+            // the page, no row names a re-arm, and no file reads Full.
+            assert_eq!(
+                proven_revisions(&quiet_index),
+                proven,
+                "{source:?} legacy {legacy}: re-armed a file"
+            );
+            let mut rearms = Vec::new();
+            for row in &rows {
+                rearm_labels(row, &mut rearms);
+            }
+            assert!(rearms.is_empty(), "{source:?} legacy {legacy}: {rearms:?}");
+            assert!(
+                !modes(&reads).iter().any(|mode| mode.starts_with("Full")),
+                "{source:?} legacy {legacy}: a Full read"
+            );
+            // Zero opens measures zero identity, cheap and other reads.
+            let measured = (all_transcript_opens_for_test() == opens).then_some(0);
+            let mut quiet = sampled_scan::transition_fixture::RouteResult::emitted(
+                sampled_scan::transition_fixture::Mode::Restart,
+                source,
+                Vec::new(),
+                &[],
+            );
+            quiet.modes = (reads.0.lock().unwrap().0.len(), 0, 0);
+            quiet.io = sampled_scan::transition_fixture::IoBytes {
+                consumed,
+                cheap_checks: measured,
+                anchor_reads: measured,
+                other_reads: measured,
+                ..Default::default()
+            };
+            sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+        }
+    }
+}
+
+/// [behaviour] A walk that starts in the requesting page serves the request
+/// without a second listing. A listing request lists every root of a kept
+/// generation at once, for every source: the downtime writes are read and no
+/// generation starts. A request while that walk runs neither restarts nor
+/// drops it: it stays unserved for the pass after the walk.
+#[test]
+fn requested_listing_reads_downtime_writes_and_never_restarts_a_running_walk() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let roots = std::slice::from_ref(&f.root);
+        let mut first = ListingRequest::default();
+        first.record(ListingTrigger::Start);
+        let (index, _, _, unserved) = f.page_requesting(source, roots, ScanIndex::default(), first);
+        assert!(!unserved.requested(), "{source:?}: the new walk serves it");
+        assert!(
+            index
+                .traversal
+                .as_ref()
+                .map_or(true, |walk| walk.counts.listing_generations == 0),
+            "{source:?}: no second listing"
+        );
+
+        let index = kept_generation(&f, source, false);
+        append_records(
+            &f.root.join(format!("{GROWN}.jsonl")),
+            &usage_records(source, GROWN, 2, false),
+        );
+        append_records(
+            &f.root.join(format!("{CREATED}.jsonl")),
+            &usage_records(source, CREATED, 1, true),
+        );
+        let mut expected = vec![
+            format!("{:?}", DeliveryMode::Full),
+            format!("{:?}", growth_mode()),
+        ];
+        expected.sort();
+        let mut rescan = ListingRequest::default();
+        rescan.record(ListingTrigger::Rescan);
+        let starting = |row: &&Value| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        };
+        with_test_directory_entries(ROOT_ENTRIES, || {
+            let (index, reads, rows, unserved) = f.page_requesting(source, roots, index, first);
+            assert!(!unserved.requested(), "{source:?}: served at once");
+            let walk = index.traversal.as_ref().unwrap();
+            assert_eq!(walk.counts.listing_generations, 1, "{source:?}");
+            assert!(!walk.pending_directories.is_empty(), "{source:?}");
+            let (mut index, more, more_rows, unserved) =
+                f.page_requesting(source, roots, index, rescan);
+            assert_eq!(unserved, rescan, "{source:?}: kept, the walk not restarted");
+            let mut read = [modes(&reads), modes(&more)].concat();
+            let mut starts = rows.iter().chain(&more_rows).filter(starting).count();
+            // The passes after it drain what the listing queued.
+            for _ in 0..8 {
+                if index.traversal.as_ref().map_or(true, |walk| {
+                    walk.pending_directories.is_empty() && walk.pending_candidates.is_empty()
+                }) {
+                    break;
+                }
+                let (next, _, reads, rows) = f.page(source, index);
+                index = next;
+                read.extend(modes(&reads));
+                starts += rows.iter().filter(starting).count();
+            }
+            read.sort();
+            assert_eq!(read, expected, "{source:?}");
+            assert_eq!(starts, 0, "{source:?}: no new generation");
+        });
+    }
+}
+
+/// [regress] A re-armed (owed) file whose stamp is unchanged stays
+/// schedulable through the re-listing pass and through the watcher-hint
+/// filter, and a pass queues it as the hint rule does (a census member for
+/// Claude/Pi). A settled file with a metadata-only change and its hint is
+/// never read. Before the fix both paths skipped the owed file on its stamp.
+#[test]
+fn owed_unchanged_file_stays_schedulable_and_settled_file_is_not_read() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for hinted in [false, true] {
+            let mut f = Fixture::new();
+            let mut index = kept_generation(&f, source, !hinted);
+            // A restart: no retained acquisition checkpoint.
+            f.cache = Arc::new(sampled_scan::SharedCache::default());
+            let rearmed = f.root.join(format!("{REARMED}.jsonl"));
+            let unchanged = f.root.join(format!("{UNCHANGED}.jsonl"));
+            let key = local_index_key(&rearmed);
+            index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+            // Metadata-only changes (ctime).
+            for path in [&rearmed, &unchanged] {
+                let original = fs::metadata(path).unwrap().permissions();
+                let mut read_only = original.clone();
+                read_only.set_readonly(true);
+                fs::set_permissions(path, read_only).unwrap();
+                fs::set_permissions(path, original).unwrap();
+            }
+            if !hinted {
+                let mut walked = index.clone();
+                let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+                start_due_listing_pass(
+                    source,
+                    walked.traversal.as_mut().unwrap(),
+                    &now,
+                    false,
+                    &mut ListingRequest::default(),
+                );
+                advance_bounded_directory_traversal(source, &mut walked, 7, None);
+                let queued = &walked.traversal.as_ref().unwrap().pending_candidates;
+                let owed = queued
+                    .iter()
+                    .find(|pending| pending.path == rearmed)
+                    .expect("the owed file is queued");
+                assert_eq!(owed.census_member, source != SnapshotSource::Codex);
+                assert!(!queued.iter().any(|pending| pending.path == unchanged));
+            }
+            let hints = if hinted {
+                vec![rearmed.clone(), unchanged.clone()]
+            } else {
+                Vec::new()
+            };
+            let (index, scan, reads, _) = f.page_hinted(source, index, &hints);
+            assert_eq!(
+                modes(&reads),
+                vec![format!("{:?}", DeliveryMode::Full)],
+                "{source:?} hinted {hinted}"
+            );
+            assert_eq!(scan.scanned_file_count, 1, "{source:?} hinted {hinted}");
+            assert!(
+                !index.files[&key].source_file_fingerprint.is_empty(),
+                "{source:?} hinted {hinted}: the owed work resolved"
+            );
+        }
+    }
+}
+
+/// [regress] An owed file whose stamp stays unchanged (a held revert keeps
+/// clearing its fingerprint) is queued by the re-listing pass at most once
+/// per file per six hours, counted apart from changed files; a pass inside
+/// the interval leaves it alone, and the queued offer reads Full once.
+#[test]
+fn owed_unchanged_file_is_requeued_once_per_six_hours() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let rearmed = f.root.join(format!("{REARMED}.jsonl"));
+        let key = local_index_key(&rearmed);
+        let queued = |index: &ScanIndex| {
+            let traversal = index.traversal.as_ref().unwrap();
+            (
+                traversal
+                    .pending_candidates
+                    .iter()
+                    .filter(|pending| pending.path == rearmed)
+                    .count(),
+                traversal.counts.listing_owed_requeued,
+                traversal.counts.listing_changes_without_hint,
+            )
+        };
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 1, 0), "{source:?}: first offer");
+        let offer = index.clone();
+        // Its read is out of scope here; the fingerprint stays cleared.
+        for _ in 0..3 {
+            index.traversal.as_mut().unwrap().pending_candidates.clear();
+            relist(source, &mut index);
+            assert_eq!(queued(&index), (0, 1, 0), "{source:?}: paced");
+        }
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_candidates.clear();
+        *traversal
+            .listing_owed_requeued_unix_seconds
+            .get_mut(&key)
+            .unwrap() -= LISTING_OWED_PACE_SECONDS;
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (1, 2, 0), "{source:?}: after six hours");
+
+        f.cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, scan, reads, _) = f.page(source, offer);
+        assert_eq!(
+            modes(&reads),
+            vec![format!("{:?}", DeliveryMode::Full)],
+            "{source:?}"
+        );
+        assert_eq!(scan.scanned_file_count, 1, "{source:?}");
+    }
+}
+
+/// Starts a due re-listing pass on a kept generation and walks it.
+fn relist(source: SnapshotSource, index: &mut ScanIndex) {
+    let now = OffsetDateTime::now_utc();
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.listing_started_unix_seconds =
+        Some(now.unix_timestamp() as u64 - LISTING_INTERVAL_SECONDS - 60);
+    start_due_listing_pass(
+        source,
+        traversal,
+        &now.format(&Rfc3339).unwrap(),
+        false,
+        &mut ListingRequest::default(),
+    );
+    advance_bounded_directory_traversal(source, index, 7, None);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+}
+
+/// [money] Body-witness revision debt is owed when re-listing. An unchanged
+/// Claude file saved below the active revision (revision 0, a snapshot
+/// fingerprint, no entity: never offered) is queued once per six hours and
+/// its offer reads it. Files at the active revision stay seen, and so does
+/// the owed file while the list names it or the list is paused.
+#[test]
+fn claude_revision_debt_is_requeued_by_the_relist_once_per_six_hours() {
+    let source = SnapshotSource::ClaudeCode;
+    let mut f = Fixture::new();
+    let mut base = kept_generation(&f, source, false);
+    base.activate_effective_upload_body_witness_revision(3);
+    base.adopt_effective_upload_body_witness_revision_monotonically();
+    // The walk context does not bind the delivery context: the walk is kept.
+    base.activate_upload_context("relist-debt-context".into());
+    for entry in base.files.values_mut() {
+        entry.effective_upload_body_witness_revision = 3;
+    }
+    let owed = f.root.join(format!("{REARMED}.jsonl"));
+    let key = local_index_key(&owed);
+    let entry = base.files.get_mut(&key).unwrap();
+    entry.effective_upload_body_witness_revision = 0;
+    assert!(entry.last_snapshot_fingerprint.is_some());
+    base.file_snapshot_fingerprints.remove(&key);
+    let queued = |index: &ScanIndex| {
+        let traversal = index.traversal.as_ref().unwrap();
+        (
+            traversal
+                .pending_candidates
+                .iter()
+                .map(|pending| pending.path.clone())
+                .collect::<Vec<_>>(),
+            traversal.counts.listing_owed_requeued,
+        )
+    };
+
+    let digest = format!(
+        "{:x}\n",
+        <sha2::Sha256 as sha2::Digest>::digest(REARMED.as_bytes())
+    );
+    for list in [digest.as_str(), "not-a-digest\n"] {
+        let mut held = base.clone();
+        held.claude_reemission_exclusions =
+            super::claude_reemission_exclusions::ReemissionExclusions::parse(list.as_bytes());
+        relist(source, &mut held);
+        assert_eq!(queued(&held), (Vec::new(), 0), "held by {list:?}");
+    }
+
+    let mut index = base;
+    relist(source, &mut index);
+    assert_eq!(queued(&index), (vec![owed.clone()], 1), "debt only");
+    let offer = index.clone();
+    for _ in 0..2 {
+        index.traversal.as_mut().unwrap().pending_candidates.clear();
+        relist(source, &mut index);
+        assert_eq!(queued(&index), (Vec::new(), 1), "paced");
+    }
+
+    f.cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut offered, scan, _, _) = f.page(source, offer);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == REARMED));
+    // The service finish: the exact ACK earns the file receipt.
+    let acks = crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots);
+    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+        &mut offered,
+        &scan.snapshots,
+        &acks,
+    );
+    let entry = &offered.files[&key];
+    assert_eq!(entry.effective_upload_body_witness_revision, 3);
+    assert!(entry.upload_context_receipt.is_some(), "ACK receipt");
+    assert!(offered
+        .file_snapshot_fingerprints
+        .get(&key)
+        .is_some_and(|entities| !entities.is_empty()));
+}
+
+/// [money] A known Codex rollout append with no directory move or watcher
+/// hint is queued once by the re-listing pass, Tail-read once, and emits the
+/// same whole money body as a cold Full.
+#[test]
+fn retained_codex_stat_growth_tails_once_with_full_money() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = Fixture::new();
+    let mut index = f.retained_codex();
+    f.codex_turn(2);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .codex_join_directory_census
+        .as_ref()
+        .unwrap()
+        .moved_directories()
+        .is_empty());
+    // A second pass before selection cannot duplicate queued work.
+    for _ in 0..2 {
+        relist(SnapshotSource::Codex, &mut index);
+        let traversal = index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.counts.listing_changes_without_hint, 1);
+        assert_eq!(traversal.pending_candidates.len(), 1);
+        assert!(!traversal.pending_candidates[0].census_member);
+    }
+    let (caught, scan, reads, _) = f.page(SnapshotSource::Codex, index);
+    assert_eq!(reads.0.lock().unwrap().0, vec![DeliveryMode::Tail]);
+    assert_eq!(scan.snapshots.len(), 1);
+    let item = &scan.snapshots[0];
+    assert_eq!(item.input_tokens, 20);
+    assert_eq!(item.cache_read_tokens, 4);
+    assert_eq!(item.output_tokens, 6);
+    assert_eq!(item.request_count, 2);
+    f.cache.with_cursor(|cursor| cursor.headers.clear());
+    let (cold_index, cold, _, _) = f.page_at(
+        SnapshotSource::Codex,
+        ScanIndex::default(),
+        &scan.snapshots[0].collected_at,
+    );
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(SnapshotSource::Codex, &cold_index, &cold),
+        &sampled_scan::transition_fixture::scan_money(SnapshotSource::Codex, &caught, &scan),
+    );
+    let (_, idle, reads, _) = f.page(SnapshotSource::Codex, caught);
+    assert!(idle.snapshots.is_empty());
+    assert!(reads.0.lock().unwrap().0.is_empty());
+}
+
+/// [behaviour] The re-listing pass queues and acquires nothing for unchanged
+/// bytes (a ctime-only change included) or for inventory-held growth while
+/// its refusal evidence stays unchanged.
+#[test]
+fn retained_codex_unchanged_or_inventory_held_member_is_not_enqueued() {
+    for held_growth in [false, true] {
+        let f = Fixture::new();
+        let mut index = f.retained_codex();
+        if held_growth {
+            f.codex_turn(2);
+            let key = local_index_key(&f.path);
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .residue
+                .codex_inventory_hold = Some(CodexInventoryHold {
+                owed: BTreeSet::from([key.clone()]),
+                refused_headers: BTreeMap::from([(key, codex_file_join::path_witness(&f.path))]),
+                ..CodexInventoryHold::default()
+            });
+        } else {
+            let original = fs::metadata(&f.path).unwrap().permissions();
+            let mut read_only = original.clone();
+            read_only.set_readonly(true);
+            fs::set_permissions(&f.path, read_only).unwrap();
+            fs::set_permissions(&f.path, original).unwrap();
+        }
+        for _ in 0..2 {
+            relist(SnapshotSource::Codex, &mut index);
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(traversal.pending_candidates.is_empty());
+            assert_eq!(traversal.counts.listing_changes_without_hint, 0);
+        }
+        let (_, scan, reads, _) = f.page(SnapshotSource::Codex, index);
+        assert!(scan.snapshots.is_empty());
+        assert!(reads.0.lock().unwrap().0.is_empty());
+    }
+}
+
+/// [behaviour] A watcher hint for a settled file is dropped unless this
+/// cycle leased one of its snapshots for a reason re-offer; the leased hint
+/// is kept for the ordinary candidate gate.
+#[test]
+fn leased_reoffer_hint_survives_the_settled_hint_filter() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let f = Fixture::new();
+        let mut index = kept_generation(&f, source, false);
+        let unchanged = f.root.join(format!("{UNCHANGED}.jsonl"));
+        let hints = [unchanged.clone()];
+        assert!(
+            changed_watcher_hints(&index, &hints).is_empty(),
+            "{source:?}: a settled hint is dropped"
+        );
+        let fingerprint = index.file_snapshot_fingerprints[&local_index_key(&unchanged)]
+            .first()
+            .expect("the read recorded its snapshot")
+            .clone();
+        let leased =
+            index.activate_reason_reoffer_retries(BTreeMap::from([(fingerprint, "body".into())]));
+        assert_eq!(leased, vec![unchanged.clone()], "{source:?}");
+        assert_eq!(
+            changed_watcher_hints(&index, &hints),
+            vec![unchanged],
+            "{source:?}: the leased hint is kept"
+        );
+    }
+}
+
+/// [behaviour] A parsed file deleted before its body is ACKed is counted once
+/// on the retiring page with the resident copy's requests and tokens. Claude's
+/// copy folds its responses only at finish, so its totals are unknown. The
+/// same file deleted after its ACK counts nothing.
+/// Count only: the entry retires exactly as before, whether a remove hint or
+/// the re-listing's complete directory read proves it absent, or (Claude) the
+/// re-listing listed it and it was gone before its lstat; the retirement
+/// adds no accepted fingerprint.
+#[test]
+fn deleted_before_ack_counts_unacked_usage_lost() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for (unacked, hinted, race) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            if race && source != SnapshotSource::ClaudeCode {
+                continue;
+            }
+            let mut f = Fixture::new();
+            f.unacked = unacked;
+            let index = kept_generation(&f, source, !hinted);
+            let grown = f.root.join(format!("{GROWN}.jsonl"));
+            let key = local_index_key(&grown);
+            assert!(index.files[&key].last_upload_body_witness.is_some());
+            let accepted = index.accepted_snapshot_fingerprints.clone();
+            let (index, _, _, rows) = if hinted {
+                fs::remove_file(&grown).unwrap();
+                f.page_hinted(source, index, &[grown])
+            } else if race {
+                // Listed by the re-listing's read, gone before its lstat.
+                let (root, target) = (f.root.clone(), grown.clone());
+                let fault = move |read: &Path, type_read: bool| {
+                    if type_read && read == root.as_path() && target.exists() {
+                        fs::remove_file(&target).unwrap();
+                    }
+                    false
+                };
+                let (page, sites) = with_directory_read_fault(fault, || {
+                    crate::snapshots::disappearance_diagnostics::observe_sites(|| {
+                        f.page(source, index)
+                    })
+                });
+                assert_eq!(sites[source.slot()][1], [0, 1], "one WalkEntry removal");
+                page
+            } else {
+                fs::remove_file(&grown).unwrap();
+                f.page(source, index)
+            };
+            assert!(!index.files.contains_key(&key), "{source:?}: retired");
+            assert!(
+                index.accepted_snapshot_fingerprints.is_subset(&accepted),
+                "{source:?} hinted {hinted}: retirement grants no ACK"
+            );
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            let expected = match (unacked, source) {
+                (false, _) => Value::Null,
+                (true, SnapshotSource::Codex) => json!({"files": 1, "requests": 1, "tokens": 20}),
+                (true, SnapshotSource::Pi) => json!({"files": 1, "requests": 1, "tokens": 16}),
+                (true, SnapshotSource::ClaudeCode) => {
+                    json!({"files": 1, "totals_unknown_files": 1})
+                }
+            };
+            assert_eq!(
+                page["counts"]["unacked_usage_lost_to_deletion"], expected,
+                "{source:?} unacked {unacked} hinted {hinted} race {race}"
+            );
+        }
+    }
+}
+
+mod cleared_group_listing;
+mod codex_archive_tests;
+
+/// [regress] A positive remove hint in a retained Codex generation retires
+/// this listing's absent key even if an earlier page observed it.
+#[test]
+fn codex_current_listing_removal_retires_an_earlier_generation_observation() {
+    let f = Fixture::new();
+    let index = f.retained_codex();
+    let key = local_index_key(&f.path);
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .observed_index_keys
+        .contains(&key));
+    assert!(index.files.contains_key(&key));
+    fs::remove_file(&f.path).unwrap();
+    let (index, _, _, _) =
+        f.page_hinted(SnapshotSource::Codex, index, std::slice::from_ref(&f.path));
+    assert!(!index.files.contains_key(&key));
+}
+
+/// [money] A directory wider than a tiny per-tick budget is listed in full on
+/// a fresh tick for every source: the census completes and the scan emits the
+/// same snapshots and file count as under the default budget.
+#[test]
+fn wide_directory_over_budget_completes_census_with_default_budget_money() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let root = crate::test_scratch::unique_path("wide-directory-money");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        for session in [UNCHANGED, GROWN, CREATED, REARMED] {
+            append_records(
+                &root.join(format!("{session}.jsonl")),
+                &usage_records(source, session, 1, true),
+            );
+        }
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let scan = || {
+            let mut index = ScanIndex::default();
+            scan_source_roots(source, std::slice::from_ref(&root), &mut index, &now, 7).unwrap()
+        };
+        let default = scan();
+        let tiny = with_test_directory_entries(3, scan);
+
+        assert!(tiny.census_complete, "{source:?}");
+        assert_eq!(tiny.directory_entry_cap_exceeded_count, 0, "{source:?}");
+        assert_eq!(tiny.scanned_file_count, 4, "{source:?}");
+        assert_eq!(tiny.snapshots.len(), 4, "{source:?}");
+        assert_eq!(
+            tiny.scanned_file_count, default.scanned_file_count,
+            "{source:?}"
+        );
+        assert_eq!(census(&tiny), census(&default), "{source:?}");
+        assert_eq!(
+            serde_json::to_value(&tiny.snapshots).unwrap(),
+            serde_json::to_value(&default.snapshots).unwrap(),
+            "{source:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// [regress] A hint for a transcript the census walk already queued moves
+/// it into the hinted turn, ahead of the census FIFO, on Claude and Pi as
+/// on Codex. It is read once, and the census closes on the same page in
+/// the same generation as without the hint.
+#[test]
+fn hint_orders_an_already_queued_census_member_ahead_of_the_fifo() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let root = crate::test_scratch::unique_path("ottto-bounded-queued-member-hint");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let line = |session: &str, request: u64| {
+            if source == SnapshotSource::ClaudeCode {
+                format!(
+                    "{{\"timestamp\":\"2026-07-22T08:00:0{request}.000Z\",\"sessionId\":\"{session}\",\"type\":\"assistant\",\"requestId\":\"req_{session}_{request}\",\"message\":{{\"id\":\"msg_{session}_{request}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":{request},\"output_tokens\":1}}}}}}\n"
+                )
+            } else {
+                format!(
+                    "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":{},\"usage\":{{\"input\":{request},\"output\":1}}}}}}\n",
+                    1784707201000 + request
+                )
+            }
+        };
+        for file in 0..6 {
+            let session = format!("session-{file}");
+            fs::write(root.join(format!("{session}.jsonl")), line(&session, 1))
+                .expect("write census fixture");
+        }
+        let page = |index: &mut ScanIndex, tick: u64, hints: &[PathBuf]| {
+            let mut scan = scan_source_roots_with_limit_and_attribution(
+                source,
+                std::slice::from_ref(&root),
+                index,
+                &format!("2026-07-31T00:0{tick}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                2,
+                None,
+                None,
+                hints,
+                false,
+            )
+            .expect("bounded census page");
+            if source == SnapshotSource::ClaudeCode {
+                apply_claude_reported_usage_with_index(
+                    &mut scan.snapshots,
+                    &Default::default(),
+                    &Default::default(),
+                    index,
+                );
+            }
+            finalize_scan_after_policy(source, &mut scan, index);
+            scan
+        };
+        let mut index = ScanIndex::default();
+
+        let first = page(&mut index, 0, &[]);
+        assert!(!first.census_complete);
+        assert_eq!(first.scanned_file_count, 2);
+        let pending = &index
+            .traversal
+            .as_ref()
+            .expect("census in progress")
+            .pending_candidates;
+        assert_eq!(pending.len(), 4);
+        let last_queued = pending.back().expect("queued census member");
+        assert!(last_queued.census_member && !last_queued.watcher_hint);
+        let queued = last_queued.path.clone();
+        let key = local_index_key(&queued);
+        assert!(!index.files.contains_key(&key));
+        let session = queued
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("fixture stem")
+            .to_string();
+        let mut grown = fs::read_to_string(&queued).expect("read queued fixture");
+        grown.push_str(&line(&session, 2));
+        fs::write(&queued, grown).expect("grow queued fixture");
+
+        let hinted = page(&mut index, 1, std::slice::from_ref(&queued));
+        assert!(!hinted.census_complete);
+        assert_eq!(hinted.scanned_file_count, 2);
+        assert_eq!(
+            index.files.get(&key).map(|entry| entry.size_bytes),
+            Some(fs::metadata(&queued).expect("queued metadata").len()),
+            "{source:?}: the hinted member is read ahead of the census FIFO"
+        );
+
+        let last = page(&mut index, 2, &[]);
+        assert!(last.census_complete, "{source:?}: closure is not delayed");
+        assert_eq!(last.scanned_file_count, 2, "{source:?}: read once");
+        for scan in [&first, &hinted, &last] {
+            assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
+        }
+        assert!(index.traversal.is_none());
+        assert_eq!(index.files.len(), 6);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// Fully settle a flat census so the next page cannot reuse an unfinished walk.
+fn settled_listing_fixture(source: SnapshotSource) -> (Fixture, ScanIndex, Vec<PathBuf>) {
+    let f = Fixture::new();
+    let paths = (0..6)
+        .map(|n| {
+            let session = format!("0f000000-0000-4000-8000-{n:012}");
+            let path = f.root.join(format!("{session}.jsonl"));
+            append_records(&path, &usage_records(source, &session, 1, true));
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut index = ScanIndex::default();
+    let scan = listing_page(&f, source, &mut index, 10);
+    assert!(scan.census_complete);
+    assert!(index.traversal.is_none());
+    assert_eq!(index.files.len(), paths.len());
+    assert!(index.terminal_contract_retries.is_empty());
+    assert!(index.decode_holds.is_empty());
+    assert!(index.v2().growth_retention.is_empty());
+    for path in &paths {
+        let entry = &index.files[&local_index_key(path)];
+        assert!(index.listing_unchanged(path, &fs::metadata(path).unwrap()));
+        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+    }
+    (f, index, paths)
+}
+
+fn listing_page(
+    f: &Fixture,
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    limit: usize,
+) -> SourceScanResult {
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    let mut scan = scan_source_roots_with_limit_and_attribution(
+        source,
+        std::slice::from_ref(&f.root),
+        index,
+        &now,
+        7,
+        limit,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    if source == SnapshotSource::ClaudeCode {
+        apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &Default::default(),
+            &Default::default(),
+            index,
+        );
+    }
+    finalize_scan_after_policy(source, &mut scan, index);
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    scan
+}
+
+/// [regress] Growth while stopped is read on the first census page listing it,
+/// even when its indexed path is last in the cold FIFO, on Claude and Pi.
+#[test]
+fn census_listing_reads_indexed_growth_ahead_of_the_cold_fifo() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let (f, mut index, paths) = settled_listing_fixture(source);
+        let target = paths.last().unwrap();
+        let session = target.file_stem().unwrap().to_str().unwrap();
+        append_records(target, &usage_records(source, session, 2, false));
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        assert_eq!(
+            ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7),
+            TraversalProgress::Started
+        );
+        let mut request = ListingRequest::default();
+        request.record(ListingTrigger::Start);
+        start_due_listing_pass(
+            source,
+            index.traversal.as_mut().unwrap(),
+            &now,
+            true,
+            &mut request,
+        );
+        assert!(!request.requested());
+        let scan = listing_page(&f, source, &mut index, 2);
+        assert_eq!(
+            index.files[&local_index_key(target)].size_bytes,
+            fs::metadata(target).unwrap().len(),
+            "{source:?}: indexed growth must be read on the first listing page"
+        );
+        assert!(scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == session && item.request_count == 2));
+        let walk = index.traversal.as_ref().unwrap();
+        assert_eq!(walk.counts.listing_generations, 0);
+        assert_eq!(walk.counts.listing_changes_without_hint, 1);
+    }
+}
+
+/// [behaviour] A later listing promotes queued growth in place, once, on either
+/// pass kind; the next page reads it ahead of the remaining cold census members.
+#[test]
+fn listing_promotes_queued_growth_without_reordering_or_duplicating_it() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        for relisting in [false, true] {
+            let (f, mut index, paths) = settled_listing_fixture(source);
+            let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+            ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7);
+            advance_bounded_directory_traversal(source, &mut index, 7, None);
+            let before = index.traversal.as_ref().unwrap().pending_candidates.clone();
+            assert_eq!(before.back().unwrap().path, *paths.last().unwrap());
+            assert!(before.iter().all(|candidate| !candidate.watcher_hint));
+            let target = &before.back().unwrap().path;
+            let session = target.file_stem().unwrap().to_str().unwrap();
+            append_records(target, &usage_records(source, session, 2, false));
+            for _ in 0..2 {
+                if relisting {
+                    relist(source, &mut index);
+                } else {
+                    index
+                        .traversal
+                        .as_mut()
+                        .unwrap()
+                        .pending_directories
+                        .push_back(ScanTraversalPath {
+                            scan_root: f.root.clone(),
+                            path: f.root.clone(),
+                            census_member: true,
+                            watcher_hint: false,
+                        });
+                    advance_bounded_directory_traversal(source, &mut index, 7, None);
+                }
+                let walk = index.traversal.as_ref().unwrap();
+                assert_eq!(
+                    walk.pending_candidates
+                        .iter()
+                        .map(|candidate| &candidate.path)
+                        .collect::<Vec<_>>(),
+                    before
+                        .iter()
+                        .map(|candidate| &candidate.path)
+                        .collect::<Vec<_>>()
+                );
+                assert!(walk.pending_candidates.back().unwrap().watcher_hint);
+                assert_eq!(walk.counts.listing_changes_without_hint, 1);
+            }
+            listing_page(&f, source, &mut index, 2);
+            assert_eq!(
+                index.files[&local_index_key(target)].size_bytes,
+                fs::metadata(target).unwrap().len()
+            );
+        }
+    }
+}
+
+/// [behaviour] An unchanged census stays cold even when some entries are owed.
+#[test]
+fn census_listing_does_not_hint_unchanged_or_owed_files() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let (f, mut index, paths) = settled_listing_fixture(source);
+        index
+            .files
+            .get_mut(&local_index_key(&paths[0]))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        ensure_bounded_traversal(source, std::slice::from_ref(&f.root), &mut index, &now, 7);
+        advance_bounded_directory_traversal(source, &mut index, 7, None);
+        let walk = index.traversal.as_ref().unwrap();
+        assert_eq!(walk.pending_candidates.len(), paths.len());
+        assert!(walk
+            .pending_candidates
+            .iter()
+            .all(|candidate| candidate.census_member && !candidate.watcher_hint));
+        assert_eq!(walk.counts.listing_changes_without_hint, 0);
+    }
+}

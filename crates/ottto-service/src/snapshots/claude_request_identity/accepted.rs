@@ -1,0 +1,1164 @@
+//! Class L hints: bucket starts and non-reversible accepted share fingerprints.
+use super::*;
+use hmac::{Hmac, Mac};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserializer, Serializer};
+use std::ops::Deref;
+use zeroize::Zeroizing;
+
+pub(crate) const MAX_BUCKETS: usize = 5_000;
+const MAX_SHARES: usize = 1_536;
+/// Receiver's dense identity-parts bound: serialized item bytes / 320.
+/// Keep the released ledger limit when the receiver has not raised the cap.
+pub(super) const fn max_shares(item_cap: usize) -> usize {
+    if item_cap > MAX_ITEM_BYTES {
+        max_parts_per_item(item_cap)
+    } else {
+        MAX_SHARES
+    }
+}
+
+// Runtime keys never serialize and Debug must never expose their bytes.
+#[derive(Clone, PartialEq, Eq)]
+struct FingerprintKey(Zeroizing<[u8; 32]>);
+impl std::fmt::Debug for FingerprintKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FingerprintKey([redacted])")
+    }
+}
+/// Third field: epoch changed this pass; fourth: receiver item cap.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AcceptedBuckets(
+    BTreeMap<String, AcceptedSession>,
+    Option<FingerprintKey>,
+    bool,
+    usize,
+);
+/// Why a tagging attempt had no complete accepted state (local diagnostics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UnknownCause {
+    /// No usable attribution key (or no ledger): share protection is off.
+    #[default]
+    NoKey,
+    /// Hints were discarded because the key epoch changed this pass.
+    EpochChanged,
+    /// No hints for this session: never stored-body ACKed, evicted or invalid.
+    UntrackedSession,
+    /// Hints exist but whole buckets were evicted at the share limit.
+    Incomplete,
+}
+
+impl super::CopyInvalidation {
+    /// The session whose body treats this row as never accepted.
+    pub(crate) fn session(&self) -> &str {
+        &self.session
+    }
+}
+
+#[cfg(test)]
+fn fixture_key() -> FingerprintKey {
+    FingerprintKey(Zeroizing::new([0x42; 32]))
+}
+impl Serialize for AcceptedBuckets {
+    fn serialize<S: Serializer>(&self, encoder: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(encoder)
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedSession {
+    // Required: unkeyed v1 records have no epoch and decode as unknown.
+    #[serde(with = "digest_hex")]
+    key_epoch: [u8; 32],
+    #[serde(skip)]
+    key: Option<FingerprintKey>,
+    /// The digest of this value as its identity row last stored it; `None`
+    /// before any store. Dirty = the encoded value differs.
+    #[serde(skip)]
+    stored: Option<[u8; 32]>,
+    #[serde(default, rename = "last_ack", skip_serializing)]
+    _last_ack: Dropped,
+    starts: Vec<i64>,
+    shares: Vec<AcceptedShare>,
+    #[serde(default)]
+    pub(super) incomplete: bool,
+    /// Removed retained-identity proof rows and their pending missing buckets
+    /// (written only while a server advertised that contract): decoded and
+    /// dropped, never written.
+    #[serde(default, rename = "proved", skip_serializing)]
+    _proved: Dropped,
+    #[serde(default, rename = "missing", skip_serializing)]
+    _missing: Dropped,
+}
+/// A released field's value: decoded and dropped, never written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Dropped;
+impl<'de> Deserialize<'de> for Dropped {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        IgnoredAny::deserialize(decoder).map(|_| Dropped)
+    }
+}
+/// Validity barriers for a destination's stored identity rows, at progress
+/// generations: a row stamped before `discard_before` or under another key
+/// epoch is not loaded. `retained_before` is the removed retained-identity
+/// barrier: still decoded and written unchanged, never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityScope {
+    pub(crate) key_epoch: Option<String>,
+    pub(crate) discard_before: u64,
+    pub(crate) retained_before: u64,
+}
+impl IdentityScope {
+    pub(crate) fn is_unset(&self) -> bool {
+        self == &Self::default()
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for IdentityScope {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.key_epoch, c)
+    }
+}
+fn encoded(state: &AcceptedSession) -> Option<[u8; 32]> {
+    crate::snapshots::serialized_json_digest(state, b"").map(|digest| digest.finalize().into())
+}
+impl AcceptedSession {
+    /// The one per-session rule for a decoded hint, from the ledger or an
+    /// identity row: every bound holds, the vectors are sorted and
+    /// deduplicated, and every share lies in a start. `false`: invalid.
+    fn normalize(&mut self) -> bool {
+        if self.starts.len() > MAX_BUCKETS
+            || self.shares.len() > max_shares(MAX_ADVERTISED_ITEM_BYTES)
+        {
+            return false;
+        }
+        self.starts.sort_unstable();
+        self.starts.dedup();
+        self.shares.sort_unstable();
+        self.shares.dedup();
+        if (self.shares.iter()).any(|share| self.starts.binary_search(&share.bucket).is_err()) {
+            return false;
+        }
+        fn exact<T>(vector: &mut Vec<T>) {
+            *vector = std::mem::take(vector).into_boxed_slice().into_vec();
+        }
+        exact(&mut self.starts);
+        exact(&mut self.shares);
+        true
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(super) struct AcceptedShare {
+    bucket: i64,
+    #[serde(with = "digest_hex")]
+    row: [u8; 32],
+    #[serde(with = "optional_digest_hex")]
+    authority: Option<[u8; 32]>,
+}
+pub(crate) mod digest_hex {
+    use super::*;
+    pub(crate) use crate::hex::encode;
+    pub(crate) fn decode<E: serde::de::Error>(value: &str) -> Result<[u8; 32], E> {
+        if !hash_is_valid(value) {
+            return Err(E::custom("invalid fingerprint"));
+        }
+        let mut result = [0; 32];
+        for (byte, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let digit = |n: u8| if n <= b'9' { n - b'0' } else { n - b'a' + 10 };
+            *byte = (digit(pair[0]) << 4) | digit(pair[1]);
+        }
+        Ok(result)
+    }
+    pub(super) fn serialize<S: Serializer>(
+        value: &[u8; 32],
+        encoder: S,
+    ) -> Result<S::Ok, S::Error> {
+        encoder.serialize_str(&encode(value))
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(decoder: D) -> Result<[u8; 32], D::Error> {
+        decode(&String::deserialize(decoder)?)
+    }
+}
+mod optional_digest_hex {
+    use super::*;
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<[u8; 32]>,
+        encoder: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .map(|digest| crate::hex::encode(&digest))
+            .serialize(encoder)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        decoder: D,
+    ) -> Result<Option<[u8; 32]>, D::Error> {
+        Option::<String>::deserialize(decoder)?
+            .as_deref()
+            .map(digest_hex::decode)
+            .transpose()
+    }
+}
+impl Deref for AcceptedSession {
+    type Target = [i64];
+    fn deref(&self) -> &Self::Target {
+        &self.starts
+    }
+}
+fn digest(key: &FingerprintKey, value: Value) -> [u8; 32] {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key.0.as_ref()).expect("HMAC key");
+    mac.update(b"ottto:session-attribution:");
+    mac.update(&serde_json::to_vec(&value).expect("JSON fingerprint"));
+    mac.finalize().into_bytes().into()
+}
+fn key_epoch(key: &FingerprintKey) -> [u8; 32] {
+    digest(
+        key,
+        json!([
+            "claude_accepted_key_epoch:v2",
+            crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION
+        ]),
+    )
+}
+fn row_hash(key: &FingerprintKey, row: &RowKey) -> [u8; 32] {
+    digest(
+        key,
+        json!([
+            "claude_accepted_row:v2",
+            row.model,
+            row.selector_hash,
+            row.reasoning_effort,
+            row.billing_fields()
+        ]),
+    )
+}
+fn authority_hash(key: &FingerprintKey, authority: &AuthorityKey) -> [u8; 32] {
+    digest(
+        key,
+        json!([
+            "claude_accepted_authority:v2",
+            authority.login,
+            authority.org,
+            authority.basis
+        ]),
+    )
+}
+fn wire_row_key(row: &Value) -> Option<RowKey> {
+    let text = |name: &str| row[name].as_str().map(str::to_owned);
+    let context = match row["selector_context"].as_object() {
+        Some(context) => context
+            .iter()
+            .map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+            .collect::<Option<BTreeMap<_, _>>>()?,
+        None => BTreeMap::new(),
+    };
+    Some(RowKey {
+        model: text("model")?,
+        // The daemon's RowKey partition (`row_key_with_selector_hash`): a
+        // marked copy and its unmarked own twin are different rows.
+        selector_hash: super::super::copy_unproven_selector_hash(
+            row["copy_unproven"] == json!(true),
+            super::super::selector_hash(&context),
+        ),
+        reasoning_effort: text("reasoning_effort"),
+        auth_mode: text("auth_mode"),
+        billing_channel: text("billing_channel"),
+        billing_provider: text("billing_provider"),
+        gateway_provider: text("gateway_provider"),
+        model_provider: text("model_provider"),
+        subscription_product: text("subscription_product"),
+    })
+}
+/// A carried or recorded-login share: placement, never proof of its row. The
+/// stored-JSON boundary twin of `AuthorityKey::placement_only`, stricter: any
+/// present `account_source` (even null) counts.
+fn placement_only_entry(entry: &Value) -> bool {
+    entry.get("account_source").is_some()
+        || entry.get("identity_basis").and_then(Value::as_str) == Some(TRANSCRIPT_RECORDED_LOGIN)
+}
+fn session_key(key: &FingerprintKey, session: &str) -> String {
+    crate::hex::encode(&digest(
+        key,
+        json!(["claude_accepted_identity_buckets:v2", session]),
+    ))
+}
+
+/// The domain of the local `session_context` change detector.
+const SESSION_CONTEXT_DOMAIN: &str = "claude_session_context:v1";
+
+// The cycle's attribution key, for a parser that sees lines without its context.
+// Outer `None`: not bound yet this process. Fixtures start keyed, as their
+// parsers always compared sentences.
+#[cfg(not(test))]
+static SESSION_CONTEXT_KEY: std::sync::Mutex<Option<Option<FingerprintKey>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static SESSION_CONTEXT_KEY: std::cell::RefCell<Option<Option<FingerprintKey>>> =
+        std::cell::RefCell::new(Some(Some(fixture_key())));
+}
+
+#[cfg(not(test))]
+fn with_session_context_key<R>(
+    use_key: impl FnOnce(&mut Option<Option<FingerprintKey>>) -> R,
+) -> R {
+    use_key(
+        &mut SESSION_CONTEXT_KEY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+#[cfg(test)]
+fn with_session_context_key<R>(
+    use_key: impl FnOnce(&mut Option<Option<FingerprintKey>>) -> R,
+) -> R {
+    SESSION_CONTEXT_KEY.with(|key| use_key(&mut key.borrow_mut()))
+}
+
+/// Binds the cycle's attribution key; true when it changed, which ends what any
+/// retained parse's digest can be compared with, so the caller scrubs those
+/// digests. The process's first bind is no change: no Claude parse exists before it.
+pub(crate) fn bind_session_context_key(
+    context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> bool {
+    let key = context.map(|context| FingerprintKey(context.accepted_fingerprint_key()));
+    with_session_context_key(|bound| {
+        let changed = bound.as_ref().is_some_and(|previous| *previous != key);
+        *bound = Some(key);
+        changed
+    })
+}
+#[cfg(test)]
+pub(super) fn unbind_test_session_context_key() {
+    with_session_context_key(|bound| *bound = None);
+}
+
+/// The sentence's HMAC-SHA-256 under the bound key; `None` without one.
+pub(crate) fn session_context_digest(sentence: &str) -> Option<String> {
+    let key = with_session_context_key(|bound| bound.clone().flatten())?;
+    Some(crate::hex::encode(&digest(
+        &key,
+        json!([SESSION_CONTEXT_DOMAIN, sentence]),
+    )))
+}
+
+/// The epoch of the bound key, the one every keyed Tail head field is made
+/// under; `None` without a key.
+pub(crate) fn session_context_key_epoch() -> Option<[u8; 32]> {
+    with_session_context_key(|bound| bound.clone().flatten()).map(|key| key_epoch(&key))
+}
+
+/// Binds `key` (`None`: no key) as a cycle would.
+#[cfg(test)]
+pub(crate) fn bind_test_session_context_key(key: Option<[u8; 32]>) {
+    with_session_context_key(|bound| {
+        *bound = Some(key.map(|key| FingerprintKey(Zeroizing::new(key))))
+    });
+}
+
+pub(super) fn bucket_key(start: &str) -> Option<i64> {
+    OffsetDateTime::parse(start, &Rfc3339)
+        .ok()
+        .map(|at| at.unix_timestamp())
+}
+impl AcceptedSession {
+    /// Predict exactly the share set an ACK would retain, without changing proof.
+    fn shares_after(
+        &self,
+        body: &Value,
+        shares: impl Iterator<Item = AcceptedShare>,
+    ) -> BTreeSet<AcceptedShare> {
+        let fingerprint_key = self.bound_key();
+        let mut shares = shares.collect::<BTreeSet<_>>();
+        let mut present = BTreeSet::new();
+        for bucket in body["usage_buckets"].as_array().into_iter().flatten() {
+            let Some(start) = bucket["bucket_start"].as_str().and_then(bucket_key) else {
+                continue;
+            };
+            present.insert(start);
+            for row in bucket["model_usage"].as_array().into_iter().flatten() {
+                let Some(row_key) = wire_row_key(row) else {
+                    continue;
+                };
+                let row_hash = row_hash(fingerprint_key, &row_key);
+                // Freeze a row's first accepted tagged share set. A refused
+                // later ACK must not bless its new untagged presence or key.
+                if shares
+                    .iter()
+                    .any(|share| share.bucket == start && share.row == row_hash)
+                {
+                    continue;
+                }
+                let parts = row["identity_parts"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(std::slice::from_ref(row));
+                let mut row_shares = BTreeSet::new();
+                for part in parts {
+                    let authority = match part["evidence_ref"]
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                    {
+                        None => None,
+                        Some(reference) => {
+                            let evidence = &body["request_evidence"][reference];
+                            let Some(basis) =
+                                evidence["identity_basis"].as_str().and_then(basis_token)
+                            else {
+                                continue;
+                            };
+                            // A carried share is placement, never a proven authority.
+                            (!placement_only_entry(evidence)).then(|| {
+                                authority_hash(
+                                    fingerprint_key,
+                                    &AuthorityKey {
+                                        login: part["account_identifier_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        org: evidence["provider_workspace_hash"]
+                                            .as_str()
+                                            .map(str::to_owned),
+                                        basis,
+                                        account_source: None,
+                                    },
+                                )
+                            })
+                        }
+                    };
+                    row_shares.insert(AcceptedShare {
+                        bucket: start,
+                        row: row_hash,
+                        authority,
+                    });
+                }
+                if row_shares.iter().any(|share| share.authority.is_some()) {
+                    shares.extend(row_shares);
+                }
+            }
+        }
+        shares.retain(|share| present.contains(&share.bucket));
+        shares
+    }
+    pub(super) fn exceeds_share_bound(
+        &self,
+        item: &SnapshotItem,
+        item_cap: usize,
+        new_shares: usize,
+    ) -> bool {
+        // The union cannot exceed prior + new shares; avoid building a wire
+        // Value on the ordinary path well below the negotiated bound.
+        self.shares.len().saturating_add(new_shares) > max_shares(item_cap)
+            && serde_json::to_value(item).map_or(true, |body| {
+                self.shares_after(&body, self.shares.iter().cloned()).len() > max_shares(item_cap)
+            })
+    }
+    pub(super) fn authority_hash(&self, authority: &AuthorityKey) -> [u8; 32] {
+        authority_hash(self.key.as_ref().expect("bound accepted epoch"), authority)
+    }
+    /// Frozen tagged rows of a present bucket that no current row key matches,
+    /// e.g. usage moved to a new key by late effort or billing resolution.
+    pub(super) fn vanished_rows<'r>(
+        &self,
+        bucket: i64,
+        current: impl Iterator<Item = &'r RowKey>,
+    ) -> u64 {
+        let key = self.key.as_ref().expect("bound accepted epoch");
+        let current = current
+            .map(|row| row_hash(key, row))
+            .collect::<BTreeSet<_>>();
+        let first = self.shares.partition_point(|share| share.bucket < bucket);
+        self.shares[first..]
+            .iter()
+            .take_while(|share| share.bucket == bucket)
+            .map(|share| share.row)
+            .filter(|row| !current.contains(row))
+            .collect::<BTreeSet<_>>()
+            .len() as u64
+    }
+    pub(super) fn row_shares(&self, bucket: i64, row: &RowKey) -> BTreeSet<Option<[u8; 32]>> {
+        let row = row_hash(self.key.as_ref().expect("bound accepted epoch"), row);
+        let first = self
+            .shares
+            .partition_point(|share| (share.bucket, share.row) < (bucket, row));
+        self.shares[first..]
+            .iter()
+            .take_while(|share| (share.bucket, share.row) == (bucket, row))
+            .map(|share| share.authority)
+            .collect()
+    }
+    fn bound_key(&self) -> &FingerprintKey {
+        self.key.as_ref().expect("bound accepted epoch")
+    }
+    /// This ledger with `rows` invalidated, for the pass that decides them.
+    pub(super) fn invalidated(&self, rows: &[(i64, RowKey)]) -> Self {
+        let mut state = self.clone();
+        state.invalidate(rows);
+        state
+    }
+    /// Copy-derived rows become a definite "never accepted" record: their
+    /// frozen shares go while the bucket stays accepted (the row reads as
+    /// ACKed untagged). Returns the rows changed.
+    fn invalidate(&mut self, rows: &[(i64, RowKey)]) -> u64 {
+        let key = self.bound_key().clone();
+        let mut changed = 0;
+        for (bucket, row) in rows {
+            let shared = row_hash(&key, row);
+            let before = self.shares.len();
+            self.shares
+                .retain(|share| (share.bucket, share.row) != (*bucket, shared));
+            changed += u64::from(self.shares.len() != before);
+        }
+        changed
+    }
+}
+impl<'de> Deserialize<'de> for AcceptedBuckets {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Hints;
+        impl<'de> Visitor<'de> for Hints {
+            type Value = AcceptedBuckets;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("optional accepted identity hints")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut states = BTreeMap::new();
+                while let Some(session) = map.next_key::<String>()? {
+                    if !hash_is_valid(&session) {
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    }
+                    // At most one session Value tree, consumed without cloning.
+                    // Malformed/old hints never invalidate neighbouring ordinary ACKs.
+                    let value = map.next_value::<Value>()?;
+                    let Ok(mut state) = serde_json::from_value::<AcceptedSession>(value) else {
+                        continue;
+                    };
+                    if state.normalize() {
+                        states.insert(session, state);
+                    }
+                }
+                Ok(AcceptedBuckets(states, None, false, 0))
+            }
+            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AcceptedBuckets::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(AcceptedBuckets::default())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+        }
+        decoder.deserialize_any(Hints)
+    }
+}
+impl AcceptedBuckets {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(BTreeMap::new(), Some(fixture_key()), false, 0)
+    }
+    /// One session at every per-session bound: the per-row maximum.
+    #[cfg(test)]
+    pub(crate) fn maximal_session_for_test() -> Self {
+        let key = fixture_key();
+        Self(
+            (0..1)
+                .map(|session| {
+                    let starts = (0..MAX_BUCKETS)
+                        .map(|n| i64::MIN + n as i64)
+                        .collect::<Vec<_>>();
+                    let shares = (0..MAX_SHARES)
+                        .map(|n| {
+                            let mut row = [255; 32];
+                            row[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                            AcceptedShare {
+                                bucket: starts[n],
+                                row,
+                                authority: Some([255; 32]),
+                            }
+                        })
+                        .collect();
+                    (
+                        session_key(&key, &format!("max-{session}")),
+                        AcceptedSession {
+                            key_epoch: key_epoch(&key),
+                            key: Some(key.clone()),
+                            stored: None,
+                            _last_ack: Dropped,
+                            _proved: Dropped,
+                            _missing: Dropped,
+                            starts,
+                            shares,
+                            incomplete: true,
+                        },
+                    )
+                })
+                .collect(),
+            Some(key),
+            false,
+            0,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn restore_for_test(bytes: &[u8]) -> Self {
+        let mut state: Self = serde_json::from_slice(bytes).unwrap();
+        state.bind_key(Some(fixture_key()));
+        state
+    }
+    /// The negotiated attribution key is owned by the existing per-cycle context.
+    /// Missing or rotated keys discard hints before any share comparison or ACK.
+    pub(crate) fn bind_context(
+        &mut self,
+        context: Option<&crate::session_attribution::SessionAttributionContext>,
+    ) {
+        self.bind_key(context.map(|context| FingerprintKey(context.accepted_fingerprint_key())));
+    }
+    #[cfg(test)]
+    pub(crate) fn bind_test_key(&mut self, key: Option<[u8; 32]>) {
+        self.bind_key(key.map(|key| FingerprintKey(Zeroizing::new(key))));
+    }
+    fn bind_key(&mut self, key: Option<FingerprintKey>) {
+        let epoch = key.as_ref().map(key_epoch);
+        let rotated = self.0.values().any(|state| Some(state.key_epoch) != epoch);
+        if epoch.is_none() || rotated {
+            self.0.clear();
+        }
+        self.2 = epoch.is_some() && rotated;
+        for state in self.0.values_mut() {
+            state.key = key.clone();
+        }
+        self.1 = key;
+    }
+    /// Runtime-only receiver cap; never serialized as accepted proof.
+    pub(crate) fn set_item_cap(&mut self, item_cap: usize) {
+        self.3 = item_cap;
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Why `get(session)` found no state; meaningful only when it returned `None`.
+    pub(crate) fn miss_cause(&self) -> UnknownCause {
+        match (&self.1, self.2) {
+            (None, _) => UnknownCause::NoKey,
+            (Some(_), true) => UnknownCause::EpochChanged,
+            (Some(_), false) => UnknownCause::UntrackedSession,
+        }
+    }
+    /// Tombstone the copy-derived rows an identity pass treated as never
+    /// accepted (`AcceptedSession::invalidate`), counted once per row.
+    /// Returns whether the ledger changed; the caller persists before upload.
+    pub(crate) fn invalidate_copy_derived(&mut self, rows: &[super::CopyInvalidation]) -> bool {
+        let mut invalidated = 0;
+        for row in rows {
+            if let Some(state) = self.session_mut(&row.session) {
+                invalidated += state.invalidate(&[(row.bucket, row.row.clone())]);
+            }
+        }
+        if invalidated > 0 {
+            super::budget::record(&super::budget::Counts {
+                copy_derived_proof_invalidated: invalidated,
+                ..Default::default()
+            });
+        }
+        invalidated > 0
+    }
+    fn session_mut(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+        let key = self.1.as_ref()?;
+        let epoch = key_epoch(key);
+        self.0
+            .get_mut(&session_key(key, session))
+            .filter(|state| state.key_epoch == epoch)
+    }
+    /// The session's entry, created on its first stored-body ACK.
+    fn session_entry(&mut self, session: &str) -> Option<&mut AcceptedSession> {
+        let fingerprint_key = self.1.as_ref()?;
+        let entry = self
+            .0
+            .entry(session_key(fingerprint_key, session))
+            .or_insert_with(|| AcceptedSession {
+                key_epoch: key_epoch(fingerprint_key),
+                key: Some(fingerprint_key.clone()),
+                ..Default::default()
+            });
+        Some(entry)
+    }
+    /// The identity row name of `session` under the bound key.
+    pub(crate) fn row_name(&self, session: &str) -> Option<String> {
+        self.1.as_ref().map(|key| session_key(key, session))
+    }
+    pub(crate) fn holds_row(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+    /// The bound key's epoch, the identity rows' scope.
+    pub(crate) fn epoch(&self) -> Option<String> {
+        self.1
+            .as_ref()
+            .map(|key| crate::hex::encode(&key_epoch(key)))
+    }
+    /// The epoch the resident hints were written under (an import's scope).
+    pub(crate) fn resident_epoch(&self) -> Option<String> {
+        let state = self.0.values().next()?;
+        Some(crate::hex::encode(&state.key_epoch))
+    }
+    /// The stored scope's key epoch changed: no hint written under another
+    /// epoch stays, resident or stored.
+    pub(crate) fn discard_resident(&mut self, rotated: bool) {
+        self.0.clear();
+        self.2 |= rotated && self.1.is_some();
+    }
+    /// A stored row this key can use: its own epoch, and already in the
+    /// form the shared per-session rule leaves (rows are written that way).
+    pub(crate) fn admissible(&self, state: &AcceptedSession) -> bool {
+        let mut normal = state.clone();
+        (self.1.as_ref()).is_some_and(|key| state.key_epoch == key_epoch(key))
+            && normal.normalize()
+            && normal == *state
+    }
+    /// Make a stored row resident, unless the session already is (a
+    /// resident entry is never replaced by a read).
+    pub(crate) fn admit(&mut self, name: String, mut state: AcceptedSession) {
+        state.stored = encoded(&state);
+        state.key = self.1.clone();
+        self.0.entry(name).or_insert(state);
+    }
+    /// Resident sessions whose encoded value differs from their stored row.
+    pub(crate) fn dirty(&self) -> Vec<(&str, &AcceptedSession)> {
+        (self.0.iter())
+            .filter(|(_, state)| state.stored.is_none() || state.stored != encoded(state))
+            .map(|(name, state)| (name.as_str(), state))
+            .collect()
+    }
+    /// Every resident session is stored: release them; reads load them again.
+    pub(crate) fn release(&mut self) {
+        self.0.clear();
+    }
+    /// may have frozen `session`'s bucket at `bucket_start`. Known hints
+    /// answer exactly; incomplete hints (whole buckets evicted) or an
+    /// unparsable start answer yes. Without hints for the session the answer
+    /// is no, the same reach as accepted-share protection (`accepted_state_unknown`).
+    #[cfg(test)]
+    pub(crate) fn may_have_accepted(&self, session: &str, bucket_start: &str) -> bool {
+        self.get(session).is_some_and(|state| {
+            state.incomplete
+                || bucket_key(bucket_start)
+                    .map_or(true, |start| state.binary_search(&start).is_ok())
+        })
+    }
+    pub(crate) fn get(&self, session: &str) -> Option<&AcceptedSession> {
+        let key = self.1.as_ref()?;
+        self.0
+            .get(&session_key(key, session))
+            .filter(|state| state.key_epoch == key_epoch(key))
+    }
+    /// Record only the body actually stored. A stripped ACK preserves prior
+    /// fingerprints while the bucket is present; fingerprints never restore tags.
+    pub(crate) fn record(&mut self, body: &Value) {
+        if self.1.is_none() {
+            return;
+        }
+        if body["provenance"]["collector"].as_str() != Some(COLLECTOR) {
+            return;
+        }
+        let Some(session) = body["source_session_id"].as_str() else {
+            return;
+        };
+        let Some(buckets) = body["usage_buckets"].as_array() else {
+            return;
+        };
+        if buckets.len() > MAX_BUCKETS {
+            return;
+        }
+        let item_cap = self.3;
+        let limit = max_shares(item_cap);
+        let entry = self.session_entry(session).expect("bound fingerprint key");
+        let mut shares = if item_cap > MAX_ITEM_BYTES {
+            entry.shares_after(body, entry.shares.iter().cloned())
+        } else {
+            let prior = std::mem::take(&mut entry.shares);
+            entry.shares_after(body, prior.into_iter())
+        };
+        // An increased-cap upload is preflighted before POST. Preserve prior
+        // proof defensively if an unexpected ACK would exceed its bound.
+        if item_cap > MAX_ITEM_BYTES && shares.len() > limit {
+            entry.incomplete = true;
+            return;
+        }
+        // Evict whole buckets, never a partial share set masquerading as a
+        // complete accepted fingerprint. Loss takes the counted unknown path.
+        while shares.len() > limit {
+            let oldest = shares.first().expect("nonempty").bucket;
+            shares.retain(|share| share.bucket != oldest);
+            entry.incomplete = true;
+        }
+        entry.starts = shares
+            .iter()
+            .map(|share| share.bucket)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into_vec();
+        entry.shares = shares
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into_vec();
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AcceptedSession {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(
+            self.starts
+                .capacity()
+                .checked_mul(std::mem::size_of::<i64>())?,
+        )?;
+        c.add(
+            self.shares
+                .capacity()
+                .checked_mul(std::mem::size_of::<AcceptedShare>())?,
+        )
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AcceptedBuckets {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    pub(super) fn body(tagged: bool) -> Value {
+        json!({"source_session_id":"synthetic", "provenance":{"collector":COLLECTOR},
+        "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}], "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z", "model_usage":[
+            if tagged { json!({"model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64)}) } else { json!({"model":"claude-synthetic"}) }
+        ]}]})
+    }
+    #[test]
+    fn record_retains_keys_across_stripped_revisions_and_restart_without_identities() {
+        let mut state = AcceptedBuckets::for_test();
+        state.record(&body(true));
+        state.record(&body(false));
+        let bytes = serde_json::to_vec(&state).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic"));
+        assert!(!String::from_utf8_lossy(&bytes).contains(&"a".repeat(64)));
+        let mut restored: AcceptedBuckets = AcceptedBuckets::restore_for_test(&bytes);
+        assert_eq!(restored, state);
+        assert_eq!(restored.get("synthetic").unwrap().len(), 1);
+        let mut deleted = body(false);
+        deleted["usage_buckets"] = json!([]);
+        restored.record(&deleted);
+        assert!(restored.get("synthetic").unwrap().is_empty());
+    }
+    #[test]
+    fn decoder_and_record_keep_every_session_and_unknown_is_distinct_from_known_empty() {
+        let oversized = json!((0..MAX_BUCKETS + 1).collect::<Vec<_>>());
+        let raw = (0..17)
+            .map(|i| {
+                (
+                    format!("{i:064x}"),
+                    json!({"key_epoch":digest_hex::encode(&key_epoch(&fixture_key())),"starts":[],"shares":[],"last_ack":i}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let decoded: AcceptedBuckets = serde_json::from_value(Value::Object(raw)).unwrap();
+        assert_eq!(decoded.0.len(), 17);
+        assert!(
+            !serde_json::to_string(&decoded)
+                .unwrap()
+                .contains("last_ack"),
+            "a released LRU stamp decodes and is never written"
+        );
+        let decoded: AcceptedBuckets =
+            serde_json::from_value(json!({"a".repeat(64):oversized})).unwrap();
+        assert!(decoded.is_empty());
+        let mut state = AcceptedBuckets::for_test();
+        for i in 0..17 {
+            let mut value = body(false);
+            value["source_session_id"] = json!(format!("session-{i}"));
+            state.record(&value);
+        }
+        assert_eq!(state.0.len(), 17);
+        assert!(state.get("never-acknowledged").is_none());
+        assert!(state.get("session-0").is_some(), "no session is evicted");
+        assert_eq!(state.get("session-16").unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn timestamp_only_decoder_state_is_unknown_without_share_fingerprints() {
+        let state: AcceptedBuckets =
+            serde_json::from_value(json!({session_key(&fixture_key(), "old"): [1, 2]})).unwrap();
+        assert!(state.get("old").is_none());
+    }
+}
+
+#[cfg(test)]
+mod share_bound_tests {
+    use super::*;
+    #[test]
+    fn record_evicts_whole_share_sets_and_counts_state_as_incomplete() {
+        let start = OffsetDateTime::parse("2026-09-01T00:00:00Z", &Rfc3339).unwrap();
+        let body = json!({"source_session_id":"bounded-shares","provenance":{"collector":COLLECTOR},
+            "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}],
+            "usage_buckets":(0..MAX_SHARES / 3 + 1).map(|hour| json!({
+                "bucket_start":(start+time::Duration::hours(hour as i64)).format(&Rfc3339).unwrap(),
+                "model_usage":[{"model":"claude-synthetic","identity_parts":(0..3).map(|key| json!({
+                    "evidence_ref":0,"account_identifier_hash":format!("{key:064x}")
+                })).collect::<Vec<_>>()}]
+            })).collect::<Vec<_>>()});
+        let mut state = AcceptedBuckets::for_test();
+        state.record(&body);
+        let known = state.get("bounded-shares").unwrap();
+        assert!(known.incomplete);
+        assert_eq!(known.shares.len(), MAX_SHARES);
+        assert_eq!(known.shares.capacity(), MAX_SHARES);
+        assert_eq!(known.starts.len(), MAX_SHARES / 3);
+        assert!(known
+            .shares
+            .iter()
+            .all(|share| share.bucket != start.unix_timestamp()));
+        let restored: AcceptedBuckets =
+            AcceptedBuckets::restore_for_test(&serde_json::to_vec(&state).unwrap());
+        assert_eq!(restored, state);
+
+        // [money] The receiver's 2 MiB formula admits exactly 6,553 shares.
+        // Existing OFF assertions above retain the released 1,536 behavior.
+        let mut enlarged = body.clone();
+        enlarged["usage_buckets"] = json!((0..2_185)
+            .map(|hour| json!({
+                "bucket_start":(start+time::Duration::hours(hour)).format(&Rfc3339).unwrap(),
+                "model_usage":[{"model":"claude-synthetic","identity_parts":
+                    (0..if hour == 2_184 { 1 } else { 3 }).map(|key| json!({
+                        "evidence_ref":0,"account_identifier_hash":format!("{key:064x}")
+                    })).collect::<Vec<_>>()}]
+            }))
+            .collect::<Vec<_>>());
+        let mut state = AcceptedBuckets::for_test();
+        state.set_item_cap(2 * 1024 * 1024);
+        assert_eq!(max_shares(2 * 1024 * 1024), 6_553);
+        state.record(&enlarged);
+        let known = state.get("bounded-shares").unwrap();
+        assert_eq!(known.shares.len(), 6_553);
+        assert!(!known.incomplete);
+        assert_eq!(known.starts.len(), 2_185);
+        assert_eq!(
+            known
+                .row_shares(
+                    start.unix_timestamp(),
+                    &wire_row_key(&enlarged["usage_buckets"][0]["model_usage"][0]).unwrap()
+                )
+                .len(),
+            3
+        );
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restored = AcceptedBuckets::restore_for_test(&bytes);
+        restored.set_item_cap(2 * 1024 * 1024);
+        restored.record(&enlarged);
+        assert_eq!(restored.get("bounded-shares").unwrap().shares, known.shares);
+        assert!(!restored.get("bounded-shares").unwrap().incomplete);
+        if crate::heap_layout_bound::layout_supported() {
+            assert!(crate::heap_layout_bound::bound(&restored, 100_000).is_none());
+            assert!(crate::heap_layout_bound::bound(&restored, usize::MAX).unwrap() > 500_000);
+        }
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+    #[test]
+    fn fixed_key_is_deterministic_and_not_plain_sha256_of_identity_json() {
+        let key = fixture_key();
+        let authority = AuthorityKey {
+            login: Some("low-entropy-login".into()),
+            org: Some("low-entropy-org".into()),
+            basis: TELEMETRY_LOGIN,
+            account_source: None,
+        };
+        let material = json!([
+            "claude_accepted_authority:v2",
+            authority.login,
+            authority.org,
+            authority.basis
+        ]);
+        let actual = authority_hash(&key, &authority);
+        assert_eq!(actual, authority_hash(&key, &authority));
+        assert_ne!(
+            actual,
+            <[u8; 32]>::from(sha2::Sha256::digest(serde_json::to_vec(&material).unwrap()))
+        );
+        let row = wire_row_key(&json!({"model":"synthetic-model"})).unwrap();
+        let material = json!([
+            "claude_accepted_row:v2",
+            row.model,
+            row.selector_hash,
+            row.reasoning_effort,
+            row.billing_fields()
+        ]);
+        assert_ne!(
+            row_hash(&key, &row),
+            <[u8; 32]>::from(sha2::Sha256::digest(serde_json::to_vec(&material).unwrap()))
+        );
+        let mut first = AcceptedBuckets::for_test();
+        first.record(&tests::body(true));
+        let mut second = AcceptedBuckets::for_test();
+        second.record(&tests::body(true));
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains(&"a".repeat(64)));
+        assert!(!encoded.contains("synthetic"));
+        assert!(!format!("{first:?}").contains("66, 66"));
+        assert_ne!(
+            session_key(&key, "synthetic"),
+            super::super::super::sha256_hex(&["claude_accepted_identity_buckets:v2", "synthetic"])
+        );
+    }
+    #[test]
+    fn rotated_missing_or_changed_version_keys_drop_the_entire_set() {
+        let mut state = AcceptedBuckets::for_test();
+        state.record(&tests::body(true));
+        let bytes = serde_json::to_vec(&state).unwrap();
+        for key in [None, Some([0x43; 32])] {
+            let mut restored: AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
+            restored.bind_test_key(key);
+            assert!(restored.is_empty());
+            assert!(restored.get("synthetic").is_none());
+            restored.record(&tests::body(true));
+            assert_eq!(restored.is_empty(), key.is_none());
+        }
+        let mut version_changed = serde_json::to_value(&state).unwrap();
+        version_changed
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()["key_epoch"] = json!("0".repeat(64));
+        let mut restored: AcceptedBuckets = serde_json::from_value(version_changed).unwrap();
+        restored.bind_test_key(Some([0x42; 32]));
+        assert!(restored.is_empty());
+    }
+    #[test]
+    fn negotiated_context_binds_the_existing_key_and_restart_requires_rebinding() {
+        use base64::Engine as _;
+        let home = std::path::Path::new("/nonexistent/e2-accepted-fingerprints");
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42; 32]);
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::ClaudeCode,
+            home,
+            true,
+            Some(&encoded),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap();
+        let mut state = AcceptedBuckets::default();
+        state.record(&tests::body(true));
+        assert!(state.is_empty());
+        state.bind_context(Some(&context));
+        assert_eq!(state.1.as_ref(), Some(&fixture_key()));
+        state.record(&tests::body(true));
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restored: AcceptedBuckets = serde_json::from_slice(&bytes).unwrap();
+        assert!(restored.get("synthetic").is_none());
+        restored.bind_context(Some(&context));
+        assert_eq!(restored, state);
+        restored.bind_context(None);
+        restored.record(&tests::body(true));
+        assert!(restored.is_empty());
+    }
+    #[test]
+    fn round_five_unkeyed_v1_share_state_is_unknown() {
+        let key =
+            super::super::super::sha256_hex(&["claude_accepted_identity_buckets:v1", "synthetic"]);
+        let restored: AcceptedBuckets = serde_json::from_value(json!({key:{
+            "starts":[1], "shares":[{"bucket":1,"row":vec![0;32],"authority":vec![1;32]}], "incomplete":false
+        }})).unwrap();
+        assert!(restored.is_empty());
+        assert!(restored.get("synthetic").is_none());
+    }
+}
+
+#[cfg(test)]
+mod removed_retained_state_tests {
+    use super::*;
+    /// Rows the removed retained-identity arm wrote still load: their proof
+    /// fields are decoded and dropped, and the hint is written without them.
+    #[test]
+    fn stored_proved_rows_and_missing_buckets_decode_and_are_never_written() {
+        let mut off = AcceptedBuckets::for_test();
+        off.record(&json!({"source_session_id":"synthetic",
+            "provenance":{"collector":COLLECTOR},
+            "request_evidence":[{"identity_basis":TELEMETRY_LOGIN}],
+            "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z","model_usage":[
+                {"model":"claude-synthetic","request_count":1,"evidence_ref":0,
+                    "account_identifier_hash":"a".repeat(64)}]}]}));
+        let bytes = serde_json::to_string(&off).unwrap();
+        assert!(!bytes.contains("proved") && !bytes.contains("missing"));
+        let mut stored: Value = serde_json::from_str(&bytes).unwrap();
+        for state in stored.as_object_mut().unwrap().values_mut() {
+            state["proved"] = json!(format!("v2:{}", "A".repeat(100)));
+            state["missing"] = json!([1_788_256_800_i64]);
+        }
+        let restored = AcceptedBuckets::restore_for_test(&serde_json::to_vec(&stored).unwrap());
+        assert!(restored.get("synthetic").is_some(), "the hint still loads");
+        assert_eq!(restored, off);
+        assert_eq!(serde_json::to_string(&restored).unwrap(), bytes);
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod heap_tests {
+    use super::*;
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    #[test]
+    fn one_maximal_session_has_a_quarter_mib_heap_bound() {
+        let state = AcceptedSession {
+            key_epoch: [0; 32],
+            key: None,
+            stored: None,
+            _last_ack: Dropped,
+            starts: (0..MAX_BUCKETS as i64).collect(),
+            shares: vec![
+                AcceptedShare {
+                    bucket: 1,
+                    row: [0; 32],
+                    authority: Some([0; 32])
+                };
+                MAX_SHARES
+            ],
+            incomplete: false,
+            _proved: Dropped,
+            _missing: Dropped,
+        };
+        // Resident hints are the page's sessions, each within this bound.
+        let mut counter = Counter::new(256 * 1024);
+        counter.add(std::mem::size_of_val(&state)).unwrap();
+        state.heap_bound(&mut counter).unwrap();
+        assert_eq!(std::mem::size_of::<AcceptedShare>(), 80);
+        assert_eq!(
+            counter.bytes,
+            std::mem::size_of::<AcceptedSession>() + MAX_BUCKETS * 8 + MAX_SHARES * 80
+        );
+        eprintln!(
+            "accepted-share requested-layout maximum={} bytes per session",
+            counter.bytes
+        );
+    }
+}

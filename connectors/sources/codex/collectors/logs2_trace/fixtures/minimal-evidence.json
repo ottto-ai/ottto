@@ -1,0 +1,35 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "logs2_trace",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "local_usage_fast_mode_tier",
+      "sample": {
+        "source_id": "codex",
+        "session_hash": "codex_fixture_session_hash",
+        "selector_context": {
+          "service_tier": "priority"
+        },
+        "selector_source": "derived_from_logs_2"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Reads only the requested service_tier (priority = fast) per turn from the undocumented logs_2.sqlite debug database and contributes it as a service_tier selector on the existing hourly usage rows. Turn ids are used locally to join the tier to the right turn and are never uploaded; no prompt, instruction, response, or tool output is read or uploaded.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

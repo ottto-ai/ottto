@@ -1,0 +1,16 @@
+# cargo-audit exceptions. Every entry needs a justification and a re-check
+# condition; remove entries as soon as the upstream fix path exists.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS (quadratic
+    # duplicate-attribute check; unbounded namespace allocation in NsReader).
+    # quick-xml is a transitive dep of plist (1.9.0, the latest release),
+    # which pins quick-xml 0.39.x — there is no patched upgrade path yet.
+    # ottto-service uses plist only to parse local, trusted macOS plist
+    # files, never attacker-controlled XML, so the DoS surface does not
+    # apply. Re-check and drop these when plist releases with quick-xml
+    # >= 0.41 (advisories published 2026-06-29).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

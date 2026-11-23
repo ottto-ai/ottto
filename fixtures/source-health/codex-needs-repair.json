@@ -1,0 +1,202 @@
+{
+  "source": "codex",
+  "descriptor": {
+    "source": "codex",
+    "display_name": "Codex",
+    "local_state_owner": "local_daemon",
+    "telemetry_owner": "local_daemon",
+    "repair_owner": "local_daemon",
+    "operations": [
+      {
+        "operation": "detect",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "verify",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "repair",
+        "supported": true,
+        "state": "available",
+        "requires_approval": true,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "collect_usage",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "monitor_quota",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": "Quota windows are display-only plan facts and never imply spend."
+      },
+      {
+        "operation": "upload_snapshot",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "diagnostics",
+        "supported": true,
+        "state": "available",
+        "requires_approval": false,
+        "destructive": false,
+        "reason": null
+      },
+      {
+        "operation": "uninstall_restore",
+        "supported": true,
+        "state": "available",
+        "requires_approval": true,
+        "destructive": false,
+        "reason": "Restore uses daemon-owned backups and avoids revoke, delete, or disconnect actions."
+      }
+    ],
+    "review_tier": "official",
+    "maturity": "stable",
+    "collectors": [
+      {
+        "collector_id": "local_sessions",
+        "display_name": "Local sessions",
+        "operations": [
+          "collect_usage",
+          "upload_snapshot",
+          "diagnostics"
+        ],
+        "data_source_kind": "local_enriched",
+        "default_state": "enabled",
+        "review_tier": "official",
+        "maturity": "stable",
+        "risk_classes": [],
+        "uploads_raw_content": false,
+        "emits": [
+          "local_usage_snapshots",
+          "local_usage_collector_statuses",
+          "local_usage_session_titles",
+          "local_usage_workspace_labels"
+        ]
+      },
+      {
+        "collector_id": "otel_config",
+        "display_name": "Live telemetry config",
+        "operations": [
+          "detect",
+          "verify",
+          "repair",
+          "diagnostics"
+        ],
+        "data_source_kind": "live_telemetry",
+        "default_state": "requires_setup",
+        "review_tier": "official",
+        "maturity": "writes_config",
+        "risk_classes": [
+          "network_calls"
+        ],
+        "uploads_raw_content": false,
+        "emits": [
+          "source_descriptors",
+          "telemetry_records"
+        ]
+      },
+      {
+        "collector_id": "quota_status",
+        "display_name": "Quota and status",
+        "operations": [
+          "detect",
+          "monitor_quota",
+          "diagnostics"
+        ],
+        "data_source_kind": "local_enriched",
+        "default_state": "requires_setup",
+        "review_tier": "official",
+        "maturity": "undocumented_surface",
+        "risk_classes": [
+          "auth_adjacent",
+          "network_calls",
+          "hidden_credential_read"
+        ],
+        "uploads_raw_content": false,
+        "emits": [
+          "agent_status_snapshots",
+          "source_plan_profiles"
+        ]
+      }
+    ]
+  },
+  "state": "needs_repair",
+  "grade": "warning",
+  "account_binding": {
+    "expected_account_id": "acct_expected",
+    "observed_account_id": null,
+    "matched": false
+  },
+  "config": {
+    "discovered": true,
+    "path_hint": "~/.codex/config.toml",
+    "fingerprint": "sha256:config-fingerprint",
+    "drift": [
+      {
+        "key": "otel_exporter_otlp_headers",
+        "expected": "[REDACTED]",
+        "observed": "[REDACTED]"
+      }
+    ]
+  },
+  "last_seen_at": null,
+  "last_verified_at": "2026-05-05T08:55:00Z",
+  "problems": [
+    {
+      "code": "config_drift",
+      "title": "Codex telemetry config drifted",
+      "detail": "Codex telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app codex` or `ottto fix --app codex`.",
+      "retryable": true
+    }
+  ],
+  "recommended_actions": [
+    {
+      "action": "write_config",
+      "title": "Repair Codex telemetry config",
+      "detail": "Codex telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app codex` or `ottto fix --app codex`.",
+      "requires_approval": true,
+      "destructive": false,
+      "approval": {
+        "surface": "terminal",
+        "setup_safe": true,
+        "server_backed": true,
+        "reason": "Setup-safe config repair is tied to the active setup run."
+      },
+      "backup": {
+        "scope": "source_config",
+        "required": true,
+        "restore_available": false,
+        "backup_id": null,
+        "target_fingerprint": "sha256:config-fingerprint",
+        "restore_operation": "uninstall_restore",
+        "detail": "Codex config changes must be reversible through ottto-service."
+      }
+    }
+  ],
+  "connected_at": "2026-05-05T08:30:00Z",
+  "telemetry_configured": true,
+  "reconciliation_enabled": true
+}

@@ -1,0 +1,2135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST_SCRIPT="$ROOT/scripts/public_repo_manifest.sh"
+CONTRACT_SCRIPT="$ROOT/scripts/public_repo_contract_check.sh"
+PRIVATE_ROOT="$(cd "$ROOT/../.." && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$ROOT/scripts/public_repo_temp_cleanup.sh"
+
+tmp_dir="$(mktemp -d)"
+script_completed=0
+cleanup_tmp_dir() {
+  local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "test_public_repo_contract_check: exited before completion" >&2
+    status=1
+  fi
+  public_repo_remove_temp_dir "test_public_repo_contract_check" "$tmp_dir" || true
+  exit "$status"
+}
+trap cleanup_tmp_dir EXIT
+
+# Synthetic roots copy the committed tree. Broken cases edit plain copies; pin
+# cases use a git checkout so the manifest facts derive from its HEAD tree.
+output_dir="$tmp_dir/public-ottto"
+mkdir -p "$output_dir"
+git -C "$ROOT" archive HEAD | tar -x -C "$output_dir"
+public_git="$tmp_dir/public-git"
+cp -R "$output_dir" "$public_git"
+git -C "$public_git" init -q
+git -C "$public_git" config user.email "public-contract@example.invalid"
+git -C "$public_git" config user.name "Public Contract"
+# Disposable fixture: keep commit-triggered background gc/maintenance from
+# writing into .git while the EXIT trap removes it.
+git -C "$public_git" config gc.auto 0
+git -C "$public_git" config gc.autoDetach false
+git -C "$public_git" config maintenance.auto false
+git -C "$public_git" config core.fsmonitor false
+for key_value in "gc.auto=0" "gc.autoDetach=false" "maintenance.auto=false" "core.fsmonitor=false"; do
+  if [[ "$(git -C "$public_git" config --local --get "${key_value%%=*}")" != "${key_value#*=}" ]]; then
+    echo "Expected fixture repo to set ${key_value} locally" >&2
+    exit 1
+  fi
+done
+git -C "$public_git" add .
+git -C "$public_git" commit -qm "public runtime"
+public_commit="$(git -C "$public_git" rev-parse HEAD)"
+public_facts="$tmp_dir/public-facts.json"
+"$MANIFEST_SCRIPT" --repo "$public_git" --facts >"$public_facts"
+
+write_valid_pin() {
+  local facts_path="$1"
+  local pin_path="$2"
+  python3 - "$facts_path" "$pin_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+facts_path = Path(sys.argv[1])
+pin_path = Path(sys.argv[2])
+facts = json.loads(facts_path.read_text(encoding="utf-8"))
+pin_path.parent.mkdir(parents=True, exist_ok=True)
+pin = {
+    "schema_version": 1,
+    "generated_by": "public_runtime_pin.v1",
+    "expected_repository": "ottto-ai/ottto",
+    "authority_state": "pre_public_repo_export",
+    "public_export_manifest": {
+        "content_sha256": facts["content_sha256"],
+        "output_file_count": facts["output_file_count"],
+        "file_record_count": facts["file_record_count"],
+    },
+}
+pin_path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+write_public_commit_pin() {
+  local facts_path="$1"
+  local pin_path="$2"
+  local commit="$3"
+  python3 - "$facts_path" "$pin_path" "$commit" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+facts_path = Path(sys.argv[1])
+pin_path = Path(sys.argv[2])
+commit = sys.argv[3]
+facts = json.loads(facts_path.read_text(encoding="utf-8"))
+pin_path.parent.mkdir(parents=True, exist_ok=True)
+pin = {
+    "schema_version": 1,
+    "generated_by": "public_runtime_pin.v1",
+    "expected_repository": "ottto-ai/ottto",
+    "authority_state": "public_repo_commit",
+    "public_repo_commit": {
+        "repository": "ottto-ai/ottto",
+        "commit": commit,
+        "manifest_path": "PUBLIC_EXPORT_MANIFEST.json",
+        "manifest_content_sha256": facts["content_sha256"],
+    },
+    "public_export_manifest": {
+        "content_sha256": facts["content_sha256"],
+        "output_file_count": facts["output_file_count"],
+        "file_record_count": facts["file_record_count"],
+    },
+}
+pin_path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+write_valid_private_consumers() {
+  local private_root="$1"
+  local facts_path="$2"
+  mkdir -p \
+    "$private_root/backend/app/domain/connectors" \
+    "$private_root/backend/app/domain/local_platform" \
+    "$private_root/backend/app/features/setup_runs" \
+    "$private_root/backend/app/schemas" \
+    "$private_root/frontend/src/lib/apps"
+  write_valid_pin \
+    "$facts_path" \
+    "$private_root/backend/app/domain/local_platform/public_runtime_pin.json"
+  cat > "$private_root/backend/app/domain/connectors/registry.py" <<'PY'
+from typing import Literal
+
+DEFAULT_CONNECTOR_REGISTRY_PATH = REPO_ROOT / "connectors" / "registry.generated.json"
+schema_version: Literal["connector_registry.v1"]
+PY
+  cat > "$private_root/backend/app/schemas/setup_runs.py" <<'PY'
+from typing import Literal
+
+product: Literal["ottto-local-platform"] = "ottto-local-platform"
+PY
+  cat > "$private_root/backend/app/features/setup_runs/service.py" <<'PY'
+def load_manifest(manifest):
+    if manifest.get("schema_version") != 1:
+        raise ValueError("unsupported schema")
+    if manifest.get("product") != "ottto-local-platform":
+        raise ValueError("unsupported product")
+    return manifest
+PY
+  cat > "$private_root/frontend/src/lib/apps/local-telemetry-control.ts" <<'TS'
+const LOCAL_CONTROL_PROTOCOL_VERSIONS = [15, 14, 13, 12] as const;
+type LocalControlRequest = {
+  command: "telemetry_control";
+  targetAddressSpace?: "loopback";
+};
+TS
+}
+
+if [[ -d "$PRIVATE_ROOT/backend" && -d "$PRIVATE_ROOT/frontend" ]]; then
+  PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+    --private-repo-root "$PRIVATE_ROOT" \
+    >/tmp/public-contract-private-script.out
+  "$public_git/scripts/public_repo_contract_check.sh" \
+    --private-repo-root "$PRIVATE_ROOT" \
+    >/tmp/public-contract-copied-script.out
+else
+  PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" \
+    >/tmp/public-contract-private-script.out
+  "$output_dir/scripts/public_repo_contract_check.sh" \
+    >/tmp/public-contract-copied-script.out
+fi
+
+broken_protocol="$tmp_dir/broken-protocol"
+cp -R "$output_dir" "$broken_protocol"
+python3 - "$broken_protocol/fixtures/control/status-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["protocol_version"] = 10
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_protocol" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-protocol.out 2>&1; then
+  echo "Expected contract check to fail when control protocol drifts" >&2
+  exit 1
+fi
+grep -q "control status request protocol_version must be 15" /tmp/public-contract-broken-protocol.out
+
+broken_watch_without_json="$tmp_dir/broken-watch-without-json"
+cp -R "$output_dir" "$broken_watch_without_json"
+python3 - "$broken_watch_without_json/fixtures/cli/watch-without-json-error.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["error"]["code"] = "daemon_unavailable"
+payload["error"]["retryable"] = True
+payload["error"]["details"] = {"socket": "/tmp/ottto.sock"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_watch_without_json" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-watch-without-json.out 2>&1; then
+  echo "Expected contract check to fail when watch-without-json error semantics drift" >&2
+  exit 1
+fi
+grep -q "watch without JSON error code must be invalid_request" \
+  /tmp/public-contract-broken-watch-without-json.out
+grep -q "watch without JSON error must not be retryable" \
+  /tmp/public-contract-broken-watch-without-json.out
+grep -q "watch without JSON error details must stay empty" \
+  /tmp/public-contract-broken-watch-without-json.out
+
+broken_collector_safety_schema="$tmp_dir/broken-collector-safety-schema"
+cp -R "$output_dir" "$broken_collector_safety_schema"
+python3 - "$broken_collector_safety_schema/schemas/collector-manifest.schema.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["properties"]["uploads_raw_content"] = {"type": "boolean"}
+payload.pop("allOf", None)
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_collector_safety_schema" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-collector-safety-schema.out 2>&1; then
+  echo "Expected contract check to fail when collector safety schema loosens" >&2
+  exit 1
+fi
+grep -q "collector manifest schema must reject raw content upload" \
+  /tmp/public-contract-broken-collector-safety-schema.out
+grep -q "collector manifest schema safety rules must be a JSON array" \
+  /tmp/public-contract-broken-collector-safety-schema.out
+
+broken_agent_only_json="$tmp_dir/broken-agent-only-json"
+cp -R "$output_dir" "$broken_agent_only_json"
+python3 - "$broken_agent_only_json/fixtures/cli/context-without-json-error.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["error"]["message"] = "context requires json"
+payload["error"]["retryable"] = True
+payload["error"]["details"] = {"command": "context"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_agent_only_json" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-agent-only-json.out 2>&1; then
+  echo "Expected contract check to fail when agent-only JSON error semantics drift" >&2
+  exit 1
+fi
+grep -q "context-without-json-error.json error message must match agent JSON contract" \
+  /tmp/public-contract-broken-agent-only-json.out
+grep -q "context-without-json-error.json error must not be retryable" \
+  /tmp/public-contract-broken-agent-only-json.out
+grep -q "context-without-json-error.json error details must stay empty" \
+  /tmp/public-contract-broken-agent-only-json.out
+
+broken_uninstall="$tmp_dir/broken-uninstall"
+cp -R "$output_dir" "$broken_uninstall"
+python3 - "$broken_uninstall/fixtures/cli/uninstall-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["command"] = "uninstall"
+payload["confirm"] = False
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_uninstall" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-uninstall.out 2>&1; then
+  echo "Expected contract check to fail when uninstall is not a confirmed execute request" >&2
+  exit 1
+fi
+grep -q "CLI uninstall request command must be uninstall_execute" \
+  /tmp/public-contract-broken-uninstall.out
+grep -q "CLI uninstall request confirm must be true" \
+  /tmp/public-contract-broken-uninstall.out
+
+broken_uninstall_output="$tmp_dir/broken-uninstall-output"
+cp -R "$output_dir" "$broken_uninstall_output"
+python3 - "$broken_uninstall_output/fixtures/cli/uninstall-incomplete-output.ndjson" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+events[-1]["ok"] = True
+events[-1]["exit_code"] = 0
+events[-1]["error"]["code"] = "none"
+path.write_text(
+    "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n",
+    encoding="utf-8",
+)
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_uninstall_output" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-uninstall-output.out 2>&1; then
+  echo "Expected contract check to fail when uninstall incomplete output stops being an error" >&2
+  exit 1
+fi
+grep -q "uninstall incomplete final event must not be ok" \
+  /tmp/public-contract-broken-uninstall-output.out
+grep -q "uninstall incomplete final exit_code must be 70" \
+  /tmp/public-contract-broken-uninstall-output.out
+grep -q "uninstall incomplete error code must be internal" \
+  /tmp/public-contract-broken-uninstall-output.out
+
+broken_diagnostics_bundle="$tmp_dir/broken-diagnostics-bundle"
+cp -R "$output_dir" "$broken_diagnostics_bundle"
+python3 - "$broken_diagnostics_bundle/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+private_project_path = "/Users/example/private/project"
+operator_log_path = "/Users/example/Library/Logs/Ottto/local.log"
+payload["upload"]["support_claim"] = "support_123456"
+payload["sections"].append({
+    "name": "unsafe_support_context",
+    "status": "succeeded",
+    "items": {
+        "raw_response": "The user's private model response text",
+        "command_output": f"Raw shell output from {private_project_path}",
+        "cookie": "session=abcdefghijklmnopqrstuvwxyz",
+        "setup_run_token": "setup_run_token_123456",
+        "operator_path": operator_log_path,
+    },
+})
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_bundle" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-bundle.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics bundle exposes raw support data" >&2
+  exit 1
+fi
+grep -q "diagnostics.upload.support_claim exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.raw_response exposes unredacted raw response field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.command_output exposes unredacted raw output field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.cookie exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.setup_run_token exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.operator_path exposes unredacted local path" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+
+broken_fix="$tmp_dir/broken-fix"
+cp -R "$output_dir" "$broken_fix"
+python3 - "$broken_fix/fixtures/cli/fix-codex-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["source"] = "claude_code"
+payload["dry_run"] = True
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_fix" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-fix.out 2>&1; then
+  echo "Expected contract check to fail when fix request source or dry_run drifts" >&2
+  exit 1
+fi
+grep -q "CLI fix Codex request source must be codex" \
+  /tmp/public-contract-broken-fix.out
+grep -q "CLI fix Codex request dry_run must be false" \
+  /tmp/public-contract-broken-fix.out
+
+broken_cli_requests="$tmp_dir/broken-cli-requests"
+cp -R "$output_dir" "$broken_cli_requests"
+python3 - \
+  "$broken_cli_requests/fixtures/cli/apps-root-request.json" \
+  "$broken_cli_requests/fixtures/cli/apps-detect-request.json" \
+  "$broken_cli_requests/fixtures/cli/apps-status-pi-request.json" \
+  "$broken_cli_requests/fixtures/cli/login-headless-request.json" \
+  "$broken_cli_requests/fixtures/cli/logout-request.json" \
+  "$broken_cli_requests/fixtures/cli/logout-local-request.json" \
+  "$broken_cli_requests/fixtures/cli/update-check-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+apps_root_path = Path(sys.argv[1])
+apps_detect_path = Path(sys.argv[2])
+apps_status_path = Path(sys.argv[3])
+login_path = Path(sys.argv[4])
+logout_path = Path(sys.argv[5])
+logout_local_path = Path(sys.argv[6])
+update_path = Path(sys.argv[7])
+
+apps_root = json.loads(apps_root_path.read_text(encoding="utf-8"))
+apps_root["refresh_agent_status"] = True
+apps_root_path.write_text(json.dumps(apps_root, indent=2) + "\n", encoding="utf-8")
+
+apps_detect = json.loads(apps_detect_path.read_text(encoding="utf-8"))
+apps_detect["refresh_agent_status"] = False
+apps_detect_path.write_text(json.dumps(apps_detect, indent=2) + "\n", encoding="utf-8")
+
+apps_status = json.loads(apps_status_path.read_text(encoding="utf-8"))
+apps_status["command"] = "status"
+apps_status["source"] = "codex"
+apps_status_path.write_text(json.dumps(apps_status, indent=2) + "\n", encoding="utf-8")
+
+login = json.loads(login_path.read_text(encoding="utf-8"))
+login["command"] = "login"
+login["claim_code"] = "claim_leaky_fixture"
+login_path.write_text(json.dumps(login, indent=2) + "\n", encoding="utf-8")
+
+logout = json.loads(logout_path.read_text(encoding="utf-8"))
+logout["local_only"] = True
+logout_path.write_text(json.dumps(logout, indent=2) + "\n", encoding="utf-8")
+
+logout_local = json.loads(logout_local_path.read_text(encoding="utf-8"))
+logout_local["local_only"] = False
+logout_local_path.write_text(json.dumps(logout_local, indent=2) + "\n", encoding="utf-8")
+
+update = json.loads(update_path.read_text(encoding="utf-8"))
+update["command"] = "update"
+update_path.write_text(json.dumps(update, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_cli_requests" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-cli-requests.out 2>&1; then
+  echo "Expected contract check to fail when CLI request fixture semantics drift" >&2
+  exit 1
+fi
+grep -q "CLI apps root request must not refresh agent status" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps detect request must refresh agent status" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps status request command must be agent_status_refresh" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps status request source must be pi" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI login headless request must use daemon setup command" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI login headless request claim_code must be null" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI logout request must be cloud-first by default" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI logout local-only request local_only must be true" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI update check request command must be update_check" \
+  /tmp/public-contract-broken-cli-requests.out
+
+broken_setup_state="$tmp_dir/broken-setup-state"
+cp -R "$output_dir" "$broken_setup_state"
+python3 - "$broken_setup_state/fixtures/cli/setup-needs-user-action-output.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["next_action"] = {"type": "browser_claim"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_state" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-state.out 2>&1; then
+  echo "Expected contract check to fail when setup output has ambiguous next state" >&2
+  exit 1
+fi
+grep -q "needs-user-action output must not set both next_question and next_action" \
+  /tmp/public-contract-broken-setup-state.out
+grep -q "needs-user-action next_action must be null while waiting for approval" \
+  /tmp/public-contract-broken-setup-state.out
+
+broken_setup_agent_action="$tmp_dir/broken-setup-agent-action"
+cp -R "$output_dir" "$broken_setup_agent_action"
+python3 - \
+  "$broken_setup_agent_action/fixtures/cli/setup-browser-claim-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-needs-user-action-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-timed-out-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-failed-output.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+browser_path = Path(sys.argv[1])
+needs_path = Path(sys.argv[2])
+timeout_path = Path(sys.argv[3])
+failed_path = Path(sys.argv[4])
+
+browser = json.loads(browser_path.read_text(encoding="utf-8"))
+browser["agent_action"]["kind"] = "answer_setup_question"
+browser["agent_action"]["description"] = "Read the human setup output."
+browser_path.write_text(json.dumps(browser, indent=2) + "\n", encoding="utf-8")
+
+needs = json.loads(needs_path.read_text(encoding="utf-8"))
+needs["agent_action"]["requires_user"] = False
+needs["agent_action"]["description"] = "Ask the user what to do."
+needs_path.write_text(json.dumps(needs, indent=2) + "\n", encoding="utf-8")
+
+timeout = json.loads(timeout_path.read_text(encoding="utf-8"))
+timeout["agent_action"]["retryable"] = False
+timeout["agent_action"]["description"] = "Give up on setup."
+timeout_path.write_text(json.dumps(timeout, indent=2) + "\n", encoding="utf-8")
+
+failed = json.loads(failed_path.read_text(encoding="utf-8"))
+failed["agent_action"]["kind"] = "retry_setup"
+failed["agent_action"]["requires_user"] = True
+failed["agent_action"]["description"] = "Ask the user to decide how to repair setup."
+failed_path.write_text(json.dumps(failed, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_agent_action" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-agent-action.out 2>&1; then
+  echo "Expected contract check to fail when setup agent_action semantics drift" >&2
+  exit 1
+fi
+grep -q "browser claim agent_action.kind must be open_browser_claim" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "browser claim agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "needs-user-action agent_action.requires_user must be true" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "needs-user-action agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup timed-out agent_action.retryable must be true" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup timed-out agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.kind must be inspect_failure" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.requires_user must be false" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+
+broken_setup_docs="$tmp_dir/broken-setup-docs"
+cp -R "$output_dir" "$broken_setup_docs"
+python3 - "$broken_setup_docs/docs/setup.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "Default setup opens a browser claim and waits for approval",
+    "Default setup can run locally without browser approval",
+)
+text = text.replace("ottto setup --json", "ottto setup", 1)
+text = text.replace(
+    "parseable JSON payload with a\nnonzero exit code",
+    "human-readable payload with a failure",
+)
+text = text.replace(
+    "ottto setup --json --no-browser --no-wait",
+    "ottto setup --no-browser",
+)
+text = text.replace(
+    "Show the returned `claim_url` or `claim_code` to the user",
+    "Continue setup without showing claim details",
+)
+text = text.replace(
+    "Exit code `60` means\nbrowser or user action is required",
+    "Exit code `60` means retry later",
+)
+text = text.replace(
+    "Exit code `61` means a wait timed out",
+    "Exit code `61` means setup failed permanently",
+)
+text = text.replace(
+    "ottto setup --claim-code <code> --json",
+    "ottto setup --claim-code <code>",
+)
+text = text.replace("ottto login --json", "ottto login", 1)
+text = text.replace(
+    "ottto login --json --no-browser --no-wait",
+    "ottto login --no-browser",
+)
+text = text.replace("ottto account --json", "ottto account")
+text = text.replace("ottto logout --json", "ottto logout", 1)
+text = text.replace(
+    "Use local-only logout only as an explicit emergency cleanup path",
+    "Use local-only logout whenever cleanup is easier",
+)
+text = text.replace("ottto logout --local-only --json", "ottto logout --local-only")
+text = text.replace("ottto apps detect --json", "ottto sources detect --json")
+text = text.replace("ottto apps status --app codex --json", "ottto source status codex")
+text = text.replace("ottto verify --app claude-code --json", "ottto verify claude-code")
+text = text.replace("ottto verify --repair --app codex --json", "ottto verify --repair codex")
+text = text.replace("Plain verify is read-only", "Plain verify may repair config")
+text = text.replace(
+    "`verify --repair` is limited to daemon-owned\nWriteConfig repair",
+    "`verify --repair` may edit any local config",
+)
+text = text.replace(
+    "Pi keeps its existing verification\nflow and has no config patching",
+    "Pi config patching is supported",
+)
+text = text.replace(
+    "Do not hand-edit local Codex, Claude Code, or\nPi config as a setup shortcut",
+    "Hand-edit local configs when setup is stuck",
+)
+text = text.replace("| `0` | Success or setup complete |", "| `0` | Success |")
+text = text.replace("| `10` | `ottto-service` unavailable |", "| `10` | Service issue |")
+text = text.replace("| `60` | Setup needs user or browser action |", "| `60` | Retry later |")
+text = text.replace("| `61` | Setup timed out |", "| `61` | Failed |")
+text = text.replace("| `70` | Internal error |", "| `70` | Unknown |")
+text = text.replace(
+    "branch on `agent_action.kind` before inspecting human text",
+    "read setup summaries before deciding what to do",
+)
+text = text.replace(
+    "not treat the nonzero exit as corrupt JSON",
+    "treat nonzero setup exits as failed text output",
+)
+text = text.replace("`open_browser_claim`", "`browser`")
+text = text.replace(
+    "Show the structured `claim_url` or `claim_code`",
+    "Copy any setup URL from stdout",
+)
+text = text.replace("`answer_setup_question`", "`question`")
+text = text.replace(
+    "Ask the user for the structured `next_question`",
+    "Ask the user what to do next",
+)
+text = text.replace("`run_next_action`", "`action`")
+text = text.replace(
+    "Follow the structured `next_action` object",
+    "Run a convenient follow-up command",
+)
+text = text.replace("`retry_setup`", "`retry`")
+text = text.replace("`wait_or_check_status`", "`wait`")
+text = text.replace("`inspect_failure`", "`failure`")
+text = text.replace("`check_status`", "`status`")
+text = text.replace(
+    "Agents must consume the structured setup JSON and `agent_action` values rather\n"
+    "than parsing human output.",
+    "Agents may parse human setup output.",
+)
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-docs.out 2>&1; then
+  echo "Expected contract check to fail when setup docs lose agent-action semantics" >&2
+  exit 1
+fi
+grep -q "setup docs must preserve browser-claim-first setup guidance" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include JSON setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document nonzero JSON setup payloads" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include headless no-browser/no-wait setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve headless claim handoff guidance" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document needs-user-action exit code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document setup timeout exit code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include claim-code setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include login JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include headless login command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include account JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include cloud-first logout command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must keep local-only logout as emergency-only" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include explicit local-only logout command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include apps detect JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include app status command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include app verify command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include bounded repair verify command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve read-only verify boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve daemon-owned repair boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve Pi no-config-patching boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must prohibit hand-edit setup shortcuts" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 0" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 10" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 60" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 61" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 70" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must require branching on agent_action.kind before human text" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must treat setup exit 60/61 payloads as parseable JSON" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document open_browser_claim" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to surface structured claim URL/code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document answer_setup_question" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to use structured next_question" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document run_next_action" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to use structured next_action" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document retry_setup" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document wait_or_check_status" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document inspect_failure" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document check_status" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must prohibit parsing human output for setup state" \
+  /tmp/public-contract-broken-setup-docs.out
+
+broken_diagnostics_docs="$tmp_dir/broken-diagnostics-docs"
+cp -R "$output_dir" "$broken_diagnostics_docs"
+python3 - "$broken_diagnostics_docs/docs/diagnostics.md" "$broken_diagnostics_docs/docs/troubleshooting.md" <<'PY'
+import sys
+from pathlib import Path
+
+diagnostics_path = Path(sys.argv[1])
+troubleshooting_path = Path(sys.argv[2])
+
+diagnostics = diagnostics_path.read_text(encoding="utf-8")
+diagnostics = diagnostics.replace(
+    "Upload only when the user approves the upload and accepts the retention\n"
+    "disclosure.",
+    "Upload diagnostics when support asks for them.",
+)
+diagnostics = diagnostics.replace(
+    "An active login or support claim is required",
+    "A claim can be pasted into the report when available",
+)
+diagnostics = diagnostics.replace(
+    "Support claims are authorization material",
+    "Support claims are useful identifiers",
+)
+diagnostics = diagnostics.replace(
+    "must not appear in the returned JSON payload or uploaded bundle\ncontent",
+    "may appear in the JSON payload for support",
+)
+diagnostics = diagnostics.replace(
+    "machine ids, must appear only as redacted\nplaceholders such as `[machine_id]`",
+    "machine ids can stay visible for support",
+)
+diagnostics = diagnostics.replace(
+    "Do not share raw local paths, prompts, account ids, machine ids, credential\n"
+    "material, cookies, or command output.",
+    "Share full diagnostics payloads.",
+)
+diagnostics_path.write_text(diagnostics, encoding="utf-8")
+
+troubleshooting = troubleshooting_path.read_text(encoding="utf-8")
+troubleshooting = troubleshooting.replace(
+    "Do not parse human summaries. Use JSON status, error codes, and next-action\n"
+    "fields.",
+    "Parse the human summary when it is easier.",
+)
+troubleshooting = troubleshooting.replace(
+    "prefer `agent_action.kind` as the stable\nmachine branch",
+    "infer setup state from summary text",
+)
+troubleshooting = troubleshooting.replace(
+    "`60` | Browser/user action needed | Open or share the claim URL/code.",
+    "`60` | Browser/user action needed | Try terminal repair.",
+)
+troubleshooting = troubleshooting.replace(
+    "`61` | Setup timed out | Rerun setup or use headless setup with claim URL/code.",
+    "`61` | Setup timed out | Clear local state.",
+)
+troubleshooting = troubleshooting.replace(
+    "Plain verify is read-only. `verify --repair` repairs only daemon-owned\n"
+    "WriteConfig config drift",
+    "Verify may rewrite any local config",
+)
+troubleshooting = troubleshooting.replace(
+    "runs telemetry smoke only after\nthe config is clean",
+    "runs telemetry smoke before config checks",
+)
+troubleshooting = troubleshooting.replace(
+    "If repair JSON requires browser approval, or if verify\n"
+    "returns `patch_disabled`, do not edit config files directly.",
+    "Edit config files directly when repair is blocked.",
+)
+troubleshooting = troubleshooting.replace(
+    "binds a deterministic per-user fallback port and reports the active endpoint in\n"
+    "`ottto status --json`",
+    "binds any open port and logs it in human output",
+)
+troubleshooting = troubleshooting.replace(
+    "Do not kill another user's process unless you own that test\n"
+    "account and have confirmed it is not the active customer install.",
+    "Kill stale services when they block the relay port.",
+)
+troubleshooting = troubleshooting.replace(
+    "Use cloud-first logout:",
+    "Start with local-only logout:",
+)
+troubleshooting = troubleshooting.replace(
+    "Use local-only cleanup only after the user accepts that cloud disconnect did not\n"
+    "complete.",
+    "Use local-only cleanup whenever logout is slow.",
+)
+troubleshooting = troubleshooting.replace(
+    "Upload only with explicit approval, retention disclosure acceptance, and an\n"
+    "active login or support claim.",
+    "Upload when support asks.",
+)
+troubleshooting = troubleshooting.replace(
+    "Support claims are authorization material",
+    "Support claims can be copied",
+)
+troubleshooting = troubleshooting.replace(
+    "do\nnot paste them into issues, chat, diagnostics summaries, or support bundle\n"
+    "content.",
+    "paste them into reports.",
+)
+troubleshooting_path.write_text(troubleshooting, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-docs.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics docs lose upload/redaction constraints" >&2
+  exit 1
+fi
+grep -q "diagnostics docs must require explicit upload approval and retention acceptance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must require active login or support claim" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must classify support claims as authorization material" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must keep support claims out of payloads and bundles" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must require machine-id placeholders" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must prohibit sharing raw private diagnostics values" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit parsing human summaries" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve setup agent_action branch guidance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve browser/user-action exit code" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve setup-timeout exit code" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep verify repair daemon-owned and narrow" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep telemetry smoke after clean config" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit direct config edits on browser approval or patch_disabled" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve relay fallback endpoint contract" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit killing another user's active service" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve cloud-first logout guidance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep local-only logout user-accepted" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must require approval, retention acceptance, and authorization before upload" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must classify support claims as authorization material" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit pasting support claims" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+
+broken_support_docs="$tmp_dir/broken-support-docs"
+cp -R "$output_dir" "$broken_support_docs"
+python3 - "$broken_support_docs/docs/support.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "This runbook is public-safe. Do not add private infrastructure details": "This runbook may include internal details when useful",
+    "account\nidentifiers, machine identifiers, raw command output, screenshots with local\npaths": "account identifiers and raw command output",
+    "claim codes, setup-run tokens, setup keys": "setup tokens",
+    "raw prompts, raw model output, or private repository links": "model examples",
+    "Identify the installed surface without parsing human text": "Identify the installed surface from the human summary",
+    "ottto status --json": "ottto status",
+    "ottto update check --json": "ottto update check",
+    "ottto setup --json --no-browser --no-wait": "ottto setup --no-browser",
+    "ottto account --json": "ottto account",
+    "Share the claim URL or code with the user when JSON returns\n   `needs_user_action`": "Continue setup without sharing claim details",
+    "The CLI must not collect an Ottto password in the\n   terminal": "The CLI may collect credentials in the terminal",
+    "Check app/source status with public app nouns": "Check source status with source nouns",
+    "ottto apps detect --json": "ottto sources detect",
+    "ottto apps status --app codex --json": "ottto source status codex",
+    "ottto verify --repair --app codex --json": "ottto verify --repair codex",
+    "respect repair authority metadata": "repair when convenient",
+    "If JSON requires browser approval, do not edit local config directly": "Edit local config when browser approval is slow",
+    "`verify --repair` may repair only WriteConfig config drift": "`verify --repair` may edit any config",
+    "Share only the command family, exit code, high-level status, support bundle\nstate, redaction summary, and next user action": "Share the full diagnostics payload",
+    "Do not paste raw diagnostics\nJSON into public issues or chat": "Paste raw diagnostics JSON into issues",
+    "Upload diagnostics only after explicit user approval and retention disclosure\nacceptance": "Upload diagnostics when support asks",
+    "Do not ask users to paste\nclaims into public issues": "Ask users to paste claims into issues",
+    "diagnostics JSON and uploaded bundle content should expose only that a support\nclaim was provided, not the claim value": "diagnostics JSON may include the support claim value",
+    "Use the detected install owner from JSON status and the release manifest:": "Use whichever install owner is convenient:",
+    "Do not self-overwrite owner-managed files.": "Self-overwrite owner-managed files when repair is faster.",
+    "verify checksums, signing/notarization state,\nGatekeeper assessment, and `ottto status --json`": "verify the app opens",
+    "Security-sensitive reports go to `security@ottto.net`, not public issues": "Security-sensitive reports can use public issues",
+    "Public issues are appropriate only for redacted, reproducible CLI": "Public issues can include full local payloads",
+    "Passwords, cookies, API keys, bearer tokens, setup-run tokens, setup keys,\n  claim codes, support claims, or raw credentials": "credentials",
+    "Raw prompts, raw model output, transcripts, customer data": "model output",
+    "Absolute local filesystem paths, account identifiers, machine identifiers": "local paths",
+    "evidence records contain only redacted pass/fail facts and stable artifact\n  references": "evidence records may include raw output",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_support_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-support-docs.out 2>&1; then
+  echo "Expected contract check to fail when support docs lose public-safe triage boundaries" >&2
+  exit 1
+fi
+grep -q "support docs must preserve public-safe boundary" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw identifiers, command output, and local-path screenshots" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit claim/setup secrets" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw model content and private repo links" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require JSON status instead of human parsing" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include status JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include update check JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include headless setup JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include account JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route claim handoff through structured JSON" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit terminal password collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must preserve app-language triage" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include apps detect command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include app status command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include bounded verify repair command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require repair authority metadata" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit local config edits when browser approval is required" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep verify repair bounded to WriteConfig drift" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must restrict diagnostics sharing to summary fields" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw diagnostics JSON in issues/chat" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require explicit approval and retention acceptance before upload" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit support claims in public issues" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep support claim values out of JSON and bundles" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route update/rollback by detected install owner and manifest" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit self-overwriting owner-managed files" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require checksum/signing/Gatekeeper/status rollback verification" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route security reports away from public issues" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must scope public issues to redacted reproducible public-runtime bugs" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit credential and claim collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw prompt/output/transcript/customer data collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit absolute paths and raw identifiers" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep closeout evidence redacted and artifact-scoped" \
+  /tmp/public-contract-broken-support-docs.out
+
+broken_diagnostics_upload="$tmp_dir/broken-diagnostics-upload"
+cp -R "$output_dir" "$broken_diagnostics_upload"
+python3 - "$broken_diagnostics_upload/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+upload = payload["upload"]
+upload["retention"]["accepted"] = True
+upload["retention"]["text"] = "Diagnostics may be retained."
+upload["support_claim_provided"] = True
+upload["support_claim"] = "support_unredactedfixture"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_upload" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-upload.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics upload state exposes support authorization" >&2
+  exit 1
+fi
+grep -q "redacted diagnostics retention must not be accepted for local-only bundles" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics retention text must disclose 30-day support retention" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics support_claim_provided must be false for local-only bundles" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics upload must not expose support_claim" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "diagnostics.upload.support_claim exposes unredacted support claim" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+
+broken_setup_redaction="$tmp_dir/broken-setup-redaction"
+cp -R "$output_dir" "$broken_setup_redaction"
+python3 - "$broken_setup_redaction/fixtures/setup/claim-run.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+metadata = payload["events"][0]["metadata"]
+metadata["claim_code"] = "claim_unredactedfixture"
+metadata["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.service.plist"
+metadata["auth_header"] = "Be" + "arer setupfixturetoken123"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_setup_redaction" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-setup-redaction.out 2>&1; then
+  echo "Expected contract check to fail when setup events expose raw private values" >&2
+  exit 1
+fi
+grep -q "setup.events\\[0\\].metadata.claim_code exposes unredacted setup claim" \
+  /tmp/public-contract-broken-setup-redaction.out
+grep -q "setup.events\\[0\\].metadata.launch_agent_path exposes unredacted local path" \
+  /tmp/public-contract-broken-setup-redaction.out
+grep -q "setup.events\\[0\\].metadata.auth_header exposes unredacted bearer token" \
+  /tmp/public-contract-broken-setup-redaction.out
+
+broken_install_docs="$tmp_dir/broken-install-docs"
+cp -R "$output_dir" "$broken_install_docs"
+python3 - \
+  "$broken_install_docs/docs/install.md" \
+  "$broken_install_docs/docs/support.md" \
+  "$broken_install_docs/docs/release-verification.md" <<'PY'
+import sys
+from pathlib import Path
+
+install_path = Path(sys.argv[1])
+support_path = Path(sys.argv[2])
+release_path = Path(sys.argv[3])
+
+install = install_path.read_text(encoding="utf-8")
+install = install.replace(
+    "Do not install by copying binaries from a mutable directory. Use the install\n"
+    "owner named by the release channel.",
+    "Copy binaries from a build output when convenient.",
+)
+install = install.replace(
+    "`net.ottto.service` is a single-owner user LaunchAgent",
+    "`net.ottto.service` can be rewritten by whichever installer runs last",
+)
+install = install.replace(
+    "Homebrew-owned LaunchAgent stays managed by `brew services`",
+    "Homebrew-owned LaunchAgent can be refreshed by the app",
+)
+install = install.replace(
+    "Do not install both the\napp bundle and Homebrew as independent service owners.",
+    "Install both the app bundle and Homebrew whenever useful.",
+)
+install = install.replace(
+    "The formula must pin immutable artifact URLs and SHA-256 hashes from the stable\n"
+    "release manifest.",
+    "The formula can follow the latest artifact URL.",
+)
+install = install.replace(
+    "Do not self-overwrite a Homebrew-managed install",
+    "Self-overwrite Homebrew-managed installs",
+)
+install = install.replace(
+    "The helper verifies and opens the signed native DMG or PKG. It must not install\n"
+    "mutable shell payloads, clear quarantine, or bootstrap launchd itself.",
+    "The helper may install shell payloads and bootstrap launchd directly.",
+)
+install = install.replace(
+    "the runtime install owner is `app_bundle`",
+    "the runtime install owner can be selected later",
+)
+install = install.replace(
+    "Do not use development install scripts unless the user explicitly asks for\n"
+    "internal QA on a trusted machine.",
+    "Use development install scripts for customer setup when faster.",
+)
+install_path.write_text(install, encoding="utf-8")
+
+support = support_path.read_text(encoding="utf-8")
+support = support.replace(
+    "Use the detected install owner from JSON status and the release manifest:",
+    "Use whichever installer is easiest:",
+)
+support = support.replace(
+    "Do not self-overwrite owner-managed files.",
+    "Overwrite owner-managed files during rollback.",
+)
+support = support.replace(
+    "verify checksums, signing/notarization state,\n"
+    "Gatekeeper assessment, and `ottto status --json`",
+    "verify that the command seems to work",
+)
+support_path.write_text(support, encoding="utf-8")
+
+release = release_path.read_text(encoding="utf-8")
+release = release.replace(
+    "Stable local-platform releases must be verifiable without trusting mutable\n"
+    "installer state.",
+    "Stable local-platform releases may trust current installer state.",
+)
+release = release.replace(
+    "Do not trust a release where the manifest omits required public-v1 metadata.",
+    "Trust releases even when the manifest omits metadata.",
+)
+release = release.replace(
+    "The computed digest must exactly match the manifest.",
+    "The computed digest only needs to look plausible.",
+)
+release = release.replace(
+    "Verify `release-manifest.json.sig` with\n"
+    "`macos_manifest_signature.sh verify --manifest release-manifest.json --identity \"$OTTTO_MACOS_CODESIGN_IDENTITY\"`",
+    "Skip manifest signature verification when checksums exist.",
+)
+release = release.replace(
+    "bound to the expected Ottto Developer ID identity",
+    "bound to any local signing identity",
+)
+release = release.replace(
+    "The macOS stable release workflow can optionally publish a public GitHub Release\n"
+    "as a **verification mirror only**.",
+    "The macOS stable release workflow can publish GitHub Releases as an install source.",
+)
+release = release.replace(
+    "The CDN at\n"
+    "`install.ottto.net` remains the install and update source of truth",
+    "GitHub Releases can become the install and update source of truth",
+)
+release = release.replace(
+    "stable-candidate RC QA",
+    "optional candidate QA",
+)
+release = release.replace(
+    "The evidence must\n"
+    "not include private repo paths, local user paths, raw claim/setup tokens,\n"
+    "account or machine identifiers, passwords, API keys, or bearer credentials.",
+    "The evidence may include local identifiers and bearer credentials.",
+)
+release = release.replace(
+    "ottto status --json",
+    "ottto status",
+)
+release = release.replace(
+    "ottto update check --json",
+    "ottto update check",
+)
+release = release.replace(
+    "The JSON should report the expected version, install owner, update state, and\n"
+    "daemon reachability.",
+    "Human output should look healthy.",
+)
+release = release.replace(
+    "requires clean-machine evidence for every install owner advertised by the\n"
+    "manifest",
+    "can advertise install owners before clean-machine evidence",
+)
+release = release.replace(
+    "The verified native\ninstaller helper is not a runtime owner",
+    "The verified native installer helper is a runtime owner",
+)
+release = release.replace(
+    "Homebrew\nmust remain absent from `supported_install_owners` until its clean-machine\n"
+    "lifecycle evidence passes.",
+    "Homebrew can be listed before lifecycle evidence.",
+)
+release = release.replace(
+    "App-bundle\n"
+    "evidence has to prove a second Homebrew install/start attempt is either a safe\n"
+    "refusal with instructions or an explicit migration, not silent owner takeover.",
+    "App-bundle evidence need not cover Homebrew takeover.",
+)
+release = release.replace(
+    "must not contain\n"
+    "extra required install owners, unknown per-owner check names, local user paths,\n"
+    "private repo paths, raw claim codes, account IDs, machine IDs, passwords, or\n"
+    "tokens.",
+    "may contain raw owner evidence.",
+)
+release_path.write_text(release, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_install_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-install-docs.out 2>&1; then
+  echo "Expected contract check to fail when install docs lose owner and installer boundaries" >&2
+  exit 1
+fi
+grep -q "install docs must prohibit mutable binary-copy installs" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must document single-owner LaunchAgent authority" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep Homebrew-owned services under brew services" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must prohibit independent Homebrew/app-bundle owners" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must require immutable Homebrew artifacts from the stable manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must prohibit self-overwriting Homebrew-managed installs" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep verified native helper non-mutating before the signed package" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must bind verified native installs to app_bundle" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep development install scripts out of customer flows" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must route update/rollback by detected install owner and manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must prohibit self-overwriting owner-managed files" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must require checksum/signing/Gatekeeper/status rollback verification" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must distrust mutable installer state" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must treat manifest metadata as required" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require checksum equality with manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require manifest signature verification" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must bind signatures to Ottto Developer ID identity" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep GitHub releases verification-only" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep CDN as install/update source of truth" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require stable-candidate RC QA" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep stable-candidate evidence redacted" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must include status JSON check" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must include update-check JSON check" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require installed-runtime JSON fields" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require clean-machine evidence per advertised owner" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep verified native helper out of runtime owners" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must gate Homebrew owner support on clean-machine evidence" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must prohibit silent app/Homebrew owner takeover" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep stable evidence redacted and owner-scoped" \
+  /tmp/public-contract-broken-install-docs.out
+
+broken_docs_index="$tmp_dir/broken-docs-index"
+cp -R "$output_dir" "$broken_docs_index"
+python3 - "$broken_docs_index/docs/README.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "CLI and `ottto-service` daemon, not private development scripts.",
+    "CLI, daemon, and useful development scripts.",
+)
+text = text.replace("[Install](install.md)", "[Install](setup.md)")
+text = text.replace("[Privacy](privacy.md)", "Privacy")
+text = text.replace("[Diagnostics](diagnostics.md)", "Diagnostics")
+text = text.replace("[Support Runbook](support.md)", "Support Runbook")
+text = text.replace("[Connector Contribution](connectors.md)", "Connector Contribution")
+text = text.replace("[Agent Adapters](agent-adapters.md)", "Agent Adapters")
+text = text.replace("[Release Verification](release-verification.md)", "Release Verification")
+text = text.replace("[Troubleshooting](troubleshooting.md)", "Troubleshooting")
+text = text.replace("[Examples](examples.md)", "Examples")
+text = text.replace(
+    "Automation should consume only `ottto --json` output.",
+    "Automation may parse concise human summaries.",
+)
+text = text.replace(
+    "`--json --watch` emits newline-delimited JSON progress events and a final event",
+    "`--json --watch` prints progress",
+)
+text = text.replace("Customer-facing commands use app language", "Customer-facing commands may use source language")
+text = text.replace("ottto apps --json", "ottto sources --json")
+text = text.replace("ottto setup --json", "ottto setup")
+text = text.replace("ottto diagnostics collect --json", "ottto diagnostics collect")
+text = text.replace("public docs should prefer `apps` and `--app`", "public docs may prefer sources")
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_docs_index" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-docs-index.out 2>&1; then
+  echo "Expected contract check to fail when docs index loses public entrypoint guidance" >&2
+  exit 1
+fi
+grep -q "docs index must keep private development scripts out of public setup" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link install docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link privacy docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link diagnostics docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link support runbook" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link connector contribution docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link agent adapter docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link release verification docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link troubleshooting docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link examples docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must require automation to consume JSON output" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must document NDJSON watch semantics" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must preserve public app-language command guidance" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include apps JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include setup JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include diagnostics JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must prefer apps and --app over lower-level source nouns" \
+  /tmp/public-contract-broken-docs-index.out
+
+broken_examples_docs="$tmp_dir/broken-examples-docs"
+cp -R "$output_dir" "$broken_examples_docs"
+python3 - "$broken_examples_docs/docs/examples.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "consume only JSON\noutput": "can parse concise human output",
+    "ottto status --json": "ottto status",
+    "ottto account --json": "ottto account",
+    "ottto apps --json": "ottto apps",
+    "ottto context --json": "ottto context",
+    "ottto costs --json": "ottto costs",
+    "ottto sessions --json": "ottto sessions",
+    "machine-readable agent surfaces": "human-readable agent surfaces",
+    "require this Mac to be connected": "can run without this Mac connected",
+    "`--app": "`--source",
+    "codex|claude-code|pi": "provider slugs",
+    "`--source`": "`--provider`",
+    "backend source slugs": "provider names",
+    "ottto setup --json --no-browser --no-wait": "ottto setup --no-browser",
+    "exits `60`": "fails",
+    "`claim_url`": "`setup_url`",
+    "`claim_code`": "`setup_code`",
+    "treat the nonzero exit as a corrupt response": "treat nonzero exit as failed text output",
+    "ottto apps status --app claude-code --json": "ottto apps status claude-code",
+    "ottto verify --app claude-code --json": "ottto verify claude-code",
+    "ottto verify --repair --app claude-code --json": "ottto verify --repair claude-code",
+    "Plain verify is read-only": "Plain verify can repair config",
+    "Use `--repair` only when the JSON reports config drift": "Use `--repair` whenever setup is stuck",
+    "daemon-owned WriteConfig": "any local config",
+    "ottto doctor --json": "ottto doctor",
+    "ottto verify --repair --app codex --json": "ottto verify --repair codex",
+    "ottto fix --app codex --json": "ottto fix codex",
+    "ottto verify --app codex --json": "ottto verify codex",
+    "Apply repair only through `ottto fix`": "Patch local config when repair is faster",
+    "Do not patch `~/.codex/config.toml`\ndirectly": "Patch `~/.codex/config.toml` directly",
+    "ottto diagnostics collect --json": "ottto diagnostics collect",
+    "Summarize the redaction report": "Paste the full diagnostics payload",
+    "ottto diagnostics collect --upload": "ottto diagnostics upload",
+    "--approve-upload": "--yes",
+    "--accept-retention-disclosure": "--accept",
+    "--support-claim <claim>": "--claim <claim>",
+    "Use this only after the user approves upload and retention disclosure": "Upload whenever support asks",
+    "ottto update check --json": "ottto update check",
+    "install owner": "installer",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_examples_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-examples-docs.out 2>&1; then
+  echo "Expected contract check to fail when examples docs lose JSON/setup/diagnostics boundaries" >&2
+  exit 1
+fi
+grep -q "examples docs must keep examples JSON-only" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include status JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve machine-readable agent guidance" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include headless setup JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must document setup exit 60" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve nonzero JSON setup boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve read-only verify boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must route Codex repair through ottto fix" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must prohibit direct Codex config patching" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve diagnostics upload approval boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include update check JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+
+broken_privacy_docs="$tmp_dir/broken-privacy-docs"
+cp -R "$output_dir" "$broken_privacy_docs"
+python3 - "$broken_privacy_docs/docs/privacy.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "local state and secret material on the Mac unless a user-approved setup or\n"
+    "diagnostics flow sends a redacted payload": "local state may be uploaded when useful for support",
+    "`ottto-service` owns:": "Agents may own:",
+    "local control token storage": "local control token inspection",
+    "diagnostics redaction": "diagnostics collection",
+    "Agents, the CLI, the macOS app, and the web app are clients": "Agents, the CLI, the macOS app, and the web app may each own setup",
+    "should not\nduplicate local setup or repair logic": "may duplicate local setup and repair logic",
+    "must not upload raw prompts, raw responses, tool output,\n"
+    "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
+    "absolute local paths": "may upload raw local content when support needs details",
+    "email is permitted only in the named status display\nfields": "email may be sent on any upload",
+    "Tokens and credentials stay local": "Credentials may be sent",
+    "derived and redacted fields": "raw fields",
+    "hashed workspace identity": "workspace path",
+    "display-safe account or plan evidence": "raw account evidence",
+    "Live telemetry is source-level opt-in": "Live telemetry is enabled by default",
+    "Opt-out must remove fenced\nlocal config or Keychain state before backend setup-key revocation completes": "Opt-out can revoke backend setup keys before local cleanup",
+    "`ottto fix --json` returns repair authority metadata": "`ottto fix --json` returns repair text",
+    "Terminal repair is allowed\nonly for setup-safe actions tied to an active setup-run binding": "Terminal repair may run whenever setup is stuck",
+    "Credential,\nauth-adjacent, stale-account, or disconnected cases require browser approval": "Credential and auth-adjacent cases may use terminal repair",
+    "`ottto verify --repair --json` is narrower": "`ottto verify --repair --json` can repair broadly",
+    "can repair only Codex or Claude\nCode WriteConfig drift": "can repair any app config",
+    "`OTTTO_PATCH_CODEX_DISABLED` and\n"
+    "`OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return\n"
+    "`patch_disabled`": "patch-disable flags may be ignored during repair",
+    "Uploads require explicit\napproval, retention disclosure acceptance, and either an active login or a\nsupport claim": "Uploads can happen when support asks",
+    "Redaction covers local paths, secret tokens, account identifiers,\n"
+    "machine identifiers, raw prompts, and command output before display or upload": "Redaction is best-effort after upload",
+    "Do not paste full\ndiagnostics payloads or raw JSON containing local identifiers": "Paste full diagnostics payloads into support channels",
+    "reviewed for redaction": "reviewed for relevance",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_privacy_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-privacy-docs.out 2>&1; then
+  echo "Expected contract check to fail when privacy docs lose local ownership and redaction boundaries" >&2
+  exit 1
+fi
+grep -q "privacy docs must preserve local-first redacted-upload boundary" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must name ottto-service as local owner" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit duplicate setup/repair logic" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit uploading raw private local data" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must scope email to named status display fields" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep credentials local" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep live telemetry source-level opt-in" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must preserve opt-out local cleanup ordering" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep terminal repair setup-run bound" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must require browser approval for auth-adjacent repair" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must bound verify repair to Codex/Claude WriteConfig drift" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must require diagnostics upload approval, retention, and authorization" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must list diagnostics redaction categories before display/upload" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit pasting full diagnostics payloads" \
+  /tmp/public-contract-broken-privacy-docs.out
+
+broken_connector_docs="$tmp_dir/broken-connector-docs"
+cp -R "$output_dir" "$broken_connector_docs"
+python3 - \
+  "$broken_connector_docs/docs/connectors.md" \
+  "$broken_connector_docs/connectors/README.md" <<'PY'
+import sys
+from pathlib import Path
+
+docs_path = Path(sys.argv[1])
+readme_path = Path(sys.argv[2])
+
+docs = docs_path.read_text(encoding="utf-8")
+docs = docs.replace(
+    "Use the public Rust testkit helpers in source-package tests instead of copying\n"
+    "backend generator logic",
+    "Copy the backend generator checks into source-package tests",
+)
+docs = docs.replace("assert_collector_manifest_contract", "assert_manifest")
+docs = docs.replace("CollectorManifestContract", "ManifestContract")
+docs = docs.replace(
+    "a maintainer regenerates the registry before merge",
+    "edit the registry by hand",
+)
+docs = docs.replace(
+    "Official first-party fixtures must not expose raw prompts, responses, tool\n"
+    "  output, command output, local paths, credentials, cookies, API keys,\n"
+    "  passwords, or secrets.",
+    "Official fixtures may include local examples for support.",
+)
+docs_path.write_text(docs, encoding="utf-8")
+
+readme = readme_path.read_text(encoding="utf-8")
+readme = readme.replace("## SDK And Testkit Helpers", "## Helpers")
+readme = readme.replace("`ottto-connector-sdk` owns schema-version constants", "The SDK helps with manifests")
+readme = readme.replace("`ottto-connector-testkit` owns contract assertion helpers", "The test helper runs contracts")
+readme = readme.replace("ottto-connector-testkit/tests/first_party_sources.rs", "first party tests")
+readme = readme.replace(
+    "Use the testkit in source package tests instead of copying backend generator\n"
+    "logic",
+    "Copy backend generator logic into source package tests",
+)
+readme = readme.replace(
+    "-p ottto-connector-testkit \\\n"
+    "    --test first_party_sources",
+    "-p ottto-connector-testkit",
+)
+readme = readme.replace(
+    "Changing manifests without updating the\n"
+    "generated registry is incomplete",
+    "Changing manifests can be reviewed later",
+)
+readme_path.write_text(readme, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-docs.out 2>&1; then
+  echo "Expected contract check to fail when connector docs lose SDK/testkit guidance" >&2
+  exit 1
+fi
+grep -q "connector docs must route source-package tests through the public Rust testkit" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector docs must say who regenerates the registry" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector docs must preserve fixture raw-content prohibition" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must include SDK/testkit helper section" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must name first-party source contract tests" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must preserve first-party source test command" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must require registry refresh with manifest changes" \
+  /tmp/public-contract-broken-connector-docs.out
+
+broken_registry="$tmp_dir/broken-registry"
+cp -R "$output_dir" "$broken_registry"
+python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["sources"] = [
+    source for source in payload["sources"] if source.get("source_id") != "codex"
+]
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_registry" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-registry.out 2>&1; then
+  echo "Expected contract check to fail when a required source is missing" >&2
+  exit 1
+fi
+grep -q "registry is missing required source(s): codex" /tmp/public-contract-broken-registry.out
+
+broken_source_docs="$tmp_dir/broken-source-docs"
+cp -R "$output_dir" "$broken_source_docs"
+python3 - \
+  "$broken_source_docs/connectors/sources/codex/README.md" \
+  "$broken_source_docs/connectors/sources/codex/POLICY.md" <<'PY'
+import sys
+from pathlib import Path
+
+readme_path = Path(sys.argv[1])
+policy_path = Path(sys.argv[2])
+
+readme = readme_path.read_text(encoding="utf-8")
+readme = readme.replace("# Codex Source Package", "# Source Package")
+readme = readme.replace("Codex remains an official Ottto app", "This package")
+readme = readme.replace("Collectors:", "Capabilities:")
+readme = readme.replace("- `logs2_trace`:", "- logs2 trace:")
+readme = readme.replace("Raw prompts", "Content")
+readme_path.write_text(readme, encoding="utf-8")
+
+policy = policy_path.read_text(encoding="utf-8")
+policy = policy.replace("# Codex Source Policy", "# Codex Policy")
+policy = policy.replace("Review tier: `official`", "Review tier: unofficial")
+policy = policy.replace("## Upload Boundaries", "## Upload Notes")
+policy = policy.replace("Do not upload", "Avoid uploading")
+policy_path.write_text(policy, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_source_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-source-docs.out 2>&1; then
+  echo "Expected contract check to fail when source package docs lose governance content" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/README.md must include a Collectors section" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/README.md must document collector logs2_trace" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/README.md must document raw prompt/content upload boundary" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must be titled for Codex" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must include ## Upload Boundaries" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must preserve official review tier" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must document upload prohibitions" \
+  /tmp/public-contract-broken-source-docs.out
+
+broken_connector_manifest="$tmp_dir/broken-connector-manifest"
+cp -R "$output_dir" "$broken_connector_manifest"
+python3 - \
+  "$broken_connector_manifest/connectors/sources/codex/source.toml" \
+  "$broken_connector_manifest/connectors/sources/codex/collectors/local_sessions/collector.toml" <<'PY'
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+collector_path = Path(sys.argv[2])
+
+source_text = source_path.read_text(encoding="utf-8")
+source_text = source_text.replace('source_id = "codex"', 'source_id = "codex_drift"', 1)
+source_text = source_text.replace('"local_sessions"', '"local_sessions_drift"', 1)
+source_path.write_text(source_text, encoding="utf-8")
+
+collector_text = collector_path.read_text(encoding="utf-8")
+collector_text = collector_text.replace('collector_id = "local_sessions"', 'collector_id = "local_sessions_drift"', 1)
+collector_text = collector_text.replace('risk_classes = []', 'risk_classes = ["unexpected_risk"]', 1)
+collector_text = collector_text.replace('uploads_raw_content = false', 'uploads_raw_content = true', 1)
+collector_text = collector_text.replace('"local_usage_snapshots"', '"local_usage_snapshots_drift"', 1)
+collector_path.write_text(collector_text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_manifest" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-manifest.out 2>&1; then
+  echo "Expected contract check to fail when connector manifests drift from registry" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/source.toml source_id must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/source.toml collectors must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml collector_id must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml risk_classes must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml uploads_raw_content must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml uploads_raw_content must be false for public v1" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml emits must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+
+broken_connector_fixture="$tmp_dir/broken-connector-fixture"
+cp -R "$output_dir" "$broken_connector_fixture"
+python3 - "$broken_connector_fixture/connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["emitted_records"][0]["record_type"] = "unexpected_fixture_record"
+payload["emitted_records"][0]["sample"]["raw_prompt"] = "unredacted fixture prompt"
+payload["upload_policy"]["uploads_raw_content"] = True
+payload["upload_policy"]["redacts"].remove("credential")
+payload["upload_policy"]["redacts"].append("prompt")
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_connector_fixture" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-connector-fixture.out 2>&1; then
+  echo "Expected contract check to fail when connector fixtures drift from registry" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.uploads_raw_content must match registry" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted record types must match registry emits" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted_records\\[0\\].sample.raw_prompt exposes raw-content sample key" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.redacts values must be unique" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.redacts missing required classes: credential" \
+  /tmp/public-contract-broken-connector-fixture.out
+
+broken_diagnostics_redaction="$tmp_dir/broken-diagnostics-redaction"
+cp -R "$output_dir" "$broken_diagnostics_redaction"
+python3 - "$broken_diagnostics_redaction/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["machine_id"] = "machine_unredactedfixture"
+payload["redaction"]["redacted_fields"] = [
+    field
+    for field in payload["redaction"]["redacted_fields"]
+    if field not in {"account_id", "machine_id"}
+]
+payload["redaction"]["preserved_fields"].append("machine_id")
+for section in payload["sections"]:
+    if section["name"] == "installation":
+        section["items"]["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.plist"
+    if section["name"] == "security":
+        section["items"]["auth_header"] = "Bearer " + "ghp_" + "unredactedfixturetoken"
+    if section["name"] == "repair":
+        section["items"]["support_claim"] = "support_unredactedfixture"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_diagnostics_redaction" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-diagnostics-redaction.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics expose unredacted values" >&2
+  exit 1
+fi
+grep -q "diagnostics machine_id must be redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction fields must include machine_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction fields must include account_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction preserved_fields must not include machine_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.machine_id exposes unredacted machine identifier" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "launch_agent_path must be path-redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "auth_header must be redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.sections\\[4\\].items.auth_header exposes unredacted bearer token" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.sections\\[3\\].items.support_claim exposes unredacted support claim" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+
+broken_local_health_diagnostics="$tmp_dir/broken-local-health-diagnostics"
+cp -R "$output_dir" "$broken_local_health_diagnostics"
+python3 - "$broken_local_health_diagnostics/fixtures/local-health/contract-matrix.v1.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+for case in payload:
+    if case.get("case_id") != "diagnostics_redaction":
+        continue
+    case["tags"].remove("redaction")
+    case["health"]["capabilities"].remove("diagnostics.collect")
+    case["health"]["overall"]["next_action"] = "share_raw_bundle"
+    case["health"]["sources"][0]["next_action"] = "share_raw_bundle"
+    case["health"]["blockers"][0]["owner"] = "runtime"
+    event_payload = case["events"][0]["payload"]
+    event_payload["redacted_identifiers"].remove("device_id")
+    event_payload["excluded_secret_classes"].remove("hardware_serials")
+    event_payload["included_sections"].remove("command_ledger")
+    event_payload["support_claim"] = "support_unredactedfixture"
+    break
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_local_health_diagnostics" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-local-health-diagnostics.out 2>&1; then
+  echo "Expected contract check to fail when local-health diagnostics redaction contract drifts" >&2
+  exit 1
+fi
+grep -q "local health diagnostics_redaction tags must include redaction" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction capabilities must include diagnostics.collect" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction next_action must be share_redacted_bundle" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction source next_action must be share_redacted_bundle" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction blocker owner must be support" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction redacted_identifiers must include device_id" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction excluded_secret_classes must include hardware_serials" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction included_sections must include command_ledger" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local-health.diagnostics_redaction.event_payload.support_claim exposes unredacted support claim" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+
+broken_mcp="$tmp_dir/broken-mcp"
+cp -R "$output_dir" "$broken_mcp"
+mkdir -p "$broken_mcp/agent-adapters/mcp-server"
+printf 'deferred\n' > "$broken_mcp/agent-adapters/mcp-server/README.md"
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_mcp" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-mcp.out 2>&1; then
+  echo "Expected contract check to fail when an MCP adapter is exported for v1" >&2
+  exit 1
+fi
+grep -q "MCP adapter must remain deferred for public v1" /tmp/public-contract-broken-mcp.out
+
+broken_adapter_path="$tmp_dir/broken-adapter-path"
+cp -R "$output_dir" "$broken_adapter_path"
+cat >> "$broken_adapter_path/agent-adapters/codex-skill/SKILL.md" <<'EOF'
+
+Private install path regression:
+tools/ottto-local-platform/scripts/macos_dev_install.sh
+EOF
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_path" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-path.out 2>&1; then
+  echo "Expected contract check to fail when an adapter skill references private install paths" >&2
+  exit 1
+fi
+grep -q "Codex skill must not reference private monorepo install paths" \
+  /tmp/public-contract-broken-adapter-path.out
+
+broken_adapter_metadata="$tmp_dir/broken-adapter-metadata"
+cp -R "$output_dir" "$broken_adapter_metadata"
+cat >> "$broken_adapter_metadata/agent-adapters/claude-code-skill/SKILL.md" <<'EOF'
+
+allowed-tools:
+  - Bash
+hooks:
+  PreToolUse: []
+statusLine:
+  command: ottto status --json
+EOF
+cat >> "$broken_adapter_metadata/agent-adapters/codex-skill/agents/openai.yaml" <<'EOF'
+tools:
+  - shell
+status-line:
+  command: ottto status --json
+EOF
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_metadata" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-metadata.out 2>&1; then
+  echo "Expected contract check to fail when adapter metadata pregrants tools or hooks" >&2
+  exit 1
+fi
+grep -q "Claude Code skill must not pregrant tools" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Claude Code skill must not define hooks metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Claude Code skill must not define status-line metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Codex agent manifest must not pregrant tools" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Codex agent manifest must not define status-line metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+
+broken_adapter_docs="$tmp_dir/broken-adapter-docs"
+cp -R "$output_dir" "$broken_adapter_docs"
+python3 - "$broken_adapter_docs/docs/agent-adapters.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "Pi is supported through the same public CLI app value, `--app pi`",
+    "Pi uses a separate adapter package",
+)
+text = text.replace(
+    "consume machine-readable `ottto --json` output",
+    "parse convenient human output",
+)
+text = text.replace(
+    "avoid direct edits to agent config, credentials, cookies, hooks, status-line\n"
+    "  monitors, or local source files",
+    "edit agent config, credentials, cookies, hooks, status-line monitors, and local source files",
+)
+text = text.replace(
+    "summarize redacted status facts instead of pasting raw diagnostics payloads",
+    "paste raw diagnostics payloads when debugging",
+)
+text = text.replace(
+    "keep support claims out of public issues, chat, returned JSON, and uploaded\n"
+    "  bundle content",
+    "paste support claims into public issues, chat, returned JSON, and uploaded bundle content",
+)
+path.write_text(text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_docs" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-docs.out 2>&1; then
+  echo "Expected contract check to fail when adapter docs lose safety boundaries" >&2
+  exit 1
+fi
+grep -q "agent adapter docs must route Pi through the public CLI app value" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must require machine-readable JSON output" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must prohibit direct config/credential/hook/source edits" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must require redacted summaries instead of raw diagnostics" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must keep support claims out of public issues/chat/JSON/bundles" \
+  /tmp/public-contract-broken-adapter-docs.out
+
+broken_adapter_required="$tmp_dir/broken-adapter-required"
+cp -R "$output_dir" "$broken_adapter_required"
+python3 - "$broken_adapter_required" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+codex_skill = root / "agent-adapters/codex-skill/SKILL.md"
+codex_text = codex_skill.read_text(encoding="utf-8")
+codex_text = codex_text.replace(
+    "Always pass `--json`",
+    "Prefer structured output",
+)
+codex_skill.write_text(codex_text, encoding="utf-8")
+
+claude_skill = root / "agent-adapters/claude-code-skill/SKILL.md"
+claude_text = claude_skill.read_text(encoding="utf-8")
+claude_text = claude_text.replace(
+    "Do not ask users to paste support claims into public issues or chat",
+    "Support claims may be pasted into chat",
+)
+claude_skill.write_text(claude_text, encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$broken_adapter_required" "$CONTRACT_SCRIPT" >/tmp/public-contract-broken-adapter-required.out 2>&1; then
+  echo "Expected contract check to fail when adapter skills lose required safety instructions" >&2
+  exit 1
+fi
+grep -q "Codex skill must require JSON output for consumed CLI responses" \
+  /tmp/public-contract-broken-adapter-required.out
+grep -q "Claude Code skill must keep support claims out of chat" \
+  /tmp/public-contract-broken-adapter-required.out
+
+pin_private="$tmp_dir/pin-private"
+write_valid_private_consumers "$pin_private" "$public_facts"
+pin_private_v2="$tmp_dir/pin-private-v2"
+write_valid_private_consumers "$pin_private_v2" "$public_facts"
+python3 - "$pin_private_v2/backend/app/domain/local_platform/public_runtime_pin.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+pin = json.loads(path.read_text(encoding="utf-8"))
+pin["schema_version"] = 2
+pin["stable_version"] = "0.1.100"
+pin["provider_daily_reference_admission_required"] = True
+path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$pin_private_v2" \
+  >/tmp/public-contract-pin-v2.out
+
+bad_pin_v2="$tmp_dir/bad-pin-v2.json"
+python3 - "$pin_private_v2/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$bad_pin_v2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pin = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+pin.pop("stable_version")
+Path(sys.argv[2]).write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$pin_private_v2" \
+  --private-runtime-pin "$bad_pin_v2" \
+  >/tmp/public-contract-bad-pin-v2.out 2>&1; then
+  echo "Expected contract check to fail when the v2 private runtime pin lacks stable_version" >&2
+  exit 1
+fi
+grep -q "schema_version 2 requires an exact X.Y.Z stable_version" \
+  /tmp/public-contract-bad-pin-v2.out
+
+bad_pin="$tmp_dir/bad-pin.json"
+python3 - "$pin_private/backend/app/domain/local_platform/public_runtime_pin.json" "$bad_pin" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pin = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+pin["public_export_manifest"]["content_sha256"] = "0" * 64
+Path(sys.argv[2]).write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$pin_private" \
+  --private-runtime-pin "$bad_pin" \
+  >/tmp/public-contract-bad-pin.out 2>&1; then
+  echo "Expected contract check to fail when the private runtime pin drifts" >&2
+  exit 1
+fi
+grep -q "private runtime pin content_sha256 must match public manifest content_sha256" \
+  /tmp/public-contract-bad-pin.out
+
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$pin_private" \
+  --require-public-authority \
+  >/tmp/public-contract-require-public-authority.out 2>&1; then
+  echo "Expected contract check to fail when public authority is required but pin is pre-public" >&2
+  exit 1
+fi
+grep -q "private runtime pin authority_state must be public_repo_commit when public authority is required" \
+  /tmp/public-contract-require-public-authority.out
+
+public_authority_private="$tmp_dir/public-authority-private"
+write_valid_private_consumers "$public_authority_private" "$public_facts"
+write_public_commit_pin \
+  "$public_facts" \
+  "$public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$public_commit"
+PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$public_authority_private" \
+  --require-public-authority \
+  >/tmp/public-contract-public-authority.out
+
+short_public_authority_private="$tmp_dir/short-public-authority-private"
+write_valid_private_consumers "$short_public_authority_private" "$public_facts"
+write_public_commit_pin \
+  "$public_facts" \
+  "$short_public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$(git -C "$public_git" rev-parse --short=12 HEAD)"
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$short_public_authority_private" \
+  --require-public-authority \
+  >/tmp/public-contract-short-public-authority.out 2>&1; then
+  echo "Expected contract check to fail when public authority pin uses a short commit SHA" >&2
+  exit 1
+fi
+grep -q "private runtime pin public_repo_commit.commit must be a full 40-character git SHA" \
+  /tmp/public-contract-short-public-authority.out
+
+bad_public_authority_private="$tmp_dir/bad-public-authority-private"
+write_valid_private_consumers "$bad_public_authority_private" "$public_facts"
+write_public_commit_pin \
+  "$public_facts" \
+  "$bad_public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "0000000000000000000000000000000000000000"
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$bad_public_authority_private" \
+  --require-public-authority \
+  >/tmp/public-contract-bad-public-authority.out 2>&1; then
+  echo "Expected contract check to fail when public authority pin commit mismatches public root" >&2
+  exit 1
+fi
+grep -q "private runtime pin public_repo_commit.commit must match public root HEAD" \
+  /tmp/public-contract-bad-public-authority.out
+
+# Legacy mismatch: the commit tracks a manifest that does not match its tree.
+public_stale="$tmp_dir/public-stale"
+cp -R "$public_git" "$public_stale"
+printf '{"files": []}\n' > "$public_stale/PUBLIC_EXPORT_MANIFEST.json"
+git -C "$public_stale" add PUBLIC_EXPORT_MANIFEST.json
+git -C "$public_stale" commit -qm "track a stale manifest"
+stale_private="$tmp_dir/public-stale-private"
+write_valid_private_consumers "$stale_private" "$public_facts"
+write_public_commit_pin \
+  "$public_facts" \
+  "$stale_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$(git -C "$public_stale" rev-parse HEAD)"
+if PUBLIC_CONTRACT_REPO_ROOT="$public_stale" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$stale_private" \
+  --require-public-authority \
+  >/tmp/public-contract-git-legacy-mismatch.out 2>&1; then
+  echo "Expected contract check to fail when a tracked manifest does not match its commit tree" >&2
+  exit 1
+fi
+grep -q "public export manifest could not be derived from the public root HEAD" \
+  /tmp/public-contract-git-legacy-mismatch.out
+grep -q "tracked PUBLIC_EXPORT_MANIFEST.json at [0-9a-f]* does not match the commit tree" \
+  /tmp/public-contract-git-legacy-mismatch.out
+
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$pin_private" \
+  --private-runtime-pin "$tmp_dir/missing-pin.json" \
+  >/tmp/public-contract-missing-pin.out 2>&1; then
+  echo "Expected contract check to fail when the private runtime pin is missing" >&2
+  exit 1
+fi
+grep -q "private runtime pin is missing" /tmp/public-contract-missing-pin.out
+
+fake_private="$tmp_dir/private"
+write_valid_private_consumers "$fake_private" "$public_facts"
+cat > "$fake_private/backend/app/domain/connectors/registry.py" <<'PY'
+DEFAULT_CONNECTOR_REGISTRY_PATH = REPO_ROOT / "tools" / "ottto-local-platform" / "connectors" / "registry.generated.json"
+PY
+cat > "$fake_private/backend/app/schemas/setup_runs.py" <<'PY'
+product: str
+PY
+cat > "$fake_private/backend/app/features/setup_runs/service.py" <<'PY'
+def loader(manifest):
+    return manifest
+PY
+cat > "$fake_private/frontend/src/lib/apps/local-telemetry-control.ts" <<'TS'
+const LOCAL_CONTROL_PROTOCOL_VERSION = 10;
+TS
+if PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$fake_private" \
+  >/tmp/public-contract-broken-private.out 2>&1; then
+  echo "Expected contract check to fail when private consumers drift" >&2
+  exit 1
+fi
+grep -q "private backend registry loader must read root connectors/registry.generated.json" /tmp/public-contract-broken-private.out
+grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
+
+# [behaviour] Stable skeleton requirements survive without the export gates.
+for relative in Cargo.lock crates/Cargo.lock release/manifest.schema.json \
+  agent-adapters/codex-skill/agents/openai.yaml; do
+  mv "$output_dir/$relative" "$tmp_dir/required-file"
+  if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/required.out" 2>&1; then
+    echo "Expected missing stable public file to fail contracts" >&2
+    exit 1
+  fi
+  grep -Fq "required file is missing: $relative" "$tmp_dir/required.out"
+  mv "$tmp_dir/required-file" "$output_dir/$relative"
+done
+for manifest in Cargo.toml crates/Cargo.toml; do
+  cp "$output_dir/$manifest" "$tmp_dir/workspace.toml"
+  sed '/^\[workspace\]$/d' "$tmp_dir/workspace.toml" > "$output_dir/$manifest"
+  if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/workspace.out" 2>&1; then
+    echo "Expected missing workspace declaration to fail contracts" >&2
+    exit 1
+  fi
+  grep -q 'Rust workspace: pattern not found' "$tmp_dir/workspace.out"
+  cp "$tmp_dir/workspace.toml" "$output_dir/$manifest"
+done
+chmod -x "$output_dir/scripts/public_repo_manifest.sh"
+if PUBLIC_CONTRACT_REPO_ROOT="$output_dir" "$CONTRACT_SCRIPT" >"$tmp_dir/executable.out" 2>&1; then
+  echo "Expected missing executable permission to fail contracts" >&2
+  exit 1
+fi
+grep -q 'required executable is not executable: scripts/public_repo_manifest.sh' "$tmp_dir/executable.out"
+chmod +x "$output_dir/scripts/public_repo_manifest.sh"
+
+echo "public_repo_contract_check tests passed"
+script_completed=1

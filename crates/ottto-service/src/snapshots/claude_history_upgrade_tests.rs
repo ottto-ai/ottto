@@ -1,0 +1,1310 @@
+//! Fold-level regressions for the Claude history-upgrade gate: every file is
+//! selected for a reason other than the revision (a changed upload context,
+//! and where a held file must still parse, a missing activity clock), so only
+//! the reason-independent gate can hold it. Fixtures are synthetic.
+
+use super::claude_history_upgrade::{
+    local_count, with_max_gated_claude_revision, LocalCount, REQUEST_OWNED_USAGE_CONTRACT,
+};
+use super::claude_reemission_exclusions::{with_no_list_cutoff, ListState, ReemissionExclusions};
+use super::*;
+
+const COLLECTED_AT: &str = "2026-08-23T18:40:00Z";
+
+fn session(slot: usize) -> String {
+    format!("bbbbbbbb-cccc-4ddd-8eee-{slot:012x}")
+}
+
+/// `roots` families of a root and one subagent, all sent and stamped at
+/// revision 1 under upload context `ctx-1`.
+pub(super) fn families(name: &str, roots: usize) -> (PathBuf, PathBuf, ScanIndex) {
+    let home = crate::test_scratch::unique_path(&format!("ottto-{name}"));
+    fs::create_dir_all(&home).unwrap();
+    let home = fs::canonicalize(home).unwrap();
+    let root = home.join("project");
+    for slot in 0..roots {
+        let session = session(slot);
+        for agent in [None, Some(format!("{slot:016x}"))] {
+            let path = match &agent {
+                Some(agent) => root
+                    .join(&session)
+                    .join("subagents")
+                    .join(format!("agent-{agent}.jsonl")),
+                None => root.join(format!("{session}.jsonl")),
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let request = agent.as_deref().unwrap_or("root");
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp": "2026-08-23T18:20:00Z",
+                        "type": "assistant",
+                        "sessionId": session,
+                        "agentId": agent,
+                        "isSidechain": agent.is_some(),
+                        "requestId": format!("request-{slot}-{request}"),
+                        "message": {
+                            "id": format!("message-{slot}-{request}"),
+                            "model": "claude-haiku-4-5",
+                            "usage": {"input_tokens": 10, "output_tokens": 1}
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        }
+    }
+    let mut index = ScanIndex::default();
+    let mut first = scan(&root, &mut index, "ctx-1", 1);
+    assert_eq!(first.snapshots.len(), roots * 2);
+    let index = settle(&home, &ScanIndex::default(), &mut first, &mut index);
+    assert!(index
+        .files
+        .values()
+        .all(|entry| entry.effective_upload_body_witness_revision == 1));
+    (home, root, index)
+}
+
+/// Select every file for a local reason that still parses a held file: a
+/// missing activity clock. Upload-context debt alone no longer does: the gate
+/// vetoes every held body, so that read could never earn a receipt.
+fn forget_activity(index: &mut ScanIndex) {
+    index.snapshot_activity_at.clear();
+}
+
+fn scan(root: &Path, index: &mut ScanIndex, context: &str, revision: u64) -> SourceScanResult {
+    index.activate_upload_context(context.into());
+    index.activate_effective_upload_body_witness_revision(revision);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    scan_source_roots_with_limit(
+        SnapshotSource::ClaudeCode,
+        &[root.to_path_buf()],
+        index,
+        COLLECTED_AT,
+        BACKFILL_WINDOW_DAYS,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+    )
+    .unwrap()
+}
+
+/// Finalize (the emission backstop runs first), keep what the server
+/// accepted, save and reload.
+fn settle(
+    home: &Path,
+    previous: &ScanIndex,
+    scan: &mut SourceScanResult,
+    index: &mut ScanIndex,
+) -> ScanIndex {
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+    let accepted = scan
+        .snapshots
+        .iter()
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect();
+    let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
+    // The service finish: each exact ACK earns its file receipt.
+    let acks = crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots);
+    crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+        &mut settled,
+        &scan.snapshots,
+        &acks,
+    );
+    let path = home.join("scan-index.json");
+    e2_pipeline_scan_fixture::save_reload_for_test(&mut settled, &path)
+}
+
+fn support(name: &str) -> crate::test_scratch::ScratchDir {
+    let support = crate::test_scratch::ScratchDir::new(name);
+    fs::create_dir_all(ReemissionExclusions::path(&support).parent().unwrap()).unwrap();
+    support
+}
+
+fn digest(id: &str) -> String {
+    format!("{:x}", Sha256::digest(id.as_bytes()))
+}
+
+fn revisions(index: &ScanIndex) -> Vec<u64> {
+    index
+        .files
+        .values()
+        .map(|entry| entry.effective_upload_body_witness_revision)
+        .collect()
+}
+
+/// Group 2: a member-only line closes over its root; the listed family's
+/// root and sibling are selected by a missing activity clock, still parse
+/// (their census records refresh), emit nothing, keep revision 1 and spend
+/// no budget, while the unlisted family upgrades.
+#[test]
+fn listed_family_selected_for_another_reason_emits_nothing() {
+    let (home, root, mut index) = families("history-gate-listed", 2);
+    let support = support("history-gate-listed-support");
+    let listed_member = index
+        .files
+        .keys()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .find(|(family, member)| *family == session(1) && *member != session(1))
+        .map(|(_, member)| member)
+        .unwrap();
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&listed_member)),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    forget_activity(&mut index);
+    let previous = index.clone();
+    let mut result =
+        with_body_witness_adoption_page_budget(2, || scan(&root, &mut index, "ctx-2", 2));
+    assert_eq!(result.scanned_file_count, 4, "every file parses locally");
+    assert_eq!(result.snapshots.len(), 4, "parsed, not yet vetoed");
+    let mut resend = result.snapshots.clone();
+    index.retain_claude_history_emission_permitted(&mut resend);
+    assert_eq!(resend.len(), 2, "the resend hook drops the listed family");
+    let settled = settle(&home, &previous, &mut result, &mut index);
+    assert_eq!(result.snapshots.len(), 2, "only the unlisted family emits");
+    for (key, entry) in &settled.files {
+        let listed = claude_index_path_family_member(Path::new(key))
+            .is_some_and(|(family, _)| family == session(1));
+        assert_eq!(
+            entry.effective_upload_body_witness_revision,
+            if listed { 1 } else { 2 }
+        );
+        assert!(settled.claude_request_census_for_test().get(key).is_some());
+        if listed {
+            assert_eq!(
+                entry.last_snapshot_fingerprint,
+                previous.files[key].last_snapshot_fingerprint
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Group 3: no list on an unverified Mac. Old or unknown births are held
+/// whatever the reason; newer
+/// births pass. A malformed list, a list missing after install and an
+/// unrecordable install hold everything even with budget available. On a
+/// verified Mac without a list, old history is paced instead.
+#[test]
+fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
+    let (home, root, index) = families("history-gate-no-list", 2);
+    let held_under = |policy: NoListPolicy, support: &Path, cutoff: u64| {
+        let mut index = index.clone();
+        index.claude_no_list_policy = policy;
+        index.load_claude_reemission_exclusions(support);
+        forget_activity(&mut index);
+        let state = index.claude_reemission_exclusions.state();
+        let mut result = with_no_list_cutoff(cutoff, || scan(&root, &mut index, "ctx-2", 2));
+        assert_eq!(result.scanned_file_count, 4);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        (state, result.snapshots.len(), revisions(&index))
+    };
+    let held =
+        |support: &Path, cutoff: u64| held_under(NoListPolicy::HoldUnverified, support, cutoff);
+    let never = support("history-gate-never");
+    assert_eq!(
+        held(&never, u64::MAX),
+        (ListState::NotInstalled, 0, vec![1; 4])
+    );
+    assert_eq!(
+        held_under(NoListPolicy::HoldMoveNotFull, &never, u64::MAX),
+        (ListState::NotInstalled, 0, vec![1; 4])
+    );
+    assert_eq!(
+        held_under(NoListPolicy::Pace, &never, u64::MAX),
+        (ListState::NotInstalled, 4, vec![2; 4]),
+        "a verified Mac without a list paces old history"
+    );
+    assert_eq!(
+        held(&never, 0),
+        (ListState::NotInstalled, 4, vec![2; 4]),
+        "newer births are not held without a list"
+    );
+
+    let malformed = support("history-gate-malformed");
+    fs::write(ReemissionExclusions::path(&malformed), "not-a-digest\n").unwrap();
+    assert_eq!(held(&malformed, 0), (ListState::Unreadable, 0, vec![1; 4]));
+
+    let missing = support("history-gate-missing");
+    fs::write(ReemissionExclusions::path(&missing), "").unwrap();
+    assert_eq!(
+        ReemissionExclusions::load(&missing).state(),
+        ListState::Installed
+    );
+    fs::remove_file(ReemissionExclusions::path(&missing)).unwrap();
+    let ((state, emitted, stamps), _) =
+        crate::local_resource_diagnostics::capture(|| held(&missing, 0));
+    assert_eq!(
+        (state, emitted, stamps),
+        (ListState::MissingAfterInstall, 0, vec![1; 4])
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let unwritable = support("history-gate-unwritable");
+        let list = ReemissionExclusions::path(&unwritable);
+        fs::write(&list, "").unwrap();
+        let snapshots = list.parent().unwrap().to_path_buf();
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = held(&unwritable, 0);
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o700)).unwrap();
+        // A privileged runner can still write the marker; then it installs.
+        if outcome.0 == ListState::MarkerUnwritable {
+            assert_eq!(outcome, (ListState::MarkerUnwritable, 0, vec![1; 4]));
+        }
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Group 4: an installed empty list paces history selected for another
+/// reason, one file per page under budget 1; the rest keep their tuples and
+/// census records. A missing (never installed) list is not the same: old
+/// births are held.
+#[test]
+fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
+    let (home, root, mut index) = families("history-gate-empty-list", 2);
+    let empty = support("history-gate-empty");
+    fs::write(ReemissionExclusions::path(&empty), "").unwrap();
+    let mut per_page = Vec::new();
+    with_no_list_cutoff(u64::MAX, || {
+        with_body_witness_adoption_page_budget(1, || {
+            for _ in 0..6 {
+                index.load_claude_reemission_exclusions(&empty);
+                assert_eq!(
+                    index.claude_reemission_exclusions.state(),
+                    ListState::Installed
+                );
+                let previous = index.clone();
+                let mut result = scan(&root, &mut index, "ctx-2", 2);
+                index = settle(&home, &previous, &mut result, &mut index);
+                assert_eq!(
+                    index.files.len(),
+                    4,
+                    "held files keep their entries and census"
+                );
+                assert!(index
+                    .files
+                    .keys()
+                    .all(|key| index.claude_request_census_for_test().get(key).is_some()));
+                per_page.push(result.snapshots.len());
+            }
+        });
+    });
+    assert_eq!(per_page, vec![1, 1, 1, 1, 0, 0]);
+    assert_eq!(revisions(&index), vec![2; 4]);
+
+    let (home_missing, root_missing, missing_index) = families("history-gate-missing-list", 2);
+    let never = support("history-gate-missing-list-support");
+    for (policy, expected) in [(NoListPolicy::HoldUnverified, 0), (NoListPolicy::Pace, 1)] {
+        let mut missing_index = missing_index.clone();
+        missing_index.claude_no_list_policy = policy;
+        missing_index.load_claude_reemission_exclusions(&never);
+        let mut result = with_no_list_cutoff(u64::MAX, || {
+            with_body_witness_adoption_page_budget(1, || {
+                scan(&root_missing, &mut missing_index, "ctx-2", 2)
+            })
+        });
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut missing_index);
+        assert_eq!(
+            result.snapshots.len(),
+            expected,
+            "{policy:?}: absence is not an empty list, and only holds an unverified Mac"
+        );
+    }
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(home_missing);
+}
+
+/// The switch-on re-read: a revision bump (2 to 3) on a live-shaped
+/// index (families of a root and 0-3 subagents, empty files, and a
+/// walk longer than one page, as 13,424 files observed live are against 10,000 per
+/// page) re-reads every stamped file once, paced by the byte budget, in
+/// ceil(bytes / budget) reading pages, and then a complete walk reads nothing.
+/// A budget hold queues the file again as a re-read for the next page of its
+/// walk, so pacing does not wait for the next walk. Each page commits as a
+/// fully accepted page without holds does (the upload context is adopted).
+#[test]
+fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
+    const FAMILIES: usize = 20;
+    const EMPTY_FILES: usize = 3;
+    const FILE_BYTES: usize = 2_048;
+    const FILES_PER_BUDGET: u64 = 5;
+    const PAGE_FILES: usize = 40;
+    let home = crate::test_scratch::unique_path("ottto-history-gate-switch-on");
+    let root = home.join("project");
+    let mut nonempty = 0_u64;
+    for slot in 0..FAMILIES {
+        let session = session(slot);
+        let agents = (0..slot % 4).map(|n| Some(format!("{slot:08x}{n:08x}")));
+        for agent in std::iter::once(None).chain(agents) {
+            let path = match &agent {
+                Some(agent) => root
+                    .join(&session)
+                    .join("subagents")
+                    .join(format!("agent-{agent}.jsonl")),
+                None => root.join(format!("{session}.jsonl")),
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let request = agent.as_deref().unwrap_or("root");
+            let mut line = json!({
+                "timestamp": "2026-08-23T18:20:00Z",
+                "type": "assistant",
+                "sessionId": session,
+                "agentId": agent,
+                "isSidechain": agent.is_some(),
+                "requestId": format!("request-{slot}-{request}"),
+                "message": {
+                    "id": format!("message-{slot}-{request}"),
+                    "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                },
+                "pad": ""
+            });
+            let pad = FILE_BYTES - 1 - line.to_string().len();
+            line["pad"] = json!("x".repeat(pad));
+            let text = format!("{line}\n");
+            assert_eq!(text.len(), FILE_BYTES);
+            fs::write(&path, text).unwrap();
+            nonempty += 1;
+        }
+    }
+    for slot in FAMILIES..FAMILIES + EMPTY_FILES {
+        fs::write(root.join(format!("{}.jsonl", session(slot))), "").unwrap();
+    }
+    let at = |index: &ScanIndex, revision: u64| {
+        index
+            .files
+            .values()
+            .filter(|entry| entry.effective_upload_body_witness_revision >= revision)
+            .count()
+    };
+    let page = |index: &mut ScanIndex, revision: u64| {
+        index.activate_upload_context("ctx-1".into());
+        index.activate_effective_upload_body_witness_revision(revision);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            index,
+            COLLECTED_AT,
+            BACKFILL_WINDOW_DAYS,
+            PAGE_FILES,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&accepted);
+        // The service finish: each exact ACK earns its file receipt.
+        let acks =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&result.snapshots);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            index,
+            &result.snapshots,
+            &acks,
+        );
+        result
+    };
+    let mut index = ScanIndex::default();
+    with_max_gated_claude_revision(3, || {
+        // Sent and stamped at revision 2, then settled: whole walks until
+        // one reads no file.
+        let (mut stamp_pages, mut walk_reads) = (0, 0);
+        loop {
+            stamp_pages += 1;
+            assert!(stamp_pages <= 12, "the stamped corpus settles");
+            let result = page(&mut index, 2);
+            walk_reads += result.scanned_file_count;
+            if result.census_complete {
+                if walk_reads == 0 {
+                    break;
+                }
+                walk_reads = 0;
+            }
+        }
+        let files = index.files.len();
+        assert_eq!(files as u64, nonempty + EMPTY_FILES as u64);
+        assert_eq!(at(&index, 2), files);
+
+        // The switch-on: an installed, empty list and revision 3.
+        let list = support("history-gate-switch-on-list");
+        fs::write(ReemissionExclusions::path(&list), "").unwrap();
+        index.load_claude_reemission_exclusions(&list);
+        let budget = FILES_PER_BUDGET * FILE_BYTES as u64;
+        let bound = (nonempty * FILE_BYTES as u64).div_ceil(budget) as usize;
+        with_body_witness_adoption_byte_budget(budget, || {
+            let mut receipts = Vec::new();
+            let mut reads = 0;
+            while at(&index, 3) < files {
+                assert!(
+                    receipts.len() < 4 * bound,
+                    "every file upgrades: {receipts:?}"
+                );
+                let before = index.clone();
+                let result = page(&mut index, 3);
+                let bytes = index
+                    .files
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.effective_upload_body_witness_revision >= 3
+                            && before.files[*key].effective_upload_body_witness_revision < 3
+                    })
+                    .map(|(_, entry)| entry.size_bytes)
+                    .sum::<u64>();
+                reads += result.scanned_file_count;
+                receipts.push((
+                    at(&index, 3) - at(&before, 3),
+                    bytes,
+                    result.scanned_file_count,
+                    result.census_complete,
+                ));
+                assert!(bytes <= budget, "paced by the byte budget: {receipts:?}");
+            }
+            let reading = receipts.iter().filter(|receipt| receipt.0 > 0).count();
+            assert_eq!(
+                reading, bound,
+                "ceil(bytes / budget) reading pages: {receipts:?}"
+            );
+            assert!(
+                receipts.len() <= bound + 1,
+                "pages without a read only close a walk: {receipts:?}"
+            );
+            assert_eq!(
+                reads, files,
+                "every stamped file is read once: {receipts:?}"
+            );
+            // Then nothing more: the walk in flight completes, and so does
+            // one whole walk after it, reading no file.
+            let mut complete = 0;
+            let mut after = Vec::new();
+            while complete < 2 {
+                assert!(after.len() < 8, "the walks complete: {after:?}");
+                let result = page(&mut index, 3);
+                complete += usize::from(result.census_complete);
+                after.push((result.scanned_file_count, result.snapshots.len()));
+            }
+            assert!(
+                after.iter().all(|&(read, sent)| read == 0 && sent == 0),
+                "no second re-read: {after:?}"
+            );
+            assert_eq!(at(&index, 3), files);
+        });
+    });
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A fold that latches the stop after the candidate loop permitted an
+/// upgrade blocks its emission at the seam.
+#[test]
+fn a_latch_set_after_the_candidate_loop_blocks_permitted_history() {
+    let (home, root, mut index) = families("history-gate-late-latch", 1);
+    let empty = support("history-gate-late-latch-support");
+    fs::write(ReemissionExclusions::path(&empty), "").unwrap();
+    index.load_claude_reemission_exclusions(&empty);
+    let previous = index.clone();
+    let mut result = scan(&root, &mut index, "ctx-2", 2);
+    assert_eq!(result.snapshots.len(), 2, "permitted before the fold");
+    note_claude_reemission_stop_with_cause_at(
+        &ClaudeContextFileBirthCounts::default(),
+        &BTreeSet::new(),
+        Some(ClaudeReemissionStopCause::EvidenceBound),
+        std::time::Instant::now(),
+    );
+    let settled = settle(&home, &previous, &mut result, &mut index);
+    assert!(result.snapshots.is_empty());
+    assert_eq!(revisions(&settled), vec![1; 2]);
+    restart_claude_reemission_stop_for_test();
+    let _ = fs::remove_dir_all(home);
+}
+
+/// The shared stamp never downgrades a Claude revision and refuses a file
+/// the gate holds; Codex and Pi keep the exact stamp.
+#[test]
+fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
+    let (home, root, mut index) = families("history-gate-stamp", 1);
+    let key = index.files.keys().next().unwrap().clone();
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 3;
+    index.activate_effective_upload_body_witness_revision(2);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    assert!(index.stamp_effective_upload_body_witness_revision(&key, &fingerprint, 2));
+    assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
+    index.activate_effective_upload_body_witness_revision(2);
+    assert!(index.stamp_effective_upload_body_witness_revision(&key, &fingerprint, 2));
+    assert_eq!(
+        index.files[&key].effective_upload_body_witness_revision, 2,
+        "the exact (Codex and Pi) comparison assigns"
+    );
+    assert!(!index.stamp_effective_upload_body_witness_revision(&key, &fingerprint, 0));
+
+    // A held file never stamps, whatever path settles it.
+    let never = support("history-gate-stamp-support");
+    index.load_claude_reemission_exclusions(&never);
+    index.claude_no_list_policy = NoListPolicy::HoldUnverified;
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 1;
+    forget_activity(&mut index);
+    let _held = with_no_list_cutoff(u64::MAX, || scan(&root, &mut index, "ctx-3", 2));
+    let held = index
+        .files
+        .iter()
+        .find(|(_, entry)| entry.effective_upload_body_witness_revision == 1)
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .unwrap();
+    assert!(index.claude_history_emission_held(&held.1).is_some());
+    assert!(!index.stamp_effective_upload_body_witness_revision(&held.0, &held.1, 2));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// The listed family's subagent member id (`root_stem`).
+fn listed_member(index: &ScanIndex, family: &str) -> String {
+    index
+        .files
+        .keys()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .find(|(root, member)| root == family && member != family)
+        .map(|(_, member)| member)
+        .unwrap()
+}
+
+/// A member directory the closure cannot read may hold a
+/// listed member, so its root is held, not sent.
+#[cfg(unix)]
+#[test]
+fn unreadable_member_directory_holds_its_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, root, index) = families("history-gate-member-unreadable", 2);
+    let support = support("history-gate-member-unreadable-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&listed_member(&index, &session(1)))),
+    )
+    .unwrap();
+    let subagents = root.join(session(1)).join("subagents");
+    fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    fresh.load_claude_reemission_exclusions(&support);
+    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
+    fs::set_permissions(&subagents, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result
+        .snapshots
+        .iter()
+        .all(|item| !item.source_session_id.starts_with(&session(1))));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// One synthetic usage line for subagent `agent` of family `family`.
+fn subagent_line(family: &str, agent: &str) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "timestamp": "2026-08-23T18:20:00Z",
+            "type": "assistant",
+            "sessionId": family,
+            "agentId": agent,
+            "isSidechain": true,
+            "requestId": format!("request-{family}-{agent}"),
+            "message": {
+                "id": format!("message-{family}-{agent}"),
+                "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }
+        })
+    )
+}
+
+/// A family `<project>/<family>/subagents/<stem>.jsonl` for each stem, with
+/// no root file unless `with_root`. Returns the project dir and each file's
+/// candidate, by stem (the root's under `""`).
+fn family_on_disk(
+    project: &Path,
+    family: &str,
+    stems: &[&str],
+    with_root: bool,
+) -> BTreeMap<String, CandidateFile> {
+    let candidate = |path: PathBuf| CandidateFile {
+        physical_identity: None,
+        scan_root: project.to_path_buf(),
+        source_file_fingerprint: path.display().to_string(),
+        path,
+        size_bytes: 1,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+        withheld_content_stamp: None,
+    };
+    let subagents = project.join(family).join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let mut candidates = BTreeMap::new();
+    for stem in stems {
+        let path = subagents.join(format!("{stem}.jsonl"));
+        fs::write(&path, subagent_line(family, stem)).unwrap();
+        candidates.insert((*stem).to_owned(), candidate(path));
+    }
+    if with_root {
+        let path = project.join(format!("{family}.jsonl"));
+        fs::write(&path, subagent_line(family, "root")).unwrap();
+        candidates.insert(String::new(), candidate(path));
+    }
+    candidates
+}
+
+/// A fresh index with prior history on this Mac and `list` installed: every
+/// new file born before the cutoff is owed history.
+fn fresh_with_list(name: &str, list: &str) -> (crate::test_scratch::ScratchDir, ScanIndex) {
+    let support = support(name);
+    fs::write(ReemissionExclusions::path(&support), list).unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    fresh.activate_effective_upload_body_witness_revision(2);
+    fresh.adopt_effective_upload_body_witness_revision_monotonically();
+    fresh.load_claude_reemission_exclusions(&support);
+    assert_eq!(
+        fresh.claude_reemission_exclusions.state(),
+        ListState::Installed
+    );
+    (support, fresh)
+}
+
+fn decide(index: &mut ScanIndex, candidate: &CandidateFile) -> HistoryDecision {
+    index.claude_history_upgrade_decision(candidate, Some(0), &mut HistoryPage::default())
+}
+
+/// A rootless family whose member walk cannot finish holds its root: an
+/// unreadable nested directory (it may hold the listed member), or more
+/// entries than the walk's bound.
+#[test]
+fn rootless_family_walk_that_cannot_finish_holds_the_root() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::test_scratch::unique_path("ottto-history-gate-rootless-unreadable");
+        let project = home.join("project");
+        let family = session(1);
+        let members = family_on_disk(&project, &family, &["agent-b"], false);
+        let nested = project.join(&family).join("subagents").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("agent-a.jsonl"),
+            subagent_line(&family, "agent-a"),
+        )
+        .unwrap();
+        let (_support, mut fresh) = fresh_with_list(
+            "history-gate-rootless-unreadable-support",
+            &format!("{}\n", digest(&format!("{family}_agent-a"))),
+        );
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000)).unwrap();
+        let decision = decide(&mut fresh, &members["agent-b"]);
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(decision, HistoryDecision::Held(HistoryHold::Listed));
+        assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    let home = crate::test_scratch::unique_path("ottto-history-gate-rootless-bound");
+    let project = home.join("project");
+    let family = session(1);
+    let members = family_on_disk(&project, &family, &["agent-b"], false);
+    let subagents = project.join(&family).join("subagents");
+    for slot in 0..4_096 {
+        fs::write(subagents.join(format!("pad-{slot}")), "").unwrap();
+    }
+    // Nothing on disk is listed: only the bound holds the root.
+    let (_support, mut fresh) = fresh_with_list(
+        "history-gate-rootless-bound-support",
+        &format!("{}\n", digest(&format!("{family}_agent-absent"))),
+    );
+    assert_eq!(
+        decide(&mut fresh, &members["agent-b"]),
+        HistoryDecision::Held(HistoryHold::Listed)
+    );
+    assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A listed (held) family member owed only a proof
+/// correction is not re-read every traversal: it is skipped like any held
+/// adoption, and its correction is deferred to the history gate (disclosed)
+/// instead of blocking a fully settled upload.
+#[test]
+fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
+    let (home, root, mut index) = families("history-gate-correction", 2);
+    let support = support("history-gate-correction-support");
+    let family = session(1);
+    let owed = listed_member(&index, &family);
+    let members = index
+        .files
+        .iter()
+        .filter_map(|(key, entry)| {
+            claude_index_path_family_member(Path::new(key))
+                .filter(|(root, _)| *root == family)
+                .map(|(_, member)| (member, entry.source_file_fingerprint.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(members.len(), 2);
+    let witness = claude_usage_family_witness_fingerprint(
+        index
+            .claude_usage_family_witnesses
+            .entry(family.clone())
+            .or_insert_with(|| ClaudeUsageFamilyWitness {
+                evidence_fingerprint: "e".repeat(64),
+                member_request_id_fingerprints: BTreeMap::new(),
+                member_occurrence_fingerprints: BTreeMap::new(),
+                assigned_request_id_fingerprints: BTreeMap::new(),
+                legacy_excluded_request_id_hashes: BTreeMap::new(),
+                legacy_exclusion_evidence_fingerprint: None,
+                legacy_owner_roots: BTreeSet::new(),
+            }),
+    );
+    index.claude_usage_authority_quarantine.insert(
+        family.clone(),
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: witness.clone(),
+            member_source_file_fingerprints: members,
+            failed_reconstruction_count: MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+            retry_after_unix_seconds: 0,
+            proof_correction: Some(ClaudeAuthorityProofCorrection {
+                proof_witness_fingerprint: witness,
+                owed_member_ids: BTreeSet::from([owed]),
+            }),
+        },
+    );
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&family)),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let mut scanned = Vec::new();
+    for _ in 0..2 {
+        let mut result = scan(&root, &mut index, "ctx-1", 2);
+        scanned.push(result.scanned_file_count);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        assert!(result
+            .snapshots
+            .iter()
+            .all(|item| !item.source_session_id.starts_with(&family)));
+        // The uploader exact-ACKs the emitted bodies: each earns its receipt.
+        let acks =
+            crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&result.snapshots);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &result.snapshots,
+            &acks,
+        );
+    }
+    assert_eq!(
+        scanned,
+        vec![2, 0],
+        "only the unlisted family parses, once; the held member is never re-read"
+    );
+    assert_eq!(
+        index.claude_authority_proof_correction_blocking(),
+        (false, 1),
+        "the held member's correction is deferred, not blocking"
+    );
+    // A re-armed member (cleared fingerprint) is still found by identity.
+    let member_key = index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(root, member)| root == family && member != family)
+        })
+        .unwrap()
+        .clone();
+    index
+        .files
+        .get_mut(&member_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(
+        index.claude_authority_proof_correction_blocking(),
+        (false, 1)
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// StateMissing L1: a stored cutoff ahead of the clock is pulled back to
+/// now, and only prior history records one.
+#[test]
+fn history_cutoff_is_bounded_by_the_clock() {
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let mut index = ScanIndex::default();
+    index.note_claude_history_cutoff(PriorHistory::None, false, true);
+    assert_eq!(
+        index.claude_history_cutoff_unix_seconds, None,
+        "fresh install"
+    );
+    index.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(index.claude_history_cutoff_unix_seconds, None);
+    index.claude_history_cutoff_unix_seconds = Some(u64::MAX - 1);
+    index.note_claude_history_cutoff(PriorHistory::None, false, false);
+    assert!(index.claude_history_cutoff_unix_seconds.unwrap() <= now());
+    // Prior history records a cutoff on the first gated
+    // load of an index without one, never on an index a gated daemon already
+    // loaded (a fresh install's after its bootstrap).
+    let mut pre_gate = ScanIndex::default();
+    pre_gate.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert!(pre_gate.claude_history_cutoff_unix_seconds.is_some());
+    let mut gated = ScanIndex::default();
+    gated.note_claude_history_cutoff(PriorHistory::None, false, false);
+    gated.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(gated.claude_history_cutoff_unix_seconds, None);
+}
+
+/// StateMissing N1: the first gated load of an intact index records the last
+/// moment it shows this destination receiving history (the newest valid
+/// activity clock among its accepted entities), so sessions created after it
+/// are new. A fresh index, a replay drop, or an index with no accepted
+/// activity records now.
+#[test]
+fn history_cutoff_is_the_last_received_activity() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let received = |activity: &[(&str, Option<&str>, bool)]| {
+        let mut index = ScanIndex::default();
+        for (fingerprint, at, accepted) in activity {
+            index
+                .snapshot_activity_at
+                .insert(fingerprint.repeat(64), at.map(str::to_owned));
+            if *accepted {
+                index
+                    .accepted_snapshot_fingerprints
+                    .insert(fingerprint.repeat(64));
+            }
+        }
+        index
+    };
+    let activity = [
+        ("a", Some("2026-08-02T07:00:00Z"), true),
+        ("b", Some("2026-08-02T07:30:00Z"), true),
+        ("c", Some("2026-08-02T09:00:00Z"), false),
+        ("d", Some("not a clock"), true),
+        ("e", None, true),
+    ];
+    let mut pre_gate = received(&activity);
+    pre_gate.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(
+        pre_gate.claude_history_cutoff_unix_seconds,
+        Some(1_785_655_800),
+        "2026-08-02T07:30:00Z: the newest accepted activity, not an unaccepted one"
+    );
+    let mut lost = received(&activity);
+    lost.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    assert!(lost.claude_history_cutoff_unix_seconds.unwrap() >= now);
+    let mut unknown = received(&[("a", Some("2026-08-02T07:00:00Z"), false)]);
+    unknown.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert!(unknown.claude_history_cutoff_unix_seconds.unwrap() >= now);
+    let mut future = received(&[("a", Some("2999-01-01T00:00:00Z"), true)]);
+    future.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert!(future.claude_history_cutoff_unix_seconds.unwrap() <= now + 60);
+}
+
+/// The cycle's no-list
+/// policy. An unverified Mac holds; a move under a claim policy other than
+/// an explicit `full` holds, and its index keeps that after its own
+/// bootstrap until a `full` claim; everything else is paced.
+#[test]
+fn no_list_policy_follows_the_prior_history_evidence() {
+    let policy = |prior: PriorHistory, full: bool, index: &mut ScanIndex| {
+        index.note_claude_history_cutoff(prior, full, true);
+        index.claude_no_list_policy
+    };
+    let mut index = ScanIndex::default();
+    assert_eq!(
+        policy(PriorHistory::None, false, &mut index),
+        NoListPolicy::Pace
+    );
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::Pace
+    );
+    assert_eq!(
+        policy(PriorHistory::Unverified, false, &mut index),
+        NoListPolicy::HoldUnverified
+    );
+    let mut full_move = ScanIndex::default();
+    assert_eq!(
+        policy(PriorHistory::Moved, true, &mut full_move),
+        NoListPolicy::Pace
+    );
+    assert!(!full_move.claude_history_move_not_full);
+    assert_eq!(
+        policy(PriorHistory::Moved, false, &mut index),
+        NoListPolicy::HoldMoveNotFull
+    );
+    assert!(index.claude_history_move_not_full);
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::HoldMoveNotFull,
+        "the moved history stays held after this destination's bootstrap"
+    );
+    assert_eq!(
+        policy(PriorHistory::Here, true, &mut index),
+        NoListPolicy::Pace,
+        "an explicit full claim lifts it"
+    );
+    assert!(!index.claude_history_move_not_full, "and clears it");
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::Pace,
+        "a later claim with another policy does not bring it back"
+    );
+    let scratch = crate::test_scratch::ScratchDir::new("history-gate-move-kept");
+    let path = scratch.join("index.json");
+    let mut moved = ScanIndex::default();
+    moved.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    moved.save_fixture(&path).unwrap();
+    let mut reloaded = ScanIndex::load(&path).unwrap();
+    assert!(reloaded.claude_history_move_not_full, "persisted");
+    assert!(
+        reloaded
+            .committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new())
+            .claude_history_move_not_full
+    );
+    // Move, then `full`, then save, reload and a same-destination claim with
+    // another policy: the hold stays lifted.
+    let previous = reloaded.clone();
+    reloaded.note_claude_history_cutoff(PriorHistory::Here, true, false);
+    let mut lifted = reloaded.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert!(
+        !lifted.claude_history_move_not_full,
+        "a partial commit keeps it lifted"
+    );
+    lifted.save_fixture(&path).unwrap();
+    let mut again = ScanIndex::load(&path).unwrap();
+    again.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
+
+    // The evidence may still read as a move after the `full` claim (its own
+    // bootstrap and uploads not done yet): the release holds all the same,
+    // across a save, a reload and a replay drop.
+    let mut moving = ScanIndex::default();
+    moving.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    assert_eq!(moving.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
+    moving.note_claude_history_cutoff(PriorHistory::Moved, true, false);
+    assert_eq!(moving.claude_no_list_policy, NoListPolicy::Pace);
+    let moving_path = scratch.join("moving.json");
+    moving.save_fixture(&moving_path).unwrap();
+    let mut reloaded = ScanIndex::load(&moving_path).unwrap();
+    for entries_lost in [false, true] {
+        reloaded.note_claude_history_cutoff(PriorHistory::Moved, false, entries_lost);
+        assert_eq!(reloaded.claude_no_list_policy, NoListPolicy::Pace);
+        assert!(!reloaded.claude_history_move_not_full);
+    }
+}
+
+/// Activating a revision with no history-policy row keeps
+/// the previous active revision, raises one local alarm and counts it; with
+/// a row it activates. The static release check above stays the second line.
+#[test]
+fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
+    with_max_gated_claude_revision(3, || {
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(2);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        // Per-pass state a refused activation must still reset (R6).
+        index
+            .effective_upload_body_witness_revision_excluded_source_files
+            .insert("held-source".into());
+        index.claude_history_emission.files.insert(
+            "gated-source".into(),
+            super::claude_history_upgrade::GatedHistory::default(),
+        );
+        let stamp = None;
+        index
+            .claude_reemission_exclusions
+            .note_members_walked("walked-root", stamp);
+        assert!(index
+            .claude_reemission_exclusions
+            .members_walked("walked-root", &stamp));
+        let refused = local_count(LocalCount::ActivationRefused);
+        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+            with_max_gated_claude_revision(2, || {
+                index.activate_effective_upload_body_witness_revision(3);
+            });
+        });
+        assert_eq!(index.active_effective_upload_body_witness_revision, 2);
+        assert!(
+            index.active_effective_upload_body_witness_revision_monotone,
+            "the kept revision keeps its flag"
+        );
+        assert!(index
+            .effective_upload_body_witness_revision_excluded_source_files
+            .is_empty());
+        assert!(index.claude_history_emission.files.is_empty());
+        assert!(
+            !index
+                .claude_reemission_exclusions
+                .members_walked("walked-root", &stamp),
+            "begin_pass runs on a refused activation too"
+        );
+        assert_eq!(alarms.len(), 1, "{alarms:?}");
+        assert_eq!(
+            alarms[0]["stage"],
+            "claude_history_revision_activation_refused"
+        );
+        assert_eq!(alarms[0]["counts"]["refused_revision"], 3);
+        assert_eq!(alarms[0]["counts"]["kept_revision"], 2);
+        assert_eq!(local_count(LocalCount::ActivationRefused), refused + 1);
+
+        let ((), none) = crate::local_resource_diagnostics::capture(|| {
+            index.activate_effective_upload_body_witness_revision(3);
+        });
+        assert_eq!(index.active_effective_upload_body_witness_revision, 3);
+        assert!(none.is_empty());
+        assert_eq!(local_count(LocalCount::ActivationRefused), refused + 1);
+        let _ = crate::local_resource_diagnostics::capture(|| {
+            index.activate_effective_upload_body_witness_revision(4);
+        });
+        assert_eq!(index.active_effective_upload_body_witness_revision, 3);
+    });
+}
+
+/// Stand-in for the money item emitter, which builds request-owned items
+/// after the emission seam: one literal copy of every item. It ignores
+/// the emitter's own protected-root skip, so only the gate removes it.
+fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
+    let copies = snapshots
+        .iter()
+        .map(|item| {
+            let mut copy = item.clone();
+            copy.usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
+            copy
+        })
+        .collect::<Vec<_>>();
+    snapshots.extend(copies);
+}
+
+/// F5: a same-size file whose mtime alone moved is not a genuine change. A
+/// listed root touched this way is held history under revision 3: nothing
+/// emits and its tuple and stamp stay.
+#[test]
+fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
+    with_max_gated_claude_revision(3, || {
+        let (home, root, mut index) = families("history-gate-touched", 1);
+        let support = support("history-gate-touched-support");
+        fs::write(
+            ReemissionExclusions::path(&support),
+            format!("{}\n", digest(&session(0))),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        let path = root.join(format!("{}.jsonl", session(0)));
+        let size = fs::metadata(&path).unwrap().len();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size);
+        let previous = index.clone();
+        let denied = local_count(LocalCount::ListedLiteralDenied);
+        let mut result = scan(&root, &mut index, "ctx-1", 3);
+        let settled = settle(&home, &previous, &mut result, &mut index);
+        assert!(result.snapshots.is_empty(), "held, not ordinary sync");
+        assert_eq!(local_count(LocalCount::ListedLiteralDenied), denied);
+        assert_eq!(revisions(&settled), vec![1; 2]);
+        let suffix = format!("{}.jsonl", session(0));
+        let key = settled
+            .files
+            .keys()
+            .find(|key| key.ends_with(&suffix))
+            .unwrap();
+        assert_eq!(
+            settled.files[key].last_snapshot_fingerprint,
+            previous.files[key].last_snapshot_fingerprint
+        );
+        let _ = fs::remove_dir_all(home);
+    });
+}
+
+/// A literal item and a covering stamp for a listed root that
+/// is not a candidate this cycle (a settlement, a re-offer outside the scan
+/// hints, an in-place resend): no literal of the listed family passes
+/// either upload path and it never stamps revision 3, while an unlisted
+/// family keeps both. [money] A paused list holds adoption only: it stamps
+/// no file during the pause but filters literals by the digests it still has, so
+/// with them kept the listed family stays off `e2` (G4), and with none (a
+/// list missing after install) every family takes `e2` until the list is
+/// back (G5, disclosed).
+#[test]
+fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
+    with_max_gated_claude_revision(3, || {
+        let (home, root, mut index) = families("history-gate-c2", 2);
+        // Items with the indexed source files, as a resend would carry them.
+        // A delivery context alone reads nothing, even for files whose
+        // entity stamps are gone (unproven): forward-only.
+        let mut probe = index.clone();
+        probe.upload_context_proof.entity_stamps.clear();
+        assert!(
+            scan(&root, &mut probe.clone(), "ctx-probe", 1)
+                .snapshots
+                .is_empty(),
+            "a context change reads no unproven file"
+        );
+        // A re-arm is a live read cause: the probe re-emits the bodies.
+        for entry in probe.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
+        let mut items = scan(&root, &mut probe, "ctx-probe", 1).snapshots;
+        assert_eq!(items.len(), 4);
+        mint_request_owned_copies(&mut items);
+        let support = support("history-gate-c2-support");
+        fs::write(
+            ReemissionExclusions::path(&support),
+            format!("{}\n", digest(&session(1))),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        index.activate_effective_upload_body_witness_revision(3);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        // No file was decided this cycle.
+        index.claude_history_emission = HistoryEmission::default();
+        let listed_sources = index
+            .files
+            .iter()
+            .filter(|(key, _)| key.contains(&session(1)))
+            .map(|(_, entry)| entry.source_file_fingerprint.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(listed_sources.len(), 2);
+        let literals = |items: &[SnapshotItem]| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT)
+                })
+                .map(|item| item.source_file_fingerprint.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // Both upload paths: the resend hook and the emission seam.
+        let upload_paths = |index: &mut ScanIndex| {
+            let mut resend = items.clone();
+            index.retain_claude_history_emission_permitted(&mut resend);
+            let mut seam = items.clone();
+            index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut seam);
+            [resend, seam]
+        };
+        let only_unlisted_literals = |index: &mut ScanIndex| {
+            for kept in upload_paths(index) {
+                assert_eq!(kept.len(), 6, "every body plus the unlisted literals");
+                let kept_literals = literals(kept.as_slice());
+                assert_eq!(kept_literals.len(), 2, "{kept_literals:?}");
+                assert!(kept_literals
+                    .iter()
+                    .all(|source| !listed_sources.contains(source)));
+            }
+            let index: &ScanIndex = index;
+            let applies = |slot| {
+                crate::snapshots::claude_request_money::e2::family_applies(
+                    index,
+                    &session(slot),
+                    None,
+                )
+            };
+            assert!(applies(0) && !applies(1), "only the unlisted family folds");
+        };
+        only_unlisted_literals(&mut index);
+        for (key, entry) in index.files.clone() {
+            let listed = listed_sources.contains(&entry.source_file_fingerprint);
+            assert_eq!(
+                index.stamp_effective_upload_body_witness_revision(
+                    &key,
+                    &entry.source_file_fingerprint,
+                    3
+                ),
+                !listed,
+                "{key}"
+            );
+        }
+        for (key, entry) in &index.files {
+            let expected = if listed_sources.contains(&entry.source_file_fingerprint) {
+                1
+            } else {
+                3
+            };
+            assert_eq!(
+                entry.effective_upload_body_witness_revision, expected,
+                "{key}"
+            );
+        }
+
+        let (key, entry) = index
+            .files
+            .iter()
+            .find(|(_, entry)| !listed_sources.contains(&entry.source_file_fingerprint))
+            .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+            .unwrap();
+        let no_stamp = |index: &mut ScanIndex| {
+            assert!(index.claude_reemission_exclusions.pauses_adoption());
+            index.re_owe_effective_upload_body_witness_revision(&key, 2);
+            assert!(!index.stamp_effective_upload_body_witness_revision(&key, &entry, 3));
+            assert_eq!(index.files[&key].effective_upload_body_witness_revision, 2);
+        };
+
+        // G4: paused with its digests kept (closure overflow).
+        let installed = index.claude_reemission_exclusions.clone();
+        index.claude_reemission_exclusions =
+            installed.with_state_for_test(ListState::ClosureOverflow);
+        only_unlisted_literals(&mut index);
+        no_stamp(&mut index);
+
+        // G5: the list goes missing after install. No digest is left, so
+        // every literal passes both paths and the listed family folds.
+        fs::remove_file(ReemissionExclusions::path(&support)).unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        for kept in upload_paths(&mut index) {
+            assert_eq!(kept.len(), 8, "every body and every literal");
+        }
+        assert!(crate::snapshots::claude_request_money::e2::family_applies(
+            &index,
+            &session(1),
+            None
+        ));
+        no_stamp(&mut index);
+
+        // Once the list is back, the listed family is denied again.
+        fs::write(
+            ReemissionExclusions::path(&support),
+            format!("{}\n", digest(&session(1))),
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(&support);
+        assert!(!index.claude_reemission_exclusions.pauses_adoption());
+        only_unlisted_literals(&mut index);
+        let _ = fs::remove_dir_all(home);
+    });
+}

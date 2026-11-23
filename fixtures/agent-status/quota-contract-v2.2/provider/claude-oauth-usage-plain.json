@@ -1,0 +1,51 @@
+{
+  "five_hour": {
+    "utilization": 26.0,
+    "resets_at": "2026-10-01T15:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 100.0,
+    "resets_at": "2026-10-04T05:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "tangelo": null,
+  "cinder_cove": null,
+  "wattle_ember": null,
+  "iguana_necktie": {
+    "utilization": 5.0,
+    "resets_at": "2026-11-05T07:59:00+00:00",
+    "limit_dollars": 250,
+    "used_dollars": 12.5,
+    "remaining_dollars": 237.5,
+    "locked_reason": null
+  },
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": "out_of_credits",
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": true
+  },
+  "spend": {
+    "enabled": false,
+    "disabled_reason": "out_of_credits",
+    "used": null,
+    "limit": null,
+    "percent": null,
+    "severity": null,
+    "balance": null
+  }
+}

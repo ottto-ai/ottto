@@ -1,0 +1,741 @@
+// Synthetic v1 custody -> composed rows -> mapper hydrate
+// -> real scan, identity qualification, finalization and upload encoding.
+use super::money_equivalence_tests::{
+    claude_change, claude_corpus, compare_claude_uploads, corpus, finish_claude_pages, grow,
+    input_clock, receipt_with_output,
+};
+use super::*;
+use serde_json::Value;
+
+pub(super) fn tagged_api(
+    request: &str,
+    tokens: u64,
+    account: Option<&str>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    tagged_api_for(ROOT, request, tokens, account)
+}
+
+pub(super) fn tagged_api_for(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    account: Option<&str>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    tag(api_for(session, request, tokens, tokens * 10), account)
+}
+
+/// A telemetry row that names `account` (None: a present but invalid login).
+fn tag(
+    mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence,
+    account: Option<&str>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    use crate::claude_local_otel::{
+        ClaudeIdentityAttributeEvidence as Attribute, ClaudeIdentityAttributeOrigin as Origin,
+        ClaudeIdentityDisposition as Disposition, ClaudeRequestIdentityEvidence,
+    };
+    row.account_identity_checked = true;
+    row.account_identifier_hash = account.map(Into::into);
+    row.request_identity = Some(std::sync::Arc::new(ClaudeRequestIdentityEvidence {
+        identity_hash_scheme: "provider-sha256:v1".into(),
+        account: Attribute {
+            // None models a present but invalid login attribute.
+            origin: Origin::LogRecord,
+            disposition: if account.is_some() {
+                Disposition::Complete
+            } else {
+                Disposition::Invalid
+            },
+            resource_hash: None,
+            log_record_hash: account.map(str::to_owned),
+        },
+        organization: Attribute {
+            origin: Origin::Missing,
+            disposition: Disposition::Missing,
+            resource_hash: None,
+            log_record_hash: None,
+        },
+        disposition: if account.is_some() {
+            Disposition::Missing
+        } else {
+            Disposition::Invalid
+        },
+    }));
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&row).unwrap())
+    );
+    row
+}
+
+fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
+    let key = path.to_str().unwrap();
+    let mut raw = serde_json::to_value(&*index).unwrap();
+    match class {
+        "census_keep" => {
+            // The retained old copy shares exact request hashes with the live
+            // member. These hashes justify keeping the old copy and its old window.
+            let record = raw["claude_request_census"][key].clone();
+            assert!(
+                record.is_object(),
+                "warm scan must create real census custody"
+            );
+            let mut old = record;
+            old["w"] = json!(0);
+            raw["claude_request_census"]["/synthetic/aged-copy"] = old;
+        }
+        "pending" => {
+            let shaped: Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/scan_index/real-shaped-v1.json"
+            ))
+            .unwrap();
+            for field in ["claude_account_family_pending"] {
+                let mut pending = shaped["logical"][field]["synthetic-family"].clone();
+                assert!(pending.is_object(), "pending fixture must be present");
+                for member_field in ["members", "member_request_id_hashes", "member_occurrences"] {
+                    // IndexMut would insert null for absent optional maps,
+                    // which the v1 decoder correctly refuses as a non-map.
+                    if let Some(members) =
+                        pending.get_mut(member_field).and_then(Value::as_object_mut)
+                    {
+                        let value = members.remove("synthetic-file").unwrap();
+                        members.insert(key.into(), value);
+                    }
+                }
+                if let Some(windows) = pending
+                    .get_mut("previous_windows")
+                    .and_then(Value::as_array_mut)
+                {
+                    for window in windows {
+                        let members = window["members"].as_object_mut().unwrap();
+                        let value = members.remove("synthetic-file").unwrap();
+                        members.insert(key.into(), value);
+                    }
+                }
+                raw[field] = json!({ROOT: pending});
+            }
+        }
+        "proved_rows" | "authority_quarantine" => {
+            raw["claude_account_family_witnesses"] = json!({ROOT: {
+                "account_identifier_hash":"a".repeat(64), "evidence_request_count":1,
+                "members":{key:1}, "member_request_id_fingerprints":{key:"b".repeat(64)}
+            }});
+            raw["claude_usage_family_witnesses"] = json!({ROOT:{
+                "evidence_fingerprint":"c".repeat(64),
+                "member_request_id_fingerprints":{key:"b".repeat(64)},
+                "member_occurrence_fingerprints":{key:"d".repeat(64)},
+                "assigned_request_id_fingerprints":{ROOT:"e".repeat(64)},
+                "legacy_excluded_request_id_hashes":{key:["f".repeat(64)]},
+                "legacy_exclusion_evidence_fingerprint":"1".repeat(64), "legacy_owner_roots":[ROOT]
+            }});
+            if class == "authority_quarantine" {
+                raw["claude_usage_authority_quarantine"] = json!({ROOT:{
+                    "contract":"claude_usage_authority_quarantine:v2",
+                    "proven_witness_fingerprint":"c".repeat(64),
+                    "member_source_file_fingerprints":{key:raw["files"][key]["source_file_fingerprint"]},
+                    "failed_reconstruction_count":2,"disposition":"unproven_terminal",
+                    "retry_after_unix_seconds":u64::MAX,
+                    "proof_correction":{"proof_witness_fingerprint":"2".repeat(64),"owed_member_ids":[ROOT]}
+                }});
+            }
+        }
+        "snapshot_quarantine" => {
+            let mut record =
+                crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+            record.retry_after_unix_seconds = u64::MAX;
+            record.failed_reconstruction_count = 3;
+            record.disposition = crate::snapshots::SnapshotQuarantineDisposition::UnprovenTerminal;
+            raw["quarantined_snapshot_fingerprints"] = json!({"8".repeat(64):record});
+        }
+        "accepted_ack" => {
+            let fp = "3".repeat(64);
+            raw["accepted_snapshot_fingerprints"] = json!([fp]);
+            // Only the current ledger loads; an older one is held for a reset.
+            raw["accepted_snapshot_fingerprint_ledger_version"] = json!(2);
+            raw["accepted_rebuild_incidence"] = json!({key:[fp]});
+            raw["upload_ack_retirement_handoff"] = json!({
+                "destination_namespace_hash":"4".repeat(64), "committed_generation":index.generation,
+                "bodies":{fp:"5".repeat(64)}, "pending_bodies":{"6".repeat(64):"7".repeat(64)}
+            });
+        }
+        "copy_removal" => {
+            let births = &mut index.claude_money_birth_store;
+            let from = "/synthetic/moved-away";
+            births.record_observation(COPY, from, nanos("2026-08-01T07:00:00Z"));
+            births.record_observation(COPY, key, nanos(AT));
+            assert!(births.record_proven_move(
+                COPY,
+                crate::snapshots::claude_money_birth_store::location_key(from),
+                key
+            ));
+            births.set_money_rule_version(1);
+            births.set_money_marks(key, 1 | 2 | 4);
+            return;
+        }
+        "identity" | "identity_inheritance" => {}
+        _ => panic!("uncovered money class {class}"),
+    }
+    *index = serde_json::from_value(raw).unwrap();
+}
+
+fn condition_b(class: &str) {
+    with_e2(|| {
+        let mut c = corpus(&format!("v2-condition-b-{class}"));
+        if class == "identity" {
+            crate::snapshots::write_claude_reemission_list_for_test(&c.support, &[ROOT]);
+        }
+        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        input_clock(&path);
+        c.evidence(
+            &[tagged_api("r1", 10, Some(&"a".repeat(64)))],
+            &[trace("r1", "")],
+        );
+        let mut warm = c.raw(
+            &E2ScanFixture::with_identity_capture(class.starts_with("identity")),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        warm.enrich(&c);
+        warm.finish();
+        assert!(!warm.scan.snapshots.is_empty(), "warm fixture must emit");
+        let mut prior = warm.index;
+        add_class(&mut prior, &path, class);
+        // Decode both arms from the same v1 bytes, dropping identical runtime
+        // flags. Only the candidate passes through composed populate/hydrate.
+        let mut v1: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
+        // The restore arm loads as a live pass does; the imported view is
+        // read back for the custody comparison only.
+        let (mut store, v2, v2_view) = crate::snapshots::StateV2ColdStore::roundtrip(
+            &v1,
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("money.v2.sqlite.import"),
+        );
+        v1.generation = v2.generation;
+        assert_eq!(
+            canonical(&v1),
+            canonical(&v2_view),
+            "all custody and join keys"
+        );
+        grow(&path, "r2", 20);
+        c.evidence(
+            &[
+                tagged_api("r1", 10, Some(&"a".repeat(64))),
+                tagged_api("r2", 20, None),
+            ],
+            &[trace("r1", ""), trace("r2", "")],
+        );
+        let mut pages = [v1.clone(), v1, v2].map(|prior| {
+            c.raw(
+                &E2ScanFixture::with_identity_capture(class.starts_with("identity")),
+                prior,
+                100,
+                false,
+                &[],
+            )
+        });
+        finish_claude_pages(&c, &mut pages);
+        for candidate in &pages[1..] {
+            assert_eq!(
+                candidate.receipt(),
+                pages[0].receipt(),
+                "session, fingerprint and body join keys"
+            );
+            assert_eq!(
+                canonical(&candidate.scan.snapshots),
+                canonical(&pages[0].scan.snapshots),
+                "identity tags/refusals and money"
+            );
+            assert_eq!(
+                candidate.disposition, pages[0].disposition,
+                "authority refusal"
+            );
+        }
+        if matches!(class, "identity" | "identity_inheritance") {
+            assert!(
+                pages[0]
+                    .scan
+                    .snapshots
+                    .iter()
+                    .any(|item| !item.request_evidence.is_empty()),
+                "tagged r1 must survive"
+            );
+        }
+        if class == "identity" {
+            assert!(
+                pages[0]
+                    .scan
+                    .snapshots
+                    .iter()
+                    .any(|item| item.request_identity_refusals > 0),
+                "invalid r2 must disclose its refusal"
+            );
+        }
+        if class == "identity_inheritance" {
+            // Preserve coverage of the original `e2` path too: its invalid
+            // login inherits r1's account rather than emitting a refusal.
+            assert!(pages[0]
+                .scan
+                .snapshots
+                .iter()
+                .all(|item| item.request_identity_refusals == 0));
+        }
+        if pages[0].scan.snapshots.is_empty() {
+            assert!(
+                matches!(class, "proved_rows" | "authority_quarantine"),
+                "unexpected empty money fixture {class}"
+            );
+            assert!(
+                pages[0].disposition.quarantined_entity_count() > 0,
+                "empty fixture must have a named refusal"
+            );
+            // A held family has no upload request in either arm.
+            for page in &pages {
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut e2_progress(), |_| {
+                    panic!("held family POST")
+                });
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(sent.is_empty());
+            }
+        } else {
+            let body = compare_claude_uploads(&pages);
+            receipt_with_output(
+                &format!("v2-{class}"),
+                &[body],
+                "OTTTO_STATE_V2_MONEY_EQUIVALENCE_OUTPUT",
+                "STATE_V2_MONEY_EQUIVALENCE",
+            );
+            // Receiver UNCHANGED is a distinct settlement: compare the real
+            // POST and retained progress without pretending it was a stored ACK.
+            let unchanged = pages.each_ref().map(|page| {
+                let mut progress = e2_progress();
+                progress
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, |batch| {
+                    let mut response = ack(batch)?;
+                    response.unchanged_entities = std::mem::take(&mut response.accepted_entities);
+                    for entity in &mut response.unchanged_entities {
+                        entity.unchanged_basis = Some("usage_identical".into());
+                    }
+                    Ok(response)
+                });
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(!sent.is_empty());
+                assert!(
+                    progress.accepted_identity_buckets.is_empty(),
+                    "UNCHANGED must not invent accepted shares"
+                );
+                (sent, serde_json::to_vec(&progress).unwrap())
+            });
+            assert_eq!(unchanged[0], unchanged[1]);
+            assert_eq!(unchanged[0], unchanged[2]);
+            // Persisted exact-body ACKs must still suppress a subsequent POST.
+            let mut accepted = e2_progress();
+            let (result, sent, _) = upload(&pages[0].scan.snapshots, &mut accepted, ack);
+            assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+            assert!(!sent.is_empty());
+            let bytes = serde_json::to_vec(&accepted).unwrap();
+            for page in &pages {
+                let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut restored, |_| {
+                    panic!("unchanged exact body POST")
+                });
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(sent.is_empty());
+            }
+        }
+        if class == "pending" {
+            // Restart arm: the v2 page saves through the production delta,
+            // reloads and scans the next page. v1 takes the same page in RAM
+            // and through a real v1 save and load. The retired account field
+            // of the seeded store is decoded and dropped on every arm.
+            let ram: ScanIndex =
+                serde_json::from_slice(&serde_json::to_vec(&pages[0].index).unwrap()).unwrap();
+            let restart = {
+                let dir = c.base.join("v1-restart");
+                std::fs::create_dir_all(&dir).unwrap();
+                crate::locked_state_dir::test_locks::hold(&dir);
+                let index_path = dir.join("scan-index.json");
+                let mut saved = ram.clone();
+                // `ram` carries the v2 store's generation; a v1 save creates
+                // a new file only from generation 0.
+                saved.generation = 0;
+                saved.save_fixture(&index_path).unwrap();
+                ScanIndex::load(&index_path).unwrap()
+            };
+            let [_, _, disk] = pages;
+            let mut page = disk.index;
+            let cold = store.save_reload(&mut page);
+            // The next page switches account and captures identity, so its
+            // rows are tagged and accepted shares are recorded.
+            grow(&path, "r3", 30);
+            c.evidence(
+                &[
+                    tagged_api("r1", 10, Some(&"a".repeat(64))),
+                    tagged_api("r2", 20, None),
+                    tagged_api("r3", 30, Some(&"b".repeat(64))),
+                ],
+                &[trace("r1", ""), trace("r2", ""), trace("r3", "")],
+            );
+            // The first page's growth claim on the live v2 session paces a
+            // second growth Full of this file for six hours; v1 has no growth
+            // pacing. Scan the next page past that interval, every arm alike.
+            let scan = || {
+                let mut next = [ram, restart, cold].map(|prior| {
+                    c.raw(
+                        &E2ScanFixture::with_identity_capture(true),
+                        prior,
+                        100,
+                        false,
+                        &[],
+                    )
+                });
+                finish_claude_pages(&c, &mut next);
+                next
+            };
+            #[cfg(unix)]
+            let next = crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 7 * 60 * 60,
+                scan,
+            );
+            #[cfg(not(unix))]
+            let next = scan();
+            for candidate in &next[1..] {
+                assert_eq!(candidate.receipt(), next[0].receipt(), "restart join keys");
+                assert_eq!(
+                    canonical(&candidate.scan.snapshots),
+                    canonical(&next[0].scan.snapshots),
+                    "restart totals and account tags"
+                );
+            }
+            assert!(
+                next[0]
+                    .scan
+                    .snapshots
+                    .iter()
+                    .any(|item| !item.request_evidence.is_empty()),
+                "positive control: tagged rows reach the restart page"
+            );
+            compare_claude_uploads(&next);
+            let accepted = next.each_ref().map(|page| {
+                let mut progress = e2_progress();
+                progress
+                    .accepted_identity_buckets
+                    .bind_test_key(Some([0x42; 32]));
+                let (result, sent, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(!sent.is_empty());
+                assert!(
+                    !progress.accepted_identity_buckets.is_empty(),
+                    "positive control: accepted identity shares"
+                );
+                serde_json::to_vec(&progress).unwrap()
+            });
+            assert_eq!(
+                accepted[0], accepted[1],
+                "v1 restart accepted identity buckets"
+            );
+            assert_eq!(
+                accepted[0], accepted[2],
+                "cold restart accepted identity buckets"
+            );
+        }
+    });
+}
+
+macro_rules! classes {
+    ($($test:ident => $class:literal),+ $(,)?) => {$(#[doc = "[money] Preserve the next upload and ACK custody for this persisted money class, restored cold."] #[test] fn $test() { condition_b($class); })+};
+}
+classes! {
+    v2_census_and_920_keep_emit_identical_next_body => "census_keep",
+    v2_account_pending_emits_identical_next_body => "pending",
+    v2_option_ii_proved_rows_emit_identical_body_or_refusal => "proved_rows",
+    v2_authority_quarantine_preserves_refusal_and_join_keys => "authority_quarantine",
+    v2_accepted_ledger_and_ack_handoff_preserve_no_post => "accepted_ack",
+    v2_snapshot_quarantine_preserves_terminal_refusal => "snapshot_quarantine",
+    v2_e2_copy_removal_and_rule_marks_preserve_next_body => "copy_removal",
+    v2_909_identity_tags_and_refusals_preserve_next_body => "identity",
+    v2_e2_invalid_identity_inheritance_preserves_next_body => "identity_inheritance",
+}
+
+/// [money] v2 accepted identity buckets and ack receipt preserve identical next upload.
+#[test]
+fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload() {
+    with_e2(|| {
+        let mut c = corpus("v2-accepted-identity-buckets");
+        // Accepted-share protection deliberately retains uniform markerless `e2` bodies in the
+        // existing wire shape. An own captured marker exercises identity rows.
+        let marker = json!({"type":"attachment", "sessionId":ROOT,
+            "attachment":{"type":"credential_org",
+                "organizationUuid":"11111111-1111-4111-8111-111111111111"}});
+        let path = c.root(
+            ROOT,
+            &(marker.to_string() + "\n" + &line(ROOT, "r1", AT, 10)),
+        );
+        input_clock(&path);
+        c.evidence(
+            &[tagged_api("r1", 10, Some(&"a".repeat(64)))],
+            &[trace("r1", "")],
+        );
+        let mut warm = c.raw(
+            &E2ScanFixture::with_identity_capture(true),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        warm.enrich(&c);
+        warm.finish();
+        assert!(
+            warm.scan
+                .snapshots
+                .iter()
+                .any(|item| !item.request_evidence.is_empty()),
+            "fixture must carry real identity tags"
+        );
+        let mut progress = e2_progress();
+        progress
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        let (result, sent, _) = upload(&warm.scan.snapshots, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(!sent.is_empty());
+        assert!(!progress.accepted_identity_buckets.is_empty());
+        let bytes = serde_json::to_vec(&progress).unwrap();
+        let progress_path = c.base.join("claude_code-upload-progress.json");
+        ottto_core::write_owner_only_file_atomic(&progress_path, &bytes).unwrap();
+        let v2 = crate::snapshots::state_v2_money_roundtrip(
+            &warm.index,
+            &c.base
+                .canonicalize()
+                .unwrap()
+                .join("accepted.v2.sqlite.import"),
+        );
+        assert_eq!(
+            std::fs::read(&progress_path).unwrap(),
+            bytes,
+            "import/ACK handoff must leave external progress byte-unchanged"
+        );
+        let mut v1: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&warm.index).unwrap()).unwrap();
+        v1.generation = v2.generation;
+        grow(&path, "r2", 20);
+        // A changed/new authority must not erase the previously accepted share.
+        c.evidence(
+            &[
+                tagged_api("r1", 10, Some(&"a".repeat(64))),
+                tagged_api("r2", 20, Some(&"b".repeat(64))),
+            ],
+            &[trace("r1", ""), trace("r2", "")],
+        );
+        let mut pages = [v1.clone(), v1, v2].map(|prior| {
+            c.raw(
+                &E2ScanFixture::with_identity_capture(true),
+                prior,
+                100,
+                false,
+                &[],
+            )
+        });
+        let mut bodies = Vec::new();
+        for page in &mut pages {
+            let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
+            restored
+                .accepted_identity_buckets
+                .bind_test_key(Some([0x42; 32]));
+            assert_eq!(
+                restored.accepted_identity_buckets,
+                progress.accepted_identity_buckets
+            );
+            page.enrich_with(&c, Some(&mut restored.accepted_identity_buckets));
+            page.finish();
+            let (result, sent, _) = upload(&page.scan.snapshots, &mut restored, ack);
+            assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+            assert!(!sent.is_empty(), "changed body must reach next POST");
+            bodies.push(sent);
+        }
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(
+            bodies[0], bodies[2],
+            "accepted share priority, identity parts/refusals, body bytes and joins"
+        );
+        assert_eq!(std::fs::read(&progress_path).unwrap(), bytes);
+    });
+}
+
+/// A4: two accounts, shared by every cold row. The row's telemetry (r1 alone
+/// when the row has none) answers on account a, and two more root requests
+/// answer on accounts a and b. Telemetry tags a request only with its trace
+/// ownership row, so each added request carries one; the row's own traces
+/// are kept, so its ownership cases are unchanged.
+#[cfg(unix)]
+pub(super) fn second_account(c: &Corpus, path: &Path) {
+    let mut effort: Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence> =
+        otel_rows(c, "claude-code-effort");
+    if effort.is_empty() {
+        effort.push(api("r1", 10, 100));
+    }
+    let mut effort: Vec<_> = effort
+        .into_iter()
+        .map(|row| tag(row, Some(&"a".repeat(64))))
+        .collect();
+    let mut traces: Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence> =
+        otel_rows(c, "claude-code-trace-ownership");
+    for (request, tokens, account) in [("r-account-a", 40, "a"), ("r-account-b", 50, "b")] {
+        append(path, &line(ROOT, request, AT, tokens));
+        effort.push(tagged_api(request, tokens, Some(&account.repeat(64))));
+        traces.push(trace(request, ""));
+    }
+    c.evidence(&effort, &traces);
+}
+
+/// The root session's telemetry rows of one kind, as last written.
+#[cfg(unix)]
+pub(super) fn otel_rows<T: serde::de::DeserializeOwned>(c: &Corpus, directory: &str) -> Vec<T> {
+    let path = c
+        .support
+        .join("local-otel")
+        .join(directory)
+        .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The page's real upload with ACK, as the placement oracle reads it.
+#[cfg(unix)]
+pub(super) fn routed(
+    page: &Page,
+    policy: SnapshotUploadPolicy,
+) -> crate::snapshots::sampled_scan::transition_fixture::RouteResult {
+    use crate::snapshots::sampled_scan::transition_fixture::{Mode, RouteResult};
+    let mut progress = e2_progress();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let (result, bodies, _) = upload_under(policy, &page.scan.snapshots, &mut progress, ack);
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    let mut route = RouteResult::emitted_under(
+        Mode::ColdFull,
+        SnapshotSource::ClaudeCode,
+        bodies,
+        &page.scan.snapshots,
+        policy,
+    );
+    route.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    route
+}
+
+/// An `e2` money row from the same v1 bytes, resident and restored cold on a
+/// live session. Both arms emit the same bodies, totals and account
+/// placement.
+#[cfg(unix)]
+fn cold_row(name: &str) {
+    if !crate::heap_layout_bound::layout_supported() {
+        println!("STATE_V2_COLD_ROW {name} UNEXECUTED: native retained layout unavailable");
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = claude_corpus(name);
+        let scanner = || E2ScanFixture::with_identity_capture(true);
+        let mut warm = c.raw(&scanner(), ScanIndex::default(), 100, false, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let mut prior = warm.index;
+        add_class(&mut prior, &path, "pending");
+        claude_change(&c, &path, name);
+        second_account(&c, &path);
+        input_clock(&path);
+        let mut v1: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&prior).unwrap()).unwrap();
+        let (custody, mut v2) = crate::snapshots::StateV2ColdSession::publish(
+            crate::snapshots::scan_index_persistence::Source::Claude,
+            &v1,
+            &c.base.canonicalize().unwrap().join("cold-session"),
+        );
+        // Tail rows share this store: their presence must not move money.
+        crate::snapshots::state_v2_stage_tail_for_test(custody.path());
+        let v2 = custody.save_reload(&mut v2);
+        assert!(crate::snapshots::state_v2_tail_published_for_test(&v2));
+        v1.generation = v2.generation;
+        let mut pages = [v1, v2].map(|prior| c.raw(&scanner(), prior, 100, false, &[]));
+        for page in &mut pages {
+            page.enrich(&c);
+            page.finish();
+        }
+        // The pass's growth claim saved the store one generation past the
+        // page graph before the page ran; its loads still read at the claim.
+        assert!(
+            custody.claimed_ahead(&pages[1].index),
+            "a claim-only save precedes the cold page"
+        );
+        // Account placement is per usage row and identity part; request
+        // evidence carries only the organization.
+        let accounts = pages[0]
+            .scan
+            .snapshots
+            .iter()
+            .flat_map(|item| {
+                item.model_usage
+                    .iter()
+                    .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+            })
+            .flat_map(|row| {
+                row.account_identifier_hash.iter().chain(
+                    row.identity_parts
+                        .iter()
+                        .flatten()
+                        .filter_map(|part| part.account_identifier_hash.as_ref()),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(accounts.len() >= 2, "positive control: two accounts placed");
+        let [resident, cold] = pages
+            .each_ref()
+            .map(|page| routed(page, SnapshotUploadPolicy::default()));
+        crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+            &resident, &cold,
+        );
+    });
+}
+
+macro_rules! cold_rows {
+    ($($test:ident => $row:literal),+ $(,)?) => {$(#[doc = "[money] A4: this E2 money row emits the same bodies and account placement restored cold on a live session."] #[cfg(unix)] #[test] fn $test() { cold_row($row); })+};
+}
+cold_rows! {
+    v2_cold_duplicate_request_ids_place_money_identically => "duplicate_request_ids",
+    v2_cold_progressive_response_places_money_identically => "progressive_response",
+    v2_cold_resolver_conflict_places_money_identically => "resolver_conflict",
+    v2_cold_side_owner_places_money_identically => "side_owner",
+    v2_cold_side_without_owner_places_money_identically => "side_without_owner",
+    v2_cold_side_owner_directory_unlisted_places_money_identically => "side_owner_directory_unlisted",
+}

@@ -1,0 +1,373 @@
+//! Test-only bridge from emitted-body fixtures to the composed semantic mapper.
+//! Publication is deliberately not simulated: this proves row custody, while
+//! the import fixtures separately exercise the production publication route.
+use super::*;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use super::super::scan_index_persistence::Source;
+
+pub(super) fn binding(source: Source) -> super::super::scan_index_persistence::Binding {
+    super::super::scan_index_persistence::Binding {
+        source,
+        namespace_hash: "a".repeat(64),
+    }
+}
+
+/// Synthetic v1 file name that `scan_index_storage_binding` binds to `source`.
+pub(super) fn synthetic_file(source: Source, suffix: &str) -> String {
+    format!(
+        "{}-synthetic-scan-index{suffix}",
+        source.snapshot().api_slug()
+    )
+}
+
+pub(super) fn populate(
+    source: Source,
+    path: &Path,
+    index: &ScanIndex,
+    presence: BTreeMap<String, bool>,
+) -> sqlite::Sqlite {
+    let mut db = sqlite::Sqlite::create_import(path).unwrap();
+    let identity = Identity {
+        format: FORMAT,
+        db_id: "synthetic-money-custody".into(),
+        binding: binding(source),
+        fence_generation: index.generation,
+    };
+    db.control("identity", &identity).unwrap();
+    db.control("generation", &index.generation).unwrap();
+    let mut cx = KindCx::default();
+    cx.binding = Some(binding(source));
+    cx.presence = presence;
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    kinds::populate(index, &mut tx, &mut cx).unwrap();
+    assert_eq!(
+        tx.commit(index.generation, index.generation + 1),
+        DurableCommitOutcome::Committed(index.generation + 1)
+    );
+    // Journal OFF deliberately invalidates aborted imports. Fault/rollback
+    // tests must operate on a completed import reopened in live WAL mode.
+    db.finish_import().unwrap();
+    sqlite::Sqlite::open(path, &identity).unwrap()
+}
+
+pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> ScanIndex {
+    ColdStore::roundtrip(index, path).2
+}
+
+/// Condition b's v2 store. Its graphs load as a live pass loads them, on a
+/// live session.
+pub(crate) struct ColdStore {
+    session: ColdSession,
+}
+impl ColdStore {
+    /// (store, its session graph, the same graph read back from the import).
+    pub(crate) fn roundtrip(index: &ScanIndex, path: &Path) -> (Self, ScanIndex, ScanIndex) {
+        // Feed v1 bytes through its decoder, rather than smuggling runtime
+        // state into the oracle. Leases and in-process flags are not custody.
+        let bytes = serde_json::to_vec(index).unwrap();
+        let mut expected: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let mut db = populate(Source::Claude, path, &expected, BTreeMap::new());
+        let restored = hydrate_resident(&mut db);
+        expected.generation += 1;
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&expected).unwrap(),
+            "composed money custody changed v1 fields or join keys"
+        );
+        assert_eq!(
+            restored.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        expected.generation -= 1;
+        let (session, cold) =
+            ColdSession::publish(Source::Claude, &expected, &path.with_extension("session"));
+        (Self { session }, cold, restored)
+    }
+
+    /// Save `page` (scanned from this store's graph) through the production
+    /// route and reload it.
+    pub(crate) fn save_reload(&mut self, page: &mut ScanIndex) -> ScanIndex {
+        self.session.save_reload(page)
+    }
+}
+
+/// Custody published through the real fence route and loaded by the runtime
+/// as a live pass loads it, over a real session store. Dropping it erases
+/// the custody.
+pub(crate) struct ColdSession {
+    path: std::path::PathBuf,
+}
+impl ColdSession {
+    /// (custody under `dir`, its cold graph).
+    pub(crate) fn publish(source: Source, index: &ScanIndex, dir: &Path) -> (Self, ScanIndex) {
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": "a".repeat(64),
+        }))
+        .unwrap();
+        Self::publish_with_progress(source, index, dir, &progress)
+    }
+    /// `publish` of a route whose upload-progress JSON holds exactly
+    /// `progress` before publication.
+    pub(crate) fn publish_with_progress(
+        source: Source,
+        index: &ScanIndex,
+        dir: &Path,
+        progress: &[u8],
+    ) -> (Self, ScanIndex) {
+        let path = dir
+            .join("snapshots/destinations")
+            .join("a".repeat(64))
+            .join(synthetic_file(source, ".json"));
+        Self::publish_at(index, &path, progress)
+    }
+    /// Publish at a real destination's checkpoint name for lifecycle fixtures.
+    pub(crate) fn publish_at(index: &ScanIndex, path: &Path, progress: &[u8]) -> (Self, ScanIndex) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cold = publish(index, path, progress);
+        assert!(cold.v2().persistence_v2.is_some(), "a live session");
+        (
+            Self {
+                path: path.to_owned(),
+            },
+            cold,
+        )
+    }
+    /// The published index path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    /// Save `page` (descended from this custody's graph) through the
+    /// production route and reload it.
+    pub(crate) fn save_reload(&self, page: &mut ScanIndex) -> ScanIndex {
+        page.save(&self.path).unwrap();
+        ScanIndex::load(&self.path).unwrap()
+    }
+    /// Whether this pass's claim-only growth save moved the store past
+    /// `index`, the working graph a page still saves from.
+    pub(crate) fn claimed_ahead(&self, index: &ScanIndex) -> bool {
+        super::super::sampled_audit::own_growth_claim_generation(index, &self.path)
+            .is_some_and(|generation| generation > index.generation)
+    }
+}
+impl Drop for ColdSession {
+    fn drop(&mut self) {
+        erase_published(&self.path);
+    }
+}
+
+/// Compare each selected page with the graph the full-clone saver received.
+/// Keep returned commitments across pages, including a freshly rebuilt subset.
+pub(crate) fn assert_selected_saves(source: Source, initial: &ScanIndex, pages: &[ScanIndex]) {
+    let scratch = crate::test_scratch::ScratchDir::canonical("selected-row-saves");
+    let mut db = populate(
+        source,
+        &scratch.join("state.v2.sqlite.import"),
+        initial,
+        BTreeMap::new(),
+    );
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (previous, mut cx) = kinds::hydrate(&mut db, binding(source)).unwrap();
+    let mut digests = kinds::baseline(&previous, &mut cx).unwrap();
+    for page in pages {
+        let mut expected = page.clone();
+        digests = kinds::save_graph(&mut db, &identity, digests, &mut expected, &mut cx).unwrap();
+        let restored = kinds::hydrate(&mut db, binding(source)).unwrap().0;
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert!(restored.decode_holds.same_as(&expected.decode_holds));
+        assert_eq!(
+            restored.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        assert_eq!(
+            restored.v2().growth_retention,
+            expected.v2().growth_retention
+        );
+    }
+}
+
+/// Preserve v2-only debt and raw holds through the composed store as well.
+pub(in super::super) fn roundtrip_rows(index: &ScanIndex, path: &Path) -> ScanIndex {
+    let mut db = populate(Source::Claude, path, index, BTreeMap::new());
+    hydrate_resident(&mut db)
+}
+
+/// The production hydrate, for graph comparisons.
+pub(super) fn hydrate_resident(db: &mut sqlite::Sqlite) -> ScanIndex {
+    import::hydrate_context(db).unwrap().0
+}
+
+/// CCR2 of the persisted copy-removals fixture plus one prefix-hold debt
+/// file, with definite metadata (shared by the format and inventory tests).
+pub(super) const CCR2_DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
+
+/// Install synthetic custody through the publication route.
+/// All subsequent loads, saves and receipt replay use the real route.
+pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {
+    publish_retaining_progress(index, path, progress, &FixtureProgress::default())
+}
+
+/// Exact native progress custody for an index-only fixture mutation, including
+/// identity barriers and rows a normal progress page leaves out of RAM.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct FixtureProgress(Vec<(Header, Vec<u8>)>);
+impl FixtureProgress {
+    pub(crate) fn capture(path: &Path) -> Self {
+        if !runtime::published(path).unwrap() {
+            return Self::default();
+        }
+        let index = ScanIndex::load(path).unwrap();
+        let mut saved = Self::default();
+        crate::snapshot_sync::with_state_v2_progress_lock(path, |_| {
+            runtime::with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                for kind in catalogue::PROGRESS_KINDS {
+                    let mut rows = mapper::KeyRows::new(kind, None, 128).unwrap();
+                    while let Some(header) = rows.next(&mut tx).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+                for name in [progress::GENERATION, progress::IMPORT] {
+                    if let Some(header) = tx.get(&RowKey::Meta(name.into())).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+        saved
+    }
+}
+
+pub(crate) fn publish_retaining_progress(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+) -> ScanIndex {
+    publish_fixture_at_generation(index, path, progress, retained, index.generation + 1)
+}
+
+/// Fresh quarantine fixtures keep the production rebuild's generation zero.
+pub(crate) fn publish_fixture_at_generation(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+    generation: u64,
+) -> ScanIndex {
+    let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
+    let identity = Identity {
+        format: FORMAT,
+        db_id: "synthetic-partial-checkpoint".into(),
+        binding: binding.clone(),
+        fence_generation: generation,
+    };
+    let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
+    db.control("identity", &identity).unwrap();
+    db.control("generation", &index.generation).unwrap();
+    let mut cx = KindCx::default();
+    cx.binding = Some(binding);
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    kinds::populate(index, &mut tx, &mut cx).unwrap();
+    for (header, bytes) in &retained.0 {
+        tx.put(RowInput {
+            key: &header.key,
+            fixed: &header.fixed,
+            value_version: header.value_version,
+            value: bytes,
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        tx.commit(index.generation, identity.fence_generation),
+        DurableCommitOutcome::Committed(identity.fence_generation)
+    );
+    db.finish_import().unwrap();
+    ottto_core::write_owner_only_file_atomic(
+        &fence::sibling(path, ".v1-readonly"),
+        &serde_json::to_vec(index).unwrap(),
+    )
+    .unwrap();
+    crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
+        match std::fs::read(progress_path) {
+            Ok(bytes) => assert_eq!(
+                bytes, progress,
+                "the published route keeps the actual original bytes"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ottto_core::write_owner_only_file_atomic(progress_path, progress)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    })
+    .unwrap();
+    fence::publish(path, &identity, &mut false).unwrap();
+    ScanIndex::load(path).unwrap()
+}
+
+pub(in super::super) use runtime::erase_published;
+
+/// Inject a synthetic persisted record fault before the next real hydrate.
+pub(crate) fn edit_record_for_test(
+    index: &ScanIndex,
+    kind: &str,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = mapper::key(kind, name, 1).unwrap();
+        let mut value = match tx.get(&key).unwrap() {
+            Some(header) => {
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                codec::decode::<serde_json::Value>(&bytes, value_cap(&key)).unwrap()
+            }
+            None => {
+                let manifest = mapper::key(kind, "", 0).unwrap();
+                let header = tx.get(&manifest).unwrap().expect("fixture kind manifest");
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                let count = codec::decode::<usize>(&bytes, value_cap(&manifest)).unwrap();
+                mapper::put(&mut tx, &manifest, &(count + 1)).unwrap();
+                serde_json::Value::Null
+            }
+        };
+        edit(&mut value);
+        mapper::put(&mut tx, &key, &value).unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}
+
+/// Model a progress header exhausted by earlier commits, without JSON import.
+pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &RowKey::Meta(progress::GENERATION.into()),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &serde_json::to_vec(&u64::MAX).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}

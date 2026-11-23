@@ -1,0 +1,2637 @@
+//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
+//! loads and saves every graph; these tests make no hydration parity claim.
+use super::*;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+/// Release synthetic custody and its registry slot when a fixture is finished.
+pub(in crate::snapshots) fn erase_published(path: &Path) {
+    // Cleanup also owns deliberately malformed fences; it must not decode them.
+    let _owner =
+        super::super::super::CheckpointLock::acquire_with_custody(path, false, Some(true)).unwrap();
+    erase_locked(path).unwrap();
+    states().lock().unwrap().remove(path);
+}
+
+/// Close the shared session before unlinking all artifacts, and invalidate
+/// clones before releasing CheckpointLock.
+fn erase_locked(path: &Path) -> Result<()> {
+    invalidate_locked(path)?;
+    for (suffix, _, _) in fence::ARTIFACTS {
+        fence::remove_artifact(&fence::sibling(path, suffix))?;
+    }
+    super::super::super::sync_checkpoint_parent(path)?;
+    remove_retired_record_dir(&retired_record_dir(path))?;
+    super::super::super::sync_checkpoint_parent(path)?;
+    // Retain the invalidated route's custody latch: erased artifacts must not
+    // let this process resume v1 or re-create v2 without an explicit new lineage.
+    Ok(())
+}
+
+pub(super) fn load_with(path: &Path, importable: bool) -> Result<Option<ScanIndex>> {
+    Ok(load_locked(path, importable, published(path)?)?.0)
+}
+pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
+    save_with_mode(path, index, false)
+}
+pub(super) fn save_with_mode(path: &Path, index: &mut ScanIndex, claim_only: bool) -> Result<bool> {
+    save_locked(path, index, claim_only).map(|()| true)
+}
+
+/// Generation of a freshly imported native fixture store.
+pub(super) const G: u64 = 1;
+
+/// (generation, data version) before and after a raced delete.
+type RacedStamps = Option<((u64, u64), (u64, u64))>;
+thread_local! {
+    /// Delete this row from another connection right after the next
+    /// reused-session hydrate, before its stamp is re-read.
+    pub(super) static DELETE_DURING_HYDRATE: std::cell::Cell<Option<RowKey>> =
+        const { std::cell::Cell::new(None) };
+    /// That session connection's stamps around the delete.
+    pub(super) static RACED_STAMPS: std::cell::Cell<RacedStamps> =
+        const { std::cell::Cell::new(None) };
+    /// Commit G+1 on the session connection after the next growth claim
+    /// authenticated G, before its write transaction begins.
+    pub(super) static COMMIT_BEFORE_GROWTH_CLAIM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Apply a per-store seam to the live session store behind `index`; the
+/// failed save's reload reopens the store without it.
+pub(in crate::snapshots) fn with_session_db(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut sqlite::Sqlite),
+) {
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    let mut guard = runtime.session.lock().unwrap();
+    f(&mut guard.as_mut().unwrap().db);
+}
+/// Cap the session at its current pages and add enough new rows that the
+/// next save must grow the file: SQLite's own SQLITE_FULL, no fault knob.
+fn fill_session(index: &mut ScanIndex) {
+    with_session_db(index, |db| sqlite::cap_pages(db));
+    for n in 0..2048 {
+        index
+            .accepted_snapshot_fingerprints
+            .insert(format!("{n:064x}"));
+    }
+}
+
+pub(super) struct Fixture {
+    pub(super) support: PathBuf,
+    pub(super) path: PathBuf,
+}
+impl Fixture {
+    pub(super) fn new() -> Self {
+        let support = crate::test_scratch::canonical_private_dir("ottto-v2-route");
+        let parent = support.join("snapshots/destinations").join("b".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        Self {
+            path: parent.join("claude_code-test-scan-index.json"),
+            support,
+        }
+    }
+    pub(super) fn identity(&self) -> Identity {
+        Identity {
+            format: FORMAT,
+            db_id: "fixture-db".into(),
+            binding: binding(&self.path).unwrap(),
+            fence_generation: 0,
+        }
+    }
+    /// Native store: the shipped row mapper writes an empty graph at G.
+    fn imported(&self) {
+        self.import(true);
+    }
+    fn import(&self, mapped: bool) {
+        self.import_graph(mapped.then(ScanIndex::default).as_ref());
+    }
+    fn import_graph(&self, mapped: Option<&ScanIndex>) {
+        let mut db =
+            sqlite::Sqlite::create_import(&fence::sibling(&self.path, ".v2.sqlite.import"))
+                .unwrap();
+        db.control("identity", &self.identity()).unwrap();
+        db.control("generation", &0_u64).unwrap();
+        if let Some(graph) = mapped {
+            let mut cx = KindCx::default();
+            cx.binding = Some(self.identity().binding);
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            kinds::populate(graph, &mut tx, &mut cx).unwrap();
+            assert_eq!(tx.commit(0, G), DurableCommitOutcome::Committed(G));
+        }
+        db.finish_import().unwrap();
+    }
+    pub(super) fn published(&self) {
+        self.imported();
+        fence::publish(&self.path, &self.identity(), &mut false).unwrap();
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        super::super::money_test_support::erase_published(&self.path);
+        let _ = fs::remove_dir_all(&self.support);
+    }
+}
+
+/// [behaviour] Unbound v1 loads ignore growth fields for every source and never
+/// consult the v2 registry, even when another route owns it.
+#[test]
+fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
+    let root = crate::test_scratch::private_dir("v1-off-growth");
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let registry = states().lock().unwrap();
+        let root = &root;
+        scope.spawn(move || {
+            for source in [
+                crate::snapshots::SnapshotSource::ClaudeCode,
+                crate::snapshots::SnapshotSource::Codex,
+                crate::snapshots::SnapshotSource::Pi,
+            ] {
+                // An unbound path has no custody-probe exception. The bound
+                // Claude probe is covered by the existing custody regression.
+                let path = root.join(format!("{}-test-scan-index.json", source.api_slug()));
+                for growth in [
+                    serde_json::Value::Null,
+                    serde_json::json!(42),
+                    serde_json::json!({"/synthetic/grown": {"last_growth_full_unix": 100}}),
+                ] {
+                    let mut wire = serde_json::to_value(ScanIndex::default()).unwrap();
+                    wire["growth_retention"] = growth;
+                    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+                    crate::local_resource_diagnostics::source_prepare(
+                        source.api_slug(),
+                        || {
+                            let mut index =
+                                ScanIndex::load_attributed(&path, Some(source)).unwrap();
+                            assert!(index.v2.is_none());
+                            assert!(index.decode_holds.is_empty());
+                            let before = fs::read(&path).unwrap();
+                            let error = index.save(&path).unwrap_err();
+                            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ForeignBinding));
+                            assert_eq!(fs::read(&path).unwrap(), before);
+                        },
+                        |_| false,
+                    );
+                }
+            }
+            done.send(()).unwrap();
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(10));
+        drop(registry);
+        assert!(completed.is_ok(), "OFF loads waited for the v2 registry");
+    });
+    fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
+}
+
+/// [regress] F5: uninstall must not flock or latch a paused v1 import route.
+#[test]
+fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    let before = fs::read(&f.path).unwrap();
+    // An ordinary v1 owner must not prevent uninstall from reaching its
+    // established cleanup, and an absent checkpoint lock must stay absent.
+    invalidate_tree(&f.support).unwrap();
+    assert!(!f.path.with_extension("lock").exists());
+    let lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+    invalidate_tree(&f.support).unwrap();
+    drop(lock);
+    with_state(&f.path, |state| {
+        assert!(!state.latched);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    let live = Fixture::new();
+    live.published();
+    let index = load_with(&live.path, false).unwrap().unwrap();
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    assert!(runtime.session.lock().unwrap().is_some());
+    let fence = fs::read(&live.path).unwrap();
+    invalidate_tree(&live.support).unwrap();
+    assert!(runtime.session.lock().unwrap().is_none());
+    assert!(guard_external(&live.path, Some(runtime), index.generation).is_err());
+    assert_eq!(fs::read(&live.path).unwrap(), fence);
+}
+/// [format] f5 missing v1 garbled fences never authenticate final db.
+#[test]
+fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
+    for root in [
+        None,
+        Some(b"{\"schema_version\":3}".as_slice()),
+        Some(b"bad".as_slice()),
+    ] {
+        let f = Fixture::new();
+        f.published();
+        if let Some(bytes) = root {
+            fs::write(&f.path, bytes).unwrap();
+        } else {
+            fs::remove_file(&f.path).unwrap();
+        }
+        let db = fence::sibling(&f.path, ".v2.sqlite");
+        let before = fs::read(&db).unwrap();
+        assert_eq!(
+            load_with(&f.path, false)
+                .unwrap_err()
+                .downcast_ref::<Hold>(),
+            Some(&Hold::FenceLost)
+        );
+        assert!(guard_containment_locked(&f.path).is_err());
+        assert!(save_with(&f.path, &mut ScanIndex::default()).is_err());
+        assert_eq!(fs::read(db).unwrap(), before);
+        assert!(!fence::sibling(&f.path, ".v2.sqlite.import").exists());
+    }
+}
+/// [format] f7 publication failures keep latch and artifacts and restart recovers.
+#[test]
+fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
+    // Reconstruct the actual on-disk crash states, without process-global failpoints.
+    for point in ["before_fence_rename", "before_db_rename", "after_db_rename"] {
+        let f = Fixture::new();
+        fs::write(&f.path, b"v1-before-publication").unwrap();
+        f.imported();
+        let temp = fence::sibling(&f.path, ".v2-fence.tmp");
+        ottto_core::write_owner_only_file_atomic(
+            &temp,
+            &serde_json::to_vec(&fence::Fence::new(&f.identity())).unwrap(),
+        )
+        .unwrap();
+        if point != "before_fence_rename" {
+            fs::rename(&temp, &f.path).unwrap();
+        }
+        if point == "after_db_rename" {
+            fs::rename(
+                fence::sibling(&f.path, ".v2.sqlite.import"),
+                fence::sibling(&f.path, ".v2.sqlite"),
+            )
+            .unwrap();
+        }
+        assert!(fence::cleanup_unpublished(&f.path, true).is_err());
+        if point == "before_fence_rename" {
+            assert!(fence::reconcile(&f.path, &f.identity().binding, true).is_err());
+            assert_eq!(fs::read(&f.path).unwrap(), b"v1-before-publication");
+        } else {
+            let pair = fence::reconcile(&f.path, &f.identity().binding, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pair.0, f.identity());
+            assert!(pair.1.exists());
+            assert!(load_with(&f.path, false).unwrap().is_some());
+            assert!(guard_containment_locked(&f.path).is_err());
+        }
+    }
+}
+/// [format] f7 a load with no support dir saves a published route through the
+/// one semantic save and published custody without semantic rows holds.
+#[test]
+fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, G + 1);
+    // A fresh route must decode the missing semantic rows, never treat them as empty.
+    let f = Fixture::new();
+    f.import(false);
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    assert!(load_locked(&f.path, false, published(&f.path).unwrap()).is_err());
+}
+/// [format] publication pending pause does not touch v1.
+#[test]
+fn publication_pending_pause_does_not_touch_v1() {
+    let f = Fixture::new();
+    let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
+    raw["future_money"] = serde_json::json!({"owed": 1});
+    let bytes = serde_json::to_vec(&raw).unwrap();
+    fs::write(&f.path, &bytes).unwrap();
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    let mut index = ScanIndex::default();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
+}
+
+/// [behaviour] a support-dir load imports v1 or a missing root and publishes custody.
+#[test]
+fn support_dir_load_imports_and_publishes() {
+    use crate::snapshots::{ScanIndexLoadOrigin, SnapshotSource};
+    let source = SnapshotSource::ClaudeCode;
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    let index = ScanIndex::load_for_snapshot_source(&f.path, source, &f.support).unwrap();
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
+    assert_eq!(
+        index.generation, 1,
+        "present originals still advance on import"
+    );
+
+    let f = Fixture::new();
+    let (index, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Missing);
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(published(&f.path).unwrap());
+    let (mut reopened, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&reopened));
+    assert_eq!(reopened.generation, index.generation);
+    assert_eq!(
+        reopened.accepted_snapshot_fingerprints,
+        index.accepted_snapshot_fingerprints
+    );
+    assert!(save_with(&f.path, &mut reopened).unwrap());
+    let (saved, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&f.path, source, &f.support).unwrap();
+    assert!(saved.files.is_empty() && saved.generation >= 1);
+    assert!(!origin.is_fresh(&saved));
+}
+
+/// [format] absent parent containment guard never promotes a database.
+#[test]
+fn absent_parent_containment_guard_never_promotes_a_database() {
+    let f = Fixture::new();
+    f.imported();
+    let mut file = fence::create_private(&f.path).unwrap();
+    serde_json::to_writer(&mut file, &fence::Fence::new(&f.identity())).unwrap();
+    drop(file);
+    assert!(guard_containment_locked(&f.path).is_err());
+    assert!(fence::sibling(&f.path, ".v2.sqlite.import").exists());
+    assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
+}
+
+/// [format] damaged and oversized fence claims hold before v1 containment.
+#[test]
+fn damaged_and_oversized_fence_claims_hold_before_v1_containment() {
+    for bytes in [
+        b"{\"storage_format\":2,".to_vec(),
+        b"{\"storage_format\":3,".to_vec(),
+        b"{\"schema_version\":4,".to_vec(),
+        format!(
+            "{{\"schema_version\":4,\"padding\":\"{}\"}}",
+            "x".repeat(5000)
+        )
+        .into_bytes(),
+    ] {
+        let f = Fixture::new();
+        fs::write(&f.path, &bytes).unwrap();
+        assert!(load_with(&f.path, false).is_err());
+        assert!(guard_containment_locked(&f.path).is_err());
+        assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    }
+}
+
+/// [format] generation and capability are checked before external effects.
+#[test]
+fn generation_and_capability_are_checked_before_external_effects() {
+    for future_writer in [false, true] {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let check = crate::snapshots::state_v2_side_effect_guard(&f.path, &index);
+        check().unwrap();
+        {
+            let mut session = index
+                .v2()
+                .persistence_v2
+                .as_ref()
+                .unwrap()
+                .session
+                .lock()
+                .unwrap();
+            let session = session.as_mut().unwrap();
+            if future_writer {
+                sqlite::future_writer_for_test(&mut session.db);
+            } else {
+                session.db.control("generation", &(G + 1)).unwrap();
+            }
+        }
+        assert!(check().is_err());
+    }
+}
+
+/// [format] another graph save cannot advance a stale external guard.
+#[test]
+fn another_graph_save_cannot_advance_a_stale_external_guard() {
+    let f = Fixture::new();
+    f.published();
+    let mut first = load_with(&f.path, false).unwrap().unwrap();
+    let load = telemetry::take_thread_event_for_test("load_span").unwrap();
+    assert!(load["duration_ms"].is_u64());
+    assert_eq!(load["generation"], G);
+    assert_eq!(load.as_object().unwrap().len(), 2);
+    let second = load_with(&f.path, false).unwrap().unwrap();
+    let stale = crate::snapshots::state_v2_side_effect_guard(&f.path, &second);
+    stale().unwrap();
+    let saved = save_with(&f.path, &mut first).unwrap();
+    assert!(saved);
+    let save = telemetry::take_thread_event_for_test("save_span").unwrap();
+    assert!(save["duration_ms"].is_u64());
+    assert_eq!(save["outcome"], "committed");
+    assert_eq!(save["generation"], G + 1);
+    assert!(save["rows_put"].as_u64().unwrap() > 0);
+    assert_eq!(save["rows_removed"], 0);
+    assert_eq!(save.as_object().unwrap().len(), 5);
+    assert_eq!(second.generation, G);
+    assert_eq!(first.generation, G + 1);
+    assert!(stale().is_err());
+    crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
+}
+
+#[test]
+fn claim_only_save_retains_the_committed_ownership_baseline() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(save_with_mode(&f.path, &mut index, true).unwrap());
+    with_state(&f.path, |state| {
+        assert_eq!(
+            state
+                .save_digests
+                .as_ref()
+                .map(|b| (b.generation, b.links_only, b.rows.is_empty())),
+            Some((G + 1, true, true))
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, G + 2);
+}
+
+/// [format] real mapper runtime saves admitted state and keeps runtime policy.
+#[test]
+fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    index.historical_replay_generation = Some("synthetic-policy".into());
+    index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
+    // Committed row digests seed the next page; idle releases them.
+    with_state(&f.path, |state| {
+        assert_eq!(
+            state.save_digests.as_ref().map(|b| b.generation),
+            Some(G + 1)
+        );
+        Ok(())
+    })
+    .unwrap();
+    // A cycle that errors skips idle; its drop guard still releases it.
+    drop(BaselineRelease::new(&f.path, &index));
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_some());
+        Ok(())
+    })
+    .unwrap();
+    let _ = idle(&f.path, &index, true);
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(index.generation, G + 2);
+    assert_eq!(
+        index.active_upload_context_fingerprint.as_deref(),
+        Some("active-synthetic-policy")
+    );
+    assert!(index.v2().persistence_v2.is_some());
+    let current = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        current.historical_replay_generation,
+        index.historical_replay_generation
+    );
+    assert_eq!(current.generation, index.generation);
+}
+
+/// [format] newly adopted import can save without an intervening load.
+#[test]
+fn newly_adopted_import_can_save_without_an_intervening_load() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    // Use the real inventory/import/publication path: publication writes no
+    // progress receipt; upload progress moves in on its own first load.
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    let mut index = ScanIndex::default();
+    after_v1_locked(&f.path, &mut index).unwrap();
+    assert!(index.v2().persistence_v2.is_some());
+    assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
+    assert_eq!(index.generation, 1);
+    let runtime = index.v2().persistence_v2.clone().unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, 2);
+    assert!(Arc::ptr_eq(
+        &runtime,
+        index.v2().persistence_v2.as_ref().unwrap()
+    ));
+}
+
+/// [format] import without original inventory refuses publication, even with
+/// the conversion hook installed.
+#[test]
+fn import_without_original_inventory_refuses_publication() {
+    let f = Fixture::new();
+    let bytes = b"synthetic-v1-authority";
+    fs::write(&f.path, bytes).unwrap();
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    let mut index = ScanIndex::default();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+    assert!(index.v2().persistence_v2.is_none());
+    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+    for (suffix, _, _) in fence::ARTIFACTS
+        .iter()
+        .filter(|(_, cleanup, _)| *cleanup != fence::Cleanup::SourceOnly)
+    {
+        assert!(!fence::sibling(&f.path, suffix).exists());
+    }
+    assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
+    assert!(!fence::sibling(&f.path, ".v2-ack-receipt").exists());
+}
+
+// Real mapper coverage for the raw decoder/load route.
+mod hydrate_parity {
+    use super::*;
+    use crate::snapshots as s;
+    use s::lenient_decode;
+    use serde_json::value::RawValue;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn seed() -> ScanIndex {
+        let mut index = ScanIndex::default();
+        index.accepted_snapshot_fingerprints.insert("a".repeat(64));
+        index.files.insert(
+            "/synthetic/family.jsonl".into(),
+            s::tests::manifest_index_entry(Some(&"a".repeat(64))),
+        );
+        index.insert_retry_pending_claude_authority_for_test("family");
+        index
+    }
+    fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
+        let root: BTreeMap<String, &RawValue> = serde_json::from_slice(bytes).unwrap();
+        let records: BTreeMap<String, &RawValue> = serde_json::from_str(root[field].get()).unwrap();
+        records[key].get().into()
+    }
+    fn attach_raw(index: &mut ScanIndex, field: &str, key: &str, raw: &str) {
+        // Reuse the v1 hold codec to derive its platform-specific bookkeeping
+        // charge rather than duplicating the private HeldRaw layout in a fixture.
+        let probe =
+            lenient_decode::read_bounded(
+                br#"{"files":{"probe":{"size_bytes":[]}},"accepted_snapshot_fingerprint_ledger_version":2}"#,
+            )
+            .unwrap();
+        let (_, _, bytes, _, charge) = probe.decode_holds.v2_entries().next().unwrap();
+        let overhead =
+            charge - bytes.len() as u64 - serde_json::to_vec("probe").unwrap().len() as u64;
+        index
+            .decode_holds
+            .v2_insert(
+                field,
+                key.into(),
+                raw.as_bytes().to_vec(),
+                None,
+                overhead + raw.len() as u64 + serde_json::to_vec(key).unwrap().len() as u64,
+            )
+            .unwrap();
+        index.decode_holds.v2_finish((0, 0));
+    }
+    fn publish(f: &Fixture, index: &ScanIndex) {
+        let mut db =
+            sqlite::Sqlite::create_import(&fence::sibling(&f.path, ".v2.sqlite.import")).unwrap();
+        db.control("identity", &f.identity()).unwrap();
+        db.control("generation", &0_u64).unwrap();
+        let mut cx = KindCx::default();
+        cx.binding = Some(f.identity().binding);
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        db.finish_import().unwrap();
+        fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    }
+    fn assert_graph(expected: &ScanIndex, actual: &ScanIndex) {
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(actual.decode_holds.same_as(&expected.decode_holds));
+        assert_eq!(
+            actual.decode_holds.v2_provenance(),
+            expected.decode_holds.v2_provenance()
+        );
+        let custody = |index: &ScanIndex| {
+            index
+                .decode_holds
+                .v2_entries()
+                .map(|(field, key, raw, owner, charge)| {
+                    (
+                        field.to_owned(),
+                        key.to_owned(),
+                        raw.to_vec(),
+                        owner,
+                        charge,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(custody(actual), custody(expected));
+    }
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    /// Every decode and load clamps an out-of-range quarantine deadline to
+    /// its own wall-clock read, so two of them can land a second apart. Pin
+    /// deadlines clamped since `since` to `since`; anything else is untouched.
+    fn settled(mut index: ScanIndex, since: u64) -> ScanIndex {
+        let now = unix_now();
+        for record in index.quarantined_snapshot_fingerprints.values_mut() {
+            if (since..=now).contains(&record.retry_after_unix_seconds) {
+                record.retry_after_unix_seconds = since;
+            }
+        }
+        index
+    }
+    fn compare(bytes: &[u8], mapped: ScanIndex) -> ScanIndex {
+        let since = unix_now();
+        // Exercise the shared API with the stage used by both ordinary and
+        // claim-only CAS. SAVE owns installing its current-snapshot caller.
+        for bounded in [false, true] {
+            let expected = if bounded {
+                lenient_decode::read_bounded(bytes).unwrap()
+            } else {
+                lenient_decode::read(std::io::Cursor::new(bytes), "cas", "claude_code").unwrap()
+            };
+            let mut current = mapped.clone();
+            lenient_decode::post_decode_hydrated(&mut current, "cas", "claude_code").unwrap();
+            assert_graph(&settled(expected, since), &settled(current, since));
+        }
+        let f = Fixture::new();
+        let v1 = f.support.join("v1-index.json");
+        fs::write(&v1, bytes).unwrap();
+        // One clock for every load's own time checks.
+        let now = SystemTime::now();
+        let (mut expected, _) =
+            ScanIndex::load_inner_with_support(&v1, Some(s::SnapshotSource::ClaudeCode), None, now)
+                .unwrap();
+        publish(&f, &mapped);
+        expected.generation = 1;
+        let fence_bytes = fs::read(&f.path).unwrap();
+        let load = || {
+            ScanIndex::load_inner_with_support(
+                &f.path,
+                Some(s::SnapshotSource::ClaudeCode),
+                None,
+                now,
+            )
+            .unwrap()
+            .0
+        };
+        let actual = load();
+        // Both production save modes enter this exact current-snapshot CAS.
+        // Keep working edits/removals intact; compare normalized custody only.
+        for claim_only in [false, true] {
+            let mut working = actual.clone();
+            if !claim_only {
+                working.accepted_snapshot_fingerprints.clear();
+            }
+            let runtime = working.v2().persistence_v2.clone().unwrap();
+            let mut guard = runtime.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let mut tx = session.db.begin(TxnMode::Read).unwrap();
+            let generation = working.generation;
+            kinds_misc::merge_cas_at(&mut tx, &mut working, generation).unwrap();
+            kinds_files::merge_growth_cas(&mut tx, &mut working).unwrap();
+            assert!(working.decode_holds.same_as(&actual.decode_holds));
+            assert_eq!(
+                working.decode_holds.v2_provenance(),
+                actual.decode_holds.v2_provenance()
+            );
+            if !claim_only {
+                assert!(working.accepted_snapshot_fingerprints.is_empty());
+            }
+        }
+
+        let expected = settled(expected, since);
+        assert_graph(&expected, &settled(actual.clone(), since));
+        assert_graph(&expected, &settled(load(), since)); // hydrate again on the same connection
+        assert_eq!(fs::read(&v1).unwrap(), bytes);
+        assert_eq!(fs::read(&f.path).unwrap(), fence_bytes);
+        assert!(!fence::sibling(&f.path, ".v1-readonly").exists());
+        actual
+    }
+    fn typed_case(index: ScanIndex) -> ScanIndex {
+        let bytes = serde_json::to_vec(&index).unwrap();
+        // Mapped codecs, like serde, reconstruct decoded evidence.
+        let mapped = serde_json::from_slice(&bytes).unwrap();
+        compare(&bytes, mapped)
+    }
+    /// [format] future controls refuse before hydrate normalization and keep custody.
+    #[test]
+    fn future_controls_refuse_before_hydrate_normalization_and_keep_custody() {
+        for schema in [false, true] {
+            let mut index = seed();
+            if schema {
+                index.schema_version = s::SCAN_INDEX_SCHEMA_VERSION + 1;
+            } else {
+                index.accepted_snapshot_fingerprint_ledger_version =
+                    s::SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1;
+            }
+            let f = Fixture::new();
+            publish(&f, &index);
+            let before = fs::read(&f.path).unwrap();
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+        }
+    }
+    /// [format] An older build's accepted ledger (0 or 1) holds for a reset on
+    /// every load: refused before normalization, never migrated, and neither
+    /// a load nor a save changes its custody.
+    #[test]
+    fn older_ledger_holds_before_hydrate_normalization_and_keeps_custody() {
+        for version in [0_u8, 1] {
+            let mut index = seed();
+            index.accepted_snapshot_fingerprint_ledger_version = version;
+            let f = Fixture::new();
+            publish(&f, &index);
+            // The fence, the database (published import or its final name)
+            // and its WAL, plus the committed generation inside it.
+            let custody = || {
+                let read = |suffix: &str| fs::read(fence::sibling(&f.path, suffix)).ok();
+                let db = [".v2.sqlite", ".v2.sqlite.import"]
+                    .map(|suffix| fence::sibling(&f.path, suffix))
+                    .into_iter()
+                    .find(|path| path.exists())
+                    .unwrap();
+                (
+                    read(""),
+                    fs::read(&db).unwrap(),
+                    read(".v2.sqlite-wal"),
+                    sqlite::generation_for_test(&db),
+                )
+            };
+            let before = custody();
+            for _ in 0..2 {
+                // Each refusal is a cold open: it must not commit even its phase.
+                let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
+                assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
+                assert_eq!(custody(), before, "ledger {version}");
+            }
+            assert!(save_with(&f.path, &mut seed()).is_err());
+            assert_eq!(custody(), before, "ledger {version}");
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
+        }
+    }
+    /// [format] A hydrate clears a stale retired sweep cursor after its
+    /// baseline, so the next save writes the layout-1 row as null.
+    #[test]
+    fn hydrate_clears_a_stale_retired_cursor_and_the_next_save_writes_null() {
+        let mut index = seed();
+        index.legacy_settlement_reconcile_after_fingerprint = Some("a".repeat(64));
+        let f = Fixture::new();
+        publish(&f, &index);
+        let mut loaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(loaded.legacy_settlement_reconcile_after_fingerprint, None);
+        save_with(&f.path, &mut loaded).unwrap();
+        with_session_db(&loaded, |db| {
+            let (stored, _) = import::hydrate_context(db).unwrap();
+            assert_eq!(stored.legacy_settlement_reconcile_after_fingerprint, None);
+        });
+    }
+    /// [format] every hydrate runs deadline drop and cutoff rules.
+    #[test]
+    fn every_hydrate_runs_deadline_drop_and_cutoff_rules() {
+        let mut index = seed();
+        let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
+        quarantine.retry_after_unix_seconds = u64::MAX;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("b".repeat(64), quarantine);
+        let actual = typed_case(index);
+        assert!(s::snapshot_quarantine_deadline_is_bounded(
+            &actual.quarantined_snapshot_fingerprints[&"b".repeat(64)]
+        ));
+
+        let mut index = seed();
+        index
+            .snapshot_activity_at
+            .insert("c".repeat(64), Some("invalid time".into()));
+        index.accepted_snapshot_fingerprints.insert("bad".into());
+        index.claude_history_cutoff_unix_seconds = Some(s::MALFORMED_CLAUDE_HISTORY_CUTOFF);
+        index.claude_history_gate_loaded = true;
+        let actual = typed_case(index);
+        assert!(!actual.snapshot_activity_at.contains_key(&"c".repeat(64)));
+        assert!(!actual.accepted_snapshot_fingerprints.contains("bad"));
+        assert!(!actual.claude_history_gate_loaded);
+    }
+    /// [format] v2 load rearms legacy terminal with the v1 pacing rule.
+    #[test]
+    fn v2_load_rearms_legacy_terminal_with_the_v1_pacing_rule() {
+        let mut index = seed();
+        let fingerprint = "b".repeat(64);
+        let mut quarantine = s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode);
+        quarantine.disposition = s::SnapshotQuarantineDisposition::UnprovenTerminal;
+        quarantine.failed_reconstruction_count = s::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        quarantine.retry_after_unix_seconds = 0;
+        quarantine.reconstruction_contract = 0;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fingerprint.clone(), quarantine);
+        let f = Fixture::new();
+        let v1 = f.support.join("v1-index.json");
+        fs::write(&v1, serde_json::to_vec(&index).unwrap()).unwrap();
+        let (mut expected, _) = ScanIndex::load_inner_with_support(
+            &v1,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        publish(&f, &index);
+        let earliest = crate::snapshot_sync::quarantine_retry_after(&fingerprint);
+        let (mut actual, _) = ScanIndex::load_inner_with_support(
+            &f.path,
+            Some(s::SnapshotSource::ClaudeCode),
+            None,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let latest = crate::snapshot_sync::quarantine_retry_after(&fingerprint);
+        let record = &actual.quarantined_snapshot_fingerprints[&fingerprint];
+        assert_eq!(record.contract_retry_claims, Some(0));
+        assert!((earliest..=latest).contains(&record.retry_after_unix_seconds));
+        // Separate loads sample the wall clock independently. Compare the full
+        // graph after accounting solely for that clock sample, and prove the
+        // actual deadline against the shared jitter/pacing rule above.
+        expected.generation = 1;
+        expected
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        actual
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert_graph(&expected, &actual);
+    }
+    /// [money] typed unbound authority rearms files.
+    #[test]
+    fn typed_unbound_authority_rearms_files() {
+        let mut index = seed();
+        index
+            .claude_usage_family_witnesses
+            .get_mut("family")
+            .unwrap()
+            .legacy_owner_roots
+            .insert("unbound-owner".into());
+        let actual = typed_case(index);
+        assert!(actual.claude_usage_authority_quarantine.is_empty());
+        assert!(actual.files["/synthetic/family.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+    }
+    /// [money] raw quarantine repairs and opaque file freezes match v1 custody.
+    #[test]
+    fn raw_quarantine_repairs_and_opaque_file_freezes_match_v1_custody() {
+        let mut index = seed();
+        let fingerprint = "b".repeat(64);
+        index.quarantined_snapshot_fingerprints.insert(
+            fingerprint.clone(),
+            s::snapshot_quarantine_record(s::SnapshotSource::ClaudeCode),
+        );
+        let canonical = serde_json::to_string(&index).unwrap();
+        let old = raw_slot(
+            canonical.as_bytes(),
+            "quarantined_snapshot_fingerprints",
+            &fingerprint,
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&old).unwrap();
+        value["retry_after_unix_seconds"] = "mistyped-original".into();
+        let raw = serde_json::to_string_pretty(&value).unwrap();
+        let bytes = canonical.replace(&old, &raw).into_bytes();
+        index.quarantined_snapshot_fingerprints.clear();
+        attach_raw(
+            &mut index,
+            "quarantined_snapshot_fingerprints",
+            &fingerprint,
+            &raw,
+        );
+        let actual = compare(&bytes, index);
+        assert!(actual.decode_holds.is_empty());
+        assert_eq!(actual.decode_holds.v2_provenance().1, 1);
+
+        let mut index = seed();
+        let key = "/synthetic/family.jsonl";
+        let canonical = serde_json::to_string(&index).unwrap();
+        let old = raw_slot(canonical.as_bytes(), "files", key);
+        let mut value: serde_json::Value = serde_json::from_str(&old).unwrap();
+        value["size_bytes"] = serde_json::json!([]);
+        let raw = serde_json::to_string_pretty(&value).unwrap();
+        let bytes = canonical.replace(&old, &raw).into_bytes();
+        index.files.clear();
+        attach_raw(&mut index, "files", key, &raw);
+        let actual = compare(&bytes, index);
+        assert!(actual.decode_holds_family("family"));
+        assert!(actual.claude_usage_authority_quarantine.is_empty());
+    }
+    /// [money] original mistyped authority freezes siblings before canonicalization and bound control repairs.
+    #[test]
+    fn original_mistyped_authority_freezes_siblings_before_canonicalization_and_bound_control_repairs(
+    ) {
+        for bound in [false, true] {
+            let mut index = seed();
+            if !bound {
+                index
+                    .claude_usage_family_witnesses
+                    .get_mut("family")
+                    .unwrap()
+                    .legacy_owner_roots
+                    .insert("unbound-owner".into());
+            }
+            // Preserve noncanonical spacing and number spelling in the original
+            // raw slot. Re-encoding the repaired authority would lose this proof.
+            let canonical = serde_json::to_vec(&index).unwrap();
+            let original = raw_slot(&canonical, "claude_usage_authority_quarantine", "family");
+            let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            value["retry_after_unix_seconds"] = "mistyped-original".into();
+            let raw = serde_json::to_string_pretty(&value).unwrap();
+            let bytes = String::from_utf8(canonical)
+                .unwrap()
+                .replace(&original, &raw)
+                .into_bytes();
+            // A forced-unbound v1 read supplies the exact held slot's lexical
+            // charge. The mapped graph itself retains only this raw authority;
+            // all pending/witness siblings are still typed and must be frozen.
+            let mut unbound: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            unbound["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
+                serde_json::json!(["unbound-owner"]);
+            let unbound_bytes = serde_json::to_string(&unbound).unwrap();
+            let compact_raw = raw_slot(
+                unbound_bytes.as_bytes(),
+                "claude_usage_authority_quarantine",
+                "family",
+            );
+            let unbound_bytes = unbound_bytes.replace(&compact_raw, &raw);
+            let held = lenient_decode::read_bounded(unbound_bytes.as_bytes()).unwrap();
+            let (_, _, raw_bytes, owner, charge) = held
+                .decode_holds
+                .v2_entries()
+                .find(|(field, key, ..)| {
+                    *field == "claude_usage_authority_quarantine" && *key == "family"
+                })
+                .unwrap();
+            assert_eq!(raw_bytes, raw.as_bytes());
+            index.claude_usage_authority_quarantine.clear();
+            index
+                .decode_holds
+                .v2_insert(
+                    "claude_usage_authority_quarantine",
+                    "family".into(),
+                    raw_bytes.to_vec(),
+                    owner,
+                    charge,
+                )
+                .unwrap();
+            index.decode_holds.v2_finish((0, 0));
+            let actual = compare(&bytes, index);
+            assert_eq!(actual.decode_holds_family("family"), !bound);
+            assert!(actual
+                .accepted_snapshot_fingerprints
+                .contains(&"a".repeat(64)));
+            assert_eq!(actual.decode_holds.v2_provenance().1, u64::from(bound));
+            if !bound {
+                assert!(actual.claude_usage_family_witnesses.is_empty());
+                assert_eq!(
+                    actual.files["/synthetic/family.jsonl"].source_file_fingerprint,
+                    "source"
+                );
+            }
+        }
+    }
+}
+
+/// One file-entities value past the physical row limit, so value admission
+/// refuses the save; mutable rows past their 1 MiB target still commit.
+pub(super) fn over_row_limit() -> BTreeSet<String> {
+    BTreeSet::from(["0".repeat(VALUE_BYTES as usize)])
+}
+
+/// Real-shaped money (usage tokens, accepted proof, file progress) plus two
+/// family member files: a positive money control for whole-store comparisons.
+fn real_shaped_graph() -> ScanIndex {
+    const A: &str = "/synthetic/family/a.jsonl";
+    const B: &str = "/synthetic/family/b.jsonl";
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+    ))
+    .unwrap();
+    let mut index: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+    index.generation = 0;
+    for (key, c) in [(A, '1'), (B, '2')] {
+        let fingerprint = c.to_string().repeat(64);
+        let entry = crate::snapshots::tests::manifest_index_entry(Some(&fingerprint));
+        index.files.insert(key.into(), entry);
+        index.accepted_snapshot_fingerprints.insert(fingerprint);
+    }
+    index
+}
+
+/// [money] A row over the 64 MiB decode bound refuses only that save, as
+/// DbUnavailable: no page change and no hold, and the failed session reloads
+/// the committed generation before any upload or ACK. With the fault removed
+/// the retried pass commits G+1 with the same money and placement as a run
+/// that never refused. Both runs save a typed traversal past the former
+/// 16 MiB limit and a typed birth store (within its 4 MiB decoder bound) and
+/// reopen them unchanged; an older build's 16 MiB decoder refuses the
+/// widened row rather than reading a narrower value.
+#[test]
+fn row_over_the_decode_bound_refuses_its_save_without_a_hold() {
+    let page = |index: &mut ScanIndex| {
+        index.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
+        for n in 0..12_000 {
+            index.claude_money_birth_store.record_observation(
+                &format!("session-{n}"),
+                &format!("/synthetic/birth/{n}.jsonl"),
+                1_000 + i128::from(n),
+            );
+        }
+        index
+            .files
+            .get_mut("/synthetic/family/a.jsonl")
+            .unwrap()
+            .last_snapshot_fingerprint = Some("3".repeat(64));
+    };
+    let run = |fault: bool| {
+        let f = Fixture::new();
+        let progress = br#"{"generation":0}"#;
+        let mut index =
+            super::super::money_test_support::publish(&real_shaped_graph(), &f.path, progress);
+        assert_eq!(index.generation, G);
+        if fault {
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            page(&mut index);
+            index
+                .file_snapshot_fingerprints
+                .insert("oversize".into(), over_row_limit());
+            telemetry::take_thread_event_for_test("db_unavailable_cause");
+            let error = save_with(&f.path, &mut index).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+            assert_eq!(
+                telemetry::take_thread_event_for_test("db_unavailable_cause").unwrap()["at"],
+                "state_v2_value_admission"
+            );
+            assert_eq!(collection_page_limit(&index, 250), 250);
+            assert_eq!(
+                with_state(&f.path, |state| Ok(state.save_hold)).unwrap(),
+                None
+            );
+            // The refused session cannot authorize an upload or ACK.
+            assert!(guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation
+            )
+            .is_err());
+            // Reload through the production route, as publication did.
+            index = ScanIndex::load(&f.path).unwrap();
+            assert_eq!(index.generation, G);
+            assert!(!index.file_snapshot_fingerprints.contains_key("oversize"));
+            guard_external(
+                &f.path,
+                index.v2().persistence_v2.as_ref(),
+                index.generation,
+            )
+            .unwrap();
+            assert!(
+                crate::snapshots::state_v2_recovery_save_guard(&f.path, &index)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        page(&mut index);
+        assert!(save_with(&f.path, &mut index).unwrap());
+        assert_eq!(index.generation, G + 1);
+        assert_eq!(collection_page_limit(&index, 250), 250);
+        let saved = serde_json::to_vec(&index).unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(reloaded.generation, G + 1);
+        assert_eq!(serde_json::to_vec(&reloaded).unwrap(), saved);
+        let key = mapper::key("scan_state.traversal", "", 0).unwrap();
+        with_session_db(&reloaded, |db| {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let header = tx.get(&key).unwrap().unwrap();
+            let stored = mapper::bytes(&mut tx, &header).unwrap();
+            let json = codec::expand(&stored, value_cap(&key)).unwrap();
+            assert!(json.len() > 16 * 1024 * 1024);
+            assert_eq!(
+                codec::expand(&stored, 16 * 1024 * 1024)
+                    .unwrap_err()
+                    .to_string(),
+                "state_v2_value_admission"
+            );
+        });
+        reloaded
+    };
+    let clean = run(false);
+    assert_eq!(
+        serde_json::to_vec(&run(true)).unwrap(),
+        serde_json::to_vec(&clean).unwrap()
+    );
+    // Positive control: the typed birth store present. The fixture's
+    // usage-pending and account rows are retired kinds and load as nothing.
+    let value = serde_json::to_value(&clean).unwrap();
+    assert!(value.get("claude_usage_family_pending").is_none());
+    assert!(value.get("claude_account_family_pending").is_none());
+    let birth = serde_json::to_vec(&clean.claude_money_birth_store).unwrap();
+    assert!((1024 * 1024..4 * 1024 * 1024).contains(&birth.len()));
+    assert_eq!(
+        clean
+            .claude_money_birth_store
+            .observed_birth("session-7", "/synthetic/birth/7.jsonl"),
+        Some(1_007)
+    );
+}
+
+/// [money] sqlite full holds across reopen until a complete save succeeds.
+#[test]
+fn sqlite_full_holds_across_reopen_until_a_complete_save_succeeds() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    fill_session(&mut index);
+    let error = save_with(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::SaveFull));
+    let mut retry = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(retry.generation, G);
+    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &retry);
+    assert_eq!(
+        guard().unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::SaveFull)
+    );
+    assert!(save_with_mode(&f.path, &mut retry, true).unwrap());
+    assert_eq!(
+        guard_external(
+            &f.path,
+            retry.v2().persistence_v2.as_ref(),
+            retry.generation
+        )
+        .unwrap_err()
+        .downcast_ref::<Hold>(),
+        Some(&Hold::SaveFull)
+    );
+    let recovery = crate::snapshots::state_v2_recovery_save_guard(&f.path, &retry)
+        .unwrap()
+        .unwrap();
+    recovery().unwrap();
+    assert!(save_with(&f.path, &mut retry).unwrap());
+    guard_external(
+        &f.path,
+        retry.v2().persistence_v2.as_ref(),
+        retry.generation,
+    )
+    .unwrap();
+}
+
+/// [regress] The store itself may demand a reload outside any save: its
+/// erasure swap failed after closing the connection. The next load reopens it
+/// at the durable generation instead of failing on the refused stamp read, and
+/// the erasure debt survives (never marked complete).
+#[test]
+fn store_reload_demand_outside_a_save_reopens_on_next_load() {
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        db.control("erasure_pending", &G).unwrap();
+        db.control("erasure_since", &0_u64).unwrap();
+        sqlite::on_swap("W3", |_| anyhow::bail!("test: rename refused"));
+        assert!(db.maintenance(true).is_err());
+        assert!(db.reload_required());
+    });
+    let reloaded = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(reloaded.generation, G);
+    with_session_db(&reloaded, |db| {
+        assert!(!db.reload_required());
+        assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(G));
+    });
+}
+
+/// [format] unpublished import does not reorder v1 progress admission.
+#[test]
+fn unpublished_import_does_not_reorder_v1_progress_admission() {
+    let f = Fixture::new();
+    fs::write(&f.path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    assert!(states().lock().unwrap().contains_key(&f.path));
+    assert!(!published(&f.path).unwrap());
+    f.published();
+    assert!(published(&f.path).unwrap());
+}
+
+/// [money] Unknown state preserves v1 before publication, holds afterward, and rollback keeps the last good graph.
+#[test]
+fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_custody() {
+    let f = Fixture::new();
+    let progress = br#"{"generation":0}"#;
+    let progress_path = crate::snapshot_sync::with_state_v2_progress_lock(&f.path, |path| {
+        ottto_core::write_owner_only_file_atomic(path, progress)?;
+        Ok(path.to_owned())
+    })
+    .unwrap();
+    let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
+    raw["future_money"] = serde_json::json!({"owed": 19});
+    fs::write(&f.path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(load_with(&f.path, true).unwrap().is_none());
+    assert_eq!(
+        ScanIndex::load(&f.path).unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
+    assert_eq!(fs::read(&progress_path).unwrap(), progress);
+    assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/scan_index/real-shaped-v1.json"
+    ))
+    .unwrap();
+    let mut seed: ScanIndex = serde_json::from_value(fixture["logical"].clone()).unwrap();
+    seed.generation = 0;
+    let mut current = super::super::money_test_support::publish(&seed, &f.path, progress);
+    let committed = current.clone();
+    let committed_generation = current.generation;
+    let committed_context = current.historical_replay_generation.clone();
+    assert!(current.prepare_historical_replay("uncommitted-context".into()));
+    fill_session(&mut current);
+    assert!(save_locked(&f.path, &mut current, false).is_err());
+    with_state(&f.path, |state| {
+        assert!(state.save_digests.is_none());
+        Ok(())
+    })
+    .unwrap();
+    // Publication returns a public load. Compare at that same boundary after
+    // rollback, including load settlement.
+    let restored = ScanIndex::load(&f.path).unwrap_or_else(|e| {
+        panic!(
+            "reload after FULL: {e:#}; cause={:?}",
+            telemetry::latest_for_test("db_unavailable_cause")
+        )
+    });
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&committed).unwrap()
+    );
+    assert!(restored.decode_holds.same_as(&committed.decode_holds));
+    assert_eq!(
+        restored.decode_holds.v2_provenance(),
+        committed.decode_holds.v2_provenance()
+    );
+    assert_eq!(
+        restored.v2().growth_retention,
+        committed.v2().growth_retention
+    );
+    assert_eq!(restored.generation, committed_generation);
+    assert_eq!(restored.historical_replay_generation, committed_context);
+    let mut replay_again = restored.clone();
+    assert!(replay_again.prepare_historical_replay("uncommitted-context".into()));
+    assert!(!replay_again.prepare_historical_replay("uncommitted-context".into()));
+    assert_eq!(fs::read(&progress_path).unwrap(), progress);
+
+    let path = seed.files.keys().next().unwrap();
+    let mut unknown = serde_json::to_value(&seed.files[path]).unwrap();
+    unknown["future_money"] = serde_json::json!({"owed": 23});
+    let encoded = codec::encode(&serde_json::to_vec(&unknown).unwrap()).unwrap();
+    let runtime = restored.v2().persistence_v2.as_ref().unwrap();
+    {
+        let mut guard = runtime.session.lock().unwrap();
+        let session = guard.as_mut().unwrap();
+        let mut tx = session.db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &mapper::key("file.progress", path, 1).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &encoded,
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(committed_generation, committed_generation + 1),
+            DurableCommitOutcome::Committed(committed_generation + 1)
+        );
+    }
+    invalidate_locked(&f.path).unwrap();
+    let db_path = fence::sibling(&f.path, ".v2.sqlite");
+    let before_db = fs::read(&db_path).unwrap();
+    let before_fence = fs::read(&f.path).unwrap();
+    // A held load returns no graph to collection, so it cannot authorize a Full
+    // or a transcript re-read. A compatible build must recover these same bytes.
+    let error = ScanIndex::load(&f.path).unwrap_err();
+    // A newer build's key holds as "update", not as local damage.
+    assert!(crate::snapshots::scan_index_health::is_version_refusal(
+        &error
+    ));
+    assert_eq!(fs::read(&db_path).unwrap(), before_db);
+    assert_eq!(fs::read(&f.path).unwrap(), before_fence);
+    assert_eq!(fs::read(&progress_path).unwrap(), progress);
+}
+
+/// [money] aged growing keys remain readable and retain owed custody.
+#[test]
+fn aged_published_key_gets_normal_read_and_keeps_owed_debt() {
+    use crate::snapshots::{local_index_key, scan_source_roots_with_test_limit, SnapshotSource};
+    let f = Fixture::new();
+    let roots = f.support.join("transcripts");
+    fs::create_dir(&roots).unwrap();
+    let transcript = roots.join("11111111-1111-4111-8111-111111111111.jsonl");
+    fs::write(&transcript, b"invalid json\n").unwrap();
+    let key = local_index_key(&transcript);
+    let mut seed = ScanIndex::default();
+    seed.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 4, "modified_unix_seconds": 1,
+            "source_file_fingerprint": "a".repeat(64),
+            "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+        }))
+        .unwrap(),
+    );
+    seed.accepted_rebuild_incidence
+        .insert(key.clone(), BTreeSet::from(["owed".into()]));
+    let progress = br#"{"generation":0}"#;
+    let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
+    let fence_before = fs::read(&f.path).unwrap();
+    let scan = |index: &mut ScanIndex| {
+        scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&roots),
+            index,
+            "2050-10-31T12:00:00Z",
+            30,
+            10,
+        )
+        .unwrap()
+    };
+    let result = scan(&mut index);
+    assert_eq!(
+        result.malformed_json_line_count, 1,
+        "a due aged key gets a normal read"
+    );
+    assert!(index.files.contains_key(&key));
+    assert_eq!(index.files[&key].size_bytes, 4);
+    assert_eq!(fs::read(&f.path).unwrap(), fence_before);
+    assert_eq!(
+        index.accepted_rebuild_incidence[&key],
+        BTreeSet::from(["owed".into()])
+    );
+}
+
+/// [regress] A paced growth refusal was counted unreadable at both admission
+/// sites (sampled and unsampled), turning the traversal red. It now defers
+/// with its debt owed, and the next pass after the interval admits its Full.
+#[test]
+fn paced_growth_read_defers_at_both_admission_sites() {
+    use crate::snapshots::sampled_audit::GROWTH_FULL_INTERVAL;
+    use crate::snapshots::{
+        local_index_key, sampled_scan, scan_source_roots_with_test_limit, OwnedSourceScan,
+        OwnedSourceScanStep, SnapshotSource,
+    };
+    let at = |seconds: u64| {
+        ::time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&::time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let reduction = crate::codex_scan_diagnostics::UnreadableCause::Reduction as usize;
+    for sampled in [false, true] {
+        let f = Fixture::new();
+        let roots = f.support.join("transcripts");
+        fs::create_dir(&roots).unwrap();
+        let transcript = roots.join("11111111-1111-4111-8111-111111111111.jsonl");
+        let line = serde_json::json!({"type": "assistant",
+            "sessionId": "11111111-1111-4111-8111-111111111111", "uuid": "u1",
+            "cwd": "/synthetic", "timestamp": "2026-10-06T10:00:00.000Z",
+            "requestId": "req_u1", "message": {"id": "msg_u1", "model": "claude-opus-4-8",
+                "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+        fs::write(&transcript, format!("{line}\n")).unwrap();
+        let key = local_index_key(&transcript);
+        let claimed = sampled_scan::now_seconds();
+        let mut seed = ScanIndex::default();
+        seed.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap(),
+        );
+        seed.v2_mut().growth_retention.insert(
+            key.clone(),
+            serde_json::from_value(
+                serde_json::json!({"predecessor_size": 4, "last_growth_full_unix": claimed}),
+            )
+            .unwrap(),
+        );
+        let progress = br#"{"generation":0}"#;
+        let mut index = super::super::money_test_support::publish(&seed, &f.path, progress);
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        // Unsampled pages take the StateMissing site; sampled pages the
+        // acquisition site.
+        let page = |index: &mut ScanIndex, now: u64| {
+            if !sampled {
+                return scan_source_roots_with_test_limit(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&roots),
+                    index,
+                    &at(now),
+                    30,
+                    10,
+                )
+                .unwrap();
+            }
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&roots),
+                std::mem::take(index),
+                &at(now),
+                30,
+                10,
+                None,
+                &[],
+                false,
+            )
+            .with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("paced-growth".into()),
+            );
+            loop {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => scan = next,
+                    OwnedSourceScanStep::Complete {
+                        index: done, scan, ..
+                    } => {
+                        *index = done;
+                        return scan;
+                    }
+                }
+            }
+        };
+
+        sampled_scan::test_hooks::clear();
+        let result = page(&mut index, claimed);
+        assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+        assert!(
+            !sampled_scan::test_hooks::unreadable().contains(&reduction),
+            "sampled={sampled}"
+        );
+        assert!(
+            index.traversal.as_ref().map_or(true, |walk| {
+                !walk.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
+            }),
+            "sampled={sampled}: healthy, no unhealthy retry armed"
+        );
+        assert_eq!(index.files[&key].size_bytes, 4, "sampled={sampled}");
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()["predecessor_size"],
+            4,
+            "sampled={sampled}: the growth debt stays owed"
+        );
+
+        // A later pass after the interval selects the file again; the claim
+        // advancing to that pass's clock is its admitted Full.
+        let later = claimed + GROWTH_FULL_INTERVAL;
+        sampled_scan::set_test_now(Some(later));
+        for _ in 0..3 {
+            let result = page(&mut index, later);
+            assert_eq!(result.unreadable_path_count, 0, "sampled={sampled}");
+            if serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"]
+                == later
+            {
+                break;
+            }
+        }
+        sampled_scan::set_test_now(None);
+        assert_eq!(
+            serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()
+                ["last_growth_full_unix"],
+            later,
+            "sampled={sampled}: the aged-out Full was admitted"
+        );
+    }
+}
+
+/// [regress] A deferred growth Full left the queue, and after its claim
+/// expired its queued path waited behind the census FIFO. It now rides the
+/// next selecting page and its one admitted Full settles the debt.
+#[test]
+fn expired_growth_claim_rides_the_next_selecting_page() {
+    use crate::snapshots::sampled_audit::GROWTH_FULL_INTERVAL;
+    use crate::snapshots::{
+        local_index_key, sampled_scan, scan_source_roots_with_test_limit, SnapshotSource,
+    };
+    let at = |seconds: u64| {
+        ::time::OffsetDateTime::from_unix_timestamp(seconds as i64)
+            .unwrap()
+            .format(&::time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let f = Fixture::new();
+    let roots = f.support.join("transcripts");
+    fs::create_dir(&roots).unwrap();
+    let write = |digit: char| {
+        let session = format!(
+            "{0}{0}{0}{0}{0}{0}{0}{0}-{0}{0}{0}{0}-4{0}{0}{0}-8{0}{0}{0}-{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}",
+            digit
+        );
+        let line = serde_json::json!({"type": "assistant", "sessionId": session,
+            "uuid": format!("u{digit}"), "cwd": "/synthetic",
+            "timestamp": "2026-10-06T10:00:00.000Z", "requestId": format!("req_{digit}"),
+            "message": {"id": format!("msg_{digit}"), "model": "claude-opus-4-8",
+                "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 20}}});
+        let path = roots.join(format!("{session}.jsonl"));
+        fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    };
+    // Name order queues the ordinary members ahead of the debt file.
+    let ahead = ['1', '2', '3'].map(&write);
+    let transcript = write('f');
+    let key = local_index_key(&transcript);
+    let claimed = sampled_scan::now_seconds();
+    let mut seed = ScanIndex::default();
+    seed.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 4, "modified_unix_seconds": 1,
+            "source_file_fingerprint": "a".repeat(64),
+            "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+        }))
+        .unwrap(),
+    );
+    seed.v2_mut().growth_retention.insert(
+        key.clone(),
+        serde_json::from_value(
+            serde_json::json!({"predecessor_size": 4, "last_growth_full_unix": claimed}),
+        )
+        .unwrap(),
+    );
+    let mut index =
+        super::super::money_test_support::publish(&seed, &f.path, br#"{"generation":0}"#);
+    let page = |index: &mut ScanIndex, now: u64| {
+        scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&roots),
+            index,
+            &at(now),
+            30,
+            1,
+        )
+        .unwrap()
+    };
+    let queued = |index: &ScanIndex, path: &std::path::Path| {
+        index.traversal.as_ref().is_some_and(|walk| {
+            walk.pending_candidates
+                .iter()
+                .any(|c| c.path.as_path() == path)
+        })
+    };
+    let claim = |index: &ScanIndex| {
+        serde_json::to_value(&index.v2().growth_retention[&key]).unwrap()["last_growth_full_unix"]
+            .clone()
+    };
+    page(&mut index, claimed);
+    assert!(
+        queued(&index, transcript.as_path()),
+        "the debt file waits in the queue"
+    );
+    assert!(
+        queued(&index, ahead[2].as_path()),
+        "an ordinary member is queued ahead"
+    );
+    assert_eq!(claim(&index), claimed);
+
+    let later = claimed + GROWTH_FULL_INTERVAL;
+    sampled_scan::set_test_now(Some(later));
+    page(&mut index, later);
+    sampled_scan::set_test_now(None);
+    assert_eq!(claim(&index), later, "the expired claim was taken once");
+    let debt = serde_json::to_value(&index.v2().growth_retention[&key]).unwrap();
+    assert!(
+        debt["predecessor_size"].is_null(),
+        "its Full settled the debt"
+    );
+    assert_eq!(
+        index.files[&key].size_bytes,
+        fs::metadata(&transcript).unwrap().len()
+    );
+    assert!(
+        queued(&index, ahead[2].as_path()),
+        "it rode the page ahead of the census FIFO"
+    );
+}
+
+/// [behaviour] A bound legacy source adopts SQLite even without a support directory.
+#[test]
+fn bound_v1_load_without_support_adopts_native_custody_before_saving() {
+    let f = Fixture::new();
+    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+    fs::write(&f.path, &bytes).unwrap();
+    let mut index = ScanIndex::load(&f.path).unwrap();
+    assert!(index.v2().persistence_v2.is_some());
+    assert_eq!(index.generation, 1);
+    index.save(&f.path).unwrap();
+    assert_eq!(index.generation, 2);
+    assert!(fence::sibling(&f.path, ".v2.sqlite").exists());
+    assert_eq!(
+        fs::read(fence::sibling(&f.path, ".v1-readonly")).unwrap(),
+        bytes
+    );
+    assert!(published(&f.path).unwrap());
+}
+
+/// [format] Legacy refusal debt survives exact decoding and ordinary save removes it on native and imported stores.
+#[test]
+fn retired_file_size_debt_clears_through_normal_save_and_reopen() {
+    for native in [false, true] {
+        let f = Fixture::new();
+        let traversal = serde_json::from_value(serde_json::json!({
+            "context_fingerprint":"synthetic", "census_window_end":"2026-10-27T08:00:00Z",
+            "scan_roots":[], "pending_directories":[], "pending_candidates":[], "observed_index_keys":[],
+            "reconciliation_upper_bound":null, "reconciliation_after":null, "reconciliation_started":false,
+            "oversized_discovery":{"synthetic_path_hash":{"content_hash":"synthetic_content_hash","observations":1}},
+            "counts":{"oversized_file_count":1}
+        })).unwrap();
+        let pre = ScanIndex {
+            traversal: Some(traversal),
+            ..ScanIndex::default()
+        };
+        if native {
+            f.import_graph(Some(&pre));
+            fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+        } else {
+            fs::write(&f.path, serde_json::to_vec(&pre).unwrap()).unwrap();
+        }
+        let mut index = ScanIndex::load_for_snapshot_source(
+            &f.path,
+            crate::snapshots::SnapshotSource::ClaudeCode,
+            &f.support,
+        )
+        .unwrap();
+        assert!(index.v2().persistence_v2.is_some());
+        let assert_cleared = |index: &ScanIndex| {
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(traversal.oversized_discovery.is_empty());
+            assert_eq!(traversal.counts.oversized_file_count, 0);
+        };
+        assert_cleared(&index);
+        assert!(save_with(&f.path, &mut index).unwrap());
+        with_session_db(&index, |db| {
+            let (stored, _) = import::hydrate_context(db).unwrap();
+            assert_cleared(&stored);
+        });
+        drop(index);
+        let reopened = load_with(&f.path, false).unwrap().unwrap();
+        assert_cleared(&reopened);
+    }
+}
+
+/// Upload-progress rows in the custody store.
+mod progress_rows {
+    use super::*;
+    use serde_json::{json, Value as Json};
+
+    /// A page's owned rows; `view` borrows them as a `progress::Page`.
+    struct Page {
+        cache_state: BTreeMap<String, Json>,
+        cache_head: BTreeMap<String, Json>,
+        ledger: Json,
+    }
+    fn view(page: &Page) -> progress::Page<'_, Json, Json, Json> {
+        progress::Page {
+            cache_state: &page.cache_state,
+            cache_head: &page.cache_head,
+            ledger: &page.ledger,
+        }
+    }
+
+    fn page(sessions: &[&str], offset: u64) -> Page {
+        Page {
+            cache_state: sessions
+                .iter()
+                .map(|s| (s.to_string(), json!({ "offset": offset })))
+                .collect(),
+            cache_head: sessions
+                .iter()
+                .map(|s| (s.to_string(), json!({ "head": s })))
+                .collect(),
+            ledger: json!({ "schema_version": 1, "offset": offset }),
+        }
+    }
+    fn commit(
+        f: &Fixture,
+        _index: &ScanIndex,
+        baseline: progress::Baseline,
+        page: &Page,
+    ) -> Result<progress::Outcome> {
+        crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+            with_progress_session(&f.path, owner, |db, identity, graph| {
+                progress::commit(db, identity, graph, &baseline, &view(page), None)
+            })
+        })
+    }
+    fn control(index: &ScanIndex, name: &str) -> Option<u64> {
+        let mut value = None;
+        with_session_db(index, |db| value = db.read_control(name).unwrap());
+        value
+    }
+    /// The graph session's stamp; the session must still be current.
+    fn session_stamp(index: &ScanIndex) -> (u64, u64) {
+        let runtime = index.v2().persistence_v2.as_ref().unwrap();
+        let guard = runtime.session.lock().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert!(!session.reload, "the graph session must not reload");
+        session.stamp
+    }
+    fn progress_headers(db: &mut sqlite::Sqlite) -> Vec<Header> {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut headers = Vec::new();
+        for kind in catalogue::PROGRESS_KINDS {
+            headers.extend(
+                tx.scan_kind(&RecordKind::parse(kind).unwrap(), None, 128)
+                    .unwrap(),
+            );
+        }
+        headers
+    }
+    fn has_member(db: &mut sqlite::Sqlite, session: &str) -> bool {
+        let key = mapper::key("progress.cache_state", session, 1).unwrap();
+        db.begin(TxnMode::Read)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some()
+    }
+
+    /// [behaviour] A progress page advances `progress_generation` alone: G, the
+    /// session stamp and the capability stamp stay, a stale baseline refuses
+    /// without a write, removed members owe no erasure, and `read` hydrates
+    /// the committed baseline.
+    #[test]
+    fn progress_commit_moves_only_its_own_generation() {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let stamp = session_stamp(&index);
+        let capability = control(&index, "minimum_writer_capability");
+        assert_eq!(capability, Some(sqlite::writer_capability_for_test()));
+        let empty = progress::Baseline::default();
+        let first = commit(&f, &index, empty.clone(), &page(&["a", "b"], 1)).unwrap();
+        let progress::Outcome::Committed(baseline) = first else {
+            panic!("the first page commits");
+        };
+        assert_eq!(baseline.generation, 1);
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+        assert_eq!(control(&index, "generation"), Some(G));
+        assert_eq!(control(&index, "minimum_writer_capability"), capability);
+        assert_eq!(session_stamp(&index), stamp);
+        with_session_db(&index, |db| assert_eq!(db.stamp().unwrap(), stamp));
+
+        // A stale baseline, and a write refusal before COMMIT (a baseline that
+        // names a graph row), refuse: no row, no generation, no reload.
+        let mut before = Vec::new();
+        with_session_db(&index, |db| before = progress_headers(db));
+        let graph_row = mapper::key("account.current", "x", 1).unwrap();
+        let foreign = progress::Baseline {
+            generation: 1,
+            rows: [(graph_row, [0; 32])].into(),
+            kept: Default::default(),
+        };
+        for refused in [empty, foreign] {
+            assert_eq!(
+                commit(&f, &index, refused, &page(&["c"], 9)).unwrap(),
+                progress::Outcome::NotPublished
+            );
+            assert_eq!(session_stamp(&index), stamp);
+        }
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+        with_session_db(&index, |db| {
+            assert_eq!(progress_headers(db), before);
+            assert!(!db.reload_required());
+            // Every graph row would now owe erasure on removal; progress never does.
+            db.path_extractor(|_, _, emit| emit("/synthetic/private/path"));
+        });
+        let erasure = control(&index, "erasure_pending");
+
+        // The next page against the committed baseline removes "a".
+        let second = commit(&f, &index, baseline, &page(&["b", "c"], 2)).unwrap();
+        let progress::Outcome::Committed(baseline) = second else {
+            panic!("the second page commits");
+        };
+        assert_eq!(baseline.generation, 2);
+        assert_eq!(control(&index, "erasure_pending"), erasure);
+        with_session_db(&index, |db| {
+            assert_eq!(sqlite::erasure_marks_for_test(db), 0);
+            assert!(!has_member(db, "a") && has_member(db, "c"));
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let (stored, hydrated) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+            assert!(stored.is_some_and(|stored| stored.cache_state.len() == 2));
+            assert_eq!(hydrated, baseline);
+        });
+        assert_eq!(session_stamp(&index), stamp);
+    }
+
+    /// [behaviour] A COMMIT error reopens and classifies from the progress CAS
+    /// row, never from the graph's generation.
+    #[test]
+    fn progress_commit_error_classifies_from_the_progress_row() {
+        let cases = [
+            (
+                ("progress_generation", 1),
+                DurableCommitOutcome::Published(1),
+            ),
+            (("progress_generation", 9), DurableCommitOutcome::Ambiguous),
+            // The graph's row moving says nothing about this commit.
+            (("generation", G + 1), DurableCommitOutcome::NotPublished),
+        ];
+        for ((name, value), outcome) in cases {
+            let f = Fixture::new();
+            f.published();
+            let index = load_with(&f.path, false).unwrap().unwrap();
+            with_session_db(&index, |db| {
+                sqlite::fence_commit_writing(db, "progress_generation");
+                sqlite::on_reopen_write_control(name, value);
+                let mut tx = db.begin(TxnMode::Write).unwrap();
+                mapper::put(
+                    &mut tx,
+                    &mapper::key("progress.ledger", "", 1).unwrap(),
+                    &json!({ "offset": 1 }),
+                )
+                .unwrap();
+                let published = outcome != DurableCommitOutcome::NotPublished;
+                assert_eq!(
+                    tx.commit_inner(sqlite::Cas::Progress {
+                        expected: 0,
+                        next: 1
+                    }),
+                    outcome
+                );
+                assert_eq!(db.reload_required(), published);
+            });
+        }
+    }
+
+    /// [behaviour] Identity rows belong to the `points` seam alone. A page
+    /// commits them with P + 1; hydrate and every baseline leave them out; a
+    /// later page never rewrites or deletes them (byte-identical); the graph
+    /// walk steps over them and the header audit counts them as progress; a
+    /// point read fetches only the named keys and sets an invalid row aside;
+    /// and a page with nothing changed opens no transaction.
+    #[test]
+    fn identity_rows_belong_to_the_points_seam_alone() {
+        fn identity_rows(db: &mut sqlite::Sqlite) -> Vec<(Header, Json)> {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let kind = RecordKind::parse("progress.identity").unwrap();
+            let headers = tx.scan_kind(&kind, None, 128).unwrap();
+            headers
+                .into_iter()
+                .map(|h| {
+                    let value = mapper::read::<Json>(&mut tx, &h, None).unwrap();
+                    (h, value)
+                })
+                .collect()
+        }
+        fn names_identity(baseline: &progress::Baseline) -> bool {
+            baseline.rows.keys().any(|key| {
+                matches!(key, RowKey::Record { kind, .. } if kind.name() == "progress.identity")
+            })
+        }
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        let first = page(&["a", "b"], 1);
+        let empty = progress::Baseline::default();
+        let progress::Outcome::Committed(baseline) = commit(&f, &index, empty, &first).unwrap()
+        else {
+            panic!("the first page commits");
+        };
+        // The same page again opens no transaction and claims no generation.
+        assert_eq!(
+            commit(&f, &index, baseline.clone(), &first).unwrap(),
+            progress::Outcome::Unchanged
+        );
+        assert_eq!(control(&index, "progress_generation"), Some(1));
+
+        let mut seen = None;
+        let outcome =
+            crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+                with_progress_session(&f.path, owner, |db, identity, graph| {
+                    let mut points = |tx: &mut dyn Transaction, next: u64| -> Result<bool> {
+                        seen = Some(next);
+                        progress::put_point(tx, "k1", &json!({ "bucket": 1 }))?;
+                        progress::put_point(tx, "k2", &json!({ "bucket": 2 }))?;
+                        progress::put_point(tx, "bad", &json!("not an object"))?;
+                        Ok(true)
+                    };
+                    progress::commit(
+                        db,
+                        identity,
+                        graph,
+                        &baseline,
+                        &view(&first),
+                        Some(&mut points),
+                    )
+                })
+            })
+            .unwrap();
+        let progress::Outcome::Committed(baseline) = outcome else {
+            panic!("points alone commit the page");
+        };
+        assert_eq!((seen, baseline.generation), (Some(2), 2));
+        assert!(!names_identity(&baseline));
+        let mut stored = Vec::new();
+        with_session_db(&index, |db| {
+            stored = identity_rows(db);
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let (_, hydrated) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+            assert_eq!(hydrated, baseline, "hydrate leaves identity rows out");
+            let keys: BTreeSet<String> = ["k1", "k2", "bad", "absent"].map(String::from).into();
+            let (points, set_aside) =
+                progress::read_points::<Json>(&mut tx, &keys, |_, v| v.is_object()).unwrap();
+            assert_eq!(points.keys().collect::<Vec<_>>(), ["k1", "k2"]);
+            assert_eq!(set_aside, 1, "the invalid row is set aside and counted");
+        });
+        assert_eq!(stored.len(), 3);
+
+        // A later page removes "a": the identity rows stay byte-identical.
+        let progress::Outcome::Committed(baseline) =
+            commit(&f, &index, baseline, &page(&["b"], 2)).unwrap()
+        else {
+            panic!("the next page commits");
+        };
+        assert!(!names_identity(&baseline));
+        with_session_db(&index, |db| {
+            assert_eq!(identity_rows(db), stored);
+            let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+            db.audit_headers().unwrap();
+            // One member and a manifest per map, the ledger's manifest and one
+            // chunk, 3 identity.
+            let (_, progress_rows, _) = sqlite::row_counts_for_test(db);
+            assert_eq!(progress_rows, 6 + 3);
+            let (_, cx) = kinds::hydrate(db, identity.binding.clone()).unwrap();
+            assert!(cx.retired.iter().all(|key| !progress::owned(key)));
+        });
+    }
+
+    /// [behaviour] The ledger is an ordered chunk stream with no total limit:
+    /// a ledger over many chunks (multi-byte text split on char boundaries)
+    /// round-trips exactly, a smaller one deletes its trailing chunks, each
+    /// committed page records the ledger's bytes, and a missing, extra or
+    /// out-of-order chunk refuses the read, so the source holds.
+    #[test]
+    fn progress_ledger_is_an_ordered_chunk_stream() {
+        fn chunks(db: &mut sqlite::Sqlite) -> Vec<Header> {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            let kind = RecordKind::parse("progress.ledger").unwrap();
+            let headers = tx.scan_kind(&kind, None, 128).unwrap();
+            let members = headers.into_iter();
+            members
+                .filter(|h| matches!(h.key, RowKey::Record { position: 1, .. }))
+                .collect()
+        }
+        fn stored_ledger(db: &mut sqlite::Sqlite) -> Result<Json> {
+            let mut tx = db.begin(TxnMode::Read)?;
+            let (stored, _) = progress::read::<Json, Json, Json>(&mut tx)?;
+            Ok(stored.context("progress rows")?.ledger)
+        }
+        let mut big = page(&["a"], 1);
+        big.ledger["text"] = json!("\u{e9}\u{20ac}".repeat(300) + &"x".repeat(1000));
+        let bytes = serde_json::to_string(&big.ledger).unwrap().len();
+        let small = page(&["a"], 2);
+
+        for damage in [None, Some("missing"), Some("extra"), Some("gap")] {
+            let f = Fixture::new();
+            f.published();
+            let index = load_with(&f.path, false).unwrap().unwrap();
+            telemetry::take_thread_event_for_test("progress_ledger_bytes");
+            let empty = progress::Baseline::default();
+            let progress::Outcome::Committed(baseline) = commit(&f, &index, empty, &big).unwrap()
+            else {
+                panic!("the first page commits");
+            };
+            assert_eq!(
+                telemetry::take_thread_event_for_test("progress_ledger_bytes"),
+                Some(json!(bytes)),
+                "one scalar per committed page"
+            );
+            let mut stored = Vec::new();
+            with_session_db(&index, |db| {
+                stored = chunks(db);
+                assert_eq!(stored_ledger(db).unwrap(), big.ledger);
+            });
+            assert!(stored.len() > 4, "{} chunks", stored.len());
+            let Some(damage) = damage else {
+                assert_eq!(
+                    commit(&f, &index, baseline.clone(), &big).unwrap(),
+                    progress::Outcome::Unchanged
+                );
+                assert!(commit(&f, &index, baseline, &small).is_ok());
+                with_session_db(&index, |db| {
+                    assert_eq!(chunks(db).len(), 1, "trailing chunks are deleted");
+                    assert_eq!(stored_ledger(db).unwrap(), small.ledger);
+                });
+                continue;
+            };
+            with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Write).unwrap();
+                let name = |n: usize| format!("{n:010}");
+                let at = |n: usize| mapper::key("progress.ledger", &name(n), 1).unwrap();
+                let last = stored.len() - 1;
+                match damage {
+                    "missing" => mapper::remove(&mut tx, &stored[1].key).unwrap(),
+                    "extra" => {
+                        mapper::put(&mut tx, &at(stored.len()), &"x").unwrap();
+                    }
+                    _ => {
+                        let value: String = mapper::read(&mut tx, &stored[last], None).unwrap();
+                        mapper::remove(&mut tx, &stored[last].key).unwrap();
+                        mapper::put(&mut tx, &at(last + 5), &value).unwrap();
+                    }
+                }
+                let outcome = tx.commit_inner(sqlite::Cas::Progress {
+                    expected: 1,
+                    next: 2,
+                });
+                assert_eq!(outcome, DurableCommitOutcome::Committed(2));
+                assert!(stored_ledger(db).is_err(), "{damage}: the read refuses");
+            });
+        }
+    }
+
+    /// The committed progress rows of the session store, as plain values.
+    fn stored_rows(db: &mut sqlite::Sqlite) -> Json {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let (stored, baseline) = progress::read::<Json, Json, Json>(&mut tx).unwrap();
+        let stored = stored.expect("progress rows");
+        json!({
+            "generation": baseline.generation,
+            "cache_state": stored.cache_state,
+            "cache_head": stored.cache_head,
+            "ledger": stored.ledger,
+        })
+    }
+    fn carry_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("OTTTO_PROGRESS_CARRY_DIR").expect("the carry harness"))
+    }
+
+    /// [format] Carry fixture for an older binary: a published route holding
+    /// progress rows at writer capability 6, checkpointed and kept on disk.
+    /// Run only by scripts/test_progress_rows_carry.py.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn write_progress_rows_carry_fixture() {
+        let root = carry_dir();
+        let support = root.join("support");
+        let parent = support.join("snapshots/destinations").join("b".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let f = Fixture {
+            path: parent.join("claude_code-test-scan-index.json"),
+            support,
+        };
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        // An identity row rides the page commit, so the carry covers it too.
+        let mut points = |tx: &mut dyn Transaction, progress_generation: u64| -> Result<bool> {
+            let row = json!({ "progress_generation": progress_generation, "accepted": {} });
+            progress::put_point(tx, &"c".repeat(64), &row)?;
+            Ok(true)
+        };
+        let outcome =
+            crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+                with_progress_session(&f.path, owner, |db, identity, graph| {
+                    let page = page(&["a", "b"], 1);
+                    let baseline = progress::Baseline::default();
+                    progress::commit(
+                        db,
+                        identity,
+                        graph,
+                        &baseline,
+                        &view(&page),
+                        Some(&mut points),
+                    )
+                })
+            });
+        assert!(matches!(outcome.unwrap(), progress::Outcome::Committed(_)));
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        let mut expected = Json::Null;
+        with_session_db(&index, |db| {
+            expected = stored_rows(db);
+            db.clean_checkpoint().unwrap();
+        });
+        fs::write(
+            root.join("expected.json"),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("index-path.txt"), f.path.to_str().unwrap()).unwrap();
+        // The older binary and the re-upgrade read this store after exit.
+        std::mem::forget(f);
+        println!("PROGRESS_CARRY_FIXTURE_WRITTEN");
+    }
+
+    /// [format] After an older binary refused the store, this binary opens it
+    /// and reads exactly the rows it wrote: re-upgrade equals no downgrade.
+    #[test]
+    #[ignore = "run by scripts/test_progress_rows_carry.py"]
+    fn verify_progress_rows_carry_reupgrade() {
+        let root = carry_dir();
+        let path = PathBuf::from(fs::read_to_string(root.join("index-path.txt")).unwrap());
+        let index = load_with(&path, false).unwrap().unwrap();
+        let mut actual = Json::Null;
+        with_session_db(&index, |db| actual = stored_rows(db));
+        let expected: Json =
+            serde_json::from_slice(&fs::read(root.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(
+            actual, expected,
+            "re-upgrade equals the never-downgraded store"
+        );
+        assert_eq!(control(&index, "minimum_writer_capability"), Some(6));
+        println!("PROGRESS_CARRY_REUPGRADE_VERIFIED");
+    }
+
+    /// [behaviour] Progress rows are counted apart from graph records and never
+    /// trip the records alarm, and the graph's catalogue walk still finds the
+    /// graph kinds on both sides of the progress range.
+    #[test]
+    fn progress_rows_stay_out_of_graph_counts_and_walk() {
+        let f = Fixture::new();
+        f.published();
+        let index = load_with(&f.path, false).unwrap().unwrap();
+        with_session_db(&index, |db| {
+            let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+            db.audit_headers().unwrap();
+            let (graph, progress, alarm) = sqlite::row_counts_for_test(db);
+            assert_eq!((progress, alarm), (0, false));
+            // At the alarm threshold, progress rows never trip it.
+            sqlite::set_record_rows_for_test(db, 200_000);
+            let empty = progress::Baseline::default();
+            let page = page(&["s"], 1);
+            let outcome = progress::commit(db, &identity, G, &empty, &view(&page), None).unwrap();
+            assert!(matches!(outcome, progress::Outcome::Committed(_)));
+            // One member of each map, their two manifests, the ledger's
+            // manifest and its one chunk.
+            let rows = 6;
+            assert_eq!(sqlite::row_counts_for_test(db), (200_000, rows, false));
+            db.audit_headers().unwrap();
+            assert_eq!(sqlite::row_counts_for_test(db), (graph, rows, false));
+
+            // Graph rows on both sides of the range are records; they count.
+            let before = mapper::key("account.current", "before-progress", 1).unwrap();
+            let after = mapper::key("proof.owned_start", "after-progress", 1).unwrap();
+            sqlite::set_record_rows_for_test(db, 199_999);
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            mapper::put(&mut tx, &before, &json!({})).unwrap();
+            mapper::put(&mut tx, &after, &json!({})).unwrap();
+            assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+            assert_eq!(sqlite::row_counts_for_test(db), (200_001, rows, true));
+            assert_eq!(
+                db.read_control::<u64>("progress_generation").unwrap(),
+                Some(1)
+            );
+            let (_, cx) = kinds::hydrate(db, identity.binding.clone()).unwrap();
+            assert!(cx.retired.contains(&before) && cx.retired.contains(&after));
+        });
+    }
+}
+
+/// A previous layout gains empty membership without changing delivery proof.
+#[test]
+fn layout_seven_upgrade_preserves_delivery_proof_and_persists_exact_request_ack() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::upload_context_receipt::{EntityStamp, Receipt, SlotRows};
+    use crate::snapshots::{ScanIndexEntry, SnapshotSource};
+    use std::sync::Arc;
+    let f = Fixture::new();
+    let holder = f
+        .support
+        .join("holder.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let receipt = Receipt {
+        context_fingerprint: "a".repeat(64),
+        replay_generation: 0,
+        source_witness: "b".repeat(64),
+        body_witness: "c".repeat(64),
+    };
+    let mut previous = ScanIndex::default();
+    previous.upload_context_proof.entity_stamps.insert(
+        "d".repeat(64),
+        EntityStamp {
+            context_fingerprint: receipt.context_fingerprint.clone(),
+            body_witness: receipt.body_witness.clone(),
+        },
+    );
+    previous.files.insert(
+        holder.clone(),
+        ScanIndexEntry {
+            source_file_fingerprint: receipt.source_witness.clone(),
+            upload_context_receipt: Some(receipt.clone()),
+            ..Default::default()
+        },
+    );
+    f.import_graph(Some(&previous));
+    {
+        // Recreate the older writer's catalogue before publishing the store.
+        let mut db =
+            sqlite::Sqlite::open(&fence::sibling(&f.path, ".v2.sqlite.import"), &f.identity())
+                .unwrap();
+        sqlite::delete_row_for_test(
+            &db,
+            &mapper::key("proof.request_contribution", "", 0).unwrap(),
+        );
+        db.control("catalogue_layout", &7_u32).unwrap();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx
+            .scan_kind(
+                &RecordKind::parse("proof.request_contribution").unwrap(),
+                None,
+                1
+            )
+            .unwrap()
+            .is_empty());
+    }
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let delivery_unchanged = |index: &ScanIndex| {
+        assert_eq!(
+            index.upload_context_proof.header(),
+            previous.upload_context_proof.header()
+        );
+        assert_eq!(
+            index.upload_context_proof.entity_stamps,
+            previous.upload_context_proof.entity_stamps
+        );
+        assert_eq!(
+            index.files[&holder].upload_context_receipt,
+            Some(receipt.clone())
+        );
+    };
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(7));
+    });
+    assert!(index.upload_context_proof.request_contributions.is_empty());
+    delivery_unchanged(&index);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+    });
+    assert!(index.upload_context_proof.request_contributions.is_empty());
+    delivery_unchanged(&index);
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
+    item.usage_accounting_contract =
+        Some(crate::snapshots::claude_history_upgrade::REQUEST_OWNED_USAGE_CONTRACT.into());
+    item.request_contributions =
+        vec![(location_key(&holder), Arc::from([7_u64]))].into_boxed_slice();
+    item.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+    let (slot, rows) = SlotRows::capture(&item);
+    crate::snapshot_sync::accept_request_contributions_for_test(
+        &mut index,
+        &[item],
+        &BTreeMap::from([(rows.fingerprint.clone(), rows.body_witness.clone())]),
+    );
+    let expected = BTreeMap::from([(slot, rows)]);
+    assert_eq!(index.upload_context_proof.request_contributions, expected);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.upload_context_proof.request_contributions, expected);
+    delivery_unchanged(&index);
+}
+
+/// Accepted request membership has its own native rows, independent of stamps.
+/// These membership assertions are expected red on main.
+#[test]
+fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::upload_context_receipt::{ProofState, SlotRows};
+    use std::sync::Arc;
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let slot = "a".repeat(32);
+    let row = SlotRows {
+        fingerprint: "b".repeat(64),
+        body_witness: "c".repeat(64),
+        rows: vec![(location_key("synthetic-holder"), Arc::from([1_u64, 7, 99]))]
+            .into_boxed_slice(),
+    };
+    index
+        .upload_context_proof
+        .request_contributions
+        .insert(slot.clone(), row.clone());
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+    });
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.upload_context_proof.request_contributions[&slot], row);
+    assert!(index
+        .upload_context_proof
+        .header()
+        .request_contributions
+        .is_empty());
+    assert!(index.upload_context_proof.entity_stamps.is_empty());
+    index
+        .upload_context_proof
+        .request_contributions
+        .get_mut(&slot)
+        .unwrap()
+        .rows = Box::new([]);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(index.upload_context_proof.request_contributions[&slot]
+        .rows
+        .is_empty());
+    let legacy: ProofState = serde_json::from_str("{}").unwrap();
+    assert!(legacy.request_contributions.is_empty());
+    assert!(legacy.is_empty());
+    // The current reader exercises the same refusal used by an older reader
+    // when its supported layout is below the stored layout.
+    with_session_db(&index, |db| db.control("catalogue_layout", &9_u32).unwrap());
+    let error = load_with(&f.path, false).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+}
+
+fn contribution_reference_fixture() -> (Fixture, ScanIndex, String, String) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let holder = f
+        .support
+        .join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let slot = "a".repeat(32);
+    index.files.insert(
+        holder.clone(),
+        crate::snapshots::ScanIndexEntry {
+            source_file_fingerprint: "d".repeat(64),
+            ..Default::default()
+        },
+    );
+    index.claude_request_census.insert(
+        holder.clone(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"d".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, 7, 99],
+        ),
+    );
+    index.upload_context_proof.request_contributions.insert(
+        slot.clone(),
+        SlotRows {
+            fingerprint: "b".repeat(64),
+            body_witness: "c".repeat(64),
+            rows: vec![(location_key(&holder), Arc::from([1_u64, 7, 99]))].into_boxed_slice(),
+        },
+    );
+    assert!(save_with(&f.path, &mut index).unwrap());
+    (f, index, holder, slot)
+}
+
+#[test]
+fn contribution_references_survive_census_replacement_and_last_census_release() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    let expected = index.upload_context_proof.request_contributions[&slot].clone();
+    let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+    let census = mapper::key("file.census", &holder, 1).unwrap();
+    let mut original = None;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::referenced_sets(&mut tx, &census), sets);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(2));
+        let header = tx.get(&row).unwrap().unwrap();
+        let raw: serde_json::Value =
+            codec::decode(&mapper::bytes(&mut tx, &header).unwrap(), VALUE_BYTES).unwrap();
+        let RowKey::RequestSet(id) = &sets[0] else {
+            panic!("request set")
+        };
+        assert_eq!(raw["rows"][0][1], serde_json::json!({"$request_set": id}));
+        assert!(serde_json::to_value(&expected).unwrap()["rows"][0][1].is_string());
+        assert_eq!(
+            mapper::read::<SlotRows>(&mut tx, &header, None).unwrap(),
+            expected
+        );
+        original = Some(sets[0].clone());
+    });
+    let original = original.unwrap();
+    drop(index);
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    index.claude_request_census.insert(
+        holder.clone(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"d".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![2, 7, 99],
+        ),
+    );
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let mut replacement = None;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(
+            kinds::tests::referenced_sets(&mut tx, &row),
+            vec![original.clone()]
+        );
+        let sets = kinds::tests::referenced_sets(&mut tx, &census);
+        assert_eq!(sets.len(), 1);
+        assert_ne!(sets[0], original);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), Some(1));
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+        replacement = Some(sets[0].clone());
+    });
+    let replacement = replacement.unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    assert_eq!(
+        index
+            .claude_request_census
+            .get(&holder)
+            .unwrap()
+            .request_hashes(),
+        &[2, 7, 99]
+    );
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    drop(index);
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), Some(1));
+        assert_eq!(kinds::tests::set_refs(&mut tx, &replacement), None);
+    });
+    index.upload_context_proof.request_contributions.clear();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), None);
+    });
+    let mut next = expected;
+    next.rows[0].1 = Arc::from([100_u64]);
+    index
+        .upload_context_proof
+        .request_contributions
+        .insert(slot.clone(), next);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        let (RowKey::RequestSet(new), RowKey::RequestSet(old), RowKey::RequestSet(other)) =
+            (&sets[0], original, replacement)
+        else {
+            panic!("request sets")
+        };
+        assert!(*new > old && *new > other, "deleted ids are never reused");
+    });
+}
+
+#[test]
+fn missing_contribution_only_reference_refuses_the_store() {
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+        drop(tx);
+        sqlite::delete_row_for_test(db, &sets[0]);
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let header = tx.get(&row).unwrap().unwrap();
+        let error = mapper::read::<SlotRows>(&mut tx, &header, None).unwrap_err();
+        assert!(format!("{error:#}").contains("state_v2_reference_missing"));
+    });
+    drop(index);
+    cold_close_for_test(&f.path).unwrap();
+    assert!(load_with(&f.path, false).is_err());
+}
+
+#[test]
+fn inline_contribution_rows_reopen_and_intern_on_replacement() {
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let expected = index.upload_context_proof.request_contributions[&slot].clone();
+    let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+    let generation = index.generation;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::remove(&mut tx, &row).unwrap();
+        let value = codec::encode(&codec::json(&expected, VALUE_BYTES).unwrap()).unwrap();
+        // Publish the previous inline layout-8 encoding, without projection.
+        tx.put(RowInput {
+            key: &row,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &value,
+        })
+        .unwrap();
+        assert!(kinds::tests::referenced_sets(&mut tx, &row).is_empty());
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+    drop(index);
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    index
+        .upload_context_proof
+        .request_contributions
+        .get_mut(&slot)
+        .unwrap()
+        .fingerprint = "e".repeat(64);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+    });
+}
+
+#[test]
+fn malformed_accepted_request_rows_refuse_the_native_store() {
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    for hashes in [
+        "",
+        "AA==",
+        "AAAAAAAAAAEAAAAAAAAAAQ==",
+        "AAAAAAAAAAIAAAAAAAAAAQ==",
+    ] {
+        let location = [0_u8; 16];
+        let raw = serde_json::json!({
+            "fingerprint": "a".repeat(64), "body_witness": "b".repeat(64),
+            "rows": [[location, hashes]],
+        });
+        assert!(codec::exact_json::<SlotRows>(&serde_json::to_vec(&raw).unwrap()).is_err());
+    }
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = RowKey::record("proof.request_contribution", b"slot".to_vec(), 1).unwrap();
+        tx.put(RowInput { key: &key, fixed: &Fixed::None, value_version: 1,
+            value: br#"{"fingerprint":"bad","body_witness":"bad","rows":[[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"AA=="]]}"# }).unwrap();
+        assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+    });
+    assert!(load_with(&f.path, false).is_err());
+}

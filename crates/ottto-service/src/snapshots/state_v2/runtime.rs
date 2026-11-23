@@ -1,0 +1,1462 @@
+//! Locked runtime routing. Bound loads must publish and adopt the store before
+//! collection. Custody evidence always wins.
+use super::*;
+use anyhow::{bail, ensure, Context};
+use import::Pause;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Hold {
+    Future,
+    /// An older build's accepted ledger: never migrated, held for a reset.
+    OlderLedger,
+    UnknownRecordKind,
+    DbUnavailable,
+    ForeignBinding,
+    FenceLost,
+    NewerSchema,
+    MigrationFailed,
+    ReloadRequired,
+    SaveFull,
+    ReferenceDrift,
+}
+impl std::fmt::Display for Hold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Future | Self::UnknownRecordKind => "scan_index_representation_refused",
+            Self::OlderLedger => "scan_index_older_ledger_refused",
+            Self::DbUnavailable => "state_v2_db_unavailable",
+            Self::ForeignBinding => "state_v2_foreign_binding",
+            Self::NewerSchema => "state_v2_newer_schema_refused",
+            Self::MigrationFailed => "state_v2_migration_failed",
+            Self::SaveFull => "state_v2_sqlite_full",
+            Self::ReferenceDrift => "state_v2_reference_drift",
+            Self::ReloadRequired => "current_index_requires_reload",
+            Self::FenceLost => "state_v2_fence_lost",
+        })
+    }
+}
+impl std::error::Error for Hold {}
+impl Hold {
+    pub(super) fn storage(error: anyhow::Error) -> anyhow::Error {
+        // Keep only the content-free typed cause, including through SQLite's
+        // conversion wrapper; arbitrary engine messages still stay private.
+        if error
+            .chain()
+            .any(|cause| matches!(cause.downcast_ref::<Self>(), Some(Self::UnknownRecordKind)))
+        {
+            return Self::UnknownRecordKind.into();
+        }
+        if let Some(hold) = error.downcast_ref::<Self>() {
+            return (*hold).into();
+        }
+        let integrity_repair = error
+            .chain()
+            .any(|cause| cause.to_string() == INTEGRITY_REPAIR);
+        if integrity_repair {
+            // Publish the refusal before any diagnostic snapshot can retain
+            // the preceding successful open's cleared hold.
+            telemetry::event("hold", &"integrity_repair");
+        }
+        let reason = error
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|e| e.sqlite_error_code())
+            .map(|c| match c {
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => "busy",
+                _ => "engine",
+            })
+            .unwrap_or("integrity_or_io");
+        telemetry::event("db_unavailable", &reason);
+        // Content-free cause: where (outermost static state_v2_* code) and what
+        // (innermost code, io kind or SQLite extended code); never text or paths.
+        let code = |e: &(dyn std::error::Error + 'static)| {
+            let text = e.to_string();
+            (text.starts_with("state_v2_")
+                && text.len() <= 64
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+            .then_some(text)
+            .or_else(|| {
+                e.downcast_ref::<std::io::Error>()
+                    .map(|io| format!("io_{:?}", io.kind()))
+            })
+            .or_else(|| match e.downcast_ref::<rusqlite::Error>() {
+                Some(rusqlite::Error::SqliteFailure(f, _)) => {
+                    Some(format!("sqlite_{}", f.extended_code))
+                }
+                _ => None,
+            })
+        };
+        let codes = error.chain().filter_map(code).collect::<Vec<_>>();
+        let cause = serde_json::json!({ "at": codes.first(), "cause": codes.last() });
+        telemetry::event("db_unavailable_cause", &cause);
+        if integrity_repair {
+            return anyhow::anyhow!(INTEGRITY_REPAIR);
+        }
+        let hold = if sqlite::disk_full(&error) {
+            telemetry::event("sqlite_full", &1);
+            Self::SaveFull
+        } else if error
+            .chain()
+            .any(|e| e.to_string() == "state_v2_foreign_binding")
+        {
+            Self::ForeignBinding
+        } else if error.chain().any(|e| {
+            // A key this build does not know, inside a known row, was written
+            // by a newer build: hold until upgrade, never as a data fault.
+            let text = e.to_string();
+            text == "scan_index_representation_refused"
+                || text.starts_with("state_v2_ignored_field")
+        }) {
+            Self::Future
+        } else if error
+            .chain()
+            .any(|e| e.to_string() == "current_index_requires_reload")
+        {
+            Self::ReloadRequired
+        } else {
+            Self::DbUnavailable
+        };
+        // Do not retain arbitrary engine messages/paths in public health output.
+        hold.into()
+    }
+}
+struct RouteState {
+    import_pause: Option<Pause>,
+    latched: bool,
+    pending_publication: Option<(Identity, Option<fence::InputStamp>)>,
+    inventory_ready: bool,
+    original: Option<import::Original>,
+    runtimes: Vec<std::sync::Weak<Runtime>>,
+    current: Option<Arc<Runtime>>,
+    // Logical row commitments, consumed by the next save or discarded at idle.
+    save_digests: Option<kinds::Baseline>,
+    page_limit: usize,
+    requested_page: usize,
+    save_hold: Option<Hold>,
+    pass_written_start: Option<u64>,
+    // This pass's unsaved Tail state, published by the next full save or at exit.
+    tail: tail::TailStage,
+    // Files whose committed head a commit may have changed since the Codex
+    // header inventory's cache (its address) last took them (`take_head_writes`).
+    // `None` until it first asks, and again on each new session: then any head
+    // may have changed.
+    head_writes: Option<(usize, BTreeSet<Vec<u8>>)>,
+}
+impl RouteState {
+    fn report_hold(&self) {
+        if let Some(hold) = self.save_hold {
+            telemetry::event("hold", &hold);
+        } else {
+            telemetry::event("hold", &"none");
+        }
+    }
+    fn reduce_page(&mut self) {
+        let previous = self.page_limit;
+        self.page_limit = (self.page_limit / 2).max(1);
+        if self.page_limit < previous {
+            telemetry::event("save_page_reduced", &self.page_limit);
+        }
+    }
+    fn saved_page(&mut self, over_target: bool, claim_only: bool) {
+        // A small claim/CAS-only write cannot resolve an oversized collection
+        // delta. Only a normal or local recovery save may lift its fence.
+        if claim_only {
+            return;
+        }
+        self.save_hold = None;
+        self.report_hold();
+        if over_target {
+            self.reduce_page();
+        } else {
+            self.page_limit = self.page_limit.saturating_add(25).min(self.requested_page);
+        }
+    }
+}
+type RouteHandle = Arc<Mutex<RouteState>>;
+fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
+    static STATES: OnceLock<Mutex<BTreeMap<PathBuf, RouteHandle>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Rest-heap diagnostics: open store routes, or None while busy.
+pub(super) fn route_entries() -> Option<usize> {
+    states().try_lock().ok().map(|states| states.len())
+}
+
+/// Cold-close one saved synthetic route; leave every durable row and fence intact.
+#[cfg(test)]
+pub(crate) fn cold_close_for_test(path: &Path) -> Result<()> {
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    let state = states().lock().unwrap().get(path).cloned();
+    if let Some(state) = state {
+        for runtime in state
+            .lock()
+            .unwrap()
+            .runtimes
+            .iter()
+            .filter_map(|r| r.upgrade())
+        {
+            ensure!(
+                Arc::strong_count(&runtime) <= 2,
+                "drop fixture index handles before cold close"
+            );
+        }
+        invalidate_locked(path)?;
+        states().lock().unwrap().remove(path);
+    }
+    Ok(())
+}
+/// Close each registered session whose route directory is gone and that no
+/// graph still holds. Removing a test directory unlinks the store, but the
+/// registry's session keeps its descriptors (database, WAL, SHM, identity
+/// file and owner lock) open until the test process exits. Any later load or
+/// save of the route reconciles its missing fence before it reaches a
+/// session, so the close changes no result; latches and staged state stay.
+#[cfg(test)]
+pub(crate) fn close_removed_routes_for_test() {
+    let Ok(routes) = states().lock().map(|states| {
+        states
+            .iter()
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    let removed = |path: &Path| {
+        path.parent().is_some_and(|dir| {
+            fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+    };
+    let mut closed = Vec::new();
+    for (path, state) in routes {
+        // A route in use by another thread is never idle.
+        let Ok(mut state) = state.try_lock() else {
+            continue;
+        };
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|runtime| Arc::strong_count(runtime) == 1)
+            && removed(&path)
+        {
+            closed.extend(state.current.take());
+        }
+    }
+    if closed.is_empty() {
+        return;
+    }
+    // Closing samples pager counters; keep them out of this thread's
+    // `cache_lifecycle::observe` scope.
+    if let Ok(closer) = std::thread::Builder::new().spawn(move || drop(closed)) {
+        let _ = closer.join();
+    }
+}
+fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> Result<T> {
+    let state = {
+        let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;
+        // Latches are never evicted. Release the registry before blocking work.
+        states
+            .entry(path.to_owned())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(RouteState {
+                    import_pause: None,
+                    latched: false,
+                    pending_publication: None,
+                    inventory_ready: false,
+                    original: None,
+                    runtimes: Vec::new(),
+                    current: None,
+                    save_digests: None,
+                    page_limit: 250,
+                    requested_page: 250,
+                    save_hold: None,
+                    pass_written_start: None,
+                    tail: Default::default(),
+                    head_writes: None,
+                }))
+            })
+            .clone()
+    };
+    let mut state = state.lock().map_err(|_| Hold::DbUnavailable)?;
+    f(&mut state)
+}
+
+fn route_needed(path: &Path, custody: bool) -> Result<bool> {
+    Ok(states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .contains_key(path)
+        || custody)
+}
+/// Probe custody without admitting a v1 path to the route registry or decoding
+/// its index. A paused, unpublished import does not change progress ordering.
+pub(in super::super) fn published(path: &Path) -> Result<bool> {
+    if binding(path).is_none() {
+        return Ok(false);
+    }
+    let state = states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .get(path)
+        .cloned();
+    if let Some(state) = state {
+        if state.lock().map_err(|_| Hold::DbUnavailable)?.latched {
+            return Ok(true);
+        }
+    }
+    held(fence::evidence(path))
+}
+
+fn binding(path: &Path) -> Option<super::super::scan_index_persistence::Binding> {
+    super::super::scan_index_integration::scan_index_storage_binding(path)
+        .filter(|b| v2_on(b.source))
+}
+
+pub(in super::super) struct Session {
+    db: sqlite::Sqlite,
+    cx: KindCx,
+    identity: Identity,
+    path: PathBuf,
+    reload: bool,
+    stamp: (u64, u64),
+}
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StateV2Session")
+    }
+}
+
+/// The live route over a freshly opened session.
+fn active(
+    db: sqlite::Sqlite,
+    cx: KindCx,
+    identity: Identity,
+    path: &Path,
+    stamp: (u64, u64),
+) -> Arc<Runtime> {
+    Arc::new(Runtime {
+        active: true,
+        session: Mutex::new(Some(Session {
+            db,
+            cx,
+            identity,
+            path: path.to_owned(),
+            reload: false,
+            stamp,
+        })),
+    })
+}
+
+fn held<T>(result: Result<T>) -> Result<T> {
+    let result = result.map_err(Hold::storage);
+    if let Err(error) = &result {
+        if let Some(hold) = error.downcast_ref::<Hold>() {
+            telemetry::event("hold", hold);
+        }
+    }
+    result
+}
+
+/// Caller owns CheckpointLock, before missing-root validation or v1 decode.
+/// The returned flag says the caller's decoded legacy graph must import.
+pub(in super::super) fn load_locked(
+    path: &Path,
+    _importable: bool,
+    custody: bool,
+) -> Result<(Option<ScanIndex>, bool)> {
+    // Unbound paths and sources outside `v2_on` never probe the store.
+    let Some(binding) = binding(path) else {
+        return Ok((None, false));
+    };
+    let index = load_with_custody(path, &binding, true, custody)?;
+    let try_import = index.is_none();
+    Ok((index, try_import))
+}
+fn load_with_custody(
+    path: &Path,
+    binding: &super::super::scan_index_persistence::Binding,
+    importable: bool,
+    custody: bool,
+) -> Result<Option<ScanIndex>> {
+    if !importable && !route_needed(path, custody)? {
+        return Ok(None);
+    }
+    let mut load_started = None;
+    let result = held(with_state(path, |state| {
+        if state.latched {
+            if let Some((identity, input)) = &state.pending_publication {
+                if fence::read(path)?.is_none() {
+                    ensure!(fence::input_stamp(path)? == *input, Hold::DbUnavailable);
+                    if let Some(original) = &state.original {
+                        original.unchanged()?;
+                        original.verify_baseline(path)?;
+                    }
+                    fence::resume_publication(path, identity)?;
+                }
+            }
+        }
+        state.inventory_ready = false;
+        state.original = None;
+        state.import_pause = None;
+        state.save_digests = None;
+        let pair = fence::reconcile(path, binding, state.latched)?;
+        state.pass_written_start = (importable || pair.is_some())
+            .then(telemetry::process_written_bytes)
+            .flatten();
+        if let Some((identity, db_path)) = pair {
+            telemetry::hydrate_checkpoint("hydrate_route_entry", 0, None);
+            load_started = Some(Instant::now());
+            state.latched = true;
+            state.pending_publication = None;
+            telemetry::baseline(path);
+            if let Some(runtime) = state.current.clone() {
+                let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+                if let Some(session) = guard.as_mut() {
+                    // A store marked for reload refuses reads; reopen it
+                    // below instead of probing its stamp.
+                    // Either owner may demand a reload; both reopen below.
+                    let stamp = (!session.reload && !session.db.reload_required())
+                        .then(|| session.db.stamp())
+                        .transpose()?;
+                    if let Some(stamp) = stamp
+                        .filter(|stamp| session.identity == identity && session.stamp == *stamp)
+                    {
+                        // Reuse the connection, but hydrate the durable graph each pass.
+                        let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
+                        // The image read must be the stamp this session holds:
+                        // after a commit from elsewhere neither its baseline
+                        // nor its lineage is adopted; reopen below.
+                        let image = hydrate_image(&mut session.db, binding.source, |index, db| {
+                            ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                            Ok((db.stamp()? == stamp).then_some(stamp))
+                        })?;
+                        if let Some((mut index, cx, digests, _)) = image {
+                            session.cx = cx;
+                            adopt(state, digests, &session.cx);
+                            index.v2_mut().persistence_v2 = Some(runtime.clone());
+                            state.report_hold();
+                            telemetry::event("route", &"v2");
+                            return Ok(Some(index));
+                        }
+                    }
+                }
+                // Invalidate every old clone before replacing the connection.
+                guard.take();
+                state.save_digests = None;
+                state.current = None;
+            }
+            let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
+            let mut db = sqlite::Sqlite::open_gated(&db_path, &identity, |db| {
+                refuse_unsupported_versions(db, binding.source)
+            })
+            .map_err(Hold::storage)?;
+            // Static stage labels: Hold::storage reports where a reopen failed.
+            db.stamp().context("state_v2_open_stamp")?;
+            let image = hydrate_image(&mut db, binding.source, |index, db| {
+                let stamp = db.stamp().context("state_v2_open_stamp")?;
+                ensure!(index.generation == stamp.0, Hold::DbUnavailable);
+                Ok(Some(stamp))
+            })?;
+            // The reopen check always passes; a stale image fails above.
+            let (mut index, cx, digests, stamp) = image.ok_or(Hold::DbUnavailable)?;
+            db.audit_headers().context("state_v2_open_audit_headers")?;
+            adopt(state, digests, &cx);
+            index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
+            register(state, &index)?;
+            state.report_hold();
+            telemetry::event("route", &"v2");
+            return Ok(Some(index));
+        }
+        if !importable {
+            return Ok(None);
+        }
+        if !fence::exists(path)? {
+            // A preserved legacy baseline is prior history, never fresh-init
+            // authority. Only unpublished native remnants may be discarded.
+            ensure!(
+                !fence::exists(&fence::sibling(path, ".v1-readonly"))?
+                    && !fence::exists(&fence::sibling(path, ".v1-readonly.shards"))?,
+                Hold::DbUnavailable
+            );
+            telemetry::event(
+                "orphan_removed",
+                &fence::cleanup_unpublished(path, state.latched)?,
+            );
+        }
+        super::super::scan_index_integration::recover_fresh_init(
+            path,
+            binding.source.snapshot().api_slug(),
+        )?;
+        telemetry::event("import_attempt", &"retry");
+        match import::inventory_context(path) {
+            Ok(original) => {
+                state.inventory_ready = true;
+                state.original = original;
+            }
+            Err(class) => pause(state, class),
+        }
+        telemetry::event("route", &"v1");
+        Ok(None)
+    }));
+    if let Some(started) = load_started {
+        telemetry::event(
+            "load_span",
+            &serde_json::json!({
+                "duration_ms": started.elapsed().as_millis(),
+                "generation": result.as_ref().ok().and_then(|index| index.as_ref()).map(|index| index.generation)
+            }),
+        );
+    }
+    if result.is_err() {
+        with_state(path, |state| {
+            if state.latched || state.current.as_ref().is_some_and(|runtime| runtime.active) {
+                telemetry::abort_pass();
+            }
+            state.save_digests = None;
+            if let Some(runtime) = state.current.take() {
+                runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .take();
+            }
+            Ok(())
+        })?;
+    }
+    result
+}
+/// A hydrated graph, its context and baseline, and the stamp they were read at.
+type Image = (ScanIndex, KindCx, kinds::Baseline, (u64, u64));
+/// One hydrate of the durable image: ACK progress recovery before decode,
+/// then the caller's freshness check, then the baseline before
+/// normalization. `fresh` returns the stamp the image belongs to; `None`
+/// means the image is stale and nothing from it may be adopted.
+fn hydrate_image(
+    db: &mut sqlite::Sqlite,
+    source: super::super::scan_index_persistence::Source,
+    fresh: impl FnOnce(&ScanIndex, &sqlite::Sqlite) -> Result<Option<(u64, u64)>>,
+) -> Result<Option<Image>> {
+    let (mut index, mut cx) = import::hydrate_context(db).context("state_v2_open_hydrate")?;
+    telemetry::hydrate_checkpoint("hydrate_after_decode", 0, Some(&cx));
+    #[cfg(test)]
+    if let Some(key) = tests::DELETE_DURING_HYDRATE.with(std::cell::Cell::take) {
+        let stamps = sqlite::delete_row_elsewhere_for_test(db, &key);
+        tests::RACED_STAMPS.with(|raced| raced.set(Some(stamps)));
+    }
+    let Some(stamp) = fresh(&index, &*db)? else {
+        return Ok(None);
+    };
+    // Digest the exact persisted image: a save then also persists whatever
+    // normalization changes.
+    let digests = import::baseline(db, &index, &mut cx)?;
+    telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
+    normalize_hydrated(&mut index, source).context("state_v2_open_normalize")?;
+    Ok(Some((index, cx, digests, stamp)))
+}
+
+/// The hydrated baseline becomes the next save's baseline.
+fn adopt(state: &mut RouteState, digests: kinds::Baseline, cx: &KindCx) {
+    telemetry::hydrate_checkpoint("hydrate_exit", digests.rows.len(), Some(cx));
+    state.save_digests = Some(digests);
+}
+fn normalize_hydrated(
+    index: &mut ScanIndex,
+    source: super::super::scan_index_persistence::Source,
+) -> Result<()> {
+    use super::super::lenient_decode;
+    let slug = source.snapshot().api_slug();
+    lenient_decode::post_decode_hydrated(index, "load", slug).map_err(refusal_hold)?;
+    index.clear_retired_file_size_debt();
+    // After the baseline: the next save writes a stale retired cursor as null.
+    index.legacy_settlement_reconcile_after_fingerprint = None;
+    Ok(())
+}
+/// The shared load gate on the persisted versions, before the native open
+/// writes anything: an unsupported schema or ledger keeps the database as is.
+fn refuse_unsupported_versions(
+    db: &mut sqlite::Sqlite,
+    source: super::super::scan_index_persistence::Source,
+) -> Result<()> {
+    let mut versions = ScanIndex::default();
+    kinds_misc::read_version_controls(&mut db.begin(TxnMode::Read)?, &mut versions)?;
+    super::super::lenient_decode::controls(&versions, source.snapshot().api_slug())
+        .map_err(refusal_hold)
+}
+fn refusal_hold(error: super::super::lenient_decode::Error) -> anyhow::Error {
+    use super::super::lenient_decode::{Error, OLDER_LEDGER_REFUSAL};
+    match error {
+        Error::Refused("schema_version" | "accepted-ledger version") => Hold::Future.into(),
+        Error::Refused(OLDER_LEDGER_REFUSAL) => Hold::OlderLedger.into(),
+        error => error.into(),
+    }
+}
+
+fn pause(state: &mut RouteState, class: Pause) {
+    state.inventory_ready = false;
+    state.original = None;
+    state.import_pause = Some(class);
+    telemetry::event("import_paused", &class);
+    telemetry::event("import_paused_alarm", &1);
+}
+
+/// Import must succeed before a bound graph can collect. A paused inventory
+/// keeps the input intact and exposes its existing recovery action.
+pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> Result<()> {
+    let Some(_binding) = binding(path) else {
+        return Ok(());
+    };
+    if !states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .contains_key(path)
+    {
+        return Ok(());
+    }
+    with_state(path, |state| {
+        if !index.persistence_available() {
+            pause(state, Pause::Partial);
+            return Err(Hold::DbUnavailable.into());
+        }
+        if !state.inventory_ready {
+            return Err(state
+                .import_pause
+                .map_or(Hold::ReloadRequired, Pause::hold)
+                .into());
+        }
+        state.inventory_ready = false;
+        let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
+        let result = (|| {
+            let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
+            let generation = import::import_generation(index, original)?;
+            import::publish_graph(
+                path,
+                index,
+                original,
+                generation,
+                &mut state.latched,
+                &mut state.pending_publication,
+            )
+        })();
+        // One gauge per import attempt, including one refused for an over-cap row.
+        telemetry::row_cap_save();
+        let mut cx = match result {
+            Ok(cx) => {
+                telemetry::event("import_done", &1);
+                cx
+            }
+            Err(error) if state.latched => return Err(Hold::storage(error)),
+            Err(error) => {
+                if let Some(class) = error.downcast_ref::<Pause>().copied() {
+                    pause(state, class);
+                    return Err(class.hold().into());
+                }
+                if !sqlite::disk_full(&error) && error.downcast_ref::<std::io::Error>().is_some() {
+                    pause(state, Pause::Io);
+                    return Err(Hold::ReloadRequired.into());
+                }
+                return Err(Hold::storage(error));
+            }
+        };
+        // Publication succeeded: adoption failure is a hold, never a v1 result.
+        let (identity, db_path) =
+            fence::reconcile(path, &binding_for(path)?, true)?.ok_or(Hold::DbUnavailable)?;
+        let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
+        db.audit_headers()?;
+        let stamp = db.stamp()?;
+        ensure!(stamp.0 == identity.fence_generation, Hold::DbUnavailable);
+        index.generation = stamp.0;
+        let digests = import::baseline(&mut db, index, &mut cx)?;
+        index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
+        telemetry::pass_start();
+        register(state, index)?;
+        state.save_digests = Some(digests);
+        Ok(())
+    })
+}
+/// Caller has authorized a legacy rebuild and retains CheckpointLock. Fresh
+/// publication never adopts a second runtime; the next ordinary load does.
+pub(in super::super) fn publish_rebuilt_locked(path: &Path, index: &ScanIndex) -> Result<()> {
+    binding_for(path)?;
+    with_state(path, |state| {
+        state.original = None;
+        import::publish_graph(
+            path,
+            index,
+            &import::Original::default(),
+            0,
+            &mut state.latched,
+            &mut state.pending_publication,
+        )?;
+        Ok(())
+    })
+    .map_err(Hold::storage)
+}
+pub(in super::super) fn fence_published(path: &Path) -> bool {
+    fence::read(path).ok().flatten().is_some()
+}
+fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Binding> {
+    binding(path).ok_or_else(|| Hold::ForeignBinding.into())
+}
+
+/// Only an authenticated store session may save a graph.
+pub(in super::super) fn save_locked(
+    path: &Path,
+    index: &mut ScanIndex,
+    claim_only: bool,
+) -> Result<()> {
+    binding_for(path)?;
+    ensure!(index.v2().persistence_v2.is_some(), Hold::ReloadRequired);
+    // This accessor authenticates the owner/session; call before route/session locks.
+    let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
+    let runtime = index.v2().persistence_v2.clone();
+    let expected = claim_generation.unwrap_or(index.generation);
+    let result = with_save_session(path, runtime, expected, |state, session, id| {
+        let previous = match state.save_digests.take() {
+            Some(previous) if !previous.links_only => previous,
+            _ => {
+                // A pass may save more than once (including claim-only saves).
+                // The preceding save dropped its baseline; read committed state.
+                ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
+                let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
+                ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
+                let digests = import::baseline(&mut session.db, &previous, &mut cx)?;
+                session.cx = cx;
+                digests
+            }
+        };
+        ensure!(previous.generation == session.stamp.0, Hold::ReloadRequired);
+        if claim_generation.is_some() {
+            index.generation = previous.generation;
+        }
+        typed_write(session, |session| {
+            session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
+            let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
+            note_head_writes(state, std::mem::take(&mut session.cx.head_writes));
+            // A commit published the stage; otherwise it waits for the next
+            // save or the exit commit.
+            if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
+                state.tail = stage;
+            }
+            let digests = saved?;
+            session.stamp = session.db.stamp()?;
+            state.saved_page(session.db.save_over_target(), claim_only);
+            // A claim-only save keeps its carrier links for decide; row
+            // diffs re-read the committed rows (it writes no tail stage, so
+            // committed heads still match those links).
+            if !session.reload {
+                state.save_digests = Some(if claim_only {
+                    digests.links_only()
+                } else {
+                    digests
+                });
+            }
+            Ok(())
+        })
+    })
+    .and_then(|saved| saved.ok_or_else(|| Hold::ReloadRequired.into()));
+    if result.is_ok() && !claim_only {
+        super::super::sampled_audit::renew_growth_claims(index, path);
+    }
+    result
+}
+/// Custody shared by both v2 writes: fence and session checks, then a stale
+/// graph is refused before any write without invalidating the healthy
+/// session. A failed write keeps a disk-full hold and reopens the session.
+/// `None`: no runtime and no published store.
+fn with_save_session<T>(
+    path: &Path,
+    runtime: Option<Arc<Runtime>>,
+    expected: u64,
+    write: impl FnOnce(&mut RouteState, &mut Session, Identity) -> Result<T>,
+) -> Result<Option<T>> {
+    let binding = binding_for(path)?;
+    let mut stale_graph = false;
+    let mut result = held(with_state(path, |state| {
+        let pair = fence::reconcile(path, &binding, state.latched)?;
+        let Some(runtime) = runtime else {
+            ensure!(pair.is_none(), Hold::DbUnavailable);
+            return Ok(None);
+        };
+        let (identity, _) = pair.ok_or(Hold::FenceLost)?;
+        state.latched = true;
+        let mut session = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = session.as_mut().ok_or(Hold::DbUnavailable)?;
+        ensure!(
+            !session.reload && session.identity == identity && session.path == path,
+            Hold::ForeignBinding
+        );
+        telemetry::baseline(path);
+        let _gauge = telemetry::Stage::new(telemetry::Kind::Save);
+        if expected != session.stamp.0 {
+            // Refuse this graph without invalidating another graph's healthy
+            // session or its durable claim-only lineage. No save has begun.
+            stale_graph = true;
+            bail!(Hold::ReloadRequired);
+        }
+        write(state, session, identity).map(Some)
+    }));
+    if let Err(error) = &result {
+        if stale_graph {
+            return result;
+        }
+        with_state(path, |state| {
+            state.save_digests = None;
+            if matches!(error.downcast_ref::<Hold>(), Some(Hold::SaveFull)) {
+                state.save_hold = Some(Hold::SaveFull);
+            }
+            if let Some(runtime) = &state.current {
+                if let Some(session) = runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .as_mut()
+                {
+                    session.reload = true;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    if result.is_err() {
+        if let Some(hold) = with_state(path, |state| Ok(state.save_hold))? {
+            telemetry::event("hold", &hold);
+            result = Err(hold.into());
+        }
+    }
+    result
+}
+
+/// A graph write under the session. It takes no progress owner: that lock
+/// orders before CheckpointLock and the session. A failed write reports the
+/// store's typed hold.
+fn typed_write<T>(
+    session: &mut Session,
+    write: impl FnOnce(&mut Session) -> Result<T>,
+) -> Result<T> {
+    let result = write(session);
+    if result.is_err() {
+        if let Some(hold) = session.db.save_failure() {
+            return Err(hold.into());
+        }
+    }
+    result
+}
+
+pub(in super::super) type GrowthRows =
+    BTreeMap<String, super::super::sampled_audit::GrowthRetention>;
+/// Claim-only growth write without a graph hydrate. The caller holds
+/// CheckpointLock and has authenticated `expected` as its lineage's G. One
+/// BEGIN IMMEDIATE transaction reads the committed growth rows, the key's raw
+/// hold and which of those keys still have a file row; `decide` updates the
+/// rows and says whether to write. The rows then commit as G+1 through the
+/// save's own row writer, so row caps, erasure marks and the gauge apply.
+/// A graph without a v2 runtime or binding is refused: there is no route.
+pub(in super::super) fn claim_growth_locked(
+    path: &Path,
+    index: &ScanIndex,
+    expected: u64,
+    key: &str,
+    decide: impl FnOnce(&mut GrowthRows, bool, &BTreeSet<String>) -> bool,
+) -> Result<(bool, GrowthRows)> {
+    let runtime = index.v2().persistence_v2.clone();
+    ensure!(runtime.is_some(), Hold::ReloadRequired);
+    let _save_window = telemetry::Window::begin("save");
+    with_save_session(path, runtime, expected, |state, session, id| {
+        typed_write(session, |session| {
+            #[cfg(test)]
+            if tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take) {
+                let tx = session.db.begin(TxnMode::Write)?;
+                ensure!(
+                    tx.commit(expected, expected + 1)
+                        == DurableCommitOutcome::Committed(expected + 1),
+                    "synthetic concurrent commit"
+                );
+            }
+            let claimed = growth_claim_txn(
+                &mut session.db,
+                &id,
+                expected,
+                key,
+                state.save_digests.as_mut(),
+                decide,
+            )?;
+            if claimed.0 {
+                session.stamp = session.db.stamp()?;
+            }
+            Ok(claimed)
+        })
+    })?
+    .ok_or_else(|| Hold::ReloadRequired.into())
+}
+fn growth_claim_txn(
+    db: &mut sqlite::Sqlite,
+    identity: &Identity,
+    expected: u64,
+    key: &str,
+    baseline: Option<&mut kinds::Baseline>,
+    decide: impl FnOnce(&mut GrowthRows, bool, &BTreeSet<String>) -> bool,
+) -> Result<(bool, GrowthRows)> {
+    const KIND: &str = "file.growth_retention";
+    if let Some(baseline) = &baseline {
+        ensure!(baseline.generation == expected, Hold::ReloadRequired);
+    }
+    let next = expected.checked_add(1).ok_or(Hold::DbUnavailable)?;
+    let span = kinds::SaveSpan::begin(db);
+    db.validate_save(identity, expected)?;
+    let mut tx = db.begin(TxnMode::Write)?;
+    let mut old = mapper::Digests::new();
+    let mut rows: GrowthRows = mapper::read_map(&mut tx, KIND, None, Some(&mut old))?;
+    let hold = RowKey::record("raw_hold.growth_retention", key.as_bytes(), 0)?;
+    let held = tx.get(&hold)?.is_some();
+    let mut files = BTreeSet::new();
+    for name in rows.keys().map(String::as_str).chain([key]) {
+        if tx.get(&mapper::key("file.progress", name, 1)?)?.is_some() {
+            files.insert(name.to_owned());
+        }
+    }
+    if !decide(&mut rows, held, &files) {
+        return Ok((false, rows));
+    }
+    let mut writer = mapper::Rows {
+        tx: Some(&mut tx as &mut dyn Transaction),
+        old,
+        ..Default::default()
+    };
+    writer.map(KIND, &rows)?;
+    let digests = writer.finish()?;
+    // COMMIT re-checks the generation control against G inside this write.
+    let outcome = tx.commit(expected, next);
+    kinds::commit_next(db, span, outcome, expected, next)?;
+    if let Some(baseline) = baseline {
+        // A reclaimed member can return with identical bytes; its old digest
+        // would skip recreating it. Replace manifest and members.
+        baseline
+            .rows
+            .retain(|key, _| !matches!(key, RowKey::Record { kind, .. } if kind.name() == KIND));
+        baseline.rows.extend(digests);
+        baseline.generation = next;
+    }
+    Ok((true, rows))
+}
+/// The route's live session for upload progress, under the caller's source
+/// progress owner, then CheckpointLock, then the route and session locks. The
+/// session authenticates at its own current graph stamp: a pass's own graph
+/// commits (a save, a partial checkpoint, a growth claim) advance that stamp
+/// with them, so only a foreign writer makes progress reload. `write` gets the
+/// session's store, identity and graph G; G must not move under it.
+pub(super) fn with_progress_session<T>(
+    path: &Path,
+    owner: &crate::snapshot_sync::SnapshotProgressLock,
+    write: impl FnOnce(&mut sqlite::Sqlite, &Identity, u64) -> Result<T>,
+) -> Result<T> {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
+        progress_session_locked(path, write)
+    })
+}
+/// `with_progress_session` once the source progress owner is held.
+fn progress_session_locked<T>(
+    path: &Path,
+    write: impl FnOnce(&mut sqlite::Sqlite, &Identity, u64) -> Result<T>,
+) -> Result<T> {
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    let runtime =
+        with_state(path, |state| Ok(state.current.clone()))?.ok_or(Hold::ReloadRequired)?;
+    let graph = runtime
+        .session
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .as_ref()
+        .map(|session| session.stamp.0)
+        .ok_or(Hold::ReloadRequired)?;
+    // A progress commit leaves G and this connection's data_version as they
+    // are, so the session's stamp stays valid after it.
+    with_save_session(path, Some(runtime), graph, |_, session, id| {
+        write(&mut session.db, &id, session.stamp.0)
+    })?
+    .ok_or_else(|| Hold::ReloadRequired.into())
+}
+/// A read of the route's live session store, under the caller's source
+/// progress owner.
+pub(super) fn with_progress_read<T>(
+    path: &Path,
+    owner: &crate::snapshot_sync::SnapshotProgressLock,
+    read: impl FnOnce(&mut dyn Transaction) -> Result<T>,
+) -> Result<T> {
+    crate::snapshot_sync::with_state_v2_progress_owner(path, Some(owner), |_, _| {
+        let runtime =
+            with_state(path, |state| Ok(state.current.clone()))?.ok_or(Hold::ReloadRequired)?;
+        let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let mut tx = session.db.begin(TxnMode::Read)?;
+        read(&mut tx)
+    })
+}
+pub(in super::super) fn guard_containment_locked(path: &Path) -> Result<()> {
+    if binding(path).is_none() || !route_needed(path, published(path)?)? {
+        return Ok(());
+    }
+    // A containment guard never promotes a DB. This also covers a parent/root
+    // appearing during the absent-parent path where no checkpoint lock exists.
+    held(with_state(path, |state| {
+        ensure!(
+            !state.latched && !fence::evidence(path)?,
+            Hold::DbUnavailable
+        );
+        Ok(())
+    }))
+}
+
+/// Caller retains the process-lifetime LockedStateDir. This guard is repeated
+/// at each external boundary; COMMIT fencing alone is too late for uploads.
+pub(in super::super) fn guard_external(
+    path: &Path,
+    runtime: Option<&Arc<Runtime>>,
+    graph_generation: u64,
+) -> Result<()> {
+    guard_current(path, runtime, graph_generation, true)
+}
+
+/// A local guard that ignores a save-pressure hold. Lock, reload, fence and
+/// generation checks still apply.
+#[cfg(test)]
+pub(in super::super) fn guard_local(
+    path: &Path,
+    runtime: Option<&Arc<Runtime>>,
+    graph_generation: u64,
+) -> Result<()> {
+    guard_current(path, runtime, graph_generation, false)
+}
+
+/// Only the local checkpoint-retry path may ignore a save-pressure hold.
+/// Generation, owner, reload and capability fencing still apply.
+pub(in super::super) fn recovery_save_guard(
+    path: &Path,
+    index: &ScanIndex,
+) -> Result<Option<impl Fn() -> Result<()> + use<>>> {
+    let Some(runtime) = &index.v2().persistence_v2 else {
+        return Ok(None);
+    };
+    if !with_state(path, |state| Ok(state.save_hold.is_some()))? {
+        return Ok(None);
+    }
+    let path = path.to_owned();
+    let runtime = runtime.clone();
+    let generation = super::super::sampled_audit::own_growth_claim_generation(index, &path)
+        .unwrap_or(index.generation);
+    Ok(Some(move || {
+        guard_current(&path, Some(&runtime), generation, false)
+    }))
+}
+
+fn guard_current(
+    path: &Path,
+    runtime: Option<&Arc<Runtime>>,
+    graph_generation: u64,
+    external: bool,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    held(with_state(path, |state| {
+        if external {
+            if let Some(hold) = state.save_hold {
+                return Err(hold.into());
+            }
+        }
+        let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = guard.as_mut().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let pair = fence::reconcile(path, &session.identity.binding, state.latched)?;
+        ensure!(
+            pair.is_some_and(|(id, _)| id == session.identity),
+            Hold::FenceLost
+        );
+        let stamp = session.db.stamp()?;
+        ensure!(
+            stamp == session.stamp && stamp.0 == graph_generation,
+            Hold::ReloadRequired
+        );
+        Ok(())
+    }))
+}
+
+/// The route of this graph's live session: the index path its stage is kept under.
+pub(in super::super) fn runtime_path(index: &ScanIndex) -> Result<Option<PathBuf>> {
+    let Some(runtime) = &index.v2().persistence_v2 else {
+        return Ok(None);
+    };
+    let guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+    Ok(Some(
+        guard.as_ref().ok_or(Hold::ReloadRequired)?.path.clone(),
+    ))
+}
+
+/// Release a synthetic small-page request without discarding staged Tail state.
+#[cfg(test)]
+pub(crate) fn release_collection_page_limit_for_test(index: &ScanIndex) {
+    let path = runtime_path(index)
+        .unwrap()
+        .expect("a routed fixture index");
+    with_state(&path, |state| {
+        state.page_limit = 250;
+        state.requested_page = 250;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[cfg(test)]
+#[path = "progress_fixtures.rs"]
+mod progress_fixtures;
+#[cfg(test)]
+pub(crate) use progress_fixtures::*;
+
+pub(in super::super) fn collection_page_limit(index: &ScanIndex, requested: usize) -> usize {
+    let Some(_) = &index.v2().persistence_v2 else {
+        return requested;
+    };
+    let path = runtime_path(index).ok().flatten();
+    path.and_then(|p| {
+        with_state(&p, |s| {
+            s.requested_page = requested.max(1);
+            s.page_limit = s.page_limit.min(s.requested_page);
+            Ok(s.page_limit.min(requested))
+        })
+        .ok()
+    })
+    .unwrap_or(requested.min(250))
+}
+
+/// idle releases the page baseline when a cycle completes; an error exit skips
+/// idle, so dropping this at the cycle's end releases it as well. It also owns
+/// the end of the pass for staged Tail state no later save carried: `commit_tail`
+/// is the normal exit's one write, and dropping only discards and counts.
+pub(crate) struct BaselineRelease(Option<(PathBuf, std::sync::Weak<Runtime>)>);
+impl BaselineRelease {
+    pub(in super::super) fn new(path: &Path, index: &ScanIndex) -> Self {
+        // A v1 graph has no runtime: hold nothing, so drop is a no-op.
+        Self(
+            index
+                .v2()
+                .persistence_v2
+                .as_ref()
+                .map(|runtime| (path.to_owned(), Arc::downgrade(runtime))),
+        )
+    }
+    /// The normal cycle exit's Tail-only commit, when anything is staged.
+    pub(crate) fn commit_tail(&self) -> Result<()> {
+        match &self.0 {
+            Some((path, runtime)) => tail_route::commit_at_exit(path, runtime),
+            None => Ok(()),
+        }
+    }
+}
+impl Drop for BaselineRelease {
+    fn drop(&mut self) {
+        if let Some((path, _)) = &self.0 {
+            tail_route::discard_at_exit(path);
+            let _ = with_state(path, |state| {
+                state.save_digests = None;
+                Ok(())
+            });
+        }
+    }
+}
+pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Result<()> {
+    let Some(runtime) = &index.v2().persistence_v2 else {
+        return Ok(());
+    };
+    // The cycle can finish without saving. Release its baseline even if
+    // advisory maintenance cannot acquire the checkpoint lock or fails.
+    with_state(path, |state| {
+        state.save_digests = None;
+        Ok(())
+    })?;
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    held(with_state(path, |state| {
+        let mut session = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = session.as_mut().ok_or(Hold::DbUnavailable)?;
+        ensure!(!session.reload && session.path == path, Hold::DbUnavailable);
+        let pair = fence::reconcile(path, &session.identity.binding, state.latched)?;
+        ensure!(
+            pair.is_some_and(|(identity, _)| identity == session.identity),
+            Hold::ForeignBinding
+        );
+        telemetry::baseline(path);
+        // This hook is between sync cycles even when that cycle saved rows.
+        erasure_inventory(path)?;
+        session.db.between_cycles(quiet).map_err(Hold::storage)?;
+        session.db.clean_checkpoint().map_err(Hold::storage)?;
+        session.stamp = session.db.stamp()?;
+        telemetry::event(
+            "bytes_written_per_pass",
+            &state
+                .pass_written_start
+                .zip(telemetry::process_written_bytes())
+                .and_then(|(a, b)| b.checked_sub(a)),
+        );
+        Ok(())
+    }))
+}
+/// After any commit attempt: the heads it may have written.
+fn note_head_writes(state: &mut RouteState, written: impl IntoIterator<Item = Vec<u8>>) {
+    if let Some((_, keys)) = &mut state.head_writes {
+        keys.extend(written);
+    }
+}
+fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
+    // One test process opens thousands of routes: release the sessions of
+    // removed ones first, so it does not run out of descriptors.
+    #[cfg(test)]
+    close_removed_routes_for_test();
+    // A new session: another writer may have changed any head.
+    state.head_writes = None;
+    state.runtimes.retain(|r| r.strong_count() != 0);
+    ensure!(state.runtimes.len() < 16, Hold::DbUnavailable);
+    if let Some(runtime) = &index.v2().persistence_v2 {
+        state.runtimes.push(Arc::downgrade(runtime));
+        state.current = Some(runtime.clone());
+    }
+    Ok(())
+}
+
+/// Inventory only: the baseline's explicit single-file erasure exception and
+/// the H/N/L-only restart cache are not covered by a DB VACUUM claim.
+fn erasure_inventory(path: &Path) -> Result<()> {
+    let artifacts = fence::ARTIFACTS
+        .iter()
+        .filter_map(|(suffix, _, class)| class.map(|class| (class, fence::sibling(path, suffix))))
+        .chain(std::iter::once((
+            "restart_record_inventory",
+            retired_record_dir(path),
+        )));
+    for (class, artifact) in artifacts {
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        let mut bounded = false;
+        match fs::symlink_metadata(&artifact) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+                for entry in fs::read_dir(&artifact)?.take(1025) {
+                    let m = entry?.metadata()?;
+                    count += 1;
+                    bytes = bytes.saturating_add(m.len());
+                    if count > 1024 {
+                        bounded = true;
+                        break;
+                    }
+                }
+            }
+            Ok(m) => {
+                count = 1;
+                bytes = m.len();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        telemetry::event(
+            class,
+            &serde_json::json!({"count":count,"bytes":bytes,"bounded":bounded}),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn invalidate_locked(path: &Path) -> Result<()> {
+    with_state(path, |state| {
+        state.latched = true;
+        state.inventory_ready = false;
+        state.save_digests = None;
+        state.tail = Default::default();
+        state.current = None;
+        for runtime in state.runtimes.drain(..).filter_map(|r| r.upgrade()) {
+            runtime
+                .session
+                .lock()
+                .map_err(|_| Hold::DbUnavailable)?
+                .take();
+        }
+        Ok(())
+    })
+}
+/// The retired restart-record directory beside a scan index.
+pub(crate) fn retired_record_dir(index_path: &Path) -> PathBuf {
+    index_path.with_extension("durable-tail")
+}
+
+/// Removes that directory, never following a link, and syncs its parent.
+/// `Ok(false)`: nothing was there.
+pub(crate) fn remove_retired_record_dir(records: &Path) -> Result<bool> {
+    let removed = fence::remove_artifact(records)?;
+    if removed {
+        super::super::sync_checkpoint_parent(records)?;
+    }
+    Ok(removed)
+}
+
+pub(crate) fn source_erasure_alarm(consecutive_failures: u32) {
+    telemetry::event("source_erasure_failure_alarm", &consecutive_failures);
+}
+
+/// Uninstall retains its existing OS/ownership/cleanup ordering. Close native
+/// handles first; its established cleanup owner performs all file deletion.
+#[cfg(any(test, target_os = "macos"))]
+pub(in super::super) fn invalidate_tree(support: &Path) -> Result<()> {
+    let root = support.join("snapshots");
+    let routes: Vec<_> = states()
+        .lock()
+        .map_err(|_| Hold::DbUnavailable)?
+        .iter()
+        .filter(|(path, _)| path.starts_with(&root))
+        .map(|(path, state)| (path.clone(), state.clone()))
+        .collect();
+    for (path, state) in routes {
+        let live = {
+            let state = state.lock().map_err(|_| Hold::DbUnavailable)?;
+            let mut live = false;
+            for runtime in state.runtimes.iter().filter_map(|r| r.upgrade()) {
+                if runtime
+                    .session
+                    .lock()
+                    .map_err(|_| Hold::DbUnavailable)?
+                    .is_some()
+                {
+                    live = true;
+                    break;
+                }
+            }
+            live
+        };
+        if !live {
+            continue;
+        }
+        if path.parent().is_some_and(Path::is_dir) {
+            let _lock = super::super::CheckpointLock::acquire(&path)?;
+            invalidate_locked(&path)?;
+        } else {
+            invalidate_locked(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// One short read transaction on the graph's own session, with the store
+/// stamp it read under. A graph not at the generation its save would commit
+/// over (its own, or its confirmed growth claim's), or a store changed
+/// elsewhere, holds.
+fn read_txn<R>(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut dyn Transaction) -> Result<R>,
+) -> Result<(R, (u64, u64))> {
+    read_txn_at(index, |tx, stamp| Ok((f(tx)?, stamp)))
+}
+/// `read_txn`, handing `f` the authenticated stamp before it reads.
+fn read_txn_at<R>(
+    index: &ScanIndex,
+    f: impl FnOnce(&mut dyn Transaction, (u64, u64)) -> Result<R>,
+) -> Result<R> {
+    // The save path's rule: a claim-only growth save in this pass moved the
+    // store past the working graph. Authenticate before the session lock.
+    let path = runtime_path(index)?.ok_or(Hold::DbUnavailable)?;
+    let generation = super::super::sampled_audit::own_growth_claim_generation(index, &path)
+        .unwrap_or(index.generation);
+    let runtime = index
+        .v2()
+        .persistence_v2
+        .as_ref()
+        .ok_or(Hold::DbUnavailable)?;
+    let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+    let session = guard.as_mut().ok_or(Hold::DbUnavailable)?;
+    ensure!(
+        !session.reload && !session.db.reload_required(),
+        Hold::DbUnavailable
+    );
+    let stamp = session.db.stamp()?;
+    ensure!(
+        stamp == session.stamp && generation == stamp.0,
+        Hold::DbUnavailable
+    );
+    let mut tx = session.db.begin(TxnMode::Read)?;
+    f(&mut tx, stamp)
+}
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
+#[cfg(test)]
+pub(in super::super) use tests::{erase_published, with_session_db};
+
+// OPS maintenance boundary; routing/import/ACK remain owned by their adapters.
+#[path = "runtime_ops.rs"]
+mod ops;
+pub(in super::super) use ops::before_collection;
+
+/// Read-only custody seam for growth receipts. Callers doing CAS retain the
+/// checkpoint lock; never acquire it recursively from the save hook.
+pub(in super::super) fn confirmed_growth_stamp(
+    index: &ScanIndex,
+    path: &Path,
+) -> Result<(u64, u64)> {
+    held(with_state(path, |state| {
+        let runtime = index
+            .v2()
+            .persistence_v2
+            .as_ref()
+            .ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            state
+                .current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, runtime)),
+            Hold::ForeignBinding
+        );
+        let guard = runtime.session.lock().map_err(|_| Hold::ReloadRequired)?;
+        let session = guard.as_ref().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && session.path == path,
+            Hold::ReloadRequired
+        );
+        let pair = fence::reconcile(path, &session.identity.binding, state.latched)?;
+        ensure!(
+            pair.is_some_and(|(identity, _)| identity == session.identity),
+            Hold::FenceLost
+        );
+        let stamp = session.db.stamp()?;
+        ensure!(stamp == session.stamp, Hold::ReloadRequired);
+        Ok(stamp)
+    }))
+}
+
+#[cfg(test)]
+#[path = "runtime_growth_tests.rs"]
+mod growth_tests;
+
+#[path = "runtime_tail.rs"]
+pub(super) mod tail_route;
+#[cfg(test)]
+#[path = "tail_tests.rs"]
+mod tail_tests;
+#[cfg(test)]
+pub(crate) use tail_tests::{
+    seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
+    tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
+};
+
+#[cfg(test)]
+#[path = "publication_gate_tests.rs"]
+mod publication_gate_tests;

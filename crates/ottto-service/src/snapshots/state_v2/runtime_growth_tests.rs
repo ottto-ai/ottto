@@ -1,0 +1,771 @@
+//! Native custody fixtures. Execution belongs to CI; no production save bypass.
+use super::*;
+use crate::snapshots::{
+    candidate_from_traversal_path, local_index_key, open_and_identify_scan_candidate_at,
+    sampled_audit, CandidateFile, ScanCensus, ScanTraversalPath, SnapshotSource,
+    LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+};
+use crate::transcript_acquisition::{FullReason, ReadMode};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+const NOW: u64 = 100_000;
+const INTERVAL: u64 = 6 * 60 * 60;
+
+struct Fixture {
+    support: PathBuf,
+    path: PathBuf,
+    source: PathBuf,
+    key: String,
+}
+impl Fixture {
+    fn new() -> Self {
+        Self::with_claims(BTreeMap::new())
+    }
+    fn with_claims(claims: BTreeMap<String, sampled_audit::GrowthRetention>) -> Self {
+        Self::on_route("claude_code-test-scan-index.json", claims)
+    }
+    /// `index_file` names the route, and so the source its binding derives.
+    fn on_route(
+        index_file: &str,
+        claims: BTreeMap<String, sampled_audit::GrowthRetention>,
+    ) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let support = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "ottto-growth-lineage-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = support.join("snapshots/destinations").join("a".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(index_file);
+        let source = support.join("session.jsonl");
+        fs::write(&source, b"old\nappend\n").unwrap();
+        let key = local_index_key(&source);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes": 4, "modified_unix_seconds": 1,
+                "source_file_fingerprint": "a".repeat(64),
+                "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+            }))
+            .unwrap(),
+        );
+        index.v2_mut().growth_retention = claims;
+        index
+            .v2_mut()
+            .growth_retention
+            .insert(key.clone(), debt(None));
+        let identity = Identity {
+            format: FORMAT,
+            db_id: "synthetic-growth-lineage".into(),
+            binding: binding(&path).unwrap(),
+            fence_generation: 1,
+        };
+        let mut db =
+            sqlite::Sqlite::create_import(&fence::sibling(&path, ".v2.sqlite.import")).unwrap();
+        db.control("identity", &identity).unwrap();
+        db.control("generation", &0_u64).unwrap();
+        let mut cx = KindCx::default();
+        cx.binding = Some(identity.binding.clone());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        kinds::populate(&index, &mut tx, &mut cx).unwrap();
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        db.finish_import().unwrap();
+        fence::publish(&path, &identity, &mut false).unwrap();
+        Self {
+            support,
+            path,
+            source,
+            key,
+        }
+    }
+    fn load(&self) -> ScanIndex {
+        ScanIndex::load(&self.path).unwrap()
+    }
+    fn candidate(&self, index: &ScanIndex) -> CandidateFile {
+        let mut census = ScanCensus::default();
+        let pending = ScanTraversalPath {
+            scan_root: self.support.clone(),
+            path: self.source.clone(),
+            census_member: true,
+            watcher_hint: false,
+        };
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::ClaudeCode,
+            pending,
+            &mut census,
+            None,
+            30,
+            // v2 growth follows the index (production derivation).
+            &mut crate::snapshots::CandidateDiscovery::new(&mut index.clone(), None),
+        )
+        .unwrap();
+        open_and_identify_scan_candidate_at(
+            SnapshotSource::ClaudeCode,
+            candidate,
+            &mut census,
+            crate::snapshots::CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 30,
+                retention: crate::snapshots::DiscoveryRetention::unverified(&index.files),
+                growth: Some(&index.v2().growth_retention),
+            },
+        )
+        .unwrap()
+        .0
+    }
+    /// Simulate a confirmed claim-only transaction independently of SAVE's
+    /// still-gated production planner, then exercise the real receipt hook.
+    fn commit_claim(&self, index: &mut ScanIndex, confirmed: bool) {
+        index
+            .v2_mut()
+            .growth_retention
+            .insert(self.key.clone(), debt(Some(NOW)));
+        let runtime = index.v2().persistence_v2.as_ref().unwrap().clone();
+        let mut guard = runtime.session.lock().unwrap();
+        let session = guard.as_mut().unwrap();
+        let mut tx = session.db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &RowKey::record("file.growth_retention", self.key.as_bytes(), 1).unwrap(),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &codec::encode(
+                &serde_json::to_vec(&index.v2().growth_retention[&self.key]).unwrap(),
+            )
+            .unwrap(),
+        })
+        .unwrap();
+        let next = index.generation + 1;
+        assert_eq!(
+            tx.commit(index.generation, next),
+            DurableCommitOutcome::Committed(next)
+        );
+        index.generation = next;
+        if confirmed {
+            session.stamp = session.db.stamp().unwrap();
+        } else {
+            session.reload = true;
+        }
+        drop(guard);
+        with_state(&self.path, |state| {
+            state.save_digests = None;
+            Ok(())
+        })
+        .unwrap();
+        let _lock = crate::snapshots::CheckpointLock::acquire(&self.path).unwrap();
+        assert_eq!(
+            sampled_audit::publish_growth_claim_receipt(index, &self.path, index.generation)
+                .is_ok(),
+            confirmed
+        );
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        super::super::money_test_support::erase_published(&self.path);
+        let _ = fs::remove_dir_all(&self.support);
+    }
+}
+fn debt(last: Option<u64>) -> sampled_audit::GrowthRetention {
+    serde_json::from_value(serde_json::json!({
+        "predecessor_size": 4, "last_growth_full_unix": last,
+    }))
+    .unwrap()
+}
+fn admitted(
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+    reason: FullReason,
+    now: u64,
+) -> bool {
+    sampled_audit::growth_read_admitted_at(index, candidate, ReadMode::Full(reason), now)
+}
+
+/// [money] confirmed claim survives native reopen and clock rollback.
+#[test]
+fn confirmed_claim_survives_native_reopen_and_clock_rollback() {
+    let f = Fixture::new();
+    let mut committed = f.load();
+    let original = committed.clone();
+    let fence_before = fs::read(&f.path).unwrap();
+    f.commit_claim(&mut committed, true);
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&original, &f.path),
+        Some(2)
+    );
+    assert_eq!(
+        fs::read(&f.path).unwrap(),
+        fence_before,
+        "the root is constant"
+    );
+    invalidate_locked(&f.path).unwrap();
+    let mut reopened = f.load();
+    let candidate = f.candidate(&reopened);
+    assert_eq!(
+        serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
+            ["last_growth_full_unix"],
+        NOW
+    );
+    for now in [NOW - 1, NOW, NOW + INTERVAL - 1] {
+        assert!(!admitted(
+            &mut reopened,
+            &candidate,
+            FullReason::StateMissing,
+            now
+        ));
+    }
+    assert!(admitted(
+        &mut reopened,
+        &candidate,
+        FullReason::Replaced,
+        NOW + 1
+    ));
+}
+
+/// [money] independent load cannot borrow claim generation even without working debt.
+#[test]
+fn independent_load_cannot_borrow_claim_generation_even_without_working_debt() {
+    let f = Fixture::new();
+    let mut owner = f.load();
+    let mut stale = f.load();
+    let candidate = f.candidate(&stale);
+    f.commit_claim(&mut owner, true);
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&stale, &f.path),
+        None
+    );
+    assert!(crate::snapshots::state_v2_side_effect_guard(&f.path, &stale)().is_err());
+    stale.v2_mut().growth_retention.clear();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for reason in [FullReason::StateMissing, FullReason::Replaced] {
+            assert!(!admitted(&mut stale, &candidate, reason, NOW + INTERVAL));
+        }
+    });
+    assert!(rows
+        .iter()
+        .any(|row| row["counts"]["latest"]["growth_claim_refused"] == "lineage"));
+}
+
+/// [money] reopened owner and other path cannot reuse foreign claim context.
+#[test]
+fn reopened_owner_and_other_path_cannot_reuse_foreign_claim_context() {
+    let f = Fixture::new();
+    let mut old = f.load();
+    f.commit_claim(&mut old, true);
+    let context = old.v2().growth_claim_context.clone();
+    invalidate_locked(&f.path).unwrap();
+    let mut reopened = f.load();
+    let candidate = f.candidate(&reopened);
+    reopened.v2_mut().growth_claim_context = context.clone();
+    assert!(!admitted(
+        &mut reopened,
+        &candidate,
+        FullReason::Replaced,
+        NOW + INTERVAL
+    ));
+    let other = Fixture::new();
+    let mut foreign = other.load();
+    foreign.v2_mut().growth_claim_context = context;
+    let candidate = other.candidate(&foreign);
+    assert!(!admitted(
+        &mut foreign,
+        &candidate,
+        FullReason::StateMissing,
+        NOW + INTERVAL
+    ));
+}
+
+/// [money] unconfirmed commit cannot publish receipt or admit full.
+#[test]
+fn unconfirmed_commit_cannot_publish_receipt_or_admit_full() {
+    let f = Fixture::new();
+    let mut index = f.load();
+    let mut original = index.clone();
+    let candidate = f.candidate(&original);
+    f.commit_claim(&mut index, false);
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&original, &f.path),
+        None
+    );
+    assert!(!admitted(
+        &mut original,
+        &candidate,
+        FullReason::Replaced,
+        NOW + INTERVAL
+    ));
+}
+
+/// [money] same generation db replacement cannot borrow constant fence.
+#[test]
+fn same_generation_db_replacement_cannot_borrow_constant_fence() {
+    let f = Fixture::new();
+    let mut owner = f.load();
+    let mut original = owner.clone();
+    let candidate = f.candidate(&original);
+    f.commit_claim(&mut owner, true);
+    let db = fence::sibling(&f.path, ".v2.sqlite");
+    let replacement = f.support.join("replacement.sqlite");
+    fs::copy(&db, &replacement).unwrap();
+    fs::rename(&replacement, &db).unwrap();
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&original, &f.path),
+        None
+    );
+    assert!(!admitted(
+        &mut original,
+        &candidate,
+        FullReason::Replaced,
+        NOW + INTERVAL
+    ));
+}
+
+/// [money] real claim save authenticates old clone and ordinary save ends its authority.
+#[test]
+fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority() {
+    let f = Fixture::new();
+    let mut claim = f.load();
+    let mut old = claim.clone();
+    let context = claim.v2().growth_claim_context.clone().unwrap();
+    claim
+        .v2_mut()
+        .growth_retention
+        .insert(f.key.clone(), debt(Some(NOW)));
+    claim.save_growth_claim(&f.path).unwrap();
+    with_state(&f.path, |state| {
+        // Only carrier links survive a claim-only save; no row baseline.
+        assert!(state.save_digests.as_ref().is_none_or(|b| b.links_only));
+        Ok(())
+    })
+    .unwrap();
+    let durable_claim = {
+        let runtime = claim.v2().persistence_v2.as_ref().unwrap();
+        let mut guard = runtime.session.lock().unwrap();
+        super::super::money_test_support::hydrate_resident(&mut guard.as_mut().unwrap().db)
+    };
+    assert_eq!(
+        serde_json::to_vec(&durable_claim).unwrap(),
+        serde_json::to_vec(&claim).unwrap()
+    );
+    assert_eq!(
+        durable_claim.v2().growth_retention,
+        claim.v2().growth_retention
+    );
+    assert!(Arc::ptr_eq(
+        claim.v2().growth_claim_context.as_ref().unwrap(),
+        &context
+    ));
+    {
+        let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path, claim.generation).unwrap();
+    }
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&old, &f.path),
+        Some(claim.generation)
+    );
+    let guard = crate::snapshots::state_v2_side_effect_guard(&f.path, &old);
+    guard().unwrap();
+    old.historical_replay_generation = Some("synthetic-next-context".into());
+    old.save(&f.path).unwrap();
+    assert!(
+        guard().is_err(),
+        "an ordinary save ends this claim's authority"
+    );
+    assert!(!Arc::ptr_eq(
+        old.v2().growth_claim_context.as_ref().unwrap(),
+        &context
+    ));
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&claim, &f.path),
+        None
+    );
+    let reopened = f.load();
+    assert_eq!(
+        serde_json::to_vec(&reopened).unwrap(),
+        serde_json::to_vec(&old).unwrap()
+    );
+    assert_eq!(reopened.v2().growth_retention, old.v2().growth_retention);
+    assert_eq!(
+        reopened.historical_replay_generation,
+        old.historical_replay_generation
+    );
+    assert_eq!(
+        serde_json::to_value(&reopened.v2().growth_retention[&f.key]).unwrap()
+            ["last_growth_full_unix"],
+        serde_json::json!(NOW)
+    );
+}
+
+/// [behaviour] A claim-only growth save earlier in the pass moves the session
+/// to the claim's G; a progress page from the pass's index authenticates at
+/// that lineage instead of refusing as a stale graph.
+#[test]
+fn progress_page_follows_the_claim_lineage() {
+    let f = Fixture::new();
+    let mut claim = f.load();
+    let pass = claim.clone();
+    claim
+        .v2_mut()
+        .growth_retention
+        .insert(f.key.clone(), debt(Some(NOW)));
+    claim.save_growth_claim(&f.path).unwrap();
+    {
+        let _lock = crate::snapshots::CheckpointLock::acquire(&f.path).unwrap();
+        sampled_audit::publish_growth_claim_receipt(&claim, &f.path, claim.generation).unwrap();
+    }
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&pass, &f.path),
+        Some(pass.generation + 1)
+    );
+    let (states, heads) = (
+        BTreeMap::from([("s".to_string(), 1_u64)]),
+        BTreeMap::<String, u64>::new(),
+    );
+    let page = progress::Page {
+        cache_state: &states,
+        cache_head: &heads,
+        ledger: &1_u64,
+    };
+    let outcome = crate::snapshot_sync::with_state_v2_progress_owner(&f.path, None, |owner, _| {
+        with_progress_session(&f.path, owner, |db, identity, graph| {
+            progress::commit(db, identity, graph, &Default::default(), &page, None)
+        })
+    })
+    .unwrap();
+    assert!(matches!(outcome, progress::Outcome::Committed(_)));
+}
+
+/// One growth Full claim through selection admission. Also reports whether
+/// no committed graph was hydrated: a reused-session hydrate takes the tripwire.
+fn admit_without_hydrate(
+    index: &mut ScanIndex,
+    candidate: &CandidateFile,
+    now: u64,
+) -> (bool, bool) {
+    super::tests::DELETE_DURING_HYDRATE
+        .with(|cell| cell.set(Some(RowKey::Meta("growth_claim_tripwire".into()))));
+    let admitted = admitted(index, candidate, FullReason::StateMissing, now);
+    let untouched = super::tests::DELETE_DURING_HYDRATE
+        .with(std::cell::Cell::take)
+        .is_some();
+    (admitted, untouched)
+}
+fn durable(index: &ScanIndex) -> ScanIndex {
+    let runtime = index.v2().persistence_v2.as_ref().unwrap();
+    let mut guard = runtime.session.lock().unwrap();
+    super::super::money_test_support::hydrate_resident(&mut guard.as_mut().unwrap().db)
+}
+
+/// [money] One transaction commits exactly the expected growth rows at G+1
+/// (the claim, the save's merge and pruning), publishes the lineage receipt,
+/// paces the next Full, and keeps a no-hydrate save equal to a fresh baseline,
+/// including recreation of an identical reclaimed member.
+#[test]
+fn row_claim_commits_expected_rows_without_a_hydrate() {
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    let (expired, recent) = ("/synthetic/expired.jsonl", "/synthetic/recent.jsonl");
+    let f = Fixture::with_claims(BTreeMap::from([
+        (expired.into(), debt(Some(now - INTERVAL - 1))),
+        (recent.into(), debt(Some(now - 1))),
+    ]));
+    let mut index = f.load();
+    let candidate = f.candidate(&index);
+    let (claimed, untouched) = admit_without_hydrate(&mut index, &candidate, now);
+    assert!(claimed);
+    assert!(untouched, "no committed graph was hydrated");
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&index, &f.path),
+        Some(2)
+    );
+    // Durable: the claim at `now`; the expired orphan pruned; recent kept.
+    let expected = BTreeMap::from([
+        (f.key.clone(), debt(Some(now))),
+        (recent.to_owned(), debt(Some(now - 1))),
+    ]);
+    let committed = durable(&index);
+    assert_eq!(committed.generation, 2);
+    assert_eq!(committed.v2().growth_retention, expected);
+    // The working page merges the claim and keeps its own rows.
+    let mut working = expected.clone();
+    working.insert(expired.to_owned(), debt(Some(now - INTERVAL - 1)));
+    assert_eq!(index.v2().growth_retention, working);
+
+    assert!(!admit_without_hydrate(&mut index, &candidate, now + INTERVAL - 1).0);
+    // An identical reclaimed debt must be written again when its file returns.
+    index
+        .files
+        .insert(expired.into(), index.files[&f.key].clone());
+    index.historical_replay_generation = Some("synthetic-next-context".into());
+    let desired = index.v2().growth_retention.clone();
+    let durable_rows = |index: &ScanIndex| {
+        let mut rows = BTreeMap::new();
+        super::tests::with_session_db(index, |db| {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            for table in Table::ALL {
+                for h in super::super::money_fault_tests::headers(&mut tx, table) {
+                    // Generation alone advances between the two saves.
+                    if h.key != RowKey::Meta("generation".into()) {
+                        let mut value = Vec::new();
+                        tx.read_value(&h, &mut value).unwrap();
+                        rows.insert(h.key, (h.fixed, h.value_version, value));
+                    }
+                }
+            }
+        });
+        rows
+    };
+    with_state(&f.path, |state| {
+        let baseline = state.save_digests.as_ref().expect("save must not hydrate");
+        assert_eq!(baseline.generation, 2);
+        Ok(())
+    })
+    .unwrap();
+    index.save(&f.path).unwrap();
+    let saved_rows = durable_rows(&index);
+    let committed = durable(&index);
+    assert_eq!(committed.generation, 3);
+    assert_eq!(committed.v2().growth_retention, desired);
+    let mut fresh = f.load();
+    fresh.v2_mut().growth_retention = desired;
+    fresh.save(&f.path).unwrap();
+    assert_eq!(fresh.generation, 4);
+    assert_eq!(saved_rows, durable_rows(&fresh));
+}
+
+/// [money] A stale generation is refused before any write: selection keeps
+/// today's lineage refusal, and the store transaction itself returns the
+/// save's ReloadRequired hold without disturbing the owner's session.
+#[test]
+fn row_claim_refuses_a_stale_generation() {
+    let f = Fixture::new();
+    let mut owner = f.load();
+    let mut stale = f.load();
+    let candidate = f.candidate(&stale);
+    owner.historical_replay_generation = Some("synthetic-next-context".into());
+    owner.save(&f.path).unwrap();
+    let (claimed, untouched) = admit_without_hydrate(&mut stale, &candidate, NOW);
+    assert!(!claimed);
+    assert!(untouched);
+    let error =
+        claim_growth_locked(&f.path, &stale, stale.generation, &f.key, |_, _, _| true).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    crate::snapshots::state_v2_side_effect_guard(&f.path, &owner)().unwrap();
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&stale, &f.path),
+        None
+    );
+    let committed = durable(&owner);
+    assert_eq!(committed.generation, owner.generation);
+    assert_eq!(committed.v2().growth_retention, owner.v2().growth_retention);
+}
+
+/// [money] A commit landing after the claim authenticated G and before its
+/// write refuses the claim with the save's hold: no row, no receipt, no Full.
+#[test]
+fn row_claim_refuses_a_commit_between_authentication_and_write() {
+    let f = Fixture::new();
+    let index = f.load();
+    let before = index.v2().growth_retention.clone();
+    super::tests::COMMIT_BEFORE_GROWTH_CLAIM.with(|hook| hook.set(true));
+    let error = claim_growth_locked(&f.path, &index, index.generation, &f.key, |rows, _, _| {
+        rows.insert(f.key.clone(), debt(Some(NOW)));
+        true
+    })
+    .unwrap_err();
+    assert!(!super::tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take));
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    assert!(
+        crate::snapshots::state_v2_side_effect_guard(&f.path, &index)().is_err(),
+        "the session reloads, as after a refused save"
+    );
+
+    invalidate_locked(&f.path).unwrap();
+    let mut index = f.load();
+    assert_eq!(index.generation, 2, "only the synthetic commit landed");
+    assert_eq!(index.v2().growth_retention, before);
+    let candidate = f.candidate(&index);
+    super::tests::COMMIT_BEFORE_GROWTH_CLAIM.with(|hook| hook.set(true));
+    let (claimed, untouched) = admit_without_hydrate(&mut index, &candidate, NOW);
+    assert!(!super::tests::COMMIT_BEFORE_GROWTH_CLAIM.with(std::cell::Cell::take));
+    assert!(!claimed);
+    assert!(untouched);
+    assert_eq!(
+        sampled_audit::own_growth_claim_generation(&index, &f.path),
+        None
+    );
+    assert_eq!(index.v2().growth_retention, before);
+    invalidate_locked(&f.path).unwrap();
+    let reopened = f.load();
+    assert_eq!(reopened.generation, 3);
+    assert_eq!(reopened.v2().growth_retention, before);
+}
+
+/// [regress] v2 CAS resurrected expired absent-file claims on normal and claim saves.
+#[test]
+fn saves_reclaim_expired_orphan_claims_after_merging_maxima() {
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    for route in ["normal", "claim", "subset"] {
+        let expired = "/synthetic/expired.jsonl";
+        let recent = "/synthetic/recent.jsonl";
+        let future = "/synthetic/future.jsonl";
+        let f = Fixture::with_claims(BTreeMap::from([
+            (expired.into(), debt(Some(now - INTERVAL - 1))),
+            (recent.into(), debt(Some(now - 1))),
+            (future.into(), debt(Some(now + INTERVAL))),
+        ]));
+        let previous = f.load();
+        let mut working = previous.clone();
+        working.v2_mut().growth_retention.remove(expired);
+        if route == "subset" {
+            working =
+                working.committable_subset(&previous, &Default::default(), &Default::default());
+        }
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            if route == "claim" {
+                working.save_growth_claim(&f.path).unwrap();
+            } else {
+                working.save(&f.path).unwrap();
+            }
+        });
+        assert!(rows
+            .iter()
+            .any(|row| row["counts"]["growth_claim_reclaimed"] == 1));
+        invalidate_locked(&f.path).unwrap();
+        let reopened = f.load();
+        assert!(
+            !reopened.v2().growth_retention.contains_key(expired),
+            "{route}"
+        );
+        for key in [&f.key, recent, future] {
+            assert!(
+                reopened.v2().growth_retention.contains_key(key),
+                "{route}: {key}"
+            );
+        }
+        let mut guard = reopened
+            .v2()
+            .persistence_v2
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap();
+        let db = &mut guard.as_mut().unwrap().db;
+        assert!(
+            db.read_control::<u64>("erasure_pending")
+                .unwrap()
+                .unwrap_or(0)
+                > 0
+        );
+    }
+}
+
+/// [regress] grown and undiscovered keys kept old Exact proof after lossy/failed parses.
+#[test]
+fn growth_never_suppresses_lossy_records_or_failed_validation() {
+    use crate::snapshots::claude_request_census::{
+        self, ClaudeRequestBirth, ClaudeRequestCensusParse, ClaudeRequestCensusRecord,
+        ClaudeRequestCensusShape,
+    };
+    for case in [
+        "lossy",
+        "lossy_past_old_cap",
+        "incomplete",
+        "no_record",
+        "invalidate",
+        "nongrown_in_range",
+    ] {
+        let f = Fixture::new();
+        let mut index = f.load();
+        let fingerprint = "a".repeat(64);
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &fingerprint,
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![7],
+        )
+        .with_modified_for_test(Some(1))
+        .with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: 1,
+            inode: 1,
+        }));
+        index.claude_request_census.insert_for_test(&f.key, record);
+        if case == "lossy_past_old_cap" {
+            // The hashes the census held before it lost its caps.
+            let cap = 2_097_152_u64;
+            index.claude_request_census.insert_for_test(
+                "/synthetic/young.jsonl",
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &fingerprint,
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    (100..cap + 99).collect(),
+                )
+                .with_modified_for_test(Some(u64::MAX)),
+            );
+        }
+        crate::snapshots::ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&f.support),
+            &mut index,
+            "2026-10-07T12:00:00Z",
+            30,
+        );
+        if case == "nongrown_in_range" {
+            index.v2_mut().growth_retention.clear();
+        }
+        if case == "invalidate" {
+            let mut candidate = f.candidate(&index);
+            candidate.physical_identity = Some([2, 2]);
+            claude_request_census::invalidate_claude_request_census(&mut index, &candidate.path);
+        } else {
+            claude_request_census::record_claude_request_census(
+                &mut index,
+                ClaudeRequestCensusParse {
+                    path: &f.source,
+                    index_key: &f.key,
+                    source_file_fingerprint: if case == "no_record" {
+                        "invalid"
+                    } else {
+                        &fingerprint
+                    },
+                    census_window_end: "2026-10-07T12:00:00Z",
+                    complete: case != "incomplete",
+                    lossy: case != "no_record",
+                    source_verified: true,
+                    continued_source: false,
+                    itemless_request_hashes: vec![8, 9],
+                    opened_birth: None,
+                    modified_unix_seconds: 1,
+                },
+                &[],
+            );
+        }
+        let record = index.claude_request_census.record_for_test(&f.key).unwrap();
+        assert!(!record.request_hashes_for_test().contains(&7), "{case}");
+        if matches!(case, "no_record" | "invalidate") {
+            assert!(record.is_birth_stub(), "{case}");
+        } else {
+            assert_eq!(
+                record.shape_for_test(),
+                ClaudeRequestCensusShape::Lossy,
+                "{case}"
+            );
+        }
+        let holders = index
+            .claude_request_census
+            .family_transcript_holders(
+                &BTreeMap::from([("session", vec![7])]),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(
+            holders
+                .get("session")
+                .map_or(true, |family| family.held.is_empty()),
+            "{case}"
+        );
+    }
+}

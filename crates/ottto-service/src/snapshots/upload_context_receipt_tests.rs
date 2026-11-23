@@ -1,0 +1,3228 @@
+//! Synthetic production-scanner and exact entity-ACK fixtures. No live inputs.
+use super::*;
+use upload_context_receipt::{Candidate, RearmCounts};
+#[path = "privacy_flip_tests.rs"]
+mod privacy_flip;
+#[path = "privacy_flip_launch_tests.rs"]
+mod privacy_flip_launch;
+#[path = "upload_context_released_entry_fixture.rs"]
+mod released;
+
+const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
+struct Fixture {
+    _scratch: crate::test_scratch::ScratchDir,
+    root: PathBuf,
+    path: PathBuf,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    uploader: crate::snapshot_sync::upload_context_receipt_tests::Uploader,
+}
+impl Fixture {
+    /// Model entities whose stamps are gone from the index and the ACK
+    /// ledger (dropped by an older decoder, or retired): an unproven delivered
+    /// file. A delivery context change reads nothing, even for this
+    /// population. Fixtures that exercise the catch-up of bodies sent anyway
+    /// drive the read with a live cause (`rearm_for_read`, growth).
+    fn drop_entity_stamps(&mut self) {
+        self.index.upload_context_proof.entity_stamps.clear();
+        self.uploader.drop_body_contexts();
+    }
+    /// A live read cause at the same bytes (a re-arm clears the revision, as
+    /// a terminal retry does): the next walk reads the file again.
+    fn rearm_for_read(&mut self) {
+        let key = self.key();
+        self.index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    /// One pass under the active context: no body parse, no body bytes and
+    /// no POST.
+    fn assert_no_read_or_post(&mut self) {
+        let previous = self.index.clone();
+        let (((scan, bytes), parses), group_bytes) =
+            terminal_contract_retry::group_body_bytes(|| {
+                terminal_contract_retry::source_acquisitions(|| self.walk(true))
+            });
+        assert!(parses.is_empty(), "no body parse: {parses:?}");
+        assert_eq!((bytes, group_bytes), (0, 0), "no body bytes");
+        let context = self
+            .index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap();
+        self.uploader
+            .activate(self.source, context, &mut self.index);
+        let before = self.uploader.posts.len();
+        self.uploader
+            .send(self.source, &mut self.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(self.uploader.posts.len(), before, "no POST");
+    }
+    fn new(source: SnapshotSource) -> Self {
+        let scratch = crate::test_scratch::ScratchDir::new("upload-context-receipt");
+        let root = scratch.join(match source {
+            SnapshotSource::Codex => "home/.codex/sessions",
+            _ => "home/.claude/projects/synthetic-project",
+        });
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(match source {
+            SnapshotSource::Codex => format!("rollout-2026-10-29T10-00-00-{SESSION}.jsonl"),
+            _ => format!("{SESSION}.jsonl"),
+        });
+        let lines = match source {
+            SnapshotSource::Codex => vec![
+                json!({"type":"session_meta","payload":{"id":SESSION}}),
+                json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12,"output_tokens":4}}}}),
+            ],
+            SnapshotSource::Pi => vec![
+                json!({"type":"session","id":SESSION,"timestamp":"2026-10-29T10:00:00Z"}),
+                json!({"type":"message_end","message":{"responseId":"synthetic-response","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":12,"output":4}}}),
+            ],
+            _ => vec![
+                json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:00:01Z","requestId":"synthetic-request","message":{"id":"synthetic-message","model":"claude-sonnet-4-6","usage":{"input_tokens":12,"output_tokens":4}}}),
+            ],
+        };
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut index = ScanIndex::default();
+        index.activate_file_upload_context(source, "d".repeat(64));
+        Self {
+            _scratch: scratch,
+            root,
+            path,
+            source,
+            index,
+            cache: Arc::default(),
+            uploader: crate::snapshot_sync::upload_context_receipt_tests::Uploader::new(source),
+        }
+    }
+    fn key(&self) -> String {
+        local_index_key(&self.path)
+    }
+    fn entry(&self) -> &ScanIndexEntry {
+        &self.index.files[&self.key()]
+    }
+    fn walk(&mut self, finalize: bool) -> (SourceScanResult, u64) {
+        self.walk_with_file_limit(finalize, 10, false)
+    }
+    fn walk_with_file_limit(
+        &mut self,
+        finalize: bool,
+        file_limit: usize,
+        allow_census_complete: bool,
+    ) -> (SourceScanResult, u64) {
+        let mut scan = OwnedSourceScan::new(
+            self.source,
+            std::slice::from_ref(&self.root),
+            std::mem::take(&mut self.index),
+            "2026-10-29T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            file_limit,
+            None,
+            &[],
+            false,
+        )
+        .with_sampled_acquisition(
+            self.cache.clone(),
+            crate::transcript_acquisition::Scope("upload-context-fixture".into()),
+        );
+        let mut bytes = 0;
+        loop {
+            if let Some(sampling) = scan.sampling.as_ref() {
+                bytes = sampling.native_bytes;
+            }
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete {
+                    index, mut scan, ..
+                } => {
+                    self.index = index;
+                    // Most fixtures model an incomplete census. Terminal-page
+                    // regressions retain the scanner's actual completion result.
+                    if !allow_census_complete {
+                        scan.census_complete = false;
+                    }
+                    apply_upload_policy(
+                        self.source,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    if finalize {
+                        finalize_scan_after_policy(self.source, &mut scan, &mut self.index);
+                    }
+                    return (scan, bytes);
+                }
+            }
+        }
+    }
+    fn pending(&mut self) -> (Vec<Candidate>, Vec<SnapshotItem>) {
+        let (scan, _) = self.walk(true);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(
+            !scan.snapshots.is_empty(),
+            "a byte-identical old body must still reach the uploader"
+        );
+        let candidates = self
+            .index
+            .file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
+        assert_eq!(candidates.len(), 1);
+        (candidates, scan.snapshots)
+    }
+    fn adopt(&mut self) -> RearmCounts {
+        let committed = self.index.clone();
+        let (_, items) = self.pending();
+        self.uploader.activate(
+            self.source,
+            self.index
+                .active_upload_context_fingerprint
+                .clone()
+                .unwrap(),
+            &mut self.index,
+        );
+        let (files, bytes) = self
+            .uploader
+            .send(self.source, &mut self.index, &committed, &items)
+            .unwrap();
+        RearmCounts {
+            files,
+            bytes,
+            local_bytes: self.index.context_read_counts.local_bytes,
+            ..RearmCounts::default()
+        }
+    }
+
+    fn send_ordering_page(&mut self, previous: &ScanIndex, scan: &SourceScanResult) -> (u64, u64) {
+        self.uploader.activate(
+            self.source,
+            self.index
+                .active_upload_context_fingerprint
+                .clone()
+                .unwrap(),
+            &mut self.index,
+        );
+        let before = (
+            self.uploader.received_item_bytes,
+            self.uploader.received_catchup_bytes,
+            self.uploader.received_resend_bytes,
+        );
+        let counts = self
+            .uploader
+            .send(self.source, &mut self.index, previous, &scan.snapshots)
+            .unwrap();
+        let catchup = self.uploader.received_catchup_bytes - before.1;
+        let ordinary = self.uploader.received_item_bytes - before.0 - catchup;
+        // These small ordering fixtures need no oversized wire/native exception.
+        assert!(
+            catchup
+                <= (crate::snapshot_sync::SNAPSHOT_BATCH_MAX_BYTES as u64).saturating_sub(ordinary)
+        );
+        assert_eq!(
+            self.uploader.counts().1,
+            self.uploader.received_resend_bytes - before.2,
+            "resend counter equals actual received item bytes, including changed revisions"
+        );
+        counts
+    }
+
+    fn assert_quiet(&mut self) {
+        // Freeze the ceiling before any quiet walk can enlarge the index.
+        let settled_group_members = self
+            .index
+            .files
+            .values()
+            .filter(|entry| {
+                entry.codex_joined_member_set.is_some()
+                    && entry
+                        .upload_context_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            self.index.active_upload_context_fingerprint.as_ref()
+                                == Some(&receipt.context_fingerprint)
+                                && receipt.replay_generation
+                                    == upload_context_receipt::RECEIPT_REPLAY_EPOCH
+                                && receipt.source_witness == entry.source_file_fingerprint
+                                && entry.last_upload_body_witness.as_ref()
+                                    == Some(&receipt.body_witness)
+                        })
+            })
+            .count();
+        let held_quarantine = !self.index.quarantined_snapshot_fingerprints.is_empty();
+        for quiet_call in 0..3 {
+            if held_quarantine && quiet_call > 0 {
+                assert!(
+                    !self.index.quarantined_snapshot_fingerprints.is_empty(),
+                    "refusal quarantine survives settlement before quiet call {}",
+                    quiet_call + 1
+                );
+            }
+            self.uploader.prepare_for_scan(
+                self.source,
+                self.index
+                    .active_upload_context_fingerprint
+                    .clone()
+                    .unwrap(),
+                &mut self.index,
+            );
+            let previous = self.index.clone();
+            let (((scan, bytes), parses), group_bytes) =
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| self.walk(true))
+                });
+            // Per-census unchanged-group identity walks pre-exist on main; no body read.
+            assert!(
+                parses.is_empty(),
+                "no body parser is stepped on a quiet or held page; quiet_call={} parses={parses:?} sampled_bytes={bytes} group_body_bytes={group_bytes}",
+                quiet_call + 1
+            );
+            assert_eq!(bytes, 0);
+            assert_eq!(
+                group_bytes, 0,
+                "no physical group body bytes after adoption"
+            );
+            assert!(
+                scan.scanned_file_count <= settled_group_members,
+                "quiet metadata work cannot exceed the settled alias population"
+            );
+            let before = self.uploader.posts.len();
+            self.uploader
+                .send(self.source, &mut self.index, &previous, &scan.snapshots)
+                .unwrap();
+            assert_eq!(self.uploader.posts.len(), before, "no POST after adoption");
+            assert!(!scan.census_complete);
+        }
+    }
+}
+
+#[test]
+fn codex_incomplete_census_exact_ack_stops_upload_context_for_three_passes() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    assert_eq!(f.adopt().files, 1);
+    f.assert_quiet();
+}
+#[test]
+fn claude_fresh_index_and_context_change_are_quiet_after_adoption() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    f.assert_quiet();
+    let old = f.entry().upload_context_receipt.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    assert_eq!(
+        f.entry().upload_context_receipt,
+        old,
+        "activation does not rewrite receipts"
+    );
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    // A context reads nothing.
+    f.assert_quiet();
+}
+#[test]
+fn upload_context_receipt_parse_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.walk(false);
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_finalize_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.walk(true);
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_quarantine_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index.quarantined_snapshot_fingerprints.insert(
+        items[0].snapshot_fingerprint.clone(),
+        snapshot_quarantine_record(f.source),
+    );
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_c_ack_after_switch_to_d_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.index
+        .activate_file_upload_context(f.source, "c".repeat(64));
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+
+#[test]
+fn unaffected_base_receipt_still_refuses_ack_from_previous_retry_mode() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let base = "d".repeat(64);
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index.activate_file_upload_context(
+        f.source,
+        crate::snapshot_sync::resumed_prefix_upload_context(base, true),
+    );
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+
+#[test]
+fn acknowledged_unaffected_receipt_survives_resumed_prefix_mode_changes() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone();
+    assert!(receipt.is_some(), "real uploader ACK granted the receipt");
+    let base = "d".repeat(64);
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    for wire in [false, true] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+        let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
+        f.index.activate_file_upload_context(f.source, mode);
+        let (scan, bytes) = f.walk(true);
+        assert_eq!(bytes, 0);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(f.entry().upload_context_receipt, receipt);
+    }
+}
+
+#[test]
+fn pre_scope_mode_qualified_receipt_keeps_unaffected_history_quiet() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let base = "d".repeat(64);
+    let old_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    // Simulate the earlier ON builder: no scoped base override, so a real
+    // uploader ACK grants the mode-qualified receipt to this unchanged file.
+    f.index
+        .activate_file_upload_context(f.source, old_on.clone());
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone().unwrap();
+    assert_eq!(receipt.context_fingerprint, old_on);
+    f.index = serde_json::from_value(serde_json::to_value(&f.index).unwrap()).unwrap();
+    f.index.copy_prefix_base_upload_context = Some(base.clone());
+    for wire in [false, true] {
+        let mode = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+        let mode = crate::snapshot_sync::copy_unproven_upload_context(mode, wire);
+        f.index.activate_file_upload_context(f.source, mode);
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(f.entry().upload_context_receipt.as_ref(), Some(&receipt));
+    }
+    // A context alias grants no body/source/replay authority of its own.
+    let key = f.key();
+    let receipt_generation = |index: &mut ScanIndex, delta: i64| {
+        let receipt = index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .upload_context_receipt
+            .as_mut()
+            .unwrap();
+        receipt.replay_generation = receipt.replay_generation.wrapping_add_signed(delta);
+    };
+    receipt_generation(&mut f.index, 1);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    receipt_generation(&mut f.index, -1);
+    let witness = f.entry().source_file_fingerprint.clone();
+    f.index
+        .files
+        .get_mut(&f.key())
+        .unwrap()
+        .source_file_fingerprint = "changed".into();
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index
+        .files
+        .get_mut(&f.key())
+        .unwrap()
+        .source_file_fingerprint = witness;
+    f.index.copy_prefix_base_upload_context = Some("e".repeat(64));
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+#[test]
+fn scoped_mode_preserves_census_settlement_after_acked_file_becomes_empty_or_suppressed() {
+    for empty in [true, false] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        assert_eq!(f.adopt().files, 1);
+        let old_receipt = f.entry().upload_context_receipt.clone();
+        let base = "d".repeat(64);
+        f.index.copy_prefix_base_upload_context = Some(base.clone());
+        f.index.activate_file_upload_context(
+            f.source,
+            crate::snapshot_sync::resumed_prefix_upload_context(base, true),
+        );
+        if empty {
+            fs::write(&f.path, "").unwrap();
+        } else {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&f.path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+        let (mut scan, _) = f.walk(false);
+        assert_eq!(scan.scanned_file_count, 1, "real change reads once");
+        if !empty {
+            assert!(!scan.snapshots.is_empty());
+            // The post-policy finalizer receives no permitted bodies.
+            scan.snapshots.clear();
+        }
+        scan.census_complete = true;
+        finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+        assert!(f.index.confirmed_empty_files.contains(&f.key()));
+        assert!(f.entry().last_upload_body_witness.is_none());
+        // The old ACK receipt named other source bytes; the file's own local
+        // empty proof replaces it. Nothing was emitted, ACKed or credited.
+        let proof = f.entry().upload_context_receipt.clone().unwrap();
+        assert_ne!(Some(&proof), old_receipt.as_ref());
+        assert!(proof.body_witness.is_empty());
+        assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
+        assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+        for _ in 0..3 {
+            let (scan, bytes) = f.walk(true);
+            assert_eq!(
+                (scan.scanned_file_count, bytes, scan.snapshots.len()),
+                (0, 0, 0)
+            );
+        }
+        // An actual policy change still revisits suppressed/empty outcomes.
+        let changed = "e".repeat(64);
+        f.index.copy_prefix_base_upload_context = Some(changed.clone());
+        f.index.activate_file_upload_context(
+            f.source,
+            crate::snapshot_sync::resumed_prefix_upload_context(changed, true),
+        );
+        assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    }
+}
+#[test]
+fn upload_context_receipt_stale_source_witness_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    let key = f.key();
+    f.index.files.get_mut(&key).unwrap().source_file_fingerprint = "e".repeat(64);
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+}
+#[test]
+fn upload_context_receipt_stale_body_witness_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    let key = f.key();
+    f.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .last_upload_body_witness = Some("e".repeat(64));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+}
+#[test]
+fn upload_context_receipt_partial_entity_ack_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, _) = f.pending();
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &BTreeMap::new())
+            .files,
+        0
+    );
+}
+#[test]
+fn codex_refused_body_backoff_reads_zero_bytes_over_three_relists() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (_, items) = f.pending();
+    let mut refusal = snapshot_quarantine_record(f.source);
+    refusal.witness = f.index.active_quarantine_witness.clone().unwrap();
+    refusal.upload_body_witness = Some(snapshot_upload_body_witness(&items[0]));
+    f.index
+        .quarantined_snapshot_fingerprints
+        .insert(items[0].snapshot_fingerprint.clone(), refusal);
+    f.assert_quiet();
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn claude_held_family_backoff_reads_zero_bytes_over_three_relists() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.pending();
+    let revision = f.entry().source_file_fingerprint.clone();
+    f.index
+        .insert_retry_pending_claude_authority_at_revision_for_test(SESSION, &revision);
+    f.assert_quiet();
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_survives_restart() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let size = fs::metadata(&f.path).unwrap().len();
+    let counts = f.adopt();
+    assert_eq!(counts.files, 1);
+    assert_eq!(
+        counts.bytes,
+        f.uploader
+            .posts
+            .last()
+            .unwrap()
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() as u64)
+            .sum::<u64>(),
+        "wire item bytes, not native file length"
+    );
+    assert!(counts.local_bytes <= size);
+    let saved_path = f._scratch.join("restart-index.json");
+    f.index.save_fixture(&saved_path).unwrap();
+    f.index = ScanIndex::load(&saved_path).unwrap();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    f.assert_quiet();
+}
+#[test]
+fn upload_context_receipt_historical_replay_rearms_retained_entry() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let key = f.key();
+    f.index.files.get_mut(&key).unwrap().codex_protected_owner = Some("f".repeat(64));
+    assert!(f.index.prepare_historical_replay("synthetic-replay".into()));
+    f.uploader.replay("synthetic-replay");
+    assert!(f.index.files[&key].upload_context_receipt.is_none());
+    // The reset receipt selects no read by itself; the replayed revision's
+    // read (here a re-arm) earns it again.
+    f.rearm_for_read();
+    assert_eq!(f.adopt().files, 1);
+    assert!(!f.index.prepare_historical_replay("synthetic-replay".into()));
+    for _ in 0..3 {
+        assert_eq!(f.walk(true).0.scanned_file_count, 0);
+    }
+}
+
+/// [behaviour] Pi earns the shared per-file receipt from its exact ACK under
+/// the active context, and decides from it like Claude and Codex.
+#[test]
+fn pi_exact_ack_writes_the_shared_file_receipt() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    assert_eq!(f.adopt().files, 1);
+    let receipt = f.entry().upload_context_receipt.clone().unwrap();
+    assert_eq!(receipt.context_fingerprint, "d".repeat(64));
+    assert_eq!(receipt.source_witness, f.entry().source_file_fingerprint);
+    assert_eq!(
+        f.entry().last_upload_body_witness.as_ref(),
+        Some(&receipt.body_witness)
+    );
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0), "no context resend");
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [behaviour] A confirmed-empty file gets a local proof of its context and
+/// source witness: it proves that file only and is never ACK evidence.
+#[test]
+fn empty_file_proof_is_local_and_never_ack_evidence() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let base = "b".repeat(64);
+    let local_on = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    f.index
+        .activate_file_upload_context(f.source, local_on.clone());
+    fs::write(&f.path, "").unwrap();
+    assert_eq!(f.walk(true).0.scanned_file_count, 1);
+    assert!(f.index.confirmed_empty_files.contains(&f.key()));
+    let proof = f.entry().upload_context_receipt.clone().unwrap();
+    assert!(proof.body_witness.is_empty());
+    assert_eq!(proof.context_fingerprint, local_on);
+    assert_eq!(proof.source_witness, f.entry().source_file_fingerprint);
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    f.index
+        .set_copy_prefix_base_upload_context(Some(base.clone()));
+    assert_eq!(f.index.copy_prefix_base_upload_context, Some(base));
+    // The same base keeps this empty file's local proof, but it is never ACK
+    // evidence of the base for the scoped copy-prefix admission.
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    assert!(!f.index.copy_prefix_base_context_proven(&f.key()));
+}
+
+/// [regress] Local pacing debt is not a backend conflict: the deferred
+/// catch-up stays owed on its own file and the page completes, so it no
+/// longer marks the sweep unsettled (before: Deferred, deferred_conflict).
+#[test]
+fn local_budget_deferral_completes_the_page_and_stays_owed() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    f.rearm_for_read();
+    let (scan, _) = f.walk(true);
+    assert!(!scan.snapshots.is_empty());
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(
+        f.uploader.deferral_counts(),
+        (scan.snapshots.len() as u64, 0)
+    );
+    assert!(f.uploader.completed, "local pacing never defers the page");
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+}
+
+/// [money] A context change reads nothing, even for an unproven delivered
+/// file: it stays owed and nothing is sent. Its next ordinary read (growth,
+/// an append read) carries the new context, equals a cold Full of the grown
+/// file under that context, and earns the receipt once.
+#[test]
+fn context_change_reads_nothing_then_growth_is_stamped_and_equals_a_full() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    assert_eq!(f.adopt().files, 1);
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(f.source, context.clone());
+    f.drop_entity_stamps();
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+    f.assert_no_read_or_post();
+    assert!(
+        f.index.file_upload_context_requires_adoption(&f.key()),
+        "still owed: paid on the next ordinary read"
+    );
+    let growth = format!(
+        "{}\n",
+        json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})
+    );
+    let mut body = fs::read_to_string(&f.path).unwrap();
+    body.push_str(&growth);
+    fs::write(&f.path, &body).unwrap();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 1, "growth reads once");
+    let mut cold = Fixture::new(f.source);
+    fs::write(&cold.path, &body).unwrap();
+    cold.index
+        .activate_file_upload_context(cold.source, context.clone());
+    let (cold_scan, _) = cold.walk(true);
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+        &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &scan),
+    );
+    f.uploader.activate(f.source, context.clone(), &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "stamped");
+    assert_eq!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        context
+    );
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    f.assert_quiet();
+}
+
+/// [regress] [money] An mtime-only rewrite moves the revision with the same
+/// bodies: the file is read again, its complete parse finds the identical
+/// entity and body sets, and the receipt carries to the new revision with no
+/// re-send (before: every accepted body went on the wire again). The carried
+/// bodies are the exact-ACKed ones, which equal a cold Full.
+#[test]
+fn mtime_only_rewrite_carries_the_receipt_without_a_resend() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (sent, _) = f.walk(true);
+    assert!(!sent.snapshots.is_empty());
+    let context = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, context, &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &sent.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "receipted");
+    let mut cold = Fixture::new(f.source);
+    let (cold_scan, _) = cold.walk(true);
+    sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+        &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+        &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &sent),
+    );
+    let before = f.entry().clone();
+    let modified = fs::metadata(&f.path).unwrap().modified().unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(60)))
+        .unwrap();
+    let sent_items = f.uploader.counts().0;
+    let previous = f.index.clone();
+    let (moved, _) = f.walk(true);
+    assert_eq!(moved.scanned_file_count, 1, "the read still happens");
+    assert!(
+        moved.snapshots.is_empty(),
+        "no re-send: {:?}",
+        moved.snapshots
+    );
+    assert!(moved.semantic_noop_count > 0);
+    let entry = f.entry().clone();
+    assert_ne!(
+        entry.source_file_fingerprint,
+        before.source_file_fingerprint
+    );
+    assert_eq!(
+        entry.last_upload_body_witness,
+        before.last_upload_body_witness
+    );
+    let receipt = entry.upload_context_receipt.as_ref().expect("carried");
+    assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+    assert_eq!(
+        receipt.body_witness,
+        before.upload_context_receipt.as_ref().unwrap().body_witness
+    );
+    assert!(!f.index.file_upload_context_requires_adoption(&f.key()));
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &moved.snapshots)
+        .unwrap();
+    assert_eq!(f.uploader.counts().0, sent_items, "0 resends");
+    f.assert_quiet();
+}
+
+/// [regress] [money] A forced reparse clears the entry's revision after the
+/// page parsed and sent it. The exact ACKs earn a receipt keyed by the parsed
+/// revision; it proves nothing until the re-read restores that revision, and
+/// then the identical accepted bodies are not sent again (before: no receipt,
+/// so one more send). A file at another revision when the ACK lands earns none.
+#[test]
+fn forced_reparse_receipt_keys_the_parsed_revision() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let key = f.key();
+    let previous = f.index.clone();
+    let (sent, _) = f.walk(true);
+    assert!(!sent.snapshots.is_empty());
+    let parsed = f.entry().source_file_fingerprint.clone();
+    let mut moved = f.index.clone();
+    moved.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
+    assert!(moved
+        .file_upload_context_ack_candidates(&sent.snapshots, &BTreeMap::new())
+        .is_empty());
+    f.index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let context = f.index.active_upload_context_fingerprint.clone().unwrap();
+    f.uploader.activate(f.source, context, &mut f.index);
+    let (files, _) = f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &sent.snapshots)
+        .unwrap();
+    assert_eq!(files, 1, "receipted under the parsed revision");
+    assert_eq!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .source_witness,
+        parsed
+    );
+    assert!(
+        f.index.file_upload_context_requires_adoption(&key),
+        "proves nothing until the re-read"
+    );
+    let sent_items = f.uploader.counts().0;
+    let previous = f.index.clone();
+    let (reread, _) = f.walk(true);
+    assert_eq!(reread.scanned_file_count, 1, "the forced reparse happens");
+    assert!(
+        reread.snapshots.is_empty(),
+        "no second send: {:?}",
+        reread.snapshots
+    );
+    assert!(!f.index.file_upload_context_requires_adoption(&key));
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &reread.snapshots)
+        .unwrap();
+    assert_eq!(f.uploader.counts().0, sent_items);
+    f.assert_quiet();
+}
+
+/// [regress] A refused sibling leaves a proven file quiet: no re-read, no
+/// re-send. Before, Pi's source-wide gate kept every file owed while any
+/// sibling stayed unsettled.
+#[test]
+fn refused_sibling_causes_no_reread_of_a_proven_file() {
+    let mut f = Fixture::new(SnapshotSource::Pi);
+    assert_eq!(f.adopt().files, 1);
+    let proven = f.key();
+    let sibling_session = "019fa111-2222-7333-8444-666666666666";
+    fs::write(
+        f.root.join(format!("{sibling_session}.jsonl")),
+        [
+            json!({"type":"session","id":sibling_session,"timestamp":"2026-10-29T10:00:00Z"}),
+            json!({"type":"message_end","message":{"responseId":"synthetic-sibling","model":"gpt-5.4","timestamp":"1793268001000","usage":{"input":7,"output":3}}}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != SESSION));
+    f.uploader.refuse = true;
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    f.index
+        .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+    let posts = f.uploader.posts.len();
+    for _ in 0..3 {
+        let (scan, _) = f.walk(true);
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != SESSION));
+        assert!(!f.index.file_upload_context_requires_adoption(&proven));
+    }
+    assert_eq!(
+        f.uploader.posts.len(),
+        posts,
+        "the proven file is never re-sent"
+    );
+}
+
+fn legacy_round_trip(version: &str) {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let saved_path = f._scratch.join("downgrade-index.json");
+    f.index.save_fixture(&saved_path).unwrap();
+    let encoded: Value = serde_json::to_value(&f.index).unwrap();
+    // The complete released per-entry codecs are byte-identical at the two
+    // pinned versions. Exercise their actual serde path on every files slot.
+    let mut old = encoded.clone();
+    for value in old["files"].as_object_mut().unwrap().values_mut() {
+        let decoded: released::ScanIndexEntry = serde_json::from_value(value.clone()).unwrap();
+        *value = serde_json::to_value(decoded).unwrap();
+        assert!(value.get("upload_context_receipt").is_none(), "{version}");
+    }
+    f.index = e2_pipeline_scan_fixture::seed_json_for_test(
+        &saved_path,
+        &serde_json::to_vec(&old).unwrap(),
+    );
+    // Downgrade saves also pass progress through the old unknown-field codec.
+    f.uploader.forget_stamps();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert!(f.entry().upload_context_receipt.is_none());
+    // A downgrade costs no read: the file stays unproven until its next
+    // ordinary read.
+    f.assert_quiet();
+    assert!(
+        f.entry().upload_context_receipt.is_none(),
+        "{version}: no re-read earns a receipt"
+    );
+}
+#[test]
+fn upload_context_receipt_decoder_0_1_201_ignores_field() {
+    legacy_round_trip("0.1.201");
+}
+#[test]
+fn upload_context_receipt_decoder_0_1_202_round_trip_reads_nothing() {
+    legacy_round_trip("0.1.202");
+}
+#[test]
+fn upload_context_receipt_current_round_trip_and_size() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.adopt();
+    let entry = f.entry();
+    let mut bare = entry.clone();
+    bare.upload_context_receipt = None;
+    let encoded = serde_json::to_vec(entry).unwrap();
+    assert_eq!(
+        encoded.len() - serde_json::to_vec(&bare).unwrap().len(),
+        304
+    );
+    let decoded: ScanIndexEntry = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.upload_context_receipt, entry.upload_context_receipt);
+    assert_eq!(std::mem::size_of::<upload_context_receipt::Receipt>(), 80);
+    assert_eq!(std::mem::size_of::<ScanIndexEntry>(), 560);
+}
+
+#[test]
+fn upload_context_receipt_wrong_ack_body_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (candidates, items) = f.pending();
+    let mut exact =
+        crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    exact.insert(items[0].snapshot_fingerprint.clone(), "e".repeat(64));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_receipt_withheld_after_capture_refused() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (candidates, items) = f.pending();
+    let exact = crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &items);
+    f.index
+        .exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from([f
+            .entry()
+            .source_file_fingerprint
+            .clone()]));
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        0
+    );
+}
+#[test]
+fn upload_context_receipt_destination_policy_precedes_admission() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let (mut scan, _) = f.walk(false);
+    scan.snapshots[0].session_display_name = Some("Synthetic private title".into());
+    scan.snapshots[0].session_display_name_source = Some("synthetic".into());
+    apply_upload_policy(
+        f.source,
+        &mut scan.snapshots,
+        SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            ..SnapshotUploadPolicy::default()
+        },
+    );
+    assert!(scan.snapshots[0].session_display_name.is_none());
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    let candidates = f
+        .index
+        .file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
+    let exact =
+        crate::snapshot_sync::upload_context_receipt_tests::exact_acks(f.source, &scan.snapshots);
+    assert_eq!(
+        f.index
+            .accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new())
+            .files,
+        1
+    );
+}
+
+#[test]
+fn upload_context_receipt_partial_checkpoint_accepts_runtime_fields_and_persists_receipt() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.index = crate::snapshot_sync::upload_context_receipt_tests::partial_context_checkpoint(
+        f.source, &f.index, &previous, &items, true,
+    );
+    assert!(f.entry().upload_context_receipt.is_some());
+    f.assert_quiet();
+}
+#[test]
+fn upload_context_receipt_partial_checkpoint_old_ack_refused() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.index = crate::snapshot_sync::upload_context_receipt_tests::partial_context_checkpoint(
+        f.source, &f.index, &previous, &items, false,
+    );
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+#[test]
+fn upload_context_policy_change_reprojects_old_refusal_then_keeps_backoff() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    f.index
+        .activate_file_upload_context(f.source, "c".repeat(64));
+    let (_, items) = f.pending();
+    let mut refusal = snapshot_quarantine_record(f.source);
+    refusal.witness = f.index.active_quarantine_witness.clone().unwrap();
+    refusal.upload_body_witness = Some(snapshot_upload_body_witness(&items[0]));
+    refusal.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+    refusal.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    refusal.retry_after_unix_seconds = 0;
+    f.index
+        .quarantined_snapshot_fingerprints
+        .insert(items[0].snapshot_fingerprint.clone(), refusal);
+    let original = f.index.quarantined_snapshot_fingerprints.clone();
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    // A context change alone reassesses a held body at its deadline, not early.
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 0, "a held body stays held");
+    let rebound = crate::snapshot_sync::upload_context_receipt_tests::reproject_context_refusal(
+        f.source,
+        &"d".repeat(64),
+        original.clone(),
+        &items,
+    );
+    for (entity, record) in &rebound {
+        assert_eq!(record.disposition, original[entity].disposition);
+        assert_eq!(
+            record.failed_reconstruction_count,
+            original[entity].failed_reconstruction_count
+        );
+        assert_eq!(
+            record.retry_after_unix_seconds,
+            original[entity].retry_after_unix_seconds
+        );
+    }
+    f.index.quarantined_snapshot_fingerprints = rebound;
+    f.assert_quiet();
+    assert!(f.entry().upload_context_receipt.is_none());
+}
+
+#[test]
+fn upload_context_policy_suppressed_file_stays_quiet_on_context_change() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.index
+        .activate_file_upload_context(f.source, "c".repeat(64));
+    f.pending();
+    let key = f.key();
+    f.index.confirmed_empty_files.insert(key.clone());
+    f.index.file_snapshot_fingerprints.remove(&key);
+    let entry = f.index.files.get_mut(&key).unwrap();
+    entry.last_snapshot_fingerprint = None;
+    entry.last_upload_body_witness = None;
+    // As the scan's record does for a suppressed file: its local empty proof.
+    f.index.note_empty_file_upload_context(&key);
+    assert!(!f.index.file_upload_context_requires_adoption(&key));
+    f.index
+        .activate_file_upload_context(f.source, "d".repeat(64));
+    assert!(f.index.file_upload_context_requires_adoption(&key));
+    assert_eq!(f.walk(true).0.scanned_file_count, 0);
+}
+
+/// A context change alone reads and sends nothing for an unproven file. A
+/// later read for another cause re-sends its identical body once under the
+/// new context, then the file is quiet.
+#[test]
+fn real_uploader_context_change_resends_identical_body_only_on_a_later_read() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        f.adopt();
+        let accepted = f.uploader.posts.last().unwrap().clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
+        f.assert_no_read_or_post();
+        assert_eq!(f.uploader.posts.len(), 1);
+        assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+        f.rearm_for_read();
+        assert_eq!(f.adopt().files, 1);
+        assert_eq!(f.uploader.posts.len(), 2);
+        assert_eq!(
+            *f.uploader.posts.last().unwrap(),
+            accepted,
+            "all sent bytes, tokens, cost and request fields unchanged"
+        );
+        let counts = f.uploader.counts();
+        assert_eq!((counts.0, counts.2, counts.3), (1, 1, 0));
+        assert!(counts.1 > 0);
+        for _ in 0..3 {
+            let previous = f.index.clone();
+            let (scan, bytes) = f.walk(true);
+            assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            assert_eq!(f.uploader.posts.len(), 2);
+            assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+        }
+    }
+}
+
+fn uploader_group(f: &mut Fixture, count: usize) -> Vec<SnapshotItem> {
+    let (mut scan, _) = f.walk(false);
+    let template = scan.snapshots[0].clone();
+    scan.snapshots = (0..count)
+        .map(|n| {
+            let mut item = template.clone();
+            item.source_session_id = format!("context-group-{n:04}");
+            item
+        })
+        .collect();
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    scan.snapshots
+}
+#[test]
+fn real_uploader_restart_mid_context_catchup_never_resends_reacked_entities() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let empty = f.index.clone();
+    let items = uploader_group(&mut f, 51);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &empty, &items)
+            .unwrap()
+            .0,
+        1
+    );
+    let committed = f.index.clone();
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.fail_after = Some(f.uploader.posts.len() + 1);
+    assert!(f
+        .uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .is_err());
+    let reacked = f
+        .uploader
+        .posts
+        .last()
+        .unwrap()
+        .iter()
+        .map(|v| v["snapshot_fingerprint"].clone())
+        .collect::<Vec<_>>();
+    assert!(!reacked.is_empty() && reacked.len() < items.len());
+    f.uploader.restart(f.source, &"e".repeat(64));
+    f.uploader.fail_after = None;
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    let before = f.uploader.posts.len();
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .unwrap();
+    let resumed = f.uploader.posts[before..]
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(resumed.len(), items.len() - reacked.len());
+    assert!(resumed
+        .iter()
+        .all(|v| !reacked.contains(&v["snapshot_fingerprint"])));
+    assert_eq!(f.uploader.counts().0 as usize, resumed.len());
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &committed, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts.len(), before + 1);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+}
+#[test]
+fn real_uploader_same_context_transport_retry_has_zero_context_resends() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let items = uploader_group(&mut f, 51);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader.fail_after = Some(1);
+    assert!(f
+        .uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .is_err());
+    let first = f.uploader.posts[0].len();
+    f.uploader.restart(f.source, &"d".repeat(64));
+    f.uploader.fail_after = None;
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts[1].len(), items.len() - first);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.posts.len(), 2);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+}
+#[test]
+fn real_uploader_retired_ack_with_durable_stamp_resends_nothing() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    f.uploader.forget_stamps();
+    let key = f.key();
+    f.index.files.get_mut(&key).unwrap().upload_context_receipt = None;
+    let previous = f.index.clone();
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &items)
+            .unwrap()
+            .0,
+        1,
+        "the durable entity stamp restores the receipt without a POST"
+    );
+    assert_eq!(f.uploader.posts.len(), 1);
+    assert_eq!(f.uploader.counts(), (0, 0, 0, 0));
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+    }
+}
+#[test]
+fn real_uploader_new_usage_precedes_pending_context_catchup() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.adopt();
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    f.rearm_for_read();
+    let (mut scan, _) = f.walk(false);
+    let mut new_usage = scan.snapshots[0].clone();
+    new_usage.source_session_id = "zz-new-usage".into();
+    scan.snapshots.push(new_usage);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let posts = &f.uploader.posts[1..];
+    assert_eq!(posts[0][0]["source_session_id"], "zz-new-usage");
+    assert_eq!(posts[0].len(), 1, "ordinary usage has its own first POST");
+    assert_eq!(posts.iter().map(Vec::len).sum::<usize>(), 2);
+    assert!(posts
+        .iter()
+        .all(|post| serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024));
+}
+/// [regress] [money] A context re-offer the server answers `unchanged`
+/// without storing it is one POST. `usage_identical` holds the exact body
+/// terminally; `dominated_by_head` keeps its 6 h retry. Neither mints a
+/// receipt, stamp or accepted mark, and later passes lease, read and POST
+/// nothing. Growth is a new body: it equals a cold Full, is POSTed and earns
+/// the receipt. The answered POST is byte-equal under both answers.
+#[test]
+fn real_uploader_unstored_answer_holds_by_basis_and_growth_earns_receipt() {
+    let mut answered = Vec::new();
+    for (basis, terminal) in [("usage_identical", true), ("dominated_by_head", false)] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        f.adopt();
+        let context = "e".repeat(64);
+        f.index
+            .activate_file_upload_context(f.source, context.clone());
+        f.drop_entity_stamps();
+        f.rearm_for_read();
+        let previous = f.index.clone();
+        let (_, items) = f.pending();
+        f.uploader.activate(f.source, context.clone(), &mut f.index);
+        f.uploader.not_stored = Some(basis);
+        let posts = f.uploader.posts.len();
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &items)
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(f.uploader.posts.len(), posts + 1, "{basis}: one POST");
+        // Each arm reads its own fixture file: only the physical identity
+        // (`source_file_fingerprint`) may differ, as in the money oracle's
+        // normalization. Every other byte, money included, must be equal.
+        let mut post = f.uploader.posts[posts].clone();
+        for item in &mut post {
+            item["source_file_fingerprint"] = json!("physical-identity:excluded");
+        }
+        answered.push(post);
+        assert_eq!(f.uploader.fresh_count(), 0);
+        assert_eq!(f.uploader.not_stored_files(), 1);
+        assert_ne!(
+            f.entry()
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .context_fingerprint,
+            context
+        );
+        assert!(f.index.upload_context_proof.entity_stamps.is_empty());
+        for item in &items {
+            let entity = &item.snapshot_fingerprint;
+            assert!(!f.index.accepted_snapshot_fingerprint_recorded(entity));
+            let hold = &f.index.quarantined_snapshot_fingerprints[entity];
+            assert_eq!(
+                hold.upload_body_witness,
+                Some(snapshot_upload_body_witness(item))
+            );
+            assert_eq!(
+                hold.disposition == SnapshotQuarantineDisposition::UnprovenTerminal,
+                terminal,
+                "{basis}"
+            );
+            assert_eq!(hold.retry_after_unix_seconds == 0, terminal, "{basis}");
+        }
+        // A terminal hold's deadline is 0, so every later pass is past its
+        // 6 h and 12 h retries; none leases, reads or POSTs it.
+        for _ in 0..3 {
+            f.uploader
+                .prepare_for_scan(f.source, context.clone(), &mut f.index);
+            f.assert_no_read_or_post();
+        }
+        assert_eq!(f.uploader.posts.len(), posts + 1);
+        let mut body = fs::read_to_string(&f.path).unwrap();
+        body.push_str(&format!("{}\n",json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})));
+        fs::write(&f.path, &body).unwrap();
+        f.uploader.not_stored = None;
+        let previous = f.index.clone();
+        let (scan, _) = f.walk(true);
+        assert_eq!(scan.scanned_file_count, 1, "growth reads once");
+        let mut cold = Fixture::new(f.source);
+        fs::write(&cold.path, &body).unwrap();
+        cold.index
+            .activate_file_upload_context(cold.source, context.clone());
+        let (cold_scan, _) = cold.walk(true);
+        sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+            &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+            &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &scan),
+        );
+        f.uploader.activate(f.source, context.clone(), &mut f.index);
+        let (files, _) = f
+            .uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(files, 1, "{basis}: growth earns the receipt");
+        assert_eq!(f.uploader.posts.len(), posts + 2);
+        assert_eq!(
+            f.entry()
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .context_fingerprint,
+            context
+        );
+        f.assert_quiet();
+    }
+    assert_eq!(answered[0], answered[1], "the answer never changes a body");
+}
+impl Fixture {
+    /// A process restart: the index and the upload ledger are saved, then
+    /// both reload from disk, with a cold transcript cache.
+    fn restart_from_disk(&mut self, context: &str) {
+        let path = self._scratch.join("index.json");
+        self.index.save_fixture(&path).unwrap();
+        self.index = ScanIndex::load(&path).unwrap();
+        self.cache = Arc::default();
+        self.uploader.save_and_restart(self.source, context);
+    }
+}
+
+/// [regress] [money] Two sessions hold an old `usage_identical` answer
+/// terminally. A new historical replay (the server no longer has the head)
+/// reads one file per page, so one body is first met on page 2 whatever the
+/// order. The process restarts between the pages, with the old terminal of
+/// the page-2 body still on disk. Each unchanged body is offered once and
+/// earns one durable exact ACK: a terminal hold carried from before the
+/// replay keeps its disclosure but does not suppress re-entry on a later
+/// page, as it does not on the first.
+#[test]
+fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
+    const OTHER: &str = "019fa111-2222-7333-8444-666666666666";
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    fs::write(
+        f.root.join(format!("{OTHER}.jsonl")),
+        format!("{}\n", json!({"type":"assistant","sessionId":OTHER,"timestamp":"2026-10-29T10:00:02Z","requestId":"other-request","message":{"id":"other-message","model":"claude-sonnet-4-6","usage":{"input_tokens":7,"output_tokens":3}}})),
+    )
+    .unwrap();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(f.source, context.clone());
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.snapshots.len(), 2);
+    f.uploader.activate(f.source, context.clone(), &mut f.index);
+    f.uploader.not_stored = Some("usage_identical");
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let held = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            let hold = &f.index.quarantined_snapshot_fingerprints[&item.snapshot_fingerprint];
+            assert_eq!(
+                hold.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            let witness = snapshot_upload_body_witness(item);
+            assert_eq!(hold.upload_body_witness.as_ref(), Some(&witness));
+            (item.snapshot_fingerprint.clone(), witness)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    f.uploader.not_stored = None;
+    let posts = f.uploader.posts.len();
+    let mut first_page = BTreeMap::new();
+    for page in 1..=2 {
+        f.uploader
+            .prepare_replay_page(f.source, context.clone(), &mut f.index, "replay-1");
+        let previous = f.index.clone();
+        let (scan, _) = f.walk_with_file_limit(true, 1, false);
+        assert_eq!(scan.scanned_file_count, 1, "page {page}");
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        for item in &scan.snapshots {
+            let met = (page, snapshot_upload_body_witness(item));
+            first_page
+                .entry(item.snapshot_fingerprint.clone())
+                .or_insert(met);
+        }
+        if page == 1 {
+            f.restart_from_disk(&context);
+            let waiting = held
+                .keys()
+                .filter(|entity| !first_page.contains_key(*entity))
+                .collect::<Vec<_>>();
+            assert_eq!(waiting.len(), 1, "one held body waits for page 2");
+            let hold = &f.index.quarantined_snapshot_fingerprints[waiting[0]];
+            assert_eq!(
+                hold.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal,
+                "the old terminal is still on disk"
+            );
+            assert_eq!(hold.upload_body_witness.as_ref(), Some(&held[waiting[0]]));
+        }
+    }
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|(entity, (_, witness))| (entity.clone(), witness.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        held,
+        "the replay meets each held body unchanged"
+    );
+    assert!(
+        first_page.values().any(|(page, _)| *page == 2),
+        "one held body is first met on page 2"
+    );
+    // Later passes of the same replay offer nothing again.
+    f.uploader
+        .prepare_replay_page(f.source, context.clone(), &mut f.index, "replay-1");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let mut offered = f.uploader.posts[posts..]
+        .iter()
+        .flatten()
+        .map(|body| body["snapshot_fingerprint"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    offered.sort();
+    assert_eq!(
+        offered,
+        held.keys().cloned().collect::<Vec<_>>(),
+        "each held body is offered exactly once"
+    );
+    f.restart_from_disk(&context);
+    for (entity, witness) in &held {
+        assert!(f.index.accepted_snapshot_fingerprint_recorded(entity));
+        assert!(!f
+            .index
+            .quarantined_snapshot_fingerprints
+            .contains_key(entity));
+        assert_eq!(
+            f.uploader.accepted_body(entity),
+            Some(witness),
+            "a durable exact ACK of the old body"
+        );
+    }
+}
+
+/// One measured pass: the files parsed (by path), the body bytes read, the
+/// page lines' forced-family seeds and family selections, and the POSTs.
+struct FamilyPass {
+    parsed: BTreeMap<PathBuf, usize>,
+    bytes: u64,
+    seeds: u64,
+    family: u64,
+    posts: usize,
+}
+
+impl Fixture {
+    fn family_pass(&mut self, context: &str) -> FamilyPass {
+        self.uploader
+            .prepare_for_scan(self.source, context.into(), &mut self.index);
+        let previous = self.index.clone();
+        let ((((scan, bytes), parsed), group_bytes), rows) =
+            crate::local_resource_diagnostics::capture(|| {
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| {
+                        self.walk_with_file_limit(true, 10, true)
+                    })
+                })
+            });
+        let (mut seeds, mut family) = (0, 0);
+        for row in rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+        {
+            let counts = &row["counts"];
+            seeds += counts["forced_family_seeds"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, n)| n.as_u64().unwrap())
+                .sum::<u64>();
+            family += [
+                "forced_family_roots",
+                "forced_family_members_pulled",
+                "forced_family_member_scoped",
+            ]
+            .iter()
+            .map(|key| counts["page_selection"][*key].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        }
+        self.uploader
+            .activate(self.source, context.into(), &mut self.index);
+        let before = self.uploader.posts.len();
+        self.uploader
+            .send(self.source, &mut self.index, &previous, &scan.snapshots)
+            .unwrap();
+        FamilyPass {
+            parsed,
+            bytes: bytes + group_bytes,
+            seeds,
+            family,
+            posts: self.uploader.posts.len() - before,
+        }
+    }
+}
+
+/// [regress] [money] A Claude family: the root, two subagents, and a copy of
+/// the root in a second project (a path twin, which forces its family when
+/// read). Every entity was ACKed, then re-offered under a new upload context
+/// and answered without storing. After `usage_identical`, passes past the
+/// 6 h and 12 h retries parse no file of the family, read no body byte, seed
+/// no forced family, pull no member and POST nothing. The positive control
+/// is the same family answered `dominated_by_head`. Once due, that retry
+/// seeds the family and re-reads it, so these counters can fail.
+#[test]
+fn usage_identical_family_is_never_re_read_by_a_retry() {
+    for (basis, retried) in [("usage_identical", false), ("dominated_by_head", true)] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        let project = f.root.clone();
+        // Scan the Claude projects root, so both homes of the root are listed.
+        f.root = project.parent().unwrap().to_path_buf();
+        let main = fs::read_to_string(&f.path).unwrap();
+        let row = |request: &str, input: u64| {
+            format!(
+                "{}\n",
+                json!({"type":"assistant","sessionId":SESSION,
+                "timestamp":"2026-10-29T10:01:00Z","requestId":request,
+                "message":{"id":format!("{request}-message"),"model":"claude-sonnet-4-6",
+                "usage":{"input_tokens":input,"output_tokens":1}}})
+            )
+        };
+        let mut family = vec![f.path.clone()];
+        for agent in 0..2 {
+            let path = project
+                .join(SESSION)
+                .join("subagents")
+                .join(format!("agent-{agent:03}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, main.clone() + &row(&format!("child-{agent}"), 20)).unwrap();
+            family.push(path);
+        }
+        let copy = f
+            .root
+            .join("synthetic-project-copy")
+            .join(format!("{SESSION}.jsonl"));
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::write(&copy, main.clone() + &row("resumed", 9)).unwrap();
+        family.push(copy);
+
+        // Every entity is ACKed under the first context.
+        let first = f.index.active_upload_context_fingerprint.clone().unwrap();
+        let read = f.family_pass(&first);
+        assert!(read.posts > 0, "{basis}: the family is uploaded");
+        // A new context re-offers every body; the head stores none.
+        let context = "e".repeat(64);
+        f.index
+            .activate_file_upload_context(f.source, context.clone());
+        f.drop_entity_stamps();
+        // A live read cause at the same bytes, as `rearm_for_read`.
+        for key in f.index.files.keys().cloned().collect::<Vec<_>>() {
+            f.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+        }
+        f.uploader.not_stored = Some(basis);
+        let answered = f.family_pass(&context);
+        assert!(answered.posts > 0, "{basis}: the family is re-offered");
+        f.uploader.not_stored = None;
+        let held = f.index.quarantined_snapshot_fingerprints.clone();
+        assert!(!held.is_empty(), "{basis}: the answer holds the family");
+        assert_eq!(
+            held.values()
+                .any(|hold| hold.disposition == SnapshotQuarantineDisposition::RetryPending),
+            retried,
+            "{basis}"
+        );
+
+        // Past the 6 h, then the 12 h retry.
+        for retry in ["6 h", "12 h"] {
+            f.uploader.expire_retry_holds(&mut f.index);
+            let pass = f.family_pass(&context);
+            if retried && retry == "6 h" {
+                assert!(
+                    family.iter().any(|path| pass.parsed.contains_key(path)),
+                    "control: the due retry re-reads its family: {:?}",
+                    pass.parsed
+                );
+                assert!(pass.bytes > 0, "control: body bytes read");
+                assert!(pass.seeds > 0, "control: the retry seeds its family");
+                assert!(pass.posts > 0, "control: the due body is offered again");
+            } else if !retried {
+                assert!(
+                    pass.parsed.is_empty(),
+                    "{retry}: no file parsed: {:?}",
+                    pass.parsed
+                );
+                assert_eq!(pass.bytes, 0, "{retry}: no body byte");
+                assert_eq!(pass.seeds, 0, "{retry}: no forced-family seed");
+                assert_eq!(pass.family, 0, "{retry}: no family root or member");
+                assert_eq!(pass.posts, 0, "{retry}: no POST");
+                assert_eq!(f.index.quarantined_snapshot_fingerprints, held);
+            }
+        }
+    }
+}
+
+#[test]
+fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    f.adopt();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    f.rearm_for_read();
+    let previous = f.index.clone();
+    let (_, items) = f.pending();
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    f.uploader.refuse = true;
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &items)
+        .unwrap();
+    assert_eq!(f.uploader.fresh_count(), 0);
+    assert_ne!(
+        f.entry()
+            .upload_context_receipt
+            .as_ref()
+            .unwrap()
+            .context_fingerprint,
+        "e".repeat(64)
+    );
+    let posts = f.uploader.posts.len();
+    for _ in 0..3 {
+        let (scan, bytes) = f.walk(true);
+        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+        assert_eq!(f.uploader.posts.len(), posts);
+    }
+}
+#[test]
+fn real_uploader_privacy_reducing_context_uses_destination_policy() {
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk(false);
+    scan.snapshots[0].session_display_name = Some("synthetic title".into());
+    scan.snapshots[0].session_display_name_source = Some("synthetic".into());
+    let on = SnapshotUploadPolicy {
+        session_titles_enabled: true,
+        ..SnapshotUploadPolicy::default()
+    };
+    apply_upload_policy(f.source, &mut scan.snapshots, on);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    assert_eq!(
+        f.uploader.posts.last().unwrap()[0]["session_display_name"],
+        "synthetic title"
+    );
+    let previous = f.index.clone();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    let off = SnapshotUploadPolicy {
+        session_titles_enabled: false,
+        ..SnapshotUploadPolicy::default()
+    };
+    apply_upload_policy(f.source, &mut scan.snapshots, off);
+    finalize_scan_after_policy(f.source, &mut scan, &mut f.index);
+    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        f.uploader.counts().3,
+        1,
+        "D-policy projection is a changed ordinary revision"
+    );
+    assert!(f.uploader.posts.last().unwrap()[0]
+        .get("session_display_name")
+        .map_or(true, serde_json::Value::is_null));
+}
+
+#[test]
+fn real_uploader_context_catchup_spends_only_budget_left_after_new_usage() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let empty = f.index.clone();
+        let old = uploader_group(&mut f, 3);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        f.uploader.send(source, &mut f.index, &empty, &old).unwrap();
+        let previous = f.index.clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
+        f.rearm_for_read();
+        let (mut scan, _) = f.walk(false);
+        let mut usage = old[0].clone();
+        usage.source_session_id = "zz-new-usage".into();
+        scan.snapshots = old.clone();
+        scan.snapshots.push(usage);
+        finalize_scan_after_policy(source, &mut scan, &mut f.index);
+        let usage = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == "zz-new-usage")
+            .unwrap();
+        // Exactly enough packing allowance for ordinary usage plus one old
+        // body, including separators and the conservative array reserve.
+        let ordinary_bytes = serde_json::to_vec(usage).unwrap().len() + 3;
+        let old_bytes = old
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() + 3)
+            .max()
+            .unwrap();
+        f.uploader.activate(source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(ordinary_bytes + old_bytes);
+        let first = f.uploader.posts.len();
+        let received_before = f.uploader.received_catchup_bytes;
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        let posts = &f.uploader.posts[first..];
+        assert_eq!(posts[0].len(), 1);
+        assert_eq!(posts[0][0]["source_session_id"], "zz-new-usage");
+        assert_eq!(
+            posts.iter().map(Vec::len).sum::<usize>(),
+            2,
+            "only one catch-up fits the remainder"
+        );
+        assert_eq!(f.uploader.counts().2, 1);
+        assert!(f.uploader.received_catchup_bytes - received_before <= old_bytes as u64);
+        let reacked = posts
+            .iter()
+            .flatten()
+            .map(|item| item["snapshot_fingerprint"].clone())
+            .collect::<Vec<_>>();
+        f.uploader.restart(source, &"e".repeat(64));
+        f.uploader.activate(source, "e".repeat(64), &mut f.index);
+        f.uploader.set_byte_allowance(2 * old_bytes);
+        let next = f.uploader.posts.len();
+        let received_before = f.uploader.received_catchup_bytes;
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        let remaining = f.uploader.posts[next..]
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "remaining catch-up continues on the next pass"
+        );
+        assert!(remaining
+            .iter()
+            .all(|item| !reacked.contains(&item["snapshot_fingerprint"])));
+        assert_eq!(f.uploader.counts().2, 2);
+        assert!(f.uploader.received_catchup_bytes - received_before <= (2 * old_bytes) as u64);
+    }
+}
+
+/// [money] One file's two context bodies split across
+/// passes, with a crash between them. The receipt waits for the second exact
+/// ACK, only the unACKed body resends, and the server receives each entity's
+/// unchanged body exactly once, so the money totals are unchanged.
+#[test]
+fn split_context_ack_set_receipts_after_every_body_and_keeps_money_totals() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let empty = f.index.clone();
+        let items = uploader_group(&mut f, 2);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        assert_eq!(
+            f.uploader
+                .send(source, &mut f.index, &empty, &items)
+                .unwrap()
+                .0,
+            1
+        );
+        let key = f.key();
+        let previous = f.index.clone();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        // Room for exactly one body, including separators and the array reserve.
+        let one_body = items
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len() + 3)
+            .max()
+            .unwrap();
+        let mut sent = Vec::new();
+        for pass in 0..2u64 {
+            f.uploader.activate(source, "e".repeat(64), &mut f.index);
+            if pass == 0 {
+                f.uploader.set_byte_allowance(one_body);
+            }
+            let first = f.uploader.posts.len();
+            let (files, _) = f
+                .uploader
+                .send(source, &mut f.index, &previous, &items)
+                .unwrap();
+            let posted = f.uploader.posts[first..]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(posted.len(), 1, "pass {pass} sends only an unACKed body");
+            assert_eq!(files, pass, "the receipt waits for every exact ACK");
+            assert_eq!(
+                f.index.files[&key]
+                    .upload_context_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.context_fingerprint == "e".repeat(64)),
+                pass == 1
+            );
+            sent.extend(posted);
+            // A crash between batches keeps only the durable ACK ledger.
+            f.uploader.restart(source, &"e".repeat(64));
+        }
+        let mut expected = items
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect::<Vec<_>>();
+        let order = |value: &serde_json::Value| value["snapshot_fingerprint"].to_string();
+        expected.sort_by_key(order);
+        sent.sort_by_key(order);
+        assert_eq!(
+            sent, expected,
+            "each unchanged body reaches the server once"
+        );
+        let totals = |values: &[serde_json::Value]| {
+            ["input_tokens", "output_tokens", "request_count"].map(|field| {
+                values
+                    .iter()
+                    .map(|value| value[field].as_u64().unwrap())
+                    .sum::<u64>()
+            })
+        };
+        let item_totals = items.iter().fold([0u64; 3], |sum, item| {
+            [
+                sum[0] + item.input_tokens,
+                sum[1] + item.output_tokens,
+                sum[2] + item.request_count,
+            ]
+        });
+        assert!(item_totals[0] > 0);
+        assert_eq!(totals(&sent), item_totals);
+    }
+}
+
+/// [regress] A terminal Codex census adopted its source
+/// context before a budget-deferred body, hiding that body's debt after
+/// restart. The debt stays visible; it selects no re-read and is paid on the
+/// file's next ordinary read.
+#[test]
+fn terminal_census_context_deferral_stays_owed_after_restart() {
+    let source = SnapshotSource::Codex;
+    let mut f = Fixture::new(source);
+    f.adopt();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    f.drop_entity_stamps();
+    f.rearm_for_read();
+    let previous = f.index.clone();
+    let (mut scan, _) = f.walk_with_file_limit(false, 10, true);
+    assert!(scan.census_complete, "the actual scanner closes its census");
+    assert!(f.index.traversal.is_none(), "the terminal queue is retired");
+    finalize_scan_after_policy(source, &mut scan, &mut f.index);
+    f.uploader.activate(source, context.clone(), &mut f.index);
+    f.uploader.set_byte_allowance(0);
+    let first = f.uploader.posts.len();
+    assert_eq!(
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(f.uploader.posts.len(), first);
+    assert!(f.index.file_upload_context_requires_adoption(&f.key()));
+
+    // Restart with only persisted index/ACK evidence and no retained traversal.
+    f.index = serde_json::from_slice(&serde_json::to_vec(&f.index).unwrap()).unwrap();
+    f.uploader.restart(source, &context);
+    f.index
+        .activate_file_upload_context(source, context.clone());
+    f.cache = Arc::default();
+    f.assert_no_read_or_post();
+    assert_eq!(f.uploader.posts.len(), first);
+    assert!(
+        f.index.file_upload_context_requires_adoption(&f.key()),
+        "the deferred debt stays owed after restart"
+    );
+}
+
+/// [behaviour] A context change reads none of 40 unproven delivered files
+/// (live, 2026-11-03: about 100 files per page were re-read for it).
+#[test]
+fn real_scan_context_change_reads_none_of_forty_unproven_files() {
+    let source = SnapshotSource::Codex;
+    let mut f = Fixture::new(source);
+    let template = fs::read_to_string(&f.path).unwrap();
+    let mut paths = vec![f.path.clone()];
+    for n in 1..40 {
+        let session = format!("019fa111-2222-7333-8444-{n:012}");
+        let path = f
+            .root
+            .join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+        fs::write(&path, template.replace(SESSION, &session)).unwrap();
+        paths.push(path);
+    }
+    let receipted = |index: &ScanIndex, context: &str| {
+        paths
+            .iter()
+            .filter(|path| {
+                index
+                    .files
+                    .get(&local_index_key(path))
+                    .and_then(|entry| entry.upload_context_receipt.as_ref())
+                    .is_some_and(|receipt| receipt.context_fingerprint == context)
+            })
+            .count()
+    };
+    for _ in 0..40 {
+        let previous = f.index.clone();
+        let (scan, _) = f.walk_with_file_limit(true, 64, false);
+        f.uploader.activate(source, "d".repeat(64), &mut f.index);
+        f.uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        if receipted(&f.index, &"d".repeat(64)) == paths.len() {
+            break;
+        }
+    }
+    assert_eq!(receipted(&f.index, &"d".repeat(64)), 40);
+    f.index.activate_file_upload_context(source, "e".repeat(64));
+    f.drop_entity_stamps();
+    f.cache = Arc::default(); // cold: nothing retained could hide a read
+    f.assert_no_read_or_post();
+    assert_eq!(f.index.context_read_counts.files, 0);
+    assert_eq!(receipted(&f.index, &"e".repeat(64)), 0);
+    assert_eq!(
+        receipted(&f.index, &"d".repeat(64)),
+        40,
+        "each file keeps what it uploaded"
+    );
+}
+
+/// [regress] cursor resume beside context-only census members (census drain,
+/// 2026-11-01). A context change selects none of the receipted members: a
+/// new large file's cursor job starts and resumes on ordinary pages, and no
+/// member is read for its context.
+#[test]
+fn cursor_resume_reads_no_context_only_census_members() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let limit = 4096;
+    sampled_scan::codex_cursor::with_test_limits(limit, limit, 64, || {
+        let mut f = Fixture::new(source);
+        let template = fs::read_to_string(&f.path).unwrap();
+        let mut members = vec![f.path.clone()];
+        for n in 1..4 {
+            let session = format!("019fa111-2222-7333-8444-{n:012}");
+            let path = f
+                .root
+                .join(format!("rollout-2026-10-29T10-00-00-{session}.jsonl"));
+            fs::write(&path, template.replace(SESSION, &session)).unwrap();
+            members.push(path);
+        }
+        // A new file larger than both allowances.
+        let large_session = "019fa111-2222-7333-8444-999999999999";
+        let large = f
+            .root
+            .join(format!("rollout-2026-10-29T10-00-00-{large_session}.jsonl"));
+        let mut body = format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":large_session}})
+        );
+        for n in 1..=160u64 {
+            body.push_str(&format!(
+                "{}\n",
+                json!({"timestamp":"2026-10-29T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":12 * n,"output_tokens":4 * n}}}})
+            ));
+        }
+        let receipted = |index: &ScanIndex, context: &str| {
+            members
+                .iter()
+                .filter(|path| {
+                    index
+                        .files
+                        .get(&local_index_key(path))
+                        .and_then(|entry| entry.upload_context_receipt.as_ref())
+                        .is_some_and(|receipt| receipt.context_fingerprint == context)
+                })
+                .count()
+        };
+        for _ in 0..32 {
+            let previous = f.index.clone();
+            let (scan, _) = f.walk_with_file_limit(true, 64, false);
+            f.uploader.activate(source, "d".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            if receipted(&f.index, &"d".repeat(64)) == members.len() {
+                break;
+            }
+        }
+        assert_eq!(receipted(&f.index, &"d".repeat(64)), members.len());
+        assert_eq!(f.cache.cursor_job_key(), None);
+        fs::write(&large, &body).unwrap();
+        assert!(fs::metadata(&large).unwrap().len() > 3 * limit);
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
+        f.cache = Arc::default();
+        ensure_bounded_traversal(
+            source,
+            std::slice::from_ref(&f.root),
+            &mut f.index,
+            "2026-10-29T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        advance_bounded_directory_traversal(source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
+        f.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .make_contiguous()
+            .sort_by_key(|pending| pending.path != large);
+        // A one-file page starts the large file's cursor job; it pauses.
+        f.walk_with_file_limit(true, 1, false);
+        assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+        // One ordinary page resumes it.
+        crate::snapshots::begin_continuation_read_ranges_for_test();
+        let ((_, _), per_file) = terminal_contract_retry::source_acquisitions(|| {
+            f.walk_with_file_limit(true, 64, false)
+        });
+        let ranges = crate::snapshots::take_continuation_read_ranges_for_test();
+        let member_max = members
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .max()
+            .unwrap();
+        assert_eq!(f.cache.cursor_job_key(), Some(local_index_key(&large)));
+        assert!(
+            ranges.iter().any(|range| range.start > member_max),
+            "the paused job advanced past its first chunk"
+        );
+        assert!(
+            members.iter().all(|path| !per_file.contains_key(path)),
+            "no member is read for its context"
+        );
+        assert_eq!(f.index.context_read_counts.files, 0);
+        assert_eq!(receipted(&f.index, &"e".repeat(64)), 0);
+    });
+}
+
+/// Cold acquisition makes any Full read observable. After a context change
+/// only the grown file reads, once, and earns its receipt under the new
+/// context; the unchanged unproven files read nothing.
+#[test]
+fn real_scan_context_change_reads_only_the_grown_file() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut f = Fixture::new(source);
+        let template = fs::read_to_string(&f.path).unwrap();
+        let mut paths = vec![f.path.clone()];
+        for n in 1..8 {
+            let session = format!("019fa111-2222-7333-8444-{n:012}");
+            let name = match source {
+                SnapshotSource::Codex => format!("rollout-2026-10-29T10-00-00-{session}.jsonl"),
+                _ => format!("{session}.jsonl"),
+            };
+            let path = f.root.join(name);
+            fs::write(&path, template.replace(SESSION, &session)).unwrap();
+            paths.push(path);
+        }
+        // Populate the actual index/ACK ledger, without direct receipt writes.
+        for _ in 0..8 {
+            let previous = f.index.clone();
+            let (scan, _) = f.walk(true);
+            f.uploader.activate(source, "d".repeat(64), &mut f.index);
+            f.uploader
+                .send(source, &mut f.index, &previous, &scan.snapshots)
+                .unwrap();
+            if paths.iter().all(|path| {
+                f.index
+                    .files
+                    .get(&local_index_key(path))
+                    .is_some_and(|entry| entry.upload_context_receipt.is_some())
+            }) {
+                break;
+            }
+        }
+        assert!(paths
+            .iter()
+            .all(|path| f.index.files[&local_index_key(path)]
+                .upload_context_receipt
+                .is_some()));
+        // Grow the last (not FIFO-first) file.
+        let changed = paths.last().unwrap().clone();
+        let mut body = fs::read_to_string(&changed).unwrap();
+        let changed_session = "019fa111-2222-7333-8444-000000000007";
+        let growth = match source {
+            SnapshotSource::Codex => {
+                json!({"timestamp":"2026-10-29T10:02:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-5.5","total_token_usage":{"input_tokens":24,"output_tokens":8}}}})
+            }
+            _ => {
+                json!({"type":"assistant","sessionId":changed_session,"timestamp":"2026-10-29T10:02:01Z","requestId":"changed-request","message":{"id":"changed-message","model":"claude-sonnet-4-6","usage":{"input_tokens":24,"output_tokens":8}}})
+            }
+        };
+        body.push_str(&format!("{growth}\n"));
+        fs::write(&changed, body).unwrap();
+        f.index.activate_file_upload_context(source, "e".repeat(64));
+        f.drop_entity_stamps();
+        f.cache = Arc::default(); // force cold Full, not a retained-cache shortcut
+        let previous = f.index.clone();
+        let ((scan, _), per_file) = terminal_contract_retry::source_acquisitions(|| f.walk(true));
+        assert_eq!(
+            per_file,
+            BTreeMap::from([(changed.clone(), 1)]),
+            "only the grown file reads, once"
+        );
+        assert_eq!(f.index.context_read_counts.local_bytes, 0);
+        f.uploader.activate(source, "e".repeat(64), &mut f.index);
+        let (files, _) = f
+            .uploader
+            .send(source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(files, 1, "the grown file earns its receipt");
+        for path in &paths {
+            let receipt = f.index.files[&local_index_key(path)]
+                .upload_context_receipt
+                .as_ref()
+                .unwrap();
+            let expected = if *path == changed { "e" } else { "d" };
+            assert_eq!(
+                receipt.context_fingerprint,
+                expected.repeat(64),
+                "each unchanged file keeps what it uploaded"
+            );
+        }
+        f.assert_quiet();
+    }
+}
+
+/// A context change reads no joined Codex alias unit.
+#[test]
+fn real_scan_joined_codex_context_change_reads_no_alias() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    fs::remove_file(&f.path).unwrap();
+    for name in ["a", "b"] {
+        let body = fs::read_to_string(root.join("sessions").join(format!("{name}.jsonl"))).unwrap();
+        fs::write(
+            f.root.join(format!("{name}.jsonl")),
+            body.replace("2026-10-01", "2026-10-29"),
+        )
+        .unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    f.path = f.root.join("a.jsonl");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 2);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        2
+    );
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    f.cache = Arc::default();
+    // A flip re-arms no traversal: the next census generation lists the group.
+    f.index.traversal = None;
+    f.assert_no_read_or_post();
+    for name in ["a", "b"] {
+        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+        assert!(
+            f.index.file_upload_context_requires_adoption(&key),
+            "{name} keeps what it uploaded, owed only to its next read"
+        );
+    }
+}
+
+#[test]
+fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    fs::remove_file(&f.path).unwrap();
+    for (name, original, other) in [
+        ("a", "a", false),
+        ("b", "b", false),
+        ("c", "a", true),
+        ("d", "b", true),
+    ] {
+        let mut body = fs::read_to_string(root.join("sessions").join(format!("{original}.jsonl")))
+            .unwrap()
+            .replace("2026-10-01", "2026-10-29");
+        if other {
+            body = body.replace(
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            );
+        }
+        fs::write(f.root.join(format!("{name}.jsonl")), body).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    f.path = f.root.join("a.jsonl");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.scanned_file_count, 4);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(f.send_ordering_page(&previous, &scan).0, 4);
+    let path = f.root.join("d.jsonl");
+    let mut changed = fs::read_to_string(&path).unwrap();
+    changed.push(' '); // physical growth forces the joined unit's ordinary read
+    fs::write(&path, changed).unwrap();
+    let limit = ["c", "d"]
+        .iter()
+        .map(|name| {
+            fs::metadata(f.root.join(format!("{name}.jsonl")))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    f.index
+        .activate_file_upload_context(f.source, "e".repeat(64));
+    f.drop_entity_stamps();
+    // A flip re-arms no traversal: the next census generation lists both groups.
+    f.index.traversal = None;
+    f.cache = Arc::default();
+    let previous = f.index.clone();
+    // Select both groups on an ordinary page; the byte cap still fits only
+    // the changed unit. Fewer slots would exercise freshness/fill admission.
+    let ((scan, _), order) =
+        upload::context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 4, false));
+    assert!(
+        order
+            .first()
+            .is_some_and(|path| path.ends_with("c.jsonl") || path.ends_with("d.jsonl")),
+        "changed group reads; the lexically earlier context-only group does not"
+    );
+    assert_eq!(order.len(), 2, "only the changed group's bodies are read");
+    assert_eq!(
+        order.iter().cloned().collect::<BTreeSet<_>>(),
+        [f.root.join("c.jsonl"), f.root.join("d.jsonl")]
+            .into_iter()
+            .collect()
+    );
+    // Both selected groups count as scanned; the context group is a
+    // body-free unchanged decision, not an additional transcript read.
+    assert_eq!(scan.scanned_file_count, 4);
+    assert_eq!(scan.semantic_noop_count, 2);
+    assert_eq!(f.send_ordering_page(&previous, &scan).0, 2);
+    f.cache = Arc::default();
+    // The context-only group never reads for its context.
+    f.assert_no_read_or_post();
+    for name in ["a", "b"] {
+        let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+        assert!(f.index.file_upload_context_requires_adoption(&key));
+    }
+}
+
+// Real scanner and transport; a context census member must not consume the
+// ordinary singleton's slot, including an oversized own-page alias group.
+fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
+    for members in [2, 3] {
+        let (root, _) = codex_file_join::tests::counting_v2_fixture();
+
+        let mut f = Fixture::new(SnapshotSource::Codex);
+        let singleton = f.root.join("z.jsonl");
+        fs::rename(&f.path, &singleton).unwrap();
+        f.path = singleton.clone();
+        let original = fs::read(&singleton).unwrap();
+        if !same_size_rewrite {
+            fs::remove_file(&singleton).unwrap();
+        }
+        let names = if members == 2 {
+            vec!["a", "b"]
+        } else {
+            vec!["a", "b", "c"]
+        };
+        for name in &names {
+            let body = if *name == "c" {
+                // A genuine continuation after b's 300, never a copied candidate.
+                let mut rows = codex_file_join::tests::member(
+                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "r-c",
+                    100,
+                    400,
+                );
+                let created = rows[0]["timestamp"].clone();
+                rows[0]["payload"]["timestamp"] = created.clone();
+                rows[1]["timestamp"] = json!("2026-10-01T10:03:01Z");
+                rows[1]["payload"]["turn_id"] = json!("turn-c");
+                rows.insert(
+                    1,
+                    json!({"type":"event_msg","timestamp":created,
+                        "payload":{"type":"task_started","turn_id":"turn-c"}}),
+                );
+                let finished = rows.last().unwrap()["timestamp"].clone();
+                rows.push(json!({"type":"event_msg","timestamp":finished,
+                    "payload":{"type":"task_complete","turn_id":"turn-c"}}));
+                rows.into_iter()
+                    .map(|row| format!("{row}\n"))
+                    .collect::<String>()
+            } else {
+                fs::read_to_string(root.join("sessions").join(format!("{name}.jsonl"))).unwrap()
+            };
+            fs::write(
+                f.root.join(format!("{name}.jsonl")),
+                body.replace("2026-10-01", "2026-10-29"),
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+        let previous = f.index.clone();
+        let (scan, _) = f.walk(true);
+        f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+        assert_eq!(
+            f.send_ordering_page(&previous, &scan).0,
+            members + u64::from(same_size_rewrite)
+        );
+        let prior_modified =
+            same_size_rewrite.then(|| fs::metadata(&singleton).unwrap().modified().unwrap());
+        fs::write(&singleton, &original).unwrap();
+        if let Some(prior) = prior_modified {
+            fs::File::options()
+                .write(true)
+                .open(&singleton)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(prior + std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(
+                fs::metadata(&singleton).unwrap().len(),
+                original.len() as u64
+            );
+        }
+        f.index
+            .activate_file_upload_context(f.source, "e".repeat(64));
+        f.drop_entity_stamps();
+        // A flip re-arms no traversal: start the next census generation.
+        f.index.traversal = None;
+        // Use the scanner's real discovery, then place the reachable traversal
+        // shape at the front: one context alias and an ordinary singleton,
+        // hinted when rewritten. Inventory still supplies the remaining aliases.
+        ensure_bounded_traversal(
+            f.source,
+            std::slice::from_ref(&f.root),
+            &mut f.index,
+            "2026-10-29T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        advance_bounded_directory_traversal(f.source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
+        let traversal = f.index.traversal.as_mut().unwrap();
+
+        let a = f.root.join("a.jsonl");
+        traversal
+            .pending_candidates
+            .make_contiguous()
+            .sort_by_key(|pending| {
+                if pending.path == a {
+                    0
+                } else if pending.path == singleton {
+                    1
+                } else {
+                    2
+                }
+            });
+        assert!(traversal.pending_candidates.iter().all(
+            |pending| pending.watcher_hint == (same_size_rewrite && pending.path == singleton)
+        ));
+        assert_eq!(traversal.pending_candidates[0].path, a);
+        assert_eq!(traversal.pending_candidates[1].path, singleton);
+        // The owed group is no context-only work any more: like any unchanged
+        // selected group it may take this page's file allowance and reads
+        // nothing (Codex group admission), so the singleton can wait a page.
+        // Across pages the singleton is read exactly once; the group never.
+        let mut total = BTreeMap::new();
+        let mut sent = 0;
+        let first = f.uploader.posts.len();
+        for _ in 0..3 {
+            f.cache = Arc::default();
+            let previous = f.index.clone();
+            let (((scan, native), reads), group_native) =
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| {
+                        f.walk_with_file_limit(true, 2, false)
+                    })
+                });
+            assert!(
+                native + group_native <= sampled_scan::codex_cursor::Limits::current().singleton()
+            );
+            assert_eq!(group_native, 0, "the context group stays unparsed");
+            for (path, count) in reads {
+                *total.entry(path).or_insert(0) += count;
+            }
+            sent += f.send_ordering_page(&previous, &scan).0;
+        }
+        assert_eq!(
+            total,
+            BTreeMap::from([(singleton.clone(), 1)]),
+            "the ordinary singleton is read once; the context group never"
+        );
+        for name in &names {
+            let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+            assert!(
+                f.index.file_upload_context_requires_adoption(&key),
+                "group remains owed"
+            );
+        }
+        assert_eq!(sent, 1);
+        assert!(f.uploader.posts[first..]
+            .iter()
+            .flatten()
+            .all(|item| item["source_session_id"] == SESSION));
+        // No later page reads the context-only group either.
+        f.cache = Arc::default();
+        f.assert_no_read_or_post();
+        for name in &names {
+            let key = local_index_key(&f.root.join(format!("{name}.jsonl")));
+            assert!(f.index.file_upload_context_requires_adoption(&key));
+        }
+    }
+}
+#[test]
+fn real_scan_new_unhinted_singleton_precedes_context_group_at_file_limit_two() {
+    ordinary_singleton_precedes_context_group(false);
+}
+#[test]
+fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
+    ordinary_singleton_precedes_context_group(true);
+}
+
+#[test]
+fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_group() {
+    let (root, _) = codex_file_join::tests::counting_v2_fixture();
+
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let singleton = f.root.join("z.jsonl");
+    let body = fs::read(&f.path).unwrap();
+    fs::remove_file(&f.path).unwrap();
+    for (name, original, other) in [
+        ("a", "a", false),
+        ("b", "b", false),
+        ("c", "a", true),
+        ("d", "b", true),
+    ] {
+        let mut body = fs::read_to_string(root.join("sessions").join(format!("{original}.jsonl")))
+            .unwrap()
+            .replace("2026-10-01", "2026-10-29");
+        if other {
+            body = body.replace(
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            );
+        }
+        fs::write(f.root.join(format!("{name}.jsonl")), body).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
+    assert_eq!(
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap()
+            .0,
+        4
+    );
+    assert!(
+        f.uploader
+            .finish_adopted_index(&mut f.index, &BTreeSet::new())
+            .unwrap()
+            > 0,
+        "setup transfers adopted ACKs through the real saved-index finish"
+    );
+    // A remains receipt-settled. B has ordinary physical work; z is new.
+    fs::write(&singleton, body).unwrap();
+    let d = f.root.join("d.jsonl");
+    let prior_modified = fs::metadata(&d).unwrap().modified().unwrap();
+    let body = fs::read(&d).unwrap();
+    fs::write(&d, &body).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&d)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(prior_modified + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert_eq!(fs::metadata(&d).unwrap().len(), body.len() as u64);
+    // Growing this ORDINARY group would give it a dedicated freshness page
+    // before unhinted z. Ordinary-vs-ordinary scheduling is allowed; a context
+    // group may never do that. Keep size fixed to exercise normal file slots.
+    assert!(!codex_fresh_data_pending(
+        &ScanTraversalPath {
+            scan_root: f.root.clone(),
+            path: d,
+            census_member: true,
+            watcher_hint: false,
+        },
+        &f.index
+    ));
+    f.index.traversal = None;
+    ensure_bounded_traversal(
+        f.source,
+        std::slice::from_ref(&f.root),
+        &mut f.index,
+        "2026-10-29T12:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(f.source, &mut f.index, BACKFILL_WINDOW_DAYS, None);
+    let traversal = f.index.traversal.as_mut().unwrap();
+
+    traversal
+        .pending_candidates
+        .make_contiguous()
+        .sort_by_key(
+            |pending| match pending.path.file_stem().and_then(|name| name.to_str()) {
+                Some("a") => 0,
+                Some("c") => 1,
+                Some("z") => 2,
+                _ => 3,
+            },
+        );
+    let ordinary_group = [f.root.join("c.jsonl"), f.root.join("d.jsonl")];
+    let group_bytes = ordinary_group
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum::<u64>();
+    let expected_modified = fs::metadata(&ordinary_group[1])
+        .unwrap()
+        .modified()
+        .unwrap();
+    let mut singleton_parses = 0;
+    let mut group_parses = 0;
+    let mut total_group_bytes = 0;
+    // Ordinary B and z may share a page or run on separate pages. Observe the
+    // bounded service window, not a filename/hash-dependent ordinary schedule.
+    for page in 0..3 {
+        f.cache = Arc::default();
+        let previous = f.index.clone();
+        let (((scan, native), reads), physical_group_bytes) =
+            terminal_contract_retry::group_body_bytes(|| {
+                terminal_contract_retry::source_acquisitions(|| {
+                    f.walk_with_file_limit(true, 3, false)
+                })
+            });
+        assert!(scan.scanned_file_count <= 3);
+        assert!(
+            native + physical_group_bytes
+                <= sampled_scan::codex_cursor::Limits::current().singleton()
+        );
+        assert!(
+            reads.iter().all(|(path, count)| {
+                *count == 1 && (path == &singleton || ordinary_group.contains(path))
+            }),
+            "settled a/b never acquire a body parser"
+        );
+        let representatives = reads
+            .iter()
+            .filter(|(path, _)| ordinary_group.contains(path))
+            .count();
+        assert!(representatives <= 1, "B uses one joined canonical parser");
+        let group_admitted = representatives == 1;
+        singleton_parses += reads.get(&singleton).copied().unwrap_or(0);
+        group_parses += representatives;
+        assert!(
+            singleton_parses <= 1 && group_parses <= 1,
+            "an ordinary item was parsed twice without another change"
+        );
+        total_group_bytes += physical_group_bytes;
+        if group_admitted {
+            // All group-body I/O belongs to c/d, once each; a/b contribute none.
+            assert_eq!(physical_group_bytes, group_bytes);
+            let changed = &f.index.files[&local_index_key(&ordinary_group[1])];
+            assert_eq!(
+                changed.modified_unix_nanos,
+                expected_modified
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_nanos() as u64)
+            );
+            assert_ne!(
+                changed.source_file_fingerprint,
+                previous.files[&local_index_key(&ordinary_group[1])].source_file_fingerprint
+            );
+            assert!(changed.codex_joined_member_set.is_some());
+        } else {
+            assert_eq!(physical_group_bytes, 0, "no hidden settled-group body read");
+            if group_parses == 0 {
+                for path in &ordinary_group {
+                    let key = local_index_key(path);
+                    let pending = f
+                        .index
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .pending_candidates
+                        .iter()
+                        .find(|pending| local_index_key(&pending.path) == key)
+                        .expect("deferred ordinary group remains owed in traversal");
+                    assert!(pending.census_member);
+                    assert_eq!(
+                        f.index.files[&key].source_file_fingerprint,
+                        previous.files[&key].source_file_fingerprint
+                    );
+                    assert_eq!(
+                        f.index.files[&key].last_upload_body_witness,
+                        previous.files[&key].last_upload_body_witness
+                    );
+                    assert_eq!(
+                        f.index.files[&key].upload_context_receipt,
+                        previous.files[&key].upload_context_receipt,
+                        "deferred B receives no credit"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            f.index.context_read_counts.local_bytes, 0,
+            "this page has ordinary work and settled metadata, no context catch-up"
+        );
+        let first = f.uploader.posts.len();
+        f.send_ordering_page(&previous, &scan);
+        let posted = f.uploader.posts[first..]
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(posted
+            .iter()
+            .all(|item| item["source_session_id"] == SESSION
+                || item["source_session_id"] == "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        if reads.contains_key(&singleton) {
+            assert!(posted
+                .iter()
+                .any(|item| item["source_session_id"] == SESSION));
+        }
+        let group_posted = posted
+            .iter()
+            .any(|item| item["source_session_id"] == "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        eprintln!(
+            "settled-alias page={} reads={reads:?} B_admitted={group_admitted} B_posted={group_posted} sampled_bytes={native} group_body_bytes={physical_group_bytes} POSTs={} B_owed={:?}",
+            page + 1,
+            f.uploader.posts.len() - first,
+            ordinary_group.iter().map(|path| f.index.file_upload_context_requires_adoption(&local_index_key(path))).collect::<Vec<_>>()
+        );
+        assert!(!group_posted || group_admitted, "unadmitted B cannot POST");
+        // d's rewrite keeps its bytes: only the revision moves. After setup
+        // ACK retirement the durable entity stamps still prove B's exact
+        // bodies, so admission carries B's receipts with no POST (A1-A4).
+        assert!(
+            !group_posted,
+            "an mtime-only revision move re-sends nothing after ACK retirement"
+        );
+        if group_admitted {
+            for path in &ordinary_group {
+                let entry = &f.index.files[&local_index_key(path)];
+                let receipt = entry
+                    .upload_context_receipt
+                    .as_ref()
+                    .expect("admitted B keeps or carries its receipt");
+                assert_eq!(receipt.context_fingerprint, "d".repeat(64));
+                assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+                assert_eq!(
+                    Some(&receipt.body_witness),
+                    entry.last_upload_body_witness.as_ref()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        singleton_parses, 1,
+        "ordinary z is served exactly once within three pages"
+    );
+    assert_eq!(
+        group_parses, 1,
+        "ordinary B is served exactly once within three pages"
+    );
+    assert_eq!(
+        total_group_bytes, group_bytes,
+        "physical group body bytes are exactly one c/d replay, with no a/b read"
+    );
+    for path in ordinary_group.iter().chain(std::iter::once(&singleton)) {
+        let key = local_index_key(path);
+        let entry = &f.index.files[&key];
+        let receipt = entry
+            .upload_context_receipt
+            .as_ref()
+            .expect("ordinary work is settled before entering quiet checks");
+        assert_eq!(
+            Some(&receipt.context_fingerprint),
+            f.index.active_upload_context_fingerprint.as_ref()
+        );
+        assert_eq!(receipt.source_witness, entry.source_file_fingerprint);
+        assert_eq!(
+            Some(&receipt.body_witness),
+            entry.last_upload_body_witness.as_ref()
+        );
+        assert!(
+            !f.index.file_upload_context_requires_adoption(&key),
+            "ordinary work owes no adoption before quiet checks"
+        );
+    }
+    f.assert_quiet();
+}
+
+/// One file without its own context proof under an active context: on disk,
+/// committed member `entity`, accepted in the current ledger, no receipt.
+fn owed_count_index(
+    source: SnapshotSource,
+) -> (crate::test_scratch::ScratchDir, ScanIndex, String) {
+    let scratch = crate::test_scratch::ScratchDir::new("owed-count-exemption");
+    let path = scratch.join(format!("projects/synthetic/{SESSION}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        super::tests::manifest_index_entry(Some("entity")),
+    );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["entity".to_string()]));
+    index.accepted_snapshot_fingerprints.insert("entity".into());
+    index.activate_file_upload_context(source, "a".repeat(64));
+    assert!(index.file_upload_context_requires_adoption(&key));
+    (scratch, index, key)
+}
+
+/// The real operator list, naming one root session's family.
+fn list_root(index: &mut ScanIndex, root: &str) {
+    use sha2::Digest;
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(
+        format!("{:x}\n", sha2::Sha256::digest(root.as_bytes())).as_bytes(),
+    );
+}
+
+/// [behaviour] An operator-listed family file owes no body: settled while
+/// listed, even with no committed member, and owed again once delisted.
+#[test]
+fn listed_family_file_counts_settled_until_delisted() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    index.accepted_snapshot_fingerprints.clear();
+    list_root(&mut index, SESSION);
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.listed_files), (0, 1));
+    assert_eq!(counts.no_proof_entities, 0, "listed owes no entity either");
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!(
+        (counts.owed_files, counts.listed_files),
+        (0, 1),
+        "an empty member set is still settled as listed"
+    );
+    index.claude_reemission_exclusions = ReemissionExclusions::default();
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.listed_files), (1, 0));
+    assert!(
+        index.file_upload_context_requires_adoption(&key),
+        "count only: the file never gained proof"
+    );
+}
+
+/// [behaviour] A confirmed-empty file without its empty proof is settled only
+/// once absent on disk: a present one may have grown unread, so it stays owed.
+#[test]
+fn confirmed_empty_counts_settled_only_when_absent() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    index.file_snapshot_fingerprints.remove(&key);
+    index.confirmed_empty_files.insert(key.clone());
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.empty_files), (1, 0));
+    fs::remove_file(&key).unwrap();
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    assert_eq!((counts.owed_files, counts.empty_files), (0, 1));
+    assert!(
+        index.file_upload_context_requires_adoption(&key),
+        "count only: the file never gained proof"
+    );
+}
+
+/// [behaviour] Exact ledger acceptance settles a file only with every
+/// committed member accepted and unquarantined, and no open evidence debt.
+/// Codex also needs its proven owner.
+#[test]
+fn ledger_accepted_file_counts_settled_only_with_every_member_accepted() {
+    let settled = |index: &ScanIndex, source| {
+        let counts = index.upload_context_owed_counts(source);
+        assert_eq!(counts.owed_files + counts.ledger_accepted_files, 1);
+        counts.ledger_accepted_files == 1
+    };
+    let (_scratch, index, key) = owed_count_index(SnapshotSource::ClaudeCode);
+    assert!(settled(&index, SnapshotSource::ClaudeCode));
+    let mut quarantined = index.clone();
+    quarantined.quarantined_snapshot_fingerprints.insert(
+        "entity".into(),
+        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
+    );
+    assert!(
+        !settled(&quarantined, SnapshotSource::ClaudeCode),
+        "quarantined member"
+    );
+    let mut grown = index.clone();
+    grown.file_snapshot_fingerprints.insert(
+        key.clone(),
+        BTreeSet::from(["entity".to_string(), "new".to_string()]),
+    );
+    assert!(
+        !settled(&grown, SnapshotSource::ClaudeCode),
+        "newly committed unaccepted member"
+    );
+    assert!(
+        !settled(&index, SnapshotSource::Codex),
+        "Codex acceptance needs a proven owner"
+    );
+}
+
+/// [behaviour] Pi has no file-body acceptance predicate: its accepted ledger
+/// settles nothing, and only the confirmed-empty exemption applies.
+#[test]
+fn pi_gets_empty_exemption_only() {
+    let (_scratch, mut index, key) = owed_count_index(SnapshotSource::Pi);
+    let counts = index.upload_context_owed_counts(SnapshotSource::Pi);
+    assert_eq!((counts.owed_files, counts.ledger_accepted_files), (1, 0));
+    index.file_snapshot_fingerprints.remove(&key);
+    index.confirmed_empty_files.insert(key.clone());
+    fs::remove_file(&key).unwrap();
+    let counts = index.upload_context_owed_counts(SnapshotSource::Pi);
+    assert_eq!((counts.owed_files, counts.empty_files), (0, 1));
+}
+
+/// [behaviour] The hourly owed line names the settled buckets, and the file
+/// buckets reconcile with the per-file gate: every unproven file is owed or
+/// settled exactly once. No active context owes nothing.
+#[test]
+fn owed_line_reports_exempt_buckets() {
+    assert_eq!(
+        ScanIndex::default().upload_context_owed_counts(SnapshotSource::ClaudeCode),
+        upload_context_receipt::OwedCounts::default()
+    );
+    let (scratch, mut index, accepted) = owed_count_index(SnapshotSource::ClaudeCode);
+    let entry = index.files[&accepted].clone();
+    let mut add = |name: &str, members: &[&str]| {
+        let key = local_index_key(&scratch.join(format!("projects/synthetic/{name}")));
+        index.files.insert(key.clone(), entry.clone());
+        index.file_snapshot_fingerprints.insert(
+            key.clone(),
+            members.iter().map(|member| member.to_string()).collect(),
+        );
+        key
+    };
+    // Listed with an empty member set; never on disk.
+    add("listed-root/subagents/agent-a.jsonl", &[]);
+    add("owed.jsonl", &["unaccepted"]);
+    let deleted_empty = add("deleted-empty.jsonl", &[]);
+    index.file_snapshot_fingerprints.remove(&deleted_empty);
+    index.confirmed_empty_files.insert(deleted_empty);
+    list_root(&mut index, "listed-root");
+    let counts = index.upload_context_owed_counts(SnapshotSource::ClaudeCode);
+    let line = serde_json::to_value(&counts).unwrap();
+    for (field, value) in [
+        ("owed_files", 1),
+        ("listed_files", 1),
+        ("empty_files", 1),
+        ("ledger_accepted_files", 1),
+        ("no_proof_entities", 1),
+    ] {
+        assert_eq!(line[field], json!(value), "{field}");
+    }
+    assert!(line.get("empty_pending_files").is_none());
+    assert_eq!(
+        crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&index)
+            as u64,
+        counts.owed_files + counts.listed_files + counts.empty_files + counts.ledger_accepted_files,
+        "old file count = owed + listed + empty + ledger_accepted"
+    );
+}
+
+/// [money] A folded Codex body offers every joined member a receipt candidate
+/// under the member's own source revision. The carrier's candidate is the
+/// same as without the join, a file with the same body but no join marker gets
+/// none, one exact ACK settles every member and counts the wire body once, and
+/// a not-stored answer settles none.
+#[test]
+fn folded_codex_members_each_earn_their_own_receipt_on_one_exact_ack() {
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.source_file_fingerprint = Some("1".repeat(64));
+    item.snapshot_fingerprint = "7".repeat(64);
+    let entity = item.snapshot_fingerprint.clone();
+    let body = snapshot_upload_body_witness(&item);
+    let folded = snapshot_file_upload_body_set_hex([&body]);
+    let key = |n: usize| format!("/synthetic/rollout-member-{n}.jsonl.zst");
+    let build = |joined: bool| {
+        let mut index = ScanIndex::default();
+        index.activate_file_upload_context(SnapshotSource::Codex, "d".repeat(64));
+        for (n, marker) in [(1, joined), (2, joined), (3, joined), (9, false)] {
+            let mut entry: ScanIndexEntry = serde_json::from_value(json!({
+                "size_bytes": 1, "modified_unix_seconds": 1,
+                "source_file_fingerprint": n.to_string().repeat(64),
+                "scan_identity_version": crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            }))
+            .unwrap();
+            entry.codex_joined_member_set = marker.then(|| "joined".to_string());
+            entry.last_upload_body_witness = Some(folded.clone());
+            index.files.insert(key(n), entry);
+            index
+                .file_snapshot_fingerprints
+                .insert(key(n), BTreeSet::from([entity.clone()]));
+        }
+        index
+    };
+    let items = vec![item];
+    let unjoined = build(false).file_upload_context_ack_candidates(&items, &BTreeMap::new());
+    assert_eq!(unjoined.len(), 1, "without a join only the carrier");
+    let candidates = build(true).file_upload_context_ack_candidates(&items, &BTreeMap::new());
+    assert_eq!(candidates.len(), 3, "one per joined member");
+    assert!(
+        candidates.contains(&unjoined[0]),
+        "the carrier's candidate is unchanged"
+    );
+
+    let mut not_stored = build(true);
+    let counts =
+        not_stored.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &BTreeMap::new());
+    assert_eq!((counts.files, counts.bytes), (0, 0));
+    for n in [1, 2, 3, 9] {
+        assert!(not_stored.file_upload_context_requires_adoption(&key(n)));
+    }
+
+    let mut index = build(true);
+    let exact = BTreeMap::from([(entity.clone(), body.clone())]);
+    let counts = index.accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new());
+    let wire = crate::snapshot_sync::snapshot_packing_json_length(&items[0]).unwrap() as u64;
+    assert_eq!(
+        (counts.files, counts.bytes),
+        (3, wire),
+        "the body counts once"
+    );
+    for n in [1, 2, 3] {
+        let receipt = index.files[&key(n)]
+            .upload_context_receipt
+            .clone()
+            .expect("each member's own receipt");
+        assert_eq!(receipt.source_witness, n.to_string().repeat(64));
+        assert_eq!(receipt.body_witness, folded);
+        assert!(!index.file_upload_context_requires_adoption(&key(n)));
+    }
+    assert_eq!(index.files[&key(9)].upload_context_receipt, None);
+    assert!(index.file_upload_context_requires_adoption(&key(9)));
+
+    // A member whose join marker changed after the candidates were taken
+    // earns nothing from them.
+    let mut remarked = build(true);
+    remarked
+        .files
+        .get_mut(&key(2))
+        .unwrap()
+        .codex_joined_member_set = Some("rejoined".into());
+    let counts = remarked.accept_file_upload_context_acks(&candidates, &exact, &BTreeMap::new());
+    assert_eq!(counts.files, 2);
+    assert_eq!(remarked.files[&key(2)].upload_context_receipt, None);
+    assert!(remarked.file_upload_context_requires_adoption(&key(2)));
+}
+
+#[test]
+fn held_probe_substitution_updates_every_alias_and_keeps_revision_guard() {
+    let mut f = Fixture::new(SnapshotSource::Codex);
+    let (_, items) = f.pending();
+    let key = f.key();
+    let entry = f.index.files[&key].clone();
+    let entities = f.index.file_snapshot_fingerprints[&key].clone();
+    for alias in ["alias", "changed"] {
+        f.index.files.insert(alias.into(), entry.clone());
+        f.index
+            .file_snapshot_fingerprints
+            .insert(alias.into(), entities.clone());
+    }
+    let mut candidates = f
+        .index
+        .file_upload_context_ack_candidates(&items, &BTreeMap::new());
+    assert_eq!(candidates.len(), 3);
+    f.index
+        .files
+        .get_mut("changed")
+        .unwrap()
+        .last_upload_body_witness = Some("changed".into());
+    let fp = items[0].snapshot_fingerprint.clone();
+    let old = snapshot_upload_body_witness(&items[0]);
+    let probe = "e".repeat(64);
+    f.index.substitute_file_upload_context_bodies(
+        &mut candidates,
+        &[(fp.clone(), old, probe.clone())],
+    );
+    let digest = snapshot_file_upload_body_set_hex(BTreeSet::from([probe.clone()]));
+    for alias in [key.as_str(), "alias"] {
+        assert_eq!(
+            f.index.files[alias].last_upload_body_witness,
+            Some(digest.clone())
+        );
+    }
+    f.index.accept_file_upload_context_acks(
+        &candidates,
+        &BTreeMap::new(),
+        &BTreeMap::from([(fp, probe)]),
+    );
+    for alias in [key.as_str(), "alias"] {
+        assert_eq!(
+            f.index.files[alias]
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .body_witness,
+            digest
+        );
+    }
+    assert!(f.index.files["changed"].upload_context_receipt.is_none());
+    assert_eq!(
+        f.index.files["changed"].last_upload_body_witness.as_deref(),
+        Some("changed")
+    );
+}
+
+/// [behaviour] Exact active ACK stamps are key-independent, including scoped
+/// re-read debt; other contexts, bodies, destinations and replay epochs fail.
+#[test]
+fn file_entity_stamps_require_the_active_ack_context() {
+    let base = "base".to_string();
+    let resumed = crate::snapshot_sync::resumed_prefix_upload_context(base.clone(), true);
+    let active = crate::snapshot_sync::copy_unproven_upload_context(resumed.clone(), true);
+    let mut index = ScanIndex::default();
+    index.activate_upload_context(active.clone());
+    index.set_copy_prefix_base_upload_context(Some(base.clone()));
+    index
+        .claude_money_birth_store
+        .set_money_marks("reowed", claude_copy_prefix_reread::REOWED);
+    index.file_snapshot_fingerprints.insert(
+        "unaffected".into(),
+        BTreeSet::from(["entity".into(), "other".into()]),
+    );
+    let bodies = BTreeMap::from([("entity".into(), "body".into())]);
+    for context in [
+        base,
+        resumed,
+        crate::snapshot_sync::resumed_prefix_upload_context("changed-base".into(), true),
+        active.clone(),
+    ] {
+        index.stamp_entity_upload_context_acks(
+            "destination",
+            &bodies,
+            &BTreeMap::from([("entity".into(), context.clone())]),
+        );
+        for key in ["unaffected", "reowed"] {
+            assert_eq!(
+                index.file_entity_stamp_proves(key, "entity", "body"),
+                context == active,
+                "only the exact active context proves for {key}"
+            );
+            assert!(!index.file_entity_stamp_proves(key, "entity", "wrong-body"));
+        }
+    }
+    let proven = index.clone();
+    index.stamp_entity_upload_context_acks(
+        "another-destination",
+        &BTreeMap::from([("other".into(), "body".into())]),
+        &BTreeMap::from([("other".into(), active.clone())]),
+    );
+    assert!(!index
+        .upload_context_proof
+        .entity_stamps
+        .contains_key("entity"));
+    assert!(!index.file_entity_stamp_proves("unaffected", "entity", "body"));
+    index = proven.clone();
+    index.historical_replay_generation = Some("next-replay".into());
+    assert!(!index.file_entity_stamp_proves("unaffected", "entity", "body"));
+    index = proven;
+    index.set_copy_prefix_base_upload_context(None);
+    assert!(index.file_entity_stamp_proves("codex-shaped", "entity", "body"));
+    index.stamp_entity_upload_context_acks(
+        "destination",
+        &bodies,
+        &BTreeMap::from([(
+            "entity".into(),
+            crate::snapshot_sync::resumed_prefix_upload_context(active, true),
+        )]),
+    );
+    assert!(!index.file_entity_stamp_proves("codex-shaped", "entity", "body"));
+}

@@ -1,0 +1,72 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "local_sessions",
+  "input_fixture_paths": [
+    "../../../fixtures/local_sessions/minimal-session.jsonl"
+  ],
+  "emitted_records": [
+    {
+      "record_type": "local_usage_snapshots",
+      "sample": {
+        "source_id": "codex",
+        "session_hash": "codex_fixture_session_hash",
+        "workspace_hash": "workspace_sha256_fixture",
+        "started_at": "2026-05-20T08:00:00Z",
+        "input_tokens": 1200,
+        "cache_read_input_tokens": 300,
+        "output_tokens": 220,
+        "selector_context": {
+          "service_tier": "standard",
+          "batch_mode": "false"
+        }
+      }
+    },
+    {
+      "record_type": "local_usage_session_titles",
+      "sample": {
+        "source_id": "codex",
+        "session_hash": "codex_fixture_session_hash",
+        "session_display_name": "Fixture session",
+        "session_display_name_source": "local_transcript_title",
+        "metadata_policy": "organization_and_user_enabled"
+      }
+    },
+    {
+      "record_type": "local_usage_workspace_labels",
+      "sample": {
+        "source_id": "codex",
+        "workspace_hash": "workspace_sha256_fixture",
+        "workspace_display_label": "Fixture workspace",
+        "workspace_label_source": "user_approved",
+        "metadata_policy": "organization_and_user_enabled"
+      }
+    },
+    {
+      "record_type": "local_usage_collector_statuses",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "local_sessions",
+        "status": "ok",
+        "last_collected_at": "2026-05-20T08:01:00Z",
+        "records_emitted": 1
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Aggregate session usage, selector metadata, hashed workspace/session identifiers, and collector health only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

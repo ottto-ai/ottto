@@ -1,0 +1,1516 @@
+use crate::account_store::default_support_dir;
+use crate::{OTTTO_CONTROL_TOKEN_ENV, OTTTO_SECRET_FALLBACK_DIR_ENV};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use thiserror::Error;
+
+pub const OTTTO_KEYCHAIN_SERVICE: &str = "net.ottto.service";
+pub const OTTTO_LEGACY_KEYCHAIN_SERVICE: &str = "net.ottto.locald";
+pub const OTTTO_KEYCHAIN_ACCOUNT: &str = "control-token";
+pub const OTTTO_SETUP_RUN_TOKEN_ACCOUNT: &str = "setup-run-token";
+pub const OTTTO_RELAY_DEVICE_SECRET_ACCOUNT: &str = "relay-device-secret";
+pub const OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT: &str = "prior-relay-device-secret";
+pub const OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT: &str = "pending-relay-device-secret";
+pub const OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT: &str = "pending-setup-run-token";
+pub const OTTTO_REVOCATION_RECEIPT_ACCOUNT: &str = "revocation-receipt";
+pub const OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT: &str = "local-release-marker";
+pub const OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT: &str = "local-release-device-proof";
+pub const OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT: &str = "history-browser-claim";
+pub const CONTROL_TOKEN_FILE_NAME: &str = "control-token";
+
+#[derive(Debug, Error)]
+pub enum TokenStoreError {
+    #[error("control token is missing")]
+    Missing,
+    #[error("control token store failed: {0}")]
+    Store(String),
+    #[error("control token is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("file-backed secret exceeds 64 KiB")]
+    OversizeRefused,
+    /// A daemon owns local state but has not saved its control token yet.
+    #[error("ottto-service is starting and has not created its control token yet")]
+    DaemonNotReady,
+}
+
+pub trait ControlTokenStore {
+    fn load(&self) -> Result<String, TokenStoreError>;
+    fn save(&self, token: &str) -> Result<(), TokenStoreError>;
+    fn delete(&self) -> Result<(), TokenStoreError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryTokenStore {
+    values: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+impl MemoryTokenStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ControlTokenStore for MemoryTokenStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        self.values
+            .lock()
+            .map_err(|_| TokenStoreError::Store("memory token lock poisoned".to_string()))?
+            .get(OTTTO_KEYCHAIN_ACCOUNT)
+            .cloned()
+            .ok_or(TokenStoreError::Missing)
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        self.values
+            .lock()
+            .map_err(|_| TokenStoreError::Store("memory token lock poisoned".to_string()))?
+            .insert(OTTTO_KEYCHAIN_ACCOUNT.to_string(), token.to_string());
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        self.values
+            .lock()
+            .map_err(|_| TokenStoreError::Store("memory token lock poisoned".to_string()))?
+            .remove(OTTTO_KEYCHAIN_ACCOUNT);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeychainTokenStore;
+
+#[derive(Debug, Clone)]
+pub struct KeychainSecretStore {
+    account: &'static str,
+    keychain_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileControlTokenStore {
+    path: PathBuf,
+}
+
+impl FileControlTokenStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn default_path() -> PathBuf {
+        default_support_dir().join(CONTROL_TOKEN_FILE_NAME)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Default for FileControlTokenStore {
+    fn default() -> Self {
+        Self::new(Self::default_path())
+    }
+}
+
+impl ControlTokenStore for FileControlTokenStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        match fs::read_to_string(&self.path) {
+            Ok(value) => {
+                let token = value.trim().to_string();
+                if token.is_empty() {
+                    Err(TokenStoreError::Missing)
+                } else {
+                    Ok(token)
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(TokenStoreError::Missing)
+            }
+            Err(error) => Err(TokenStoreError::Store(error.to_string())),
+        }
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| TokenStoreError::Store(error.to_string()))?;
+            set_user_only_directory_permissions(parent)?;
+        }
+        write_secret_file_0600(&self.path, token.as_bytes())
+            .map_err(|error| TokenStoreError::Store(error.to_string()))
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(TokenStoreError::Store(error.to_string())),
+        }
+    }
+}
+
+impl KeychainSecretStore {
+    pub const fn new(account: &'static str) -> Self {
+        Self {
+            account,
+            keychain_only: false,
+        }
+    }
+
+    /// Use the existing Keychain service without a file mirror or fallback.
+    /// Explicit file-store isolation disables this store rather than touching
+    /// the real Keychain or writing the secret to disk.
+    pub const fn keychain_only(account: &'static str) -> Self {
+        Self {
+            account,
+            keychain_only: true,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ControlTokenStore for KeychainTokenStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).load()
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).save(token)
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).delete()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ControlTokenStore for KeychainSecretStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        if self.keychain_only {
+            return if explicit_file_secret_store() {
+                Err(TokenStoreError::Missing)
+            } else {
+                run_keychain_with_timeout(self.account, "load", keychain_load)
+            };
+        }
+        // An explicit file-store directory is an isolation boundary, not just
+        // a different mirror location. Tests and support tools use it with a
+        // temporary HOME and must never fall through to the user's Keychain.
+        if explicit_file_secret_store() {
+            return load_file_secret(self.account);
+        }
+        match load_file_secret(self.account) {
+            Ok(token) => return Ok(token),
+            Err(TokenStoreError::Missing) => {}
+            Err(error) => return Err(error),
+        }
+        match run_keychain_with_timeout(self.account, "load", keychain_load) {
+            Ok(token) => Ok(token),
+            Err(TokenStoreError::Missing) => Err(TokenStoreError::Missing),
+            Err(error) => match load_file_secret(self.account) {
+                Ok(token) => Ok(token),
+                Err(TokenStoreError::Missing) => Err(error),
+                Err(file_error) => Err(file_error),
+            },
+        }
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            if explicit_file_secret_store() {
+                return Err(TokenStoreError::Store(
+                    "Keychain-only storage is unavailable".to_string(),
+                ));
+            }
+            let token = token.to_string();
+            return run_keychain_with_timeout(self.account, "save", move |account| {
+                keychain_save(account, &token)
+            });
+        }
+        if explicit_file_secret_store() {
+            return save_file_secret(self.account, token);
+        }
+        let token = token.to_string();
+        let keychain_token = token.clone();
+        match run_keychain_with_timeout(self.account, "save", move |account| {
+            keychain_save(account, &keychain_token)
+        }) {
+            Ok(()) => {
+                // Keep the owner-only fallback as a mirror. Dev/preview ad-hoc
+                // signatures can churn between installs, and macOS may then
+                // deny the new helper access to a Keychain item it created
+                // before the update. Stable builds still use Keychain first.
+                let _ = save_file_secret(self.account, &token);
+                Ok(())
+            }
+            Err(error) => match save_file_secret(self.account, &token) {
+                Ok(()) => Ok(()),
+                Err(file_error) => Err(TokenStoreError::Store(format!(
+                    "{error}; file fallback failed: {file_error}"
+                ))),
+            },
+        }
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return if explicit_file_secret_store() {
+                Ok(())
+            } else {
+                run_keychain_with_timeout(self.account, "delete", keychain_delete)
+            };
+        }
+        if explicit_file_secret_store() {
+            return delete_file_secret(self.account);
+        }
+        let keychain_result = run_keychain_with_timeout(self.account, "delete", keychain_delete);
+        let file_result = delete_file_secret(self.account);
+        match (keychain_result, file_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(TokenStoreError::Missing), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(keychain_error), Err(file_error)) => Err(TokenStoreError::Store(format!(
+                "{keychain_error}; file fallback failed: {file_error}"
+            ))),
+        }
+    }
+}
+
+/// macOS `errSecNoSuchKeychain`. The Security framework hands a long-lived
+/// process a database session for the login keychain, but macOS atomically
+/// replaces `login.keychain-db` (a *new inode*) on every keychain write — by any
+/// app — which strands that session. Reads then fail with this status, and a
+/// store would pop a blocking "Keychain Not Found" modal. Re-resolving the
+/// default keychain and retrying once recovers in-process, without the daemon
+/// restart the local watchdog currently forces.
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294;
+
+/// Runs a keychain operation and, if it fails with `errSecNoSuchKeychain`,
+/// re-resolves the default keychain via `reresolve` and retries `op` exactly
+/// once. Success, or any other error (e.g. `errSecItemNotFound`), is returned
+/// unchanged — and the retry runs at most once, so a keychain that never
+/// recovers falls through to the file fallback instead of spinning. Kept generic
+/// and free of macOS types so the retry/re-resolve contract is unit-testable on
+/// every platform.
+#[cfg(any(target_os = "macos", test))]
+fn run_with_keychain_retry<T, E>(
+    mut op: impl FnMut() -> Result<T, E>,
+    is_missing_keychain: impl Fn(&E) -> bool,
+    mut reresolve: impl FnMut(),
+) -> Result<T, E> {
+    match op() {
+        Err(error) if is_missing_keychain(&error) => {
+            reresolve();
+            op()
+        }
+        other => other,
+    }
+}
+
+/// Disables interactive Security UI for this process. A background daemon must
+/// never block on a keychain modal (the "Keychain Not Found — A keychain cannot
+/// be found to store …" dialog, whose "Reset To Defaults" button is destructive);
+/// a transient failure has to log and retry instead. Process-global and
+/// idempotent: the service calls this once at startup and every keychain call on
+/// every thread then inherits it. The interactive CLI deliberately does not call
+/// it, so its keychain prompts (where a human is present) are preserved.
+#[cfg(target_os = "macos")]
+pub fn disable_keychain_user_interaction() {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<()> = OnceLock::new();
+    DISABLED.get_or_init(|| unsafe {
+        // Boolean(0) == false. Best-effort: ignore the OSStatus — even if this
+        // ever fails we still want a logged keychain error over a blocking modal.
+        let _ = security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn disable_keychain_user_interaction() {}
+
+/// Re-resolves the process default keychain so the next call binds to the
+/// *current* `login.keychain-db` rather than the stranded session described on
+/// [`ERR_SEC_NO_SUCH_KEYCHAIN`]. `SecKeychain::default()` performs a fresh
+/// `SecKeychainCopyDefault`; the handle drops immediately — we never cache a
+/// `SecKeychainRef` across operations.
+#[cfg(target_os = "macos")]
+fn reresolve_default_keychain() {
+    use security_framework::os::macos::keychain::SecKeychain;
+    let _ = SecKeychain::default();
+}
+
+/// Runs a keychain `op`, re-resolving the default keychain and retrying once if
+/// it reports `errSecNoSuchKeychain`. Shared by the control-token, setup-run, and
+/// relay-device-secret stores here and by the telemetry key store in
+/// `ottto-service`. The caller keeps its own error mapping (e.g.
+/// `errSecItemNotFound` → "missing") by inspecting the returned error.
+#[cfg(target_os = "macos")]
+pub fn with_default_keychain_retry<T>(
+    op: impl FnMut() -> security_framework::base::Result<T>,
+) -> security_framework::base::Result<T> {
+    run_with_keychain_retry(
+        op,
+        |error| error.code() == ERR_SEC_NO_SUCH_KEYCHAIN,
+        reresolve_default_keychain,
+    )
+}
+
+#[cfg(target_os = "macos")]
+const KEYCHAIN_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(target_os = "macos")]
+fn run_keychain_with_timeout<T, F>(
+    account: &'static str,
+    operation: &'static str,
+    work: F,
+) -> Result<T, TokenStoreError>
+where
+    T: Send + 'static,
+    F: FnOnce(&'static str) -> Result<T, TokenStoreError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work(account));
+    });
+    receiver
+        .recv_timeout(KEYCHAIN_OPERATION_TIMEOUT)
+        .map_err(|_| {
+            TokenStoreError::Store(format!("keychain {operation} timed out for {account}"))
+        })?
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_load(account: &'static str) -> Result<String, TokenStoreError> {
+    use security_framework::passwords::get_generic_password;
+    use security_framework_sys::base::errSecItemNotFound;
+
+    let bytes =
+        match with_default_keychain_retry(|| get_generic_password(OTTTO_KEYCHAIN_SERVICE, account))
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.code() == errSecItemNotFound => {
+                return Err(TokenStoreError::Missing);
+            }
+            Err(error) => return Err(TokenStoreError::Store(error.to_string())),
+        };
+    String::from_utf8(bytes).map_err(|_| TokenStoreError::InvalidUtf8)
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_save(account: &'static str, token: &str) -> Result<(), TokenStoreError> {
+    use security_framework::passwords::set_generic_password;
+
+    with_default_keychain_retry(|| {
+        set_generic_password(OTTTO_KEYCHAIN_SERVICE, account, token.as_bytes())
+    })
+    .map_err(|error| TokenStoreError::Store(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete(account: &'static str) -> Result<(), TokenStoreError> {
+    use security_framework::passwords::delete_generic_password;
+    use security_framework_sys::base::errSecItemNotFound;
+
+    match with_default_keychain_retry(|| delete_generic_password(OTTTO_KEYCHAIN_SERVICE, account)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == errSecItemNotFound => Ok(()),
+        Err(error) => match keychain_delete_with_security_cli(account) {
+            Ok(()) => Ok(()),
+            Err(cli_error) => Err(TokenStoreError::Store(format!(
+                "{error}; security CLI delete fallback failed: {cli_error}"
+            ))),
+        },
+    }
+}
+
+/// Outcome of an already captured Security CLI deletion response.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecurityCliDeleteOutcome {
+    Removed,
+    Missing,
+    Failed(String),
+}
+
+/// Classifies output without launching a process or touching credential state.
+/// Process success takes precedence over missing-item diagnostics; failures keep
+/// the original stderr/stdout spelling and Security status formatting.
+#[cfg(target_os = "macos")]
+pub fn classify_security_cli_delete_output(
+    output: &std::process::Output,
+) -> SecurityCliDeleteOutcome {
+    if output.status.success() {
+        return SecurityCliDeleteOutcome::Removed;
+    }
+    if security_cli_delete_reports_missing(output.status.code(), &output.stderr) {
+        return SecurityCliDeleteOutcome::Missing;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    SecurityCliDeleteOutcome::Failed(if message.is_empty() {
+        format!("security exited with status {}", output.status)
+    } else {
+        message
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete_with_security_cli(account: &'static str) -> Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            OTTTO_KEYCHAIN_SERVICE,
+            "-a",
+            account,
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    match classify_security_cli_delete_output(&output) {
+        SecurityCliDeleteOutcome::Removed | SecurityCliDeleteOutcome::Missing => Ok(()),
+        SecurityCliDeleteOutcome::Failed(message) => Err(message),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn security_cli_delete_reports_missing(exit_code: Option<i32>, stderr: &[u8]) -> bool {
+    if exit_code == Some(44) {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    stderr.contains("could not be found") || stderr.contains("item not found")
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ControlTokenStore for KeychainTokenStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).load()
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).save(token)
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        KeychainSecretStore::new(OTTTO_KEYCHAIN_ACCOUNT).delete()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ControlTokenStore for KeychainSecretStore {
+    fn load(&self) -> Result<String, TokenStoreError> {
+        if self.keychain_only {
+            return Err(TokenStoreError::Missing);
+        }
+        load_file_secret(self.account)
+    }
+
+    fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return Err(TokenStoreError::Store(
+                "Keychain-only storage is unavailable".to_string(),
+            ));
+        }
+        save_file_secret(self.account, token)
+    }
+
+    fn delete(&self) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return Ok(());
+        }
+        delete_file_secret(self.account)
+    }
+}
+
+pub fn client_control_token() -> Result<String, TokenStoreError> {
+    if let Ok(token) = std::env::var(OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(token);
+    }
+
+    match FileControlTokenStore::default().load() {
+        Ok(token) => Ok(token),
+        Err(TokenStoreError::Missing) if cfg!(debug_assertions) => {
+            Ok("local-development-control-token".to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn load_or_create_control_token() -> Result<String, TokenStoreError> {
+    if let Ok(token) = std::env::var(OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(token);
+    }
+
+    let store = FileControlTokenStore::default();
+    match store.load() {
+        Ok(token) => Ok(token),
+        Err(TokenStoreError::Missing) => {
+            let token = generate_control_token().map_err(TokenStoreError::Store)?;
+            store.save(&token)?;
+            Ok(token)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Client-side fallback when the control token cannot be read. A missing
+/// token is created only while this process holds the daemon's
+/// state-directory lock, so a client and a starting daemon can never each
+/// save a different token. When a daemon holds the lock it creates the token
+/// itself: the existing token is used, or `DaemonNotReady` is returned and
+/// nothing is written.
+#[cfg(unix)]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    if let Ok(token) = std::env::var(OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(token);
+    }
+    load_or_create_control_token_unless_owned_in(&default_support_dir())
+}
+
+#[cfg(not(unix))]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    load_or_create_control_token()
+}
+
+#[cfg(unix)]
+fn load_or_create_control_token_unless_owned_in(
+    support_dir: &Path,
+) -> Result<String, TokenStoreError> {
+    use crate::state_dir_lock::{StateDirLock, StateDirLockError};
+    let store = FileControlTokenStore::new(support_dir.join(CONTROL_TOKEN_FILE_NAME));
+    let _lock = match StateDirLock::acquire(support_dir) {
+        Ok(lock) => lock,
+        Err(StateDirLockError::Held { .. }) => {
+            return match store.load() {
+                Err(TokenStoreError::Missing) => Err(TokenStoreError::DaemonNotReady),
+                other => other,
+            };
+        }
+        Err(error) => return Err(TokenStoreError::Store(error.to_string())),
+    };
+    match store.load() {
+        Ok(token) => Ok(token),
+        Err(TokenStoreError::Missing) => {
+            let token = generate_control_token().map_err(TokenStoreError::Store)?;
+            store.save(&token)?;
+            Ok(token)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn generate_control_token() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Atomically writes machine-local private state with an owner-only parent
+/// directory and file mode. Suitable for credentials and credential-adjacent
+/// caches that must never expose a partial JSON document after a crash.
+pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    write_secret_file_0600(path, bytes)
+}
+
+/// [`write_owner_only_file_atomic`] for often-refreshed status caches. After
+/// the parent is made owner-only, a file that already holds exactly `bytes`
+/// owner-only is left as is (no rewrite, no fsync, same mtime).
+pub fn write_owner_only_file_atomic_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_owner_only_file_if_changed(path, bytes, true).map(drop)
+}
+
+/// Owner-only atomic replacement for disposable local diagnostics/cache data.
+/// Shares the secure temporary-file path with durable writes, but deliberately
+/// skips fsync, and skips the write when the file already holds `bytes`. A
+/// crash may lose this cache; never use it for credentials or a
+/// checkpoint/receipt ledger.
+pub fn write_owner_only_cache_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_owner_only_file_if_changed(path, bytes, false).map(drop)
+}
+
+/// [`write_owner_only_file_atomic_if_changed`] (`fsync`) or
+/// [`write_owner_only_cache_file_atomic`] (no `fsync`), reporting the outcome:
+/// `true` when it wrote, `false` when the file already held exactly `bytes`.
+pub fn replace_owner_only_file_if_changed(
+    path: &Path,
+    bytes: &[u8],
+    fsync: bool,
+) -> std::io::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    if holds_owner_only_bytes(path, bytes) {
+        return Ok(false);
+    }
+    if fsync {
+        write_secret_file_0600(path, bytes)?;
+    } else {
+        write_private_file_0600(path, bytes, false)?;
+    }
+    Ok(true)
+}
+
+/// True only for a regular, euid-owned, mode-0600 file (final symlink not
+/// followed) holding exactly `bytes`. Any doubt or error means rewrite.
+#[cfg(unix)]
+fn holds_owner_only_bytes(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    else {
+        return false;
+    };
+    let same_shape = file.metadata().is_ok_and(|meta| {
+        meta.is_file()
+            && meta.mode() & 0o7777 == 0o600
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.len() == bytes.len() as u64
+    });
+    let mut old = Vec::new();
+    let limit = bytes.len() as u64 + 1;
+    same_shape && file.take(limit).read_to_end(&mut old).is_ok() && old == bytes
+}
+
+#[cfg(not(unix))]
+fn holds_owner_only_bytes(_path: &Path, _bytes: &[u8]) -> bool {
+    false
+}
+
+/// Writes `bytes` to `path` so the secret is never exposed through a
+/// world-readable or symlink-followable window.
+///
+/// A fresh temp file is created in the same directory with `create_new` +
+/// mode `0o600`: `create_new` fails if anything (including a pre-planted
+/// symlink) already exists at the temp path, so a squatter cannot redirect the
+/// write to another target. The temp file is then `rename`d over `path`, which
+/// is atomic and preserves the `0o600` mode while overwriting any existing
+/// secret. On any failure after creation the temp file is removed.
+///
+/// Shared with `account_store.rs` (same crate); each caller maps the
+/// `io::Error` to its own error type.
+#[cfg(unix)]
+pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_file_0600(path, bytes, true)
+}
+
+#[cfg(unix)]
+fn write_private_file_0600(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut attempt = 0_u32;
+    let (mut file, tmp_path) = loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(
+            ".{}.tmp.{}.{nanos}.{attempt}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("secret"),
+            std::process::id(),
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+        {
+            Ok(file) => break (file, tmp_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) =
+        file.write_all(bytes)
+            .and_then(|()| if durable { file.sync_all() } else { Ok(()) })
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private_file_0600(path: &Path, bytes: &[u8], _durable: bool) -> std::io::Result<()> {
+    let _ = (path, bytes);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "owner-only atomic cache writes require Unix",
+    ))
+}
+
+/// Restricts a created secret directory to owner-only (`0o700`) so the secrecy
+/// of the files inside does not silently depend on an ancestor (`~/Library`)
+/// the daemon never controls. Shared with `account_store.rs`.
+#[cfg(unix)]
+pub(crate) fn restrict_secret_dir_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restrict_secret_dir_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn set_user_only_directory_permissions(path: &Path) -> Result<(), TokenStoreError> {
+    restrict_secret_dir_to_owner(path).map_err(|error| TokenStoreError::Store(error.to_string()))
+}
+
+fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
+    let read = || {
+        crate::credential_file::read(
+            fs::File::open(file_secret_path(account))?,
+            crate::CredentialFileCapRefused::FileSecret,
+        )
+    };
+    match read() {
+        Ok(value) => {
+            let token = value.trim().to_string();
+            if token.is_empty() {
+                Err(TokenStoreError::Missing)
+            } else {
+                Ok(token)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(TokenStoreError::Missing),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|e| e.is::<crate::CredentialFileCapRefused>()) =>
+        {
+            Err(TokenStoreError::OversizeRefused)
+        }
+        Err(error) => Err(TokenStoreError::Store(error.to_string())),
+    }
+}
+
+fn save_file_secret(account: &str, token: &str) -> Result<(), TokenStoreError> {
+    let path = file_secret_path(account);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| TokenStoreError::Store(error.to_string()))?;
+        set_user_only_directory_permissions(parent)?;
+    }
+    write_secret_file_0600(&path, token.as_bytes())
+        .map_err(|error| TokenStoreError::Store(error.to_string()))
+}
+
+fn delete_file_secret(account: &str) -> Result<(), TokenStoreError> {
+    match fs::remove_file(file_secret_path(account)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(TokenStoreError::Store(error.to_string())),
+    }
+}
+
+fn file_secret_path(account: &str) -> PathBuf {
+    file_secret_dir().join(secret_file_name(account))
+}
+
+fn file_secret_dir() -> PathBuf {
+    std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV)
+        .map(PathBuf::from)
+        .or_else(isolated_test_secret_dir)
+        .unwrap_or_else(|| default_support_dir().join("secrets"))
+}
+
+/// Whether this build must use synthetic file stores, including when compiled
+/// as a dependency of another crate's tests (which does not set `cfg(test)`).
+#[doc(hidden)]
+pub const fn test_secret_store_enabled() -> bool {
+    cfg!(any(test, feature = "test-secret-store"))
+}
+
+/// A fresh process-local root for tests that have not selected their own fixture
+/// directory. Never derive this from HOME or adopt a previous process's files.
+/// Test callers may still select an explicit fixture directory via the existing
+/// environment variables; removing those variables cannot enable Keychain.
+#[doc(hidden)]
+pub fn isolated_test_secret_dir() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-secret-store"))]
+    {
+        use std::sync::OnceLock;
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        Some(
+            ROOT.get_or_init(|| {
+                let suffix = generate_control_token().expect("random test secret directory");
+                let root = std::env::temp_dir().join(format!(
+                    "ottto-test-secrets-{}-{suffix}",
+                    std::process::id()
+                ));
+                fs::create_dir(&root).expect("create fresh test secret directory");
+                set_user_only_directory_permissions(&root).expect("private test secret directory");
+                root
+            })
+            .clone(),
+        )
+    }
+    #[cfg(not(any(test, feature = "test-secret-store")))]
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn explicit_file_secret_store() -> bool {
+    test_secret_store_enabled() || std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
+}
+
+fn secret_file_name(account: &str) -> String {
+    account
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes the tests that resolve the env-driven secret fallback dir:
+    /// one of them points `OTTTO_SECRET_FALLBACK_DIR_ENV` at its own directory
+    /// and removes it, which would pull files from under the other.
+    static SECRET_FALLBACK_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_secret_fallback_dir_env() -> std::sync::MutexGuard<'static, ()> {
+        SECRET_FALLBACK_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn revocation_receipt_keychain_only_never_uses_file_store() {
+        let _env = lock_secret_fallback_dir_env();
+        // cfg(test) isolates all Keychain access. Even an existing fallback
+        // must not be read, replaced, or removed by the Keychain-only store.
+        let mirrored = KeychainSecretStore::new(OTTTO_REVOCATION_RECEIPT_ACCOUNT);
+        mirrored.save("synthetic-file-value").unwrap();
+        let isolated = KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT);
+        assert!(matches!(isolated.load(), Err(TokenStoreError::Missing)));
+        assert!(isolated.save("synthetic-keychain-only-value").is_err());
+        isolated.delete().unwrap();
+        assert_eq!(mirrored.load().unwrap(), "synthetic-file-value");
+        mirrored.delete().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostic_cache_writer_is_private_atomic_and_does_not_follow_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-disposable-cache-{}",
+            generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("unrelated");
+        fs::write(&target, b"unchanged").unwrap();
+        let cache = root.join("cache.json");
+        symlink(&target, &cache).unwrap();
+        write_owner_only_cache_file_atomic(&cache, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        write_owner_only_cache_file_atomic(&cache, b"second").unwrap();
+        assert_eq!(fs::read(&cache).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "no temporary files retained"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_owner_only_writes_are_skipped_only_for_exact_private_files() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-skip-unchanged-{}",
+            generate_control_token().unwrap()
+        ));
+        let stamp = |path: &Path| {
+            let meta = fs::symlink_metadata(path).unwrap();
+            (meta.ino(), meta.mtime(), meta.mtime_nsec())
+        };
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        type Writer = fn(&Path, &[u8]) -> std::io::Result<()>;
+        let writers: [Writer; 2] = [
+            write_owner_only_file_atomic_if_changed,
+            write_owner_only_cache_file_atomic,
+        ];
+        for (index, write) in writers.into_iter().enumerate() {
+            let path = root.join(format!("state-{index}.json"));
+            write(&path, b"same").unwrap(); // missing: created
+            assert_eq!(
+                (fs::read(&path).unwrap(), mode(&path)),
+                (b"same".to_vec(), 0o600)
+            );
+            let before = stamp(&path);
+            write(&path, b"same").unwrap(); // identical: untouched
+            assert_eq!(stamp(&path), before);
+            write(&path, b"next").unwrap(); // changed: replaced
+            assert_eq!(fs::read(&path).unwrap(), b"next");
+            assert_ne!(stamp(&path).0, before.0);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            write(&path, b"next").unwrap(); // same bytes, wrong mode: repaired
+            assert_eq!(mode(&path), 0o600);
+            // Unreadable through the no-follow open: written as a regular file.
+            let target = root.join(format!("target-{index}"));
+            fs::write(&target, b"next").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+            write(&path, b"next").unwrap();
+            assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        }
+        // The plain durable writer still rewrites identical bytes.
+        let path = root.join("state-0.json");
+        let before = stamp(&path);
+        write_owner_only_file_atomic(&path, b"next").unwrap();
+        assert_ne!(stamp(&path).0, before.0);
+        // The reporting form says whether it wrote, in both fsync modes.
+        for fsync in [true, false] {
+            let path = root.join(format!("reported-{fsync}.json"));
+            assert!(replace_owner_only_file_if_changed(&path, b"one", fsync).unwrap());
+            assert!(!replace_owner_only_file_if_changed(&path, b"one", fsync).unwrap());
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(1)
+                .unwrap();
+            assert!(replace_owner_only_file_if_changed(&path, b"one", fsync).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), b"one");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn memory_token_store_round_trips() {
+        let store = MemoryTokenStore::new();
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+
+        store.save("secret-token").expect("save token");
+        assert_eq!(store.load().expect("load token"), "secret-token");
+
+        store.delete().expect("delete token");
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+    }
+
+    #[test]
+    fn generated_tokens_are_hex_and_unguessable_length() {
+        let token = generate_control_token().expect("token");
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn file_control_token_store_round_trips_with_user_only_permissions() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-control-token-test-{}", std::process::id()));
+        let path = dir.join(CONTROL_TOKEN_FILE_NAME);
+        let _ = fs::remove_dir_all(&dir);
+        let store = FileControlTokenStore::new(&path);
+
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        store.save("token_from_file").expect("save token");
+        assert_eq!(store.load().expect("load token"), "token_from_file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        store.delete().expect("delete token");
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_secret_load_enforces_64_kib_boundary() {
+        let _env = lock_secret_fallback_dir_env();
+        let account = "e2-9-synthetic-size-bound";
+        save_file_secret(account, &"s".repeat(64 * 1024)).unwrap();
+        assert_eq!(load_file_secret(account).unwrap().len(), 64 * 1024);
+        {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(file_secret_path(account))
+                .unwrap()
+                .write_all(b"s")
+                .unwrap();
+        }
+        let error = load_file_secret(account).unwrap_err();
+        assert!(matches!(error, TokenStoreError::OversizeRefused));
+        assert!(error.to_string().contains("exceeds 64 KiB"));
+        delete_file_secret(account).unwrap();
+        assert!(matches!(
+            load_file_secret(account),
+            Err(TokenStoreError::Missing)
+        ));
+    }
+
+    #[test]
+    fn file_secret_store_round_trips_with_sanitized_names_and_user_only_permissions() {
+        let _env = lock_secret_fallback_dir_env();
+        let dir =
+            std::env::temp_dir().join(format!("ottto-secret-fallback-test-{}", std::process::id()));
+        let previous = std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV);
+        unsafe { std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, &dir) };
+
+        let account = "setup/run:token";
+        assert_eq!(secret_file_name(account), "setup_run_token");
+        assert!(matches!(
+            load_file_secret(account),
+            Err(TokenStoreError::Missing)
+        ));
+
+        save_file_secret(account, "secret-value").expect("save fallback secret");
+        assert_eq!(
+            load_file_secret(account).expect("load fallback secret"),
+            "secret-value"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(file_secret_path(account))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        delete_file_secret(account).expect("delete fallback secret");
+        assert!(matches!(
+            load_file_secret(account),
+            Err(TokenStoreError::Missing)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(previous) = previous {
+            unsafe { std::env::set_var(OTTTO_SECRET_FALLBACK_DIR_ENV, previous) };
+        } else {
+            unsafe { std::env::remove_var(OTTTO_SECRET_FALLBACK_DIR_ENV) };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_existing_secret_file_keeps_user_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-control-token-overwrite-{}",
+            std::process::id()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE_NAME);
+        let _ = fs::remove_dir_all(&dir);
+        let store = FileControlTokenStore::new(&path);
+
+        store.save("first_value").expect("save first");
+        store.save("second_value").expect("overwrite");
+        assert_eq!(store.load().expect("load"), "second_value");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_secret_does_not_follow_symlink_at_final_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-control-token-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create dir");
+
+        let target = dir.join("attacker-target");
+        fs::write(&target, "untouched").expect("seed target");
+        let link = dir.join("control-token");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
+
+        let store = FileControlTokenStore::new(&link);
+        store
+            .save("real_secret")
+            .expect("save through symlink path");
+
+        // The symlink's original target must NOT have received the secret; the
+        // rename replaced the symlink itself with a fresh regular file.
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "untouched"
+        );
+        assert!(!fs::symlink_metadata(&link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&link).expect("read link path"),
+            "real_secret"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_owner_only_secret_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Exercise directory hardening via the explicit-path store so the test
+        // never mutates the process-global `OTTTO_SECRET_FALLBACK_DIR_ENV` and
+        // cannot race the env-driven fallback test running in parallel.
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-control-token-dirmode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = FileControlTokenStore::new(dir.join(CONTROL_TOKEN_FILE_NAME));
+
+        store.save("off-box-secret").expect("save secret");
+        let mode = fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_cli_output_classification_preserves_precedence_and_messages() {
+        use std::os::unix::process::ExitStatusExt;
+        use SecurityCliDeleteOutcome::{Failed, Missing, Removed};
+
+        let cases: &[(i32, &[u8], &[u8], SecurityCliDeleteOutcome)] = &[
+            (0, b"item not found", b"failure", Removed),
+            (44 << 8, b"permission denied", b"ignored", Missing),
+            (
+                1 << 8,
+                b"The specified item COULD NOT BE FOUND.",
+                b"",
+                Missing,
+            ),
+            (1 << 8, b"ITEM NOT FOUND", b"", Missing),
+            (9, b"item not found", b"", Missing),
+            (1 << 8, b"\xffITEM NOT FOUND", b"", Missing),
+            (
+                1 << 8,
+                b"permission denied",
+                b"item not found",
+                Failed("permission denied".into()),
+            ),
+            (
+                1 << 8,
+                b"",
+                b"item not found",
+                Failed("item not found".into()),
+            ),
+            (
+                1 << 8,
+                b"  Mixed CASE error\n",
+                b"other",
+                Failed("Mixed CASE error".into()),
+            ),
+            (
+                1 << 8,
+                b" \t\n",
+                b"  stdout error\n",
+                Failed("stdout error".into()),
+            ),
+            (1 << 8, b"\xff", b"ignored", Failed("\u{fffd}".into())),
+            (
+                1 << 8,
+                "İTEM NOT FOUND".as_bytes(),
+                b"",
+                Failed("İTEM NOT FOUND".into()),
+            ),
+            (
+                1 << 8,
+                b"item not foun",
+                b"",
+                Failed("item not foun".into()),
+            ),
+            (
+                1 << 8,
+                b" \n",
+                b"\t",
+                Failed("security exited with status exit status: 1".into()),
+            ),
+            (
+                9,
+                b"signal failure",
+                b"ignored",
+                Failed("signal failure".into()),
+            ),
+        ];
+        for (status, stderr, stdout, expected) in cases {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(*status),
+                stderr: stderr.to_vec(),
+                stdout: stdout.to_vec(),
+            };
+            assert_eq!(&classify_security_cli_delete_output(&output), expected);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_cli_missing_item_exit_is_clean_delete() {
+        assert!(security_cli_delete_reports_missing(Some(44), b""));
+        assert!(security_cli_delete_reports_missing(
+            Some(1),
+            b"The specified item could not be found in the keychain."
+        ));
+        assert!(!security_cli_delete_reports_missing(
+            Some(1),
+            b"permission denied"
+        ));
+    }
+
+    #[test]
+    fn keychain_retry_reresolves_once_then_succeeds_on_missing_keychain() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // First call hits the stranded login-keychain session (errSecNoSuchKeychain);
+        // the second, after re-resolving the default keychain, succeeds.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Err(ERR_SEC_NO_SUCH_KEYCHAIN)
+                } else {
+                    Ok("relay-device-secret")
+                }
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Ok("relay-device-secret"));
+        assert_eq!(
+            attempts.get(),
+            2,
+            "must retry exactly once after re-resolve"
+        );
+        assert_eq!(
+            reresolves.get(),
+            1,
+            "the default keychain must be re-resolved before the retry"
+        );
+    }
+
+    #[test]
+    fn keychain_retry_does_not_retry_unrelated_errors() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // errSecItemNotFound (-25300) means the item is genuinely absent, not a
+        // stranded keychain handle: surface it immediately, no re-resolve.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(-25300)
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Err(-25300));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(reresolves.get(), 0);
+    }
+
+    #[test]
+    fn keychain_retry_gives_up_after_a_single_retry() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // A keychain that never recovers must not spin: re-resolve once, retry
+        // once, then return the error so the file fallback can take over.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(ERR_SEC_NO_SUCH_KEYCHAIN)
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Err(ERR_SEC_NO_SUCH_KEYCHAIN));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(reresolves.get(), 1);
+    }
+
+    /// A daemon holding local state and still creating its token: the CLI
+    /// fallback reports not-ready and writes nothing, then uses the token
+    /// the daemon saves.
+    #[cfg(unix)]
+    #[test]
+    fn cli_token_fallback_never_creates_while_a_daemon_owns_state() {
+        use crate::state_dir_lock::{scratch, StateDirLock, STATE_DIR_LOCK_FILE_NAME};
+        let root = scratch("cli-token-held");
+        let support = root.join("Ottto");
+        let daemon = StateDirLock::acquire(&support).expect("daemon owns state");
+        let lock_bytes = fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock");
+
+        let result = load_or_create_control_token_unless_owned_in(&support);
+        assert!(
+            matches!(result, Err(TokenStoreError::DaemonNotReady)),
+            "{result:?}"
+        );
+        let names: Vec<_> = fs::read_dir(&support)
+            .expect("support dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(STATE_DIR_LOCK_FILE_NAME)]
+        );
+        assert_eq!(
+            fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock"),
+            lock_bytes
+        );
+
+        let store = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+        store.save("daemon-token").expect("daemon saves its token");
+        assert_eq!(
+            load_or_create_control_token_unless_owned_in(&support).expect("existing token"),
+            "daemon-token"
+        );
+        assert_eq!(store.load().expect("token kept"), "daemon-token");
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Daemons and CLI fallbacks starting together on a fresh directory end
+    /// with exactly one saved token, and every caller that got one got it.
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_first_start_saves_one_token() {
+        use crate::state_dir_lock::{scratch, StateDirLock};
+        const STARTERS: usize = 8;
+        for round in 0..16 {
+            let root = scratch(&format!("token-first-start-{round}"));
+            let support = root.join("Ottto");
+            let barrier = Arc::new(std::sync::Barrier::new(STARTERS));
+            let threads: Vec<_> = (0..STARTERS)
+                .map(|starter| {
+                    let support = support.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if starter % 2 == 0 {
+                            // serve: lock for life, then load or create.
+                            let Ok(lock) = StateDirLock::acquire(&support) else {
+                                return (None, None);
+                            };
+                            let store =
+                                FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+                            let token = match store.load() {
+                                Ok(token) => token,
+                                Err(TokenStoreError::Missing) => {
+                                    let token = generate_control_token().expect("token");
+                                    store.save(&token).expect("save token");
+                                    token
+                                }
+                                Err(error) => panic!("{error}"),
+                            };
+                            (Some(token), Some(lock))
+                        } else {
+                            match load_or_create_control_token_unless_owned_in(&support) {
+                                Ok(token) => (Some(token), None),
+                                Err(TokenStoreError::DaemonNotReady) => (None, None),
+                                Err(error) => panic!("{error}"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().expect("starter"))
+                .collect();
+            let saved = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME))
+                .load()
+                .expect("one token saved");
+            let tokens: Vec<_> = results
+                .iter()
+                .filter_map(|(token, _)| token.clone())
+                .collect();
+            assert!(!tokens.is_empty(), "round {round}");
+            assert!(
+                tokens.iter().all(|token| *token == saved),
+                "round {round}: {tokens:?} vs {saved}"
+            );
+            assert!(
+                results.iter().filter(|(_, lock)| lock.is_some()).count() <= 1,
+                "round {round}: two daemons owned state"
+            );
+            drop(results);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}

@@ -1,0 +1,501 @@
+//! A source's continuation from the state database. RAM keeps no reduction
+//! of a source with a Tail codec on a database route: a read that continues
+//! a file loads its committed Tail head, checks the head's identity, then the
+//! file against the head's certificate, then streams the pages (the session
+//! facts among them), validates the decoded state, and installs the read's
+//! live inputs. Content is never read back from the file: a quiet restart
+//! reads 0 transcript bytes.
+//!
+//! Each load counts once in `tail_db_loads{outcome}` on its source's line; a
+//! hit adds the bytes it read to `tail_db_load_bytes{head,page}`. Counters
+//! only: no point repeats them (§13). Stored state that cannot be
+//! reused is a counted reconstruction (`tail_reconstruct`) and the read starts
+//! at once as a Full; a file shorter than its head reads Full (`Shrunk`) and
+//! is counted in `tail_shorter_file_full`. A head whose session owes a
+//! head-CAS answer reads Full, counted under the `head_conflict` change
+//! reason (`native_change_reasons`). Only a head from a newer build, a
+//! session fact of a kind or version this build does not know, or a live
+//! input that is not available now, holds the file, untouched. A session
+//! fact that does not match its head (a count mismatch) is corrupt: that
+//! file alone reconstructs. A
+//! metadata-only head (revisions or inventory, no reduction) is no
+//! checkpoint: the file's first read, with no credit. A head bound to another
+//! route, scan root or path is retired before anything else in it is read
+//! (C′), whatever the Full that follows achieves. A head made under another
+//! key (a rotation) is an explicit-action reconstruction: counted, but
+//! neither a release-gate failure nor an alarm. Attribution toggled on or off
+//! since the head is no rotation: the head is reused with its context digest
+//! scrubbed, as main scrubs a retained parse's.
+use super::counters;
+use super::seam::TailBase;
+use super::{HeadIdentity, LiveLoadError, ReconstructCause, TailSource};
+use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
+use crate::snapshots::state_v2::{self, Hold};
+use crate::snapshots::*;
+use crate::transcript_acquisition::{CertificateRefusal, FullReason, Scope};
+use crate::transcript_cache::Retained;
+
+/// What a load hands the read.
+pub(in crate::snapshots) enum Load {
+    /// Continue from the stored reduction. `base` is `None` for a file set
+    /// aside, so its next stage replaces every stored row.
+    Reused(Box<Retained<CachedJsonlReduction>>, Option<TailBase>),
+    /// A newer build's head, or a live input not available now: the file
+    /// waits, untouched, with its debt.
+    Held,
+    /// Start a Full read now, with the reason the file proved, if any.
+    Cold(Option<FullReason>),
+}
+
+/// A selection of an unchanged transcript for evidence read at finish (late
+/// telemetry or side calls, a family or account proof, a quarantine retry).
+/// Its re-fold from stored state reads 0 transcript bytes, counted
+/// `tail_refold{reason}` at the load; a body that is not the ACKed one goes as
+/// an ordinary update.
+pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool {
+    matches!(
+        reason,
+        CandidateParseReason::SourceChanged
+            | CandidateParseReason::Rearmed
+            | CandidateParseReason::ForcedFamily
+            | CandidateParseReason::AuthorityQuarantine
+            | CandidateParseReason::ActivityOrQuarantineRetry
+    )
+}
+
+/// Whether this selection loads the committed Tail. A due `Audit` certifies
+/// against the committed head: an unchanged file retires quietly, and only
+/// what the file proves changed reads Full. An `UnknownOutcome` re-read
+/// continues as well. Growth beats a quarantine-retry or activity selection,
+/// which precedes `TranscriptChanged`: a file that `grew` past its committed
+/// entry is an append and continues as for `TranscriptChanged`, even while a
+/// body of it waits on a retry (unless its session owes a head-CAS answer).
+/// `BodyWitnessAdoption` and every legacy
+/// selection stay native. A `NewFile` is a first read, except one `e2` withheld
+/// (`held_new`): its committed head is custody, never acceptance, and it
+/// continues as a changed file does.
+///
+/// A late-evidence re-fold needs complete stored state: a set-aside file
+/// reads natively instead. A body waiting on a server retry re-folds: it is
+/// the same body a native read sends. Whatever the selection, a file whose
+/// session owes a head-CAS answer that can ride an upload never continues
+/// from stored state; the load refuses it ([`conflict_owed`]) once the head
+/// names the session. A challenge without a saved base follows these rules.
+pub(in crate::snapshots) fn reuses_stored(
+    index: &ScanIndex,
+    key: &str,
+    reason: Option<CandidateParseReason>,
+    grew: bool,
+    held_new: bool,
+) -> bool {
+    match reason {
+        None
+        | Some(
+            CandidateParseReason::TranscriptChanged
+            | CandidateParseReason::Audit
+            | CandidateParseReason::UnknownOutcome,
+        ) => true,
+        Some(CandidateParseReason::ActivityOrQuarantineRetry) if grew => true,
+        // Same-generation loss is cumulative in the saved head. Its certificate
+        // still refuses a replaced object; shrink never enters this arm.
+        Some(CandidateParseReason::TerminalDisposition) if grew => index
+            .terminal_jsonl_dispositions
+            .get(key)
+            .is_some_and(|disposition| {
+                disposition.parser_generation == JSONL_TERMINAL_DISPOSITION_GENERATION
+            }),
+        Some(CandidateParseReason::NewFile) => held_new,
+        Some(reason) => late_evidence(reason) && !set_aside(index, key),
+    }
+}
+
+/// A NEW key `e2` withheld, by its durable custody: the withheld read left
+/// its census record and no index entry. Its committed head (if any) is then
+/// custody, never acceptance; the load still validates it against the file.
+pub(in crate::snapshots) fn held_new(index: &ScanIndex, key: &str) -> bool {
+    !index.files.contains_key(key) && index.claude_request_census.get(key).is_some()
+}
+
+/// The stored head's session owes a head-CAS answer that can ride an upload:
+/// the upload ledger holds an open challenge and a saved base for it. The
+/// answer attaches to an outgoing body of the session and claims a full
+/// rescan, so it rides only a real native Full: the file reads Full whatever
+/// its selection, a grown file included.
+pub(in crate::snapshots) fn conflict_owed(
+    index: &ScanIndex,
+    path: &Path,
+    head: &SnapshotAccumulator,
+) -> bool {
+    head.wire_source_session_id(path).is_some_and(|session| {
+        index.head_conflict_owed(&crate::snapshot_sync::cache_session_key(&session))
+    })
+}
+
+/// The per-candidate marker check, before an ordinary Skip: a file whose
+/// Tail failed alone re-reads from its committed head even when its graph
+/// stamps already match.
+pub(in crate::snapshots) fn set_aside(index: &ScanIndex, key: &str) -> bool {
+    matches!(state_v2::tail_set_aside(index, key), Ok(Some(_)))
+}
+
+/// A4d: after a complete census with no decode hold, a head whose file the
+/// census did not observe, that is no residue and has no index entry, is
+/// absent. Each absent head is classified by its custody, never deleted by
+/// set difference: a reduction retires at the next save (the store keeps its
+/// unresolved revisions under a metadata-only head); a metadata-only head
+/// with revisions keeps its debt, which absence never clears; one with no
+/// revisions retires. A head that fails to load is set aside, not retired
+/// (F4). A read error of the key set, or a database hold, retires nothing.
+/// A set-aside marker with no head is not listed.
+pub(in crate::snapshots) fn retire_absent(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    observed: &BTreeSet<String>,
+    residue: &BTreeSet<String>,
+) {
+    let Ok(Some(route)) = state_v2::tail_route_path(index) else {
+        return;
+    };
+    let revision = super::reduction_revision(source);
+    let Ok(mut absent) = state_v2::tail_head_keys(index) else {
+        return;
+    };
+    absent.retain(|key| {
+        !observed.contains(key) && !residue.contains(key) && !index.files.contains_key(key)
+    });
+    let mut retire = BTreeSet::new();
+    let (mut kept_debt, mut set_aside) = (0_u64, 0_u64);
+    for key in absent {
+        match state_v2::load_head(index, &key, revision) {
+            Ok(Some(head))
+                if head.metadata_only
+                    && head.table.contains_key(&state_v2::Collection::Revisions) =>
+            {
+                kept_debt += 1;
+            }
+            Ok(Some(_)) => {
+                retire.insert(key);
+            }
+            Ok(None) => {}
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<Hold>(),
+                    Some(Hold::DbUnavailable | Hold::ReloadRequired)
+                ) =>
+            {
+                return;
+            }
+            Err(_) => {
+                let _ = state_v2::set_aside_tail(&route, &key, state_v2::SetAsideCause::Row);
+                set_aside += 1;
+            }
+        }
+    }
+    if kept_debt + set_aside > 0 {
+        crate::local_resource_diagnostics::traversal_point(
+            "tail_absent",
+            source.api_slug(),
+            &serde_json::json!({
+                "retired": retire.len(), "kept_debt": kept_debt, "set_aside": set_aside
+            }),
+        );
+    }
+    let _ = state_v2::retire_tail(&route, retire);
+}
+
+/// `S`'s load of `candidate` on `route`; `held` is the read's opened file and
+/// `live` its fresh accumulator.
+pub(in crate::snapshots) fn entry<S: TailSource>(
+    index: &ScanIndex,
+    route: &Path,
+    candidate: &CandidateFile,
+    live: &SnapshotAccumulator,
+    capture: bool,
+    held: &mut File,
+    scope: &Scope,
+) -> (Load, u64) {
+    let id = HeadIdentity::new(
+        route,
+        S::SOURCE,
+        &candidate.scan_root,
+        &candidate.path,
+        capture,
+    );
+    load_with_bytes::<S>(
+        index,
+        route,
+        &local_index_key(&candidate.path),
+        &id,
+        held,
+        scope,
+        candidate,
+        live,
+    )
+}
+
+enum Miss {
+    NoHead,
+    /// A head with no reduction: no checkpoint to continue.
+    MetadataOnly,
+    Future,
+    /// A session fact of a kind or version this build does not know: a
+    /// newer build's, held as a future revision is, never read Full.
+    FutureFact,
+    /// The file is no longer the certified one: an ordinary Full.
+    Changed(FullReason),
+    /// The database or the file could not be read.
+    Unreadable,
+    Reconstruct(ReconstructCause),
+    /// A live input is not available now: the file holds with its debt.
+    LiveUnavailable,
+    /// The head's session owes a head-CAS answer: a native Full answers.
+    ConflictOwed,
+}
+
+/// What a hit loaded: the reduction, its base, and the bytes it read.
+struct Hit {
+    retained: Box<Retained<CachedJsonlReduction>>,
+    base: TailBase,
+    head_bytes: u64,
+    page_bytes: u64,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared load takes every codec's cycle inputs"
+)]
+pub(super) fn load<S: TailSource>(
+    index: &ScanIndex,
+    route: &Path,
+    key: &str,
+    id: &HeadIdentity,
+    held: &mut File,
+    scope: &Scope,
+    fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
+) -> Load {
+    load_with_bytes::<S>(index, route, key, id, held, scope, fresh, live).0
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared load takes every codec's cycle inputs"
+)]
+fn load_with_bytes<S: TailSource>(
+    index: &ScanIndex,
+    route: &Path,
+    key: &str,
+    id: &HeadIdentity,
+    held: &mut File,
+    scope: &Scope,
+    fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
+) -> (Load, u64) {
+    let source = S::SOURCE;
+    // (outcome, counted reconstruction, load)
+    let loaded = stored::<S>(index, key, id, held, scope, fresh, live);
+    let (outcome, reconstruct, load) = match loaded {
+        Ok(hit) => {
+            let base = (!set_aside(index, key)).then_some(hit.base);
+            counters::bump(source, "tail_db_loads", "hit");
+            counters::add(source, "tail_db_load_bytes", "head", hit.head_bytes);
+            counters::add(source, "tail_db_load_bytes", "page", hit.page_bytes);
+            crate::local_resource_diagnostics::tail_loaded(source.api_slug(), hit.page_bytes);
+            return (Load::Reused(hit.retained, base), hit.page_bytes);
+        }
+        Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
+        // Valid stored state for a file that changed: an ordinary Full. A
+        // shorter file is main's counted Full; no floor holds it.
+        Err(Miss::Changed(reason)) => {
+            if reason == FullReason::Shrunk {
+                counters::bump(source, "tail_shorter_file_full", "files");
+            }
+            ("miss", None, Load::Cold(Some(reason)))
+        }
+        // Counted with the read under the `head_conflict` change reason.
+        Err(Miss::ConflictOwed) => {
+            crate::local_resource_diagnostics::change_reason::selected(
+                source.api_slug(),
+                key.to_owned(),
+                crate::local_resource_diagnostics::change_reason::Token::HeadConflict,
+                crate::local_resource_diagnostics::change_reason::AdminCause::Other,
+            );
+            ("miss", None, Load::Cold(None))
+        }
+        Err(Miss::NoHead) => {
+            counters::bump(source, "tail_bootstrap_full", "no_head");
+            ("miss", Some("no_head"), Load::Cold(None))
+        }
+        // Debt or inventory only: the file's first read, no reconstruction.
+        Err(Miss::MetadataOnly) => {
+            counters::bump(source, "tail_bootstrap_full", "metadata_only");
+            ("miss", None, Load::Cold(None))
+        }
+        Err(Miss::Unreadable) => ("error", Some("unreadable"), Load::Cold(None)),
+        Err(Miss::Reconstruct(cause)) => {
+            if cause == ReconstructCause::Identity {
+                // C′: void before any reuse; a fresh `Reset` stage of this
+                // key in the same pass cancels the retirement.
+                let _ = state_v2::retire_tail(route, [key.to_owned()]);
+            }
+            (
+                reconstruct_outcome(cause),
+                Some(cause.label()),
+                Load::Cold(None),
+            )
+        }
+    };
+    if let Some(cause) = reconstruct {
+        // A head was read and could not be reused; the release gate reads
+        // these apart from a file's first read. A key change is an explicit
+        // action, counted apart from both.
+        let explicit_action = cause == ReconstructCause::KeyEpoch.label();
+        let after_head = !matches!(cause, "no_head" | "unreadable") && !explicit_action;
+        let bytes = held.metadata().map_or(0, |metadata| metadata.len());
+        counters::bump(source, "tail_reconstruct", cause);
+        counters::add(source, "tail_reconstruct_bytes", cause, bytes);
+        if after_head {
+            counters::bump(source, "tail_reconstruct_after_head", cause);
+        }
+    }
+    counters::bump(source, "tail_db_loads", outcome);
+    (load, 0)
+}
+
+/// A reconstruction's `tail_db_loads` outcome. A key rotation is a miss. A
+/// Codex head whose stored sidecar binding differs from the live one is its
+/// own outcome, apart from failures.
+fn reconstruct_outcome(cause: ReconstructCause) -> &'static str {
+    match cause {
+        ReconstructCause::KeyEpoch => "miss",
+        ReconstructCause::Incompatible(super::codex::INCOMPATIBLE_SIDECAR_BINDING) => {
+            "sidecar_binding"
+        }
+        _ => "error",
+    }
+}
+
+/// The stored reduction, its base and the bytes read, or why not. The
+/// session facts load here, with the pages, only for a read that continues
+/// the file.
+fn stored<S: TailSource>(
+    index: &ScanIndex,
+    key: &str,
+    id: &HeadIdentity,
+    held: &mut File,
+    scope: &Scope,
+    fresh: &CandidateFile,
+    live: &SnapshotAccumulator,
+) -> Result<Hit, Miss> {
+    let head = match state_v2::load_head(index, key, S::REDUCTION_REVISION) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Err(Miss::NoHead),
+        Err(error) if error.downcast_ref::<Hold>() == Some(&Hold::Future) => {
+            return Err(Miss::Future)
+        }
+        Err(_) => return Err(Miss::Unreadable),
+    };
+    // Before any decode: a metadata-only head has nothing to restore.
+    if head.metadata_only {
+        return Err(Miss::MetadataOnly);
+    }
+    let toggled = id.check(&head.body).map_err(Miss::Reconstruct)?;
+    let mut acc = SnapshotAccumulator::new(S::SOURCE);
+    let decoded = S::decode_head(head.revision, &head.body, &mut acc).map_err(Miss::Reconstruct)?;
+    if conflict_owed(index, &fresh.path, &acc) {
+        return Err(Miss::ConflictOwed);
+    }
+    // The file against the certificate, before any page.
+    let cert = &decoded.certificate;
+    // Bind the ctime to the indexed read that minted this certificate, as for
+    // census_base_bound; unavailable birth never binds (same_birth semantics).
+    let read_changed_nanos = index.files.get(key).and_then(|entry| {
+        let nanos = entry.modified_unix_nanos?;
+        let seconds = (nanos / 1_000_000_000) as i64;
+        (cert.length == entry.size_bytes
+            && cert.modified == (seconds, (nanos % 1_000_000_000) as i64)
+            && cert.birth_nanos != 0
+            && entry.opened_birth_nanos == cert.birth_nanos)
+            .then_some(entry.opened_changed_nanos)
+    });
+    let checkpoint = match cert.restore_grown(held, scope.clone(), read_changed_nanos) {
+        Ok((checkpoint, _admission)) => {
+            #[cfg(test)]
+            assert!(
+                _admission.sample_bytes_read <= 2 * crate::transcript_acquisition::SAMPLE_BYTES
+            );
+            checkpoint
+        }
+        Err(CertificateRefusal::Changed(reason)) => return Err(Miss::Changed(reason)),
+        Err(CertificateRefusal::ReadError) => return Err(Miss::Unreadable),
+    };
+    let mut base = TailBase::new(&head.body);
+    let mut failed = None;
+    let mut page_bytes = 0u64;
+    let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
+        page_bytes = page_bytes.saturating_add(bytes.len() as u64);
+        S::decode_page(collection, page, &bytes, &mut acc)
+            .and_then(|()| base.observe::<S>(collection, page, &bytes))
+            .map_err(|cause| {
+                failed = Some((collection, cause));
+                anyhow::anyhow!("tail_page")
+            })
+    });
+    if pages.is_err() {
+        return Err(match failed {
+            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible(_))) => {
+                Miss::FutureFact
+            }
+            Some((_, cause)) => Miss::Reconstruct(cause),
+            None => Miss::Reconstruct(ReconstructCause::Corrupt),
+        });
+    }
+    // The reduction's collections only: `Revisions` is the file's freshness
+    // debt (G7), never a reduction page (`load_tail` skips it too).
+    let table = head
+        .table
+        .iter()
+        .filter(|(c, _)| **c != state_v2::Collection::Revisions)
+        .map(|(c, m)| (*c, m.meta))
+        .collect();
+    S::validate_loaded(&acc, &table).map_err(Miss::Reconstruct)?;
+    S::install_live(&mut acc, fresh, live).map_err(|error| match error {
+        LiveLoadError::Unavailable => Miss::LiveUnavailable,
+        LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),
+    })?;
+    let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
+    if toggled {
+        reduction.scrub_context_digest();
+    }
+    Ok(Hit {
+        retained: Box::new(Retained {
+            checkpoint,
+            state: reduction,
+        }),
+        base,
+        head_bytes: head.body.len() as u64,
+        page_bytes,
+    })
+}
+
+#[cfg(test)]
+#[path = "facts_tests.rs"]
+mod facts_tests;
+#[cfg(test)]
+#[path = "format_tests.rs"]
+mod format_tests;
+#[cfg(test)]
+#[path = "grown_head_tests.rs"]
+mod grown_head_tests;
+#[cfg(test)]
+#[path = "held_original_tests.rs"]
+mod held_original_tests;
+#[cfg(test)]
+#[path = "refold_tests.rs"]
+mod refold_tests;
+#[cfg(test)]
+#[path = "settlement_tests.rs"]
+mod settlement_tests;
+#[cfg(test)]
+mod tests;

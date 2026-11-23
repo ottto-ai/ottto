@@ -1,0 +1,20 @@
+# scope	regex	description
+path	(^|/)docs/dev(/|$)	Private session notes and planning docs are not public export inputs.
+path	(^|/)docs/ai(/|$)	Private AI KB docs are not public export inputs.
+path	(^|/)backend(/|$)	Private backend code is not part of the public local runtime export.
+path	(^|/)frontend(/|$)	Private frontend code is not part of the public local runtime export.
+path	(^|/)infra(/|$)	Private infrastructure code is not part of the public local runtime export.
+path	(^|/)dist(/|$)	Build artifacts must not be exported.
+path	(^|/)target(/|$)	Rust build output must not be exported.
+content	(^|[^A-Za-z0-9_])/Users/(?!(example|test|tester|someone|private|sensitive|me|Shared|x|owner|dev|alice|user|you)([^A-Za-z0-9._-]|$))[A-Za-z0-9][A-Za-z0-9._-]*	Local home paths must not appear in public export candidates; use a placeholder such as /Users/example.
+content	/var/folders/[A-Za-z0-9._/ -]+	Local temporary filesystem paths must not appear in public export candidates.
+content	docs/dev/	Private session-note links must not appear in public export candidates.
+content	docs/ai/	Private AI KB links must not appear in public export candidates.
+content	OTTTO_QA_DEMO_PASSWORD	Demo credential variables must not appear in public export candidates.
+content	AWS_SECRET_ACCESS_KEY	AWS secret variables must not appear in public export candidates.
+content	GITHUB_TOKEN=	GitHub token assignments must not appear in public export candidates.
+content	BEGIN (RSA|DSA|EC|OPENSSH|PRIVATE) KEY	Private key material must not appear in public export candidates.
+content	Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}	Bearer credentials must not appear in public export candidates.
+content	(^|[^A-Za-z0-9_])\(D[0-9]{2,3}([-.][0-9]+|\([a-z]\))?([):,]|[[:space:]])	Internal decision-record ids must not appear in public files; state the rule in words.
+content	(//|^[[:space:]]*\*|^[[:space:]]*#).*\bD[0-9]{2,3}([-.][0-9]+)?(\([a-z]\)(:|[[:space:]])|:|'s[[:space:]]+replays?\b|[[:space:]]+(amendment|replays?)\b)	Internal decision-record ids must not label public comments; state the rule in words.
+content	(^|[^A-Za-z0-9_./-])(ottto-ai/)?ottto#[0-9]+	Issue and PR numbers from the repository before its move do not carry over; state the reason in words.

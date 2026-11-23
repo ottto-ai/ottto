@@ -1,0 +1,31 @@
+{
+  "credit_balances": [
+    {
+      "freshness": "fresh",
+      "kind": "plan_credits",
+      "limit_id": "codex",
+      "name": "credits",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "remaining": 2583,
+      "status": "ok",
+      "unit": "credits",
+      "unlimited": false
+    },
+    {
+      "enabled": true,
+      "freshness": "fresh",
+      "kind": "workspace_allowance",
+      "limit_id": "codex",
+      "name": "workspace_monthly_credits",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "quota": 500,
+      "remaining": 400,
+      "resets_at": "2026-11-01T00:00:00Z",
+      "status": "ok",
+      "unit": "credits",
+      "unlimited": false,
+      "used": 100,
+      "used_percent": 20
+    }
+  ]
+}

@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "leaves": [
+    {
+      "path": "$[0].account.account_id",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].account.account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.auth_method",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.billing_channel",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.billing_identity_confidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.billing_identity_evidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.claude_anchor_durability",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.claude_anchor_health",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.claude_quota_access_state",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.confidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.email",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].account.login_state",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.organization_id",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].account.organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.organization_label",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].account.plan_type",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].account.provider",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account.subscription_product",
+      "value_type": "null"
+    },
+    {
+      "path": "$[0].capabilities",
+      "value_type": "array"
+    },
+    {
+      "path": "$[0].captured_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].collection_method",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].credit_balances",
+      "value_type": "array"
+    },
+    {
+      "path": "$[0].diagnostics",
+      "value_type": "array"
+    },
+    {
+      "path": "$[0].expires_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].plan_observations",
+      "value_type": "array"
+    },
+    {
+      "path": "$[0].quota_windows",
+      "value_type": "array"
+    },
+    {
+      "path": "$[0].source",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].status",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.account_id",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].account.account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.auth_method",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.billing_channel",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.billing_identity_confidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.billing_identity_evidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.claude_anchor_durability",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.claude_quota_access_state",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.confidence",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.email",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].account.login_state",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.organization_id",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].account.organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.organization_label",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].account.plan_type",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].account.provider",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account.subscription_product",
+      "value_type": "null"
+    },
+    {
+      "path": "$[1].capabilities",
+      "value_type": "array"
+    },
+    {
+      "path": "$[1].captured_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].collection_method",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].credit_balances",
+      "value_type": "array"
+    },
+    {
+      "path": "$[1].diagnostics",
+      "value_type": "array"
+    },
+    {
+      "path": "$[1].expires_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].plan_observations",
+      "value_type": "array"
+    },
+    {
+      "path": "$[1].quota_windows",
+      "value_type": "array"
+    },
+    {
+      "path": "$[1].source",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].status",
+      "value_type": "string"
+    }
+  ]
+}

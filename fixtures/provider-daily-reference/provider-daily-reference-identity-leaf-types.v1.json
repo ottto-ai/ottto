@@ -1,0 +1,285 @@
+{
+  "leaves": [
+    {
+      "path": "$[0].account_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account_identity.account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account_identity.identity_hash_scheme",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].account_identity.provider_workspace_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].collected_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].collector_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].collector_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].coverage_end",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].coverage_start",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].grant_scope_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].grant_version",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].installation_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].provider_data_refreshed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].provider_day_timezone",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[0].cached_input_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[0].credits_used",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[0].model",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[0].output_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[0].provider_day",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[0].surface",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[0].thread_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[0].total_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[0].turn_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[0].uncached_input_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[1].model",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[1].provider_day",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[1].surface",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].rows[1].thread_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[1].total_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].rows[1].turn_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[0].schema_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].source",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].collected_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].collector_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].collector_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].coverage_end",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].coverage_start",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].grant_scope_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].grant_version",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].installation_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].provider_day_timezone",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].rows[0].cached_input_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].rows[0].credits_used",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].rows[0].model",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].rows[0].output_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].rows[0].provider_day",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].rows[0].surface",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].rows[0].thread_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].rows[0].total_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].rows[0].turn_count",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].rows[0].uncached_input_tokens",
+      "value_type": "number"
+    },
+    {
+      "path": "$[1].schema_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].source",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].account_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].account_identity.account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].account_identity.identity_hash_scheme",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].account_identity.provider_workspace_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].collected_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].collector_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].collector_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].coverage_end",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].coverage_start",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].grant_scope_fingerprint",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].grant_version",
+      "value_type": "number"
+    },
+    {
+      "path": "$[2].installation_id",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].provider_day_timezone",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].rows",
+      "value_type": "array"
+    },
+    {
+      "path": "$[2].schema_version",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].source",
+      "value_type": "string"
+    }
+  ],
+  "schema_version": 1
+}

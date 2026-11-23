@@ -1,0 +1,34 @@
+{
+  "five_hour": {
+    "utilization": 26.0,
+    "resets_at": "2026-10-01T15:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 100.0,
+    "resets_at": "2026-10-04T05:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "tangelo": null,
+  "cinder_cove": null,
+  "wattle_ember": null,
+  "iguana_necktie": null,
+  "extra_usage": null,
+  "cedar_ember": {
+    "eligible": false,
+    "ineligible_reason": "tenure",
+    "at_limit": false,
+    "exhausted": [],
+    "grants": [],
+    "next_grant_id": null,
+    "weekly_resets_at": "2026-10-04T05:00:00+00:00",
+    "cooldown_until": null
+  }
+}

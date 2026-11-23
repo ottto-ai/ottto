@@ -1,0 +1,18 @@
+Ottto
+Copyright 2026 Ron Shub and the Ottto contributors
+Copyright in each contribution remains with its respective copyright holder.
+
+This product includes software developed by Ottto contributors.
+
+The local AutoReview helper includes portions of openclaw/agent-skills under the
+MIT License. See agent-adapters/autoreview/LICENSE for the copyright and license.
+
+The rustls connector in crates/ottto-service/src/retry_tls.rs is adapted from
+ureq 2.12.1 src/rtls.rs (https://github.com/algesten/ureq), Copyright (c) 2019
+Martin Algesten, dual-licensed MIT OR Apache-2.0 and used here under the Apache
+License, Version 2.0 (see LICENSE). The adaptation changes how connector errors
+are constructed.
+
+Ottto and the Ottto logo are trademarks of Ron Shub.
+Use of the Ottto name and marks is governed by TRADEMARKS.md, which also gives
+the permission contact.

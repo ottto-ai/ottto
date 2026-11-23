@@ -1,0 +1,42 @@
+{
+  "canonicalization": "rfc8785:integers-only:v1",
+  "caps": {
+    "canonical_bytes": 655360,
+    "canonical_rows": 512,
+    "operations": 64,
+    "wire_bytes": 131072
+  },
+  "contract_version": "session_cache_observations:v1",
+  "detector_revision": "v1",
+  "duration_policy": "nonnegative_whole_seconds_floor",
+  "entity_ack_contract": "snapshot_entity_ack:v1",
+  "fixtures": {
+    "claude": {
+      "body_witness_digest": "0f94a7ae8d064c5135fee319f27e494685a00d8ce5e11e3f7493c7f4e29f12d2",
+      "body_witness_version": 15,
+      "fixture_canonical_sha256": "ecdec7736e3aac526234940e54005bab894fceda56c1081a7e86a1a5b8e801ab",
+      "fixture_file": "cache_observation_claude_v1.json",
+      "fixture_wire_bytes": 6308,
+      "normalized_public_body_witness_version": 13,
+      "parser_revision": "claude_code_jsonl:v40",
+      "scan_identity_revision": "claude_code_jsonl:v30"
+    },
+    "codex": {
+      "body_witness_digest": "5e11f7452f676acfd64afbd47ac1f0cdb66b9f8e01cf069a2eacd5a0044c6ccd",
+      "body_witness_version": 16,
+      "fixture_canonical_sha256": "a1dda93ab153201014616e894ef27bfd4a82496f07227f85c985608cae9cfc27",
+      "fixture_file": "cache_observation_codex_v1.json",
+      "fixture_wire_bytes": 6281,
+      "normalized_public_body_witness_version": 14,
+      "parser_revision": "codex_jsonl:v40",
+      "scan_identity_revision": "codex_jsonl:v34"
+    }
+  },
+  "head_cas_contract": "snapshot_head_etag:v1",
+  "manifest_version": "local_cache_observations_wire_manifest:v1",
+  "normalized_public_body_witness_map": {
+    "15": 13,
+    "16": 14
+  },
+  "schema_version": 1
+}

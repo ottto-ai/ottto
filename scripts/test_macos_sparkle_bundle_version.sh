@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/macos_sparkle_bundle_version.sh
+source "$ROOT/scripts/macos_sparkle_bundle_version.sh"
+
+assert_bundle_version() {
+  local display_version="$1"
+  local expected_bundle_version="$2"
+  local actual_bundle_version
+  actual_bundle_version="$(ottto_sparkle_bundle_version "$display_version")"
+  if [[ "$actual_bundle_version" != "$expected_bundle_version" ]]; then
+    echo "Expected $display_version to map to $expected_bundle_version, got $actual_bundle_version" >&2
+    exit 1
+  fi
+}
+
+# These exact forms exercise the three release-train boundaries proven against
+# Sparkle's SUStandardVersionComparator: rc1 < rc2 < stable < next release rc1.
+assert_bundle_version "0.1.92-rc1" "0.1.92fc1"
+assert_bundle_version "0.1.92-rc2" "0.1.92fc2"
+assert_bundle_version "0.1.92" "0.1.92"
+assert_bundle_version "0.1.93-rc1" "0.1.93fc1"
+
+# Unrelated development/preview suffixes retain their existing bundle version.
+assert_bundle_version "0.1.92-dev" "0.1.92-dev"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+repo="$TMP_DIR/public-ottto"
+app_root="$TMP_DIR/ottto-macos-app"
+mock_bin="$TMP_DIR/bin"
+output_dir="$TMP_DIR/output"
+mkdir -p \
+  "$repo/scripts" \
+  "$repo/crates/ottto-protocol/src" \
+  "$repo/target/release" \
+  "$app_root/.build/release/OtttoCompanion_OtttoCompanion.bundle/Resources" \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/Updater.app" \
+  "$app_root/Sources/OtttoCompanion/Resources" \
+  "$mock_bin"
+
+cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
+cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_scheme.sh"
+cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
+cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
+cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
+pub const PROTOCOL_VERSION: u16 = 15;
+RS
+cat > "$app_root/Package.swift" <<'SWIFT'
+// test fixture
+SWIFT
+cat > "$app_root/Companion.entitlements.plist" <<'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$app_root/.build/release/Ottto"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/target/release/ottto"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/target/release/ottto-service"
+printf 'fixture\n' > "$app_root/.build/release/OtttoCompanion_OtttoCompanion.bundle/Resources/fixture.txt"
+printf 'fixture\n' > "$app_root/Sources/OtttoCompanion/Resources/OtttoCompanionIcon.icns"
+touch \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/Autoupdate" \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/Updater.app/fixture"
+chmod +x \
+  "$app_root/.build/release/Ottto" \
+  "$repo/target/release/ottto" \
+  "$repo/target/release/ottto-service"
+
+cat > "$repo/scripts/macos_launch_smoke.sh" <<'SMOKE'
+#!/usr/bin/env bash
+set -euo pipefail
+app=""
+output=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app) app="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    --wait-seconds) shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+info_plist="$app/Contents/Info.plist"
+jq -n \
+  --arg bundle_version "$(plutil -extract CFBundleVersion raw -o - "$info_plist")" \
+  --arg bundle_short_version "$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")" \
+  '{
+    status: "passed",
+    checked_at: "2026-07-23T00:00:00Z",
+    wait_seconds: 1,
+    bundle_id: "net.ottto.Companion",
+    bundle_version: $bundle_version,
+    bundle_short_version: $bundle_short_version,
+    executable_name: "Ottto",
+    process_survived_wait: true,
+    crash_reports: []
+  }' > "$output"
+SMOKE
+chmod +x "$repo/scripts/macos_launch_smoke.sh"
+
+cat > "$repo/scripts/cyclonedx_sbom.sh" <<'SBOM'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --version) shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+printf '{}\n' > "$output"
+SBOM
+chmod +x "$repo/scripts/cyclonedx_sbom.sh"
+
+cat > "$mock_bin/ditto" <<'DITTO'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
+  cp "$3" "$4"
+else
+  cp -R "$1" "$2"
+fi
+DITTO
+cat > "$mock_bin/hdiutil" <<'HDIUTIL'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+for arg in "$@"; do
+  output="$arg"
+done
+printf 'test dmg\n' > "$output"
+HDIUTIL
+cat > "$mock_bin/otool" <<'OTOOL'
+#!/usr/bin/env bash
+printf 'path @executable_path/../Frameworks\n'
+OTOOL
+# Records the entitlements plist each target is signed with; -d prints it, so
+# the packager's post-sign entitlement check sees what it asked for.
+cat > "$mock_bin/codesign" <<'CODESIGN'
+#!/usr/bin/env bash
+set -euo pipefail
+entitlements=""
+display="false"
+target=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d) display="true"; shift ;;
+    --entitlements)
+      if [[ "$display" != "true" ]]; then entitlements="$2"; fi
+      shift 2
+      ;;
+    --sign|--options) shift 2 ;;
+    *) target="$1"; shift ;;
+  esac
+done
+record="$target.fixture-entitlements"
+if [[ "$display" == "true" ]]; then
+  if [[ -f "$record" ]]; then cat "$record"; fi
+  exit 0
+fi
+if [[ -n "$entitlements" ]]; then cp "$entitlements" "$record"; else rm -f "$record"; fi
+CODESIGN
+for command_name in cargo install_name_tool swift; do
+  cat > "$mock_bin/$command_name" <<'NOOP'
+#!/usr/bin/env bash
+exit 0
+NOOP
+done
+chmod +x "$mock_bin"/*
+
+git -C "$repo" init -q
+git -C "$repo" config user.email "sparkle-version-test@example.invalid"
+git -C "$repo" config user.name "Sparkle Version Test"
+git -C "$repo" add .
+git -C "$repo" commit -qm "fixture"
+private_repo="$TMP_DIR/private-repo"
+mkdir -p "$private_repo/tools"
+mv "$app_root" "$private_repo/tools/ottto-macos-app"
+app_root="$private_repo/tools/ottto-macos-app"
+git -C "$private_repo" init -q
+git -C "$private_repo" config user.email "sparkle-version-test@example.invalid"
+git -C "$private_repo" config user.name "Sparkle Version Test"
+# No origin remote is needed: the caller supplies the repository identity.
+git -C "$private_repo" add .
+git -C "$private_repo" commit -qm "app fixture"
+private_commit="$(git -C "$private_repo" rev-parse HEAD)"
+private_tree="$(git -C "$private_repo" rev-parse HEAD:tools/ottto-macos-app)"
+# The packager must never call gh: any call is logged and fails.
+gh_calls="$TMP_DIR/gh.calls"
+cat > "$mock_bin/gh" <<GH
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$gh_calls"
+exit 2
+GH
+chmod +x "$mock_bin/gh"
+
+# package_expect_failure <label> <expected message> <packager args...>
+package_expect_failure() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  if PATH="$mock_bin:$PATH" bash "$repo/scripts/macos_package.sh" \
+    --version "0.1.92-rc3" \
+    --channel stable-candidate \
+    --release-notes "Pin fixture" \
+    --output-dir "$TMP_DIR/$label-output" \
+    --skip-build "$@" >"$TMP_DIR/$label.out" 2>&1; then
+    echo "Expected packaging to fail: $label" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$expected" "$TMP_DIR/$label.out"; then
+    echo "Packaging failure for $label did not report: $expected" >&2
+    cat "$TMP_DIR/$label.out" >&2
+    exit 1
+  fi
+}
+
+# [behaviour] The app root is a required flag.
+package_expect_failure missing-app-root "--app-root is required" \
+  --app-source-commit "$private_commit"
+# [behaviour] Stable channels require the app source commit, and the checkout must be at it.
+package_expect_failure missing-pin "--app-source-commit is required for stable-candidate and stable" \
+  --app-root "$app_root"
+package_expect_failure invalid-pin "--app-source-commit must be a 40-hex" \
+  --app-root "$app_root" --app-source-commit "${private_commit:0:12}"
+package_expect_failure pin-mismatch "not --app-source-commit" \
+  --app-root "$app_root" --app-source-commit "$(printf '0%.0s' {1..40})"
+
+# [behaviour] Repository identity is explicit and accepts only owner/name form.
+for repository in "" "https://github.com/example-org/example-app" "evil.invalid/example-org/example-app"; do
+  OTTTO_MACOS_APP_SOURCE_REPOSITORY="$repository" \
+    package_expect_failure invalid-repository "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" \
+      --app-root "$app_root" --app-source-commit "$private_commit"
+done
+
+PATH="$mock_bin:$PATH" \
+bash "$repo/scripts/macos_package.sh" \
+  --app-root "$app_root" \
+  --app-source-commit "$private_commit" \
+  --version "0.1.92-rc2" \
+  --channel stable-candidate \
+  --release-notes "Sparkle version fixture" \
+  --output-dir "$output_dir" \
+  --skip-build >/dev/null
+if [[ -e "$gh_calls" ]]; then
+  echo "Packaging must not call gh:" >&2
+  cat "$gh_calls" >&2
+  exit 1
+fi
+
+# [behaviour] Only the daemon LaunchAgent carries the allocator setting.
+service_plist="$output_dir/Ottto.app/Contents/Library/LaunchAgents/net.ottto.service.plist"
+if [[ "$(plutil -extract EnvironmentVariables.MallocLargeCache raw -o - "$service_plist")" != "0" ]]; then
+  echo "Packaged daemon must disable libmalloc large-cache retention" >&2
+  exit 1
+fi
+if [[ "$(plutil -extract EnvironmentVariables.MallocSpaceEfficient raw -o - "$service_plist")" != "1" ]]; then
+  echo "Packaged daemon must enable libmalloc space-efficient mode" >&2
+  exit 1
+fi
+info_plist="$output_dir/Ottto.app/Contents/Info.plist"
+for allocator_key in MallocLargeCache MallocSpaceEfficient; do
+  if plutil -extract "LSEnvironment.$allocator_key" raw -o - "$info_plist" >/dev/null 2>&1; then
+    echo "Companion app must not carry the daemon allocator setting $allocator_key" >&2
+    exit 1
+  fi
+done
+bundle_short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
+bundle_version="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
+if [[ "$bundle_short_version" != "0.1.92-rc2" ]]; then
+  echo "Packaged display version changed: $bundle_short_version" >&2
+  exit 1
+fi
+if [[ "$bundle_version" != "0.1.92fc2" ]]; then
+  echo "Packaged Sparkle bundle version is not monotonic: $bundle_version" >&2
+  exit 1
+fi
+# Launch Services applies LSMultipleInstancesProhibited across user sessions,
+# which blocks a second macOS user from opening the app. One process per user
+# is the app's own responsibility.
+if plutil -extract LSMultipleInstancesProhibited raw -o - "$info_plist" >/dev/null 2>&1; then
+  echo "Packaged Info.plist must not prohibit Ottto in other macOS user sessions" >&2
+  exit 1
+fi
+if [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info_plist")" != "net.ottto.Companion" ]]; then
+  echo "Packaged bundle identifier changed" >&2
+  exit 1
+fi
+if [[ "$(plutil -extract NSAppleEventsUsageDescription raw -o - "$info_plist")" != \
+  "Ottto reads the folder in your selected terminal tab when you choose Terminal folder, and opens Terminal when you sign in to Claude Code." ]]; then
+  echo "Packaged Info.plist must explain the Terminal folder Apple Events use" >&2
+  exit 1
+fi
+if [[ ! -f "$output_dir/Ottto.app.fixture-entitlements" ]] || \
+  [[ -e "$output_dir/Ottto.app/Contents/Helpers/ottto.fixture-entitlements" ]] || \
+  [[ -e "$output_dir/Ottto.app/Contents/Helpers/ottto-service.fixture-entitlements" ]]; then
+  echo "Only the Companion app may be signed with the shared entitlements" >&2
+  exit 1
+fi
+if ! jq -e '
+  .quality_gates.packaged_app_launch.bundle_short_version == "0.1.92-rc2"
+  and .quality_gates.packaged_app_launch.bundle_version == "0.1.92fc2"
+  and (.supply_chain.materials | length) == 2
+' "$output_dir/release-manifest.json" >/dev/null; then
+  echo "Release manifest launch evidence did not preserve both bundle versions" >&2
+  exit 1
+fi
+if ! jq -e \
+  --arg public_commit "$(git -C "$repo" rev-parse HEAD)" \
+  --arg private_commit "$private_commit" \
+  --arg private_tree "$private_tree" \
+  '
+    .supply_chain.materials[0] == {
+      kind: "git_repository",
+      repository: "ottto-ai/ottto",
+      commit: $public_commit
+    }
+    and .supply_chain.materials[1] == {
+      kind: "git_subtree",
+      repository: "example-org/example-app",
+      commit: $private_commit,
+      path: "tools/ottto-macos-app",
+      tree: $private_tree,
+      clean: true
+    }
+  ' "$output_dir/release-manifest.json" >/dev/null; then
+  echo "Release manifest did not bind the exact public and private app Git materials" >&2
+  exit 1
+fi
+printf '// dirty fixture\n' >> "$app_root/Package.swift"
+if PATH="$mock_bin:$PATH" \
+  bash "$repo/scripts/macos_package.sh" \
+    --app-root "$app_root" \
+    --app-source-commit "$private_commit" \
+    --version "0.1.92-rc3" \
+    --channel stable-candidate \
+    --release-notes "Dirty provenance fixture" \
+    --output-dir "$TMP_DIR/dirty-output" \
+    --skip-build >"$TMP_DIR/dirty.out" 2>&1; then
+  echo "Expected packaging to reject a dirty private app source" >&2
+  exit 1
+fi
+if ! grep -Fq "macOS app source subtree has tracked changes" "$TMP_DIR/dirty.out"; then
+  echo "Dirty private app rejection did not report the expected provenance failure" >&2
+  exit 1
+fi
+
+echo "macOS Sparkle bundle version test passed"

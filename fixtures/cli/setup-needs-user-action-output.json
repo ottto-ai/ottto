@@ -1,0 +1,26 @@
+{
+  "status": "waiting_for_approval",
+  "setup_run_id": "setup_01HXWAIT",
+  "claim_code_provided": false,
+  "source_count": 1,
+  "detected_sources": [
+    {
+      "source": "codex",
+      "state": "ready_to_install",
+      "readiness_percent": 80,
+      "missing_fields": ["browser_approval"]
+    }
+  ],
+  "next_question": {
+    "type": "approval",
+    "source": "codex"
+  },
+  "next_action": null,
+  "agent_action": {
+    "kind": "answer_setup_question",
+    "requires_user": true,
+    "retryable": true,
+    "description": "Ask the user to answer the structured next_question prompt."
+  },
+  "actions": []
+}

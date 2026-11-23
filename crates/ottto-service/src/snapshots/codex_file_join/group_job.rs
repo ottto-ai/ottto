@@ -1,0 +1,1548 @@
+//! A Codex file group as one job (P2). A pre-job boot identifies the members,
+//! reads their headers (the parent's `read_header_bytes`, called as-is),
+//! plans the canonical order (§a.3) and, for legacy-shape groups, probes each
+//! member to its first native record. Continuous groups replay through one
+//! parser, swapping readers. Independent revert groups finish one parser per
+//! member and retain contributions in memory until the full fold is built.
+//! `StreamProof` checks admission in that same pass. A continuous group larger
+//! than the singleton page budget is a multi-member
+//! cursor job (`codex_cursor`): sealed members are read to EOF with strict
+//! identity, the live (last) member through its frozen-extent certificate.
+//! Terminal proof refusals are settleable residue (outcome R); open/read
+//! failures, line loss, receipts, owner and creator conflicts stay strict.
+use super::*;
+use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
+
+/// A legacy-shape member's probe reads at most this many bytes looking for
+/// its first native record. Past it, or past the boot's probe allowance, the
+/// group keeps chronological order and the counter chain decides
+/// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder`.
+const PROBE_BYTES: usize = 1024 * 1024;
+
+/// One V2 accumulator is carried across a continuous group's members.
+pub(in crate::snapshots) fn new_group_parser(
+    file: File,
+    member: &CandidateFile,
+    metadata: &CodexTitleMetadata,
+) -> Result<Box<OwnedJsonlParser>> {
+    let parser = OwnedJsonlParser::new(
+        file,
+        &member.path,
+        SnapshotSource::Codex,
+        apply_codex_line,
+        Some(metadata),
+    )?;
+    Ok(Box::new(parser))
+}
+
+fn filename_owner(path: &Path) -> Option<(String, bool)> {
+    use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped as uuid;
+    codex_session_id_candidates_from_path(path)
+        .into_iter()
+        .find_map(|id| {
+            if uuid(&id) {
+                return Some((resolve_codex_identity(&id), false));
+            }
+            let (conversation, rollout) = id.split_once('_')?;
+            (uuid(conversation) && uuid(rollout))
+                .then(|| (resolve_codex_identity(conversation), true))
+        })
+}
+
+fn independent_path(path: &Path, owner: &str) -> bool {
+    filename_owner(path).is_some_and(|(native, revert)| revert && native == owner)
+}
+
+/// Filename evidence can hold a group before any header is read; it cannot
+/// admit a body. Use the inventory's existing owner hold for live members.
+pub(super) fn unsealed_owners(paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut groups = BTreeMap::<(PathBuf, String), (Vec<&String>, bool, bool)>::new();
+    for key in paths {
+        let path = Path::new(key);
+        if shadowed_compressed_path(path, paths) {
+            continue;
+        }
+        let Some((owner, revert)) = filename_owner(path) else {
+            continue;
+        };
+        let home = member_home(path.parent().unwrap_or(path));
+        let group = groups.entry((home, owner)).or_default();
+        group.0.push(key);
+        group.1 |= revert;
+        group.2 |= !codex_archive_path(path);
+    }
+    groups
+        .into_values()
+        .filter(|(keys, revert, live)| keys.len() > 1 && *revert && *live)
+        .flat_map(|(keys, _, _)| {
+            keys.into_iter()
+                .flat_map(|key| codex_session_id_candidates_from_path(Path::new(key)))
+        })
+        .collect()
+}
+
+pub(super) fn independent_group(group: &Group) -> bool {
+    group
+        .members
+        .iter()
+        .any(|member| independent_path(&member.path, &group.owner))
+}
+
+/// At the existing first-load hook, make indexed, sealed, not-yet-folded
+/// groups owed through the existing cleared-source witness and observed queue.
+/// Saved owner hashes qualify filenames; only the normal secure inventory can
+/// admit the body. Captured and settled folds never re-arm.
+pub(in crate::snapshots) fn rearm_unsettled(index: &mut ScanIndex) {
+    let mut groups = BTreeMap::<(PathBuf, String), (Vec<String>, bool)>::new();
+    for (key, entry) in &index.files {
+        let Some(owner) = entry
+            .codex_counting_owner
+            .as_deref()
+            .or(entry.codex_protected_owner.as_deref())
+        else {
+            continue;
+        };
+        let path = Path::new(key);
+        let Some((native, _)) =
+            filename_owner(path).filter(|(native, _)| codex_protected_owner(native) == owner)
+        else {
+            continue;
+        };
+        let group = groups
+            .entry((member_home(path.parent().unwrap_or(path)), owner.to_owned()))
+            .or_default();
+        group.0.push(key.clone());
+        group.1 |= independent_path(path, &native);
+    }
+    let mut owed = Vec::new();
+    for (keys, independent) in groups.into_values() {
+        if !independent
+            || keys.len() < 2
+            || keys.iter().any(|key| {
+                let entry = &index.files[key];
+                !codex_archive_path(Path::new(key))
+                    || entry.codex_joined_member_set.is_some()
+                    || entry.codex_captured_joined_member_set.is_some()
+            })
+        {
+            continue;
+        }
+        for key in keys {
+            // Existing re-arm debt survives partial saves without changing
+            // accepted entity/body witnesses or the starting account binding.
+            index
+                .files
+                .get_mut(&key)
+                .expect("indexed member")
+                .source_file_fingerprint
+                .clear();
+            owed.push(key);
+        }
+    }
+    if let Some(traversal) = index.traversal.as_mut() {
+        requeue_observed_keys(SnapshotSource::Codex, traversal, owed, "load");
+    }
+}
+
+/// The group job's logical key: home, owner and the sorted member keys. A
+/// new or vanished member is a different job (memo, fence and slot keys).
+pub(in crate::snapshots) fn job_key(group: &Group) -> String {
+    let mut keys = group
+        .members
+        .iter()
+        .map(|member| local_index_key(&member.path))
+        .collect::<Vec<_>>();
+    keys.sort();
+    let mut parts = vec![
+        "codex_group_job:v1".to_owned(),
+        local_index_key(&group.home),
+        group.owner.clone(),
+    ];
+    parts.extend(keys);
+    sha256_hex_owned(&parts)
+}
+
+/// The settleable disclosure of one member of a refused group (outcome R).
+pub(in crate::snapshots) fn refusal_disclosure() -> cursor::Disclosure {
+    cursor::Disclosure {
+        reason: cursor::DebtReason::HeldTerminal,
+        cause: ownership::GROUP,
+        ownership_incomplete_file_count: 1,
+        zero_snapshot_usage_evidence: false,
+        diagnostic_reason: FileReason::OwnershipIncomplete,
+        parsed_snapshot_count: 0,
+        held: cursor::HeldCounts::default(),
+    }
+}
+
+/// Every member's prior body is kept by a terminal disclosure.
+fn previous_body(index: &ScanIndex, member: &CandidateFile) -> (Option<String>, Option<String>) {
+    let keep = !index
+        .effective_upload_body_witness_revision_requires_adoption(&local_index_key(&member.path));
+    (
+        keep.then(|| index.last_snapshot_fingerprint(member))
+            .flatten(),
+        keep.then(|| index.last_upload_body_witness(member))
+            .flatten(),
+    )
+}
+
+/// The one terminal writer, once per member.
+pub(in crate::snapshots) fn disclose_members(
+    disclosure: &cursor::Disclosure,
+    members: &[CandidateFile],
+    index: &mut ScanIndex,
+    mut targets: DisclosureTargets<'_>,
+) {
+    for member in members {
+        let previous = previous_body(index, member);
+        cursor::disclose_terminal_codex_debt(
+            disclosure,
+            member,
+            previous,
+            index,
+            targets.reborrow(),
+        );
+    }
+}
+
+/// A genuine open/read failure, line loss, receipt, owner or creator
+/// conflict: strict, exactly as before P2.
+pub(in crate::snapshots) fn disclose_strict(
+    members: &[CandidateFile],
+    targets: DisclosureTargets<'_>,
+) {
+    targets.census.ownership_incomplete_file_count += members.len();
+    targets.census.causes.add(ownership::GROUP, members.len());
+    targets
+        .census
+        .record_unreadable(UnreadableCause::AliasParser, 1);
+    targets
+        .residue_index_keys
+        .extend(members.iter().map(|member| local_index_key(&member.path)));
+}
+
+/// How one boot step ended.
+pub(in crate::snapshots) enum Boot {
+    Pending,
+    /// Every member is unchanged and joined under this exact member set.
+    Unchanged,
+    Strict,
+    /// A header-derived refusal: terminal debt, decided at no replay cost.
+    Refused(JoinRefusal),
+    Ready,
+}
+
+/// Pre-job group state; one unit of work per scan step.
+pub(in crate::snapshots) struct GroupBoot {
+    pub(in crate::snapshots) group: Group,
+    pub(in crate::snapshots) key: String,
+    identified: usize,
+    stamps: Vec<OpenStamp>,
+    wake_identities: BTreeMap<String, String>,
+    headers: Vec<MemberHeader>,
+    plan: Option<GroupPlan>,
+    probes: Vec<Option<Tokens>>,
+    probed: usize,
+    ordered: bool,
+    /// The unchanged and receipt checks passed: the boot reads from here.
+    admitted: bool,
+    pub(in crate::snapshots) probe_bound: bool,
+    /// A probe was cut by `PROBE_BYTES` itself, not by the allowance: the
+    /// fallback order is the same every generation (round 3).
+    probe_limit_bound: bool,
+    /// This boot runs on a page of its own (round 3, `ProbeBudgetOrder`).
+    pub(in crate::snapshots) own_page: bool,
+    /// Probe bytes this boot may still read (R2-N2): the page's remaining
+    /// singleton budget, set by the scanner before each step.
+    probe_allowance: u64,
+    charge: u64,
+    previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
+    receipt_scope: String,
+    independent: bool,
+}
+crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
+    probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
+    charge, previous_receipts, receipt_scope, independent);
+
+impl GroupBoot {
+    pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
+        let receipt_scope = index
+            .active_upload_context_fingerprint
+            .clone()
+            .unwrap_or_default();
+        let mut previous_receipts = BTreeMap::new();
+        for member in &group.members {
+            let key = local_index_key(&member.path);
+            if let Some(entry) = index.files.get(&key) {
+                previous_receipts.insert(key, receipt_state(Some(entry)));
+            }
+        }
+        let independent = independent_group(&group);
+        Self {
+            independent,
+            key: job_key(&group),
+            group,
+            identified: 0,
+            stamps: Vec::new(),
+            wake_identities: BTreeMap::new(),
+            headers: Vec::new(),
+            plan: None,
+            probes: Vec::new(),
+            probed: 0,
+            ordered: false,
+            admitted: false,
+            probe_bound: false,
+            probe_limit_bound: false,
+            own_page: false,
+            probe_allowance: u64::MAX,
+            charge: 0,
+            previous_receipts,
+            receipt_scope,
+        }
+    }
+
+    pub(in crate::snapshots) fn independent(&self) -> bool {
+        self.independent
+    }
+
+    /// Header and probe bytes read since the last call.
+    pub(in crate::snapshots) fn take_charge(&mut self) -> u64 {
+        std::mem::take(&mut self.charge)
+    }
+
+    /// Every member is identified and the group is neither unchanged nor
+    /// receipt-strict, and no header was read yet: the boot's first read
+    /// (the cursor-slot check sits here).
+    pub(in crate::snapshots) fn awaits_read(&self) -> bool {
+        self.admitted && self.headers.is_empty()
+    }
+
+    /// Cap this boot's remaining probe reads (R2-N2). A probe cut by it ends
+    /// probing like `PROBE_BYTES`: the group keeps chronological order, and
+    /// a refusal in that order is `ProbeBudgetOrder` (strict).
+    pub(in crate::snapshots) fn allow_probe_bytes(&mut self, bytes: u64) {
+        self.probe_allowance = bytes;
+    }
+
+    /// Sum of the identified member lengths: the read this group needs.
+    pub(in crate::snapshots) fn expected_bytes(&self) -> u64 {
+        self.group
+            .members
+            .iter()
+            .fold(0u64, |sum, member| sum.saturating_add(member.size_bytes))
+    }
+
+    #[cfg(test)]
+    pub(in crate::snapshots) fn step(
+        &mut self,
+        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        index: &ScanIndex,
+    ) -> Boot {
+        self.step_with_cache(
+            attribution.map(|context| context.launch_events()),
+            index,
+            None,
+        )
+    }
+
+    pub(in crate::snapshots) fn step_with_cache(
+        &mut self,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
+        index: &ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> Boot {
+        let n = self.group.members.len();
+        if self.identified == 0
+            && self.group.members.iter().all(|member| {
+                sources::codex::counting::version::unchanged_legacy(index, &member.path)
+            })
+        {
+            return Boot::Unchanged;
+        }
+
+        if self.independent && self.identified == 0 {
+            let mut members = self.group.members.clone();
+            let quiet = members.iter_mut().all(|member| {
+                let key = local_index_key(&member.path);
+                let Some(entry) = index.files.get(&key) else {
+                    return false;
+                };
+                let Ok(stat) = fs::symlink_metadata(&member.path) else {
+                    return false;
+                };
+                if !stat.is_file()
+                    || stat.file_type().is_symlink()
+                    || !index.listing_unchanged(&member.path, &stat)
+                    || !codex_index_file_body_accepted(index, &key, entry)
+                {
+                    return false;
+                }
+                member.source_file_fingerprint = entry.source_file_fingerprint.clone();
+                true
+            });
+            if quiet {
+                let witness = member_set_witness(&members);
+                if members.iter().all(|member| {
+                    index
+                        .files
+                        .get(&local_index_key(&member.path))
+                        .is_some_and(|entry| {
+                            entry.codex_joined_member_set.as_deref() == Some(witness.as_str())
+                        })
+                }) {
+                    self.group.members = members;
+                    return if self
+                        .group
+                        .members
+                        .iter()
+                        .all(|member| index.candidate_decision(member) == CandidateDecision::Skip)
+                    {
+                        Boot::Unchanged
+                    } else {
+                        Boot::Strict
+                    };
+                }
+            }
+        }
+        // A settled independent fold has no durable admitted-key ledger.
+        // A changed member stays owed rather than rereading sealed accepted
+        // history or publishing a survivor-only replacement.
+        if self.independent
+            && !self.group.members.iter().any(|member| {
+                sources::codex::counting::version::proven_legacy(
+                    index,
+                    &local_index_key(&member.path),
+                )
+            })
+            && self.group.members.iter().any(|member| {
+                let key = local_index_key(&member.path);
+                index.files.get(&key).is_some_and(|entry| {
+                    entry.codex_joined_member_set.is_some()
+                        && codex_index_file_body_accepted(index, &key, entry)
+                })
+            })
+        {
+            return Boot::Strict;
+        }
+        // Settled contributions have no durable occurrence proof for a later
+        // tail. The first independent offer must wait for sealed members.
+        if self.independent
+            && self
+                .group
+                .members
+                .iter()
+                .any(|member| !codex_archive_path(&member.path))
+        {
+            return Boot::Strict;
+        }
+        if self.independent && self.identified == 0 {
+            match state_v2::runtime_path(index) {
+                Ok(Some(_)) => {
+                    for member in &self.group.members {
+                        match state_v2::load_head(index, &local_index_key(&member.path),
+                        <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION) {
+                        Ok(Some(head)) if !head.metadata_only => return Boot::Strict,
+                        Err(_) => return Boot::Strict,
+                        _ => {}
+                    }
+                    }
+                }
+                Err(_) => return Boot::Strict,
+                _ => {}
+            }
+        }
+        if self.identified < n {
+            return self.identify(launch_events, index, cache.map(Arc::as_ref));
+        }
+        if !self.admitted {
+            if self.unchanged_joined(index) {
+                return Boot::Unchanged;
+            }
+            if !self.receipts_valid() {
+                return Boot::Strict;
+            }
+            self.admitted = true;
+            return Boot::Pending;
+        }
+        if self.independent {
+            if self.plan.is_none() {
+                let mut order = (0..n).collect::<Vec<_>>();
+                order.sort_by_key(|i| local_index_key(&self.group.members[*i].path));
+                self.plan = Some(GroupPlan {
+                    order,
+                    plans: vec![MemberPlan::default(); n],
+                    ordinal: false,
+                });
+                self.ordered = true;
+            }
+            return Boot::Ready;
+        }
+        if self.headers.len() < n {
+            let member = &self.group.members[self.headers.len()];
+            let Ok((bytes, _, read, _)) = read_header_bytes(member, cache, &mut 0) else {
+                return Boot::Strict;
+            };
+            self.charge = self.charge.saturating_add(read as u64);
+            return match MemberHeader::parse(&bytes, member) {
+                Some(header) => {
+                    self.headers.push(header);
+                    Boot::Pending
+                }
+                // The inventory parsed this header: a failure now is a
+                // change under the read (TOCTOU), never proof debt.
+                None => Boot::Strict,
+            };
+        }
+        if self.plan.is_none() {
+            let keys = self
+                .group
+                .members
+                .iter()
+                .map(|member| local_index_key(&member.path))
+                .collect::<Vec<_>>();
+            return match plan_group(&self.headers, &keys) {
+                Ok(plan) => {
+                    self.ordered = plan.ordinal;
+                    self.plan = Some(plan);
+                    self.probes = vec![None; n];
+                    Boot::Pending
+                }
+                Err(reason) => Boot::Refused(reason),
+            };
+        }
+        if !self.ordered {
+            if self.probed < n && !self.probe_bound {
+                return self.probe(self.probed);
+            }
+            if !self.probe_bound {
+                let chronological = &self.plan.as_ref().expect("planned").order;
+                match order_by_probes(chronological, &self.probes) {
+                    Ok(order) => self.plan.as_mut().expect("planned").order = order,
+                    Err(reason) => return Boot::Refused(reason),
+                }
+            }
+            self.ordered = true;
+        }
+        Boot::Ready
+    }
+
+    fn identify(
+        &mut self,
+        launch_events: Option<&crate::launch_events::LaunchEventInventory>,
+        index: &ScanIndex,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) -> Boot {
+        // Group plans and the live-prefix certificate still use physical
+        // extents/end_byte_offset. Decoded offsets cannot satisfy those facts.
+        // Refuse before identification/probing can sample compressed bytes.
+        if !self.independent
+            && refuse_compressed_codex(
+                Some(&self.group.members[self.identified].path),
+                None,
+                CodexZstCause::GroupReadUnsupported,
+            )
+            .is_err()
+        {
+            return Boot::Strict;
+        }
+        let i = self.identified;
+        let mut candidate = self.group.members[i].clone();
+        if let Some(events) = launch_events {
+            let workers = vec![self.group.owner.clone()];
+            match events.prepare_step(&workers) {
+                Ok(false) => return Boot::Pending,
+                Err(()) => return Boot::Strict,
+                Ok(true) => {}
+            }
+            if let Some(witness) = events.witness(&workers) {
+                candidate.source_file_fingerprint = sha256_hex(&[
+                    "launcher_worker_context:v1",
+                    &candidate.source_file_fingerprint,
+                    &witness,
+                ]);
+            }
+        }
+        let mut census = ScanCensus::default();
+        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue_at(
+            SnapshotSource::Codex,
+            candidate,
+            &mut census,
+            CandidateWindow {
+                census_unix_seconds: None,
+                backfill_window_days: 0,
+                // The entry's stored ctime lets a ctime-only change keep the
+                // stored fingerprint (fresh samples hashed, no re-read).
+                retention: discovery_retention!(index),
+                growth: None,
+            },
+            cache,
+        ) else {
+            return Boot::Strict;
+        };
+        let Ok(stamp) = OpenStamp::capture(&file) else {
+            return Boot::Strict;
+        };
+        let identity = cache.map_or_else(
+            || opened.opened_object_identity.clone(),
+            |cache| cache.retained_stamp_identity(&opened, &opened.opened_object_identity),
+        );
+        self.wake_identities
+            .insert(local_index_key(&opened.path), identity);
+        self.group.members[i] = opened;
+        self.stamps.push(stamp);
+        self.identified += 1;
+        Boot::Pending
+    }
+
+    fn unchanged_joined(&self, index: &ScanIndex) -> bool {
+        let witness = member_set_witness(&self.group.members);
+        self.group.members.iter().all(|member| {
+            index.candidate_decision(member) == CandidateDecision::Skip
+                && index
+                    .files
+                    .get(&local_index_key(&member.path))
+                    .is_some_and(|entry| {
+                        entry.codex_joined_member_set.as_deref() == Some(witness.as_str())
+                            && !index.effective_upload_body_witness_revision_requires_adoption(
+                                &local_index_key(&member.path),
+                            )
+                    })
+        })
+    }
+
+    fn receipts_valid(&self) -> bool {
+        self.group.members.iter().all(|member| {
+            self.previous_receipts
+                .get(&local_index_key(&member.path))
+                .map_or(true, |(receipt, required)| {
+                    (!required || receipt.is_some())
+                        && receipt.as_ref().map_or(true, |receipt| {
+                            receipt.version == RECEIPT_VERSION
+                                && receipt.derivation == SnapshotSource::Codex.parser_version()
+                        })
+                })
+        })
+    }
+
+    /// One legacy-shape member up to its first native record, bounded.
+    fn probe(&mut self, i: usize) -> Boot {
+        let member = &self.group.members[i];
+        if refuse_compressed_codex(
+            Some(&member.path),
+            None,
+            CodexZstCause::GroupProbeUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
+        let cap = self.probe_allowance.min(PROBE_BYTES as u64);
+        let result = (|| -> std::io::Result<(Option<Tokens>, bool, u64)> {
+            let file = open_candidate_beneath_root(member)?;
+            let mut reader = BufReader::with_capacity(64 * 1024, file.take(cap + 1));
+            let mut line = Vec::new();
+            let mut read = 0u64;
+            loop {
+                line.clear();
+                let n = reader.read_until(b'\n', &mut line)?;
+                read = read.saturating_add(n as u64);
+                if n == 0 || line.last() != Some(&b'\n') {
+                    // EOF (or a withheld tail) before any native record.
+                    return Ok((None, read > cap, read));
+                }
+                #[cfg(test)]
+                codex_zst_refusal_tests::jsonl_parse_attempted();
+                if let Some(before) = serde_json::from_slice::<Value>(&line)
+                    .ok()
+                    .as_ref()
+                    .and_then(probe_before)
+                {
+                    return Ok((Some(before), false, read));
+                }
+            }
+        })();
+        let Ok((before, bound, read)) = result else {
+            return Boot::Strict;
+        };
+        self.probe_limit_bound |= bound && cap == PROBE_BYTES as u64;
+        self.charge = self.charge.saturating_add(read);
+        self.probe_allowance = self.probe_allowance.saturating_sub(read);
+        self.probes[i] = before;
+        self.probe_bound |= bound;
+        self.probed += 1;
+        Boot::Pending
+    }
+
+    fn canonical_order(&self) -> &[usize] {
+        self.plan.as_ref().map_or(&[], |plan| plan.order.as_slice())
+    }
+
+    /// The canonical last member and its boot stamp: the only member that can
+    /// be live, the memo's stamp and witness anchor.
+    pub(in crate::snapshots) fn live(&self) -> Option<(&CandidateFile, &OpenStamp)> {
+        let last = *self.canonical_order().last()?;
+        Some((&self.group.members[last], self.stamps.get(last)?))
+    }
+
+    /// The group's reduction dependencies with every sealed member's opened
+    /// identity (R2-H1): a parked record wakes on a sealed member's change,
+    /// never on the live member's growth.
+    pub(in crate::snapshots) fn dependencies(&self, codex: &CodexTitleMetadata) -> Option<String> {
+        let (live, _) = self.live()?;
+        Some(cursor::group_dependencies(
+            &self.group.members,
+            &live.path,
+            codex,
+            |member| self.wake_identity(member),
+        ))
+    }
+
+    /// M-1 `scope_job` with the group's wake dependencies (§d.4).
+    pub(in crate::snapshots) fn memo_digest(&self, codex: &CodexTitleMetadata) -> Option<String> {
+        let order = self.canonical_order();
+        let (_, live) = self.live()?;
+        Some(cursor::group_memo_digest(
+            &self.group.owner,
+            &order
+                .iter()
+                .map(|i| &self.group.members[*i])
+                .collect::<Vec<_>>(),
+            live,
+            &order
+                .iter()
+                .map(|i| self.headers.get(*i).map_or("", MemberHeader::digest))
+                .collect::<Vec<_>>(),
+            codex,
+            |member| self.wake_identity(member),
+        ))
+    }
+
+    fn wake_identity(&self, member: &CandidateFile) -> String {
+        self.wake_identities
+            .get(&local_index_key(&member.path))
+            .unwrap_or(&member.opened_object_identity)
+            .clone()
+    }
+
+    /// Open the first canonical member and build the job.
+    pub(in crate::snapshots) fn into_job(
+        self,
+        inputs: JobInputs<'_>,
+    ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
+        let memo_digest = self.memo_digest(inputs.metadata);
+        let dependencies = self.dependencies(inputs.metadata);
+        let Self {
+            group,
+            key,
+            stamps,
+            headers,
+            plan,
+            probe_bound,
+            probe_limit_bound,
+            own_page,
+            previous_receipts,
+            receipt_scope,
+            independent,
+            ..
+        } = self;
+        let plan = plan.ok_or(GroupEnd::Strict)?;
+        let members = plan
+            .order
+            .iter()
+            .map(|i| group.members[*i].clone())
+            .collect::<Vec<_>>();
+        let stamps = plan
+            .order
+            .iter()
+            .filter_map(|i| stamps.get(*i).cloned())
+            .collect::<Vec<_>>();
+        let digests = plan
+            .order
+            .iter()
+            .map(|i| {
+                headers
+                    .get(*i)
+                    .map_or_else(String::new, |h| h.digest().to_owned())
+            })
+            .collect::<Vec<_>>();
+        let (Some(first), Some(last)) = (members.first().cloned(), members.last().cloned()) else {
+            return Err(GroupEnd::Strict);
+        };
+        if stamps.len() != members.len() {
+            return Err(GroupEnd::Strict);
+        }
+        let mut opened = first.clone();
+        let file = open_member_file(&mut opened)?;
+        if opened.opened_object_identity != first.opened_object_identity {
+            return Err(GroupEnd::Changed);
+        }
+        let mut parser = if independent {
+            independent_fold::parser(file, &first, inputs.metadata, inputs.cache)?
+        } else {
+            new_group_parser(file, &first, inputs.metadata).map_err(|_| GroupEnd::Strict)?
+        };
+        let mut join = Box::new(if independent {
+            StreamProof::independent(group.owner.clone(), members.len())
+        } else {
+            StreamProof::new(group.owner.clone(), plan.plans)
+        });
+        join.begin_member(0);
+        let previous = previous_receipts
+            .get(&local_index_key(&first.path))
+            .cloned()
+            .unwrap_or_default();
+        let mut replay = TierReplay::new(previous.0, previous.1, receipt_scope.clone());
+        replay.join = Some(join);
+        parser.accumulator.codex_tier_replay = Some(replay);
+        let index = inputs.index;
+        Ok(Box::new(OwnedActiveFile {
+            first_read: crate::local_resource_diagnostics::FirstRead::begin(
+                SnapshotSource::Codex,
+                first.size_bytes,
+                !index.files.contains_key(&local_index_key(&first.path)),
+            ),
+            sampling: None,
+            previous_snapshot_fingerprint: index.last_snapshot_fingerprint(&last),
+            previous_upload_body_witness: index.last_upload_body_witness(&last),
+            projection_adoption_required: index
+                .effective_upload_body_witness_revision_requires_adoption(&local_index_key(
+                    &last.path,
+                )),
+            source_file_fingerprint: last.source_file_fingerprint.clone(),
+            candidate: first,
+            decision: CandidateDecision::Parse,
+            parse_reason: None,
+            prior_stamp: None,
+            parser,
+            aliases: members.clone(),
+            applied_receipts: BTreeMap::new(),
+            cursor: None,
+            charged_bytes: 0,
+            hold_offset: None,
+            group: Some(Box::new(GroupJob {
+                key,
+                owner: group.owner,
+                home: group.home,
+                members,
+                stamps,
+                digests,
+                current: 0,
+                finished: false,
+                previous_receipts,
+                receipt_scope,
+                lines: (0, 0),
+                charge: 0,
+                probe_bound,
+                probe_limit_bound,
+                own_page,
+                dependencies,
+                memo_digest,
+                scope: cursor::group_scope(),
+                consumed_before: 0,
+                independent,
+                contributions: Vec::new(),
+            })),
+        }))
+    }
+}
+
+/// Scan facts a group job is built with.
+pub(in crate::snapshots) struct JobInputs<'a> {
+    pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
+    pub(in crate::snapshots) index: &'a ScanIndex,
+    pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
+}
+
+fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
+    match open_candidate_file(SnapshotSource::Codex, member) {
+        Ok(file) => Ok(file),
+        // The member vanished or was renamed: membership changed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(GroupEnd::Changed),
+        Err(_) => Err(GroupEnd::Strict),
+    }
+}
+
+/// The running group job, carried by its `OwnedActiveFile`.
+pub(in crate::snapshots) struct GroupJob {
+    pub(in crate::snapshots) key: String,
+    pub(in crate::snapshots) owner: String,
+    pub(in crate::snapshots) home: PathBuf,
+    /// Canonical order; the last member is the only one that can be live.
+    pub(in crate::snapshots) members: Vec<CandidateFile>,
+    /// Boot stamps of the members' opened objects, canonical order.
+    pub(in crate::snapshots) stamps: Vec<OpenStamp>,
+    digests: Vec<String>,
+    pub(in crate::snapshots) current: usize,
+    finished: bool,
+    previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
+    receipt_scope: String,
+    /// Physical and parsed line counts of the completed members.
+    lines: (usize, usize),
+    charge: u64,
+    pub(in crate::snapshots) probe_bound: bool,
+    probe_limit_bound: bool,
+    own_page: bool,
+    /// `GroupBoot::dependencies`: a parked `ProbeBudgetOrder` record's wake
+    /// inputs (round 3).
+    pub(in crate::snapshots) dependencies: Option<String>,
+    pub(in crate::snapshots) memo_digest: Option<String>,
+    /// `cursor::group_scope` at job start: every resume and the
+    /// emission compare it with the current index.
+    pub(in crate::snapshots) scope: String,
+    /// Bytes the completed members' readers consumed, plus each member
+    /// swap's charge (R2-L3).
+    pub(in crate::snapshots) consumed_before: u64,
+    pub(in crate::snapshots) independent: bool,
+    pub(in crate::snapshots) contributions: Vec<SnapshotItem>,
+}
+crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
+    finished, previous_receipts, receipt_scope, lines,
+    charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
+    consumed_before, independent, contributions);
+
+/// Bytes the group consumed outside the current reader (completed members,
+/// header rechecks) since the last call.
+pub(in crate::snapshots) fn take_charge(active: &mut OwnedActiveFile) -> u64 {
+    active
+        .group
+        .as_mut()
+        .map_or(0, |group| std::mem::take(&mut group.charge))
+}
+
+/// How a group job ended without completing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum GroupEnd {
+    /// Terminal proof debt (outcome R) at canonical `position`; `offset` is
+    /// the end of the last complete record read in that member.
+    /// `at_eof` marks a refusal raised by the member-end proof, where the
+    /// reader stopped at its read limit; a mid-stream refusal stops it early.
+    Refused {
+        reason: JoinRefusal,
+        position: usize,
+        offset: u64,
+        at_eof: bool,
+    },
+    /// Open/read failure, line loss, receipts, owner or creator conflict.
+    Strict,
+    /// A member changed or vanished: a necessary invalidation.
+    Changed,
+    /// The live member's acquisition evidence is unavailable this page (K9).
+    Unavailable,
+}
+
+pub(in crate::snapshots) enum GroupStep {
+    /// The replay advanced; `Ok(true)` once the last member's EOF is proven.
+    Read(Result<bool>),
+    End(GroupEnd),
+}
+
+/// Scan facts one group step needs.
+pub(in crate::snapshots) struct StepInputs<'a> {
+    pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
+    pub(in crate::snapshots) attribution:
+        Option<&'a crate::session_attribution::SessionAttributionContext>,
+    /// The live member's acquisition scope (cursor jobs), computed on demand.
+    pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
+    pub(in crate::snapshots) collected_at: &'a str,
+    pub(in crate::snapshots) live_scope:
+        &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
+}
+
+/// The reader skipped a line (malformed, invalid UTF-8 or over the line
+/// cap) or failed: a refusal seen after that may be the loss's own effect
+/// (an ordinal jump, a broken chain), so it is strict, never settleable
+/// debt or a memo entry.
+fn reader_lossy(parser: &OwnedJsonlParser) -> bool {
+    !parser.reader.report.complete() || parser.reader.failure.is_some()
+}
+
+fn join_refusal(parser: &OwnedJsonlParser) -> Option<(JoinRefusal, usize)> {
+    parser
+        .accumulator
+        .codex_tier_replay
+        .as_ref()
+        .and_then(|replay| replay.join.as_ref())
+        .and_then(|join| join.refusal())
+}
+
+/// One physical line of the current member, or one member transition.
+pub(in crate::snapshots) fn step_group(
+    active: &mut OwnedActiveFile,
+    inputs: &StepInputs<'_>,
+) -> GroupStep {
+    if active.group.as_ref().map_or(true, |group| group.finished) {
+        return GroupStep::Read(Ok(true));
+    }
+    let offset = active.parser.reader.last_complete_line_end();
+    if let Some(join) = active
+        .parser
+        .accumulator
+        .codex_tier_replay
+        .as_mut()
+        .and_then(|replay| replay.join.as_deref_mut())
+    {
+        join.set_record_start(offset);
+    }
+    #[cfg(test)]
+    let before_body_read = active.parser.reader.consumed_bytes();
+    let stepped = active.parser.step();
+    #[cfg(test)]
+    terminal_contract_retry::record_group_body_bytes(
+        active
+            .parser
+            .reader
+            .consumed_bytes()
+            .saturating_sub(before_body_read),
+    );
+    let complete = match stepped {
+        Ok(complete) => complete,
+        Err(error) => return GroupStep::Read(Err(error)),
+    };
+    if let Some((reason, position)) = join_refusal(&active.parser) {
+        if reader_lossy(&active.parser) {
+            return GroupStep::End(GroupEnd::Strict);
+        }
+        return GroupStep::End(GroupEnd::Refused {
+            reason,
+            position,
+            offset: active.parser.reader.last_complete_line_end(),
+            at_eof: false,
+        });
+    }
+    if !complete {
+        return GroupStep::Read(Ok(false));
+    }
+    match member_eof(active, inputs) {
+        Ok(done) => GroupStep::Read(Ok(done)),
+        Err(end) => GroupStep::End(end),
+    }
+}
+
+/// The current member reached its EOF: prove it, then open the next member
+/// in the same step, or finish the group. `Ok(false)` also re-enters an EOF
+/// whose launch lookup yields; nothing is consumed before that lookup.
+fn member_eof(
+    active: &mut OwnedActiveFile,
+    inputs: &StepInputs<'_>,
+) -> std::result::Result<bool, GroupEnd> {
+    if reader_lossy(&active.parser) {
+        return Err(GroupEnd::Strict);
+    }
+    let paged = active.cursor.is_some();
+    let group = active.group.as_deref_mut().expect("group job");
+    let position = group.current;
+    let member = group.members[position].clone();
+    let key = local_index_key(&member.path);
+    let last = position + 1 == group.members.len();
+    let lookup_parser = group.independent.then_some(active.parser.as_ref());
+    if let (Some(context), Some(parser)) = (inputs.attribution, lookup_parser) {
+        let workers = parser
+            .accumulator
+            .source_session_id
+            .as_ref()
+            .map(|id| vec![resolve_codex_identity(id)])
+            .unwrap_or_else(|| launch_workers_for_path(SnapshotSource::Codex, &member.path));
+        // Independent native finalization needs the lookup; park the member
+        // until it is prepared.
+        match context.launch_events().prepare_step(&workers) {
+            Ok(false) => return Ok(false),
+            Err(()) => return Err(GroupEnd::Strict),
+            Ok(true) => {}
+        }
+    }
+    // A cursor job's live member is fenced by its certificate; every other
+    // member keeps exact identity at EOF.
+    if !(last && paged) {
+        match opened_object_identity(SnapshotSource::Codex, active.parser.reader.reader.get_mut()) {
+            Ok(identity) if identity == member.opened_object_identity => {}
+            Ok(_) => return Err(GroupEnd::Changed),
+            Err(_) => return Err(GroupEnd::Strict),
+        }
+    }
+    #[cfg(test)]
+    crate::snapshots::sampled_scan::codex_cursor::tests::GROUP_EOF_APPLIED
+        .with(|v| v.set(v.get() + 1));
+    if last && paged {
+        apply_live_eof_record(active);
+    }
+    let end = active.parser.reader.consumed_bytes();
+    let Some(mut replay) = active.parser.accumulator.codex_tier_replay.take() else {
+        return Err(GroupEnd::Strict);
+    };
+    let mut join = replay.join.take().ok_or(GroupEnd::Strict)?;
+    // The version is decided on the first owned record, after the proof
+    // was built; the member-end rules follow it.
+    join.end_member(end);
+    if last {
+        join.finish_group();
+    }
+    if let Some((reason, position)) = join.refusal() {
+        return Err(GroupEnd::Refused {
+            reason,
+            position,
+            offset: active.parser.reader.last_complete_line_end(),
+            at_eof: true,
+        });
+    }
+    let receipt = replay.finish().map_err(|_| GroupEnd::Strict)?;
+    // The variable records this member leaves in the job (round 4, L3).
+    let retained = [
+        crate::heap_layout_bound::completed_bound(&receipt, usize::MAX),
+        crate::heap_layout_bound::completed_bound(&key, usize::MAX),
+    ];
+    active.applied_receipts.insert(key.clone(), receipt);
+    if active.group.as_ref().is_some_and(|group| group.independent) {
+        return independent_member_eof(active, join, inputs);
+    }
+    let group = active.group.as_deref_mut().expect("group job");
+    if last {
+        // The existing single-file optional witness can be cleared on
+        // conflict. A joined body must not reach account fallback through it.
+        let owner = active
+            .parser
+            .accumulator
+            .source_session_id
+            .as_deref()
+            .map(resolve_codex_identity);
+        if active.parser.accumulator.codex_creator_evidence_conflicted
+            || owner.as_deref() != Some(group.owner.as_str())
+        {
+            return Err(GroupEnd::Strict);
+        }
+    }
+    if finish_member_report(group, &mut active.parser) {
+        return Ok(true);
+    }
+    // The finished member's unread charge moves to the group before its
+    // reader is replaced (`take_charge`).
+    group.charge = group
+        .charge
+        .saturating_add(end.saturating_sub(active.charged_bytes));
+    active.charged_bytes = 0;
+    // The swap's retained state is charged, not walked.
+    group.consumed_before = group
+        .consumed_before
+        .saturating_add(cursor::swap_charge(&retained));
+    group.current += 1;
+    open_member(active, join, inputs)?;
+    Ok(false)
+}
+
+fn finish_member_report(group: &mut GroupJob, parser: &mut OwnedJsonlParser) -> bool {
+    group.lines.0 += parser.reader.report.physical_line_count;
+    group.lines.1 += parser.reader.report.parsed_json_line_count;
+    let last = group.current + 1 == group.members.len();
+    if last {
+        parser.reader.report.physical_line_count = group.lines.0;
+        parser.reader.report.parsed_json_line_count = group.lines.1;
+        group.finished = true;
+    }
+    last
+}
+
+fn install_member_replay(
+    active: &mut OwnedActiveFile,
+    member: CandidateFile,
+    mut join: Box<StreamProof>,
+) {
+    let group = active.group.as_ref().expect("group job");
+    join.begin_member(group.current);
+    let previous = group
+        .previous_receipts
+        .get(&local_index_key(&member.path))
+        .cloned()
+        .unwrap_or_default();
+    let mut replay = TierReplay::new(previous.0, previous.1, group.receipt_scope.clone());
+    replay.join = Some(join);
+    active.parser.accumulator.codex_tier_replay = Some(replay);
+    active.candidate = member;
+}
+
+/// Independent files keep separate parser, selector and cache-detector boundaries.
+/// Completed contributions and admitted keys stay only in this attempt until its
+/// last EOF; a lost process has acquired no folded checkpoint or ACK credit.
+fn independent_member_eof(
+    active: &mut OwnedActiveFile,
+    join: Box<StreamProof>,
+    inputs: &StepInputs<'_>,
+) -> std::result::Result<bool, GroupEnd> {
+    if active.parser.accumulator.codex_creator_evidence_conflicted {
+        return Err(GroupEnd::Strict);
+    }
+    let group = active.group.as_mut().expect("group");
+    if finish_member_report(group, &mut active.parser) {
+        return Ok(true);
+    }
+    let member = group.members[group.current].clone();
+    let next = group.members[group.current + 1].clone();
+    let mut opened = next.clone();
+    let file = open_member_file(&mut opened)?;
+    if opened.opened_object_identity != next.opened_object_identity {
+        return Err(GroupEnd::Changed);
+    }
+    // Drop the completed decoder before funding the next one. Finish uses only
+    // its held descriptor's metadata after EOF, so an inert plain wrapper is safe.
+    let held = active
+        .parser
+        .reader
+        .reader
+        .get_ref()
+        .try_clone()
+        .map_err(|_| GroupEnd::Strict)?;
+    let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
+    input.close();
+    let parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
+    let mut old = std::mem::replace(&mut active.parser, parser);
+    active
+        .parser
+        .accumulator
+        .merge_session_features(&mut old.accumulator)
+        .ok_or(GroupEnd::Strict)?;
+    let end = old.reader.consumed_bytes();
+    let mut parsed = old
+        .finish_boxed_native(
+            FinishRequest {
+                expected_opened_object_identity: &member.opened_object_identity,
+                path: &member.path,
+                collected_at: inputs.collected_at,
+                source_file_fingerprint: member.source_file_fingerprint.clone(),
+                codex_title_metadata: Some(inputs.metadata),
+                claude_title_metadata: None,
+                attribution_context: inputs.attribution,
+                repository_identity: None,
+                money_context: None,
+            },
+            None,
+        )
+        .map_err(|_| GroupEnd::Strict)?;
+    if !parsed.progress_complete() {
+        return Err(GroupEnd::Strict);
+    }
+    for item in &mut parsed.snapshots {
+        apply_codex_state_evidence(item, inputs.metadata, &member.path);
+    }
+    group.contributions.extend(parsed.snapshots);
+    group.charge = group
+        .charge
+        .saturating_add(end.saturating_sub(active.charged_bytes));
+    group.consumed_before = group.consumed_before.saturating_add(end);
+    active.charged_bytes = 0;
+    group.current += 1;
+    install_member_replay(active, next, join);
+    Ok(false)
+}
+
+/// EOF-record handling for a paged group's live member, at its genuine unchanged
+/// EOF only (`cursor::group_eof_record_due`): the withheld final record is
+/// applied from the buffered bytes through the same line sink, the proof
+/// before the member's proof ends. The job
+/// then gets no S12 grant (`finish_job`), so strict finish identity covers
+/// the record. Without it, a quiescent live member ending in an
+/// unterminated record would stage hourly audit debt and re-read the whole
+/// group each time.
+fn apply_live_eof_record(active: &mut OwnedActiveFile) {
+    let Some(boot) = active
+        .group
+        .as_ref()
+        .and_then(|group| group.stamps.last().cloned())
+    else {
+        return;
+    };
+    if !cursor::group_eof_record_due(active, &boot) {
+        return;
+    }
+    let offset = active.parser.reader.last_complete_line_end();
+    let applied = {
+        let parser = &mut active.parser;
+        if let Some(join) = parser
+            .accumulator
+            .codex_tier_replay
+            .as_mut()
+            .and_then(|replay| replay.join.as_deref_mut())
+        {
+            join.set_record_start(offset);
+        }
+        parser.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
+    };
+    if applied {
+        cursor::mark_eof_applied(active);
+    }
+}
+
+/// Swap in the next canonical member's reader and its proof context.
+fn open_member(
+    active: &mut OwnedActiveFile,
+    join: Box<StreamProof>,
+    inputs: &StepInputs<'_>,
+) -> std::result::Result<(), GroupEnd> {
+    let paged = active.cursor.is_some();
+    let group = active.group.as_deref_mut().expect("group job");
+    let position = group.current;
+    let member = group.members[position].clone();
+    let boot = group
+        .stamps
+        .get(position)
+        .cloned()
+        .ok_or(GroupEnd::Strict)?;
+    let last = position + 1 == group.members.len();
+    let mut opened = member.clone();
+    let file = open_member_file(&mut opened)?;
+    if last && paged {
+        // The live member may have grown since boot; its line 0 must not
+        // have changed (TOCTOU), and its object is fenced below.
+        let (bytes, _, read, _) =
+            read_header_bytes(&member, None, &mut 0).map_err(|_| GroupEnd::Changed)?;
+        group.charge = group.charge.saturating_add(read as u64);
+        if format!("{:x}", Sha256::digest(&bytes)) != group.digests[position] {
+            return Err(GroupEnd::Changed);
+        }
+    } else if opened.opened_object_identity != member.opened_object_identity {
+        return Err(GroupEnd::Changed);
+    }
+    // The copy budget keeps counting across the swap: no walk per member.
+    group.consumed_before = group
+        .consumed_before
+        .saturating_add(active.parser.reader.consumed_bytes());
+    let parser = &mut active.parser;
+    parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file));
+    // Context inferred in one physical file must not price an unrelated
+    // record at the beginning of another file.
+    parser.accumulator.current_selector = SelectorCapture::default();
+    parser.accumulator.latest_model = None;
+    parser.accumulator.latest_reasoning_effort = None;
+    parser.accumulator.latest_turn_id = None;
+    if paged {
+        let scope = if last {
+            Some((inputs.live_scope)(&member).ok_or(GroupEnd::Unavailable)?)
+        } else {
+            None
+        };
+        cursor::arm_group_member(active, &boot, scope.as_ref())?;
+    }
+    install_member_replay(active, member, join);
+    Ok(())
+}
+
+/// Where a group's end is recorded.
+pub(in crate::snapshots) struct EndInputs<'a> {
+    pub(in crate::snapshots) sampling: Option<&'a sampled_scan::Context>,
+    pub(in crate::snapshots) index: &'a mut ScanIndex,
+    pub(in crate::snapshots) targets: DisclosureTargets<'a>,
+}
+
+/// Reuse the existing refusal memo and attempt fence for sealed independent
+/// inputs. No refusal grants delivery or acceptance credit to a member.
+/// Every member is sealed, so the entry needs no live witness (a compressed
+/// member has none) and wakes on any change of the last member's stamp.
+pub(in crate::snapshots) fn refuse_independent(
+    group: &GroupJob,
+    sampling: Option<&sampled_scan::Context>,
+    index: &mut ScanIndex,
+    mut targets: DisclosureTargets<'_>,
+) {
+    let disclosure = refusal_disclosure();
+    if let Some(context) = sampling {
+        if let (Some(digest), Some(stamp), Some(last)) = (
+            group.memo_digest.as_ref(),
+            group.stamps.last(),
+            group.members.last(),
+        ) {
+            context.cache.memo_record(
+                cursor::memo_key(&context.namespace, &group.key),
+                cursor::MemoEntry::new_group(
+                    digest.clone(),
+                    None,
+                    context.cache.retained_stamp(&last.path, stamp.clone()),
+                    None,
+                    disclosure.clone(),
+                )
+                .growth_may_cure(true),
+            );
+        }
+        context.cache.group_attempted(
+            &context.namespace,
+            &group.key,
+            cursor::census_token(index).as_deref(),
+        );
+    }
+    disclose_members(&disclosure, &group.members, index, targets.reborrow());
+    cursor::dequeue_members(index, &group.members);
+}
+
+/// End a group job that did not complete. Terminal proof debt is disclosed
+/// through the one writer for every member (outcome R) and memoized; an
+/// append-curable refusal in the live member only while that member's stamp
+/// is exactly unchanged. The attempt is fenced for the
+/// generation.
+pub(in crate::snapshots) fn end_group(
+    active: Box<OwnedActiveFile>,
+    end: GroupEnd,
+    lease: Option<cursor::CursorLease>,
+    inputs: EndInputs<'_>,
+) {
+    let EndInputs {
+        sampling,
+        index,
+        mut targets,
+    } = inputs;
+    let Some(group) = active.group.as_deref() else {
+        return;
+    };
+    // An ended group's replay counts with the bytes it read, as a completed
+    // one's does at its completion.
+    #[cfg(unix)]
+    if sampling.is_some() {
+        crate::snapshots::tail_source::counters::replay(
+            SnapshotSource::Codex,
+            crate::snapshots::tail_source::counters::Replay::Group,
+            group
+                .consumed_before
+                .saturating_add(active.parser.reader.consumed_bytes()),
+        );
+    }
+    match end {
+        // A proof refusal in a sealed independent group (even in its last
+        // member) is memoized like a strict end, so an unchanged group is not
+        // re-read whole at every discovery generation.
+        GroupEnd::Strict | GroupEnd::Refused { .. } if group.independent => {
+            if let Some(lease) = lease {
+                cursor::end_group_lease(lease, &active);
+            }
+            refuse_independent(group, sampling, index, targets.reborrow());
+        }
+        // The chronological fallback order may itself break the
+        // chain (a budget artifact, not a property of the files): strict,
+        // never settleable or memoized, named for S11. Per-member reasons
+        // (UI balance, shape) do not depend on the order.
+        GroupEnd::Refused {
+            reason: reason @ (JoinRefusal::Gap | JoinRefusal::Overlap),
+            position,
+            ..
+        } if group.probe_bound => {
+            if let Some(context) = sampling {
+                // Converge under stable inputs. An
+                // order the page's remaining singleton budget forced gets a
+                // page of its own next; one `PROBE_BYTES` forced (or forced
+                // again on its own page) is the same every generation, so it
+                // parks like `JoinStateBound` until a member changes.
+                if group.probe_limit_bound || group.own_page {
+                    if let Some(stamp) = group.stamps.last() {
+                        context.cache.park_group(
+                            &group.key,
+                            context.cache.retained_stamp(
+                                &group.members.last().expect("live member").path,
+                                stamp.clone(),
+                            ),
+                            group.dependencies.clone(),
+                            // Round 3: the strict debt a parked group
+                            // discloses again, never settleable.
+                            cursor::strict_disclosure(cursor::DebtReason::ProbeBudgetOrder),
+                            reason.append_curable() && position + 1 == group.members.len(),
+                        );
+                    }
+                } else {
+                    context
+                        .cache
+                        .request_group_own_page(&context.namespace, &group.key);
+                }
+            }
+            // The attempt ends like every terminal group end,
+            // completing its rotation (waiter removed, served, fenced).
+            if let Some(lease) = lease {
+                cursor::end_group_lease(lease, &active);
+            }
+            disclose_strict(&group.members, targets.reborrow());
+            cursor::dequeue_members(index, &group.members);
+        }
+        GroupEnd::Refused {
+            reason,
+            position,
+            offset,
+            at_eof,
+        } => {
+            let disclosure = refusal_disclosure();
+            let live_failed = position + 1 == group.members.len();
+            if let Some(context) = sampling {
+                // §d.4: growth of the live member may cure this refusal, so
+                // its entry matches only the exact recorded stamp: any
+                // append or touch wakes it, an unchanged group is not re-read.
+                let growth_may_cure = reason.append_curable() && live_failed;
+                let held = active.parser.reader.reader.get_ref();
+                let anchor = if live_failed {
+                    // An exact-stamp entry never covers bytes the job
+                    // did not read (growth past a paged cut): they may
+                    // already cure it, so the next generation reads them.
+                    // Only a refusal raised at the read limit
+                    // can be cured by those bytes; a mid-stream refusal is
+                    // fixed by records already read, and any append still
+                    // misses the exact stamp.
+                    OpenStamp::capture(held).ok().filter(|stamp| {
+                        !growth_may_cure || !at_eof || stamp.extent() == cursor::read_end(&active)
+                    })
+                } else {
+                    group.stamps.last().cloned()
+                };
+                // A refusal in the live member is witnessed at its refused
+                // offset; one before any complete record is not memoized.
+                let live = live_failed
+                    .then(|| cursor::LiveWitness::read(&active.candidate.path, held, offset))
+                    .flatten();
+                if let (Some(digest), Some(stamp)) = (group.memo_digest.clone(), anchor) {
+                    if !live_failed || live.is_some() {
+                        context.cache.memo_record(
+                            cursor::memo_key(&context.namespace, &group.key),
+                            cursor::MemoEntry::new_group(
+                                digest,
+                                live,
+                                context.cache.retained_stamp(
+                                    &group.members.last().expect("live member").path,
+                                    stamp,
+                                ),
+                                None,
+                                disclosure.clone(),
+                            )
+                            .growth_may_cure(growth_may_cure),
+                        );
+                    }
+                }
+                context.cache.group_attempted(
+                    &context.namespace,
+                    &group.key,
+                    cursor::census_token(index).as_deref(),
+                );
+            }
+            if let Some(lease) = lease {
+                cursor::end_group_lease(lease, &active);
+            }
+            disclose_members(&disclosure, &group.members, index, targets.reborrow());
+            cursor::dequeue_members(index, &group.members);
+        }
+        GroupEnd::Changed if lease.is_some() => {
+            let lease = lease.expect("checked lease");
+            let cache = &sampling.expect("a cursor job has a sampling context").cache;
+            if let Some(disclosure) = cache.cursor_invalidate(lease, &active) {
+                disclose_members(&disclosure, &group.members, index, targets.reborrow());
+                cursor::dequeue_members(index, &group.members);
+            }
+            // Otherwise its members are still pending: a later page boots
+            // the group again.
+        }
+        GroupEnd::Unavailable if lease.is_some() => {
+            if let Some(lease) = lease {
+                cursor::defer_group_lease(lease);
+            }
+        }
+        GroupEnd::Strict | GroupEnd::Changed | GroupEnd::Unavailable => {
+            if let Some(lease) = lease {
+                lease.release();
+            }
+            disclose_strict(&group.members, targets.reborrow());
+            cursor::dequeue_members(index, &group.members);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "group_job_tests.rs"]
+mod tests;

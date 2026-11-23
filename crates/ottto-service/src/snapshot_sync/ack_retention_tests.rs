@@ -1,0 +1,2475 @@
+use super::*;
+
+struct AckFixture {
+    scratch: crate::test_scratch::ScratchDir,
+    sources: PathBuf,
+    index_path: PathBuf,
+    progress_path: PathBuf,
+    namespace: String,
+    item: SnapshotItem,
+    identity: serde_json::Value,
+    /// The ledger is the route's native progress rows.
+    native: bool,
+}
+
+impl AckFixture {
+    fn new(committed_ack: bool) -> Self {
+        Self::native(committed_ack)
+    }
+
+    /// The fixture with its ledger on the graph route's native progress.
+    fn native(committed_ack: bool) -> Self {
+        Self::with_progress(committed_ack, true)
+    }
+
+    fn with_progress(committed_ack: bool, native: bool) -> Self {
+        let scratch = crate::test_scratch::ScratchDir::canonical("upload-ack-retention");
+        let sources = scratch.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        Self::write_source(&sources, "held");
+        let mut index = ScanIndex::default();
+        let scan = Self::scan(&sources, &mut index);
+        assert_eq!(scan.snapshots.len(), 1);
+        let item = scan.snapshots[0].clone();
+        let progress_path = scratch.join("progress.json");
+        let namespace = "c".repeat(64);
+        let mut progress = SnapshotUploadProgress::new(
+            namespace.clone(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        if committed_ack {
+            progress.record_body(
+                &item.snapshot_fingerprint,
+                &snapshot_upload_body_witness(&item),
+            );
+            index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        }
+        // Public synthetic identity fixtures only. Preserve bindings, the current
+        // scanner token across the crash/uploader/settlement seam.
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["session_account_bindings"] = serde_json::json!({"a".repeat(64): {
+            "account_identifier_hash":"8".repeat(64), "workspace_identifier_hash":"9".repeat(64)}});
+        index = serde_json::from_value(value).unwrap();
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            &scratch,
+            &namespace,
+        );
+        index.save_fixture(&index_path).unwrap();
+        let (progress_path, mut progress) = if native {
+            super::routed_progress(&index, &index_path, progress)
+        } else {
+            (progress_path, progress)
+        };
+        progress.save(&progress_path).unwrap();
+        let identity = serde_json::to_value(&index).unwrap();
+        Self {
+            scratch,
+            sources,
+            index_path,
+            progress_path,
+            namespace,
+            item,
+            identity,
+            native,
+        }
+    }
+
+    fn write_source(root: &Path, name: &str) {
+        let row = serde_json::json!({"timestamp":"2026-10-25T07:00:00Z",
+            "type":"assistant", "sessionId":name, "requestId":format!("req-{name}"),
+            "message":{"id":format!("msg-{name}"), "model":"claude-haiku-4-5",
+            "usage":{"input_tokens":10,"output_tokens":1}}});
+        std::fs::write(root.join(format!("{name}.jsonl")), format!("{row}\n")).unwrap();
+    }
+
+    fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
+        crate::snapshots::scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            &[root.to_owned()],
+            index,
+            "2026-10-25T07:01:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap()
+    }
+
+    fn load(&self) -> (ScanIndex, SnapshotUploadProgress) {
+        let index = ScanIndex::load(&self.index_path).unwrap();
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut progress = if self.native {
+            super::load_routed_progress(&index, &self.index_path, &self.namespace, witness)
+        } else {
+            SnapshotUploadProgress::load(&self.progress_path, &self.namespace, witness).unwrap()
+        };
+        progress.configure_ack_capacity(&index);
+        (index, progress)
+    }
+
+    fn load_native(&self) -> (ScanIndex, SnapshotUploadProgress) {
+        let index = ScanIndex::load(&self.index_path).unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.progress_path,
+            &self.namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        (index, progress)
+    }
+
+    fn assert_ack(&self, progress: &SnapshotUploadProgress) {
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&self.item.snapshot_fingerprint));
+        assert_eq!(
+            progress
+                .accepted_body_witnesses
+                .get(&self.item.snapshot_fingerprint),
+            Some(&snapshot_upload_body_witness(&self.item))
+        );
+    }
+
+    fn assert_identity(&self, index: &ScanIndex) {
+        let value = serde_json::to_value(index).unwrap();
+        for field in [
+            "session_account_bindings",
+            "claude_request_identity_contract",
+        ] {
+            assert_eq!(value[field], self.identity[field], "{field}");
+        }
+    }
+
+    fn upload(
+        &self,
+        progress: &mut SnapshotUploadProgress,
+        items: &[SnapshotItem],
+        upload: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    ) -> Result<ResumableUploadResult> {
+        upload_resumable_batches_with_body_witness(
+            items,
+            &unique_poison_scope(),
+            progress,
+            &mut 0,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            upload,
+            |state| state.save(&self.progress_path),
+        )
+    }
+}
+
+pub(super) fn exact_ack(
+    items: &[&SnapshotItem],
+) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some(collector_version()),
+        snapshots: items.to_vec(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let mut response = entity_ack_response(request.snapshots.len() as u64);
+    for item in &request.snapshots {
+        let body_version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
+        response
+            .accepted_entities
+            .push(crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: item.source_session_id.clone(),
+                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: body_version,
+                body_witness_digest: body_version.map(|_| snapshot_upload_body_witness(item)),
+                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                head_challenge: None,
+                unchanged_basis: None,
+                cache_observations_state: None,
+            });
+    }
+    response.validate_entity_ack_with_head_cas(&request, false)?;
+    Ok(response)
+}
+
+#[test]
+fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
+    let f = AckFixture::native(true);
+    let (_, mut progress) = f.load();
+    let fingerprint = &f.item.snapshot_fingerprint;
+    progress
+        .accepted_body_contexts
+        .insert(fingerprint.clone(), "b".repeat(64));
+    let fingerprints = BTreeSet::from(["1".repeat(64), "2".repeat(64)]);
+    let witnesses = BTreeMap::from([
+        ("1".repeat(64), "3".repeat(64)),
+        ("2".repeat(64), "4".repeat(64)),
+    ]);
+    let contexts = BTreeMap::from([("1".repeat(64), "5".repeat(64))]);
+    for (fp, body) in &witnesses {
+        progress.record_body(fp, body);
+    }
+    progress.accepted_body_contexts.extend(contexts.clone());
+    progress.save(&f.progress_path).unwrap();
+    let generation = progress.generation;
+
+    // Exercise both the settlement and capped-save paths.
+    // Calling it directly keeps this persistence regression independent of heap-layout pins.
+    let outcome = attempt_snapshot_page(
+        std::slice::from_ref(&f.item),
+        &[0],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+        &snapshot_upload_body_witness,
+        &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &mut |items| {
+            let mut response = exact_ack(items)?;
+            response.accepted = 0;
+            response.conflict_entities = std::mem::take(&mut response.accepted_entities);
+            Ok(response)
+        },
+        &mut |state| {
+            assert!(state.quarantined_fingerprints.contains_key(fingerprint));
+            assert!(!state.accepted_fingerprints.contains(fingerprint));
+            assert!(!state.accepted_body_witnesses.contains_key(fingerprint));
+            assert!(!state.accepted_body_contexts.contains_key(fingerprint));
+            state.save_with_read_limit(
+                &f.progress_path,
+                Some(crate::snapshot_retry::RESPONSE_BYTES),
+            )
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        SnapshotPageOutcome::Settled { conflicted: 1, .. }
+    ));
+
+    let (_, reloaded) = f.load();
+    assert_eq!(reloaded.generation, generation + 1);
+    assert_eq!(reloaded.accepted_fingerprints, fingerprints);
+    assert_eq!(reloaded.accepted_body_witnesses, witnesses);
+    assert_eq!(reloaded.accepted_body_contexts, contexts);
+    assert_eq!(
+        reloaded.quarantined_fingerprints,
+        progress.quarantined_fingerprints
+    );
+    assert!(reloaded.rows.is_some(), "valid ledger was not quarantined");
+    assert!(!std::fs::read_dir(&f.scratch).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt.")
+    }));
+}
+
+#[test]
+fn every_progress_save_prunes_contexts_without_body_witnesses() {
+    for read_limit in [None, Some(crate::snapshot_retry::RESPONSE_BYTES)] {
+        let f = AckFixture::new(true);
+        let (_, mut progress) = f.load();
+        let contexts = BTreeMap::from([(f.item.snapshot_fingerprint.clone(), "b".repeat(64))]);
+        progress.accepted_body_contexts = contexts.clone();
+        progress
+            .accepted_body_contexts
+            .insert("c".repeat(64), "d".repeat(64));
+        let fingerprints = progress.accepted_fingerprints.clone();
+        let witnesses = progress.accepted_body_witnesses.clone();
+
+        match read_limit {
+            None => progress.save(&f.progress_path),
+            Some(_) => progress.save_with_read_limit(&f.progress_path, read_limit),
+        }
+        .unwrap();
+
+        assert_eq!(progress.accepted_body_contexts, contexts);
+        let (_, reloaded) = f.load();
+        assert_eq!(reloaded.generation, progress.generation);
+        assert_eq!(reloaded.accepted_fingerprints, fingerprints);
+        assert_eq!(reloaded.accepted_body_witnesses, witnesses);
+        assert_eq!(reloaded.accepted_body_contexts, contexts);
+        assert!(reloaded.rows.is_some());
+    }
+}
+
+/// [format] An exact ACK survives a crash before the due index debt is retired.
+/// Selection leaves the old deadline due; the ACK must suppress its transport.
+#[test]
+fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
+    for unrelated in [false, true] {
+        let f = AckFixture::new(false);
+        let (mut index, mut progress) = f.load();
+        progress.quarantine_body(
+            &f.item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&f.item),
+        );
+        progress
+            .quarantined_fingerprints
+            .get_mut(&f.item.snapshot_fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        assert!(progress
+            .active_quarantine_retries
+            .contains(&f.item.snapshot_fingerprint));
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        index.save_fixture(&f.index_path).unwrap(); // selected, still due until transport
+        progress.save(&f.progress_path).unwrap();
+        assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        f.upload(&mut progress, std::slice::from_ref(&f.item), exact_ack)
+            .unwrap();
+        f.assert_ack(&f.load().1);
+        // Crash: only progress has the ACK, while the index still has old debt.
+        drop(index);
+        drop(progress);
+        let (mut index, mut progress) = f.load();
+        assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        assert!(index
+            .quarantined_snapshot_fingerprints
+            .contains_key(&f.item.snapshot_fingerprint));
+        if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
+            progress.save(&f.progress_path).unwrap();
+        }
+        assert!(!progress
+            .quarantined_fingerprints
+            .contains_key(&f.item.snapshot_fingerprint));
+        assert!(progress.active_quarantine_retries.is_empty());
+        if unrelated {
+            AckFixture::write_source(&f.sources, "unrelated");
+        }
+        let committed = index.clone();
+        let delta = AckFixture::scan(&f.sources, &mut index);
+        assert_eq!(delta.snapshots.len(), 1 + usize::from(unrelated));
+        assert_eq!(
+            delta
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            if unrelated {
+                BTreeSet::from(["held", "unrelated"])
+            } else {
+                BTreeSet::from(["held"])
+            }
+        );
+        let retained = delta
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == "held")
+            .unwrap();
+        assert_eq!(
+            snapshot_upload_body_witness(retained),
+            snapshot_upload_body_witness(&f.item)
+        );
+        let mut posts = 0;
+        f.upload(&mut progress, &delta.snapshots, |batch| {
+            f.assert_ack(&f.load().1);
+            assert!(unrelated);
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].source_session_id, "unrelated");
+            posts += 1;
+            exact_ack(batch)
+        })
+        .unwrap();
+        assert_eq!(posts, usize::from(unrelated));
+        f.assert_ack(&f.load().1);
+        settle_index_after_upload(&mut index, &committed, &progress);
+        index.save_fixture(&f.index_path).unwrap();
+        let (index, _) = f.load();
+        f.assert_identity(&index);
+        assert!(index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        let (mut index, progress) = f.load();
+        f.assert_identity(&index);
+        assert!(index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        assert!(
+            progress.accepted_fingerprints.is_empty(),
+            "adopted resume ACK is disposable"
+        );
+        assert!(AckFixture::scan(&f.sources, &mut index)
+            .snapshots
+            .is_empty());
+    }
+}
+
+#[test]
+fn changed_body_replaces_only_its_own_ack() {
+    let f = AckFixture::new(true);
+    let (_, mut progress) = f.load();
+    let sibling = "d".repeat(64);
+    progress.record_body(&sibling, &"e".repeat(64));
+    progress.save(&f.progress_path).unwrap();
+    let changed = f.item.clone();
+    // Use an explicit body witness to isolate replacement from source identity.
+    let changed_body = "f".repeat(64);
+    assert_ne!(changed_body, snapshot_upload_body_witness(&f.item));
+    let mut posts = 0;
+    upload_resumable_batches_with_body_witness(
+        &[changed],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        |item| item.snapshot_fingerprint.as_str(),
+        |_| changed_body.clone(),
+        |batch| {
+            posts += 1;
+            let loaded = f.load().1;
+            assert!(!loaded
+                .accepted_fingerprints
+                .contains(&f.item.snapshot_fingerprint));
+            assert!(loaded.accepted_fingerprints.contains(&sibling));
+            exact_ack(batch)
+        },
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap();
+    let loaded = f.load().1;
+    assert_eq!(posts, 1);
+    assert_eq!(
+        loaded.accepted_body_witnesses[&f.item.snapshot_fingerprint],
+        changed_body
+    );
+    assert_eq!(loaded.accepted_body_witnesses[&sibling], "e".repeat(64));
+}
+
+#[test]
+fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_and_shared_acks() {
+    for mode in [
+        "retired",
+        "carried",
+        "unknown",
+        "shared",
+        "entity_hold",
+        "fresh",
+    ] {
+        let f = AckFixture::new(true);
+        let (mut committed, mut progress) = f.load();
+        // Keep this a retirement test, rather than an index-ACK transfer test.
+        let mut raw = serde_json::to_value(&committed).unwrap();
+        raw["accepted_snapshot_fingerprints"] = serde_json::json!([]);
+        committed = serde_json::from_value(raw).unwrap();
+        committed.save_fixture(&f.index_path).unwrap();
+        let unindexed = "d".repeat(64);
+        progress.record_body(&unindexed, &"e".repeat(64));
+        progress.save(&f.progress_path).unwrap();
+        let mut selected = committed.clone();
+        selected.files.clear();
+        selected.file_snapshot_fingerprints.clear();
+        let mut raw = serde_json::to_value(&selected).unwrap();
+        match mode {
+            "carried" => {
+                raw["accepted_rebuild_incidence"] =
+                    serde_json::json!({"carried.jsonl":[f.item.snapshot_fingerprint.clone()]})
+            }
+            "unknown" => raw["files"] = serde_json::json!({"unknown.jsonl":{"size_bytes":"bad"}}),
+            "shared" => {
+                selected.file_snapshot_fingerprints.insert(
+                    "sibling.jsonl".into(),
+                    BTreeSet::from([f.item.snapshot_fingerprint.clone()]),
+                );
+                raw = serde_json::to_value(&selected).unwrap();
+            }
+            "entity_hold" => {
+                raw["quarantined_snapshot_fingerprints"] =
+                    serde_json::json!({f.item.snapshot_fingerprint.clone():{"disposition":"bad"}})
+            }
+            "fresh" => committed = ScanIndex::default(),
+            _ => {}
+        }
+        // Exercise the real lenient decoder for unknown incidence/entity holds.
+        if matches!(mode, "unknown" | "entity_hold") {
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&raw).unwrap(),
+            );
+            selected = ScanIndex::load(&f.index_path).unwrap();
+        } else {
+            selected = serde_json::from_value(raw).unwrap();
+        }
+        let retired = progress.retired_ack_candidates(&committed, &selected);
+        assert_eq!(
+            retired.contains(&f.item.snapshot_fingerprint),
+            mode == "retired",
+            "{mode}"
+        );
+        // The plan cannot change durable progress before the index save.
+        f.assert_ack(&f.load().1);
+        selected.save_fixture(&f.index_path).unwrap();
+        let selected = ScanIndex::load(&f.index_path).unwrap();
+        progress.retire_acks_after_index_save(&selected, &retired, &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        let loaded = f.load().1;
+        assert_eq!(
+            loaded
+                .accepted_fingerprints
+                .contains(&f.item.snapshot_fingerprint),
+            mode != "retired",
+            "{mode}"
+        );
+        assert_eq!(loaded.accepted_body_witnesses[&unindexed], "e".repeat(64));
+    }
+}
+
+#[test]
+fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_releases_it() {
+    let f = AckFixture::new(true);
+    let (mut index, mut progress) = f.load();
+    // A small deterministic capacity drives the exact production admission seam.
+    progress.ack_capacity = 2;
+    let debt = "d".repeat(64);
+    progress.record_body(&debt, &debt);
+    progress.save(&f.progress_path).unwrap();
+    let input = vec!["e".repeat(64)];
+    let result = upload_resumable_batches(
+        &input,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        String::as_str,
+        |_| panic!("capacity is reserved before POST"),
+        |state| state.save(&f.progress_path),
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("kind=ack_settlement_required"));
+    let loaded = f.load().1;
+    f.assert_ack(&loaded);
+    assert_eq!(loaded.accepted_fingerprints.len(), 2);
+    assert!(loaded.accepted_fingerprints.contains(&debt));
+    // A failed index CAS cannot transfer the ACK or change durable progress.
+    let mut stale = index.clone();
+    index.save_fixture(&f.index_path).unwrap();
+    assert!(stale.save_fixture(&f.index_path).is_err());
+    f.assert_ack(&f.load().1);
+    progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
+    progress.save(&f.progress_path).unwrap();
+    upload_resumable_batches(
+        &input,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut 0,
+        String::as_str,
+        |batch| Ok(accept_fingerprints(batch)),
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap();
+    assert_eq!(f.load().1.accepted_fingerprints.len(), 2);
+    // Existing over-capacity ledgers are retained but cannot grow after reload.
+    progress.ack_capacity = 1;
+    assert!(progress.admit_ack_batch(1).is_err());
+    assert!(progress.admit_ack_batch(0).is_ok());
+    assert_eq!(progress.accepted_fingerprints.len(), 2);
+    assert!(f.scratch.as_ref().exists());
+}
+
+#[test]
+fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
+    let f = AckFixture::new(true);
+    let (mut index, mut progress) = f.load();
+    let newer_body = "f".repeat(64);
+    progress.record_body(&f.item.snapshot_fingerprint, &newer_body);
+    progress.save(&f.progress_path).unwrap();
+    index.save_fixture(&f.index_path).unwrap();
+    progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    assert_eq!(
+        f.load().1.accepted_body_witnesses[&f.item.snapshot_fingerprint],
+        newer_body
+    );
+    // Only an exact saved body-set witness can transfer this replacement.
+    let mut digest = Sha256::new();
+    for bytes in [
+        b"snapshot_file_upload_body_set:v1".as_slice(),
+        newer_body.as_bytes(),
+    ] {
+        digest.update((bytes.len() as u32).to_be_bytes());
+        digest.update(bytes);
+    }
+    index
+        .files
+        .values_mut()
+        .next()
+        .unwrap()
+        .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
+    index.save_fixture(&f.index_path).unwrap();
+    let index = ScanIndex::load(&f.index_path).unwrap();
+    progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    assert!(f.load().1.accepted_fingerprints.is_empty());
+}
+
+fn one_body_set_witness(body: &str) -> String {
+    let mut digest = Sha256::new();
+    for bytes in [
+        b"snapshot_file_upload_body_set:v1".as_slice(),
+        body.as_bytes(),
+    ] {
+        digest.update((bytes.len() as u32).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[test]
+fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
+    let scratch = crate::test_scratch::ScratchDir::new("bootstrap-ack-capacity");
+    let progress = test_upload_progress();
+    let namespace = progress.destination_namespace_hash.clone();
+    let mut baseline = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::Codex,
+        &mut baseline,
+        &scratch,
+        &namespace,
+    );
+    baseline.save_fixture(&index_path).unwrap();
+    let (progress_path, mut progress) = super::routed_progress(&baseline, &index_path, progress);
+    progress.save(&progress_path).unwrap();
+    let (_, template) = pending_head_index_item();
+    let entry = pending_head_index_item()
+        .0
+        .files
+        .into_values()
+        .next()
+        .unwrap();
+    let all = (0..5)
+        .map(|slot| {
+            let mut item = template.clone();
+            item.source_session_id = format!("bootstrap-capacity-{slot}");
+            item.snapshot_fingerprint = format!("{:064x}", 100 + slot);
+            item.source_file_fingerprint = Some(format!("{:064x}", 200 + slot));
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut main_posts = 0;
+    for cycle in 0..3 {
+        baseline = ScanIndex::load(&index_path).unwrap();
+        progress = super::load_routed_progress(
+            &baseline,
+            &index_path,
+            &namespace,
+            test_quarantine_witness(),
+        );
+        progress.ack_capacity = 2; // exact production capacity seam, small oracle
+        let mut items = all
+            .iter()
+            .filter(|item| {
+                !baseline.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let limited = progress.admit_upload_input_with_unsettled_limit(&mut items, &baseline, 2);
+        assert_eq!(limited.is_some(), cycle < 2);
+        assert_eq!(items.len(), if cycle < 2 { 2 } else { 1 });
+        let probes = items.iter().map(cache_head_probe).collect::<Vec<_>>();
+        bootstrap_cache_heads_with_budget(
+            &probes,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut InplaceRetryBudget::default(),
+            |batch, _| {
+                let mut response = exact_ack(batch)?;
+                for entity in &mut response.accepted_entities {
+                    entity.head_etag = Some("a".repeat(64));
+                }
+                Ok(response)
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        apply_bootstrapped_cache_heads("codex", &mut items, &progress).unwrap();
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut 0,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                main_posts += batch.len();
+                exact_ack(batch)
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        // Production forces partial settlement when `limited`, rather than
+        // treating omitted work as a completed page or returning in bootstrap.
+        let mut working = baseline.clone();
+        for item in &items {
+            let key = format!("{}.jsonl", item.source_session_id);
+            let mut file = entry.clone();
+            file.source_file_fingerprint = item.source_file_fingerprint.clone().unwrap();
+            file.last_upload_body_witness =
+                Some(one_body_set_witness(&snapshot_upload_body_witness(item)));
+            working.files.insert(key.clone(), file);
+            working
+                .file_snapshot_fingerprints
+                .insert(key, BTreeSet::from([item.snapshot_fingerprint.clone()]));
+        }
+        let saved = checkpoint_partial_snapshot_index(
+            &working,
+            &baseline,
+            &progress,
+            &items,
+            None,
+            &BTreeSet::new(),
+            &index_path,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        progress
+            .release_acks_after_partial_index_save(
+                &progress_path,
+                &baseline,
+                &saved,
+                &BTreeSet::new(),
+                false,
+            )
+            .unwrap();
+        let loaded = super::load_routed_progress(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
+            &namespace,
+            test_quarantine_witness(),
+        );
+        assert!(
+            loaded.accepted_fingerprints.is_empty(),
+            "adopted capacity drains each cycle"
+        );
+    }
+    let index = ScanIndex::load(&index_path).unwrap();
+    assert!(all
+        .iter()
+        .all(|item| index.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint)));
+    assert_eq!(
+        main_posts,
+        all.len(),
+        "all admitted bodies converge without losing remaining work"
+    );
+}
+
+/// [regress] A key rotation this cycle discards saved identity hints in
+/// memory only, until the next ACK page; the partial checkpoint still runs.
+#[test]
+fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
+    let hint = serde_json::json!({
+        "source_session_id": "synthetic",
+        "provenance": {"collector": crate::snapshots::claude_request_identity::COLLECTOR},
+        "request_evidence": [{"identity_basis": "telemetry_login"}],
+        "usage_buckets": [{"bucket_start": "2026-09-01T10:00:00Z", "model_usage": [
+            {"model": "claude-synthetic", "evidence_ref": 0, "account_identifier_hash": "a".repeat(64)}
+        ]}],
+    });
+    let f = AckFixture::new(true);
+    let (index, mut progress) = f.load();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x41; 32]));
+    progress.accepted_identity_buckets.record(&hint);
+    assert!(!progress.accepted_identity_buckets.is_empty());
+    progress.save(&f.progress_path).unwrap();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    assert!(progress.accepted_identity_buckets.is_empty());
+    checkpoint_partial_snapshot_index_with_audit_release(
+        &index,
+        &index,
+        &progress,
+        std::slice::from_ref(&f.item),
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+        None,
+        Some(UnsettledUploadCause::Shed),
+        None,
+        Default::default(),
+    )
+    .expect("an unsaved ledger rebind does not refuse the partial checkpoint");
+}
+
+#[test]
+fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
+    let f = AckFixture::new(true);
+    for revision in 0..20 {
+        let (committed, mut progress) = f.load();
+        let name = format!("vanished-{revision}");
+        AckFixture::write_source(&f.sources, &name);
+        let mut indexed = committed.clone();
+        let scan = AckFixture::scan(&f.sources, &mut indexed);
+        assert!(scan.census_complete);
+        assert_eq!(scan.snapshots.len(), 1);
+        let fingerprint = scan.snapshots[0].snapshot_fingerprint.clone();
+        let body = snapshot_upload_body_witness(&scan.snapshots[0]);
+        f.upload(&mut progress, &scan.snapshots, exact_ack).unwrap();
+        settle_index_after_upload(&mut indexed, &committed, &progress);
+        indexed.save_fixture(&f.index_path).unwrap();
+        // Retain the real saved ACK across restart before cycle cleanup. The
+        // file subsequently vanishes while its containing scan root stays live.
+        drop(indexed);
+        drop(progress);
+        let (committed, mut progress) = f.load();
+        assert!(committed.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(progress.accepted_body_witnesses[&fingerprint], body);
+        assert!(progress.accepted_fingerprints.len() <= 2);
+        std::fs::remove_file(f.sources.join(format!("{name}.jsonl"))).unwrap();
+        let mut selected = committed.clone();
+        let empty = AckFixture::scan(&f.sources, &mut selected);
+        assert!(
+            empty.census_complete,
+            "one complete census is the retirement bound"
+        );
+        assert!(
+            empty.snapshots.is_empty(),
+            "live accepted sibling needs no new body"
+        );
+        assert!(!selected
+            .upload_progress_ack_incidence()
+            .any(|fp| fp == fingerprint));
+        let retired = progress.retired_ack_candidates(&committed, &selected);
+        assert!(retired.contains(&fingerprint));
+        // Neither omitted input nor the tentative index may erase durable ACKs.
+        f.upload(&mut progress, &empty.snapshots, |_| {
+            panic!("empty delta must not POST")
+        })
+        .unwrap();
+        assert_eq!(f.load().1.accepted_body_witnesses[&fingerprint], body);
+        settle_index_after_upload(&mut selected, &committed, &progress);
+        selected.save_fixture(&f.index_path).unwrap();
+        let selected = ScanIndex::load(&f.index_path).unwrap();
+        assert!(!selected.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert!(selected.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        progress.retire_acks_after_index_save(&selected, &retired, &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        let (saved, progress) = f.load();
+        f.assert_identity(&saved);
+        assert!(
+            progress.accepted_fingerprints.is_empty(),
+            "no retired revision accumulates"
+        );
+        assert!(!progress.accepted_body_witnesses.contains_key(&fingerprint));
+        assert_eq!(saved.current_snapshot_fingerprints().len(), 1);
+        assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+    }
+}
+
+#[test]
+fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures() {
+    // Size is not a bound: capacity follows the entity count.
+    const ENTITIES: usize = 50;
+    for failure in ["crash", "progress_cas", "index_cas"] {
+        let scratch = crate::test_scratch::ScratchDir::new("ack-retirement-crash");
+        let mut progress = test_upload_progress();
+        let namespace = progress.destination_namespace_hash.clone();
+        let mut committed = ScanIndex::default();
+        for entity in 0..ENTITIES {
+            let fp = format!("{entity:064x}");
+            committed.file_snapshot_fingerprints.insert(
+                format!("session-{entity}.jsonl"),
+                BTreeSet::from([fp.clone()]),
+            );
+            progress.record_body(&fp, &fp);
+        }
+        committed.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        let unindexed = "f".repeat(64);
+        progress.record_body(&unindexed, &"a".repeat(64));
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+            SnapshotSource::Codex,
+            &mut committed,
+            &scratch,
+            &namespace,
+        );
+        committed.save_fixture(&index_path).unwrap();
+        let (progress_path, mut progress) =
+            super::routed_progress(&committed, &index_path, progress);
+        progress.save(&progress_path).unwrap();
+        let load = |index: &ScanIndex| {
+            super::load_routed_progress(index, &index_path, &namespace, test_quarantine_witness())
+        };
+        progress.configure_ack_capacity(&committed);
+        assert_eq!(progress.ack_capacity, ENTITIES + 4096);
+        let mut selected = committed.clone();
+        selected.file_snapshot_fingerprints.clear();
+        progress
+            .stage_ack_retirement_handoff(&committed, &mut selected, &BTreeSet::new())
+            .unwrap();
+        // An unsaved future generation cannot authorize cleanup.
+        assert!(progress.saved_retirement_candidates(&selected).is_empty());
+        selected.save_fixture(&index_path).unwrap();
+        assert_eq!(
+            ScanIndex::load(&index_path)
+                .unwrap()
+                .upload_ack_retirement_handoff
+                .as_ref()
+                .unwrap()
+                .bodies
+                .len(),
+            ENTITIES
+        );
+        drop((committed, selected, progress)); // crash before any progress cleanup
+
+        let mut saved = ScanIndex::load(&index_path).unwrap();
+        let mut progress = load(&saved);
+        progress.configure_ack_capacity(&saved);
+        assert_eq!(progress.accepted_fingerprints.len(), ENTITIES + 1);
+        assert_eq!(progress.ack_capacity, 4096);
+        // Handed-off ACKs no longer grant slots: one past the 4096 headroom stops.
+        assert!(progress.admit_ack_batch(4096 - ENTITIES).is_err());
+        if failure == "progress_cas" {
+            // A concurrent writer saves a changed ledger first.
+            let mut concurrent = progress.clone();
+            concurrent
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
+            concurrent.save(&progress_path).unwrap();
+            assert!(progress
+                .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
+                .is_err());
+            assert_eq!(
+                progress.accepted_fingerprints.len(),
+                ENTITIES + 1,
+                "failed cleanup restores memory"
+            );
+            assert_eq!(load(&saved).accepted_fingerprints.len(), ENTITIES + 1);
+            assert!(ScanIndex::load(&index_path)
+                .unwrap()
+                .upload_ack_retirement_handoff
+                .is_some());
+        } else if failure == "index_cas" {
+            let mut concurrent = saved.clone();
+            concurrent.save_fixture(&index_path).unwrap();
+            assert!(progress
+                .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
+                .is_err());
+            assert_eq!(load(&saved).accepted_fingerprints.len(), 1);
+            assert!(ScanIndex::load(&index_path)
+                .unwrap()
+                .upload_ack_retirement_handoff
+                .is_some());
+        }
+        // Restart after either failure, too. No absent-input eviction is used.
+        let mut saved = ScanIndex::load(&index_path).unwrap();
+        let mut progress = load(&saved);
+        if failure == "index_cas" {
+            // Cleanup is already visible, but proof consumption still needs a
+            // successful progress save. A stale generation must keep authority.
+            let mut concurrent = progress.clone();
+            concurrent
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
+            concurrent.save(&progress_path).unwrap();
+            // Native rows compare the stored generation only when a page
+            // writes: an unchanged page opens no transaction. Give the stale
+            // ledger a page so its barrier save reaches the generation check.
+            // This proves a stale ledger with a page refuses, not a stale
+            // no-op; native writers are process-exclusive, so a concurrent
+            // no-op writer cannot occur in production.
+            progress
+                .accepted_cache_heads
+                .insert(cache_session_key("stale"), "d".repeat(64));
+            assert!(progress
+                .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path,)
+                .is_err());
+            assert!(ScanIndex::load(&index_path)
+                .unwrap()
+                .upload_ack_retirement_handoff
+                .is_some());
+            progress = load(&saved);
+            saved = ScanIndex::load(&index_path).unwrap();
+        }
+        progress
+            .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
+            .unwrap();
+        progress.configure_ack_capacity(&saved);
+        assert_eq!(
+            progress.accepted_fingerprints,
+            BTreeSet::from([unindexed.clone()])
+        );
+        assert_eq!(progress.accepted_body_witnesses[&unindexed], "a".repeat(64));
+        assert_eq!(progress.ack_capacity, 4096);
+        assert!(ScanIndex::load(&index_path)
+            .unwrap()
+            .upload_ack_retirement_handoff
+            .is_none());
+        let unrelated = "e".repeat(64);
+        let mut attempts = 0;
+        upload_resumable_batches(
+            std::slice::from_ref(&unrelated),
+            &unique_poison_scope(),
+            &mut progress,
+            &mut 0,
+            String::as_str,
+            |batch| {
+                attempts += 1;
+                Ok(accept_fingerprints(batch))
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(load(&saved).accepted_fingerprints.contains(&unrelated));
+    }
+}
+
+#[test]
+fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protections() {
+    for mode in [
+        "retire",
+        "destination",
+        "future_generation",
+        "new_body",
+        "current",
+        "carried",
+        "unknown",
+        "held",
+        "relogin",
+    ] {
+        let mut f = AckFixture::native(true);
+        let (committed, mut progress) = f.load();
+        let mut selected = committed.clone();
+        selected.files.clear();
+        selected.file_snapshot_fingerprints.clear();
+        progress
+            .stage_ack_retirement_handoff(&committed, &mut selected, &BTreeSet::new())
+            .unwrap();
+        match mode {
+            "destination" => {
+                selected
+                    .upload_ack_retirement_handoff
+                    .as_mut()
+                    .unwrap()
+                    .destination_namespace_hash = "d".repeat(64)
+            }
+            "future_generation" => {
+                selected
+                    .upload_ack_retirement_handoff
+                    .as_mut()
+                    .unwrap()
+                    .committed_generation += 1
+            }
+            "new_body" => {
+                progress.record_body(&f.item.snapshot_fingerprint, &"b".repeat(64));
+                progress.save(&f.progress_path).unwrap();
+            }
+            "current" => {
+                selected.file_snapshot_fingerprints.insert(
+                    "shared.jsonl".into(),
+                    BTreeSet::from([f.item.snapshot_fingerprint.clone()]),
+                );
+            }
+            "carried" => {
+                let mut value = serde_json::to_value(&selected).unwrap();
+                value["accepted_rebuild_incidence"] =
+                    serde_json::json!({"carry.jsonl":[f.item.snapshot_fingerprint.clone()]});
+                selected = serde_json::from_value(value).unwrap();
+            }
+            _ => {}
+        }
+        selected.save_fixture(&f.index_path).unwrap();
+        if matches!(mode, "unknown" | "held") {
+            let mut value = serde_json::to_value(&selected).unwrap();
+            if mode == "unknown" {
+                value["files"] = serde_json::json!({"unknown.jsonl":{"size_bytes":"bad"}});
+            } else {
+                value["quarantined_snapshot_fingerprints"] =
+                    serde_json::json!({f.item.snapshot_fingerprint.clone():{"disposition":"bad"}});
+            }
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&value).unwrap(),
+            );
+        }
+        if mode == "relogin" {
+            // Crash after the handoff; restart after a re-login A→B→C.
+            f.namespace = crate::snapshot_sync::relogin_namespace(&f.namespace, 2);
+        }
+        let (mut saved, mut progress) = f.load();
+        progress
+            .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
+            .unwrap();
+        assert_eq!(
+            f.load()
+                .1
+                .accepted_fingerprints
+                .contains(&f.item.snapshot_fingerprint),
+            !matches!(mode, "retire" | "relogin"),
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
+    let f = AckFixture::new(false);
+    let (mut index, mut progress) = f.load();
+    for entity in 0..5000 {
+        index.file_snapshot_fingerprints.insert(
+            format!("live-{entity}.jsonl"),
+            BTreeSet::from([format!("{entity:064x}")]),
+        );
+    }
+    for entity in 5000..9095 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    index.save_fixture(&f.index_path).unwrap();
+    progress.save(&f.progress_path).unwrap();
+    let (_, progress) = f.load();
+    assert_eq!(progress.ack_capacity, 4096);
+    assert!(progress.admit_ack_batch(1).is_ok());
+    assert!(progress.admit_ack_batch(2).is_err());
+}
+
+#[test]
+fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrelated_input() {
+    let f = AckFixture::new(false);
+    let (index, mut progress) = f.load();
+    for entity in 0..4096 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    progress.save(&f.progress_path).unwrap();
+    let mut unrelated = f.item.clone();
+    unrelated.snapshot_fingerprint = "e".repeat(64);
+    unrelated.source_session_id = "unrelated".into();
+    let input = vec![f.item.clone(), unrelated];
+    for _ in 0..2 {
+        // Repeated admission must not accumulate reservations or debt credit.
+        let mut page = input.clone();
+        let limited = progress.admit_upload_input(&mut page, &index).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].snapshot_fingerprint, f.item.snapshot_fingerprint);
+        assert_eq!(limited.deferred_entity_count, 1);
+        assert_eq!(progress.ack_capacity, 4097);
+    }
+    let mut page = input;
+    progress.admit_upload_input(&mut page, &index).unwrap();
+    let mut attempts = 0;
+    f.upload(&mut progress, &page, |batch| {
+        attempts += 1;
+        exact_ack(batch)
+    })
+    .unwrap();
+    assert_eq!(attempts, 1);
+    let (index, progress) = f.load();
+    f.assert_ack(&progress);
+    assert_eq!(progress.accepted_fingerprints.len(), 4097);
+    assert_eq!(progress.ack_capacity, 4097);
+    assert_eq!(index.upload_progress_ack_incidence().count(), 1);
+}
+
+#[test]
+fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
+    for mode in ["opaque", "entity_hold", "local_hold"] {
+        let f = AckFixture::native(true);
+        let (committed, progress) = f.load();
+        let mut selected = committed.clone();
+        selected.files.clear();
+        selected.file_snapshot_fingerprints.clear();
+        if mode != "local_hold" {
+            let mut raw = serde_json::to_value(&selected).unwrap();
+            if mode == "opaque" {
+                raw["files"] = serde_json::json!({"damaged.jsonl":{"size_bytes":"bad"}});
+            } else {
+                raw["quarantined_snapshot_fingerprints"] =
+                    serde_json::json!({f.item.snapshot_fingerprint.clone():{"disposition":"bad"}});
+            }
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&raw).unwrap(),
+            );
+            selected = ScanIndex::load(&f.index_path).unwrap();
+        }
+        let held = if mode == "local_hold" {
+            BTreeSet::from([f.item.snapshot_fingerprint.clone()])
+        } else {
+            BTreeSet::new()
+        };
+        progress
+            .stage_ack_retirement_handoff(&committed, &mut selected, &held)
+            .unwrap();
+        assert!(selected
+            .upload_ack_retirement_handoff
+            .as_ref()
+            .unwrap()
+            .bodies
+            .is_empty());
+        assert_eq!(
+            selected
+                .upload_ack_retirement_handoff
+                .as_ref()
+                .unwrap()
+                .pending_bodies
+                .len(),
+            1
+        );
+        selected.save_fixture(&f.index_path).unwrap();
+        let (mut protected, mut progress) = f.load();
+        progress
+            .recover_ack_retirement_handoff(&mut protected, &f.index_path, &f.progress_path)
+            .unwrap();
+        f.assert_ack(&f.load().1);
+        // Saving again while the protection remains cannot forget the obligation.
+        let mut again = protected.clone();
+        progress
+            .stage_ack_retirement_handoff(&protected, &mut again, &held)
+            .unwrap();
+        again.save_fixture(&f.index_path).unwrap();
+        let (previous, mut progress) = f.load();
+        // A later clean selection resolves the hold/opaque census. It has no
+        // historical incidence left: only the persisted obligation can retire.
+        // Repair the synthetic damage and reload through the real decoder.
+        // A fresh default index is rightly refused by the CAS repair guard.
+        let mut repaired = serde_json::to_value(&previous).unwrap();
+        repaired["files"] = serde_json::json!({});
+        repaired["quarantined_snapshot_fingerprints"] = serde_json::json!({});
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &f.index_path,
+            &serde_json::to_vec(&repaired).unwrap(),
+        );
+        let mut clean = ScanIndex::load(&f.index_path).unwrap();
+        progress
+            .stage_ack_retirement_handoff(&previous, &mut clean, &BTreeSet::new())
+            .unwrap();
+        assert_eq!(
+            clean
+                .upload_ack_retirement_handoff
+                .as_ref()
+                .unwrap()
+                .bodies
+                .len(),
+            1
+        );
+        clean.save_fixture(&f.index_path).unwrap();
+        let mut saved = ScanIndex::load(&f.index_path).unwrap();
+        progress
+            .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
+            .unwrap();
+        assert!(f.load().1.accepted_fingerprints.is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
+    let mut f = AckFixture::new(false);
+    f.progress_path = snapshot_upload_progress_path(&f.index_path);
+    let (committed, mut progress) = f.load_native();
+    // F has two unsettled siblings. Only one was accepted before an error;
+    // partial settlement therefore cannot commit the file.
+    let mut first = f.item.clone();
+    first.snapshot_fingerprint = "d".repeat(64);
+    let mut second = first.clone();
+    second.snapshot_fingerprint = "e".repeat(64);
+    let mut working = committed.clone();
+    let key = working.files.keys().next().unwrap().clone();
+    working.file_snapshot_fingerprints.insert(
+        key,
+        BTreeSet::from([
+            first.snapshot_fingerprint.clone(),
+            second.snapshot_fingerprint.clone(),
+        ]),
+    );
+    f.upload(&mut progress, std::slice::from_ref(&first), exact_ack)
+        .unwrap();
+    let mut empty_previous = ScanIndex::default();
+    empty_previous.generation = committed.generation;
+    empty_previous.retain_persistence_baseline_from(&committed);
+    let saved = checkpoint_partial_snapshot_index(
+        &working,
+        &empty_previous,
+        &progress,
+        &[first.clone(), second],
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(!saved
+        .upload_progress_ack_incidence()
+        .any(|fp| fp == first.snapshot_fingerprint));
+    assert!(f
+        .load_native()
+        .1
+        .accepted_fingerprints
+        .contains(&first.snapshot_fingerprint));
+    std::fs::remove_file(f.sources.join("held.jsonl")).unwrap();
+    let (previous, progress) = f.load_native();
+    let mut scanned = previous.clone();
+    let scan = AckFixture::scan(&f.sources, &mut scanned);
+    assert!(scan.census_complete);
+    assert!(scan.snapshots.is_empty());
+    let absent = progress.complete_census_ack_retirements(&scanned, false);
+    assert!(
+        absent.is_empty(),
+        "incomplete census is not retirement evidence"
+    );
+    let absent = progress.complete_census_ack_retirements(&scanned, scan.census_complete);
+    assert!(absent.contains(&first.snapshot_fingerprint));
+    progress
+        .stage_ack_retirement_handoff_with_census(
+            &previous,
+            &mut scanned,
+            &BTreeSet::new(),
+            &absent,
+        )
+        .unwrap();
+    assert!(progress.saved_retirement_candidates(&scanned).is_empty());
+    scanned.save_fixture(&f.index_path).unwrap();
+    drop((scanned, progress)); // ordinary error/return after the index save
+    let (mut saved, mut progress) = f.load_native();
+    progress
+        .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
+        .unwrap();
+    assert!(f.load_native().1.accepted_fingerprints.is_empty());
+}
+
+#[test]
+fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
+    let f = AckFixture::native(false);
+    let (previous, mut progress) = f.load();
+    for entity in 0..5000 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    progress.save(&f.progress_path).unwrap();
+    progress.configure_ack_capacity(&previous);
+    assert_eq!(progress.retained_stale_ack_count, 5000);
+    assert!(progress.admit_ack_batch(1).is_err());
+    // The real scanner's complete census includes the unrelated live file;
+    // even partial settlement may retire only ACKs absent from THAT census.
+    let mut scanned = previous.clone();
+    let scan = AckFixture::scan(&f.sources, &mut scanned);
+    assert!(scan.census_complete);
+    let absent = progress.complete_census_ack_retirements(&scanned, true);
+    assert_eq!(absent.len(), 5000);
+    let mut selected = checkpoint_partial_snapshot_index(
+        &scanned,
+        &previous,
+        &progress,
+        &scan.snapshots,
+        Some(&scan),
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        selected
+            .upload_ack_retirement_handoff
+            .as_ref()
+            .unwrap()
+            .bodies
+            .len(),
+        5000
+    );
+    progress
+        .recover_ack_retirement_handoff(&mut selected, &f.index_path, &f.progress_path)
+        .unwrap();
+    let (saved, mut progress) = f.load();
+    assert!(progress.accepted_fingerprints.is_empty());
+    assert_eq!(progress.retained_stale_ack_count, 0);
+    let mut items = vec![f.item.clone()];
+    assert!(progress.admit_upload_input(&mut items, &saved).is_none());
+    let mut attempts = 0;
+    f.upload(&mut progress, &items, |batch| {
+        attempts += 1;
+        exact_ack(batch)
+    })
+    .unwrap();
+    assert_eq!(attempts, 1);
+    f.assert_ack(&f.load().1);
+}
+
+#[test]
+fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
+    let f = AckFixture::new(false);
+    let (mut scanned, mut progress) = f.load();
+    let mut items = (0..4100)
+        .map(|entity| {
+            let mut item = f.item.clone();
+            item.source_session_id = format!("first-install-{entity}");
+            item.snapshot_fingerprint = format!("{entity:064x}");
+            scanned.file_snapshot_fingerprints.insert(
+                format!("{}.jsonl", item.source_session_id),
+                BTreeSet::from([item.snapshot_fingerprint.clone()]),
+            );
+            item
+        })
+        .collect::<Vec<_>>();
+    scanned.save_fixture(&f.index_path).unwrap();
+    let scanned = ScanIndex::load(&f.index_path).unwrap();
+    assert!(!scanned.accepted_snapshot_fingerprint_recorded(&items[0].snapshot_fingerprint));
+    assert!(progress.admit_upload_input(&mut items, &scanned).is_none());
+    assert_eq!(items.len(), 4100);
+    assert_eq!(progress.retained_stale_ack_count, 0);
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        exact_ack,
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap();
+    assert!(matches!(
+        ack_retention::require_settlement(result, None, &progress).unwrap(),
+        ResumableUploadResult::Completed
+    ));
+    assert_eq!(
+        accepted, 4100,
+        "one normal first-install pass, no capacity backoff"
+    );
+    assert_eq!(f.load().1.accepted_fingerprints.len(), 4100);
+}
+
+#[test]
+fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
+    let f = AckFixture::native(false);
+    let (committed, mut progress) = f.load();
+    let mut item = f.item.clone();
+    item.cache_observations = pending_head_index_item().1.cache_observations;
+    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false);
+    let probe = cache_head_probe(&item);
+    assert_ne!(
+        snapshot_upload_body_witness(&item),
+        snapshot_upload_body_witness(&probe)
+    );
+    progress.record_body(
+        &probe.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&probe),
+    );
+    for entity in 0..5001 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    progress.save(&f.progress_path).unwrap();
+    progress.configure_ack_capacity(&committed);
+    let generation = progress.generation;
+    assert_eq!(progress.accepted_fingerprints.len(), 5002);
+    let error = bootstrap_cache_heads_with_budget(
+        std::slice::from_ref(&probe),
+        &unique_poison_scope(),
+        &mut progress,
+        &mut InplaceRetryBudget::default(),
+        |_, _| panic!("full-cap reoffer must not POST"),
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap_err();
+    assert!(error
+        .downcast_ref::<ack_retention::AckSettlementRequired>()
+        .is_some());
+    assert_eq!(progress.generation, generation);
+    assert_eq!(
+        progress.accepted_body_witnesses,
+        f.load().1.accepted_body_witnesses,
+        "resumed exact probe ACK must remain present before partial checkpoint CAS"
+    );
+    let mut scanned = committed.clone();
+    let mut scan = AckFixture::scan(&f.sources, &mut scanned);
+    assert!(scan.census_complete);
+    scan.snapshots = vec![item];
+    let saved = checkpoint_partial_snapshot_index(
+        &scanned,
+        &committed,
+        &progress,
+        &scan.snapshots,
+        Some(&scan),
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .expect("partial durable equality and retirement commit must succeed");
+    progress
+        .release_acks_after_partial_index_save(
+            &f.progress_path,
+            &committed,
+            &saved,
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+    let (_, mut progress) = f.load();
+    assert_eq!(progress.accepted_fingerprints.len(), 1);
+    assert!(progress
+        .accepted_fingerprints
+        .contains(&probe.snapshot_fingerprint));
+    let mut attempts = 0;
+    bootstrap_cache_heads_with_budget(
+        std::slice::from_ref(&probe),
+        &unique_poison_scope(),
+        &mut progress,
+        &mut InplaceRetryBudget::default(),
+        |batch, _| {
+            attempts += 1;
+            let mut response = exact_ack(batch)?;
+            for entity in &mut response.accepted_entities {
+                entity.head_etag = Some("a".repeat(64));
+            }
+            Ok(response)
+        },
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "live re-offer succeeds once stale debt is durably retired"
+    );
+    assert_eq!(
+        f.load().1.accepted_cache_heads[&cache_session_key(&probe.source_session_id)],
+        "a".repeat(64)
+    );
+}
+
+// An obligation left by a held save reappears in a new file whose
+// sibling has not settled. The partial subset omits that file; the full scan
+// still references it, so the obligation stays pending and the ACK stays.
+#[test]
+fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
+    let f = AckFixture::new(true);
+    let (committed, progress) = f.load();
+    let entry = committed.files.values().next().unwrap().clone();
+    let mut selected = committed.clone();
+    selected.files.clear();
+    selected.file_snapshot_fingerprints.clear();
+    let held = BTreeSet::from([f.item.snapshot_fingerprint.clone()]);
+    progress
+        .stage_ack_retirement_handoff(&committed, &mut selected, &held)
+        .unwrap();
+    assert_eq!(
+        selected
+            .upload_ack_retirement_handoff
+            .as_ref()
+            .unwrap()
+            .pending_bodies
+            .len(),
+        1
+    );
+    selected.save_fixture(&f.index_path).unwrap();
+    let (previous, mut progress) = f.load();
+    let mut sibling = f.item.clone();
+    sibling.source_session_id = "unsettled-sibling".into();
+    sibling.snapshot_fingerprint = "d".repeat(64);
+    let mut working = previous.clone();
+    working.files.insert("moved.jsonl".into(), entry);
+    working.file_snapshot_fingerprints.insert(
+        "moved.jsonl".into(),
+        BTreeSet::from([
+            f.item.snapshot_fingerprint.clone(),
+            sibling.snapshot_fingerprint.clone(),
+        ]),
+    );
+    let items = [f.item.clone(), sibling.clone()];
+    let saved = checkpoint_partial_snapshot_index(
+        &working,
+        &previous,
+        &progress,
+        &items,
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !saved
+            .upload_progress_ack_incidence()
+            .any(|fp| fp == f.item.snapshot_fingerprint),
+        "the committable subset omits the unsettled new file"
+    );
+    let handoff = saved.upload_ack_retirement_handoff.as_ref().unwrap();
+    assert!(!handoff.bodies.contains_key(&f.item.snapshot_fingerprint));
+    assert!(handoff
+        .pending_bodies
+        .contains_key(&f.item.snapshot_fingerprint));
+    let referenced = progress.ack_retirement_scan_references(&previous, &working);
+    progress
+        .release_acks_after_partial_index_save_with_scan(
+            &f.progress_path,
+            &previous,
+            &saved,
+            &referenced,
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+    f.assert_ack(&f.load().1);
+    // The next preparation replays the saved handoff before admission.
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    f.assert_ack(&f.load().1);
+    let (_, mut progress) = f.load();
+    let mut offered = Vec::new();
+    f.upload(&mut progress, &items, |batch| {
+        offered.extend(batch.iter().map(|item| item.snapshot_fingerprint.clone()));
+        exact_ack(batch)
+    })
+    .unwrap();
+    assert_eq!(
+        offered,
+        vec![sibling.snapshot_fingerprint.clone()],
+        "the retained exact ACK is not re-sent"
+    );
+
+    // "kept" alone would allow a forever-kept ACK. The
+    // pending obligation is persisted across recovery, and adopting the
+    // settled containing file then retires the exact ACK.
+    let (previous, mut progress) = f.load();
+    let handoff = previous
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .expect("the pending retirement obligation is persisted");
+    assert_eq!(
+        handoff.pending_bodies.get(&f.item.snapshot_fingerprint),
+        Some(&snapshot_upload_body_witness(&f.item))
+    );
+    assert!(!handoff.bodies.contains_key(&f.item.snapshot_fingerprint));
+    let mut moved = working.files["moved.jsonl"].clone();
+    moved.last_upload_body_witness = Some(body_set_witness(&[
+        snapshot_upload_body_witness(&f.item),
+        snapshot_upload_body_witness(&sibling),
+    ]));
+    let mut settled = previous.clone();
+    settled.files.insert("moved.jsonl".into(), moved);
+    settled.file_snapshot_fingerprints.insert(
+        "moved.jsonl".into(),
+        BTreeSet::from([
+            f.item.snapshot_fingerprint.clone(),
+            sibling.snapshot_fingerprint.clone(),
+        ]),
+    );
+    let referenced = progress.ack_retirement_scan_references(&previous, &settled);
+    settle_index_after_upload(&mut settled, &previous, &progress);
+    let mut retired = progress
+        .stage_selected_ack_retirement(
+            &previous,
+            &mut settled,
+            &referenced,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    settled.save_fixture(&f.index_path).unwrap();
+    let saved = ScanIndex::load(&f.index_path).unwrap();
+    retired.extend(progress.saved_retirement_candidates(&saved));
+    progress.retire_acks_after_index_save(&saved, &retired, &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    let (saved, progress) = f.load();
+    assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+    assert!(
+        !progress
+            .accepted_fingerprints
+            .contains(&f.item.snapshot_fingerprint),
+        "adopting the settled file retires the exact ACK"
+    );
+    assert!(
+        progress.accepted_fingerprints.is_empty(),
+        "the sibling ACK transfers with its file"
+    );
+    let still_pending = saved.upload_ack_retirement_handoff.as_ref().map(|handoff| {
+        handoff
+            .pending_bodies
+            .contains_key(&f.item.snapshot_fingerprint)
+    });
+    assert_ne!(still_pending, Some(true), "the obligation is discharged");
+    f.assert_identity(&saved);
+}
+
+// Committed-incidence variant: E leaves its settled file for a new
+// file with an unsettled sibling. Committed incidence minus the committable
+// subset names E, but the full scan still references it.
+#[test]
+fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_file() {
+    let f = AckFixture::native(true);
+    let (committed, mut progress) = f.load();
+    let key = committed.files.keys().next().unwrap().clone();
+    let entry = committed.files[&key].clone();
+    let mut replacement = f.item.clone();
+    replacement.source_session_id = "replacement".into();
+    replacement.snapshot_fingerprint = "d".repeat(64);
+    let mut sibling = f.item.clone();
+    sibling.source_session_id = "unsettled-sibling".into();
+    sibling.snapshot_fingerprint = "e".repeat(64);
+    f.upload(&mut progress, std::slice::from_ref(&replacement), exact_ack)
+        .unwrap();
+    let mut working = committed.clone();
+    working.file_snapshot_fingerprints.insert(
+        key,
+        BTreeSet::from([replacement.snapshot_fingerprint.clone()]),
+    );
+    working.files.insert("moved.jsonl".into(), entry);
+    working.file_snapshot_fingerprints.insert(
+        "moved.jsonl".into(),
+        BTreeSet::from([
+            f.item.snapshot_fingerprint.clone(),
+            sibling.snapshot_fingerprint.clone(),
+        ]),
+    );
+    let items = [f.item.clone(), replacement, sibling];
+    let saved = checkpoint_partial_snapshot_index(
+        &working,
+        &committed,
+        &progress,
+        &items,
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(!saved
+        .upload_progress_ack_incidence()
+        .any(|fp| fp == f.item.snapshot_fingerprint));
+    assert!(
+        progress
+            .retired_ack_candidates(&committed, &saved)
+            .contains(&f.item.snapshot_fingerprint),
+        "the committable subset alone would look like an absence proof"
+    );
+    assert!(!saved
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.bodies.contains_key(&f.item.snapshot_fingerprint)));
+    let referenced = progress.ack_retirement_scan_references(&committed, &working);
+    progress
+        .release_acks_after_partial_index_save_with_scan(
+            &f.progress_path,
+            &committed,
+            &saved,
+            &referenced,
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+    f.assert_ack(&f.load().1);
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    f.assert_ack(&f.load().1);
+
+    // The pending obligation is persisted across
+    // recovery; when the new file vanishes before it settled, a complete
+    // census proves E absent and retires the exact ACK.
+    let (previous, mut progress) = f.load();
+    let handoff = previous
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .expect("the pending retirement obligation is persisted");
+    assert_eq!(
+        handoff.pending_bodies.get(&f.item.snapshot_fingerprint),
+        Some(&snapshot_upload_body_witness(&f.item))
+    );
+    assert!(!handoff.bodies.contains_key(&f.item.snapshot_fingerprint));
+    let mut clean = previous.clone();
+    assert!(!progress
+        .complete_census_ack_retirements(&clean, false)
+        .contains(&f.item.snapshot_fingerprint));
+    let absent = progress.complete_census_ack_retirements(&clean, true);
+    assert!(absent.contains(&f.item.snapshot_fingerprint));
+    let referenced = progress.ack_retirement_scan_references(&previous, &clean);
+    assert!(!referenced.contains(&f.item.snapshot_fingerprint));
+    let mut retired = progress
+        .stage_selected_ack_retirement(
+            &previous,
+            &mut clean,
+            &referenced,
+            &BTreeSet::new(),
+            &absent,
+        )
+        .unwrap();
+    clean.save_fixture(&f.index_path).unwrap();
+    retired.extend(progress.saved_retirement_candidates(&clean));
+    assert!(retired.contains(&f.item.snapshot_fingerprint));
+    progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    let (saved, progress) = f.load();
+    assert!(
+        !progress
+            .accepted_fingerprints
+            .contains(&f.item.snapshot_fingerprint),
+        "a complete-census absence proof retires the exact ACK"
+    );
+    let still_pending = saved.upload_ack_retirement_handoff.as_ref().map(|handoff| {
+        handoff
+            .pending_bodies
+            .contains_key(&f.item.snapshot_fingerprint)
+    });
+    assert_ne!(still_pending, Some(true), "the obligation is discharged");
+    f.assert_identity(&saved);
+}
+
+fn body_set_witness(bodies: &[String]) -> String {
+    let mut bodies = bodies.iter().map(String::as_str).collect::<Vec<_>>();
+    bodies.sort_unstable();
+    bodies.dedup();
+    let mut digest = Sha256::new();
+    for bytes in std::iter::once(b"snapshot_file_upload_body_set:v1".as_slice())
+        .chain(bodies.iter().map(|body| body.as_bytes()))
+    {
+        digest.update((bytes.len() as u32).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+// One file has more entities than the unsettled
+// limit, unrelated debt already fills that limit, and a page fails mid-file.
+// Admission is per entity and settlement per file; the file must still settle.
+// A local hold on sibling H makes the Completed-with-holds and the
+// Deferred/Rejected-with-holds selections omit a new file that still holds
+// pending E. The common selected save must keep E's obligation pending and
+// its exact ACK suppressed until a valid absence proof (or adoption).
+#[test]
+fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_references() {
+    for outcome in ["completed", "deferred", "rejected"] {
+        let f = AckFixture::new(true);
+        let (committed, progress) = f.load();
+        let entry = committed.files.values().next().unwrap().clone();
+        let mut selected = committed.clone();
+        selected.files.clear();
+        selected.file_snapshot_fingerprints.clear();
+        progress
+            .stage_ack_retirement_handoff(
+                &committed,
+                &mut selected,
+                &BTreeSet::from([f.item.snapshot_fingerprint.clone()]),
+            )
+            .unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
+        let (previous, mut progress) = f.load();
+        let held_sibling = "d".repeat(64);
+        let mut working = previous.clone();
+        working.files.insert("moved.jsonl".into(), entry);
+        working.file_snapshot_fingerprints.insert(
+            "moved.jsonl".into(),
+            BTreeSet::from([f.item.snapshot_fingerprint.clone(), held_sibling.clone()]),
+        );
+        let held = BTreeSet::from([held_sibling]);
+        let holds = LocalHoldSettlement {
+            held_entity_count: 1,
+            retry_pending_family_count: 0,
+            held_fingerprints: held.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: true,
+        };
+        // Finish captures the references before any selection.
+        let referenced = progress.ack_retirement_scan_references(&previous, &working);
+        assert_eq!(
+            referenced,
+            BTreeSet::from([f.item.snapshot_fingerprint.clone()])
+        );
+        let settlement = match outcome {
+            "completed" => settle_completed_upload(working, &previous, &progress, &holds),
+            other => settle_checkpointed_upload(
+                working,
+                &previous,
+                &progress,
+                &holds,
+                other == "rejected",
+                UnsettledUploadCause::DeferredConflict,
+            ),
+        };
+        assert!(!settlement.fully_settled, "{outcome}");
+        let mut selected = settlement.index;
+        assert!(
+            !selected
+                .upload_progress_ack_incidence()
+                .any(|fp| fp == f.item.snapshot_fingerprint),
+            "{outcome}: the selection omits the still-live new file"
+        );
+        settle_index_after_upload(&mut selected, &previous, &progress);
+        let mut retired = progress
+            .stage_selected_ack_retirement(
+                &previous,
+                &mut selected,
+                &referenced,
+                &held,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        let handoff = selected.upload_ack_retirement_handoff.as_ref().unwrap();
+        assert!(
+            !handoff.bodies.contains_key(&f.item.snapshot_fingerprint),
+            "{outcome}"
+        );
+        assert!(
+            handoff
+                .pending_bodies
+                .contains_key(&f.item.snapshot_fingerprint),
+            "{outcome}"
+        );
+        selected.save_fixture(&f.index_path).unwrap();
+        retired.extend(progress.saved_retirement_candidates(&selected));
+        assert!(!retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        progress.retire_acks_after_index_save(&selected, &retired, &held);
+        progress.finish_cycle(&f.progress_path).unwrap();
+        f.assert_ack(&f.load().1);
+        let (mut reloaded, mut progress) = f.load();
+        progress
+            .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+            .unwrap();
+        f.assert_ack(&f.load().1);
+
+        // The new file then vanishes before it ever settled. Only a complete
+        // census proves E's absence; that retires the exact ACK.
+        let (previous, mut progress) = f.load();
+        let mut clean = previous.clone();
+        assert!(progress
+            .complete_census_ack_retirements(&clean, false)
+            .is_empty());
+        let absent = progress.complete_census_ack_retirements(&clean, true);
+        assert!(absent.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        let referenced = progress.ack_retirement_scan_references(&previous, &clean);
+        assert!(referenced.is_empty(), "{outcome}");
+        let mut retired = progress
+            .stage_selected_ack_retirement(
+                &previous,
+                &mut clean,
+                &referenced,
+                &BTreeSet::new(),
+                &absent,
+            )
+            .unwrap();
+        clean.save_fixture(&f.index_path).unwrap();
+        retired.extend(progress.saved_retirement_candidates(&clean));
+        assert!(retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        assert!(
+            f.load().1.accepted_fingerprints.is_empty(),
+            "{outcome}: a valid absence proof retires the ACK"
+        );
+    }
+}
+
+// Production can reach the final ACK apply only with an
+// `AckRetirementPlan`, and no production code can make one from a plain set.
+// The compiler enforces this through the private field and `#[cfg(test)]`;
+// this pins those declarations so a refactor cannot quietly reopen the
+// raw-set bypass.
+#[test]
+fn production_ack_retirement_cannot_apply_a_plain_set() {
+    let module = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/snapshot_sync/ack_retention.rs"
+    ))
+    .expect("ACK retirement source");
+    let parent = std::fs::read_to_string(
+        if std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshot_sync/finish.rs"
+        ))
+        .exists()
+        {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync/finish.rs")
+        } else {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync.rs")
+        },
+    )
+    .expect("snapshot_sync source");
+    let production = &parent[..parent
+        .find("\n#[cfg(test)]\nmod tests {")
+        .unwrap_or(parent.len())];
+    assert!(
+        module.contains("pub(super) struct AckRetirementPlan(BTreeSet<String>);"),
+        "the plan field stays private to ack_retention"
+    );
+    for raw in [
+        "retire_acks_after_index_save(",
+        "saved_retirement_candidates(",
+        "retired_ack_candidates(",
+    ] {
+        assert!(
+            module.contains(&format!("#[cfg(test)]\n    pub(super) fn {raw}")),
+            "{raw} stays test-only"
+        );
+        assert!(
+            !production.contains(&format!(".{raw}")),
+            "production never calls {raw}"
+        );
+    }
+    assert!(production.contains(".retire_planned_acks_after_index_save("));
+    // Inside the module, only the scan-reference planner mints a plan.
+    let mut minted_by = BTreeSet::new();
+    for (at, _) in module.match_indices("AckRetirementPlan(") {
+        if module[..at].ends_with("struct ") {
+            continue;
+        }
+        let enclosing = module[..at].rfind("fn ").expect("enclosing fn") + 3;
+        let name = module[enclosing..]
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap();
+        minted_by.insert(name);
+    }
+    assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
+}
+
+// Frozen legacy bytes for size/encoder fixtures; native ACKs use routed_progress.
+fn bound_progress(progress_path: &Path, namespace: &str) -> SnapshotUploadProgress {
+    let mut progress = SnapshotUploadProgress::new(
+        namespace.into(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.save_legacy_fixture(progress_path, None).unwrap();
+    progress
+}
+/// [money] v2 db first crash retires only the committed exact handoff.
+#[test]
+fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-db-first");
+    let namespace = "a".repeat(64);
+    let fp = "b".repeat(64);
+    let body = "c".repeat(64);
+    // The empty committed graph owns the progress before the ACK page.
+    let mut saved = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        &mut saved,
+        &scratch,
+        &namespace,
+    );
+    saved.save_fixture(&index_path).unwrap();
+    let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    let (path, mut progress) = super::routed_progress(
+        &saved,
+        &index_path,
+        SnapshotUploadProgress::new(namespace.clone(), witness()),
+    );
+    progress.save(&path).unwrap();
+    progress.record_body(&fp, &body);
+    progress.save(&path).unwrap();
+    saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
+        destination_namespace_hash: namespace.clone(),
+        // The generation this save commits, as staging records it.
+        committed_generation: saved.generation + 1,
+        bodies: [(fp.clone(), body)].into(),
+        pending_bodies: BTreeMap::new(),
+    });
+    saved.save_fixture(&index_path).unwrap();
+    // Crash after source commit, before cleanup of the external progress ACK.
+    let mut loaded = super::load_routed_progress(&saved, &index_path, &namespace, witness());
+    loaded
+        .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
+        .unwrap();
+    assert!(loaded.accepted_fingerprints.is_empty());
+    assert!(saved.upload_ack_retirement_handoff.is_none());
+    let reloaded = super::load_routed_progress(&saved, &index_path, &namespace, witness());
+    assert!(reloaded.accepted_fingerprints.is_empty());
+}
+/// [money] v2 transport error and failed index commit never authorize an ack.
+#[test]
+fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-err");
+    let index_path = scratch.join("index");
+    let namespace = "a".repeat(64);
+    let mut baseline = ScanIndex::default();
+    let route = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        &mut baseline,
+        &scratch,
+        &namespace,
+    );
+    baseline.save_fixture(&route).unwrap();
+    let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    let (path, mut progress) = super::routed_progress(
+        &baseline,
+        &route,
+        SnapshotUploadProgress::new(namespace.clone(), witness()),
+    );
+    progress.save(&path).unwrap();
+    let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &[item],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |_| Err(anyhow!("synthetic transport failure")),
+        |state| state.save(&path),
+    );
+    assert!(result.is_err());
+    let loaded = super::load_routed_progress(&baseline, &route, &namespace, witness());
+    assert!(loaded.accepted_fingerprints.is_empty());
+    assert_eq!(accepted, 0);
+
+    progress.record_body(&"b".repeat(64), &"c".repeat(64));
+    progress.save(&path).unwrap();
+    let mut tentative = ScanIndex::default();
+    progress
+        .stage_ack_retirement_handoff_with_census(
+            &ScanIndex::default(),
+            &mut tentative,
+            &BTreeSet::new(),
+            &["b".repeat(64)].into(),
+        )
+        .unwrap();
+    std::fs::create_dir(&index_path).unwrap();
+    assert!(tentative.save_fixture(&index_path).is_err());
+    // Generation zero is not committed authority, even with a staged handoff.
+    progress
+        .recover_ack_retirement_handoff(&mut tentative, &index_path, &path)
+        .unwrap();
+    assert!(progress.accepted_fingerprints.contains(&"b".repeat(64)));
+}
+
+/// [regress] This pass's own unsaved progress merge no longer refuses a
+/// first-page-shed checkpoint; only a newer saved generation does, as in `save()`.
+#[test]
+fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
+    for concurrent_writer in [false, true] {
+        let f = AckFixture::new(false);
+        AckFixture::write_source(&f.sources, "owed");
+        let (committed, mut progress) = f.load();
+        let mut working = committed.clone();
+        let scan = AckFixture::scan(&f.sources, &mut working);
+        let acked = f.item.clone();
+        let owed = scan
+            .snapshots
+            .iter()
+            .find(|item| item.snapshot_fingerprint != acked.snapshot_fingerprint)
+            .unwrap()
+            .clone();
+        // An earlier pass saved this exact ACK before its index settled.
+        f.upload(&mut progress, std::slice::from_ref(&acked), exact_ack)
+            .unwrap();
+        // This pass adopts an index-only contract-1 quarantine record in
+        // memory and reports no change, so nothing saves it.
+        let merged = "e".repeat(64);
+        let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+        record.reconstruction_contract = 1;
+        assert!(!progress.prepare_quarantine_retries(&BTreeMap::from([(merged.clone(), record)])));
+        assert!(progress.quarantined_fingerprints.contains_key(&merged));
+        let stopped = f.upload(&mut progress, std::slice::from_ref(&owed), |_| {
+            Err(anyhow::Error::new(UploadShed {
+                status: 503,
+                retry_after: None,
+                code: None,
+            }))
+        });
+        assert_eq!(
+            stopped.unwrap(),
+            ResumableUploadResult::Shed { retry_after: None }
+        );
+        assert!(!f.load().1.quarantined_fingerprints.contains_key(&merged));
+        if concurrent_writer {
+            // Another writer saves a changed ledger first.
+            let mut writer = f.load().1;
+            writer
+                .accepted_cache_heads
+                .insert(cache_session_key("concurrent"), "c".repeat(64));
+            writer.save(&f.progress_path).unwrap();
+        }
+        let index_before = serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap();
+        let progress_before = serde_json::to_value(f.load().1).unwrap();
+        let result = checkpoint_partial_snapshot_index_with_audit_release(
+            &working,
+            &committed,
+            &progress,
+            &[acked.clone(), owed.clone()],
+            None,
+            &BTreeSet::new(),
+            &f.index_path,
+            &f.progress_path,
+            || Ok(()),
+            None,
+            Some(UnsettledUploadCause::Shed),
+            None,
+            Default::default(),
+        );
+        assert_eq!(serde_json::to_value(f.load().1).unwrap(), progress_before);
+        if concurrent_writer {
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains("snapshot progress changed"));
+            assert_eq!(
+                serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap(),
+                index_before
+            );
+            continue;
+        }
+        let saved = result.unwrap();
+        assert!(saved.generation > committed.generation);
+        let restored = ScanIndex::load(&f.index_path).unwrap();
+        assert_eq!(restored.generation, saved.generation);
+        assert!(restored.accepted_snapshot_fingerprint_recorded(&acked.snapshot_fingerprint));
+        assert!(!restored.accepted_snapshot_fingerprint_recorded(&owed.snapshot_fingerprint));
+        assert_eq!(
+            f.load().1.accepted_fingerprints,
+            BTreeSet::from([acked.snapshot_fingerprint.clone()])
+        );
+    }
+}
+
+/// [regress] published v2 partial checkpoint reuses progress owner through atomic save.
+#[test]
+fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
+    for stop in ["transport", "shed", "capacity"] {
+        for read_limit in [None, Some(crate::snapshot_retry::RESPONSE_BYTES)] {
+            let f = AckFixture::new(false);
+            AckFixture::write_source(&f.sources, "sibling");
+            AckFixture::write_source(&f.sources, "owed");
+            let mut scanned = ScanIndex::default();
+            let scan = AckFixture::scan(&f.sources, &mut scanned);
+            assert_eq!(scan.snapshots.len(), 3);
+            for item in &scan.snapshots {
+                let key = scanned
+                    .file_snapshot_fingerprints
+                    .iter()
+                    .find(|(_, members)| members.contains(&item.snapshot_fingerprint))
+                    .unwrap()
+                    .0
+                    .clone();
+                scanned
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_upload_body_witness =
+                    Some(one_body_set_witness(&snapshot_upload_body_witness(item)));
+            }
+            let parent = f.scratch.join("snapshots/destinations").join(&f.namespace);
+            std::fs::create_dir_all(&parent).unwrap();
+            let index_path = parent.join("claude_code-partial-scan-index.json");
+            let progress_path = snapshot_upload_progress_path(&index_path);
+            let mut progress = SnapshotUploadProgress::new(
+                f.namespace.clone(),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            );
+            progress.save_legacy_fixture(&progress_path, None).unwrap();
+            let committed = crate::snapshots::publish_state_v2_for_test(
+                &scanned,
+                &index_path,
+                &std::fs::read(&progress_path).unwrap(),
+            );
+            let mut working = committed.clone();
+            // The routed progress: the rows its first load imports.
+            let load = || {
+                SnapshotUploadProgress::load_for_index(
+                    &committed,
+                    &index_path,
+                    &progress_path,
+                    &f.namespace,
+                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                )
+                .unwrap()
+            };
+            progress = load();
+            // Two exact sibling ACKs followed by a real uploader stop. No file
+            // publication changes: the activation/staging guard stays intact.
+            let upload = |items: &[SnapshotItem],
+                          progress: &mut SnapshotUploadProgress,
+                          response: &mut dyn FnMut(
+                &[&SnapshotItem],
+            ) -> Result<
+                crate::snapshot_client::SnapshotBatchResponse,
+            >| {
+                upload_resumable_batches_with_body_witness(
+                    items,
+                    &unique_poison_scope(),
+                    progress,
+                    &mut 0,
+                    |item| item.snapshot_fingerprint.as_str(),
+                    snapshot_upload_body_witness,
+                    response,
+                    |state| state.save(&progress_path),
+                )
+            };
+            upload(&scan.snapshots[..2], &mut progress, &mut exact_ack).unwrap();
+            let accepted = progress.accepted_body_witnesses.clone();
+            assert_eq!(accepted.len(), 2);
+            if stop == "capacity" {
+                progress.ack_capacity = 2;
+            }
+            let stopped = upload(&scan.snapshots[2..], &mut progress, &mut |_| match stop {
+                "transport" => Err(anyhow!("synthetic transport failure")),
+                "shed" => Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: None,
+                    code: None,
+                })),
+                "capacity" => panic!("capacity stop must precede POST"),
+                _ => unreachable!(),
+            });
+            if stop == "shed" {
+                assert_eq!(
+                    stopped.unwrap(),
+                    ResumableUploadResult::Shed { retry_after: None }
+                );
+            } else {
+                assert!(stopped.is_err());
+                if stop == "capacity" {
+                    assert!(stopped
+                        .unwrap_err()
+                        .downcast_ref::<ack_retention::AckSettlementRequired>()
+                        .is_some());
+                }
+            }
+            let persisted_progress = serde_json::to_value(load()).unwrap();
+            working.mark_bounded_sweep_unsettled();
+            let saved = checkpoint_partial_snapshot_index_with_audit_release(
+                &working,
+                &committed,
+                &progress,
+                &scan.snapshots,
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || {
+                    assert!(
+                        SnapshotProgressLock::acquire(&progress_path).is_err(),
+                        "subset verification retains its CAS owner"
+                    );
+                    Ok(())
+                },
+                read_limit,
+                None,
+                None,
+                Default::default(),
+            )
+            .unwrap();
+            assert!(saved.generation > committed.generation);
+            let restored = ScanIndex::load(&index_path).unwrap();
+            assert_eq!(restored.generation, saved.generation);
+            for item in &scan.snapshots[..2] {
+                assert!(restored.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+                assert_eq!(
+                    progress
+                        .accepted_body_witnesses
+                        .get(&item.snapshot_fingerprint),
+                    Some(&snapshot_upload_body_witness(item))
+                );
+            }
+            assert!(!restored
+                .accepted_snapshot_fingerprint_recorded(&scan.snapshots[2].snapshot_fingerprint));
+            assert!(
+                restored.upload_ack_retirement_handoff.is_none(),
+                "live bodies use exact adoption"
+            );
+            assert_eq!(
+                restored.adopted_upload_progress_acks(&accepted),
+                accepted.keys().cloned().collect(),
+                "only saved exact bodies may retire"
+            );
+            assert_eq!(serde_json::to_value(load()).unwrap(), persisted_progress);
+            progress
+                .release_acks_after_partial_index_save(
+                    &progress_path,
+                    &committed,
+                    &restored,
+                    &BTreeSet::new(),
+                    false,
+                )
+                .unwrap();
+            assert!(progress.accepted_body_witnesses.is_empty());
+            assert!(load().accepted_fingerprints.is_empty());
+        }
+    }
+}
+
+/// Progress bytes (SHA-256) after each save in the test below, written as
+/// compact JSON.
+const ACK_SAVE_BYTES: [&str; 2] = [
+    "3cb0d1c2f50044d3f7c741074b0e157bc06fe1717de0c5e4e09ed42e14d67728",
+    "0ad339132c749dcc24faf3cdc23ba5804ab6503e27cbc37d953bbd15aab199fc",
+];
+/// The same two progress saves (SHA-256) as the earlier pretty-printed build
+/// wrote them, before the save kept one copy of the progress.
+const PRETTY_PROGRESS_BYTES: [&str; 2] = [
+    "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
+    "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
+];
+/// [money] The frozen legacy ACK encoder writes stable progress bytes through both
+/// compare-and-swap decode paths, and the compact progress holds the same
+/// ledger the pretty build wrote: printed pretty again, it is byte-identical.
+#[test]
+fn ack_bound_saves_keep_exact_progress_bytes() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-bytes");
+    let path = scratch.join("progress");
+    let mut progress = bound_progress(&path, &"a".repeat(64));
+    let mut hashes = Vec::new();
+    let mut pretty = Vec::new();
+    let sha = |bytes: &[u8]| crate::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(bytes));
+    for round in 0..2_u8 {
+        let key = format!("{round:064x}");
+        progress.record_body(&key, &"b".repeat(64));
+        let text = "quote \" slash \\ newline \n tab \t é ☃ \u{1}";
+        let state = serde_json::json!({"text": text, "n": [round, 1.5, -2], "z": null});
+        progress.accepted_cache_states.insert(key.clone(), state);
+        progress.accepted_cache_heads.insert(key, "c".repeat(64));
+        let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
+        progress.save_legacy_fixture(&path, limit).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let ledger: SnapshotUploadProgress = serde_json::from_slice(&saved).unwrap();
+        pretty.push(sha(&serde_json::to_vec_pretty(&ledger).unwrap()));
+        hashes.push(sha(&saved));
+    }
+    assert_eq!(hashes, ACK_SAVE_BYTES);
+    assert_eq!(pretty, PRETTY_PROGRESS_BYTES);
+}
+
+/// Frozen legacy encoder: allocator peak of a ~5 MiB progress, per
+/// progress byte. Requested bytes with realloc overlap; not resident memory.
+#[test]
+fn ack_bound_save_allocation_peak_per_progress_byte() {
+    let scratch = crate::test_scratch::ScratchDir::new("v2-ack-save-peak");
+    let path = scratch.join("progress");
+    let mut progress = bound_progress(&path, &"a".repeat(64));
+    let text = "line\n\"quoted\" ".repeat(128);
+    for n in 0..2048 {
+        let state = serde_json::json!({ "text": &text });
+        progress
+            .accepted_cache_states
+            .insert(format!("{n:064x}"), state);
+        progress
+            .accepted_cache_heads
+            .insert(format!("{n:064x}"), "c".repeat(64));
+    }
+    progress.save_legacy_fixture(&path, None).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as usize;
+    let (_, peak) = crate::retry_allocation_probe::measure(|| {
+        progress.save_legacy_fixture(&path, None).unwrap()
+    });
+    let requested = peak.requested_peak as f64 / size as f64;
+    let overlap = peak.requested_peak_with_overlap as f64 / size as f64;
+    eprintln!(
+        "progress_save_allocation bytes={size} requested_peak={} with_overlap={} \
+         ratio={requested:.2}/{overlap:.2}",
+        peak.requested_peak, peak.requested_peak_with_overlap
+    );
+    // Linux CI on this fixture: 6.39/7.24 before one-copy saves, 3.39/4.24 after.
+    assert!(
+        requested < 3.6 && overlap < 4.5,
+        "{requested:.2}/{overlap:.2}"
+    );
+}

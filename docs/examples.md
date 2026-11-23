@@ -1,0 +1,107 @@
+# Examples
+
+These examples are safe for agents and support because they consume only JSON
+output.
+
+## First Status Check
+
+```bash
+ottto status --json
+ottto account --json
+ottto apps --json
+```
+
+Report daemon reachability, account state, app readiness, exit code, and next
+action.
+
+## Agent Context
+
+```bash
+ottto context --json
+ottto context --json --range today --source codex
+ottto context --json --all-machines --max-tokens 4000
+ottto costs --json --range today --source codex
+ottto costs --json --all-machines --bucket day
+ottto sessions --json --limit 20 --source codex
+ottto sessions --json --all-machines --sort-by cost --sort-dir desc
+```
+
+Use `context`, `costs`, `sessions`, `recommendations`, and `provider-impact` only
+as machine-readable agent surfaces.
+They return backend-computed context, cost breakdowns, and session lists through
+the local daemon and require this Mac to be connected. `--app
+codex|claude-code|pi` is available as a local app alias, while `--source`
+accepts backend source slugs for local, API, and cloud-provider data.
+
+## Cloud Connector Status
+
+```bash
+ottto cloud status --source vertex --json
+```
+
+`ottto cloud status` is read-only. Connect or change AWS and Google Cloud
+connectors in the web app at <https://app.ottto.net/apps>.
+
+## Headless Setup
+
+```bash
+ottto setup --json --no-browser --no-wait
+```
+
+If the command exits `60`, show the returned `claim_url` or `claim_code` to the
+user when `agent_action.kind` is `open_browser_claim`. If the kind is
+`answer_setup_question`, ask the user for the structured `next_question`. Do not
+treat the nonzero exit as a corrupt response.
+
+## Verify Claude Code
+
+```bash
+ottto apps status --app claude-code --json
+ottto verify --app claude-code --json
+ottto verify --repair --app claude-code --json
+```
+
+Plain verify is read-only and reports `config.fingerprint` plus any config
+drift. Use `--repair` only when the JSON reports config drift; it repairs the
+daemon-owned WriteConfig action and re-checks config before telemetry smoke.
+
+## Repair Codex
+
+```bash
+ottto doctor --json
+ottto verify --repair --app codex --json
+ottto fix --app codex --json
+ottto verify --app codex --json
+```
+
+Apply repair only through `ottto fix`. Do not patch `~/.codex/config.toml`
+directly.
+
+## Collect Local Diagnostics
+
+```bash
+ottto diagnostics collect --json
+```
+
+Summarize the redaction report and any recommended next action.
+
+## Approved Diagnostics Upload
+
+```bash
+ottto diagnostics collect --upload \
+  --approve-upload \
+  --accept-retention-disclosure \
+  --support-claim <claim> \
+  --json
+```
+
+Use this only after the user approves upload and retention disclosure.
+
+## Update Check
+
+```bash
+ottto update check --json
+```
+
+Report whether the update is a soft warning, hard block, current, or pending
+manual action from the install owner.

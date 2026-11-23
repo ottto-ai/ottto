@@ -1,0 +1,40 @@
+{
+  "commit": "f174d111fbcdfb0ab9c2abeb299c12d50b435c29",
+  "snippets": [
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 436,
+      "text": "    pub(super) fn quarantines(&self) -> bool {\n        matches!(self, Self::Syntax(_) | Self::HoldBudget)\n    }"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 1037,
+      "text": "pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::Result<(), Error> {\n    if index.schema_version != SCAN_INDEX_SCHEMA_VERSION {\n        return Err(Error::Refused(\"schema_version\"));\n    }\n    if index.accepted_snapshot_fingerprint_ledger_version > SNAPSHOT_ACCEPTED_LEDGER_VERSION {\n        alarm_future_scan_index_ledger(source, index.accepted_snapshot_fingerprint_ledger_version);\n        return Err(Error::Refused(\"accepted-ledger version\"));\n    }\n    Ok(())\n}"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 922,
+      "text": "    let headers = decoder.index(Pass::Headers)?;\n    controls(&headers, source)?;\n    drop(headers);\n    decoder.reader.seek(SeekFrom::Start(0))?;\n    let result = decoder.index(Pass::Full);"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/lenient_decode.rs",
+      "start_line": 1947,
+      "text": "        if !seen.contains(\"files\") {\n            return Err(Error::Refused(\"missing files\"));\n        }"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots.rs",
+      "start_line": 46026,
+      "text": "        if !path.exists() {\n            return Ok((Self::default(), LoadOrigin::Missing));\n        }\n        let _lock = CheckpointLock::acquire(path)?;"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots.rs",
+      "start_line": 46079,
+      "text": "            Err(error) if error.quarantines() => {\n                let cause = if matches!(error, lenient_decode::Error::HoldBudget) {\n                    \"hold_budget\"\n                } else {\n                    \"decode\"\n                };\n                quarantine_invalid_scan_index(path, cause, None, source, support_dir, now)\n                    .map(|index| (index, LoadOrigin::Quarantined))\n                    .map_err(|refusal| refusal.context(error))\n            }\n            Err(error) => {\n                Err(error).with_context(|| format!(\"parse scan index {}\", path.display()))\n            }"
+    },
+    {
+      "file": "crates/ottto-service/src/snapshots/load_containment.rs",
+      "start_line": 641,
+      "text": "    let quarantine_path = unique_checkpoint_sibling(path, \"corrupt\");\n    fs::rename(path, &quarantine_path).context(\"quarantine invalid local snapshot scan index\")?;\n    sync_checkpoint_parent(path)?;\n    note_scan_index_quarantine_rebuild(cause, discarded_file_entries, source);\n    Ok(ScanIndex::default())"
+    }
+  ]
+}

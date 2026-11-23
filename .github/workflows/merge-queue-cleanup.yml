@@ -1,0 +1,63 @@
+name: Merge queue cleanup
+
+# When the merge queue drops a PR (a failed check, a conflict, a manual
+# removal) GitHub deletes that PR's queue branch but leaves its Public CI run
+# going, so the macOS "Rust contracts" job holds one of the org's five hosted
+# Macs for its full ~25 minutes. Cancel every merge_group run whose queue
+# branch no longer exists. A run is cancelled only after a successful lookup
+# shows its branch is gone; an API or parse error keeps the run.
+#
+# pull_request_target, not pull_request: GitHub runs no pull_request workflow
+# for a PR with merge conflicts (a common reason to be dequeued), and gives
+# fork PRs a read-only token. This job checks out nothing and reads nothing
+# from the PR, so running main's copy with a write token is safe.
+
+on:
+  pull_request_target:
+    types: [dequeued]
+
+concurrency:
+  group: merge-queue-cleanup
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-orphaned:
+    name: Cancel orphaned merge queue runs
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Cancel runs whose queue branch is gone
+        run: |
+          set -euo pipefail
+          for status in queued waiting in_progress; do
+            gh api "repos/$GH_REPO/actions/runs?event=merge_group&status=$status&per_page=100" \
+              --jq '.workflow_runs[] | "\(.id) \(.head_branch)"'
+          done | sort -u | while read -r id branch; do
+            case "$branch" in
+              gh-readonly-queue/*) ;;
+              *) continue ;;
+            esac
+            if ! refs="$(gh api "repos/$GH_REPO/git/matching-refs/heads/$branch")"; then
+              echo "kept $id: could not look up $branch"
+              continue
+            fi
+            if ! present="$(printf '%s' "$refs" | jq -r --arg ref "refs/heads/$branch" \
+              'if type == "array" then any(.[]; .ref == $ref) else error("not a ref list") end')"; then
+              echo "kept $id: unexpected lookup reply for $branch"
+              continue
+            fi
+            case "$present" in
+              false)
+                echo "cancelling $id: $branch left the queue"
+                gh run cancel "$id" || echo "could not cancel $id"
+                ;;
+              *) echo "kept $id: $branch is still queued" ;;
+            esac
+          done

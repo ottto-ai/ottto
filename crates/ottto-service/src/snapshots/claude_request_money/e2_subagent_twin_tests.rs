@@ -1,0 +1,152 @@
+//! Native skip eligibility and fallback controls.
+use super::*;
+
+fn pair() -> (PathBuf, PathBuf, ScanIndex) {
+    let dir = scratch("subagent-twin-proof");
+    let paths = ["a", "z"].map(|home| dir.join(home).join(ROOT).join("subagents/agent-a1.jsonl"));
+    let mut index = ScanIndex::default();
+    let member = format!("{ROOT}_agent-a1");
+    for (n, path) in paths.iter().enumerate() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"fixture\n").unwrap();
+        let key = local_index_key(path);
+        index.files.insert(key.clone(), entry());
+        index.claude_money_birth_store.record_observation(
+            &member,
+            &key,
+            t0() + n as i128 * 100_000_000_000,
+        );
+    }
+    (paths[0].clone(), paths[1].clone(), index)
+}
+
+/// [money] A duplicated copied id, including an own response with that id,
+/// restores all native grains exactly like a lone child's old counted path.
+#[test]
+fn ambiguous_copy_uses_restore_all() {
+    for own in [false, true] {
+        let (a, z, index) = pair();
+        let first = line("shared", &at(10), 10);
+        let mut second = line("shared", &at(if own { 130 } else { 20 }), 20);
+        second["message"]["id"] = json!("another-response");
+        let lines = [first, second];
+        let control = parse_undecided(
+            &z,
+            Some(t0() + 100_000_000_000),
+            &ScanIndex::default(),
+            &lines,
+        );
+        let mut actual = vec![parse_undecided(
+            &z,
+            Some(t0() + 100_000_000_000),
+            &index,
+            &lines,
+        )];
+        assert!(!fold(&actual[0]).ambiguous.is_empty());
+        assert!(!fold(&actual[0]).twin_pending);
+        decide_page_copies(&mut actual, &index, None);
+        let decided = fold(&actual[0]);
+        assert_eq!(decided.entity.totals(), fold(&control).entity.totals());
+        assert_eq!(decided.entity.removed_requests, 0);
+        assert!(decided.entity.certificate_ok && !decided.entity.held);
+        fs::remove_dir_all(a.ancestors().nth(4).unwrap()).unwrap();
+    }
+}
+
+/// [money] Timestamp eligibility alone is insufficient: a present earlier
+/// fold must hold the id. Missing/unreadable paths prove no removal either.
+#[test]
+fn eligible_copy_without_a_holder_counts() {
+    for state in ["lacks", "absent", "unreadable"] {
+        let (a, z, mut index) = pair();
+        let born = SUBAGENT_TWIN_FROM + 600_000_000_000;
+        let member = format!("{ROOT}_agent-a1");
+        index.claude_money_birth_store = Default::default();
+        for (path, birth) in [(&a, SUBAGENT_TWIN_FROM - 1), (&z, born)] {
+            index.claude_money_birth_store.record_observation(
+                &member,
+                &local_index_key(path),
+                birth,
+            );
+        }
+        let request = line("eligible", "2026-11-05T00:01:00Z", 10);
+        let mut items = Vec::new();
+        if state == "lacks" {
+            items.push(parse_undecided(
+                &a,
+                Some(SUBAGENT_TWIN_FROM - 1),
+                &index,
+                &[line("other", "2026-11-05T00:01:00Z", 5)],
+            ));
+        } else {
+            fs::remove_file(&a).unwrap();
+            if state == "unreadable" {
+                fs::create_dir(&a).unwrap();
+                assert!(fs::read_to_string(&a).is_err());
+            }
+        }
+        items.push(parse_undecided(&z, Some(born), &index, &[request]));
+        assert!(fold(items.last().unwrap()).twin_pending);
+        decide_page_copies(&mut items, &index, None);
+        let copy = fold(items.last().unwrap());
+        assert_eq!(
+            (
+                copy.entity.totals().1,
+                copy.entity.removed_requests,
+                copy.copied
+            ),
+            (1, 0, 0)
+        );
+        let body = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(body[0].request_count, if state == "lacks" { 2 } else { 1 });
+        fs::remove_dir_all(a.ancestors().nth(4).unwrap()).unwrap();
+    }
+}
+
+/// Which member paths reserve a trace-named side call. A final symlink or a
+/// directory leaves the row to the root fallback, counted once because the
+/// native walk never opens a symlink either (`candidate_from_traversal_path_at`
+/// and the directory listing refuse them). A lookup that fails other than
+/// NotFound may still be a member: reserve it, with one exact hint.
+#[cfg(unix)]
+#[test]
+fn member_path_type_decides_side_call_reservation() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    // SAFETY: geteuid() has no preconditions and always succeeds.
+    let superuser = unsafe { libc::geteuid() } == 0;
+    for case in ["symlink", "directory", "denied"] {
+        if case == "denied" && superuser {
+            eprintln!("skipped denied: root bypasses directory permissions");
+            continue;
+        }
+        let root = scratch(&format!("side-call-{case}")).join(format!("{ROOT}.jsonl"));
+        let subagents = root.with_extension("").join("subagents");
+        let member = subagents.join("agent-abc.jsonl");
+        fs::write(&root, b"{}\n").unwrap();
+        fs::create_dir_all(&subagents).unwrap();
+        let _restore = Restore(subagents.clone());
+        match case {
+            "symlink" => symlink(&root, &member).unwrap(),
+            "directory" => fs::create_dir(&member).unwrap(),
+            _ => {
+                fs::write(&member, b"{}\n").unwrap();
+                fs::set_permissions(&subagents, fs::Permissions::from_mode(0o600)).unwrap();
+                let lookup = fs::symlink_metadata(&member).unwrap_err().kind();
+                assert_eq!(lookup, std::io::ErrorKind::PermissionDenied, "precheck");
+            }
+        }
+        let mut discovery = SideCallDiscovery::new(std::iter::once(root.as_path()));
+        take_diag();
+        let reserved = discovery.reserve_member(ROOT, &format!("{ROOT}_agent-abc"));
+        let hints = take_diag().get("side_call_member_hints").copied();
+        let expected = (case == "denied").then_some(1);
+        assert_eq!((reserved, hints), (expected.is_some(), expected), "{case}");
+        assert_eq!(discovery.hints.len(), usize::from(reserved), "{case}");
+    }
+}

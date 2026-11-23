@@ -1,0 +1,3277 @@
+// Reason-scoped daily re-offer through the real prepare/finish pipeline.
+// One synthetic Claude session, a synthetic backend whose answer changes per
+// cycle, and a test-thread wall clock for the local re-offer schedule only.
+// Nothing waits 24 hours; no provider, credential or runtime state is read.
+use super::*;
+use std::cell::Cell;
+
+const DAY: u64 = 86_400;
+const ORIGINAL_PAIR: &str = "original_pair_candidate_unproved";
+
+thread_local! {
+    static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The synthetic local scheduling clock of this test thread, if set.
+pub(crate) fn clock() -> Option<u64> {
+    CLOCK.with(Cell::get)
+}
+
+struct ClockGuard;
+
+impl ClockGuard {
+    fn start(now: u64) -> Self {
+        CLOCK.with(|clock| clock.set(Some(now)));
+        Self
+    }
+
+    fn set(&self, now: u64) {
+        CLOCK.with(|clock| clock.set(Some(now)));
+    }
+}
+
+impl Drop for ClockGuard {
+    fn drop(&mut self) {
+        CLOCK.with(|clock| clock.set(None));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// Permanent refusal with this wire reason.
+    Refuse(&'static str),
+    Retryable(&'static str),
+    Accept,
+    /// `unchanged` with an `unchanged_basis`: the server did not store it.
+    Unstored,
+    /// Like `Accept`, except that a cache-bearing body under
+    /// `cache_state_ack:v1` is answered `unchanged` with no basis: a stored
+    /// ref whose echoed server cache state differs from the one the request
+    /// completes, so its digest is not the request witness.
+    UnchangedStoredRef,
+    Conflict,
+    /// The server stores the bodies, but its reply proves no entity (a lost
+    /// ACK).
+    Lost,
+    /// Upload outages: a plain `503` with no `Retry-After`, an HTTP `500`,
+    /// and a connection closed with no response.
+    Shed,
+    ServerError,
+    Dropped,
+}
+
+struct ReofferServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    answer: Arc<Mutex<Answer>>,
+    offered: Arc<Mutex<Vec<serde_json::Value>>>,
+    terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+    stored: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
+    cache_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Each snapshot request's (head_cas_contract, cache_state_ack_contract).
+    contracts: Arc<Mutex<Vec<(serde_json::Value, serde_json::Value)>>>,
+    /// `Some(conflicts)`: head CAS as the backend checks it. A changed body of
+    /// a held entity, sent under the contract without the head as its base,
+    /// conflicts with a challenge; the count is kept.
+    head_cas_conflicts: Arc<Mutex<Option<usize>>>,
+}
+
+/// The cache state a server holding no prior state completes `item`'s patch
+/// into.
+fn completed_cache_state(item: &serde_json::Value) -> Option<serde_json::Value> {
+    let patch = serde_json::from_value(item.get("cache_observations")?.clone()).unwrap();
+    crate::snapshots::cache_state_from_patch(None, &patch)
+}
+
+fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
+    entity_ack_with_state(item, completed_cache_state(item))
+}
+
+/// The stored ref `Answer::UnchangedStoredRef` returns for a cache-bearing
+/// `item`: the server's state reports one more omitted observation, and the
+/// ref echoes that state with the digest it gives this body.
+fn stored_ref_ack(item: &serde_json::Value) -> serde_json::Value {
+    let mut state = completed_cache_state(item).expect("a cache-bearing body");
+    let omitted = state["omitted_observation_count"]
+        .as_u64()
+        .unwrap_or_default();
+    state["coverage"] = "partial".into();
+    state["omitted_observation_count"] = (omitted + 1).into();
+    let mut reference = entity_ack_with_state(item, Some(state.clone()));
+    reference["cache_observations_state"] = state;
+    reference
+}
+
+fn entity_ack_with_state(
+    item: &serde_json::Value,
+    state: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "session_account_evidence",
+        "tool_usage",
+        "tool_usage_truncated",
+    ] {
+        if let Some(value) = item.get(key) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(state) = &state {
+        payload.insert("cache_observations_state".into(), state.clone());
+    }
+    let exclusive = item
+        .get("usage_accounting_contract")
+        .and_then(|value| value.as_str())
+        == Some("session_exclusive_reported_usage:v1");
+    let version = if state.is_some() {
+        Some(if exclusive { 14u64 } else { 13u64 })
+    } else {
+        item.get("session_account_evidence")
+            .is_some()
+            .then_some(if exclusive { 8u64 } else { 7u64 })
+    };
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(
+            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()
+        )
+    );
+    serde_json::json!({"source_session_id":item["source_session_id"],
+        "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+        "body_witness_version":version,"body_witness_digest":version.map(|_| digest)})
+}
+
+impl ReofferServer {
+    /// `capture`: the activity hint carries the exact contract-5 token, so
+    /// each cycle captures and emits request identity.
+    fn new(first: Answer, capture: bool) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let answer = Arc::new(Mutex::new(first));
+        let current = answer.clone();
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let bodies = offered.clone();
+        let terminal = Arc::new(Mutex::new(Vec::new()));
+        let statuses = terminal.clone();
+        let stored = Arc::new(Mutex::new(BTreeMap::<String, serde_json::Value>::new()));
+        let saved_bodies = stored.clone();
+        let cache_enabled = Arc::new(AtomicBool::new(false));
+        let cache = cache_enabled.clone();
+        let contracts = Arc::new(Mutex::new(Vec::new()));
+        let requests = contracts.clone();
+        let head_cas_conflicts = Arc::new(Mutex::new(None::<usize>));
+        let head_cas = head_cas_conflicts.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic re-offer accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                let raw = request.split_once("\r\n\r\n").unwrap().1;
+                let value: serde_json::Value = if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw).unwrap()
+                };
+                let response = if request.contains("/relay-token") {
+                    serde_json::json!({"token":"synthetic-reoffer-token","expires_at":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/activity-hints") {
+                    let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "session_request_account_source_contract":"session_request_account_source:v1",
+                        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    if cache.load(Ordering::Relaxed) {
+                        hint["session_cache_observations_contract"] =
+                            "session_cache_observations:v1".into();
+                        hint["snapshot_head_cas_required"] = false.into();
+                    }
+                    if capture {
+                        hint["session_request_identity_contract"] =
+                            "own_request_identity_rows:v1".into();
+                    }
+                    hint
+                } else if request.contains("/agent-status/snapshots") {
+                    serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
+                } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
+                    assert!(!items.is_empty());
+                    bodies.lock().unwrap().extend(items.iter().cloned());
+                    requests.lock().unwrap().push((
+                        value["head_cas_contract"].clone(),
+                        value["cache_state_ack_contract"].clone(),
+                    ));
+                    let outage = match *current.lock().unwrap() {
+                        Answer::Shed => Some("503 Service Unavailable"),
+                        Answer::ServerError => Some("500 Internal Server Error"),
+                        Answer::Dropped => {
+                            drop(stream);
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    if let Some(status) = outage {
+                        bounded_native_response(&mut stream, status, "{}");
+                        continue;
+                    }
+                    let references = items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "source_session_id":item["source_session_id"],
+                                "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                "occurrence_count":1
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let mut outcome = serde_json::json!({"accepted":0,"sessions_reconciled":0,
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],
+                        "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]});
+                    let answer = *current.lock().unwrap();
+                    match answer {
+                        Answer::Refuse(reason) | Answer::Retryable(reason) => {
+                            outcome["rejected_entities"] = items
+                                .iter()
+                                .map(|item| {
+                                    serde_json::json!({
+                                        "source_session_id":item["source_session_id"],
+                                        "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                        "reason":reason,"detail":"synthetic re-offer refusal",
+                                        "permanent":matches!(answer, Answer::Refuse(_)),"occurrence_count":1
+                                    })
+                                })
+                                .collect();
+                        }
+                        Answer::Accept | Answer::Lost | Answer::UnchangedStoredRef => {
+                            let cas = value.get("head_cas_contract").is_some();
+                            let echo = value["cache_state_ack_contract"] == "cache_state_ack:v1";
+                            for item in items {
+                                let fingerprint = fingerprint_of(item);
+                                let mut body = item.clone();
+                                body.as_object_mut().unwrap().remove("semantic_envelope");
+                                body.as_object_mut().unwrap().remove("collected_at");
+                                let mut stored = saved_bodies.lock().unwrap();
+                                let unchanged = stored.get(&fingerprint) == Some(&body);
+                                if let Some(conflicts) =
+                                    head_cas.lock().unwrap().as_mut().filter(|_| {
+                                        cas && !unchanged
+                                            && stored.contains_key(&fingerprint)
+                                            && item["semantic_envelope"]["base_head_etag"]
+                                                != "e".repeat(64)
+                                    })
+                                {
+                                    *conflicts += 1;
+                                    outcome["conflict_entities"].as_array_mut().unwrap().push(
+                                        serde_json::json!({
+                                            "source_session_id":item["source_session_id"],
+                                            "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                            "occurrence_count":1,"head_challenge":"c".repeat(64)
+                                        }),
+                                    );
+                                    continue;
+                                }
+                                stored.insert(fingerprint.clone(), body);
+                                // Lost replies retain the stored body without
+                                // acknowledging it; the retry echoes stored proof.
+                                if answer == Answer::Lost {
+                                    continue;
+                                }
+                                let held = &stored[&fingerprint];
+                                let stored_ref = answer == Answer::UnchangedStoredRef
+                                    && echo
+                                    && held.get("cache_observations").is_some();
+                                let mut reference = if stored_ref {
+                                    stored_ref_ack(held)
+                                } else {
+                                    entity_ack(held)
+                                };
+                                if cas {
+                                    reference["head_etag"] = "e".repeat(64).into();
+                                }
+                                if let Some(state) =
+                                    completed_cache_state(held).filter(|_| echo && !stored_ref)
+                                {
+                                    reference["cache_observations_state"] = state;
+                                }
+                                let kind = if unchanged || stored_ref {
+                                    "unchanged_entities"
+                                } else {
+                                    "accepted_entities"
+                                };
+                                outcome[kind].as_array_mut().unwrap().push(reference);
+                            }
+                            if answer != Answer::Lost {
+                                let settled = items.len()
+                                    - outcome["conflict_entities"].as_array().unwrap().len();
+                                outcome["accepted"] = settled.into();
+                                outcome["sessions_reconciled"] = settled.into();
+                            }
+                        }
+                        Answer::Unstored => {
+                            outcome["accepted"] = items.len().into();
+                            outcome["unchanged_entities"] = items
+                                .iter()
+                                .map(|item| {
+                                    let mut reference = entity_ack(item);
+                                    reference["unchanged_basis"] = "usage_identical".into();
+                                    reference
+                                })
+                                .collect();
+                        }
+                        Answer::Conflict => {
+                            outcome["conflict_entities"] = references.into();
+                        }
+                        Answer::Shed | Answer::ServerError | Answer::Dropped => {
+                            unreachable!("answered above")
+                        }
+                    }
+                    outcome
+                } else {
+                    if value["report_kind"] == "scan_status" {
+                        statuses.lock().unwrap().push(value.clone());
+                    }
+                    serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
+                };
+                bounded_native_response(&mut stream, "200 OK", &response.to_string());
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            answer,
+            offered,
+            terminal,
+            stored,
+            cache_enabled,
+            contracts,
+            head_cas_conflicts,
+        }
+    }
+
+    fn answer(&self, answer: Answer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    fn offered(&self) -> Vec<serde_json::Value> {
+        self.offered.lock().unwrap().clone()
+    }
+
+    fn last_terminal(&self) -> serde_json::Value {
+        self.terminal.lock().unwrap().last().cloned().unwrap()
+    }
+}
+
+impl Drop for ReofferServer {
+    fn drop(&mut self) {
+        stop_server(&self.stop, &mut self.worker);
+    }
+}
+
+struct CycleResult {
+    result: Result<()>,
+    census_window_end: String,
+    leased_offers: usize,
+    cache_enabled: bool,
+    index: ScanIndex,
+    progress: SnapshotUploadProgress,
+    /// The saved upload ledger as JSON, to read the exact disk form.
+    progress_json: serde_json::Value,
+    progress_path: PathBuf,
+    index_path: PathBuf,
+    /// Distinct exact-body conflicts the scan's cooldown view deferred.
+    cooldown_deferred: usize,
+    held_probe_rearms: u64,
+}
+
+struct ReofferPipeline {
+    server: ReofferServer,
+    clock: ClockGuard,
+    fixture: IdentityPipelineHome,
+    support: PathBuf,
+    device: LocalDeviceBinding,
+    client: SnapshotApiClient,
+    daemon: LocalDaemon,
+    cadence: IdentityPipelineCadence,
+    transport: crate::net_resilience::TransportCycleOutcome,
+    _guards: Vec<EnvVarGuard>,
+}
+
+impl ReofferPipeline {
+    fn new(name: &str, first: Answer, start: u64) -> Self {
+        Self::build(name, first, start, false)
+    }
+
+    /// The same pipeline with request-identity capture on (R12).
+    fn with_capture(name: &str, first: Answer, start: u64) -> Self {
+        Self::build(name, first, start, true)
+    }
+
+    fn build(name: &str, first: Answer, start: u64, capture: bool) -> Self {
+        let fixture = IdentityPipelineHome::new();
+        let cadence = IdentityPipelineCadence::new();
+        let support = fixture.base.join(format!("{name}-support"));
+        let secrets = fixture.base.join(format!("{name}-secrets"));
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let server = ReofferServer::new(first, capture);
+        let guards = vec![
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
+        ];
+        let device = LocalDeviceBinding {
+            device_id: format!("{name}-device"),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .unwrap();
+        write_native_bootstrap_sidecars(&fixture, &support);
+        let client = SnapshotApiClient::new(server.url.clone());
+        Self {
+            server,
+            clock: ClockGuard::start(start),
+            fixture,
+            support,
+            device,
+            client,
+            daemon: test_daemon("otm_test"),
+            cadence,
+            transport: crate::net_resilience::TransportCycleOutcome::default(),
+            _guards: guards,
+        }
+    }
+
+    /// One real due cycle at local time `now`.
+    fn cycle(&mut self, now: u64) -> CycleResult {
+        self.cycle_with_census(now, true)
+    }
+
+    fn collection() -> AgentStatusCollection {
+        AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
+        }
+    }
+
+    /// Prepare without collecting, so refusal fixtures can inspect the real
+    /// load boundary without unwrapping away its error.
+    fn prepare_cycle(&mut self, now: u64) -> Result<Option<SourcePreparation>> {
+        self.clock.set(now);
+        assert_eq!(clock(), Some(now));
+        self.cadence.next_due_cycle();
+        crate::agent_status_refresh::with_test_collection(Self::collection(), || {
+            prepare_sync_source(
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                self.daemon.snapshot_scan_account_witness().unwrap(),
+            )
+        })
+    }
+
+    fn cycle_with_census(&mut self, now: u64, complete: bool) -> CycleResult {
+        let frame = self
+            .prepare_cycle(now)
+            .unwrap()
+            .expect("real due preparation");
+        let (preparation, index, scan) = collect_preparation_with_rotation(frame);
+        assert_eq!(
+            scan.census_complete, complete,
+            "synthetic census is complete unless authority debt withholds it"
+        );
+        let census_window_end = preparation.scan_started_at.clone();
+        let cooldown_deferred = index.reason_reoffer_cooldown_deferred_count();
+        let cache_enabled = preparation.cache_observations_enabled;
+        let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+            )
+        });
+        let index = ScanIndex::load(&index_path).unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &index_path,
+            &progress_path,
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        let progress_json = serde_json::to_value(&progress).unwrap();
+        CycleResult {
+            result,
+            census_window_end,
+            leased_offers,
+            cache_enabled,
+            index,
+            progress,
+            progress_json,
+            progress_path,
+            index_path,
+            cooldown_deferred,
+            held_probe_rearms: 0,
+        }
+    }
+
+    /// One real cycle and its physical transcript reads, from the existing
+    /// per-page resource record: (parser/acquisition entries, native plus
+    /// guard bytes read). `restart` first drops the daemon, as a restart
+    /// does, so no retained reduction can hide a re-read.
+    fn measured_cycle(&mut self, now: u64, restart: bool) -> (CycleResult, u64, u64) {
+        if restart {
+            self.daemon = test_daemon("otm_test");
+        }
+        let (mut cycle, records) = crate::local_resource_diagnostics::capture(|| self.cycle(now));
+        cycle.held_probe_rearms = records
+            .iter()
+            .filter(|record| record["stage"] == "held_probe_witness_rearm")
+            .map(|record| record["counts"]["count"].as_u64().unwrap())
+            .sum();
+        let pages = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "native_collection_page" && record["source"] == "claude_code"
+            })
+            .collect::<Vec<_>>();
+        assert!(!pages.is_empty(), "the cycle completed a collection page");
+        let parsed = pages
+            .iter()
+            .map(|page| page["counts"]["scanned_files"].as_u64().unwrap_or_default())
+            .sum::<u64>();
+        let bytes = pages
+            .iter()
+            .map(|page| {
+                let read = &page["counts"]["sampled_acquisition"];
+                read["completed_native_bytes"].as_u64().unwrap_or_default()
+                    + read["completed_guard_bytes"].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>();
+        eprintln!(
+            "O1_MEASURED_CYCLE now={now} restart={restart} parsed={parsed} bytes={bytes} \
+             cooldown_deferred={}",
+            cycle.cooldown_deferred
+        );
+        (cycle, parsed, bytes)
+    }
+
+    /// Deletes every retired durable-tail directory under the support
+    /// directory. Native Tail heads live in the state database and survive.
+    fn drop_durable_stores(&self) {
+        fn walk(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.extension().is_some_and(|ext| ext == "durable-tail") {
+                    std::fs::remove_dir_all(&path).unwrap();
+                } else {
+                    walk(&path);
+                }
+            }
+        }
+        walk(&self.support);
+    }
+
+    /// Use a canonical state-database route and hold the daemon's
+    /// single-writer lock for the durable restore receipt.
+    #[cfg(unix)]
+    fn hold_state_dir_lock(&mut self) {
+        self.support = self.support.canonicalize().unwrap();
+        // The fixture's existing environment guard restores this on drop.
+        unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support) };
+        crate::locked_state_dir::test_locks::hold(&self.support);
+    }
+
+    /// Committed Tail heads in the saved index's state database.
+    #[cfg(all(unix, not(debug_assertions)))]
+    fn durable_records(&self) -> usize {
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ));
+        let index = ScanIndex::load(&index_path).unwrap();
+        crate::snapshots::state_v2::tail_kind_counts_for_test(&index)["tail.head"]
+    }
+
+    fn transcript(&self) -> PathBuf {
+        self.fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
+    }
+
+    /// The conflict's ordinary retry is due now on the durable index.
+    fn make_conflict_retry_due(&self, fingerprint: &str) {
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ));
+        let mut index = ScanIndex::load(&index_path).unwrap();
+        let record = index
+            .quarantined_snapshot_fingerprints
+            .get_mut(fingerprint)
+            .unwrap();
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        record.retry_after_unix_seconds = 0;
+        index.save_fixture(&index_path).unwrap();
+    }
+}
+
+fn supported(name: &str) -> bool {
+    let supported = crate::heap_layout_bound::layout_supported();
+    if !supported {
+        writeln!(
+            std::io::stderr().lock(),
+            "{name}: supported_positive=UNEXECUTED layout_supported=false"
+        )
+        .unwrap();
+    }
+    supported
+}
+
+fn fingerprint_of(offer: &serde_json::Value) -> String {
+    offer["snapshot_fingerprint"].as_str().unwrap().to_string()
+}
+
+fn usage_of(offer: &serde_json::Value) -> (u64, u64, u64) {
+    (
+        offer["request_count"].as_u64().unwrap_or_default(),
+        offer["input_tokens"].as_u64().unwrap_or_default(),
+        offer["output_tokens"].as_u64().unwrap_or_default(),
+    )
+}
+
+fn reoffer_json<'a>(cycle: &'a CycleResult, fingerprint: &str) -> &'a serde_json::Value {
+    &cycle.progress_json["permanent_rejections"][fingerprint]["reoffer"]
+}
+
+/// An unchanged finished session refused for
+/// `original_pair_candidate_unproved` is offered once a day, exactly, until
+/// the server accepts it. Repeat refusals settle the census while health
+/// stays red, and the clock restarts on each refusal.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
+    if !supported("original_pair_refusal_is_reoffered_once_a_day_until_accepted") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-daily", Answer::Refuse(ORIGINAL_PAIR), t0);
+
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let fingerprint = fingerprint_of(&offered[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+    assert_eq!(
+        first.progress_json["permanent_rejections"][&fingerprint]["reason"], "other",
+        "the new reason keeps the old enum disk form"
+    );
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "backend_validation_error"
+    );
+
+    // Hours later, and just before the day ends: no offer.
+    for now in [t0 + 3_600, t0 + 13 * 3_600, t0 + DAY - 1] {
+        let quiet = pipeline.cycle(now);
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert_eq!(
+            pipeline.server.offered().len(),
+            1,
+            "no offer before t0 + 24 h (at +{}s)",
+            now - t0
+        );
+    }
+
+    // Day 1: exactly one offer of the exact refused body; refused again.
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(
+        offered.len(),
+        2,
+        "a due original-pair refusal is re-offered once, through the real scan"
+    );
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert_eq!(usage_of(&offered[1]), usage_of(&offered[0]));
+    let refusal = &day1.progress.permanent_rejections[&fingerprint];
+    assert_eq!(refusal.body_witness, refused_body, "same exact body");
+    assert_eq!(
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"],
+        t1 + DAY,
+        "the repeat refusal restarts the 24 h clock"
+    );
+    assert_eq!(reoffer_json(&day1, &fingerprint)["reason"], ORIGINAL_PAIR);
+    assert_eq!(
+        day1.progress_json["permanent_rejections"][&fingerprint]["reason"],
+        "other"
+    );
+    // R7: the repeat refusal settles the traversal; health stays red.
+    assert!(!day1.index.bounded_sweep_had_unsettled_upload());
+    assert!(!day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert_eq!(
+        day1.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    let terminal = pipeline.server.last_terminal();
+    assert_eq!(terminal["last_error_code"], "backend_validation_error");
+    assert_eq!(terminal["last_census_complete"], true);
+
+    // No 6-12 h ordinary retry and no second offer the same day.
+    for now in [t1 + 300, t1 + 13 * 3_600] {
+        let quiet = pipeline.cycle(now);
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert_eq!(pipeline.server.offered().len(), 2);
+        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            pipeline.server.last_terminal()["last_error_code"],
+            "backend_validation_error"
+        );
+    }
+
+    // Day 2: the original pair is proven; the normal ACK clears the refusal.
+    pipeline.server.answer(Answer::Accept);
+    let t2 = t1 + DAY + 60;
+    let day2 = pipeline.cycle(t2);
+    assert!(day2.result.is_ok(), "{:?}", day2.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3);
+    assert_eq!(fingerprint_of(&offered[2]), fingerprint);
+    assert!(!day2
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(day2
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert!(!day2
+        .index
+        .quarantined_snapshot_fingerprints
+        .contains_key(&fingerprint));
+
+    // Accepted: nothing left to re-offer, and the next receipt is clean.
+    let after = pipeline.cycle(t2 + 2 * DAY);
+    assert!(after.result.is_ok(), "{:?}", after.result);
+    assert_eq!(pipeline.server.offered().len(), 3);
+    let terminal = pipeline.server.last_terminal();
+    assert_ne!(
+        terminal["last_error_code"], "backend_validation_error",
+        "{terminal}"
+    );
+    assert_eq!(terminal["last_census_complete"], true);
+    assert!(!after.index.bounded_sweep_had_unsettled_upload());
+}
+
+/// A validated `unchanged` answer that did not store the body
+/// retires the old refusal and its schedule, keeps the unstored-body hold,
+/// and records no stored body.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold() {
+    if !supported("unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-unstored", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+
+    pipeline.server.answer(Answer::Unstored);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "due offer reached the server"
+    );
+    assert!(
+        !day1
+            .progress
+            .permanent_rejections
+            .contains_key(&fingerprint),
+        "the unstored verdict replaced the refusal"
+    );
+    assert!(!day1.progress.accepted_fingerprints.contains(&fingerprint));
+    assert!(!day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    let hold = &day1.index.quarantined_snapshot_fingerprints[&fingerprint];
+    assert_eq!(
+        hold.disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(
+        hold.upload_body_witness.as_deref(),
+        Some(refused_body.as_str())
+    );
+
+    // The retired reason schedules nothing more.
+    let later = pipeline.cycle(t1 + DAY + 60);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    assert_eq!(pipeline.server.offered().len(), 2);
+}
+
+/// A conflict on the daily offer finishes with its follow-up still owed,
+/// keeps the refusal and its cooldown, and the conflict's
+/// RetryPending state cannot let the refused body escape the 24 h gate.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
+    if !supported("conflicting_reoffer_keeps_refusal_cooldown_and_follow_up") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("reoffer-conflict", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+
+    pipeline.server.answer(Answer::Conflict);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "due offer reached the server"
+    );
+    assert!(
+        day1.result.is_ok(),
+        "an isolated conflict keeps its follow-up owed"
+    );
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "server_error"
+    );
+    assert!(day1.index.bounded_sweep_had_unsettled_upload());
+    assert!(day1
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"]
+            .as_u64()
+            .is_some_and(|retry_after| retry_after >= t1 + DAY),
+        "{}",
+        day1.progress_json
+    );
+
+    // Even with the conflict's ordinary retry due, the refused body waits.
+    pipeline.server.answer(Answer::Accept);
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+    ));
+    let mut index = ScanIndex::load(&index_path).unwrap();
+    if let Some(record) = index
+        .quarantined_snapshot_fingerprints
+        .get_mut(&fingerprint)
+    {
+        record.retry_after_unix_seconds = 0;
+    }
+    index.save_fixture(&index_path).unwrap();
+    let quiet = pipeline.cycle(t1 + 3_600);
+    assert!(
+        quiet.result.is_ok(),
+        "a quiet traversal may settle exactly bound cooldown debt"
+    );
+    assert_eq!(
+        quiet.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert_eq!(
+        quiet.progress.quarantined_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(quiet.cooldown_deferred, 1);
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "backend_validation_error"
+    );
+    assert_eq!(
+        reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"]
+    );
+    assert_eq!(
+        pipeline.server.offered().len(),
+        2,
+        "no ordinary 6-12 h retry of the refused body"
+    );
+}
+
+/// Once the session's head moved past the refused body, the old
+/// body is never re-offered and no re-admission raises the session's usage.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn superseded_refused_body_is_never_reoffered_after_the_head_moved() {
+    if !supported("superseded_refused_body_is_never_reoffered_after_the_head_moved") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-head-moved", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let refused = pipeline.server.offered()[0].clone();
+    let refused_fingerprint = fingerprint_of(&refused);
+
+    // The session grows: one more request moves its head to body B.
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(format!("{grown}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    pipeline.server.answer(Answer::Accept);
+    let moved = pipeline.cycle(t0 + 3_600);
+    assert!(moved.result.is_ok(), "{:?}", moved.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(
+        offered.len(),
+        2,
+        "body B is offered through the normal path"
+    );
+    let head = offered[1].clone();
+    assert_ne!(fingerprint_of(&head), refused_fingerprint);
+
+    // Days later: the superseded refused body is not current; nothing is
+    // re-offered and the accepted head is not rewritten.
+    for day in 1..=2 {
+        let later = pipeline.cycle(t0 + day * DAY + 120);
+        assert!(later.result.is_ok(), "{:?}", later.result);
+        let offered = pipeline.server.offered();
+        assert_eq!(offered.len(), 2, "day {day}: no re-admission of body A");
+        assert!(later
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&head)));
+        assert!(!later
+            .progress
+            .permanent_rejections
+            .contains_key(&refused_fingerprint));
+    }
+    let uploaded_after_refusal = pipeline.server.offered()[1..]
+        .iter()
+        .map(usage_of)
+        .fold((0, 0, 0), |sum, usage| {
+            (sum.0 + usage.0, sum.1 + usage.1, sum.2 + usage.2)
+        });
+    assert_eq!(
+        uploaded_after_refusal,
+        usage_of(&head),
+        "only the current head's usage is ever offered after the refusal"
+    );
+}
+
+/// A JSON array's elements; none when the field is absent.
+fn json_array(value: &serde_json::Value) -> &[serde_json::Value] {
+    value.as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Every usage row of an offered body: the item's rows and its buckets' rows.
+fn usage_rows(offer: &serde_json::Value) -> Vec<&serde_json::Value> {
+    json_array(&offer["model_usage"])
+        .iter()
+        .chain(
+            json_array(&offer["usage_buckets"])
+                .iter()
+                .flat_map(|bucket| json_array(&bucket["model_usage"])),
+        )
+        .collect()
+}
+
+/// The late API capture: the session's API rows are recorded again, now
+/// carrying its login and organization (request identity), as a capture that
+/// lands after the refusal would. The trace rows are unchanged.
+fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str) {
+    let path = pipeline
+        .support
+        .join("local-otel")
+        .join("claude-code-effort")
+        .join(format!(
+            "{:x}.jsonl",
+            Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+        ));
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).unwrap();
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some(login.into());
+            row.request_identity = Some(std::sync::Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                    "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
+                    "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
+                }))
+                .unwrap(),
+            ));
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(&path, rows).unwrap();
+}
+
+/// With capture on, between the refusal and the daily re-offer,
+/// the original pair is proven and a late API capture adds the session's
+/// identity. The session's next offer is rebuilt from the current evidence,
+/// never from the refused body: the server accepts a body with the refused
+/// body's usage and the late rows' tags under R2-N2 (a request whose late row
+/// contradicts its own org marker keeps the starting account, no login), and
+/// the refused body is never sent again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
+    if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
+        return;
+    }
+    use crate::snapshots::claude_request_identity as identity;
+    let login = "a".repeat(64);
+    let org = "d".repeat(64);
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::with_capture("reoffer-late-row", Answer::Refuse(ORIGINAL_PAIR), t0);
+
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let refused = offered[0].clone();
+    let refused_fingerprint = fingerprint_of(&refused);
+    assert!(first
+        .progress
+        .permanent_rejections
+        .contains_key(&refused_fingerprint));
+    assert!(
+        usage_rows(&refused)
+            .iter()
+            .all(|row| row["account_identifier_hash"] != login.as_str()),
+        "the refused body predates the late rows: {refused}"
+    );
+    assert!(
+        json_array(&refused["request_evidence"])
+            .iter()
+            .all(|entry| entry["identity_basis"] != identity::TELEMETRY),
+        "{refused}"
+    );
+
+    // Between the refusal and the daily re-offer.
+    capture_late_identity_rows(&pipeline, &login, &org);
+    pipeline.server.answer(Answer::Accept);
+
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert_eq!(
+        day1.leased_offers, 1,
+        "the daily lease selected the refused record; disabling re-offers must fail this test"
+    );
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "one offer for the session on the due day");
+    let accepted = &offered[1];
+    assert_eq!(accepted["source_session_id"], IDENTITY_PIPELINE_ROOT);
+    let accepted_fingerprint = fingerprint_of(accepted);
+    assert_ne!(
+        accepted_fingerprint, refused_fingerprint,
+        "rebuilt from the current evidence, not the refused body"
+    );
+    assert_eq!(
+        usage_of(accepted),
+        usage_of(&refused),
+        "same usage; only the identity tags are new"
+    );
+    // The late rows' tags, per request (R2-N2). req_1 sits on the transcript's
+    // own credential_org marker and its late row names another org: two orgs
+    // on one request go to the starting account and drop the login. req_2
+    // has no own marker, so its late row's login and org tag it.
+    let evidence = accepted["request_evidence"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the tagged body declares its evidence: {accepted}"));
+    let rows = usage_rows(accepted);
+    assert!(!rows.is_empty(), "{accepted}");
+    let mut tags = Vec::new();
+    for row in rows {
+        let shares = match row["identity_parts"].as_array() {
+            Some(parts) => parts.iter().collect::<Vec<_>>(),
+            None => vec![row],
+        };
+        for share in shares {
+            let reference = share["evidence_ref"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("every usage share has an identity tag: {accepted}"));
+            let entry = &evidence[usize::try_from(reference).unwrap()];
+            tags.push((
+                share["input_tokens"].as_u64(),
+                share["request_count"].as_u64(),
+                share["account_identifier_hash"].as_str().map(str::to_owned),
+                entry["identity_basis"].as_str().map(str::to_owned),
+                entry["provider_workspace_hash"].as_str().map(str::to_owned),
+            ));
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    let org_hash = |id| ottto_core::billing_identity_hash("anthropic", "organization", id);
+    assert_eq!(
+        tags,
+        vec![
+            (
+                Some(10),
+                Some(1),
+                None,
+                Some(identity::TRANSCRIPT_ORG.to_owned()),
+                org_hash(IDENTITY_PIPELINE_ORG),
+            ),
+            (
+                Some(20),
+                Some(1),
+                Some(login.clone()),
+                Some(identity::TELEMETRY.to_owned()),
+                Some(org.clone()),
+            ),
+        ],
+        "R2-N2: the two-org request keeps the starting account without the login; \
+         the later request carries the late login and org: {accepted}"
+    );
+    assert!(
+        accepted.get("request_identity_refusals").is_none(),
+        "{accepted}"
+    );
+    // The server-accepted body is the tagged one.
+    assert!(day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
+
+    // Later days: the refused body is superseded, never re-offered, and its
+    // refusal is retired; the tagged body stays accepted.
+    let later = pipeline.cycle(t1 + DAY + 60);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    assert_eq!(pipeline.server.offered().len(), 2);
+    assert!(!later
+        .progress
+        .permanent_rejections
+        .contains_key(&refused_fingerprint));
+    assert!(later
+        .index
+        .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
+}
+
+/// F1: cache capability on, no accepted head and CAS optional. The recorded
+/// refusal belongs to the stripped probe, not the cache-enriched scan item.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
+    if !supported("cache_head_probe_refusal_reoffers_its_own_exact_body") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-cache-probe", Answer::Refuse(ORIGINAL_PAIR), t0);
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert!(
+        first.cache_enabled,
+        "the real preparation negotiated the cache contract"
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let refused = offered[0].clone();
+    let fingerprint = fingerprint_of(&refused);
+    assert!(refused.get("cache_observations").is_none());
+    assert!(first.progress.accepted_cache_heads.is_empty());
+    let quiet = pipeline.cycle(t0 + DAY - 1);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(pipeline.server.offered().len(), 1);
+    let due = pipeline.cycle(t0 + DAY + 60);
+    assert!(due.result.is_ok(), "{:?}", due.result);
+    assert_eq!(due.leased_offers, 1);
+    assert!(due.cache_enabled);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "the rebuilt probe must reach SOURCE");
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert!(offered[1].get("cache_observations").is_none());
+    assert_eq!(
+        due.progress.permanent_rejections[&fingerprint].body_witness,
+        first.progress.permanent_rejections[&fingerprint].body_witness
+    );
+    assert_eq!(
+        reoffer_json(&due, &fingerprint)["retry_after_unix_seconds"],
+        t0 + DAY + 60 + DAY
+    );
+}
+
+/// Two physical POSTs remain one logical leased offer, including bytes.
+/// Advancing the injected clock after 503 proves the saved claim is not bumped
+/// by the resend; the done marker appears only with the final answer.
+#[test]
+#[serial(client_report)]
+fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
+    let start = 2_000_000_000;
+    let clock = ClockGuard::start(start);
+    let fingerprint = "b".repeat(64);
+    let body = "c".repeat(64);
+    let mut progress = test_upload_progress();
+    progress.quarantine_permanent_body(&fingerprint, &body, "future_unknown_reason");
+    progress
+        .permanent_rejections
+        .get_mut(&fingerprint)
+        .unwrap()
+        .reoffer = Some(reason_reoffer::RefusalReoffer::OriginalPair {
+        retry_after_unix_seconds: start,
+    });
+    progress.reserve_reason_reoffer(&fingerprint, body.clone(), start);
+    let leased = progress.active_reason_reoffers.clone();
+    // The exact pre-send durable claim is observable by each fake POST.
+    let saved = std::cell::RefCell::new(serde_json::to_value(&progress).unwrap());
+    let mut posts = 0;
+    let mut accepted = 0;
+    let mut budget = InplaceRetryBudget::default();
+    let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
+        upload_resumable_batches_with_literal_families(
+            std::slice::from_ref(&fingerprint),
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| body.clone(),
+            |_| Some("synthetic-session"),
+            |_| 0,
+            |_| None,
+            &mut budget,
+            |items| {
+                assert_eq!(items, &[&fingerprint]);
+                let disk = saved.borrow();
+                let state = &disk["permanent_rejections"][&fingerprint]["reoffer"];
+                assert_eq!(state["reason"], ORIGINAL_PAIR);
+                assert_eq!(state["retry_after_unix_seconds"], start + DAY);
+                posts += 1;
+                if posts == 1 {
+                    clock.set(start + 600);
+                    return Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(1)),
+                        code: None,
+                    }));
+                }
+                let mut response = entity_ack_response(0);
+                response
+                    .rejected_entities
+                    .push(crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: "synthetic-session".into(),
+                        snapshot_fingerprint: fingerprint.clone(),
+                        reason: "future_unknown_reason".into(),
+                        detail: "synthetic final answer".into(),
+                        permanent: true,
+                        occurrence_count: 1,
+                    });
+                Ok(response)
+            },
+            |checkpoint| {
+                *saved.borrow_mut() = serde_json::to_value(checkpoint).unwrap();
+                Ok(())
+            },
+        )
+    });
+    assert!(matches!(
+        result.unwrap(),
+        ResumableUploadResult::Rejected { .. }
+    ));
+    assert_eq!(posts, 2);
+    assert_eq!(budget.resends, 1);
+    assert_eq!(waits.len(), 1);
+    assert!(budget.waited <= SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET);
+    assert_eq!(
+        saved.borrow()["permanent_rejections"][&fingerprint]["reoffer"]["reason"],
+        "classified"
+    );
+    progress.finish_reason_reoffers(&leased, false, SnapshotSource::ClaudeCode.api_slug());
+    let counts = progress.reason_reoffer_counts;
+    assert_eq!(
+        (
+            counts.selected,
+            counts.attempted,
+            counts.refused_other,
+            counts.failed
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(
+        counts.attempted_bytes,
+        snapshot_packing_json_length(&fingerprint).unwrap()
+    );
+    assert!(
+        progress.contains_body(&fingerprint, &body),
+        "lease consumed only by final answer"
+    );
+}
+
+/// After a restart, the first real ordinary prepare mirrors an open head-CAS
+/// challenge of a session holding a saved base from the persisted upload
+/// ledger into the scan index, so the session's files read a native Full;
+/// another session is not mirrored.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
+    if !supported("a_restarted_ordinary_prepare_mirrors_an_open_head_conflict") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("retry-gate-restart", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = cache_session_key(IDENTITY_PIPELINE_ROOT);
+    let mut progress = first.progress.clone();
+    progress
+        .accepted_cache_heads
+        .insert(key.clone(), "e".repeat(64));
+    progress.head_conflict_challenges.insert(
+        key.clone(),
+        HeadConflictChallenge {
+            challenge: "c".repeat(64),
+            stale_revision_v2_hash: "d".repeat(64),
+            answer_attempts: 0,
+            last_answer_unix: 0,
+        },
+    );
+    progress.save_fixture(&first.progress_path).unwrap();
+    pipeline.daemon = test_daemon("otm_test");
+    let preparation = pipeline
+        .prepare_cycle(t0 + 600)
+        .unwrap()
+        .expect("real due preparation");
+    assert!(preparation.committed_index.head_conflict_owed(&key));
+    assert!(!preparation
+        .committed_index
+        .head_conflict_owed(&cache_session_key("synthetic-other-session")));
+}
+
+/// A protected root, named by the local
+/// re-emission list, whose family holds a stored witness and whose member
+/// goes absent and then returns, through the real prepare/finish pipeline and
+/// the recording server. Nothing emitted for the root is a request-owned
+/// literal (`claude_request_counting:v1`, the "new v1"), nor is any file of
+/// it stamped with body-witness revision 3. The root either settles its proof
+/// (no record) or stays held with nothing offered.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
+    if !supported("protected_returning_root_emits_no_literal_v1_or_revision_3") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-protected-return", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+
+    crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    // An upgraded store's state: an older build stored the family's witness
+    // (no build proves a new one).
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    let items = crate::snapshots::parse_claude_code_jsonl_file(
+        &transcript,
+        &first.census_window_end,
+        String::new(),
+    )
+    .unwrap();
+    assert!(
+        index.install_stored_claude_family_witness_from_support_for_test(
+            root,
+            &items,
+            &pipeline.support
+        ),
+        "the stored witness installs"
+    );
+    index.save_fixture(&first.index_path).unwrap();
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+
+    let offered_before = pipeline.server.offered().len();
+    std::fs::write(&transcript, &bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    let offered = pipeline.server.offered();
+    let root_offers = offered[offered_before..]
+        .iter()
+        .filter(|offer| offer["source_session_id"] == root)
+        .collect::<Vec<_>>();
+    for offer in &root_offers {
+        assert_ne!(
+            offer["usage_accounting_contract"], "claude_request_counting:v1",
+            "no request-owned literal for a protected root"
+        );
+        assert!(
+            !offer.to_string().contains("claude_request_counting"),
+            "no literal body for a protected root"
+        );
+    }
+    if let Some(entry) = returned.index.files.get(&key) {
+        assert_ne!(entry.effective_upload_body_witness_revision, 3);
+        assert!(
+            entry.effective_upload_body_witness_revision
+                <= effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        );
+    }
+    let settled = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .is_none();
+    let held = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .is_some()
+        && root_offers.is_empty();
+    assert!(
+        settled || held,
+        "the return settles or stays held: settled={settled} held={held}"
+    );
+}
+
+/// The refusal, a conflict on its due daily offer, and the conflict's
+/// ordinary retry made due: the state whose quiet cycles re-read the file.
+fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_json::Value) {
+    refused_then_conflicted_holding(name, false)
+}
+
+/// `refused_then_conflicted`, optionally holding the state-directory lock
+/// from the first cycle on.
+fn refused_then_conflicted_holding(
+    name: &str,
+    locked: bool,
+) -> (ReofferPipeline, String, u64, serde_json::Value) {
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    // Keep this physical-read fixture larger than its bounded certificate
+    // samples, so total guard + suffix bytes can distinguish restore from Full.
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+        .unwrap();
+    #[cfg(unix)]
+    if locked {
+        pipeline.hold_state_dir_lock();
+    }
+    #[cfg(not(unix))]
+    let _ = locked;
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    pipeline.server.answer(Answer::Conflict);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(
+        day1.result.is_ok(),
+        "an isolated conflict keeps its follow-up owed"
+    );
+    assert_eq!(pipeline.server.offered().len(), 2);
+    let deadline = reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"].clone();
+    assert!(
+        deadline.as_u64().is_some_and(|due| due >= t1 + DAY),
+        "{}",
+        day1.progress_json
+    );
+    pipeline.make_conflict_retry_due(&fingerprint);
+    pipeline.server.answer(Answer::Accept);
+    (pipeline, fingerprint, t1, deadline)
+}
+
+/// Margin receipt for the scan workers' stack. The real prepare,
+/// rotation and finish cycle (a full scan, then a restart that restores the
+/// durable copy) completes in the optimized build on a thread with the
+/// 2 MiB spawn default, as do the Codex join ACK and creator-overlap paths.
+/// An overflow aborts the test process. Release only: the debug build's
+/// frames are far larger. Run by the dispatch-only `scan-stack-margin` job
+/// in `.github/workflows/ci.yml`.
+#[cfg(all(unix, not(debug_assertions)))]
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn scan_worker_stack_margin_receipt() {
+    const STACK_BYTES: usize = 2 * 1024 * 1024;
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "the durable restore needs a supported layout"
+    );
+    let (transcript, restored) = std::thread::Builder::new()
+        .name("ottto-snapshot-sync".to_string())
+        .stack_size(STACK_BYTES)
+        .spawn(|| {
+            let (mut pipeline, _, _, deadline) =
+                refused_then_conflicted_holding("stack-margin", true);
+            let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+            assert!(pipeline.durable_records() > 0, "written after the save");
+            // Scoped restore waits on a quiet file. Inert growth exercises the
+            // restore+Tail stack without changing the offered usage body.
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pipeline.transcript())
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
+            let due = deadline.as_u64().unwrap() + 60;
+            let (day2, _, bytes) = pipeline.measured_cycle(due, true);
+            assert!(day2.result.is_ok(), "{:?}", day2.result);
+            assert_eq!(day2.leased_offers, 1);
+            assert!(bytes < size, "restored, {bytes} >= {size}");
+            (size, bytes)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let ((ack_boots, ack_eofs), (overlap_boots, overlap_eofs, overlap_files)) =
+        run_on_scan_worker_stack_with_size(STACK_BYTES, || {
+            use super::once_credit_oracle_tests::{
+                codex_join_ack_on_worker_stack, codex_join_creator_overlap_on_worker_stack,
+            };
+            (
+                codex_join_ack_on_worker_stack(STACK_BYTES),
+                codex_join_creator_overlap_on_worker_stack(STACK_BYTES),
+            )
+        });
+    let codex_boots = ack_boots + overlap_boots;
+    let codex_eofs = ack_eofs + overlap_eofs;
+    eprintln!(
+        "SCAN_STACK_MARGIN_RECEIPT stack_bytes={STACK_BYTES} profile=release cycles=3 \
+         restart_restored=true transcript_bytes={transcript} restored_cycle_bytes={restored} \
+         codex_boots={codex_boots} codex_eofs={codex_eofs} \
+         codex_creator_overlap_refusal_files={overlap_files}"
+    );
+}
+
+/// O1: quiet cycles before the reserved daily re-offer re-read
+/// nothing for an unchanged file whose only selection is its already
+/// refused exact body, across a restart that rebuilds the runtime view.
+/// The refusal, conflict and deadline stay disclosed while the quiet traversal
+/// settles. At the due time: one reconstruction and one offer.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
+    if !supported("cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer") {
+        return;
+    }
+    let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted("reoffer-cooldown-io");
+    let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+    assert!(size > 0);
+    for (now, restart) in [
+        (t1 + 3_600, false),
+        (t1 + 7_200, true),
+        (t1 + 13 * 3_600, true),
+        (t1 + DAY - 1, true),
+    ] {
+        // Each traversal finds the conflict's ordinary timer due again, as
+        // every eligible traversal did for ~12-18 h of the cooldown.
+        pipeline.make_conflict_retry_due(&fingerprint);
+        let (quiet, parsed, bytes) = pipeline.measured_cycle(now, restart);
+        assert_eq!(parsed, 0, "no reason-driven re-read at +{}s", now - t1);
+        assert_eq!(bytes, 0, "no transcript bytes at +{}s", now - t1);
+        assert_eq!(pipeline.server.offered().len(), 2, "no POST before the day");
+        assert_eq!(quiet.leased_offers, 0);
+        assert_eq!(quiet.cooldown_deferred, 1, "counted once per entity");
+        // Only the normal clean-traversal boundary settles the cooldown debt.
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            pipeline.server.last_terminal()["last_error_code"],
+            "backend_validation_error"
+        );
+        assert_eq!(
+            pipeline.server.last_terminal()["last_census_complete"],
+            true
+        );
+        assert!(
+            pipeline.server.last_terminal()["last_success_at"].is_null(),
+            "transport settlement cannot advertise money completeness"
+        );
+        assert!(!quiet
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert!(!quiet.progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(quiet.progress.contains_body(
+            &fingerprint,
+            &quiet.progress.permanent_rejections[&fingerprint].body_witness
+        ));
+        assert_eq!(
+            quiet.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            quiet.progress.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+            deadline
+        );
+    }
+
+    // The reserved day arrives: exactly one reconstruction and one offer.
+    // The restart also loses the retired durable-tail directory, but the
+    // native Tail head lives in the state database and restores the quiet
+    // body without reading transcript bytes.
+    let due = deadline.as_u64().unwrap() + 60;
+    pipeline.drop_durable_stores();
+    let (day2, parsed, bytes) = pipeline.measured_cycle(due, true);
+    assert_eq!(day2.leased_offers, 1);
+    assert_eq!(parsed, 1, "one reconstruction at the due time");
+    assert_eq!(bytes, 0, "the native Tail head restores the unchanged body");
+    assert!(day2.result.is_ok(), "{:?}", day2.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3, "one offer at the due time");
+    assert_eq!(fingerprint_of(&offered[2]), fingerprint);
+    assert_eq!(day2.cooldown_deferred, 0);
+    assert!(!day2
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(day2
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+}
+
+/// O1 controls: a file that changes during the cooldown is re-read and its
+/// new body offered normally; an injected clock rollback re-clamps the
+/// reservation and still re-reads nothing for the unchanged file.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
+    if !supported("cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback") {
+        return;
+    }
+    let (mut pipeline, fingerprint, t1, _) = refused_then_conflicted("reoffer-cooldown-change");
+
+    // F2: the local clock rolls back an hour, past the tolerance. The
+    // reservation is re-clamped from the prepared ledger (still after the
+    // next cycle below), and the unchanged file is still not re-read.
+    let rolled_back = t1 - 3_600;
+    let (rollback, parsed, bytes) = pipeline.measured_cycle(rolled_back, true);
+    assert_eq!((parsed, bytes), (0, 0));
+    assert_eq!(pipeline.server.offered().len(), 2);
+    assert_eq!(rollback.cooldown_deferred, 1);
+    assert!(rollback.result.is_ok(), "{:?}", rollback.result);
+    assert!(!rollback.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        reoffer_json(&rollback, &fingerprint)["retry_after_unix_seconds"],
+        rolled_back + DAY
+    );
+
+    // The session grows before the daily offer: the file is re-read and its
+    // new body goes through the normal path.
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all(format!("{grown}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    let (changed, parsed, bytes) = pipeline.measured_cycle(t1 + 3_600, true);
+    assert_eq!(parsed, 1, "a changed file re-parses normally");
+    assert!(bytes > 0);
+    assert!(changed.result.is_ok(), "{:?}", changed.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3, "the new body is offered");
+    assert_ne!(fingerprint_of(&offered[2]), fingerprint);
+    assert!(changed
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&offered[2])));
+}
+
+/// The Claude scan index this pipeline's destination uses.
+fn claude_index_path(support: &Path) -> PathBuf {
+    std::fs::read_dir(support.join("snapshots/destinations"))
+        .unwrap()
+        .flatten()
+        .map(|destination| destination.path().join("claude_code-scan-index-v3.json"))
+        .find(|path| path.exists())
+        .expect("the Claude scan index")
+}
+
+/// The local Claude re-emission list.
+fn reemission_list_path(support: &Path) -> PathBuf {
+    support.join("snapshots/claude_code-reemission-exclusions.txt")
+}
+
+/// Held-body control for StateMissing re-offers: a history-held file (stored revision
+/// below the active one, no list, a saved history cutoff after its birth; the
+/// refusal in the ledger is prior history) with a due original-pair re-offer
+/// lease is not re-offered. Where no list is intended, only an unverified
+/// Mac or a move under a non-`full` claim still holds history (StateMissing
+/// N1); the index's durable move marker stands for that hold here. The lease is granted but
+/// never delivered: no body reaches the server, the refusal and its
+/// original-pair extension stay, nothing is accepted and the hold stays
+/// terminal. Once an installed list lets the upgrade through, the same lease
+/// delivers the exact refused body, so the hold is what blocked it.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
+    if !supported("history_held_file_is_not_reoffered_and_its_lease_is_not_delivered") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-history-held", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(pipeline.server.offered().len(), 1);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+
+    // History-held: every Claude entry stored below the active revision, and
+    // a saved history cutoff at or after every fixture birth.
+    let index_path = claude_index_path(&pipeline.support);
+    let mut saved: serde_json::Value =
+        serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap();
+    let files = saved["files"].as_object_mut().expect("indexed files");
+    assert!(!files.is_empty());
+    for entry in files.values_mut() {
+        entry["effective_upload_body_witness_revision"] = 1.into();
+    }
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
+    assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
+
+    pipeline.server.answer(Answer::Accept);
+    for day in 1..=2 {
+        let due = pipeline.cycle(t0 + day * (DAY + 60));
+        assert!(due.result.is_ok(), "day {day}: {:?}", due.result);
+        assert_eq!(due.leased_offers, 1, "day {day}: the lease is granted");
+        assert_eq!(
+            pipeline.server.offered().len(),
+            1,
+            "day {day}: a history-held body is never re-offered"
+        );
+        let refusal = &due.progress.permanent_rejections[&fingerprint];
+        assert_eq!(refusal.body_witness, refused_body, "day {day}");
+        assert_eq!(
+            reoffer_json(&due, &fingerprint)["reason"],
+            ORIGINAL_PAIR,
+            "day {day}: the lease is not settled"
+        );
+        assert!(!due.progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!due
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(
+            due.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal,
+            "day {day}"
+        );
+        assert!(due
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+    }
+
+    // Positive control: an installed (empty) list paces the upgrade, and the
+    // next due lease delivers the exact refused body.
+    std::fs::write(reemission_list_path(&pipeline.support), "# synthetic\n").unwrap();
+    let permitted = pipeline.cycle(t0 + 3 * (DAY + 60));
+    assert!(permitted.result.is_ok(), "{:?}", permitted.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "the permitted upgrade delivers the lease");
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert!(permitted
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+}
+
+/// A completed first cycle is not a kill before its first save: it publishes
+/// a native fence and its state database. Deleting that fence and clearing the
+/// ledger's ACKs must not turn the database's history into a fresh installation.
+/// A replay claim is still not server attestation (the separate StateMissing
+/// N1 test covers that); it cannot waive a missing published-root refusal.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
+    if !supported("missing_published_index_with_claim_only_ledger_refuses_without_reread") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-killed-install", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert!(!offered.is_empty());
+    assert!(
+        first.index_path.exists(),
+        "the first cycle DID publish an index"
+    );
+    assert!(
+        !first.index.files.is_empty(),
+        "the published index holds history"
+    );
+    let database = first.index_path.with_file_name(format!(
+        "{}.v2.sqlite",
+        first.index_path.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(
+        database.exists(),
+        "the first cycle published its state database"
+    );
+    // Rewrite the ledger as claim-only, but keep the published state database:
+    // this is loss AFTER publication, not a first install killed before it.
+    let mut claim = SnapshotUploadProgress::load_for_index(
+        &first.index,
+        &first.index_path,
+        &first.progress_path,
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .expect("load the ledger");
+    claim.historical_replay_generation = Some("claude_code:killed-first-cycle".into());
+    claim.accepted_fingerprints.clear();
+    claim.accepted_body_witnesses.clear();
+    claim.accepted_cache_states.clear();
+    claim.accepted_cache_heads.clear();
+    claim.pending_cache_heads.clear();
+    claim.quarantined_fingerprints.clear();
+    claim.permanent_rejections.clear();
+    claim
+        .save_fixture(&first.progress_path)
+        .expect("write the claim-only ledger");
+    assert!(!claim.records_server_attested_upload());
+    let progress_before = std::fs::read(&first.progress_path).ok();
+    std::fs::remove_file(&first.index_path).expect("lose the published fence");
+    let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
+    // Drop all warm process custody as a restart would; the surviving state
+    // database must keep the source closed without consulting a transcript or
+    // contacting upload.
+    pipeline.daemon = test_daemon("otm_test");
+    let ((prepared, reads), records) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            crate::snapshots::with_transcript_io_denied(|| pipeline.prepare_cycle(t0 + 60))
+        })
+    });
+    let error = match prepared {
+        Err(error) => error,
+        Ok(_) => panic!("a missing published root must refuse before collection"),
+    };
+    assert!(
+        format!("{error:#}").contains("state_v2_fence_lost"),
+        "{error:#}"
+    );
+    let health = pipeline
+        .daemon
+        .status("token")
+        .unwrap()
+        .canonical_health
+        .unwrap();
+    let repair_code = crate::snapshots::scan_index_health::SHARD_CODE;
+    let blockers: Vec<_> = health
+        .blockers
+        .iter()
+        .filter(|b| b.code == repair_code)
+        .collect();
+    assert_eq!(blockers.len(), 1, "reuse the existing repair surface");
+    assert_eq!(blockers[0].source, "claude_code");
+    assert_eq!(
+        blockers[0].clear_condition,
+        crate::snapshots::scan_index_health::SHARD_DETAIL
+    );
+    let row = health
+        .sources
+        .iter()
+        .find(|s| s.app == SourceKind::ClaudeCode)
+        .unwrap();
+    assert_eq!(row.blocking_reason.as_deref(), Some(repair_code));
+    assert_eq!(row.next_action.as_deref(), Some("contact_support"));
+    assert!(health
+        .sources
+        .iter()
+        .filter(|s| s.app != SourceKind::ClaudeCode)
+        .all(|s| s.blocking_reason.as_deref() != Some(repair_code)));
+    let alarms: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+        .collect();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["source"], "claude_code");
+    let counters: Vec<_> = records
+        .iter()
+        .filter(|r| r["counts"].get("scan_index_repair_required").is_some())
+        .collect();
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0]["source"], "claude_code");
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["cause"],
+        "state_v2"
+    );
+    assert_eq!(
+        counters[0]["counts"]["scan_index_repair_required"]["delta"], 1,
+        "one refused-load counter increment"
+    );
+    assert!(reads.is_empty(), "no transcript acquisition while held");
+    assert!(
+        !first.index_path.exists(),
+        "no default index or replacement fence"
+    );
+    assert!(database.exists(), "the state database keeps its custody");
+    assert_eq!(std::fs::read(&first.progress_path).ok(), progress_before);
+    assert_eq!(pipeline.server.offered(), offered, "no history re-uploaded");
+}
+
+/// The incident shape, through real prepare/finish (including
+/// bootstrap completion and N2 clearing), after BOTH list and .seen are lost.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn durable_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("durable_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-set", true, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn absent_list_intent_paces_quarantined_history() {
+    if !supported("absent_list_intent_paces_quarantined_history") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-absent", false, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn malformed_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("malformed_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-malformed", false, true);
+}
+
+fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
+    use crate::backfill::{backfill_state_path, load_backfill_state, ClaudeHistoryListIntent};
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(name, Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let initial = pipeline.server.offered().len();
+    assert!(initial > 0, "prior uploads");
+    assert_eq!(
+        load_backfill_state(&pipeline.support).claude_history_list_intent,
+        ClaudeHistoryListIntent::Absent
+    );
+    let seen = crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support);
+    if set {
+        // Even an empty well-formed list sets independent intent.
+        std::fs::write(
+            reemission_list_path(&pipeline.support),
+            "# installed empty list\n",
+        )
+        .unwrap();
+        let installed = pipeline.cycle(t0 + 60);
+        assert!(installed.result.is_ok(), "{:?}", installed.result);
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        assert!(seen.exists());
+        std::fs::remove_file(reemission_list_path(&pipeline.support)).unwrap();
+        std::fs::remove_file(&seen).unwrap();
+    }
+    if malformed {
+        let state_path = backfill_state_path(&pipeline.support);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        saved["claude_history_list_intent"] = serde_json::json!({"damaged": true});
+        std::fs::write(state_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable
+        );
+    }
+    let index_path = claude_index_path(&pipeline.support);
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&index_path, b"{not json");
+    let held = match pipeline.prepare_cycle(t0 + 120) {
+        Err(error) => error,
+        _ => panic!("quarantine publication requires the next ordinary pass"),
+    };
+    assert_eq!(
+        held.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+        Some(&crate::snapshots::state_v2::Hold::ReloadRequired)
+    );
+    assert_eq!(pipeline.server.offered().len(), initial);
+    assert!(index_path.exists(), "native publication keeps its fence");
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    assert!(!seen.exists());
+    let (second, lines) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::with_body_witness_adoption_page_budget(1, || pipeline.cycle(t0 + 120))
+    });
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    if set || malformed {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "no history body leaves after quarantine"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["stage"] == "claude_reemission_list_missing_after_install"),
+            "missing-list alarm: {lines:?}"
+        );
+        let third = pipeline.cycle(t0 + 180);
+        assert!(third.result.is_ok(), "{:?}", third.result);
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "hold survives real completion/marker clearing and reload"
+        );
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            if set {
+                ClaudeHistoryListIntent::Set
+            } else {
+                ClaudeHistoryListIntent::Unreadable
+            }
+        );
+    } else {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial + 1,
+            "positive Absent policy paces one history body"
+        );
+    }
+    assert!(
+        std::fs::read_dir(index_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "index was quarantined"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
+    if !supported("first_nonempty_list_read_records_durable_intent_through_prepare_finish") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-intent-first-list", Answer::Accept, t0);
+    let snapshots = pipeline.support.join("snapshots");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    std::fs::write(
+        reemission_list_path(&pipeline.support),
+        format!("{}\n", "a".repeat(64)),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Absent
+    );
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Set
+    );
+    assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
+}
+
+/// A returning member under a history move hold, on the always-on path: (b) the
+/// hold withholds the body, with nothing uploaded or stamped; (c) once
+/// the hold releases (an explicit `full` claim, then readable proof) the
+/// family's money is exactly its request-owned total: one request-owned body,
+/// never a legacy one beside it, and no identity beyond what the first
+/// accepted body carried.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn returning_history_obeys_the_move_hold() {
+    if !supported("returning_history_obeys_the_move_hold") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-return-history-held", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let root_offers = |offered: &[serde_json::Value]| {
+        offered
+            .iter()
+            .filter(|offer| offer["source_session_id"] == root)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let baseline = root_offers(&pipeline.server.offered());
+    assert_eq!(baseline.len(), 1, "the root is offered once at first");
+    let baseline = baseline[0].clone();
+    assert_eq!(
+        baseline["usage_accounting_contract"],
+        crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+        "the unlisted baseline is request-owned: {baseline}"
+    );
+    assert_eq!(usage_of(&baseline), (2, 30, 3), "req_1 + req_2");
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+    let settled_revision = first.index.files[&key].effective_upload_body_witness_revision;
+    assert_ne!(settled_revision, 0, "the accepted baseline is stamped");
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    let mut saved: serde_json::Value =
+        serde_json::to_value(ScanIndex::load(&absent.index_path).unwrap()).unwrap();
+    std::fs::write(&transcript, &bytes).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &absent.index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    let offered_before = pipeline.server.offered().len();
+
+    // Healthy local proof cannot waive the history hold or stamp the
+    // body as uploaded.
+    let proved_return = pipeline.cycle(t0 + 1_200);
+    assert!(proved_return.result.is_ok(), "{:?}", proved_return.result);
+    assert_eq!(pipeline.server.offered().len(), offered_before);
+    assert_eq!(
+        proved_return.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+
+    // Remove it again, then return without healthy proof.
+    std::fs::remove_file(&transcript).unwrap();
+    let absent_again = pipeline.cycle(t0 + 1_800);
+    assert!(absent_again.result.is_ok(), "{:?}", absent_again.result);
+    assert!(!absent_again.index.files.contains_key(&key));
+    let api = pipeline
+        .support
+        .join("local-otel/claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    std::fs::write(api, b"{ malformed synthetic proof\n").unwrap();
+    std::fs::write(&transcript, bytes).unwrap();
+    let mut saved: serde_json::Value =
+        serde_json::to_value(ScanIndex::load(&absent_again.index_path).unwrap()).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &absent_again.index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
+    let returned = pipeline.cycle(t0 + 2_400);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    // (b) The history hold still withholds the body: nothing uploaded, nothing
+    // stamped, and the durable move marker stands.
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered_before,
+        "history stays held"
+    );
+    assert_eq!(
+        returned.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+    let saved: serde_json::Value =
+        serde_json::to_value(ScanIndex::load(&returned.index_path).unwrap()).unwrap();
+    assert_eq!(
+        saved["claude_history_move_not_full"].as_bool(),
+        Some(true),
+        "the move hold stands"
+    );
+    assert!(saved.get("claude_history_move_released").is_none());
+
+    // (c) Release the hold the production way: an explicit `full` claim
+    // clears the move marker for good. The proof is still unreadable, so its
+    // own hold keeps the owed body back: no Unknown body is sent that a
+    // later account could replace.
+    crate::backfill::apply_claim_backfill_policy(&pipeline.support, Some("full"), None, "user")
+        .expect("explicit full claim");
+    let claimed = pipeline.cycle(t0 + 3_000);
+    assert!(claimed.result.is_ok(), "{:?}", claimed.result);
+    let saved: serde_json::Value =
+        serde_json::to_value(ScanIndex::load(&claimed.index_path).unwrap()).unwrap();
+    assert!(
+        saved.get("claude_history_move_not_full").is_none(),
+        "the full claim clears the move hold"
+    );
+    assert_eq!(saved["claude_history_move_released"].as_bool(), Some(true));
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered_before,
+        "unreadable proof still withholds the owed body"
+    );
+    assert_eq!(
+        claimed.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+
+    // Readable proof: the released body settles.
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    let release_offers_start = pipeline.server.offered().len();
+    let released = pipeline.cycle(t0 + 3_600);
+    assert!(released.result.is_ok(), "{:?}", released.result);
+    assert_eq!(
+        released.index.files[&key].effective_upload_body_witness_revision, settled_revision,
+        "the hold released and the body settled"
+    );
+    let offered = pipeline.server.offered();
+    let new_offers = root_offers(&offered[offered_before..]);
+    assert!(
+        new_offers.len() <= 1,
+        "at most one replacement body: {new_offers:?}"
+    );
+    // The family's money: its current body is the request-owned total, and
+    // no legacy body was ever sent beside it.
+    let all_offers = root_offers(&offered);
+    for offer in &all_offers {
+        assert_eq!(
+            offer["usage_accounting_contract"],
+            crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT,
+            "no legacy body: {offer}"
+        );
+        assert_ne!(
+            offer["usage_accounting_contract"],
+            "session_exclusive_reported_usage:v1"
+        );
+    }
+    let current = all_offers.last().unwrap();
+    assert_eq!(
+        usage_of(current),
+        usage_of(&baseline),
+        "family total == request-owned total, counted once"
+    );
+    // The durable ACK ledger is the index. finish_sync_source resets the
+    // progress file once this release page fully settles; the index keeps
+    // the exact rebuilt body uploaded on the page.
+    let uploaded_on_release = &offered[release_offers_start..];
+    let uploaded_fingerprints = uploaded_on_release
+        .iter()
+        .map(fingerprint_of)
+        .collect::<BTreeSet<_>>();
+    let release_accepted = released.index.accepted_snapshot_fingerprints_for_test();
+    assert_eq!(uploaded_on_release.len(), 1,
+        "U10(c1): exactly one release-page upload; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        release_accepted);
+    assert!(uploaded_fingerprints.is_subset(release_accepted),
+        "U10(c1): every uploaded body has its exact ACK; uploaded={uploaded_fingerprints:?} accepted={:?}",
+        release_accepted);
+    // No Unknown -> account upgrade: a replacement carries exactly the
+    // first accepted body's identity, never an account it lacked. With no
+    // replacement, the server already holds that exact accepted body.
+    let accounts = |offer: &serde_json::Value| {
+        usage_rows(offer)
+            .into_iter()
+            .flat_map(|row| {
+                std::iter::once(row)
+                    .chain(json_array(&row["identity_parts"]))
+                    .filter_map(|tag| tag["account_identifier_hash"].as_str())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    match new_offers.first() {
+        Some(replacement) => {
+            assert_eq!(accounts(replacement), accounts(&baseline), "{replacement}");
+            assert_eq!(
+                replacement["request_evidence"], baseline["request_evidence"],
+                "{replacement}"
+            );
+        }
+        None => assert_eq!(fingerprint_of(current), fingerprint_of(&baseline)),
+    }
+
+    // Quiet: nothing more is sent and the stamp holds.
+    let quiet = pipeline.cycle(t0 + 4_200);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(pipeline.server.offered().len(), offered.len(),
+        "U10(c2): quiet cycle offers nothing; release_uploaded={uploaded_fingerprints:?} release_accepted={:?} quiet_accepted={:?}",
+        release_accepted, quiet.index.accepted_snapshot_fingerprints_for_test());
+    assert_eq!(
+        quiet.index.files[&key].effective_upload_body_witness_revision,
+        settled_revision
+    );
+}
+
+thread_local! {
+    static FINALIZED_PROBE_ITEMS: std::cell::RefCell<Option<Vec<SnapshotItem>>> = const { std::cell::RefCell::new(None) };
+    /// Supply the producer patch with no owed challenge: a new session.
+    static NEW_PATCHED_SESSION: Cell<bool> = const { Cell::new(false) };
+}
+
+// Supply the producer patch before real finalization, only for these scoped
+// probe cycles. The ordinary synthetic Claude session has no cache evidence.
+// Each probe session also owes a base-less challenge, as one an older writer
+// left; it changes no wire. A new patched session owes nothing.
+pub(in crate::snapshot_sync) fn prepare_probe_for_test(
+    items: &mut [SnapshotItem],
+    progress: &mut SnapshotUploadProgress,
+) {
+    let probe = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow().is_some());
+    if probe || NEW_PATCHED_SESSION.with(Cell::get) {
+        for item in items {
+            item.cache_observations = pending_head_index_item().1.cache_observations;
+            if !probe {
+                continue;
+            }
+            progress
+                .head_conflict_challenges
+                .entry(cache_session_key(&item.source_session_id))
+                .or_insert_with(|| HeadConflictChallenge {
+                    challenge: "c".repeat(64),
+                    stale_revision_v2_hash: "d".repeat(64),
+                    answer_attempts: 0,
+                    last_answer_unix: 0,
+                });
+        }
+    }
+}
+
+pub(super) fn observe_finalized_probe_items(items: &[SnapshotItem]) {
+    FINALIZED_PROBE_ITEMS.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            *captured = items.to_vec();
+        }
+    });
+}
+
+fn held_probe_cycle(pipeline: &mut ReofferPipeline, now: u64) -> (CycleResult, Vec<SnapshotItem>) {
+    FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let cycle = pipeline.cycle(now);
+    let items = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(cycle.result.is_ok(), "{:?}", cycle.result);
+    assert!(cycle.cache_enabled);
+    (cycle, items)
+}
+
+fn body_set(item: &SnapshotItem) -> String {
+    crate::snapshots::e2_pipeline_scan_fixture::file_upload_body_set(std::slice::from_ref(item))
+}
+
+fn force_held_file_parse(cycle: &mut CycleResult) {
+    for entry in cycle.index.files.values_mut() {
+        entry.last_snapshot_fingerprint = None;
+        entry.last_upload_body_witness = None;
+    }
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
+}
+
+/// [regress] Real finalization records a cache-bearing body before bootstrap;
+/// only its exact server-covered probe may retire this file revision's debt.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_stale_refusal_earns_receipt_in_refusal_pass() {
+    if !supported("held_probe_stale_refusal_earns_receipt_in_refusal_pass") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-receipt",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (first, finalized) = held_probe_cycle(&mut pipeline, now);
+    assert_eq!(finalized.len(), 1);
+    let mut full = finalized[0].clone();
+    assert!(
+        full.cache_observations.is_some(),
+        "the real finalizer carried cache fields"
+    );
+    prepare_snapshot_cache_for_upload(&mut full, &test_upload_progress(), true, false);
+    let probe = cache_head_probe(&full);
+    assert_ne!(
+        body_set(&full),
+        body_set(&probe),
+        "non-vacuous witness mismatch"
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let mut sent = offered[0].clone();
+    sent.as_object_mut().unwrap().remove("semantic_envelope");
+    assert_eq!(sent, serde_json::to_value(&probe).unwrap());
+    let entry = first.index.files.values().next().unwrap();
+    assert_eq!(entry.last_upload_body_witness, Some(body_set(&probe)));
+    assert_eq!(
+        entry.upload_context_receipt.as_ref().unwrap().body_witness,
+        body_set(&probe)
+    );
+    assert!(first.progress.accepted_fingerprints.is_empty());
+    crate::snapshots::e2_pipeline_scan_fixture::assert_file_receipt_retires_debt(
+        std::slice::from_ref(&probe),
+        true,
+        |index| {
+            let covered = first.progress.covered_stale_bodies();
+            let candidates =
+                index.file_upload_context_ack_candidates(std::slice::from_ref(&probe), &covered);
+            index.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &covered);
+        },
+    );
+    let (quiet, _) = held_probe_cycle(&mut pipeline, now + 60);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        1,
+        "pass two offers zero bodies"
+    );
+    assert_eq!(
+        quiet
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .upload_context_receipt,
+        entry.upload_context_receipt
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_mixed_refusal_keeps_retry_debt_without_receipt() {
+    if !supported("held_probe_mixed_refusal_keeps_retry_debt_without_receipt") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-mixed",
+        Answer::Retryable("accepted_log_stale_older_mixed"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (cycle, finalized) = held_probe_cycle(&mut pipeline, now);
+    let probe = cache_head_probe(&finalized[0]);
+    let entry = cycle.index.files.values().next().unwrap();
+    assert_eq!(entry.last_upload_body_witness, Some(body_set(&probe)));
+    assert!(entry.upload_context_receipt.is_none());
+    assert_eq!(
+        cycle.index.quarantined_snapshot_fingerprints[&probe.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(cycle.progress.permanent_rejections.is_empty());
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_old_refusal_cannot_receipt_legacy_or_grown_body() {
+    if !supported("held_probe_old_refusal_cannot_receipt_legacy_or_grown_body") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-old",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut cycle, finalized) = held_probe_cycle(&mut pipeline, now);
+    let mut probe = cache_head_probe(&finalized[0]);
+    for grown in [false, true] {
+        let mut progress = cycle.progress.clone();
+        if grown {
+            probe.tool_usage_truncated = !probe.tool_usage_truncated;
+        } else {
+            progress
+                .permanent_rejections
+                .get_mut(&probe.snapshot_fingerprint)
+                .unwrap()
+                .exposure = None;
+        }
+        crate::snapshots::e2_pipeline_scan_fixture::assert_file_receipt_retires_debt(
+            std::slice::from_ref(&probe),
+            false,
+            |index| {
+                let covered = progress.covered_stale_bodies();
+                let candidates = index
+                    .file_upload_context_ack_candidates(std::slice::from_ref(&probe), &covered);
+                index.accept_file_upload_context_acks(&candidates, &BTreeMap::new(), &covered);
+            },
+        );
+    }
+    // Also restore an actual legacy record through prepare/finalize.
+    cycle
+        .progress
+        .permanent_rejections
+        .values_mut()
+        .for_each(|record| record.exposure = None);
+    cycle.progress.save_fixture(&cycle.progress_path).unwrap();
+    for entry in cycle.index.files.values_mut() {
+        entry.upload_context_receipt = None;
+    }
+    force_held_file_parse(&mut cycle);
+    let (legacy, _) = held_probe_cycle(&mut pipeline, now + 60);
+    assert!(legacy
+        .index
+        .files
+        .values()
+        .all(|entry| entry.upload_context_receipt.is_none()));
+    assert_eq!(pipeline.server.offered().len(), 1);
+}
+
+/// An ordinary later parse of unchanged bytes keeps the probe witness; no
+/// cache observation is sent on the first, quiet or explicitly forced pass.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_cache_observations_never_offered() {
+    if !supported("held_probe_cache_observations_never_offered") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-reparse",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (first, finalized) = held_probe_cycle(&mut pipeline, now);
+    let digest = body_set(&cache_head_probe(&finalized[0]));
+    assert_eq!(
+        first
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(digest.clone())
+    );
+    let (mut quiet, _) = held_probe_cycle(&mut pipeline, now + 60);
+    force_held_file_parse(&mut quiet);
+    FINALIZED_PROBE_ITEMS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let (parsed, reads, _) = pipeline.measured_cycle(now + 120, false);
+    let reparsed = FINALIZED_PROBE_ITEMS.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(reparsed[0].cache_observations.is_some());
+    assert!(parsed.result.is_ok(), "{:?}", parsed.result);
+    assert_eq!(reads, 1, "the unchanged file was explicitly parsed again");
+    assert_eq!(
+        parsed
+            .index
+            .files
+            .values()
+            .next()
+            .unwrap()
+            .last_upload_body_witness,
+        Some(digest)
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    assert!(offered
+        .iter()
+        .all(|item| item.get("cache_observations").is_none()));
+}
+
+// Restore the finalized tuple an older writer saved, with fresh exact stale
+// coverage and an unchanged source stamp from the real prepare/finish route.
+fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleResult, SnapshotItem) {
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut cycle, finalized) = held_probe_cycle(pipeline, now);
+    assert_eq!(finalized.len(), 1);
+    let mut full = finalized[0].clone();
+    assert!(full.cache_observations.is_some());
+    prepare_snapshot_cache_for_upload(&mut full, &test_upload_progress(), true, false);
+    let probe = cache_head_probe(&full);
+    assert_ne!(body_set(&full), body_set(&probe));
+    // finish_cycle transfers terminal custody to the index. Restore it as
+    // real preparation does before inspecting the seeded eligibility.
+    cycle
+        .progress
+        .prepare_quarantine_retries(&cycle.index.quarantined_snapshot_fingerprints);
+    assert_eq!(
+        cycle.progress.quarantined_fingerprints[&probe.snapshot_fingerprint].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(
+        cycle.progress.covered_stale_bodies()[&probe.snapshot_fingerprint],
+        snapshot_upload_body_witness(&probe)
+    );
+    for entry in cycle.index.files.values_mut() {
+        entry.last_upload_body_witness = Some(body_set(&full));
+        entry.upload_context_receipt = None;
+    }
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
+    (cycle, probe)
+}
+
+fn reset_held_probe_process() {
+    stale_owed::HELD_PROBE_REARMED[SnapshotSource::ClaudeCode.slot()]
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [behaviour] Only complete exact covered terminal membership may rearm;
+/// retryable, owed, partial, aligned and decode-held files stay untouched.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn held_probe_rearm_keeps_uncovered_and_aligned_files() {
+    if !supported("held_probe_rearm_keeps_uncovered_and_aligned_files") {
+        return;
+    }
+    let now = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(
+        "held-probe-controls",
+        Answer::Refuse("accepted_log_stale_older_upload"),
+        now,
+    );
+    let (legacy, probe) = seed_legacy_probe_file(&mut pipeline, now);
+    let fp = &probe.snapshot_fingerprint;
+    let key = legacy.index.files.keys().next().unwrap().clone();
+    for case in ["covered", "mixed", "owed", "sibling", "aligned", "decode"] {
+        let mut progress = legacy.progress.clone();
+        let mut index = legacy.index.clone();
+        match case {
+            "mixed" => {
+                progress
+                    .quarantined_fingerprints
+                    .get_mut(fp)
+                    .unwrap()
+                    .disposition = SnapshotQuarantineDisposition::RetryPending;
+            }
+            "owed" => progress.permanent_rejections.get_mut(fp).unwrap().exposure = None,
+            "sibling" => {
+                let sibling = "e".repeat(64);
+                progress.quarantined_fingerprints.insert(
+                    sibling.clone(),
+                    progress.quarantined_fingerprints[fp].clone(),
+                );
+                index
+                    .file_snapshot_fingerprints
+                    .get_mut(&key)
+                    .unwrap()
+                    .insert(sibling);
+            }
+            "aligned" => {
+                index.files.get_mut(&key).unwrap().last_upload_body_witness = Some(body_set(&probe))
+            }
+            "decode" => crate::snapshots::e2_pipeline_scan_fixture::hold_file_decode_for_test(
+                &mut index, &key,
+            ),
+            _ => {}
+        }
+        let group = index.files[&key].last_snapshot_fingerprint.clone();
+        let digest = index.files[&key].last_upload_body_witness.clone();
+        let source = index.files[&key].source_file_fingerprint.clone();
+        assert_eq!(
+            progress.rearm_held_probe_witness_files(&mut index),
+            usize::from(case == "covered"),
+            "{case}"
+        );
+        assert_eq!(index.files[&key].source_file_fingerprint, source, "{case}");
+        if case == "covered" {
+            assert!(index.files[&key].last_snapshot_fingerprint.is_none());
+            assert!(index.files[&key].last_upload_body_witness.is_none());
+        } else {
+            assert_eq!(index.files[&key].last_snapshot_fingerprint, group, "{case}");
+            assert_eq!(index.files[&key].last_upload_body_witness, digest, "{case}");
+        }
+    }
+    // Even an unaligned tuple cannot rearm twice in the same process.
+    reset_held_probe_process();
+    for expected in [1, 0] {
+        let mut index = legacy.index.clone();
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            stale_owed::rearm_held_probe_once(
+                SnapshotSource::ClaudeCode,
+                &legacy.progress,
+                &mut index,
+            );
+        });
+        let count = records
+            .iter()
+            .filter(|r| r["stage"] == "held_probe_witness_rearm")
+            .map(|r| r["counts"]["count"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(count, expected);
+        assert_eq!(
+            index.files[&key].last_snapshot_fingerprint.is_none(),
+            expected == 1
+        );
+    }
+}
+
+/// [regress] [money] An upload outage keeps the read. A page whose upload
+/// ends in a plain shed, an HTTP 500 or a dropped connection holds its
+/// unACKed body in retryable custody, so the file and its head commit. The
+/// due recovery pass, with or without a restart, restores the file instead of
+/// reading it in full and re-sends the same body, which is ACKed exactly. The
+/// outage records no ACK, refusal or poison loss. Without the custody the
+/// recovery pass reads the whole file again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn upload_outage_keeps_the_read_and_resends_from_the_head() {
+    use super::prior_index_lifetime_tests::Guard as RetryClock;
+    if !supported("upload_outage_keeps_the_read_and_resends_from_the_head") {
+        return;
+    }
+    for outage in [Answer::Shed, Answer::ServerError, Answer::Dropped] {
+        for restart in [false, true] {
+            let label = format!("{outage:?} restart={restart}");
+            let t0 = current_unix_seconds();
+            let mut pipeline = ReofferPipeline::new("outage-custody", outage, t0);
+            // Larger than the bounded certificate samples, so the bytes read
+            // tell a restore from a Full read.
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pipeline.transcript())
+                .unwrap()
+                .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+                .unwrap();
+            #[cfg(unix)]
+            pipeline.hold_state_dir_lock();
+            let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+            let (first, _) = with_inplace_retry_test_clock(None, || pipeline.cycle(t0));
+            let sent = pipeline.server.offered();
+            assert!(!sent.is_empty(), "{label}: the outage page POSTs");
+            let fingerprint = fingerprint_of(&sent[0]);
+            // The custody's backoff has passed: its retry is due.
+            let mut index = ScanIndex::load(&first.index_path).unwrap();
+            if let Some(record) = index
+                .quarantined_snapshot_fingerprints
+                .get_mut(&fingerprint)
+            {
+                record.retry_after_unix_seconds = 0;
+                index.save_fixture(&first.index_path).unwrap();
+            }
+            pipeline.server.answer(Answer::Accept);
+            let (recovery, _, bytes) = {
+                let _clock = RetryClock::new(false, None, Some(t0 + 3_600));
+                pipeline.measured_cycle(t0 + 3_600, restart)
+            };
+            assert!(recovery.result.is_ok(), "{label}: {:?}", recovery.result);
+            assert!(
+                bytes < size,
+                "{label}: restored, not read in full: {bytes} >= {size}"
+            );
+            let offered = pipeline.server.offered();
+            let resent = &offered[sent.len()..];
+            assert!(!resent.is_empty(), "{label}: the recovery pass re-sends");
+            for body in resent {
+                assert_eq!(
+                    fingerprint_of(body),
+                    fingerprint,
+                    "{label}: the same entity"
+                );
+                assert_eq!(
+                    body["semantic_envelope"], sent[0]["semantic_envelope"],
+                    "{label}: the same money and placement"
+                );
+                assert_eq!(usage_of(body), usage_of(&sent[0]), "{label}");
+            }
+            assert!(
+                recovery
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(&fingerprint),
+                "{label}: exact ACK"
+            );
+            assert!(
+                recovery
+                    .index
+                    .quarantined_snapshot_fingerprints
+                    .get(&fingerprint)
+                    .is_none_or(|record| {
+                        record.disposition != SnapshotQuarantineDisposition::RetryPending
+                    }),
+                "{label}: the ACK clears the custody"
+            );
+            // The outage itself committed the body's custody, without an ACK
+            // or a poison loss.
+            assert!(
+                !first
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(&fingerprint),
+                "{label}: no ACK invented"
+            );
+            assert_eq!(
+                first.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+                SnapshotQuarantineDisposition::RetryPending,
+                "{label}: outage custody"
+            );
+            assert!(
+                !counted_poison_fingerprints_for_test(SnapshotSource::ClaudeCode.api_slug())
+                    .contains(&fingerprint),
+                "{label}: no poison loss"
+            );
+        }
+    }
+}
+
+// The re-armed legacy file reached by a kept generation's due re-listing.
+mod held_probe_listing_tests {
+    include!("held_probe_listing_tests.rs");
+}
+
+/// [money] [regress] adopted_W0_head_first_W1 on the real prepare/finish
+/// route. The server holds the ordinary base W0 (no head) and the index adopted
+/// and pruned its ACK; the session's same-fingerprint body then gains a cache
+/// patch (W1). W1 is owed durably, the stripped W0 probe takes the head (CAS
+/// off, then on), and W1 goes out with that head: zero conflicts against a
+/// server that checks head CAS. A failed post-save step keeps the debt; the
+/// next cycle retires it on the exact W1 ACK with its head; a quiet cycle
+/// sends nothing. Every offer carries the same counters.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn adopted_w0_head_first_w1() {
+    if !supported("adopted_w0_head_first_w1") {
+        return;
+    }
+    struct Patched;
+    impl Drop for Patched {
+        fn drop(&mut self) {
+            NEW_PATCHED_SESSION.with(|slot| slot.set(false));
+            super::ACK_POST_SAVE_FAILURE.with(|slot| slot.set(None));
+        }
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("adopted-head-first", Answer::Accept, t0);
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *pipeline.server.head_cas_conflicts.lock().unwrap() = Some(0);
+
+    let mut adopted = pipeline.cycle(t0);
+    assert!(adopted.result.is_ok(), "{:?}", adopted.result);
+    assert!(adopted.cache_enabled);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let base = offered[0].clone();
+    assert!(base["cache_observations"].is_null(), "an ordinary W0");
+    let fingerprint = fingerprint_of(&base);
+    let key = cache_session_key(base["source_session_id"].as_str().unwrap());
+    assert!(adopted
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert!(
+        !adopted
+            .progress
+            .accepted_body_witnesses
+            .contains_key(&fingerprint),
+        "the index adopted and pruned the ACK"
+    );
+    assert!(adopted.progress.accepted_cache_heads.is_empty());
+
+    // The same session now carries a patch; a failed step after the index
+    // save stops this cycle before retirement.
+    force_held_file_parse(&mut adopted);
+    NEW_PATCHED_SESSION.with(|slot| slot.set(true));
+    let _patched = Patched;
+    super::ACK_POST_SAVE_FAILURE.with(|slot| slot.set(Some("selected_save")));
+    let unsaved = pipeline.cycle(t0 + 600);
+    assert!(unsaved.result.is_err(), "the post-save step failed");
+    let offered = pipeline.server.offered();
+    let contracts = pipeline.server.contracts.lock().unwrap().clone();
+    assert_eq!(offered.len(), 4, "probe, its CAS repeat, W1");
+    for probe in &offered[1..3] {
+        assert_eq!(fingerprint_of(probe), fingerprint);
+        assert!(probe["cache_observations"].is_null(), "stripped W0");
+    }
+    assert!(contracts[1].0.is_null(), "stage 1 without CAS");
+    assert!(contracts[2].0.is_string(), "stage 2 under CAS");
+    let patched = &offered[3];
+    assert_eq!(fingerprint_of(patched), fingerprint, "same fingerprint");
+    assert!(patched["cache_observations"].is_object(), "the whole patch");
+    assert_eq!(
+        patched["semantic_envelope"]["base_head_etag"],
+        "e".repeat(64),
+        "W1 rides the head"
+    );
+    assert!(contracts[3].0.is_string());
+    assert_eq!(contracts[3].1, "cache_state_ack:v1");
+    assert_eq!(*pipeline.server.head_cas_conflicts.lock().unwrap(), Some(0));
+    assert_eq!(unsaved.progress.accepted_cache_heads[&key], "e".repeat(64));
+    assert!(
+        !unsaved.progress.pending_cache_heads.is_empty(),
+        "W1 stays owed until retirement after the save"
+    );
+
+    let saved = pipeline.cycle(t0 + 1200);
+    assert!(saved.result.is_ok(), "{:?}", saved.result);
+    assert!(
+        saved.progress.pending_cache_heads.is_empty(),
+        "exact W1 ACK"
+    );
+    assert!(saved.progress.accepted_cache_states.contains_key(&key));
+    assert!(saved.progress.head_conflict_challenges.is_empty());
+    let stored = pipeline.server.stored.lock().unwrap()[&fingerprint].clone();
+    assert!(stored["cache_observations"].is_object(), "W1 stored");
+    assert_eq!(*pipeline.server.head_cas_conflicts.lock().unwrap(), Some(0));
+    let offered = pipeline.server.offered();
+    for offer in &offered {
+        assert_eq!(usage_of(offer), usage_of(&base), "counters unchanged");
+    }
+
+    let quiet = pipeline.cycle(t0 + 1800);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered.len(),
+        "nothing owed"
+    );
+}
+
+/// [money] A pending cache head whose patch+head offer the server answers
+/// "unchanged" with a stored ref (no basis; the echoed server cache state
+/// makes the ACK digest differ from the request witness) stays owed on that
+/// saved cycle and retires on the next quiet one without an offer. Later
+/// growth of the same transcript is still re-read, offered with its patch on
+/// the accepted head through the normal change path, and accepted with the
+/// grown usage; no pending row comes back.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn exhausted_cache_head_retired_then_growth_offers_and_accepts() {
+    if !supported("exhausted_cache_head_retired_then_growth_offers_and_accepts") {
+        return;
+    }
+    struct Patched;
+    impl Drop for Patched {
+        fn drop(&mut self) {
+            NEW_PATCHED_SESSION.with(|slot| slot.set(false));
+        }
+    }
+    let head = "e".repeat(64);
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("exhausted-head-growth", Answer::Accept, t0);
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // An ordinary W0 is accepted with no head.
+    let mut first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert!(first.cache_enabled);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let base = offered[0].clone();
+    assert!(base["cache_observations"].is_null(), "an ordinary W0");
+    let fingerprint = fingerprint_of(&base);
+    let key = cache_session_key(base["source_session_id"].as_str().unwrap());
+    assert!(first.progress.accepted_cache_heads.is_empty());
+
+    // Step 1: the session gains a patch. The headless W1 is owed, the probe
+    // takes the head, W1 rides it, and the server answers W1 with a stored
+    // ref: the ledger keeps the server's digest, not the request witness.
+    force_held_file_parse(&mut first);
+    NEW_PATCHED_SESSION.with(|slot| slot.set(true));
+    let _patched = Patched;
+    pipeline.server.answer(Answer::UnchangedStoredRef);
+    let offered_head = pipeline.cycle(t0 + 600);
+    assert!(offered_head.result.is_ok(), "{:?}", offered_head.result);
+    let offered = pipeline.server.offered();
+    let contracts = pipeline.server.contracts.lock().unwrap().clone();
+    assert!(offered.len() > 2, "the probe, then W1");
+    let patched = offered.last().unwrap().clone();
+    assert_eq!(fingerprint_of(&patched), fingerprint, "same entity");
+    assert!(patched["cache_observations"].is_object(), "the whole patch");
+    assert_eq!(patched["semantic_envelope"]["base_head_etag"], head);
+    assert_eq!(contracts.last().unwrap().1, "cache_state_ack:v1");
+    assert_eq!(offered_head.progress.accepted_cache_heads[&key], head);
+    let request_witness = entity_ack(&patched)["body_witness_digest"].clone();
+    let stored_witness = stored_ref_ack(&patched)["body_witness_digest"].clone();
+    assert_ne!(request_witness, stored_witness, "ACK body != request body");
+    assert_eq!(
+        offered_head
+            .progress
+            .accepted_body_witnesses
+            .get(&fingerprint)
+            .map(String::as_str),
+        stored_witness.as_str(),
+        "the stored ref's digest, kept: the index cannot adopt it"
+    );
+    assert_eq!(
+        offered_head.progress.accepted_cache_states[&key]["coverage"], "partial",
+        "the echoed server state is recorded"
+    );
+    assert!(offered_head
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert_eq!(
+        offered_head.progress.pending_cache_heads.len(),
+        1,
+        "the stored ref cannot settle the row on the offering cycle"
+    );
+    let pending = offered_head
+        .progress
+        .pending_cache_heads
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(pending.entities.get(&fingerprint), Some(&key));
+    assert!(!pending.settled_entities.contains(&fingerprint));
+    assert_eq!(
+        pending.reselected_heads.get(&key),
+        Some(&cache_head_selection_witness(&head)),
+        "the current head was offered, so reselect will not select the file again"
+    );
+
+    // Step 2: the file is unchanged. Nothing is offered and the exhausted
+    // row retires.
+    let quiet = pipeline.cycle(t0 + 1200);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered.len(),
+        "nothing new is offered"
+    );
+    assert!(
+        quiet.progress.pending_cache_heads.is_empty(),
+        "the exhausted row retires"
+    );
+    assert!(quiet
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert_eq!(quiet.progress.accepted_cache_heads[&key], head);
+
+    // Step 3: the session grows by one request. The file is re-read and its
+    // new body goes out with its patch on the accepted head and is accepted.
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown_line = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all(format!("{grown_line}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    pipeline.server.answer(Answer::Accept);
+    let before = pipeline.server.offered().len();
+    let (grown, parsed, bytes) = pipeline.measured_cycle(t0 + 1800, false);
+    assert!(grown.result.is_ok(), "{:?}", grown.result);
+    assert_eq!(parsed, 1, "the grown file is re-read");
+    assert!(bytes > 0);
+    let offered = pipeline.server.offered();
+    let sent = &offered[before..];
+    assert_eq!(sent.len(), 1, "one new body, no probe: the head is held");
+    let body = sent[0].clone();
+    let grown_fingerprint = fingerprint_of(&body);
+    assert_ne!(grown_fingerprint, fingerprint, "growth mints a new entity");
+    assert!(
+        body["cache_observations"].is_object(),
+        "the patch rides along"
+    );
+    assert_eq!(body["semantic_envelope"]["base_head_etag"], head);
+    assert_eq!(
+        pipeline.server.contracts.lock().unwrap().last().unwrap().1,
+        "cache_state_ack:v1"
+    );
+    let (requests, input, output) = usage_of(&base);
+    assert_eq!(
+        usage_of(&body),
+        (requests + 1, input + 30, output + 3),
+        "the grown usage"
+    );
+    assert!(grown
+        .index
+        .accepted_snapshot_fingerprint_recorded(&grown_fingerprint));
+    assert!(!grown
+        .index
+        .quarantined_snapshot_fingerprints
+        .contains_key(&grown_fingerprint));
+    let stored = pipeline.server.stored.lock().unwrap()[&grown_fingerprint].clone();
+    assert_eq!(usage_of(&stored), usage_of(&body), "the server holds it");
+    assert!(stored["cache_observations"].is_object());
+    assert_eq!(grown.progress.accepted_cache_heads[&key], head);
+    assert!(
+        grown.progress.pending_cache_heads.is_empty(),
+        "no row is re-created: the session holds a head, so the grown patch is not owed"
+    );
+
+    // A quiet cycle after the growth sends nothing.
+    let settled = pipeline.cycle(t0 + 2400);
+    assert!(settled.result.is_ok(), "{:?}", settled.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered.len(),
+        "nothing owed"
+    );
+    assert!(settled.progress.pending_cache_heads.is_empty());
+}

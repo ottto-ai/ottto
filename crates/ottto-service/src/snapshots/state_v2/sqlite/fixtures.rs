@@ -1,0 +1,329 @@
+//! Backend-only synthetic damage hooks. Never open a provider database.
+use super::*;
+
+/// [regress] SQLite header conversion preserves typed representation refusals.
+#[test]
+fn unknown_record_kind_survives_sqlite_conversion_and_health_sanitization() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("v2-unknown-record-kind");
+    let mut db = Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
+    db.conn().unwrap().execute("INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES('file.future',X'',0,1,NULL,zeroblob(16),zeroblob(16),0,0,X'')",[]).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    let error = tx
+        .scan_prefix(
+            RowPrefix {
+                table: Table::Records,
+            },
+            None,
+            1,
+        )
+        .unwrap_err();
+    assert!(error.chain().any(|cause| cause.is::<Hold>()));
+    let error = Hold::storage(error.context("private engine detail"));
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::UnknownRecordKind));
+    assert_eq!(format!("{error:#}"), "scan_index_representation_refused");
+    assert_eq!(
+        serde_json::to_value(error.downcast_ref::<Hold>().unwrap()).unwrap(),
+        serde_json::json!("unknown_record_kind")
+    );
+}
+
+pub(in super::super) fn damage_part_for_test(db: &mut Sqlite) {
+    db.conn()
+        .unwrap()
+        .execute("UPDATE value_chunks SET chunk=zeroblob(length(chunk))", [])
+        .unwrap();
+}
+pub(in super::super) fn orphan_part_for_test(db: &mut Sqlite) {
+    db.conn()
+        .unwrap()
+        .execute(
+            "INSERT INTO value_chunks VALUES('records','scan_state.traversal',X'00',0,0,X'01')",
+            [],
+        )
+        .unwrap();
+}
+pub(in super::super) fn erasure_marks_for_test(db: &Sqlite) -> u64 {
+    db.stats.erasure_pending_marks
+}
+pub(in super::super) fn assert_mmap_for_test(db: &Sqlite) {
+    let actual: i64 = db
+        .conn()
+        .unwrap()
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(actual, MMAP_BYTES);
+}
+pub(in super::super) fn wal_bytes_for_test(db: &Sqlite) -> Option<u64> {
+    db.wal_bytes()
+}
+pub(in super::super) fn oversize_header_for_test(db: &mut Sqlite) {
+    let c = db.conn().unwrap();
+    c.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE records SET header=zeroblob(1048576); PRAGMA ignore_check_constraints=OFF;").unwrap();
+}
+/// Flip one byte of `column` in the only stored record row.
+pub(in super::super) fn flip_record_byte_for_test(db: &Sqlite, column: &str) {
+    let conn = db.conn().unwrap();
+    let mut bytes: Vec<u8> = conn
+        .query_row(&format!("SELECT {column} FROM records"), [], |r| r.get(0))
+        .unwrap();
+    bytes[0] ^= 1;
+    let sql = format!("UPDATE records SET {column}=?1");
+    assert_eq!(conn.execute(&sql, params![bytes]).unwrap(), 1);
+}
+pub(in super::super) fn corrupt_header_for_test(db: &mut Sqlite) {
+    db.conn()
+        .unwrap()
+        .execute("UPDATE records SET header=X'00'", [])
+        .unwrap();
+}
+/// Damage outside any transaction: the generation does not move.
+pub(in super::super) fn delete_row_for_test(db: &Sqlite, key: &RowKey) {
+    let conn = db.conn().unwrap();
+    delete_chunks(conn, key).unwrap();
+    let table = key.table();
+    let sql = format!("DELETE FROM {} WHERE {}", table.name(), predicate(table));
+    let values = key.values().unwrap();
+    assert_eq!(conn.execute(&sql, params_from_iter(values)).unwrap(), 1);
+}
+/// Delete one row from another connection in one committed transaction: the
+/// data version moves, the generation does not. Returns this connection's
+/// stamp before and after.
+pub(in super::super) fn delete_row_elsewhere_for_test(
+    db: &Sqlite,
+    key: &RowKey,
+) -> ((u64, u64), (u64, u64)) {
+    let before = db.stamp().unwrap();
+    let mut conn = Connection::open(&db.path).unwrap();
+    conn.busy_timeout(BUSY).unwrap();
+    let tx = conn.transaction().unwrap();
+    delete_chunks(&tx, key).unwrap();
+    let table = key.table();
+    let sql = format!("DELETE FROM {} WHERE {}", table.name(), predicate(table));
+    let values = key.values().unwrap();
+    assert_eq!(tx.execute(&sql, params_from_iter(values)).unwrap(), 1);
+    tx.commit().unwrap();
+    (before, db.stamp().unwrap())
+}
+pub(in super::super) struct ReaderForTest {
+    _conn: Connection,
+}
+pub(in super::super) fn reader_for_test(db: &Sqlite) -> ReaderForTest {
+    let conn = Connection::open_with_flags(&db.path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    conn.busy_timeout(BUSY).unwrap();
+    conn.execute_batch(&format!("PRAGMA mmap_size={MMAP_BYTES}; BEGIN"))
+        .unwrap();
+    let _: Vec<u8> = conn
+        .query_row("SELECT value FROM control WHERE name='phase'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    ReaderForTest { _conn: conn }
+}
+type SchemaFacts = Vec<(String, Vec<(String, String)>)>;
+pub(in super::super) fn schema_for_test(db: &Sqlite) -> (SchemaFacts, bool) {
+    let conn = db.conn().unwrap();
+    let mut facts = Vec::new();
+    for table in ["control", "records", "shared_values", "value_chunks"] {
+        let mut stmt = conn
+            .prepare_cached(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = stmt
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        facts.push((table.into(), columns));
+    }
+    let unique=conn.query_row("SELECT \"unique\" FROM pragma_index_list('shared_values') WHERE name='shared_values_lookup'",[],|r|r.get(0)).unwrap();
+    (facts, unique)
+}
+pub(in super::super) fn damage_refs_for_test(db: &Sqlite, key: &RowKey) {
+    let RowKey::RequestSet(id) = key else {
+        panic!("shared key required")
+    };
+    db.conn()
+        .unwrap()
+        .execute(
+            "UPDATE shared_values SET ref_count=1 WHERE class='request_hash_set' AND id=?1",
+            params![id],
+        )
+        .unwrap();
+}
+pub(in super::super) fn part_count_for_test(db: &Sqlite) -> u64 {
+    db.conn()
+        .unwrap()
+        .query_row("SELECT count(*) FROM value_chunks", [], |r| r.get(0))
+        .unwrap()
+}
+pub(in super::super) fn future_writer_for_test(db: &mut Sqlite) {
+    let name = "minimum_writer_capability";
+    let bytes = serde_json::to_vec(&(migrations::WRITER_CAPABILITY + 1)).unwrap();
+    let checksum = control_checksum(name, 1, &bytes);
+    db.conn().unwrap().execute("INSERT INTO control VALUES(?1,1,?2,?3) ON CONFLICT(name) DO UPDATE SET value=excluded.value,row_checksum=excluded.row_checksum",params![name,bytes,checksum.as_slice()]).unwrap();
+}
+pub(in super::super) fn text_key_refused_for_test(db: &Sqlite) -> bool {
+    db.conn().unwrap().execute("INSERT INTO records(kind,key_bytes,position,value_version,header,value_digest,row_checksum,value_bytes,chunk_count,inline_value) VALUES('file.entities','text',0,1,NULL,zeroblob(16),zeroblob(16),0,0,X'')",[]).is_err()
+}
+pub(in super::super) fn add_extra_part_for_test(db: &Sqlite, key: &RowKey) {
+    let o = chunk_owner(key).unwrap();
+    db.conn()
+        .unwrap()
+        .execute(
+            "INSERT INTO value_chunks VALUES(?1,?2,?3,?4,255,X'01')",
+            params![o.table, o.kind, o.key, o.position],
+        )
+        .unwrap();
+}
+pub(in super::super) fn owner_for_test(key: &RowKey) -> (&'static str, String, Vec<u8>, u64) {
+    let o = chunk_owner(key).unwrap();
+    (o.table, o.kind, o.key, o.position)
+}
+
+/// Cap this connection at its current size: the next write that must grow the
+/// database fails with SQLite's own SQLITE_FULL. Reopening clears the cap.
+pub(in super::super) fn cap_pages(db: &Sqlite) {
+    let conn = db.conn().unwrap();
+    let pages: u64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let capped: u64 = conn
+        .query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(capped, pages);
+}
+
+/// Make this connection's next COMMIT that writes control row `name` fail with
+/// SQLite's own deferred-constraint refusal; the transaction stays open, as
+/// after a failed durable COMMIT. Temp objects are connection-local, so the
+/// reopen inside commit classification clears the fence.
+pub(in super::super) fn fence_commit_writing(db: &Sqlite, name: &str) {
+    db.conn()
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=ON;
+             CREATE TEMP TABLE commit_fence_parent(id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE commit_fence(parent INTEGER REFERENCES commit_fence_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER commit_fence_insert AFTER INSERT ON control WHEN NEW.name='{name}' BEGIN INSERT INTO commit_fence VALUES(1); END;
+             CREATE TEMP TRIGGER commit_fence_update AFTER UPDATE ON control WHEN NEW.name='{name}' BEGIN INSERT INTO commit_fence VALUES(1); END;"
+        ))
+        .unwrap();
+}
+
+/// Damage one checked physical value inside the caller's rollback transaction.
+pub(in super::super) fn remove_value_chunk(tx: &Txn<'_>, header: &Header) {
+    let owner = chunk_owner(&header.key).unwrap();
+    let removed = tx.store.conn().unwrap().execute(
+        "DELETE FROM value_chunks WHERE owner_table=?1 AND owner_kind=?2 AND owner_key=?3 AND position=?4 AND chunk_no=?5",
+        params![owner.table, owner.kind, owner.key, owner.position, header.parts / 2],
+    ).unwrap();
+    assert_eq!(removed, 1);
+}
+
+// The existing per-store maintenance policy owns synthetic resource admission.
+pub(in super::super) fn set_space_reader(db: &mut Sqlite, read: Option<fn(&Path) -> Option<u64>>) {
+    db.purge_policy.space = read.unwrap_or(PurgePolicy::default().space);
+}
+pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
+    db.purge_policy.path_diff_budget = bytes;
+}
+/// Rows the last committed save charged to the save target.
+pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
+    db.stats.dirty_rows_per_save
+}
+/// Bytes the last committed save charged to the save target.
+pub(in super::super) fn dirty_bytes_for_test(db: &Sqlite) -> u64 {
+    db.stats.encoded_bytes_per_save
+}
+
+type ReopenHook = Box<dyn FnOnce(&Path)>;
+thread_local! {
+    static BEFORE_REOPEN: std::cell::RefCell<Option<ReopenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Run the armed hook once, after a COMMIT error closed the connection and
+/// before the finalizer reopens it to classify the outcome.
+pub(super) fn before_reopen(path: &Path) {
+    if let Some(hook) = BEFORE_REOPEN.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
+}
+/// Once the next COMMIT error closes the connection, another connection
+/// commits `name` = `value`, as a racing or partly durable writer would.
+pub(in super::super) fn on_reopen_write_control(name: &'static str, value: u64) {
+    BEFORE_REOPEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(BUSY).unwrap();
+            let bytes = control_json(&value).unwrap();
+            conn.execute(
+                "INSERT INTO control(name,value_version,value,row_checksum) VALUES(?1,1,?2,?3) ON CONFLICT(name) DO UPDATE SET value=excluded.value,row_checksum=excluded.row_checksum",
+                params![name, bytes, control_checksum(name, 1, &bytes).to_vec()],
+            )
+            .unwrap();
+        }));
+    });
+}
+/// (graph record rows, progress rows, records alarm) as the store counts them.
+pub(in super::super) fn row_counts_for_test(db: &Sqlite) -> (u64, u64, bool) {
+    let s = &db.stats;
+    (s.record_rows, s.progress_rows, s.records_alarm)
+}
+pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
+    db.stats.record_rows = rows;
+}
+pub(in super::super) fn writer_capability_for_test() -> u64 {
+    migrations::WRITER_CAPABILITY
+}
+
+thread_local! {
+    static LOSE_COMMIT_REPLY: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// The next progress COMMIT on the store at `path` becomes durable, then
+/// reports an error, as a lost reply would: the finalizer must classify it
+/// Published from the reopened store.
+pub(in super::super) fn lose_next_progress_commit_reply(db: &Sqlite) {
+    let path = db.path.clone();
+    LOSE_COMMIT_REPLY.with(|armed| *armed.borrow_mut() = Some(path));
+}
+pub(super) fn after_commit(path: &Path, cas: Cas) -> Result<()> {
+    if !matches!(cas, Cas::Progress { .. }) {
+        return Ok(());
+    }
+    let armed = LOSE_COMMIT_REPLY.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let hit = armed.as_deref() == Some(path);
+        if hit {
+            *armed = None;
+        }
+        hit
+    });
+    anyhow::ensure!(!armed, "test: the COMMIT reply was lost");
+    Ok(())
+}
+
+type SwapHook = (&'static str, Box<dyn FnOnce(&Path) -> Result<()>>);
+thread_local! {
+    static SWAP_FAULT: std::cell::RefCell<Option<SwapHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// When the next erasure swap reaches `point` (W2b, close, W3 or W4), run
+/// `hook` once on its copy's path; an error fails the swap there.
+pub(in super::super) fn on_swap(
+    point: &'static str,
+    hook: impl FnOnce(&Path) -> Result<()> + 'static,
+) {
+    SWAP_FAULT.with(|armed| *armed.borrow_mut() = Some((point, Box::new(hook))));
+}
+pub(super) fn swap_point(point: &str, tmp: &Path) -> Result<()> {
+    let hook = SWAP_FAULT.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let hit = armed.as_ref().is_some_and(|(at, _)| *at == point);
+        if hit {
+            armed.take()
+        } else {
+            None
+        }
+    });
+    hook.map_or(Ok(()), |(_, hook)| hook(tmp))
+}

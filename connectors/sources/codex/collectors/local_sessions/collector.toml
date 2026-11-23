@@ -1,0 +1,20 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "local_sessions"
+display_name = "Local sessions"
+
+operations = ["collect_usage", "upload_snapshot", "diagnostics"]
+data_source_kind = "local_enriched"
+default_state = "enabled"
+
+review_tier = "official"
+maturity = "stable"
+risk_classes = []
+
+uploads_raw_content = false
+emits = [
+  "local_usage_snapshots",
+  "local_usage_collector_statuses",
+  "local_usage_session_titles",
+  "local_usage_workspace_labels"
+]

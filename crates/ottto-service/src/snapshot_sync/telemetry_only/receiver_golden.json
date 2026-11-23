@@ -1,0 +1,235 @@
+{
+  "schema_version": 6,
+  "source": "claude_code",
+  "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "collector_version": "0.1.synthetic",
+  "entity_ack_contract": "snapshot_entity_ack:v1",
+  "usage_decrease_hold_ack_contract": "usage_decrease_hold_ack:v1",
+  "snapshots": [
+    {
+      "cache_creation_1h_tokens": 8,
+      "cache_creation_5m_tokens": 20,
+      "cache_read_tokens": 12,
+      "collected_at": "2026-08-02T07:00:10Z",
+      "cost": {
+        "evidence_source": "claude_code_api_request",
+        "total_cost_usd": "0.0005"
+      },
+      "evidence_basis": "otel_only",
+      "initiator": "unknown",
+      "input_tokens": 50,
+      "model_usage": [
+        {
+          "cache_creation_1h_tokens": 8,
+          "cache_creation_5m_tokens": 20,
+          "cache_read_tokens": 12,
+          "cost_usd": "0.0005",
+          "identity_parts": [
+            {
+              "cache_creation_1h_tokens": 2,
+              "cache_creation_5m_tokens": 5,
+              "cache_read_tokens": 3,
+              "cost_usd": "0.00013",
+              "input_tokens": 13,
+              "output_tokens": 13,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "unattributed_total_tokens": 0
+            },
+            {
+              "account_identifier_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+              "cache_creation_1h_tokens": 2,
+              "cache_creation_5m_tokens": 5,
+              "cache_read_tokens": 3,
+              "cost_usd": "0.00011",
+              "evidence_ref": 0,
+              "input_tokens": 11,
+              "output_tokens": 11,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "unattributed_total_tokens": 0
+            },
+            {
+              "account_identifier_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+              "cache_creation_1h_tokens": 4,
+              "cache_creation_5m_tokens": 10,
+              "cache_read_tokens": 6,
+              "cost_usd": "0.00026",
+              "evidence_ref": 1,
+              "input_tokens": 26,
+              "output_tokens": 26,
+              "reasoning_output_tokens": 0,
+              "request_count": 2,
+              "unattributed_total_tokens": 0
+            }
+          ],
+          "input_tokens": 50,
+          "model": "claude-haiku-4-5",
+          "output_tokens": 50,
+          "reasoning_effort": "high",
+          "reasoning_output_tokens": 0,
+          "request_count": 4,
+          "selector_context": {
+            "request_usage_origin": "telemetry_reported"
+          },
+          "selector_sources": {
+            "request_usage_origin": "claude_api_request"
+          }
+        }
+      ],
+      "output_tokens": 50,
+      "provenance": {
+        "collector": "claude_code_jsonl:own_request_identity_rows:v1",
+        "input_token_scope": null
+      },
+      "reasoning_output_tokens": 0,
+      "removed_request_count": 0,
+      "removed_usage": {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_read_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "unattributed_total_tokens": 0
+      },
+      "request_count": 4,
+      "request_evidence": [
+        {
+          "identity_basis": "telemetry",
+          "provider_workspace_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "identity_basis": "telemetry",
+          "provider_workspace_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      ],
+      "semantic_envelope": {
+        "component_contract_version": "snapshot_semantic:v1",
+        "component_hashes": {
+          "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+          "attribution": "b2263e8ce4beb576f693fba5e321d07adad7ccd0a36e8821420dd1ea8bb1dcad",
+          "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
+          "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+          "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+          "lifecycle_activity": "67ef092a1b0bf5847b947b368974aef08146d33f1020d9668526a9ce7f3544bc",
+          "usage_accounting": "3f578bf7e8e98eb5a01f06204c55be60f16a352d7136892fe6452cad43491920"
+        },
+        "content_hash": "d2384cea8fe18823c57f6f8774ed7e3e7758ab16d0bbf0e87e3bc60ec1e13016",
+        "hash_epoch": 1,
+        "revision_v2_canonicalization": "rfc8785:integers-only:v1",
+        "revision_v2_contract_version": "snapshot_revision:v2",
+        "revision_v2_hash": "1751645cb6951ab11cbbfecbe244481b82cf3a56b55401a501d08f685ec72fa7",
+        "revision_v2_parser_version": "claude_code_jsonl:v40",
+        "revision_v2_scan_identity_version": "claude_code_jsonl:v30",
+        "upload_policy": {
+          "session_artifacts_enabled": false,
+          "session_attribution_enabled": false,
+          "session_attribution_labels_enabled": false,
+          "session_titles_enabled": true,
+          "workspace_labels_enabled": true
+        }
+      },
+      "snapshot_fingerprint": "fe1162a1a3082d2255baff2a04f0723712945fd516ac1ab6cbb9ad7ebacedab4",
+      "source_ended_at": null,
+      "source_last_activity_at": "2026-08-02T07:00:10Z",
+      "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+      "source_started_at": "2026-08-02T07:00:10Z",
+      "status": "final",
+      "telemetry_owned_complete": true,
+      "usage_accounting_contract": "claude_request_owned_usage:v1",
+      "usage_buckets": [
+        {
+          "bucket_start": "2026-08-02T07:00:00Z",
+          "first_activity_at": "2026-08-02T07:00:10Z",
+          "last_activity_at": "2026-08-02T07:00:10Z",
+          "model_usage": [
+            {
+              "cache_creation_1h_tokens": 8,
+              "cache_creation_5m_tokens": 20,
+              "cache_read_tokens": 12,
+              "cost_usd": "0.0005",
+              "identity_parts": [
+                {
+                  "cache_creation_1h_tokens": 2,
+                  "cache_creation_5m_tokens": 5,
+                  "cache_read_tokens": 3,
+                  "cost_usd": "0.00013",
+                  "input_tokens": 13,
+                  "output_tokens": 13,
+                  "reasoning_output_tokens": 0,
+                  "request_count": 1,
+                  "unattributed_total_tokens": 0
+                },
+                {
+                  "account_identifier_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                  "cache_creation_1h_tokens": 2,
+                  "cache_creation_5m_tokens": 5,
+                  "cache_read_tokens": 3,
+                  "cost_usd": "0.00011",
+                  "evidence_ref": 0,
+                  "input_tokens": 11,
+                  "output_tokens": 11,
+                  "reasoning_output_tokens": 0,
+                  "request_count": 1,
+                  "unattributed_total_tokens": 0
+                },
+                {
+                  "account_identifier_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+                  "cache_creation_1h_tokens": 4,
+                  "cache_creation_5m_tokens": 10,
+                  "cache_read_tokens": 6,
+                  "cost_usd": "0.00026",
+                  "evidence_ref": 1,
+                  "input_tokens": 26,
+                  "output_tokens": 26,
+                  "reasoning_output_tokens": 0,
+                  "request_count": 2,
+                  "unattributed_total_tokens": 0
+                }
+              ],
+              "input_tokens": 50,
+              "model": "claude-haiku-4-5",
+              "output_tokens": 50,
+              "reasoning_effort": "high",
+              "reasoning_output_tokens": 0,
+              "request_count": 4,
+              "selector_context": {
+                "request_usage_origin": "telemetry_reported"
+              },
+              "selector_sources": {
+                "request_usage_origin": "claude_api_request"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "client_report": {
+    "schema_version": 1,
+    "entries": [
+      {
+        "reason": "queue_overflow",
+        "category": "snapshot_item",
+        "quantity": 0
+      },
+      {
+        "reason": "ratelimit_backoff",
+        "category": "snapshot_batch",
+        "quantity": 0
+      },
+      {
+        "reason": "network_error",
+        "category": "snapshot_batch",
+        "quantity": 0
+      },
+      {
+        "reason": "poisoned",
+        "category": "snapshot_item",
+        "quantity": 0
+      }
+    ]
+  },
+  "head_cas_contract": "snapshot_head_etag:v1"
+}

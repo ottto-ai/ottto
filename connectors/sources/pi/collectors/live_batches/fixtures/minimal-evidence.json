@@ -1,0 +1,54 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "pi",
+  "collector_id": "live_batches",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "telemetry_records",
+      "sample": {
+        "source_id": "pi",
+        "collector_id": "live_batches",
+        "event_kind": "assistant_message_usage",
+        "input_tokens": 700,
+        "cache_read_tokens": 100,
+        "cache_write_tokens": 40,
+        "output_tokens": 160,
+        "cost_source_kind": "app_reported",
+        "billing_provider": "openai",
+        "model_provider": "openai",
+        "billing_channel": "subscription",
+        "auth_mode": "oauth",
+        "subscription_product": "chatgpt_plus"
+      }
+    },
+    {
+      "record_type": "source_plan_profiles",
+      "sample": {
+        "source_id": "pi",
+        "collector_id": "live_batches",
+        "plan_label": "ChatGPT Plus",
+        "billing_provider": "openai",
+        "model_provider": "openai",
+        "billing_channel": "subscription",
+        "confidence": "observed"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Normalized assistant-message usage, explicit route attribution, selected cost basis, and plan profile evidence only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}
