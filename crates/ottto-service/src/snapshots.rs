@@ -1269,6 +1269,7 @@ use sources::codex::line::{
     codex_plan_window_bucket, codex_transcript_title,
 };
 
+pub(crate) use sources::claude::line::session_artifact_accepted;
 use sources::claude::line::{
     apply_claude_code_line, claude_fork_line_provenance, claude_response_tool_uses,
     ClaudeForkLineProvenance,

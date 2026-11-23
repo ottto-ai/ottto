@@ -6454,6 +6454,159 @@ fn parse_artifact_url_requires_a_repository_prefix_before_the_marker() {
 }
 
 #[test]
+fn parse_artifact_url_drops_every_backend_path_fragment() {
+    // One row per entry of the backend's `_ARTIFACT_FORBIDDEN_FRAGMENTS`: a
+    // single such value refuses the whole snapshot item with HTTP 422.
+    for (fragment, url) in [
+        ("/users/", "https://github.com/users/repo/pull/1"),
+        ("\\users\\", "https://github.com/o\\users\\x/pull/1"),
+        ("/home/", "https://github.com/home/repo/issues/2"),
+        ("\\home\\", "https://github.com/o\\home\\x/issues/2"),
+        (".codex", "https://github.com/o/r.codex/pull/3"),
+        (".claude", "https://code.claude.com/o/r/issues/4"),
+        (
+            "workspace_path",
+            "https://github.com/o/workspace_path/pull/5",
+        ),
+        (
+            "transcript_path",
+            "https://github.com/o/transcript_path/issues/6",
+        ),
+    ] {
+        assert!(
+            crate::session_attribution::backend_rejects_as_path(url),
+            "{fragment}"
+        );
+        assert_eq!(parse_artifact_url(url), None, "{fragment}");
+        assert!(extract_session_artifacts(url).is_empty(), "{fragment}");
+    }
+    // The match is case-insensitive, like the backend's.
+    assert_eq!(
+        parse_artifact_url("https://github.com/O/R.Claude/pull/7"),
+        None
+    );
+    // Near misses stay, and a dropped URL never drops its clean neighbours.
+    let kept: Vec<_> = extract_session_artifacts(
+        "https://github.com/o/r.codex/pull/3 https://github.com/anthropics/claude-code/issues/8 https://github.com/o/codex/pull/9",
+    )
+    .into_iter()
+    .map(|artifact| artifact.value)
+    .collect();
+    assert_eq!(
+        kept,
+        [
+            "https://github.com/anthropics/claude-code/issues/8",
+            "https://github.com/o/codex/pull/9",
+        ]
+    );
+    assert!(!kept
+        .iter()
+        .any(|value| crate::session_attribution::backend_rejects_as_path(value)));
+}
+
+#[test]
+fn saved_artifacts_pass_only_the_receivers_url_and_sha_checks() {
+    // One row per receiver check that refuses the whole item (backend
+    // agent_session_snapshots.py `SessionArtifact._validate_value`), plus
+    // the kept shapes. A saved value is re-checked before upload.
+    let link = |kind: &str, value: &str| SessionArtifact {
+        kind: kind.into(),
+        value: value.into(),
+    };
+    for (shape, artifact, accepted) in [
+        (
+            "pull request",
+            link("pull_request", "https://github.com/o/r/pull/42"),
+            true,
+        ),
+        (
+            "merge request",
+            link("pull_request", "https://gitlab.com/g/p/-/merge_requests/7"),
+            true,
+        ),
+        (
+            "issue",
+            link("issue", "https://github.com/o/r/issues/9"),
+            true,
+        ),
+        (
+            "host with port",
+            link("issue", "https://git.example.com:8443/o/r/issues/9"),
+            true,
+        ),
+        ("commit", link("commit", "a1b2c3d"), true),
+        ("40-hex commit", link("commit", &"0".repeat(40)), true),
+        (
+            "credentials",
+            link("pull_request", "https://user:pass@github.com/o/r/pull/1"),
+            false,
+        ),
+        (
+            "user only",
+            link("pull_request", "https://user@github.com/o/r/pull/1"),
+            false,
+        ),
+        (
+            "scheme",
+            link("pull_request", "ftp://github.com/o/r/pull/1"),
+            false,
+        ),
+        (
+            "no scheme",
+            link("pull_request", "github.com/o/r/pull/1"),
+            false,
+        ),
+        (
+            "no host",
+            link("pull_request", "https:///o/r/pull/1"),
+            false,
+        ),
+        (
+            "invalid host",
+            link("pull_request", "https://git_hub.com/o/r/pull/1"),
+            false,
+        ),
+        (
+            "invalid port",
+            link("pull_request", "https://github.com:x/o/r/pull/1"),
+            false,
+        ),
+        (
+            "percent-encoding",
+            link("pull_request", "https://github.com/o/%2Fusers%2Fx/pull/1"),
+            false,
+        ),
+        (
+            "path fragment",
+            link("pull_request", "https://github.com/o/r.claude/pull/1"),
+            false,
+        ),
+        (
+            "not canonical",
+            link("pull_request", "https://github.com/o/r/pull/1/files"),
+            false,
+        ),
+        (
+            "wrong kind for the path",
+            link("pull_request", "https://github.com/o/r/issues/9"),
+            false,
+        ),
+        (
+            "unknown kind",
+            link("tag", "https://github.com/o/r/pull/1"),
+            false,
+        ),
+        ("short commit", link("commit", "a1b2c3"), false),
+        ("long commit", link("commit", &"a".repeat(41)), false),
+        ("uppercase commit", link("commit", "A1B2C3D"), false),
+        ("non-hex commit", link("commit", "a1b2c3g"), false),
+        ("padded commit", link("commit", " a1b2c3d"), false),
+    ] {
+        assert_eq!(session_artifact_accepted(&artifact), accepted, "{shape}");
+    }
+}
+
+#[test]
 fn claude_code_artifact_scrape_skipped_when_disabled_and_runs_when_enabled() {
     // Transcript whose tool_result carries a clean PR URL — exactly what the
     // per-line scraper collects when the feature is on.

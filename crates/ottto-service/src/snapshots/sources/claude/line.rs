@@ -780,9 +780,10 @@ fn collect_tool_text(value: &Value, parts: &mut Vec<String>) {
 }
 
 /// Scrape canonical, content-free VCS artifacts (PR / issue / commit) from free
-/// text. Only clean values survive: clean authority, no credentials, query, or
-/// percent-encoding, and the path truncated at the numeric id — so the backend
-/// accepts them unchanged and a malformed match can never reject the batch.
+/// text. Only clean values survive: clean authority, no credentials, query,
+/// percent-encoding or backend path fragment, and the path truncated at the
+/// numeric id — so the backend accepts them unchanged. The backend refuses the
+/// whole item, not just the artifact, for a value it reads as a path.
 pub(in crate::snapshots) fn extract_session_artifacts(text: &str) -> Vec<SessionArtifact> {
     let mut out: Vec<SessionArtifact> = Vec::new();
     for token in text.split(|c: char| {
@@ -819,6 +820,26 @@ fn push_unique_artifact(out: &mut Vec<SessionArtifact>, artifact: SessionArtifac
     }
 }
 
+/// Whether the receiver accepts this artifact as sent. A URL must be exactly
+/// the canonical form `parse_artifact_url` gives it (http(s), bare host and
+/// port, no credentials, no percent-encoding, the kind's path shape, no path
+/// fragment); a commit must be 7-40 lowercase hex. The receiver refuses the
+/// whole item for a value that fails a URL or SHA check, so a value saved by
+/// an older build is checked again before upload.
+pub(crate) fn session_artifact_accepted(artifact: &SessionArtifact) -> bool {
+    match artifact.kind.as_str() {
+        "commit" => {
+            (7..=40).contains(&artifact.value.len())
+                && artifact
+                    .value
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        "pull_request" | "issue" => parse_artifact_url(&artifact.value).as_ref() == Some(artifact),
+        _ => false,
+    }
+}
+
 /// Parse one token as a PR/issue/MR URL, returning its canonical form
 /// (`scheme://authority/<repo path>/<marker>/<id>`) or None.
 pub(in crate::snapshots) fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
@@ -846,9 +867,13 @@ pub(in crate::snapshots) fn parse_artifact_url(token: &str) -> Option<SessionArt
         return None;
     }
     let canonical_path = segments[..=id_index].join("/");
+    let value = format!("{scheme}://{authority}/{canonical_path}");
+    if crate::session_attribution::backend_rejects_as_path(&value) {
+        return None;
+    }
     Some(SessionArtifact {
         kind: kind.to_string(),
-        value: format!("{scheme}://{authority}/{canonical_path}"),
+        value,
     })
 }
 

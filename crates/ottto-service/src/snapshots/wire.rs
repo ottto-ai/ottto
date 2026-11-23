@@ -902,8 +902,8 @@ pub struct SnapshotProvenance {
 /// — e.g. a `gh pr view` of someone else's PR also counts). Opt-in (stripped
 /// before upload unless the backend activity hint enabled it); values are
 /// canonical and content-free by construction (clean authority, no credentials/
-/// query/percent-encoding, path truncated at the numeric id) so the backend
-/// accepts them unchanged.
+/// query/percent-encoding/backend path fragment, path truncated at the numeric
+/// id) so the backend accepts them unchanged.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SessionArtifact {
     pub kind: String,
