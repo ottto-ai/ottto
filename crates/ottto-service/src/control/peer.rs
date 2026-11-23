@@ -344,6 +344,19 @@ pub(super) fn companion_code_requirement() -> CompanionCodeRequirement {
     )
 }
 
+/// The code requirement an installed `Ottto.app` must satisfy before a
+/// Homebrew `serve` steps aside for it (`crate::homebrew_step_aside`): the
+/// same requirement this daemon demands of a token-less Companion peer, so the
+/// Homebrew copy only yields to an app whose daemon it would itself trust.
+/// `None` when token-less Companion trust is disabled (a fork's build).
+#[cfg(target_os = "macos")]
+pub(crate) fn installed_companion_code_requirement() -> Option<String> {
+    match companion_code_requirement() {
+        CompanionCodeRequirement::Enforced(requirement) => Some(requirement),
+        CompanionCodeRequirement::Disabled => None,
+    }
+}
+
 /// Pure resolution of [`companion_code_requirement`], split out so every branch
 /// is testable without mutating process env, re-signing this binary, or
 /// rebuilding with a different baked-in team id.

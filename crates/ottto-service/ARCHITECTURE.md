@@ -729,6 +729,25 @@ complete UTC day at that `collected_at`. `provider_daily_reference::tests::accou
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
 
+## Install variants
+
+Ottto installs one of two variants per Mac: the app (`Ottto.app` runs
+`serve-xpc` from its bundle) or the headless Homebrew formula (`serve`). Both
+use the per-user launchd label `net.ottto.service`, and the app wins. Before
+it takes the state lock, a launchd-started `serve` whose executable is under
+a Homebrew prefix checks for an installed app (`/Applications` or
+`~/Applications`) with an executable bundled service, a version at least its
+own and a signature that satisfies the Companion code requirement. If that
+app's own process runs for this user, the Homebrew copy hands over: it writes
+its pid to `homebrew-handover` in the support folder and waits, holding no
+state, up to 180 s for the app to take the job back with `--migrate-owner`
+(launchd's bootout ends it). If the app quits or does not take over, it
+removes the marker and serves. With the app installed but not running, or
+while the app's `homebrew-keeps-serving` marker exists (the app restored this
+job after its own takeover failed), it serves at once (`homebrew_step_aside`).
+Doctor reports a second variant under `install_variants`. The release gate
+runs the same decision through the hidden `service step-aside-check`.
+
 ## Local control dispatch
 
 Control dispatch validates the protocol version, then checks the command's

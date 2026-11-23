@@ -249,6 +249,9 @@ class Ottto < Formula
 
   def caveats
     <<~EOS
+      This is Ottto's headless install, for a Mac without Ottto.app: a server,
+      an SSH-only Mac, or a command-line-only setup.
+
       Start the Ottto local service:
         brew services start ottto
 
@@ -259,14 +262,16 @@ class Ottto < Formula
         brew update && brew upgrade ottto
         brew services restart ottto
 
-      Stop and uninstall:
+      Stop and uninstall (stop first, so launchd is not left with a job whose
+      program was removed):
         brew services stop ottto
         brew uninstall ottto
 
-      The Homebrew service owns launchd label net.ottto.service and the default
-      per-user socket at ~/Library/Application Support/Ottto/ottto-service.sock.
-      If Ottto.app is also installed, leave service lifecycle with Homebrew; the
-      app connects to the Homebrew-owned service instead of replacing it.
+      One Ottto per Mac, and the app wins. If Ottto.app is installed and
+      running, this copy hands the service over to the app at start.
+      On that Mac, remove this copy with "brew uninstall ottto" and don't run
+      "brew services" for ottto. To run headless instead, uninstall the app
+      first, then run "brew services restart ottto".
     EOS
   end
 

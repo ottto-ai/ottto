@@ -121,6 +121,36 @@ Equivalently, `ottto-service service write-launch-agent --executable <path>
 variable in your shell does nothing: the daemon runs under launchd and does not
 inherit it.
 
+## Two Ottto Installs On One Mac
+
+Ottto runs one install variant per Mac, and the app wins (see
+[install.md](install.md#two-variants-one-per-mac)). `ottto doctor` names a
+second variant:
+
+- **A Homebrew `ottto` formula is also installed** and the daemon belongs to
+  `Ottto.app`. The formula is a leftover; the app never updates it. Its service
+  uses the app's launchd label and LaunchAgent file, so `brew services stop`
+  for `ottto` would stop the app's daemon. In the app choose **Remove Homebrew
+  copy**, or run:
+
+  ```bash
+  brew uninstall ottto
+  ```
+
+  This removes only the formula and its links in the Homebrew `bin` folder; the
+  app's daemon keeps running. Don't run `brew services` for `ottto` on this
+  Mac.
+- **`Ottto.app` is installed but the daemon is the formula's.** Open the app
+  and choose **Move service to the app**, or run
+  `brew services stop ottto && brew uninstall ottto` and then open the app. To
+  keep the headless install instead, uninstall the app.
+- **A system-wide service from `sudo brew services` is registered.** Remove it
+  with `sudo brew services stop ottto`; Ottto's service runs per user.
+
+The Homebrew service log (`~/Library/Logs/Ottto/ottto-service.error.log`)
+says when the Homebrew copy hands over to the running app, or serves because
+the installed app is not running or did not take over.
+
 ## Local Relay Port Conflict
 
 The default local OTLP relay listens on `127.0.0.1:43119`. If another macOS

@@ -200,6 +200,15 @@ enum ServiceCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Release gate only: decide as a launchd-started Homebrew copy whose
+    /// user runs the app at `--app`, and print the decision.
+    #[command(hide = true)]
+    StepAsideCheck {
+        #[arg(long)]
+        app: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -350,6 +359,27 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                // One Ottto per Mac and the app wins: a Homebrew copy steps
+                // aside before it touches any Ottto state.
+                if !once {
+                    use ottto_service::homebrew_step_aside::{
+                        decide_for_this_process, hand_over, hand_over_ended_message,
+                        hand_over_message, serve_beside_app_message, ServeDecision,
+                    };
+                    match decide_for_this_process() {
+                        // Wait, holding no state, for the app to take the job
+                        // back (its bootout ends this process); serve if it
+                        // quits or does not take over in time.
+                        ServeDecision::HandOver { app } => {
+                            eprintln!("{}", hand_over_message(&app));
+                            eprintln!("{}", hand_over_ended_message(hand_over(&app)));
+                        }
+                        ServeDecision::ServeBesideApp { app } => {
+                            eprintln!("{}", serve_beside_app_message(&app));
+                        }
+                        ServeDecision::Serve => {}
+                    }
+                }
                 let _local_state = hold_local_state_or_exit();
                 // Before the relays start, so the first check-in already
                 // reports the transport.
@@ -533,6 +563,15 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
                 }
                 return Ok(());
             }
+            ServiceCommand::StepAsideCheck { app, json } => {
+                let report = ottto_service::homebrew_step_aside::release_check(&app);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report["decision"].as_str().unwrap_or("serve"));
+                }
+                return Ok(());
+            }
             ServiceCommand::InstallPlan { executable, json } => {
                 (executable, false, false, json, false, None)
             }
@@ -603,7 +642,8 @@ impl ServiceCommand {
             ServiceCommand::CleanupLegacy { json }
             | ServiceCommand::InstallPlan { json, .. }
             | ServiceCommand::WriteLaunchAgent { json, .. }
-            | ServiceCommand::Bootstrap { json, .. } => *json,
+            | ServiceCommand::Bootstrap { json, .. }
+            | ServiceCommand::StepAsideCheck { json, .. } => *json,
         }
     }
 }
@@ -1183,6 +1223,25 @@ mod tests {
             "fn hold_local_state_or_exit() -> &'static ottto_service::locked_state_dir::LockedStateDir {"
         ));
         assert!(source.contains("Ok(locked) => hold_for_process(locked),"));
+    }
+
+    /// [behaviour] `serve` decides whether a Homebrew copy hands over before
+    /// it takes the state lock, and `serve-xpc` (the app's entry point) never
+    /// asks.
+    #[test]
+    fn serve_steps_aside_before_the_state_lock_and_serve_xpc_never_does() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let serve = source.find("Command::Serve { socket, once } =>").unwrap();
+        let serve_xpc = source.find("Command::ServeXpc {").unwrap();
+        let serve_arm = &source[serve..serve_xpc];
+        let decision = serve_arm
+            .find("match decide_for_this_process()")
+            .expect("serve asks");
+        let lock = serve_arm.find("hold_local_state_or_exit()").unwrap();
+        assert!(decision < lock, "{serve_arm}");
+        let xpc_end = serve_xpc + source[serve_xpc..].find("Command::Service {").unwrap();
+        assert!(!source[serve_xpc..xpc_end].contains("homebrew_step_aside"));
     }
 
     /// `status` is a diagnostic: it reads the token and machine binding the

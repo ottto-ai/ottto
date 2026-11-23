@@ -276,6 +276,9 @@ fn is_daemon_path(path: &Path) -> bool {
         .is_some_and(|name| is_daemon_name(name.as_bytes()))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use process_table::same_user_process_runs;
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod process_table {
     use std::mem::size_of;
@@ -413,6 +416,50 @@ mod process_table {
         uid: libc::uid_t,
         out_of_time: &mut dyn FnMut() -> bool,
     ) -> std::io::Result<bool> {
+        same_user_process_with(api, own, uid, out_of_time, &mut |api, pid, comm| {
+            // `comm` is the executed file's name, cut at 16 bytes, which is
+            // longer than the daemon's name.
+            if super::is_daemon_name(comm) {
+                return Ok(true);
+            }
+            Ok(pid_path(api, pid)?.is_some_and(|path| super::is_daemon_path(&path)))
+        })
+    }
+
+    /// Whether a process of this user runs the executable at `path` (the
+    /// Ottto app's own process, for a Homebrew copy deciding whether to step
+    /// aside). Same listing and failure rules as `other_daemon_running_with`.
+    pub(crate) fn same_user_process_runs(path: &std::path::Path) -> std::io::Result<bool> {
+        let own = libc::pid_t::try_from(std::process::id()).map_err(std::io::Error::other)?;
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        same_user_process_with(
+            &Native,
+            own,
+            unsafe { libc::getuid() },
+            &mut || false,
+            &mut |api, pid, _| {
+                // Same file name first, so a poll canonicalizes only candidates.
+                Ok(pid_path(api, pid)?.is_some_and(|running| {
+                    running.file_name() == target.file_name()
+                        && running.canonicalize().unwrap_or(running) == target
+                }))
+            },
+        )
+    }
+
+    /// Decides whether one same-user process (its pid and kernel name) is
+    /// the one asked for.
+    type MatchProcess<'a> =
+        dyn FnMut(&dyn Libproc, libc::pid_t, &[u8]) -> std::io::Result<bool> + 'a;
+
+    /// The first same-user process other than this one that `matches`.
+    fn same_user_process_with(
+        api: &dyn Libproc,
+        own: libc::pid_t,
+        uid: libc::uid_t,
+        out_of_time: &mut dyn FnMut() -> bool,
+        matches: &mut MatchProcess<'_>,
+    ) -> std::io::Result<bool> {
         for pid in all_pids(api, own)? {
             if out_of_time() {
                 return Err(super::timed_out());
@@ -434,13 +481,8 @@ mod process_table {
             if info.uid != uid && info.ruid != uid {
                 continue;
             }
-            // `comm` is the executed file's name, cut at 16 bytes, which is
-            // longer than the daemon's name.
             let comm = info.comm.split(|byte| *byte == 0).next().unwrap_or(&[]);
-            if super::is_daemon_name(comm) {
-                return Ok(true);
-            }
-            if pid_path(api, pid)?.is_some_and(|path| super::is_daemon_path(&path)) {
+            if matches(api, pid, comm)? {
                 return Ok(true);
             }
         }

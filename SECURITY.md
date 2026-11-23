@@ -58,7 +58,7 @@ Include:
 - We credit reporters in the advisory unless they ask us not to.
 - The advisory names the affected versions and, once one exists, the fixed
   version. If no fix is available yet, the advisory says so and describes known
-  mitigations. Homebrew users update with
+  mitigations. App users update in the app. Headless Homebrew users update with
   `brew update && brew upgrade ottto && brew services restart ottto`.
 
 ## Supported Versions
