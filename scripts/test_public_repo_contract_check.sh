@@ -1058,15 +1058,15 @@ install = install.replace(
     "Copy binaries from a build output when convenient.",
 )
 install = install.replace(
-    "`net.ottto.service` is a single-owner user LaunchAgent",
+    "LaunchAgent `net.ottto.service`, so only one can run,\nand the app wins",
     "`net.ottto.service` can be rewritten by whichever installer runs last",
 )
 install = install.replace(
-    "Homebrew-owned LaunchAgent stays managed by `brew services`",
+    "It never runs Homebrew without that click.",
     "Homebrew-owned LaunchAgent can be refreshed by the app",
 )
 install = install.replace(
-    "Do not install both the\napp bundle and Homebrew as independent service owners.",
+    "Ottto ships two install variants. Install one per Mac:",
     "Install both the app bundle and Homebrew whenever useful.",
 )
 install = install.replace(
@@ -1201,11 +1201,11 @@ if PUBLIC_CONTRACT_REPO_ROOT="$broken_install_docs" "$CONTRACT_SCRIPT" >/tmp/pub
 fi
 grep -q "install docs must prohibit mutable binary-copy installs" \
   /tmp/public-contract-broken-install-docs.out
-grep -q "install docs must document single-owner LaunchAgent authority" \
+grep -q "install docs must document one service per Mac with the app winning" \
   /tmp/public-contract-broken-install-docs.out
-grep -q "install docs must keep Homebrew-owned services under brew services" \
+grep -q "install docs must keep the app's Homebrew migration an explicit click" \
   /tmp/public-contract-broken-install-docs.out
-grep -q "install docs must prohibit independent Homebrew/app-bundle owners" \
+grep -q "install docs must prohibit installing both variants" \
   /tmp/public-contract-broken-install-docs.out
 grep -q "install docs must require immutable Homebrew artifacts from the stable manifest" \
   /tmp/public-contract-broken-install-docs.out

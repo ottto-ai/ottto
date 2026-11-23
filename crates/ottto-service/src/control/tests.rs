@@ -17188,3 +17188,83 @@ fn test_machine() -> MachineIdentity {
 mod claude_settings;
 
 mod admission_matrix;
+
+/// Doctor names a second install variant: a formula next to an app-owned
+/// daemon (each keg version once), a Homebrew-owned daemon with an app bundle
+/// installed, or a root LaunchDaemon. It lists folders and reads no file.
+#[test]
+fn doctor_names_a_second_install_variant() {
+    let root = control_test_root("doctor-install-variants");
+    let arm = root.join("opt-homebrew-Cellar-ottto");
+    let intel = root.join("usr-local-Cellar-ottto");
+    for keg in [
+        arm.join("0.1.258"),
+        intel.join("0.1.258"),
+        intel.join("0.1.255"),
+    ] {
+        create_control_test_dir(&keg);
+    }
+    fs::write(arm.join("not-a-keg"), b"").unwrap();
+    create_control_test_dir(&arm.join("bad name"));
+    let cellars = [arm.as_path(), intel.as_path()];
+    let app = root.join("Applications").join("Ottto.app");
+    let helpers = app.join("Contents").join("Helpers");
+    create_control_test_dir(&helpers);
+    let apps = [root.join("missing").join("Ottto.app"), app.clone()];
+    let no_apps = [root.join("missing").join("Ottto.app")];
+    let system_plist = root.join("net.ottto.service.plist");
+    let empty = root.join("empty-cellar");
+    create_control_test_dir(&empty);
+    let missing = root.join("missing");
+    let no_cellars = [empty.as_path(), missing.as_path()];
+
+    let conflict =
+        install_variant_conflict_in(InstallOwner::AppBundle, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("formula_next_to_app"));
+    assert_eq!(conflict["versions"], json!(["0.1.255", "0.1.258"]));
+    assert_eq!(
+        conflict["daemon_version"],
+        json!(crate::compiled_release_version())
+    );
+    assert_eq!(conflict["system_service"], json!(false));
+    assert!(install_variant_conflict_in(
+        InstallOwner::AppBundle,
+        &no_cellars,
+        &apps,
+        &system_plist
+    )
+    .is_none());
+
+    // The app bundle counts only with its bundled service.
+    assert!(
+        install_variant_conflict_in(InstallOwner::Homebrew, &cellars, &no_apps, &system_plist)
+            .is_none()
+    );
+    fs::write(helpers.join("ottto-service"), b"").unwrap();
+    let conflict =
+        install_variant_conflict_in(InstallOwner::Homebrew, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("homebrew_service_with_app"));
+    assert_eq!(conflict["app_installed"], json!(true));
+
+    for owner in [
+        InstallOwner::HostedInstaller,
+        InstallOwner::Dev,
+        InstallOwner::Unknown,
+    ] {
+        assert!(install_variant_conflict_in(owner, &cellars, &apps, &system_plist).is_none());
+    }
+
+    fs::write(&system_plist, b"").unwrap();
+    let conflict =
+        install_variant_conflict_in(InstallOwner::Dev, &no_cellars, &no_apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("system_service"));
+    let conflict =
+        install_variant_conflict_in(InstallOwner::AppBundle, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("formula_next_to_app"));
+    assert_eq!(conflict["system_service"], json!(true));
+    let _ = fs::remove_dir_all(&root);
+}

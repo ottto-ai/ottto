@@ -11,20 +11,54 @@ Ottto installs a user-scoped macOS local runtime:
 Do not install by copying binaries from a mutable directory. Use the install
 owner named by the release channel.
 
-## LaunchAgent Ownership
+## Two Variants, One Per Mac
 
-`net.ottto.service` is a single-owner user LaunchAgent. Normal install, launch,
-upgrade, restart, and repair commands may refresh only the current owner. A
-Homebrew-owned LaunchAgent stays managed by `brew services`; a signed
-`Ottto.app` launch connects to that service instead of rewriting the plist. To
-switch owners, stop or uninstall the old owner first, or run an explicit
-operator migration command with the new owner selected. Do not install both the
-app bundle and Homebrew as independent service owners.
+Ottto ships two install variants. Install one per Mac:
 
-## Homebrew Install Owner
+- **The app** (`Ottto.app`, from the DMG, the verified installer, or
+  `brew install --cask ottto-ai/tap/ottto-app`): for a person at the Mac. It
+  includes the CLI, runs the service from its bundle and updates itself.
+- **Headless** (the `ottto-ai/tap/ottto` formula with `brew services`): for a
+  Mac without the app, such as a server, an SSH-only Mac or a
+  command-line-only setup.
 
-When a stable release advertises Homebrew support, install through the published
-tap and let Homebrew own service lifecycle:
+Both use the per-user LaunchAgent `net.ottto.service`, so only one can run,
+and the app wins:
+
+- A headless service that starts while this user's installed `Ottto.app`
+  (in `/Applications` or `~/Applications`) is running hands over: it waits,
+  holding no state, for the app to take the service back, and serves if the
+  app quits or does not take over within a few minutes. A `brew services
+  start` or `restart` on that Mac is therefore harmless. While the app is
+  quit, or if the app could not take the service over (it then restores the
+  Homebrew service and offers Retry), the headless service keeps running, so
+  the Mac is never left without a service.
+- When the app finds the Homebrew copy, it shows one notice with one button
+  that moves the service to the app and removes the formula
+  (`brew services stop ottto`, the app's own service registration, then
+  `brew uninstall ottto`). It never runs Homebrew without that click.
+  The one exception: when its own takeover fails, it restarts the Homebrew
+  service, so the Mac keeps a collector.
+- `ottto doctor` names a second variant and its fix.
+
+Moving between variants:
+
+- **Headless to app:** install the app and open it, then use its button. By
+  hand: `brew services stop ottto && brew uninstall ottto`, then open the app.
+  Stop first: `brew uninstall` alone leaves launchd a job whose program is
+  gone.
+- **App to headless:** uninstall the app first (its own Uninstall, or
+  `brew uninstall --cask ottto-app`), then install the formula and run
+  `brew services restart ottto` (`start` reports "already started" while the
+  app's old job is still loaded).
+
+Normal install, launch, upgrade, restart and repair commands refresh only the
+current owner's service; switching owners is the explicit migration above.
+
+## Headless Homebrew Install
+
+On a Mac without the app, install through the published tap and let Homebrew
+own service lifecycle:
 
 ```bash
 brew install ottto-ai/tap/ottto
@@ -45,7 +79,8 @@ brew uninstall ottto
 The formula must pin immutable artifact URLs and SHA-256 hashes from the stable
 release manifest. Do not self-overwrite a Homebrew-managed install; use
 `brew services restart ottto` after upgrades so launchd points at the updated
-Homebrew opt path.
+Homebrew opt path. On a Mac with the app, don't run `brew services` for ottto
+at all; remove the formula instead.
 
 System Settings → General → Login Items lists the Homebrew service under the
 name on its signing certificate, not under Ottto. Homebrew writes the

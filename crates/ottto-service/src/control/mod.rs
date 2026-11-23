@@ -391,6 +391,8 @@ use peer::daemon_is_release_signed;
 #[cfg(target_os = "macos")]
 #[cfg(test)]
 use peer::daemon_release_code_requirement;
+#[cfg(target_os = "macos")]
+pub(crate) use peer::installed_companion_code_requirement;
 use peer::request_authorization;
 #[cfg(target_os = "macos")]
 #[cfg(test)]
@@ -792,6 +794,9 @@ use status::current_millis;
 use status::current_rfc3339;
 use status::detect_install_owner;
 use status::inject_machine_icon;
+use status::install_variant_conflict;
+#[cfg(test)]
+use status::install_variant_conflict_in;
 use status::local_lifecycle_home;
 use status::operating_system_slug;
 use status::refresh_agent_status_for;
@@ -1222,6 +1227,11 @@ fn handle_command(
                     crate::claude_local_otel::support_health::store_size(&default_support_dir())
                 {
                     value["local_otel"] = serde_json::json!({"files": files, "bytes": bytes});
+                }
+            }
+            if retry_relay_authorization {
+                if let Some(conflict) = install_variant_conflict(detect_install_owner()) {
+                    value["install_variants"] = conflict;
                 }
             }
             Ok(value)
