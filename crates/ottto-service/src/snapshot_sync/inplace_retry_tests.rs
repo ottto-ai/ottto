@@ -773,15 +773,12 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
                 preparation,
                 index,
                 scan,
-                &client,
                 &device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &fixture.home,
                 &support,
                 &daemon,
-                &mut transport,
             )
         })
     });

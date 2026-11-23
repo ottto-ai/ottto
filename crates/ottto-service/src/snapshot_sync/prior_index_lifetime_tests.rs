@@ -208,15 +208,12 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 preparation,
                 index,
                 scan,
-                &client,
                 &device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &fixture.home,
                 &support,
                 &daemon,
-                &mut transport,
             )
         });
         drop(guard);

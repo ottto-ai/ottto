@@ -517,15 +517,12 @@ impl ReofferPipeline {
                 preparation,
                 index,
                 scan,
-                &self.client,
                 &self.device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &self.fixture.home,
                 &self.support,
                 &self.daemon,
-                &mut self.transport,
             )
         });
         let index = ScanIndex::load(&index_path).unwrap();

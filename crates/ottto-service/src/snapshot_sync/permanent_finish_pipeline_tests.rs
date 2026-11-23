@@ -367,15 +367,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 preparation,
                 index,
                 scan,
-                &client,
                 &device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &fixture.home,
                 &support,
                 &daemon,
-                &mut transport,
             )
         });
         assert_eq!(
@@ -718,15 +715,12 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 preparation,
                 index,
                 scan,
-                &client,
                 &device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &fixture.home,
                 &support,
                 &daemon,
-                &mut transport,
             )
         });
         assert!(result.is_ok(), "cycle {cycle}: {result:?}");
@@ -1182,15 +1176,12 @@ impl AckFinishHome {
                 preparation,
                 index,
                 scan,
-                &self.client,
                 &self.device,
                 "device-secret",
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &self.fixture.home,
                 &self.support,
                 &self.daemon,
-                &mut self.transport,
             )
         })
     }

@@ -82,7 +82,6 @@ use super::ResumableUploadResult;
 use super::Rfc3339;
 use super::ScanIndex;
 
-use super::SnapshotApiClient;
 use super::SnapshotBatchPreflightRejected;
 use super::SnapshotBatchRequest;
 use super::SnapshotItem;
@@ -1151,20 +1150,17 @@ fn record_collection_complete(source: SnapshotSource, at: &str) {
     });
 }
 
-#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
     mut scan_result: SourceScanResult,
-    _client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
-    _source: SnapshotSource,
     machine_id: &str,
-    _home: &Path,
+    home: &Path,
     support_dir: &Path,
     daemon: &LocalDaemon,
-    _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
@@ -1225,7 +1221,7 @@ pub(super) fn finish_sync_source(
         ensure_snapshot_scan_authority(device, source, client, &account_witness, daemon)?;
         ensure_snapshot_destination_current(&upload_destination_namespace)?;
         if let Some(roots) = &claude_scan_roots {
-            crate::snapshot_roots::validate_claude_roots(_home, roots)?;
+            crate::snapshot_roots::validate_claude_roots(home, roots)?;
         }
         Ok(())
     };
@@ -2275,113 +2271,12 @@ pub(super) fn finish_sync_source(
                     upload_failure_diagnostic(&error)
                 );
             }
-            // Distinguish local serializer drift, authorization failures, and
-            // backend payload rejection. The resumable driver has already
-            // checkpointed every accepted sibling before this terminal error.
-            let (state, context) = if let Some(settlement) =
-                error.downcast_ref::<ack_retention::AckSettlementRequired>()
-            {
-                let incomplete_census_stops =
-                    census_wait.capacity_stop(scan_result.census_complete);
-                eprintln!(
-                    "ottto-service: local snapshot upload deferred for {} — {} consecutive_incomplete_census_stops={}",
-                    source.api_slug(),
-                    upload_failure_diagnostic(&error),
-                    incomplete_census_stops
-                );
-                (
-                    settlement.collector_state(),
-                    "local snapshot ACK settlement pending",
-                )
-            } else if snapshot_upload_error_class(&error)
-                == Some(SnapshotUploadErrorClass::LocalState)
-            {
-                (
-                    CollectorState::Error {
-                        code: "scan_error",
-                        message: "local snapshot checkpoint or destination state failed",
-                    },
-                    "local snapshot state failed",
-                )
-            } else if snapshot_upload_error_class(&error)
-                == Some(SnapshotUploadErrorClass::BackendResponse)
-            {
-                (
-                    CollectorState::Error {
-                        code: "server_error",
-                        message: "backend snapshot response did not match the request",
-                    },
-                    "backend snapshot response was invalid",
-                )
-            } else if let Some(rejected) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
-                eprintln!(
-                    "ottto-service: local snapshot batch failed daemon v{} contract preflight for {} — {}; usage/cost sync is NOT reaching the backend until the daemon serializer is fixed.",
-                    SNAPSHOT_SCHEMA_VERSION,
-                    source.api_slug(),
-                    rejected.reason,
-                );
-                (
-                    CollectorState::Error {
-                        code: "backend_validation_error",
-                        message: "local snapshot batch failed daemon/backend contract preflight",
-                    },
-                    "local snapshot batch failed daemon/backend contract preflight",
-                )
-            } else if let Some(rejected) = error.downcast_ref::<BatchAuthorizationRejected>() {
-                eprintln!(
-                    "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
-                     for {}; start setup or sign in from the Ottto app before retrying \
-                     local usage sync.",
-                    rejected.status,
-                    source.api_slug(),
-                );
-                (
-                    CollectorState::Error {
-                        code: "auth_error",
-                        message: "backend rejected snapshot batch authorization",
-                    },
-                    "backend rejected snapshot batch authorization",
-                )
-            } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
-                eprintln!("ottto-service: source={} {rejected}", source.api_slug());
-                (
-                    CollectorState::Error {
-                        code: "backend_validation_error",
-                        message: "backend rejected snapshot batch payload validation",
-                    },
-                    "backend rejected snapshot batch payload validation",
-                )
-            } else {
-                // A shed request is not a network failure. 429 is unambiguous in
-                // the redacted diagnostics today; 503 joins it with the typed
-                // `Retry-After` handling, which is where the backoff itself
-                // lives. The collector status code stays `network_error` — that
-                // string is a backend contract, and only the loss category is
-                // being classified here.
-                ack_retention::record_upload_failure_loss(&error);
-                // Everything above this arm names its own cause. This arm is
-                // the catch-all, and it used to log the bare phrase "local
-                // snapshot upload failed" with no status code, endpoint, or
-                // body — which is undiagnosable from a log alone and cost a
-                // full reverse-engineering pass to classify. Always emit the
-                // redacted failure shape here: the typed transport/HTTP
-                // diagnostic when the request reached the wire, and the
-                // classified reason when it failed before that.
-                eprintln!(
-                    "ottto-service: local snapshot upload failed for {} — {}; \
-                     daemon SNAPSHOT_SCHEMA_VERSION={}.",
-                    source.api_slug(),
-                    upload_failure_diagnostic(&error),
-                    SNAPSHOT_SCHEMA_VERSION,
-                );
-                (
-                    CollectorState::Error {
-                        code: "network_error",
-                        message: "local snapshot upload failed",
-                    },
-                    "upload local snapshots",
-                )
-            };
+            let (state, context) = classify_upload_failure(
+                source,
+                &error,
+                &mut census_wait,
+                scan_result.census_complete,
+            );
             with_source_cadence(source, |cadence| {
                 ack_retention::record_upload_error_cadence(
                     cadence,
@@ -2596,24 +2491,17 @@ pub(super) fn finish_sync_source(
         );
     }
 
-    // StateMissing N2: a Claude census completed and settled under the
-    // history gate clears the unverified marker. A fresh index recorded its
-    // cutoff this cycle and an intact one keeps its entries, so the rebuilt
-    // history stays gated; Claude's bootstrap and replays may then run.
+    // A Claude census completed and settled under the history gate clears the
+    // unverified marker. A fresh index recorded its cutoff this cycle and an
+    // intact one keeps its entries, so the rebuilt history stays gated;
+    // Claude's bootstrap and replays may then run.
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
     if claude_replay_suppressed(source, &backfill_state)
         && scan_result.census_complete
         && upload_fully_settled
     {
-        if let Err(error) = crate::backfill::clear_prior_history_unverified(support_dir) {
-            eprintln!(
-                "local snapshot backfill state save failed for {}: {}",
-                source.api_slug(),
-                safe_error(&error)
-            );
-            return Err(anyhow!("local snapshot backfill state save failed"));
-        }
+        clear_unverified_marker(source, support_dir)?;
     }
 
     // A tier waits only for work in flight inside the import; refusals and
@@ -2653,23 +2541,12 @@ pub(super) fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
     if backfill_succeeded {
-        // Keep completion's reload, mutation and save atomic with claims,
-        // list intent and deliberate installation reset.
-        if let Err(error) = update_backfill_state(support_dir, |backfill_state| {
-            mark_backfill_complete_for_destination(
-                backfill_state,
-                source,
-                &upload_destination_namespace,
-            );
-            backfill_state.last_completed_at = Some(scan_started_at.clone());
-        }) {
-            eprintln!(
-                "local snapshot backfill state save failed for {}: {}",
-                source.api_slug(),
-                safe_error(&error)
-            );
-            return Err(anyhow!("local snapshot backfill state save failed"));
-        }
+        record_backfill_completion(
+            source,
+            support_dir,
+            &upload_destination_namespace,
+            &scan_started_at,
+        )?;
     }
 
     // Final scan/backfill markers are durable before page progress is retired.
@@ -2811,6 +2688,160 @@ pub(super) fn finish_sync_source(
                 outside,
             );
         }
+    }
+    Ok(())
+}
+
+/// The state a failed upload's terminal receipt carries, and the context its
+/// error is returned with. On the way it emits branch-specific diagnostics,
+/// updates the capacity-stop streak for a pending ACK settlement, and records
+/// the upload loss in the catch-all arm.
+fn classify_upload_failure(
+    source: SnapshotSource,
+    error: &anyhow::Error,
+    census_wait: &mut ack_retention::CapacityStopCensusCount,
+    census_complete: bool,
+) -> (CollectorState<'static>, &'static str) {
+    // Distinguish local serializer drift, authorization failures, and
+    // backend payload rejection. The resumable driver has already
+    // checkpointed every accepted sibling before this terminal error.
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        let incomplete_census_stops = census_wait.capacity_stop(census_complete);
+        eprintln!(
+            "ottto-service: local snapshot upload deferred for {} — {} consecutive_incomplete_census_stops={}",
+            source.api_slug(),
+            upload_failure_diagnostic(error),
+            incomplete_census_stops
+        );
+        (
+            settlement.collector_state(),
+            "local snapshot ACK settlement pending",
+        )
+    } else if snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState) {
+        (
+            CollectorState::Error {
+                code: "scan_error",
+                message: "local snapshot checkpoint or destination state failed",
+            },
+            "local snapshot state failed",
+        )
+    } else if snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::BackendResponse)
+    {
+        (
+            CollectorState::Error {
+                code: "server_error",
+                message: "backend snapshot response did not match the request",
+            },
+            "backend snapshot response was invalid",
+        )
+    } else if let Some(rejected) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
+        eprintln!(
+            "ottto-service: local snapshot batch failed daemon v{} contract preflight for {} — {}; usage/cost sync is NOT reaching the backend until the daemon serializer is fixed.",
+            SNAPSHOT_SCHEMA_VERSION,
+            source.api_slug(),
+            rejected.reason,
+        );
+        (
+            CollectorState::Error {
+                code: "backend_validation_error",
+                message: "local snapshot batch failed daemon/backend contract preflight",
+            },
+            "local snapshot batch failed daemon/backend contract preflight",
+        )
+    } else if let Some(rejected) = error.downcast_ref::<BatchAuthorizationRejected>() {
+        eprintln!(
+            "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
+                     for {}; start setup or sign in from the Ottto app before retrying \
+                     local usage sync.",
+            rejected.status,
+            source.api_slug(),
+        );
+        (
+            CollectorState::Error {
+                code: "auth_error",
+                message: "backend rejected snapshot batch authorization",
+            },
+            "backend rejected snapshot batch authorization",
+        )
+    } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+        eprintln!("ottto-service: source={} {rejected}", source.api_slug());
+        (
+            CollectorState::Error {
+                code: "backend_validation_error",
+                message: "backend rejected snapshot batch payload validation",
+            },
+            "backend rejected snapshot batch payload validation",
+        )
+    } else {
+        // A shed request is not a network failure. 429 is unambiguous in
+        // the redacted diagnostics today; 503 joins it with the typed
+        // `Retry-After` handling, which is where the backoff itself
+        // lives. The collector status code stays `network_error` — that
+        // string is a backend contract, and only the loss category is
+        // being classified here.
+        ack_retention::record_upload_failure_loss(error);
+        // Everything above this arm names its own cause. This arm is
+        // the catch-all, and it used to log the bare phrase "local
+        // snapshot upload failed" with no status code, endpoint, or
+        // body — which is undiagnosable from a log alone and cost a
+        // full reverse-engineering pass to classify. Always emit the
+        // redacted failure shape here: the typed transport/HTTP
+        // diagnostic when the request reached the wire, and the
+        // classified reason when it failed before that.
+        eprintln!(
+            "ottto-service: local snapshot upload failed for {} — {}; \
+                     daemon SNAPSHOT_SCHEMA_VERSION={}.",
+            source.api_slug(),
+            upload_failure_diagnostic(error),
+            SNAPSHOT_SCHEMA_VERSION,
+        );
+        (
+            CollectorState::Error {
+                code: "network_error",
+                message: "local snapshot upload failed",
+            },
+            "upload local snapshots",
+        )
+    }
+}
+
+/// Clears the unverified-history marker after a settled Claude census.
+fn clear_unverified_marker(source: SnapshotSource, support_dir: &Path) -> Result<()> {
+    if let Err(error) = crate::backfill::clear_prior_history_unverified(support_dir) {
+        eprintln!(
+            "local snapshot backfill state save failed for {}: {}",
+            source.api_slug(),
+            safe_error(&error)
+        );
+        return Err(anyhow!("local snapshot backfill state save failed"));
+    }
+    Ok(())
+}
+
+/// Marks this destination's backfill complete and stores the supplied scan-start
+/// timestamp.
+fn record_backfill_completion(
+    source: SnapshotSource,
+    support_dir: &Path,
+    upload_destination_namespace: &str,
+    scan_started_at: &str,
+) -> Result<()> {
+    // Keep completion's reload, mutation and save atomic with claims,
+    // list intent and deliberate installation reset.
+    if let Err(error) = update_backfill_state(support_dir, |backfill_state| {
+        mark_backfill_complete_for_destination(
+            backfill_state,
+            source,
+            upload_destination_namespace,
+        );
+        backfill_state.last_completed_at = Some(scan_started_at.to_owned());
+    }) {
+        eprintln!(
+            "local snapshot backfill state save failed for {}: {}",
+            source.api_slug(),
+            safe_error(&error)
+        );
+        return Err(anyhow!("local snapshot backfill state save failed"));
     }
     Ok(())
 }

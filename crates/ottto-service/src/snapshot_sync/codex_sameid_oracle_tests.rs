@@ -650,7 +650,6 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         committed_index: committed,
         ..destination.preparation(false)
     };
-    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
     // The capture moves the store to a new generation inside this call; every
     // later boundary (relay token, upload, checkpoint, final save) checks the
     // store guard, so a guard built before the capture fails the pass here.
@@ -658,15 +657,12 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         preparation,
         index,
         scan,
-        &client,
         &device,
         &secret,
-        SOURCE,
         "e2-synthetic-machine",
         &home,
         &support,
         &daemon,
-        &mut transport,
     )
     .unwrap_or_else(|error| panic!("the finish refused a boundary after the capture: {error:#}"));
 
