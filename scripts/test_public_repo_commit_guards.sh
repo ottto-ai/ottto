@@ -41,6 +41,8 @@ git init -q --initial-branch=main --object-format=sha1
 git commit --allow-empty -qm root
 base="$(git rev-parse HEAD)"
 git update-ref refs/remotes/origin/main "$base"
+# merge_group runs fetch their target branch from origin.
+git remote add origin "file://$PWD"
 tree="$(git rev-parse 'HEAD^{tree}')"
 mkdir scripts
 ln -s "$SCRIPT" scripts/public_repo_commit_guards.py
@@ -168,7 +170,11 @@ run_event() (
   export GITHUB_EVENT_NAME="$1" GITHUB_SHA="${4:-$3}"
   case "$1" in
     pull_request) export PR_BASE="$2" PR_HEAD="$3" ;;
-    merge_group) export QUEUE_BASE="$2" QUEUE_HEAD="$3" ;;
+    merge_group)
+      export QUEUE_BASE="$2" QUEUE_HEAD="$3"
+      git update-ref refs/heads/queue-target "${QUEUE_TARGET:-$base}"
+      export QUEUE_BASE_REF="${QUEUE_REF:-refs/heads/queue-target}"
+      ;;
     push) export PUSH_BEFORE="$2" PUSH_AFTER="$3" ;;
   esac
   bash "$tmp_dir/step.sh"
@@ -186,6 +192,13 @@ reject "$good" 'empty commit range' run_event merge_group "$good" "$good"
 after_bad="$(git commit-tree "$tree" -p "$bad_author" -m 'Clean queue tip')"
 git reset -q --hard "$after_bad"
 reject "$bad_author" 'disallowed author email' run_event merge_group "$base" "$after_bad"
+# A later queue entry's base is the previous entry's head; a bad entry below a
+# clean tip must still fail against the target branch.
+reject "$bad_author" 'disallowed author email' run_event merge_group "$bad_author" "$after_bad"
+QUEUE_TARGET="$good" reject "$after_bad" 'merge group base is not on its target branch' \
+  run_event merge_group "$base" "$after_bad"
+QUEUE_REF='main' reject "$after_bad" 'unexpected merge group target branch' \
+  run_event merge_group "$base" "$after_bad"
 accept run_event push "$base" "$good"
 reject "$bad_committer" 'disallowed committer email' run_event push "$base" "$bad_committer"
 reject "$good" 'cannot verify base ancestry' run_event push "$allowed" "$good"
