@@ -493,9 +493,12 @@ fn links_are_scraped_with_links_off_and_absent_on_the_wire() {
 /// nothing is dropped locally and the item is still sent.
 #[test]
 fn over_limit_link_is_dropped_only_at_upload() {
-    let long = format!("https://example.com/{}", "a".repeat(600));
-    // 512 characters, more than 512 bytes: within the receiver's limit.
-    let wide = format!("https://example.com/{}", "é".repeat(492));
+    // Canonical links, so only the length decides. A canonical link is ASCII:
+    // characters and bytes are the same count.
+    let long = format!("https://example.com/{}/r/pull/1", "a".repeat(600));
+    // Exactly 512 characters: within the receiver's limit.
+    let wide = format!("https://example.com/{}/r/pull/1", "a".repeat(483));
+    assert_eq!(wide.chars().count(), 512);
     let artifact = |value: &str| SessionArtifact {
         kind: "pull_request".into(),
         value: value.into(),
@@ -512,4 +515,42 @@ fn over_limit_link_is_dropped_only_at_upload() {
     assert!(items[0].session_artifacts[0].value.len() <= 512);
     assert_eq!(items[0].session_artifacts[1].value, wide);
     assert_eq!(items[0].snapshot_fingerprint, before, "names the sent body");
+}
+
+/// [behaviour] Links saved by an older scraper (a restored Claude Tail) that
+/// the receiver would refuse, path-like or with credentials, are left off at
+/// upload, so they cannot refuse the whole item. Clean links and usage stay.
+#[test]
+fn saved_path_like_link_is_dropped_at_upload() {
+    let artifact = |value: &str| SessionArtifact {
+        kind: "pull_request".into(),
+        value: value.into(),
+    };
+    let mut clean = tests::sample_session_artifact_item();
+    clean
+        .session_artifacts
+        .push(artifact("https://github.com/anthropics/claude-code/pull/8"));
+    let sent = snapshot_fingerprint(SnapshotSource::ClaudeCode, &clean);
+    clean.snapshot_fingerprint = sent.clone();
+    let mut item = clean.clone();
+    item.session_artifacts
+        .push(artifact("https://code.claude.com/o/r/pull/4"));
+    item.session_artifacts
+        .push(artifact("https://user:pass@github.com/o/r/pull/5"));
+    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+    assert_ne!(item.snapshot_fingerprint, sent);
+    let mut items = vec![item, clean.clone()];
+    apply_upload_policy(SnapshotSource::ClaudeCode, &mut items, all(true));
+    assert_eq!(items.len(), 2, "the item is still sent");
+    assert_eq!(items[0].session_artifacts, clean.session_artifacts);
+    assert!(items[0]
+        .session_artifacts
+        .iter()
+        .all(crate::snapshots::session_artifact_accepted));
+    assert_eq!(items[0].snapshot_fingerprint, sent, "names the sent body");
+    assert_eq!(
+        serde_json::to_value(&items[0]).unwrap(),
+        serde_json::to_value(&items[1]).unwrap(),
+        "only the link differs; usage, requests and identity are untouched"
+    );
 }

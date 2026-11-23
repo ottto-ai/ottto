@@ -42,6 +42,17 @@ pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES: usize = 32;
 /// already covered by `looks_like_local_path`.
 pub(crate) const ATTRIBUTION_FORBIDDEN_FRAGMENTS: [&str; 4] =
     [".codex", ".claude", "workspace_path", "transcript_path"];
+
+/// Mirror of the backend's path check for session artifacts and display
+/// labels: a case-insensitive substring match against every entry of
+/// `_ARTIFACT_FORBIDDEN_FRAGMENTS`, separator-bearing forms included.
+pub(crate) fn backend_rejects_as_path(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    ["/users/", "\\users\\", "/home/", "\\home\\"]
+        .iter()
+        .chain(ATTRIBUTION_FORBIDDEN_FRAGMENTS.iter())
+        .any(|fragment| lowered.contains(fragment))
+}
 /// Wire budget for one session's attribution facts.
 ///
 /// Raised 2,048 → 4,096 → 8,192. This number and the backend's
@@ -1879,11 +1890,7 @@ mod tests {
     /// Mirror of the backend's display-label path check: a plain,
     /// case-insensitive substring match over the whole label.
     fn backend_rejects_label(label: &str) -> bool {
-        let lowered = label.to_ascii_lowercase();
-        ["/users/", "\\users\\", "/home/", "\\home\\"]
-            .iter()
-            .chain(ATTRIBUTION_FORBIDDEN_FRAGMENTS.iter())
-            .any(|fragment| lowered.contains(fragment))
+        backend_rejects_as_path(label)
     }
 
     #[test]

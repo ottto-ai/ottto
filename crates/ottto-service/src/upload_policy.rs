@@ -265,6 +265,12 @@ pub fn apply_upload_policy(
             links_over_limit += (links - item.session_artifacts.len()) as u64;
             fingerprint_needs_refresh = true;
         }
+        // A saved Tail can carry a link an older scraper kept; the receiver
+        // refuses the whole item for one that fails its URL or SHA checks.
+        let links = item.session_artifacts.len();
+        item.session_artifacts
+            .retain(crate::snapshots::session_artifact_accepted);
+        fingerprint_needs_refresh |= item.session_artifacts.len() != links;
         if !policy.names() {
             fingerprint_needs_refresh |= hide_names(item);
         }
