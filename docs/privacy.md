@@ -285,7 +285,10 @@ id as its parent. A task an agent suggested and the person clicked has no
 `sideSession`, and it gets no parent or agent launch fact. The second is
 whether the app ran the session as one of its own scheduled tasks
 (`scheduledTaskId`). Only the fact that it was a scheduled task is uploaded,
-never the task id.
+never the task id. A Codex thread that Codex marks `agent_created_thread`
+is stated as an agent launch, with no parent unless the delegation wrapper
+below supplies one. This applies to such threads read after the update; an
+ended thread uploaded before it keeps what it uploaded.
 
 Upload settings apply going forward. Turning a setting on applies to sessions
 that are active after it is turned on: a session that has already ended keeps

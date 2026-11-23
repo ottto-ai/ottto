@@ -457,7 +457,7 @@ impl SessionAttributionContext {
 fn provider_origin_is_known(origin: &SnapshotOrigin) -> bool {
     matches!(
         origin.thread_source.as_deref(),
-        Some("automation" | "subagent")
+        Some("automation" | "subagent" | CODEX_AGENT_CREATED_THREAD_SOURCE)
     ) || origin.source_subagent == Some(true)
         || origin.is_sidechain == Some(true)
 }
@@ -915,6 +915,23 @@ pub fn direct_provider_facts(
                     "direct",
                     &evidence_context,
                 ),
+                // Another agent opened this thread in the Codex app. Codex
+                // records no parent for it, so only the launch kind is stated.
+                Some(CODEX_AGENT_CREATED_THREAD_SOURCE) => {
+                    for (field, value) in [
+                        ("origin_kind", "agent_spawn"),
+                        ("agent_kind", CODEX_AGENT_THREAD_KIND),
+                    ] {
+                        push_fact(
+                            &mut facts,
+                            field,
+                            value,
+                            "provider_native",
+                            "direct",
+                            &evidence_context,
+                        );
+                    }
+                }
                 _ => {}
             }
 
@@ -1101,6 +1118,12 @@ pub fn claude_subagent_facts(
     }
     facts
 }
+
+/// Codex `thread_source` for a thread another agent opened in the Codex app.
+const CODEX_AGENT_CREATED_THREAD_SOURCE: &str = "agent_created_thread";
+/// `agent_kind` stated for such a thread; the backend's "opened by another
+/// agent" rule names it next to `claude_desktop_session`.
+pub const CODEX_AGENT_THREAD_KIND: &str = "codex_agent_thread";
 
 /// A launch already stated (desktop lineage or scheduled task, a launcher
 /// edge, a Codex agent thread) outranks an external-scheduler match in the
@@ -1597,6 +1620,69 @@ mod tests {
         assert!(facts
             .iter()
             .any(|fact| fact.field == "provider_surface" && fact.value == "codex_desktop"));
+    }
+
+    /// [behaviour] A Codex thread another agent opened states the launch kind
+    /// and the Codex agent-thread kind, with no parent; a person's thread
+    /// states no origin.
+    #[test]
+    fn codex_agent_created_thread_is_an_agent_launch_without_a_parent() {
+        let facts_for = |thread_source: &str| {
+            let mut origin = origin();
+            origin.thread_source = Some(thread_source.to_string());
+            origin.originator = Some("Codex Desktop".to_string());
+            direct_provider_facts(
+                SnapshotSource::Codex,
+                Some(&origin),
+                "session-created",
+                "2026-11-23T00:00:00Z",
+                "codex_jsonl:v21",
+            )
+        };
+        let created = facts_for("agent_created_thread");
+        let value = |facts: &[SessionAttributionFact], field: &str| {
+            facts.iter().find(|fact| fact.field == field).map(|fact| {
+                (
+                    fact.value.clone(),
+                    fact.evidence.kind.clone(),
+                    fact.evidence.strength.clone(),
+                )
+            })
+        };
+        assert_eq!(
+            value(&created, "origin_kind"),
+            Some((
+                "agent_spawn".into(),
+                "provider_native".into(),
+                "direct".into()
+            ))
+        );
+        assert_eq!(
+            value(&created, "agent_kind"),
+            Some((
+                "codex_agent_thread".into(),
+                "provider_native".into(),
+                "direct".into()
+            ))
+        );
+        assert_eq!(value(&created, "parent_session_ref"), None);
+        assert_eq!(
+            value(&created, "provider_surface").map(|(value, _, _)| value),
+            Some("codex_desktop".into())
+        );
+        for thread_source in ["user", "agent_forked_thread", "realtime_voice"] {
+            let facts = facts_for(thread_source);
+            assert_eq!(value(&facts, "origin_kind"), None, "{thread_source}");
+            assert_eq!(value(&facts, "agent_kind"), None, "{thread_source}");
+        }
+        // Its launch is known, so no external-scheduler correlation runs.
+        let known = |thread_source: &str| {
+            let mut origin = origin();
+            origin.thread_source = Some(thread_source.to_string());
+            provider_origin_is_known(&origin)
+        };
+        assert!(known("agent_created_thread"));
+        assert!(!known("user"));
     }
 
     /// [behaviour] An external-scheduler match never adds a second origin to a
