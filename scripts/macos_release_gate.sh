@@ -462,6 +462,24 @@ while IFS= read -r artifact; do
         echo "codesign is required to validate stable macOS app bundles: $name" >&2
         failures=$((failures + 1))
       fi
+      # One Ottto per Mac and the app wins: a second, headless Homebrew
+      # install must hand over to this app, never take its service over.
+      # The packaged app's own service decides as a launchd-started Homebrew
+      # copy, against this bundle and against a bundle that is not there.
+      if [[ "$CHANNEL" == "stable" ]]; then
+        step_aside_helper="$verification_path/Contents/Helpers/ottto-service"
+        if [[ ! -x "$step_aside_helper" ]]; then
+          echo "macOS app bundle has no bundled ottto-service: $name" >&2
+          failures=$((failures + 1))
+        else
+          step_aside="$("$step_aside_helper" service step-aside-check --app "$verification_path" --json 2>/dev/null | jq -r '.decision' 2>/dev/null || true)"
+          no_app="$("$step_aside_helper" service step-aside-check --app "$verification_path.absent" --json 2>/dev/null | jq -r '.decision' 2>/dev/null || true)"
+          if [[ "$step_aside" != "step_aside" || "$no_app" != "serve" ]]; then
+            echo "A headless Homebrew install would not hand over to this app (with app: ${step_aside:-none}, without: ${no_app:-none}): $name" >&2
+            failures=$((failures + 1))
+          fi
+        fi
+      fi
     fi
   fi
 

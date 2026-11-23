@@ -565,7 +565,9 @@ Schema revision one uses the forward-only `user_version` runner and checks
 `minimum_writer_capability` before writes. Nonempty revision-zero layouts are
 refused rather than adopted. There are no destructive migration steps or automatic
 backup restoration; newer schema/writer capabilities hold the source. Exact ACK
-receipt reconciliation remains required before collection or settlement.
+receipt reconciliation remains required before collection or settlement. Writer
+capability 7 writes Tail head envelope 2, which adds the write generation count;
+rolling back below this release holds collection until roll-forward.
 
 Uninstall also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery

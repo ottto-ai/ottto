@@ -385,6 +385,14 @@ fn claude_sidecar_and_otlp_rows_are_inputs() {
     });
     assert_eq!(counts.otlp_relay_appended_rows, 1);
     assert!(!before.same(&after), "telemetry rows wake the walk");
+    // A row accepted after a scan-start drain is readable only after the next
+    // drain, which must wake that pass even with no new arrival.
+    let ((before, after), _) = cache_lifecycle::observe(|| {
+        let before = fixture.pass(&index, "a");
+        cache_lifecycle::add(cache_lifecycle::Event::OtlpRelayJournalDrainedRows, 1);
+        (before, fixture.pass(&index, "a"))
+    });
+    assert!(!before.same(&after), "drained journal rows wake the walk");
 }
 
 #[test]

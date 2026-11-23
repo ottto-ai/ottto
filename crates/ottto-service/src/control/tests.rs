@@ -1537,8 +1537,7 @@ fn pi_default_model_not_found_names_the_model() {
     let two_routes = pi_route_aggregate_result(vec![failed(not_found_404), failed(not_found_404)]);
     assert_eq!(two_routes.message.text, generic);
 
-    // A failed Pi check still shows as failed, but the background loop never
-    // re-runs its paid prompt.
+    // A failed Pi check shows as failed until real usage or a Verify clears it.
     let daemon = daemon().with_account(connected_account());
     daemon.record_verification_result(&not_found).unwrap();
     let status = daemon.status("token").unwrap();
@@ -1548,10 +1547,6 @@ fn pi_default_model_not_found_names_the_model() {
         .find(|health| health.source == SourceKind::Pi)
         .unwrap();
     assert_eq!(health.state, ottto_protocol::SourceState::Failed);
-    assert!(daemon
-        .blocking_verification_retry_states()
-        .unwrap()
-        .is_empty());
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1627,10 +1622,6 @@ fn pi_admin_disabled_import_rejection_stays_typed_and_non_blocking() {
     daemon
         .record_verification_result(&aggregate)
         .expect("record typed admin-disabled result");
-    assert!(daemon
-        .sources_with_blocking_verification_failure()
-        .expect("list blocking verification failures")
-        .is_empty());
     let status = daemon.status("token").expect("read projected health");
     let source = status.sources.first().expect("Pi source health");
     assert_eq!(source.grade, ottto_protocol::HealthGrade::Warning);
@@ -12922,10 +12913,7 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
             health.recommended_actions[0].action,
             RepairActionKind::ReauthProvider
         );
-        assert_eq!(
-            daemon.blocking_verification_retry_states().unwrap(),
-            vec![(SourceKind::ClaudeCode, true)]
-        );
+        assert_eq!(health.state, ottto_protocol::SourceState::Failed);
     }
     let daemon = daemon().with_account(connected_account());
     let snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
@@ -12971,13 +12959,11 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
             );
         }
     }
-    assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
     assert!(!root.join("spawned").exists());
     let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
     assert_eq!(smoke.duration_ms, 0);
     assert_eq!(smoke.exit_status, None);
     assert!(!root.join("spawned").exists());
-    assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
     initial = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
     attach_verification_check(&mut initial);
     assert_eq!(initial.status, SourceVerificationStatus::Warning);
@@ -13001,10 +12987,6 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
         ottto_protocol::StableProblemCode::AgentCliUnavailable
     );
     assert!(health.recommended_actions.is_empty());
-    assert!(daemon
-        .blocking_verification_retry_states()
-        .unwrap()
-        .is_empty());
     let canonical_health = status.canonical_health.unwrap();
     assert_ne!(
         canonical_health.overall.severity,
@@ -17188,3 +17170,83 @@ fn test_machine() -> MachineIdentity {
 mod claude_settings;
 
 mod admission_matrix;
+
+/// Doctor names a second install variant: a formula next to an app-owned
+/// daemon (each keg version once), a Homebrew-owned daemon with an app bundle
+/// installed, or a root LaunchDaemon. It lists folders and reads no file.
+#[test]
+fn doctor_names_a_second_install_variant() {
+    let root = control_test_root("doctor-install-variants");
+    let arm = root.join("opt-homebrew-Cellar-ottto");
+    let intel = root.join("usr-local-Cellar-ottto");
+    for keg in [
+        arm.join("0.1.258"),
+        intel.join("0.1.258"),
+        intel.join("0.1.255"),
+    ] {
+        create_control_test_dir(&keg);
+    }
+    fs::write(arm.join("not-a-keg"), b"").unwrap();
+    create_control_test_dir(&arm.join("bad name"));
+    let cellars = [arm.as_path(), intel.as_path()];
+    let app = root.join("Applications").join("Ottto.app");
+    let helpers = app.join("Contents").join("Helpers");
+    create_control_test_dir(&helpers);
+    let apps = [root.join("missing").join("Ottto.app"), app.clone()];
+    let no_apps = [root.join("missing").join("Ottto.app")];
+    let system_plist = root.join("net.ottto.service.plist");
+    let empty = root.join("empty-cellar");
+    create_control_test_dir(&empty);
+    let missing = root.join("missing");
+    let no_cellars = [empty.as_path(), missing.as_path()];
+
+    let conflict =
+        install_variant_conflict_in(InstallOwner::AppBundle, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("formula_next_to_app"));
+    assert_eq!(conflict["versions"], json!(["0.1.255", "0.1.258"]));
+    assert_eq!(
+        conflict["daemon_version"],
+        json!(crate::compiled_release_version())
+    );
+    assert_eq!(conflict["system_service"], json!(false));
+    assert!(install_variant_conflict_in(
+        InstallOwner::AppBundle,
+        &no_cellars,
+        &apps,
+        &system_plist
+    )
+    .is_none());
+
+    // The app bundle counts only with its bundled service.
+    assert!(
+        install_variant_conflict_in(InstallOwner::Homebrew, &cellars, &no_apps, &system_plist)
+            .is_none()
+    );
+    fs::write(helpers.join("ottto-service"), b"").unwrap();
+    let conflict =
+        install_variant_conflict_in(InstallOwner::Homebrew, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("homebrew_service_with_app"));
+    assert_eq!(conflict["app_installed"], json!(true));
+
+    for owner in [
+        InstallOwner::HostedInstaller,
+        InstallOwner::Dev,
+        InstallOwner::Unknown,
+    ] {
+        assert!(install_variant_conflict_in(owner, &cellars, &apps, &system_plist).is_none());
+    }
+
+    fs::write(&system_plist, b"").unwrap();
+    let conflict =
+        install_variant_conflict_in(InstallOwner::Dev, &no_cellars, &no_apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("system_service"));
+    let conflict =
+        install_variant_conflict_in(InstallOwner::AppBundle, &cellars, &apps, &system_plist)
+            .unwrap();
+    assert_eq!(conflict["kind"], json!("formula_next_to_app"));
+    assert_eq!(conflict["system_service"], json!(true));
+    let _ = fs::remove_dir_all(&root);
+}

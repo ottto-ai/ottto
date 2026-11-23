@@ -114,6 +114,7 @@ fn native_page(
         stats: Default::default(),
         delivered: None,
         upload_policy: SnapshotUploadPolicy::default(),
+        cutoff_candidates: Vec::new(),
     }
 }
 

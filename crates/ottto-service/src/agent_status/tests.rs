@@ -81,8 +81,8 @@ fn local_meter_fixture(
 /// is benign as well ([regress]: it used to raise the warning).
 /// Counting them as actionable raised `secret_expired` - "Claude Code
 /// durable connections need attention" - with a Verify button, for an
-/// outage at Anthropic that Verify cannot fix and that the daemon's own
-/// re-verify backoff clears on its own.
+/// outage at Anthropic that Verify cannot fix and that the next status pass
+/// rereads on its own.
 #[test]
 fn a_transient_claude_read_failure_does_not_need_attention() {
     use ClaudeConfigSlotCollectionStateV1 as State;

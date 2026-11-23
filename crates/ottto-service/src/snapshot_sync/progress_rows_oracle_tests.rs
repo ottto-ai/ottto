@@ -331,15 +331,16 @@ fn row_digests(index_path: &Path) -> RowDigests {
     (control(&conn, "progress_generation"), rows)
 }
 
-/// The route's progress lives in rows only: capability 6, the import
+/// The route's progress lives in rows only: the capability that writes them
+/// (rows need 6; this build writes 7, Tail head envelope 2), the import
 /// marker, the RAM generation as the CAS value, every keyed member of RAM, and
 /// no JSON ledger, ACK receipt or failed-import copy beside the index.
 fn assert_rows_custody(index_path: &Path, progress: &SnapshotUploadProgress) {
     let rows = rows(index_path);
     assert_eq!(
         rows.capability,
-        Some(6),
-        "progress rows need writer capability 6"
+        Some(7),
+        "progress rows need the writer capability that writes them"
     );
     assert!(
         rows.import.is_some(),

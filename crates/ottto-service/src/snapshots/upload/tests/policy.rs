@@ -170,6 +170,16 @@ fn names_off_merges_mcp_names_and_keeps_totals_and_provider_vocabulary() {
         Some("explorer")
     );
     assert_eq!(items[0].attribution_facts[0].value, "Explore");
+
+    // The collector's own launch kinds survive too: the backend's "opened by
+    // another agent" rule reads them, and `custom` would read as Automated.
+    for kind in ["claude_desktop_session", "codex_agent_thread"] {
+        let mut launched = seeded();
+        launched.attribution_facts[0].value = kind.to_string();
+        let mut items = vec![launched];
+        apply_upload_policy(SnapshotSource::ClaudeCode, &mut items, policy);
+        assert_eq!(items[0].attribution_facts[0].value, kind);
+    }
 }
 
 #[test]

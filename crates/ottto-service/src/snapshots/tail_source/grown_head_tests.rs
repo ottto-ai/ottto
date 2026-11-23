@@ -276,6 +276,8 @@ fn claude_layout() -> String {
             "",
         )
         .replace("I codex_sidecar_binding: Option<String>;", "")
+        // A live Desktop marker, set per scan and never stored.
+        .replace("I claude_desktop_scheduled_task: bool;", "")
 }
 
 /// The Codex head envelope, trailer, collection geometry, page elements and
@@ -288,7 +290,9 @@ fn codex_layout() -> String {
     <(usize, usize, bool)>::shape(&mut s);
     super::super::shape_fields(&mut s);
     super::super::codex::shape_layout(&mut s);
-    s.text().to_owned()
+    // A live Claude Desktop marker that stores no bytes in any head.
+    s.text()
+        .replace("I claude_desktop_scheduled_task: bool;", "")
 }
 
 const CODEX_LAYOUT_SHA256: &str =

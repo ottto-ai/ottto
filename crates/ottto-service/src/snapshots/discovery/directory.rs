@@ -938,13 +938,149 @@ pub(in crate::snapshots) fn first_read_aged(
     }) {
         return false;
     }
+    !has_read_evidence(index, path, false)
+}
+
+/// Aging counts any Tail head, or an unreadable route or head, as read. A
+/// tier (`tier`) needs proof: the census's metadata-only head for an owed
+/// file, or an unreadable one, is no read, so the file waits, still owed.
+fn has_read_evidence(index: &ScanIndex, path: &Path, tier: bool) -> bool {
     let key = local_index_key(path);
-    let read = index.files.contains_key(&key)
+    index.files.contains_key(&key)
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
-        || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
-    !read
+        || (state_v2::tail_route_path(index).map_or(!tier, |route| route.is_some())
+            && state_v2::load_head(index, &key, u32::MAX).map_or(!tier, |head| {
+                head.is_some_and(|head| !(tier && head.metadata_only))
+            }))
+}
+
+/// Recency tier for one look at the queue: a queued file with no proven read
+/// and an mtime before the bound waits, still owed; a vanished one keeps its
+/// removal route. Claude admits a path family (root, subagents, path twins)
+/// whole once any member is read or in the tier, and pulls every main in the
+/// folder of a read copy that counted an unproven prefix (`DISCLOSED`): a
+/// holder proves only in its copy's folder. The page that reads a pulled
+/// main re-reads those copies, so the copy decision proves it in-page.
+#[derive(Default)]
+pub(in crate::snapshots) struct TierGate {
+    deferred: BTreeSet<PathBuf>,
+    /// Older paths admitted by a family; mains among them by a folder.
+    pulled: BTreeSet<PathBuf>,
+    by_folder: BTreeSet<PathBuf>,
+    /// Read `DISCLOSED` mains (not account-held), by folder.
+    copies: BTreeMap<PathBuf, Vec<PathBuf>>,
+}
+
+impl TierGate {
+    pub(in crate::snapshots) fn new(source: SnapshotSource, index: &ScanIndex) -> Self {
+        let mut gate = Self::default();
+        let (Some(cutoff), Some(walk)) = (index.first_read_tier_cutoff, index.traversal.as_ref())
+        else {
+            return gate;
+        };
+        gate.deferred = walk
+            .pending_candidates
+            .iter()
+            .filter(|candidate| {
+                fs::symlink_metadata(&candidate.path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(unix_seconds)
+                    .is_some_and(|modified| modified < cutoff)
+                    && !has_read_evidence(index, &candidate.path, true)
+            })
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        if source != SnapshotSource::ClaudeCode || gate.deferred.is_empty() {
+            return gate;
+        }
+        let mut admitted = BTreeSet::new();
+        let mut folders = BTreeSet::new();
+        for key in index.files.keys() {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            admitted.insert(member.root.to_owned());
+            if member.subagent_stem.is_none()
+                && index
+                    .claude_money_birth_store
+                    .money_marks(claude_money_birth_store::location_key(key))
+                    & claude_request_money::e2::money_mark::DISCLOSED
+                    != 0
+            {
+                let Some(folder) = Path::new(key).parent() else {
+                    continue;
+                };
+                folders.insert(folder);
+                if !index.claude_account_deferred_holds.contains_key(key) {
+                    gate.copies
+                        .entry(folder.to_owned())
+                        .or_default()
+                        .push(PathBuf::from(key));
+                }
+            }
+        }
+        for candidate in &walk.pending_candidates {
+            let Some(member) = claude_index_path_member_ref(&candidate.path) else {
+                continue;
+            };
+            let deferred = gate.deferred.contains(&candidate.path);
+            let by_folder = member.subagent_stem.is_none()
+                && candidate
+                    .path
+                    .parent()
+                    .is_some_and(|folder| folders.contains(folder));
+            if deferred && by_folder {
+                gate.by_folder.insert(candidate.path.clone());
+            }
+            if !deferred || by_folder {
+                admitted.insert(member.root.to_owned());
+            }
+        }
+        (gate.pulled, gate.deferred) =
+            std::mem::take(&mut gate.deferred)
+                .into_iter()
+                .partition(|path| {
+                    claude_index_path_member_ref(path)
+                        .is_some_and(|member| admitted.contains(member.root))
+                });
+        gate
+    }
+
+    pub(in crate::snapshots) fn defers(&self, path: &Path) -> bool {
+        self.deferred.contains(path)
+    }
+
+    /// The copies that pulled a `selected` main, to re-read on its page.
+    pub(in crate::snapshots) fn copies_of_pulled<'a>(
+        &self,
+        selected: impl Iterator<Item = &'a Path>,
+    ) -> BTreeSet<PathBuf> {
+        selected
+            .filter(|path| self.by_folder.contains(*path))
+            .filter_map(|path| self.copies.get(path.parent()?))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Older `selected` paths by family pull and by folder pull (report only).
+    pub(in crate::snapshots) fn selected_pulls<'a>(
+        &self,
+        selected: impl Iterator<Item = &'a Path>,
+    ) -> (u64, u64) {
+        selected.filter(|path| self.pulled.contains(*path)).fold(
+            (0, 0),
+            |(family, folder), path| {
+                if self.by_folder.contains(path) {
+                    (family, folder + 1)
+                } else {
+                    (family + 1, folder)
+                }
+            },
+        )
+    }
 }
 
 pub(in crate::snapshots) fn opened_candidate_is_within_frozen_window(

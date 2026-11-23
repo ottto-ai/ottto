@@ -346,3 +346,129 @@ fn incomplete_stored_state_never_refolds() {
     let (load, _) = loaded(&route, &path, &local_index_key(&path));
     assert!(matches!(load, Load::Cold(None)));
 }
+
+/// A same-size touch: the mtime moves, no byte is written.
+fn touch_same_size(path: &Path) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified + std::time::Duration::from_secs(2))
+        .unwrap();
+}
+
+/// A committed file under `hold`, then touched at its size, read for
+/// `reason` with and without write generation counts. Every read sends a
+/// fresh native read's wire bodies byte for byte (what a build without counts
+/// sends for the touch), and leaves the withheld-account holds and copy
+/// removals as `hold` set them; returns whether each continued from stored
+/// state, without counts first.
+fn touched_under_hold(
+    hold: impl Fn(&mut Route, &Path, &str),
+    reason: Option<CandidateParseReason>,
+) -> [bool; 2] {
+    use crate::transcript_acquisition::{Generations, UseGenerations};
+    [Generations::Off, Generations::Simulated].map(|generations| {
+        let _counts = UseGenerations::new(generations);
+        let mut route = route();
+        let (path, key) = committed(&mut route, "a.jsonl", 3);
+        hold(&mut route, &path, &key);
+        let holds = |index: &ScanIndex| {
+            format!(
+                "{:?} {:?}",
+                index.claude_account_deferred_holds, index.claude_copy_removals
+            )
+        };
+        let held = holds(&route.index);
+        touch_same_size(&path);
+        let native = wire(&fresh(&route, &path));
+        if !reuses_stored(&route.index, &key, reason, false, false) {
+            return false;
+        }
+        let continued = match loaded(&route, &path, &key).0 {
+            Load::Reused(..) => {
+                let (items, native_bytes) = stored_finish(&route, &path, &key);
+                assert_eq!(native_bytes, 0, "{generations:?}");
+                assert_eq!(wire(&items), native, "{generations:?}");
+                true
+            }
+            Load::Cold(_) => false,
+            Load::Held => panic!("{generations:?}: a touch never holds"),
+        };
+        assert_eq!(holds(&route.index), held, "{generations:?}: the hold stays");
+        continued
+    })
+}
+
+/// [money] A session that owes a head-CAS answer, touched: the load refuses
+/// before any count is compared, so the file reads a native Full (counted
+/// under `head_conflict`) with counts as without.
+#[test]
+fn a_touched_conflict_owed_session_reads_native_full_with_counts() {
+    let continued = touched_under_hold(
+        |route, path, _| {
+            let session = cold_accumulator(route, path)
+                .wire_source_session_id(path)
+                .unwrap();
+            route.index.activate_head_conflict_sessions(
+                [crate::snapshot_sync::cache_session_key(&session)].into(),
+            );
+        },
+        Some(CandidateParseReason::TranscriptChanged),
+    );
+    assert_eq!(continued, [false, false]);
+}
+
+/// [money] A withheld account key, touched: the hold stays, and the read
+/// sends the native body byte for byte; the count only lets it continue from
+/// stored state instead of a Full.
+#[test]
+fn a_touched_withheld_account_key_sends_the_native_body() {
+    let continued = touched_under_hold(
+        |route, _, key| {
+            route
+                .index
+                .claude_account_deferred_holds
+                .insert(key.to_owned(), "synthetic-account".to_owned());
+        },
+        Some(CandidateParseReason::TranscriptChanged),
+    );
+    assert_eq!(continued, [false, true]);
+}
+
+/// [money] A terminal disposition selection of a touched file at its size
+/// never loads stored state: a native Full with counts as without.
+#[test]
+fn a_touched_terminal_disposition_reads_native_full_with_counts() {
+    let continued = touched_under_hold(
+        |_, _, _| {},
+        Some(CandidateParseReason::TerminalDisposition),
+    );
+    assert_eq!(continued, [false, false]);
+}
+
+/// [money] A copy whose removal is pending, touched: it stays pending and its
+/// selection (`SourceChanged`, as the scan selects a pending copy) sends the
+/// native body byte for byte; the count only lets it continue from stored
+/// state instead of a Full.
+#[test]
+fn a_touched_copy_with_a_pending_removal_sends_the_native_body() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let continued = touched_under_hold(
+        |route, _, key| {
+            let removals = &mut route.index.claude_copy_removals;
+            removals.store(
+                location_key(key),
+                std::collections::BTreeMap::from([(
+                    location_key("synthetic-holder"),
+                    std::collections::BTreeSet::from([7]),
+                )]),
+            );
+            removals.mark(location_key(key));
+            assert!(removals.pending(location_key(key)));
+        },
+        Some(CandidateParseReason::SourceChanged),
+    );
+    assert_eq!(continued, [false, true]);
+}

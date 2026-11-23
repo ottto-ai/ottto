@@ -54,6 +54,7 @@ impl SnapshotAccumulator {
             codex_creator_evidence_conflicted: false,
             claude_desktop_identity: None,
             claude_desktop_spawn_lineage: None,
+            claude_desktop_scheduled_task: false,
             claude_owned_session_id_observed: false,
             claude_owned_session_id_conflicted: false,
             codex_ownership_boundary: CodexOwnershipBoundary::Undetermined,

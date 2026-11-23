@@ -278,6 +278,18 @@ hours, and reprocesses only files whose size or modification time changed.
 Missing or ambiguous evidence produces no attribution label; it is never
 reclassified as human activity.
 
+From the Claude desktop app's per-session store, the daemon reads two launch
+markers. The first is whether another agent opened the session (`spawnedFrom`
+with `sideSession: true`). That session gets the starting session's transcript
+id as its parent. A task an agent suggested and the person clicked has no
+`sideSession`, and it gets no parent or agent launch fact. The second is
+whether the app ran the session as one of its own scheduled tasks
+(`scheduledTaskId`). Only the fact that it was a scheduled task is uploaded,
+never the task id. A Codex thread that Codex marks `agent_created_thread`
+is stated as an agent launch, with no parent unless the delegation wrapper
+below supplies one. This applies to such threads read after the update; an
+ended thread uploaded before it keeps what it uploaded.
+
 Job grouping also uses a tenant-keyed HMAC of the masked first qualifying human
 task, separately from its display title. Only the opaque identifier is uploaded;
 the masked words are temporary local memory. The server issues the tenant key and
@@ -331,7 +343,9 @@ second precision, a name that does not match the references it claims, a session
 that names itself, or a launcher family Ottto does not recognize. No prompt,
 path, command line, environment value, or free text can pass those checks, and
 nothing is read from any other source to complete a partial event. Accepted
-files move to `~/.ottto/launch-events/processed/` and expire after thirty days;
+files move to `~/.ottto/launch-events/processed/`, named for the worker session
+they describe so a lookup opens only the files of the sessions it needs, and
+expire after thirty days;
 rejected files move to `~/.ottto/launch-events/rejected/` and expire after seven
 days, with the local log line naming only a reason code and never the file's
 contents. Two events naming the same session with different controllers produce

@@ -151,7 +151,14 @@ assert_contains "$formula" 'brew services start ottto'
 assert_contains "$formula" 'brew update && brew upgrade ottto'
 assert_contains "$formula" 'brew services restart ottto'
 assert_contains "$formula" 'brew services stop ottto'
-assert_contains "$formula" 'app connects to the Homebrew-owned service instead of replacing it'
+# [behaviour] One Ottto per Mac and the app wins: the notes never invite
+# running the formula's service next to the app. The service stays
+# keep_alive: a copy that hands over waits instead of exiting.
+assert_contains "$formula" 'keep_alive true'
+assert_contains "$formula" 'One Ottto per Mac, and the app wins.'
+assert_contains "$formula" 'uninstall the app'
+assert_not_contains "$formula" 'leave service lifecycle with Homebrew'
+assert_not_contains "$formula" 'app connects to the Homebrew-owned service'
 assert_not_contains "$formula" '/latest/ottto-macos-arm64.zip'
 
 if command -v ruby >/dev/null 2>&1; then

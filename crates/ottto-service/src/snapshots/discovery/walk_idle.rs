@@ -98,8 +98,11 @@ impl Pass {
         )
         .as_bytes());
         if source == SnapshotSource::ClaudeCode {
-            let rows = crate::local_resource_diagnostics::cache_lifecycle::otlp_appended_rows();
-            add(format!("{}:{rows}", claude_reemission_stop_latched()).as_bytes());
+            // Arrivals, and the drains that make them readable: a row that
+            // arrives after the scan-start drain changes the next pass too.
+            let (rows, drained) =
+                crate::local_resource_diagnostics::cache_lifecycle::otlp_relay_rows();
+            add(format!("{}:{rows}:{drained}", claude_reemission_stop_latched()).as_bytes());
         }
         for dir in crate::launch_events::inbox_dirs(home) {
             let modified = std::fs::metadata(dir).and_then(|meta| meta.modified());

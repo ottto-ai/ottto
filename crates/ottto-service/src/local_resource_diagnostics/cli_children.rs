@@ -5,15 +5,19 @@ use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-const ARGV: [&str; 5] = [
+const ARGV: [&str; 9] = [
     "codex login status",
     "codex models",
     "claude version",
     "other codex",
+    "security",
+    "launchctl",
+    "pi",
+    "git",
     "other",
 ];
-super::process_static!(fn with_totals: [[AtomicU64; 5]; 2] =
-    [const { [const { AtomicU64::new(0) }; 5] }; 2]);
+super::process_static!(fn with_totals: [[AtomicU64; 9]; 2] =
+    [const { [const { AtomicU64::new(0) }; 9] }; 2]);
 
 #[derive(Debug, Serialize)]
 pub(super) struct Counts {
@@ -64,18 +68,28 @@ impl DerefMut for MeasuredChild {
     }
 }
 
-pub(crate) fn spawn(command: &mut Command) -> io::Result<MeasuredChild> {
+/// The fixed class of a command, by its program's file name and a few
+/// argument words; nothing about the command is kept.
+fn class(command: &Command) -> usize {
     let binary = std::path::Path::new(command.get_program())
         .file_name()
         .and_then(|s| s.to_str());
     let has = |value: &str| command.get_args().any(|arg| arg == value);
-    let class = match binary {
+    match binary {
         Some("codex") if has("login") && has("status") => 0,
         Some("codex") if has("debug") && has("models") && has("--bundled") => 1,
         Some("claude") if has("--version") => 2,
         Some("codex") => 3,
-        _ => 4,
-    };
+        Some("security") => 4,
+        Some("launchctl") => 5,
+        Some("pi") => 6,
+        Some("git") => 7,
+        _ => 8,
+    }
+}
+
+pub(crate) fn spawn(command: &mut Command) -> io::Result<MeasuredChild> {
+    let class = class(command);
     let inner = command.spawn()?;
     with_totals(|totals| totals[0][class].fetch_add(1, Relaxed));
     Ok(MeasuredChild {
@@ -163,5 +177,41 @@ impl MeasuredChild {
             };
             Ok(self.status)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind(program: &str, args: &[&str]) -> &'static str {
+        let mut command = Command::new(program);
+        command.args(args);
+        ARGV[class(&command)]
+    }
+
+    /// [behaviour] Children are counted by fixed class: the codex and claude
+    /// classes as before, then security, launchctl, pi and git by program
+    /// file name, and anything else as other.
+    #[test]
+    fn children_are_counted_by_fixed_class() {
+        assert_eq!(kind("/x/codex", &["login", "status"]), "codex login status");
+        assert_eq!(
+            kind("codex", &["debug", "models", "--bundled"]),
+            "codex models"
+        );
+        assert_eq!(kind("/x/claude", &["--version"]), "claude version");
+        assert_eq!(kind("codex", &["app-server"]), "other codex");
+        assert_eq!(
+            kind("/usr/bin/security", &["find-generic-password"]),
+            "security"
+        );
+        assert_eq!(kind("launchctl", &["print", "gui/501/x"]), "launchctl");
+        assert_eq!(kind("/bin/launchctl", &["print"]), "launchctl");
+        assert_eq!(kind("/x/pi", &["--version"]), "pi");
+        assert_eq!(kind("git", &["rev-parse"]), "git");
+        assert_eq!(kind("/bin/sh", &["-c", "git"]), "other");
+        assert_eq!(kind("claude", &["-p"]), "other");
+        assert_eq!(kind("/x/codex-helper", &[]), "other");
     }
 }

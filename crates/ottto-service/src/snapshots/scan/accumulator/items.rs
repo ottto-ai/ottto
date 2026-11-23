@@ -265,6 +265,21 @@ impl SnapshotAccumulator {
             });
             attribution_facts.extend(spawn_facts);
         }
+        // A session the Claude desktop app ran as one of its own scheduled
+        // tasks. Provider-owned, so it never overwrites a field already filled.
+        if self.claude_desktop_scheduled_task {
+            let mut scheduled_facts =
+                crate::session_attribution::claude_desktop_scheduled_task_facts(
+                    &source_session_id,
+                    collected_at,
+                );
+            scheduled_facts.retain(|scheduled_fact| {
+                !attribution_facts
+                    .iter()
+                    .any(|fact| fact.field == scheduled_fact.field)
+            });
+            attribution_facts.extend(scheduled_facts);
+        }
         // The controller edge an instrumented launcher stated at spawn time.
         // Same position and same reason as the subagent identity above: it is
         // exact lineage, so it has to outrank the derived grouping ids when the
@@ -284,25 +299,28 @@ impl SnapshotAccumulator {
             attribution_facts.extend(launch_facts);
         }
         if let Some(context) = attribution_context {
-            attribution_facts.extend(
-                context.grouping_facts(
-                    crate::session_attribution::SessionAttributionGroupingInput {
-                        source: self.source,
-                        origin: Some(&self.origin),
-                        source_session_id: &source_session_id,
-                        observed_at: collected_at,
-                        source_version: self.source.parser_version(),
-                        first_prompt: self.first_prompt_material.as_deref(),
-                        provider_skills: &self.provider_skills,
-                        activity_skills: &self.activity_skills,
-                        repository_hash: repository_identity
-                            .as_ref()
-                            .and_then(|identity| identity.repository_hash.as_deref()),
-                        source_started_at: self.started_at.as_deref(),
-                        transcript_path: path,
-                    },
-                ),
+            let mut grouping_facts = context.grouping_facts(
+                crate::session_attribution::SessionAttributionGroupingInput {
+                    source: self.source,
+                    origin: Some(&self.origin),
+                    source_session_id: &source_session_id,
+                    observed_at: collected_at,
+                    source_version: self.source.parser_version(),
+                    first_prompt: self.first_prompt_material.as_deref(),
+                    provider_skills: &self.provider_skills,
+                    activity_skills: &self.activity_skills,
+                    repository_hash: repository_identity
+                        .as_ref()
+                        .and_then(|identity| identity.repository_hash.as_deref()),
+                    source_started_at: self.started_at.as_deref(),
+                    transcript_path: path,
+                },
             );
+            crate::session_attribution::drop_superseded_scheduler_match(
+                &attribution_facts,
+                &mut grouping_facts,
+            );
+            attribution_facts.extend(grouping_facts);
             if let Some(fact) =
                 context.job_fact(self.job_template.as_ref(), &source_session_id, collected_at)
             {

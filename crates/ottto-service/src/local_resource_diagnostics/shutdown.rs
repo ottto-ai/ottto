@@ -69,6 +69,8 @@ pub(super) fn install() {
 /// No allocation and no locks: one `write(2)` of a stack buffer, then the
 /// default SIGTERM action.
 extern "C" fn on_sigterm(_: libc::c_int) {
+    // One atomic store: status requests stop reusing the launchd probe.
+    crate::macos_service::begin_status_launchd_probe_shutdown();
     let line = line();
     let mut buffer = [0u8; LINE_BUFFER];
     let mut len = 0;

@@ -71,29 +71,6 @@ mod tests {
     const TOKEN: &str = "local_control_token";
 
     #[test]
-    fn claude_verification_auth_marker_keeps_last_known_on_unavailable_read() {
-        let daemon = daemon();
-        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
-        daemon
-            .remember_claude_verification_auth_marker(None)
-            .unwrap();
-        assert_eq!(
-            daemon.claude_verification_auth_marker().unwrap(),
-            Some(None)
-        );
-        daemon
-            .remember_claude_verification_auth_marker(Some("known".into()))
-            .unwrap();
-        daemon
-            .remember_claude_verification_auth_marker(None)
-            .unwrap();
-        assert_eq!(
-            daemon.claude_verification_auth_marker().unwrap(),
-            Some(Some("known".into()))
-        );
-    }
-
-    #[test]
     fn doctor_connection_binding_finding_requires_reconnect_and_clears_after_repair() {
         if !crate::test_isolation::run_here() {
             return;
@@ -2089,6 +2066,78 @@ mod tests {
         assert_eq!(source.authority, LocalHealthAuthority::Runtime);
     }
 
+    /// A failed check stays failed through status passes, and clears
+    /// once this Mac has an upload for that app accepted after the failure.
+    #[test]
+    fn accepted_upload_after_a_failed_check_clears_it() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: None,
+            message: StableMessage {
+                code: "smoke_command_failed".to_string(),
+                text: "Codex check failed.".to_string(),
+            },
+            route_results: Vec::new(),
+            check: None,
+        };
+        daemon
+            .record_verification_result(&result)
+            .expect("record failed verification");
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: time::Duration| (now + offset).format(&Rfc3339).unwrap();
+        let pass = |captured_at: &str| {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, captured_at),
+            );
+        };
+
+        // No upload, or one accepted before the failure: still failed.
+        pass(&at(time::Duration::minutes(5)));
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::Failed
+        );
+        crate::upload_receipts::note_accepted_upload_for_test(
+            SourceKind::Codex,
+            &at(-time::Duration::hours(1)),
+        );
+        crate::upload_receipts::note_accepted_upload_for_test(
+            SourceKind::ClaudeCode,
+            &at(time::Duration::hours(1)),
+        );
+        pass(&at(time::Duration::minutes(10)));
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::Failed
+        );
+
+        // Codex usage accepted after the failure clears it.
+        crate::upload_receipts::note_accepted_upload_for_test(
+            SourceKind::Codex,
+            &at(time::Duration::hours(1)),
+        );
+        pass(&at(time::Duration::minutes(15)));
+        let status = daemon.status(TOKEN).unwrap();
+        assert_ne!(status.sources[0].state, SourceState::Failed);
+        assert!(status.sources[0].problems.iter().all(|problem| {
+            problem.code != ottto_protocol::StableProblemCode::TelemetryNotVerified
+        }));
+    }
+
     #[test]
     fn available_agent_status_preserves_admin_disabled_verification_policy() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
@@ -2270,10 +2319,6 @@ mod tests {
             .local_health_events
             .iter()
             .all(|event| !matches!(event.event_type.as_str(), "VerifyPassed" | "VerifyFailed")));
-        assert!(daemon
-            .sources_with_blocking_verification_failure()
-            .unwrap()
-            .is_empty());
         result.config.drift.push(ottto_protocol::ConfigDrift {
             key: "codex.config_toml".into(),
             expected: RedactedValue::String("valid".into()),
@@ -3556,13 +3601,17 @@ mod tests {
     }
 
     fn paused_usage_checks_status(paused: bool) -> DaemonStatus {
+        paused_usage_checks_status_for(usize::from(paused))
+    }
+
+    fn paused_usage_checks_status_for(accounts: usize) -> DaemonStatus {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut snapshot = available_agent_status(SourceKind::ClaudeCode, "2026-10-03T06:46:07Z");
-        if paused {
+        for _ in 0..accounts {
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                 agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
                 AgentDiagnosticSeverity::Warning,
-                "Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z. Last readings stay shown until then.",
+                "Claude usage checks paused for this account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z. Last readings stay shown until then.",
             ));
         }
         {
@@ -3584,7 +3633,7 @@ mod tests {
         assert_eq!(problem.title, "Claude usage checks paused");
         assert!(problem
             .detail
-            .starts_with("Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z."));
+            .starts_with("Claude usage checks paused for this account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z."));
         assert!(!problem.retryable);
         assert!(source.recommended_actions.is_empty());
         // Existing problem code on the wire, so strict older decoders keep working.
@@ -3604,6 +3653,19 @@ mod tests {
         let healthy_canonical = healthy.canonical_health.as_ref().expect("canonical");
         assert_eq!(canonical.overall.state, healthy_canonical.overall.state);
         assert_eq!(canonical.blockers.len(), healthy_canonical.blockers.len());
+    }
+
+    /// [behaviour] One paused-usage diagnostic per account still makes one
+    /// source problem; with several accounts it counts them.
+    #[test]
+    fn paused_usage_checks_for_two_accounts_make_one_counted_problem() {
+        let status = paused_usage_checks_status_for(2);
+        let problems = &status.sources[0].problems;
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            problems[0].detail,
+            "Claude usage checks paused for 2 accounts; Ottto checks each again automatically. Last readings stay shown until then."
+        );
     }
 
     #[test]

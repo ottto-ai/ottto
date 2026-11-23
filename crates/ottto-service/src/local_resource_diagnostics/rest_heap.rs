@@ -20,12 +20,15 @@ pub(super) struct RestHeap {
     claude_token_owners: usize,
     claude_spawn_admitted: Option<usize>,
     repository_identities: Option<usize>,
+    otlp_relay_journal_kept_rows: Option<u64>,
+    otlp_relay_journal_kept_bytes: Option<u64>,
 }
 
 pub(super) fn collect() -> RestHeap {
     let (rearm_clear_tags, rearm_open_pages) = super::rearm_cause::rest_entries();
     let poison = crate::snapshot_sync::counted_poison_entries();
     let notices = crate::claude_local_otel::telemetry_notices::rest_entries();
+    let kept = crate::claude_local_otel::relay_journal_kept();
     // SAFETY: SQLite documents both as thread-safe reads of its global
     // memory counters; passing 0 leaves the high-water mark unchanged.
     let (used, highwater) = unsafe {
@@ -49,6 +52,8 @@ pub(super) fn collect() -> RestHeap {
         claude_token_owners: crate::agent_status::token_owner_entries(),
         claude_spawn_admitted: spawn_admitted(),
         repository_identities: crate::snapshots::repository_identity_entries(),
+        otlp_relay_journal_kept_rows: kept.map(|(rows, _)| rows),
+        otlp_relay_journal_kept_bytes: kept.map(|(_, bytes)| bytes),
     }
 }
 
@@ -78,7 +83,7 @@ mod tests {
         assert_eq!(first.claude_token_owners, second.claude_token_owners);
         let row = serde_json::to_value(&first).unwrap();
         let fields = row.as_object().unwrap();
-        assert_eq!(fields.len(), 14);
+        assert_eq!(fields.len(), 16);
         assert!(fields.values().all(|v| v.is_null() || v.is_u64()));
         assert!(fields.contains_key("sqlite_memory_used_bytes"));
         assert!(fields.contains_key("repository_identities"));

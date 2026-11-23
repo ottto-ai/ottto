@@ -92,6 +92,16 @@ fn enclosing_app_bundle(exe: &Path) -> Option<PathBuf> {
     is_layout.then(|| bundle.to_path_buf())
 }
 
+/// The version of the Ottto app bundle at `bundle`, or `None` when it is not
+/// an Ottto bundle with a valid version.
+#[cfg(target_os = "macos")]
+pub(crate) fn companion_bundle_version(bundle: &Path) -> Option<String> {
+    match bundle_evidence(bundle) {
+        BundleEvidence::Version(version) => Some(version),
+        _ => None,
+    }
+}
+
 fn bundle_evidence(bundle: &Path) -> BundleEvidence {
     if !bundle.is_dir() {
         return BundleEvidence::Absent;

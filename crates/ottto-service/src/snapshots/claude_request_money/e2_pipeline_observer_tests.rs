@@ -218,3 +218,32 @@ pub(crate) fn released_subagent_copies(items: &mut [SnapshotItem]) {
         }
     }
 }
+
+/// Each indexed file still on disk: its durable copy ownership (stored
+/// removal groups by holder, money marks, effective birth cutoff) and its
+/// upload eligibility (accepted body not held), for comparing two reads of
+/// one corpus.
+pub(crate) fn durable_ownership(index: &ScanIndex) -> BTreeMap<String, String> {
+    index
+        .files
+        .keys()
+        .filter(|key| Path::new(key.as_str()).is_file())
+        .map(|key| {
+            let location = location_key(key);
+            let cutoff = claude_index_path_member_ref(Path::new(key)).and_then(|member| {
+                index
+                    .claude_money_birth_store
+                    .effective_cutoff(member.root, key)
+            });
+            (
+                key.clone(),
+                format!(
+                    "groups={:?} marks={} cutoff={cutoff:?} eligible={}",
+                    index.claude_copy_removals.get(location),
+                    index.claude_money_birth_store.money_marks(location),
+                    index.file_has_accepted_body_unheld(key),
+                ),
+            )
+        })
+        .collect()
+}

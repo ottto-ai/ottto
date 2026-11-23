@@ -9035,13 +9035,12 @@ fn launcher_event_binds_a_worker_transcript_to_its_controller_session() {
     );
     crate::session_attribution::validate_fact_limits(&item.attribution_facts)
         .expect("launch facts stay inside the wire contract");
-    // The event file left `pending/` and stays joinable for the next scan of
-    // the same worker.
+    // The event file left `pending/`, filed under its worker, and stays
+    // joinable for the next scan of the same worker.
     assert!(!pending.join(format!("{digest}.json")).exists());
-    assert!(home
-        .join(".ottto/launch-events/processed")
-        .join(format!("{digest}.json"))
-        .exists());
+    let processed = home.join(".ottto/launch-events/processed");
+    assert!(processed.join(format!("{worker}.{digest}.json")).exists());
+    assert!(!processed.join(format!("{digest}.json")).exists());
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -13351,6 +13350,7 @@ fn desktop_spawn_entry_raw(
         desktop_session_id: Some(desktop.to_string()),
         spawned_from_desktop_session_id: spawned_from.map(str::to_string),
         spawned_from_unresolved: false,
+        scheduled_task: false,
     }
 }
 
@@ -13612,6 +13612,140 @@ fn claude_desktop_spawned_session_emits_starting_session_lineage() {
     fs::remove_dir_all(home).expect("remove fixture");
 }
 
+/// [behaviour] Who started a desktop session: a task an agent suggested and
+/// the person clicked (`spawnedFrom` without `sideSession`) carries no
+/// lineage, the app's own scheduled task states `provider_scheduled_task`,
+/// and a Remote Control session driven from the phone (`promptSource: sdk`,
+/// `clientPlatform: ios`) states only its desktop surface, never a headless
+/// mode or an origin.
+#[test]
+fn claude_desktop_click_scheduled_task_and_remote_control_state_who_started_them() {
+    let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
+    let clicked = "da1dc804-1c50-4401-8c3c-0898b126772f";
+    let clicked_false = "0b5c9f3e-6d3a-4e8b-9a52-2f0c8d4b7e11";
+    let scheduled = "5f2a7c10-8e4b-4f6d-b3a9-1c2d3e4f5a6b";
+    let remote = "05578284-3c1d-4e7a-9b2f-6a8d0e4c1f35";
+    let remote_transcript = |session_id: &str| {
+        format!(
+            "{{\"type\":\"user\",\"timestamp\":\"2026-11-23T08:18:00Z\",\"sessionId\":\"{session_id}\",\"entrypoint\":\"claude-desktop\",\"turnOrigin\":\"human\",\"origin\":{{\"kind\":\"human\"}},\"promptSource\":\"sdk\",\"clientPlatform\":\"ios\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n{}",
+            claude_desktop_spawn_test_transcript(session_id)
+        )
+    };
+    let (home, clicked_path, projects_root) = claude_desktop_fixture(
+        "claude-desktop-who-started",
+        clicked,
+        &format!(
+            "{{\"sessionId\":\"local_clicked\",\"cliSessionId\":\"{clicked}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"taskId\":\"task_1\"}}}}"
+        ),
+        &remote_transcript(clicked),
+    );
+    let store_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("claude-code-sessions")
+        .join("account-ctx")
+        .join("workspace");
+    let project = clicked_path.parent().expect("project dir").to_path_buf();
+    for (file, record, session, transcript) in [
+        (
+            "local_desktop-0.json",
+            format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
+            parent,
+            claude_desktop_spawn_test_transcript(parent),
+        ),
+        (
+            "local_desktop-2.json",
+            format!("{{\"sessionId\":\"local_clicked_false\",\"cliSessionId\":\"{clicked_false}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"sideSession\":false}}}}"),
+            clicked_false,
+            claude_desktop_spawn_test_transcript(clicked_false),
+        ),
+        (
+            "local_desktop-3.json",
+            format!("{{\"sessionId\":\"local_scheduled\",\"cliSessionId\":\"{scheduled}\",\"scheduledTaskId\":\"daily-review\",\"spawnedFrom\":null}}"),
+            scheduled,
+            claude_desktop_spawn_test_transcript(scheduled),
+        ),
+        (
+            "local_desktop-4.json",
+            format!("{{\"sessionId\":\"local_remote\",\"cliSessionId\":\"{remote}\",\"steeredByRemoteClient\":true,\"spawnedFrom\":null}}"),
+            remote,
+            remote_transcript(remote),
+        ),
+    ] {
+        fs::write(store_dir.join(file), record).expect("write store file");
+        fs::write(project.join(format!("{session}.jsonl")), transcript)
+            .expect("write transcript");
+    }
+    let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+    assert!(
+        metadata.spawn_lineage.is_empty(),
+        "no agent opened any of them"
+    );
+    assert!(metadata.scheduled_task(scheduled));
+    for session in [parent, clicked, clicked_false, remote] {
+        assert!(!metadata.scheduled_task(session), "{session}");
+    }
+    let facts = |session: &str| -> BTreeMap<String, (String, String, String)> {
+        parse_claude_code_jsonl_file_with_title_metadata(
+            &project.join(format!("{session}.jsonl")),
+            "2026-11-23T08:20:00Z",
+            "fp".to_string(),
+            &metadata,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot")
+        .attribution_facts
+        .into_iter()
+        .map(|fact| {
+            (
+                fact.field,
+                (fact.value, fact.evidence.kind, fact.evidence.source_version),
+            )
+        })
+        .collect()
+    };
+    // Clicked tasks and the Remote Control session: the desktop surface only,
+    // so the backend reads them as started by the person.
+    for session in [clicked, clicked_false, remote] {
+        let facts = facts(session);
+        for field in [
+            "parent_session_ref",
+            "origin_kind",
+            "agent_kind",
+            "execution_mode",
+        ] {
+            assert!(!facts.contains_key(field), "{session} {field}: {facts:?}");
+        }
+        assert_eq!(facts["provider_surface"].0, "claude_desktop");
+    }
+    let scheduled_facts = facts(scheduled);
+    assert_eq!(
+        scheduled_facts["origin_kind"],
+        (
+            "provider_scheduled_task".to_string(),
+            "provider_artifact".to_string(),
+            "claude_desktop_task:v1".to_string()
+        )
+    );
+    assert!(!scheduled_facts.contains_key("parent_session_ref"));
+    assert!(!scheduled_facts.contains_key("execution_mode"));
+    // Only the scheduled session's sidecar fingerprint carries the marker.
+    let mut unmarked = metadata.clone();
+    unmarked.scheduled_tasks.clear();
+    assert_ne!(
+        metadata.session_sidecar_fingerprint(scheduled),
+        unmarked.session_sidecar_fingerprint(scheduled)
+    );
+    assert_eq!(
+        metadata.session_sidecar_fingerprint(remote),
+        unmarked.session_sidecar_fingerprint(remote)
+    );
+    fs::remove_dir_all(home).expect("remove fixture");
+}
+
 #[test]
 fn claude_desktop_spawned_session_with_a_path_cli_session_id_emits_no_lineage() {
     let parent = "94bd328b-f2a9-4c31-bbfe-e174d41b4310";
@@ -13620,27 +13754,27 @@ fn claude_desktop_spawned_session_with_a_path_cli_session_id_emits_no_lineage() 
     // are identities: a path or a whitespace-padded id never links.
     let cases = [
         (
-            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"sideSession\":true}}}}"),
             format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
             true,
         ),
         (
-            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"sideSession\":true}}}}"),
             "{\"sessionId\":\"local_parent\",\"cliSessionId\":\"/Users/example/project\",\"spawnedFrom\":null}".to_string(),
             false,
         ),
         (
-            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"sideSession\":true}}}}"),
             format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\" {parent} \",\"spawnedFrom\":null}}"),
             false,
         ),
         (
-            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\" local_parent \"}}}}"),
+            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\"{child}\",\"spawnedFrom\":{{\"sessionId\":\" local_parent \",\"sideSession\":true}}}}"),
             format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
             false,
         ),
         (
-            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\" {child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\"}}}}"),
+            format!("{{\"sessionId\":\"local_b804dc1e\",\"cliSessionId\":\" {child}\",\"spawnedFrom\":{{\"sessionId\":\"local_parent\",\"sideSession\":true}}}}"),
             format!("{{\"sessionId\":\"local_parent\",\"cliSessionId\":\"{parent}\",\"spawnedFrom\":null}}"),
             false,
         ),

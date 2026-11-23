@@ -322,6 +322,7 @@ impl OracleServer {
                             }
                             Answer::Refuse(reason) => {
                                 reference["reason"] = reason.into();
+                                reference["detail"] = "synthetic refusal".into();
                                 reference["permanent"] = true.into();
                                 reply["rejected_entities"]
                                     .as_array_mut()
@@ -4649,12 +4650,28 @@ mod money_equivalence_tests {
             .collect::<Vec<_>>();
         let effects: Value =
             serde_json::from_slice(&test_effects::canonical(&cycle.effects)).unwrap();
+        let finish_error = cycle.finish.as_ref().err().map(|error| {
+            use crate::snapshot_sync::upload::{
+                is_shed_failure, is_upload_outage, snapshot_upload_error_class,
+                SnapshotEntityDeferred, SnapshotUploadErrorClass,
+            };
+            match snapshot_upload_error_class(error) {
+                Some(SnapshotUploadErrorClass::LocalState) => "local_state",
+                Some(SnapshotUploadErrorClass::BackendResponse) => "backend_response",
+                None if error.is::<SnapshotEntityDeferred>() => "entity_deferred",
+                None if error.is::<crate::source_rotation::LocalRefusal>() => "local_refusal",
+                None if error.is::<std::io::Error>() => "local_io",
+                None if is_shed_failure(error) => "shed",
+                None if is_upload_outage(error) => "upload_outage",
+                None => "other",
+            }
+        });
         let receipt = json!({"row":row,"cycle":number,"source":source.api_slug(),
             "steps":cycle.steps,"gate_c":cycle.gate,"finalized":finalized,"posts":normalized_posts,
             "effects":effects,"saved":{"generation":cycle.index.generation,
                 "fingerprints":cycle.index.current_snapshot_fingerprints(),
                 "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
-            "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed,
+            "finish_ok":cycle.finish.is_ok(),"finish_error":finish_error,"parser_bytes":cycle.consumed,
             "io":{"cheap_checks":cycle.io.cheap_checks,"anchor_reads":cycle.io.anchor_reads,
                 "other_reads":cycle.io.other_reads,"parse_activity":cycle.io.parse_activity,
                 "quiet_anchor_window":cycle.quiet_anchor_window},
@@ -4893,4 +4910,341 @@ mod walk_gate_oracle_tests {
 // Every way one finish can end, on the scripted and oracle fixtures above.
 mod finish_outcome_tests {
     include!("finish_outcome_tests.rs");
+}
+
+/// One line for a tier row's failure: the backfill state, the saved queue
+/// and held retries, and the cycle's finalized tokens.
+fn tier_trace(home: &OracleHome, cycle: &Cycle) -> String {
+    let state = crate::backfill::load_backfill_state(&home.support);
+    let index = serde_json::to_value(&cycle.index).unwrap();
+    let tokens = cycle
+        .finalized
+        .iter()
+        .map(|item| item.input_tokens)
+        .collect::<Vec<_>>();
+    format!(
+        "tiers={:?} anchors={:?} completed={:?} traversal={} retries={} finalized={tokens:?} \
+         debt={} batches={} statuses_ok={} files={:?}",
+        state.first_read_tiers,
+        state.first_census_ends,
+        state.completed_destination_namespaces,
+        index["traversal"],
+        index["terminal_contract_retries"],
+        cycle.debt,
+        cycle.batches.len(),
+        cycle.finish.is_ok(),
+        index["files"]
+            .as_object()
+            .map(|files| files.keys().cloned().collect::<Vec<_>>()),
+    )
+}
+
+fn pi_session(id: &str, tokens: u64) -> Vec<Value> {
+    vec![
+        json!({"type":"session","id":id,"timestamp":"2026-09-01T07:00:00Z"}),
+        json!({"type":"message","timestamp":"2026-09-01T07:01:00Z","message":{"role":"assistant",
+            "model":"gpt-5","provider":"openai","responseId":format!("{id}-r"),
+            "timestamp":"2026-09-01T07:01:00Z","usage":{"input":tokens,"output":1}}}),
+    ]
+}
+
+/// [money] Recency tiers end to end through the real prepare and finish: a
+/// 45-day-old Pi file waits while the destination walks 1, 3, 7, 14 and 30
+/// days; each advance asks for the next paced pass as a first import, the
+/// advance into the final tier asks at background QoS, and the final tier
+/// reads the old file once. Every terminal status that carries the tier
+/// cutoff carries the first-read cutoff too.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.row = "c30";
+    let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    let old = home.source.default_roots(&home.fixture.home)[0].join("old.jsonl");
+    write_rows_at(&old, &pi_session("oracle-pi-old", 100));
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
+        .unwrap();
+    home.write_rows(&pi_session("oracle-pi-new", 10));
+    super::resource_schedule::with_power("ac", || {
+        let support = home.support.clone();
+        let tier = || {
+            crate::backfill::load_backfill_state(&support)
+                .first_read_tiers
+                .get(&destination)
+                .map(|tier| tier.days)
+        };
+        assert_eq!(tier(), Some(1));
+        let mut walked = Vec::new();
+        let mut tokens = Vec::new();
+        for _ in 0..8 {
+            let before = tier().unwrap();
+            let cycle = home.cycle(&server, &recording);
+            assert!(cycle.finish.is_ok(), "{}", tier_trace(&home, &cycle));
+            let read_old = cycle.finalized.iter().any(|item| item.input_tokens == 100);
+            assert!(
+                !read_old || before == crate::snapshots::FIRST_READ_WINDOW_DAYS,
+                "the old file waits for the final tier: {walked:?} {}",
+                tier_trace(&home, &cycle)
+            );
+            tokens.extend(cycle.finalized.iter().map(|item| item.input_tokens));
+            let first_import =
+                with_source_cadence(SnapshotSource::Pi, |cadence| cadence.paced_first_import());
+            let days = tier().unwrap();
+            if walked.last().map_or(1, |(days, _)| *days) != days {
+                walked.push((days, first_import));
+            }
+            if read_old {
+                break;
+            }
+        }
+        assert_eq!(
+            walked,
+            vec![
+                (3, Some(true)),
+                (7, Some(true)),
+                (14, Some(true)),
+                (30, Some(true)),
+                (crate::snapshots::FIRST_READ_WINDOW_DAYS, Some(false)),
+            ],
+            "each advance asks for a paced pass; the final tier runs at background QoS"
+        );
+        assert_eq!(tokens.iter().filter(|&&n| n == 100).count(), 1);
+        assert_eq!(tokens.iter().filter(|&&n| n == 10).count(), 1);
+    });
+    let statuses = server.statuses.lock().unwrap();
+    assert!(statuses
+        .iter()
+        .any(|status| status.get("tier_ready_cutoff").is_some()));
+    for status in statuses.iter() {
+        assert!(
+            status.get("tier_ready_cutoff").is_none() || status.get("first_read_cutoff").is_some(),
+            "{status}"
+        );
+    }
+}
+
+/// Liveness: a tier-1 file with a permanent refusal, or an unchanged answer
+/// that stores nothing, settles the tier like an accept, so the tier
+/// advances while the older file still waits.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
+    for answer in [
+        Answer::Refuse("invalid"),
+        Answer::Unstored,
+        Answer::Dominated,
+    ] {
+        let recording = Recording::start();
+        let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+        *server.fallback.lock().unwrap() = answer;
+        let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+        home.row = "c31";
+        let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+        let old = home.source.default_roots(&home.fixture.home)[0].join("old.jsonl");
+        write_rows_at(&old, &pi_session("oracle-pi-old", 100));
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 45 * 86_400))
+            .unwrap();
+        home.write_rows(&pi_session("oracle-pi-new", 10));
+        let (mut advanced, mut trace) = (false, String::new());
+        for _ in 0..3 {
+            let cycle = home.cycle(&server, &recording);
+            trace = tier_trace(&home, &cycle);
+            assert!(cycle.finish.is_ok(), "{answer:?}: {trace}");
+            assert!(
+                !cycle.finalized.iter().any(|item| item.input_tokens == 100),
+                "{answer:?}: the old file waits: {trace}"
+            );
+            let state = crate::backfill::load_backfill_state(&home.support);
+            if state.first_read_tiers[&destination].days > 1 {
+                advanced = true;
+                break;
+            }
+        }
+        assert!(
+            advanced,
+            "{answer:?}: a terminal answer never holds the tier: {trace}"
+        );
+    }
+}
+
+/// Liveness: a tier's participants are the enabled sources whose import is
+/// not complete, anchored or not. Codex finishes the 1-day tier before Claude
+/// anchors, and the tier waits until Claude has read its 1-day tier; Pi, with
+/// an empty history, anchors and stops holding the tier on its first real
+/// pass; a source with a local disable marker never holds a tier.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c32_tier_participants_are_enabled_sources_anchored_or_not() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.row = "c32";
+    let (claude, codex) = (SnapshotSource::ClaudeCode, SnapshotSource::Codex);
+    home.device.sources = vec!["claude_code".into(), "codex".into(), "pi".into()];
+    FileDeviceStore::default().save(&home.device).unwrap();
+    std::fs::create_dir_all(&home.source.default_roots(&home.fixture.home)[0]).unwrap();
+    let (device, support) = (home.device.clone(), home.support.clone());
+    let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+    let state = || crate::backfill::load_backfill_state(&support);
+    let days = || state().first_read_tiers[&destination].days;
+    let pass = |source| {
+        crate::backfill::record_first_read_tier_pass(
+            &support,
+            source,
+            &destination,
+            &crate::snapshot_sync::enabled_snapshot_sources_in(&device, &support),
+        )
+        .unwrap()
+    };
+    super::resource_schedule::with_power("ac", || {
+        crate::backfill::record_first_census(&support, codex, &destination, AT, true).unwrap();
+        assert_eq!(pass(codex), None, "Codex finished the 1-day tier first");
+        let cycle = home.cycle(&server, &recording);
+        assert!(cycle.finish.is_ok(), "{}", tier_trace(&home, &cycle));
+        let after = state();
+        assert!(
+            after.first_read_tiers[&destination].done.contains("pi")
+                || after.destination_completed("pi", &destination),
+            "an empty Pi does not hold the tier: {}",
+            tier_trace(&home, &cycle)
+        );
+        assert_eq!(days(), 1, "Claude has not anchored: its last day is unread");
+        crate::backfill::record_first_census(&support, claude, &destination, AT, true).unwrap();
+        assert_eq!(days(), 1);
+        let (wake, first_import) = pass(claude).expect("Claude's 1-day tier advances it");
+        assert_eq!((days(), first_import), (3, true));
+        assert!(wake.contains(&claude) && wake.contains(&codex));
+        let cycle = home.cycle(&server, &recording);
+        assert!(cycle.finish.is_ok(), "{}", tier_trace(&home, &cycle));
+        let marker = crate::snapshot_sync::lane::source_marker_path(&support, codex);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "paused").unwrap();
+        let (wake, _) = pass(claude).expect("a disabled Codex never holds the tier");
+        assert_eq!(days(), 7);
+        assert!(wake.contains(&claude) && !wake.contains(&codex));
+    });
+}
+
+/// Liveness and claims: Claude's prepare fails before it anchors (its relay
+/// token request fails), so it leaves the tier at once and Codex and Pi
+/// advance without it, while its own work stays owed. It returns when the
+/// destination is at 30 days: its next pass anchors and rejoins, and it
+/// claims no tier (no 14-day claim) until it finishes one itself.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c33_a_failed_prepare_never_holds_a_tier_and_a_return_earns_its_own_claim() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.row = "c33";
+    let (claude, codex, pi) = (
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    );
+    home.device.sources = vec!["claude_code".into(), "codex".into(), "pi".into()];
+    FileDeviceStore::default().save(&home.device).unwrap();
+    let (device, support) = (home.device.clone(), home.support.clone());
+    let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+    let state = || crate::backfill::load_backfill_state(&support);
+    let days = || state().first_read_tiers[&destination].days;
+    let claim = |source: SnapshotSource| {
+        state()
+            .first_read_cutoffs(&destination, source.api_slug())
+            .1
+    };
+    let pass = |source| {
+        crate::backfill::record_first_read_tier_pass(
+            &support,
+            source,
+            &destination,
+            &crate::snapshot_sync::enabled_snapshot_sources_in(&device, &support),
+        )
+        .unwrap()
+    };
+    crate::backfill::record_first_census(&support, codex, &destination, AT, true).unwrap();
+    assert_eq!(pass(codex), None, "the unanchored Claude holds the tier");
+    assert_eq!(pass(pi), None);
+    let unreachable = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let failed = prepare_sync_source(
+        &SnapshotApiClient::new(unreachable),
+        &device,
+        "device-secret",
+        claude,
+        "otm_test",
+        &home.fixture.home,
+        &support,
+        &home.daemon,
+        &mut home.transport,
+        home.daemon.snapshot_scan_account_witness().unwrap(),
+    );
+    assert!(failed.is_err(), "the relay token request fails");
+    assert!(state().first_read_tiers[&destination]
+        .stopped
+        .contains("claude_code"));
+    assert_eq!(claim(claude), None);
+    let (wake, _) = pass(codex).expect("the failed Claude no longer holds the tier");
+    assert_eq!(days(), 3);
+    assert!(!wake.contains(&claude));
+    while days() < 30 {
+        assert_eq!(pass(codex), None);
+        assert!(pass(pi).is_some());
+    }
+    assert_eq!(
+        claim(codex).as_deref(),
+        Some("2026-10-18T10:00:00.000Z"),
+        "Codex finished the 14-day tier itself"
+    );
+    crate::backfill::record_first_census(&support, claude, &destination, AT, true).unwrap();
+    assert_eq!(
+        state().first_read_tier(&destination, claude).map(|(d, _)| d),
+        Some(30),
+        "an anchored pass rejoins at the destination's tier"
+    );
+    assert_eq!(claim(claude), None, "no 14-day claim it did not earn");
+    assert_eq!(pass(codex), None);
+    assert_eq!(pass(pi), None, "the returned Claude holds the tier");
+    assert!(pass(claude).is_some());
+    assert_eq!(claim(claude), claim(codex), "its own 30-day tier earns the claim");
+    assert!(claim(claude).is_some());
+}
+
+/// Liveness: account holds wait on account binding, outside the import, so a
+/// transport-settled pass whose only holds are account deferrals settles the
+/// tier; an authority retry or another hold, or an unsettled transport, does
+/// not.
+#[test]
+fn account_holds_alone_do_not_hold_a_tier() {
+    let set = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect();
+    let holds = |held: &[&str], account: &[&str], retry: usize| LocalHoldSettlement {
+        held_entity_count: held.len(),
+        retry_pending_family_count: retry,
+        held_fingerprints: set(held),
+        account_deferred_fingerprints: set(account),
+        progress_blocking: false,
+    };
+    use crate::snapshot_sync::finish::tier_settled;
+    assert!(tier_settled(true, false, &holds(&[], &[], 0)));
+    assert!(tier_settled(false, true, &holds(&["a"], &["a"], 0)));
+    assert!(tier_settled(false, true, &holds(&[], &[], 0)), "persisted account holds");
+    assert!(!tier_settled(false, false, &holds(&["a"], &["a"], 0)));
+    assert!(!tier_settled(false, true, &holds(&["a", "b"], &["a"], 0)));
+    assert!(!tier_settled(false, true, &holds(&["a"], &["a"], 1)));
 }

@@ -563,24 +563,27 @@ pub(in crate::agent_status) fn collect_claude_status_snapshots(
     // breaker, or a provider that stopped answering) are not a repair the
     // operator makes, so they never degrade `status` above. They still must
     // not leave the source looking fully healthy: the local source-health
-    // copy carries one plain-words diagnostic that `ottto apps` turns into an
-    // attention grade. Only this machine-local copy is touched; the uploaded
-    // snapshots are unchanged.
+    // copy carries one plain-words diagnostic per paused account, bound to
+    // that account, which `ottto apps` turns into an attention grade. Only
+    // this machine-local copy is touched; the uploaded snapshots are
+    // unchanged.
     let now_epoch = current_unix_seconds();
-    if let Some(diagnostic) = claude_usage_checks_paused_diagnostic(&claude_paused_usage_accounts(
-        &slot_states,
-        &default_snapshot,
-        |account, organization| {
-            read_claude_oauth_usage_breaker(
-                account,
-                organization,
-                &claude_oauth_usage_config_fingerprint(),
-            )
-        },
-        now_epoch,
-    )) {
-        source_health_snapshot.diagnostics.push(diagnostic);
-    }
+    source_health_snapshot
+        .diagnostics
+        .extend(claude_usage_checks_paused_diagnostics(
+            &claude_paused_usage_accounts(
+                &slot_states,
+                &default_snapshot,
+                |account, organization| {
+                    read_claude_oauth_usage_breaker(
+                        account,
+                        organization,
+                        &claude_oauth_usage_config_fingerprint(),
+                    )
+                },
+                now_epoch,
+            ),
+        ));
     append_registered_claude_plan_observations(&mut source_health_snapshot, &snapshots);
     source_health_snapshot.diagnostics.extend(signed_in.clone());
     for snapshot in &mut snapshots {
@@ -658,8 +661,8 @@ pub(in crate::agent_status) fn claude_ottto_accounts_signed_in(
 /// - A transient read failure means the meters could not be read right now.
 ///   `projected_claude_quota_access_state` already classifies these
 ///   `TemporarilyUnavailable`, the credential is untouched, background upkeep
-///   keeps running, and the failed-verification re-verify backoff clears them
-///   without the operator doing anything. Their approved copy names no action
+///   keeps running, and the next status pass reads them again without the
+///   operator doing anything. Their approved copy names no action
 ///   ("Ottto could not read current limits", "Staged"), unlike `NeedsLogin`,
 ///   `StaleAccessToken`, `ReloginApproaching` and `IdentityMismatch`, which
 ///   all tell the operator to sign in again and so stay actionable here.
@@ -696,17 +699,25 @@ pub(in crate::agent_status) fn claude_default_full_meter_needs_attention(
     has_full_meter_evidence && claude_custom_slot_needs_attention(state)
 }
 
-/// Machine-local diagnostic code on the Claude source-health copy when usage
-/// checks are paused for at least one connected account. `ottto apps` reads it
-/// to grade the source as needing attention. It is never uploaded.
+/// Machine-local diagnostic code on the Claude source-health copy, one per
+/// connected account whose usage checks are paused, bound to that account and
+/// organization. `ottto apps` reads it to grade the source as needing
+/// attention. It is never uploaded.
 pub(crate) const CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE: &str = "claude_usage_checks_paused";
 
 /// One connected Claude account whose usage checks are paused right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::agent_status) struct ClaudePausedUsageAccount {
+    /// The exact account and organization, so the app can show the pause on
+    /// that account's row.
+    pub(in crate::agent_status) account_identifier_hash: String,
+    pub(in crate::agent_status) organization_identifier_hash: String,
     /// The provider rejected this account's sign-in (auth hold or open
     /// breaker), as opposed to the provider not answering.
     pub(in crate::agent_status) after_sign_in_rejection: bool,
+    /// The provider answered a usage read with a wait (a rate-limit hold with
+    /// a retry time), as opposed to not answering at all.
+    pub(in crate::agent_status) provider_asked_to_wait: bool,
     /// When Ottto may automatically check this account again, if known.
     pub(in crate::agent_status) next_check_epoch_seconds: Option<u64>,
 }
@@ -771,6 +782,8 @@ pub(in crate::agent_status) fn claude_paused_usage_accounts(
         served: bool,
         auth_paused: bool,
         provider_stale: bool,
+        /// Earliest provider retry time a stale slot's rate-limit hold names.
+        provider_wait_until: Option<u64>,
     }
     let default_binding = default_snapshot.account.as_ref().and_then(|account| {
         Some((
@@ -852,66 +865,95 @@ pub(in crate::agent_status) fn claude_paused_usage_accounts(
             continue;
         }
         entry.auth_paused |= slot_auth_evidence || caller_held || account_auth_open;
-        entry.provider_stale |= status.state
-            == ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        let slot_stale = status.state == ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
             && status.quota_snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.state == ClaudeConfigSlotQuotaSnapshotStateV1::Stale
             });
+        entry.provider_stale |= slot_stale;
+        if slot_stale {
+            // A rate-limit hold carries the provider's own retry time.
+            let wait_until = status
+                .quota_check_diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.retry_after.as_deref())
+                .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .filter_map(|at| u64::try_from(at.unix_timestamp()).ok())
+                .filter(|at| now < *at)
+                .min();
+            entry.provider_wait_until = match (entry.provider_wait_until, wait_until) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
     }
     accounts
-        .into_values()
-        .filter(|evidence| !evidence.served && (evidence.auth_paused || evidence.provider_stale))
-        .map(|evidence| {
+        .into_iter()
+        .filter(|(_, evidence)| {
+            !evidence.served && (evidence.auth_paused || evidence.provider_stale)
+        })
+        .map(|((account, organization), evidence)| {
             let held_until = evidence
                 .breaker
                 .as_ref()
                 .and_then(|breaker| claude_breaker_auth_pause_until(breaker, now));
+            let after_sign_in_rejection = evidence.auth_paused || held_until.is_some();
+            let provider_asked_to_wait =
+                !after_sign_in_rejection && evidence.provider_wait_until.is_some();
             ClaudePausedUsageAccount {
-                after_sign_in_rejection: evidence.auth_paused || held_until.is_some(),
-                next_check_epoch_seconds: held_until,
+                account_identifier_hash: account,
+                organization_identifier_hash: organization,
+                after_sign_in_rejection,
+                provider_asked_to_wait,
+                next_check_epoch_seconds: if after_sign_in_rejection {
+                    held_until
+                } else {
+                    evidence.provider_wait_until
+                },
             }
         })
         .collect()
 }
 
-/// One plain-words diagnostic for every paused account. It names accounts
-/// only, never asks the operator to sign in again, and never implies Ottto
-/// will check sooner than its own schedule. It avoids "quota" and "limit"
-/// wording so no consumer mistakes it for a used-up plan.
-pub(in crate::agent_status) fn claude_usage_checks_paused_diagnostic(
+/// One plain-words diagnostic per paused account, bound to that account and
+/// organization so the app can show it on the right row. It never asks the
+/// operator to sign in again, and never implies Ottto will check sooner than
+/// its own schedule (or the provider's retry time). It avoids "quota" and
+/// "limit" wording so no consumer mistakes it for a used-up plan.
+pub(in crate::agent_status) fn claude_usage_checks_paused_diagnostics(
     paused: &[ClaudePausedUsageAccount],
-) -> Option<AgentStatusDiagnostic> {
-    if paused.is_empty() {
-        return None;
-    }
-    let accounts = if paused.len() == 1 {
-        "one account".to_string()
-    } else {
-        format!("{} accounts", paused.len())
-    };
-    let reason = if paused.iter().all(|account| account.after_sign_in_rejection) {
-        "after the provider rejected sign-in"
-    } else if paused.iter().any(|account| account.after_sign_in_rejection) {
-        "after the provider rejected sign-in or stopped answering"
-    } else {
-        "while the provider is not answering"
-    };
-    let next_check = paused
+) -> Vec<AgentStatusDiagnostic> {
+    paused
         .iter()
-        .filter_map(|account| account.next_check_epoch_seconds)
-        .min()
-        .and_then(rfc3339_from_unix_seconds);
-    let next = match next_check {
-        Some(at) => format!("next automatic check {at}"),
-        None => "Ottto checks again automatically".to_string(),
-    };
-    Some(AgentStatusDiagnostic::source(
-        CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
-        AgentDiagnosticSeverity::Warning,
-        format!(
-            "Claude usage checks paused for {accounts} {reason}; {next}. Last readings stay shown until then."
-        ),
-    ))
+        .map(|account| {
+            let reason = if account.after_sign_in_rejection {
+                "after the provider rejected sign-in"
+            } else if account.provider_asked_to_wait {
+                "while the provider asks Ottto to wait"
+            } else {
+                "while the provider is not answering"
+            };
+            let next_check = account
+                .next_check_epoch_seconds
+                .and_then(rfc3339_from_unix_seconds);
+            let next = match &next_check {
+                Some(at) => format!("next automatic check {at}"),
+                None => "Ottto checks again automatically".to_string(),
+            };
+            let mut diagnostic = AgentStatusDiagnostic::source(
+                CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
+                AgentDiagnosticSeverity::Warning,
+                format!(
+                    "Claude usage checks paused for this account {reason}; {next}. Last readings stay shown until then."
+                ),
+            )
+            .with_quota_binding(
+                Some(account.account_identifier_hash.clone()),
+                Some(account.organization_identifier_hash.clone()),
+            );
+            diagnostic.retry_after = next_check.filter(|_| account.provider_asked_to_wait);
+            diagnostic
+        })
+        .collect()
 }
 
 pub(in crate::agent_status) fn apply_claude_anchor_continuity(

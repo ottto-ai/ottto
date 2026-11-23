@@ -42,7 +42,10 @@ pub(super) fn install(
                     anyhow::ensure!(program == "launchctl", "unexpected service command");
                     let mut command = Command::new("/bin/launchctl");
                     command.args(rest);
-                    let (status, _) = lock.run(&mut command, COMMAND_TIMEOUT)?;
+                    let ran = lock.run(&mut command, COMMAND_TIMEOUT);
+                    // Even a failed or timed-out command may have changed the job.
+                    macos_service::invalidate_status_launchd_probe();
+                    let (status, _) = ran?;
                     anyhow::ensure!(
                 status.success(),
                 "service lifecycle command failed ({status}); installation may be partial: {}",

@@ -134,6 +134,9 @@ pub(in crate::snapshots) struct StagedFile {
     pub(in crate::snapshots) pages: BTreeMap<(Collection, u64), Vec<u8>>,
     pub(in crate::snapshots) obsolete: BTreeSet<(Collection, u64)>,
     pub(in crate::snapshots) change: Change,
+    /// The write generation count bound to `head`'s certificate, if the read
+    /// that made it kept one.
+    pub(in crate::snapshots) write_generation: Option<std::num::NonZeroU32>,
 }
 impl StagedFile {
     fn bytes(&self) -> u64 {
@@ -679,6 +682,10 @@ fn delete_fragments(
 /// The common body's own version, separate from the source's (`revision`) and
 /// from the store's physical and DB generations.
 const ENVELOPE: u8 = 1;
+/// Version 1 plus a nonzero 4-byte big-endian write generation count before
+/// the reduction, bound to the reduction's certificate. Written only for a
+/// head with a reduction and a count; any other head stays version 1.
+const ENVELOPE_COUNTED: u8 = 2;
 /// The envelope's last code, before the optional parts it announces.
 const HAS_REDUCTION: u8 = 1;
 const HAS_INVENTORY: u8 = 2;
@@ -793,8 +800,13 @@ pub(super) fn encode_head(
     table: &MembershipTable,
     common: &Common,
     reduction: Option<&[u8]>,
+    write_generation: Option<std::num::NonZeroU32>,
 ) -> Result<Vec<u8>> {
     check_shape(common.representation, reduction.is_some())?;
+    ensure!(
+        write_generation.is_none() || reduction.is_some(),
+        "state_v2_tail_value_shape"
+    );
     let body = reduction.unwrap_or_default();
     let mut out = Vec::with_capacity(
         31 + table.len() * 54 + body.len() + usize::from(common.job.is_some()) * JOB_BYTES,
@@ -810,7 +822,12 @@ pub(super) fn encode_head(
         out.extend_from_slice(&entry.commit);
     }
     let debt = &common.debt;
-    out.extend_from_slice(&[ENVELOPE, common.representation as u8]);
+    let envelope = if write_generation.is_some() {
+        ENVELOPE_COUNTED
+    } else {
+        ENVELOPE
+    };
+    out.extend_from_slice(&[envelope, common.representation as u8]);
     out.extend_from_slice(&common.next_revision_id.to_be_bytes());
     out.push(u8::from(debt.earliest_unacked_change_at.is_some()));
     out.extend_from_slice(&debt.earliest_unacked_change_at.unwrap_or(0).to_be_bytes());
@@ -826,6 +843,10 @@ pub(super) fn encode_head(
     }
     if let Some(job) = &common.job {
         out.extend_from_slice(&encode_job(job)?);
+    }
+    // After the job block and right before the reduction it is bound to.
+    if let Some(count) = write_generation {
+        out.extend_from_slice(&count.get().to_be_bytes());
     }
     out.extend_from_slice(body);
     Ok(out)
@@ -844,6 +865,9 @@ pub(in crate::snapshots) struct TailHead {
     /// No reduction: never loadable, no parser restore, and no Skip, floor,
     /// census or Full credit. Acquire as for a missing checkpoint.
     pub(in crate::snapshots) metadata_only: bool,
+    /// The write generation count bound to the reduction's certificate;
+    /// `None` for a version 1 envelope.
+    pub(in crate::snapshots) write_generation: Option<std::num::NonZeroU32>,
     generation: u64,
 }
 pub(super) struct Decoded {
@@ -852,6 +876,7 @@ pub(super) struct Decoded {
     pub(super) common: Common,
     job_corrupt: bool,
     reduction: Option<Vec<u8>>,
+    pub(super) write_generation: Option<std::num::NonZeroU32>,
 }
 /// A code above `max` was written by a newer build: hold, never default.
 fn code(input: &mut Reader<'_>, max: u8) -> Result<u8> {
@@ -886,10 +911,8 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         };
         table.insert(collection, entry);
     }
-    ensure!(
-        code(&mut input, ENVELOPE)? == ENVELOPE,
-        "state_v2_tail_value_shape"
-    );
+    let envelope = code(&mut input, ENVELOPE_COUNTED)?;
+    ensure!(envelope >= ENVELOPE, "state_v2_tail_value_shape");
     let representation = match code(&mut input, 3)? {
         1 => Representation::Tail,
         2 => Representation::Archive,
@@ -924,6 +947,13 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
     };
     let job_corrupt = parts & HAS_JOB != 0 && job.is_none();
     check_shape(representation, has_reduction)?;
+    let write_generation = if envelope == ENVELOPE_COUNTED {
+        ensure!(has_reduction, "state_v2_tail_value_shape");
+        let count = std::num::NonZeroU32::new(u32::from_be_bytes(input.take()?));
+        Some(count.context("state_v2_tail_value_shape")?)
+    } else {
+        None
+    };
     let reduction = has_reduction.then(|| input.0.to_vec());
     ensure!(
         reduction.is_some() || input.0.is_empty(),
@@ -941,6 +971,7 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Decoded> {
         },
         reduction,
         job_corrupt,
+        write_generation,
     })
 }
 #[derive(Debug)]
@@ -1001,6 +1032,7 @@ pub(super) fn load_head(
         body: head.reduction.unwrap_or_default(),
         common: head.common,
         job_corrupt: head.job_corrupt,
+        write_generation: head.write_generation,
         generation,
     }))
 }
@@ -1280,17 +1312,26 @@ fn write_file(
     job: Option<&JobUpdate>,
 ) -> Result<Applied> {
     let reset = staged.filter(|staged| staged.change == Change::Reset);
-    let (mut revision, mut table, mut common, mut reduction) = if let Some(reset) = reset {
-        // Acquisition state only: committed debt stays and merges.
-        let (revision, table, common) = committed_debt(tx, file, Some(reset.revision))?;
-        delete_rows(tx, file, true)?;
-        (revision, table, common, None)
-    } else {
-        match read_head(tx, file, u32::MAX)? {
-            Some(head) => (head.revision, head.table, head.common, head.reduction),
-            None => Default::default(),
-        }
-    };
+    // The count travels with its reduction: kept by a debt-only rewrite,
+    // replaced with a staged reduction, gone with a reset or a dropped one.
+    let (mut revision, mut table, mut common, mut reduction, mut write_generation) =
+        if let Some(reset) = reset {
+            // Acquisition state only: committed debt stays and merges.
+            let (revision, table, common) = committed_debt(tx, file, Some(reset.revision))?;
+            delete_rows(tx, file, true)?;
+            (revision, table, common, None, None)
+        } else {
+            match read_head(tx, file, u32::MAX)? {
+                Some(head) => (
+                    head.revision,
+                    head.table,
+                    head.common,
+                    head.reduction,
+                    head.write_generation,
+                ),
+                None => Default::default(),
+            }
+        };
     let mut applied = Applied {
         files: 1,
         ..Default::default()
@@ -1357,6 +1398,7 @@ fn write_file(
         }
         revision = staged.revision;
         reduction = Some(staged.head.clone());
+        write_generation = staged.write_generation;
         common.representation = Representation::Tail;
         if reset.is_some()
             && job.is_none()
@@ -1371,10 +1413,9 @@ fn write_file(
         applied.revisions_added = observe(tx, file, &mut table, &mut common, observation)?;
     }
     // No longer a Tail file: the reduction and its pages go, the debt stays.
-    if reduction
-        .take_if(|_| common.representation != Representation::Tail)
-        .is_some()
-    {
+    if common.representation != Representation::Tail && reduction.is_some() {
+        reduction = None;
+        write_generation = None;
         table.retain(|collection, _| *collection == Collection::Revisions);
         delete_rows(tx, file, true)?;
     }
@@ -1408,7 +1449,14 @@ fn write_file(
         delete_rows(tx, file, false)?;
         return Ok(applied);
     }
-    let head = encode_head(revision, &table, &common, reduction.as_deref())?;
+    let write_generation = write_generation.filter(|_| reduction.is_some());
+    let head = encode_head(
+        revision,
+        &table,
+        &common,
+        reduction.as_deref(),
+        write_generation,
+    )?;
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     applied.head_bytes = head.len() as u64;
     Ok(applied)
@@ -1461,7 +1509,7 @@ fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
     common.job = None;
     delete_rows(tx, file, keep)?;
     if keep {
-        let head = encode_head(revision, &table, &common, None)?;
+        let head = encode_head(revision, &table, &common, None, None)?;
         write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
     }
     Ok(keep)
@@ -1469,9 +1517,15 @@ fn retire(tx: &mut dyn Transaction, file: &[u8]) -> Result<bool> {
 /// Write a head of a newer envelope in `tx`: this build cannot read it.
 #[cfg(test)]
 pub(super) fn future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<()> {
-    let mut head = encode_head(1, &MembershipTable::new(), &Common::default(), None)?;
-    head[5] = 2;
+    let mut head = encode_head(1, &MembershipTable::new(), &Common::default(), None, None)?;
+    head[5] = ENVELOPE_COUNTED + 1;
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, &head)?;
+    Ok(())
+}
+/// Replace the file's head row with `head` exactly, as an older build wrote it.
+#[cfg(test)]
+pub(super) fn put_head_for_test(tx: &mut dyn Transaction, file: &[u8], head: &[u8]) -> Result<()> {
+    write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, head)?;
     Ok(())
 }
 /// Retire over a future head written in `tx`, which the caller drops uncommitted.
@@ -1611,7 +1665,14 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
     head.common.job.clone_from(job);
     // A metadata-only head stays metadata-only; a reduction remains Tail.
     let reduction = head.reduction.as_ref().map(|_| rebound.as_slice());
-    let value = encode_head(head.revision, &head.table, &head.common, reduction)?;
+    // The certificate moves unchanged, so its count moves with it.
+    let value = encode_head(
+        head.revision,
+        &head.table,
+        &head.common,
+        reduction,
+        head.write_generation,
+    )?;
     write_value(tx, to, HEAD_OWNER, 0, &row(HEAD, to, 0)?, &value)?;
     tx.delete(&row(HEAD, from, 0)?)?;
     Ok(())

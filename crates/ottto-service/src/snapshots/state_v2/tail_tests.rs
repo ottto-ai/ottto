@@ -1007,9 +1007,11 @@ fn debt_survives_reset_and_retire_until_settled() {
         representation: Representation::Archive,
         ..Default::default()
     };
-    let encoded = tail::encode_head(REVISION, &Default::default(), &common, None).unwrap();
+    let encoded = tail::encode_head(REVISION, &Default::default(), &common, None, None).unwrap();
     assert!(tail::decode_head(&encoded).is_ok());
-    for (at, value) in [(5, 2), (6, 4), (24, 3), (30, 8)] {
+    // Envelope 2 (a write generation count) and parts flag 4 (a job decision)
+    // are known; envelope 3 and flag 8 are newer.
+    for (at, value) in [(5, 3), (6, 4), (24, 3), (30, 8)] {
         let mut newer = encoded.clone();
         newer[at] = value;
         let error = tail::decode_head(&newer).err().unwrap();
@@ -1033,7 +1035,8 @@ fn malformed_job_state_can_be_cleared_without_replacing_the_reduction() {
         }),
         ..Default::default()
     };
-    let mut head = tail::encode_head(REVISION, &Default::default(), &common, Some(body)).unwrap();
+    let mut head =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(body), None).unwrap();
     head[31 + 16] = 255; // invalid decision tag, inside the optional slot
     with_session_db(&index, |db| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
@@ -1059,6 +1062,215 @@ fn malformed_job_state_can_be_cleared_without_replacing_the_reduction() {
     assert!(cleared.common.job.is_none());
 }
 
+/// [format] The write generation count is envelope 2 only: 4 nonzero
+/// big-endian bytes before the reduction. A head without a count is still
+/// written as version 1, and version 1 decodes with no count.
+#[test]
+fn write_generation_count_is_envelope_two_and_version_one_has_none() {
+    use std::num::NonZeroU32;
+    // Version 1 as the previous release writes it: no table, Tail, no debt,
+    // no inventory, then the reduction.
+    let mut old = vec![0, 0, 0, REVISION as u8, 0, 1, Representation::Tail as u8];
+    old.extend_from_slice(&[0; 23]);
+    old.push(1);
+    old.extend_from_slice(b"head");
+    let common = Common::default();
+    assert_eq!(
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), None).unwrap(),
+        old
+    );
+    assert_eq!(tail::decode_head(&old).unwrap().write_generation, None);
+
+    let seven = NonZeroU32::new(7);
+    let counted =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), seven).unwrap();
+    let mut expected = old.clone();
+    expected[5] = 2;
+    expected.splice(31..31, [0, 0, 0, 7]);
+    assert_eq!(counted, expected);
+    let decoded = tail::decode_head(&counted).unwrap();
+    assert_eq!(decoded.write_generation, seven);
+
+    // A zero count, or a count with no reduction, is malformed either way.
+    let mut zero = counted.clone();
+    zero[31..35].copy_from_slice(&[0; 4]);
+    let error = tail::decode_head(&zero).err().unwrap();
+    assert_eq!(error.to_string(), "state_v2_tail_value_shape");
+    let mut bare = tail::encode_head(REVISION, &Default::default(), &common, None, None).unwrap();
+    bare[5] = 2;
+    let error = tail::decode_head(&bare).err().unwrap();
+    assert_eq!(error.to_string(), "state_v2_tail_value_shape");
+    let refused = tail::encode_head(REVISION, &Default::default(), &common, None, seven);
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "state_v2_tail_value_shape"
+    );
+}
+
+/// [format] A head with both a job decision and a write generation count
+/// stores the job block, then the 4 count bytes, then the reduction. Each
+/// part decodes back on its own, and the job block alone stays envelope 1.
+#[test]
+fn job_block_then_count_then_reduction() {
+    use super::super::tail::FileJob;
+    use crate::session_attribution::job_template::JobState;
+    use std::num::NonZeroU32;
+    let common = Common {
+        job: Some(FileJob {
+            inode: 11,
+            birth_nanos: 12,
+            state: JobState::NoId,
+        }),
+        ..Default::default()
+    };
+    let seven = NonZeroU32::new(7);
+    let job_only =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), None).unwrap();
+    assert_eq!(job_only[5], 1, "a job block alone keeps envelope 1");
+    let both =
+        tail::encode_head(REVISION, &Default::default(), &common, Some(b"head"), seven).unwrap();
+    assert_eq!(both[5], 2);
+    let body_at = both.len() - b"head".len();
+    assert_eq!(&both[body_at..], b"head");
+    assert_eq!(&both[body_at - 4..body_at], &[0, 0, 0, 7]);
+    let mut expected = job_only.clone();
+    expected[5] = 2;
+    expected.splice(body_at - 4..body_at - 4, [0, 0, 0, 7]);
+    assert_eq!(
+        both, expected,
+        "the count sits between the job block and the reduction"
+    );
+    let decoded = tail::decode_head(&both).unwrap();
+    assert_eq!(decoded.write_generation, seven);
+    assert_eq!(decoded.common.job, common.job);
+}
+
+/// The version 1 Tail head 0.1.261 writes for the counted-head test's file:
+/// revision 1; a `Responses` page (slot, 8 per page, 24 elements, 1 page) and
+/// two debt revisions (slot, 1 per page, 2 elements, 2 pages), each with a
+/// zeroed 32-byte membership commit; envelope 1, Tail, next revision id 2,
+/// debt (earliest unacked 7000, lower bound, reasons 0b101, no disposition),
+/// a reduction and no inventory; then the reduction `head`. That release's
+/// encoder is unchanged from v0.1.260 to the base of this change.
+#[rustfmt::skip]
+const V1_HEAD_0_1_261: [u8; 143] = [
+    0, 0, 0, 1, 2,
+    0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    13, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0x1b, 0x58, 1, 0, 0, 0, 5, 0, 1,
+    b'h', b'e', b'a', b'd',
+];
+
+/// [format] Through real saves and loads: a count roundtrips and survives a
+/// reload and a debt-only rewrite; version 1 bytes of the same head (the
+/// previous release's) load with no count and their pages and debt intact; an
+/// uncounted completion or a representation change drops it; the committed
+/// store refuses the previous writer; a stale session commits no count.
+#[test]
+fn write_generation_count_travels_with_its_reduction_through_saves() {
+    use std::num::NonZeroU32;
+    let counted = |head: &[u8], count: u32| StagedFile {
+        write_generation: NonZeroU32::new(count),
+        ..staged(head, &[(Collection::Responses, 0, b"page")])
+    };
+    let count_of = |index: &ScanIndex| {
+        load_head(index, FILE, REVISION)
+            .unwrap()
+            .unwrap()
+            .write_generation
+    };
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    stage_tail(&f.path, FILE, counted(b"head", 7)).unwrap();
+    observe_tail(&f.path, FILE, observation(&[b"r0"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    with_session_db(&index, |db| {
+        assert!(sqlite::previous_writer_refused_for_test(db));
+    });
+
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let (head, pages) = read(&index, FILE).unwrap();
+    assert_eq!(head.unwrap().write_generation, NonZeroU32::new(7));
+    assert_eq!(pages[&(Collection::Responses, 0)], b"page");
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec())])
+    );
+    observe_tail(&f.path, FILE, observation(&[b"r1"])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(count_of(&index), NonZeroU32::new(7), "debt-only rewrite");
+
+    // The same head as the version 1 bytes 0.1.261 writes, committed in
+    // place. Frozen: only the two membership commits, digests of the stored
+    // rows rather than envelope format, come from this store.
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    let today = tail::encode_head(
+        head.revision,
+        &head.table,
+        &head.common,
+        Some(&head.body),
+        None,
+    )
+    .unwrap();
+    let mut old = V1_HEAD_0_1_261.to_vec();
+    for entry in 0..2 {
+        let commit = 5 + 54 * entry + 22;
+        old[commit..commit + 32].copy_from_slice(&today[commit..commit + 32]);
+    }
+    assert_eq!(old[5 + 54 * 2], 1, "version 1 envelope");
+    assert_eq!(today, old, "this build's uncounted head is 0.1.261's");
+    with_session_db(&index, |db| {
+        let g = db.stamp().unwrap().0;
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tail::put_head_for_test(&mut tx, FILE.as_bytes(), &old).unwrap();
+        assert_eq!(tx.commit(g, g + 1), DurableCommitOutcome::Committed(g + 1));
+    });
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let (head, pages) = read(&index, FILE).unwrap();
+    let head = head.unwrap();
+    assert_eq!(head.write_generation, None);
+    assert_eq!(head.body, b"head");
+    assert!(!head.metadata_only);
+    assert_eq!(head.common.debt, observation(&[]).summary, "debt summary");
+    assert_eq!(pages[&(Collection::Responses, 0)], b"page");
+    assert_eq!(
+        revisions(&index, FILE),
+        BTreeMap::from([(0, b"r0".to_vec()), (1, b"r1".to_vec())]),
+        "debt intact"
+    );
+
+    stage_tail(&f.path, FILE, counted(b"head-2", 9)).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(count_of(&index), NonZeroU32::new(9));
+    stage_tail(&f.path, FILE, staged(b"head-3", &[])).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(count_of(&index), None, "an uncounted completion");
+
+    let mut stale = load_with(&f.path, false).unwrap().unwrap();
+    stage_tail(&f.path, FILE, counted(b"head-4", 11)).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    assert_eq!(count_of(&index), NonZeroU32::new(11));
+    stage_tail(&f.path, FILE, counted(b"stale", 13)).unwrap();
+    let error = save_with(&f.path, &mut stale).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ReloadRequired));
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(count_of(&index), NonZeroU32::new(11), "a stale session");
+
+    stage_tail(&f.path, FILE, counted(b"head-5", 15)).unwrap();
+    let leaves_tail = Observation {
+        representation: Representation::Archive,
+        ..observation(&[])
+    };
+    observe_tail(&f.path, FILE, leaves_tail).unwrap();
+    save_with(&f.path, &mut index).unwrap();
+    let head = load_head(&index, FILE, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(head.write_generation, None, "the reduction went");
+}
+
 /// [behaviour] Only a Tail head holds a reduction: neither side of the codec
 /// accepts another, and an observation leaving Tail drops reduction and pages.
 #[test]
@@ -1067,7 +1279,7 @@ fn reduction_requires_tail_representation() {
         representation: Representation::Archive,
         ..Default::default()
     };
-    let refused = tail::encode_head(REVISION, &Default::default(), &archive, Some(b"body"));
+    let refused = tail::encode_head(REVISION, &Default::default(), &archive, Some(b"body"), None);
     assert_eq!(
         refused.unwrap_err().to_string(),
         "state_v2_tail_value_shape"
@@ -1077,6 +1289,7 @@ fn reduction_requires_tail_representation() {
         &Default::default(),
         &Common::default(),
         Some(b"body"),
+        None,
     )
     .unwrap();
     assert!(tail::decode_head(&bytes).is_ok());
@@ -1126,7 +1339,14 @@ fn inventory_facts_need_no_reduction_and_old_envelope_has_none() {
     let mut old = vec![0, 0, 0, REVISION as u8, 0, 1, Representation::Tail as u8];
     old.extend_from_slice(&[0; 24]);
     assert_eq!(
-        tail::encode_head(REVISION, &Default::default(), &Common::default(), None).unwrap(),
+        tail::encode_head(
+            REVISION,
+            &Default::default(),
+            &Common::default(),
+            None,
+            None
+        )
+        .unwrap(),
         old
     );
     assert_eq!(tail::decode_head(&old).unwrap().common.inventory, None);

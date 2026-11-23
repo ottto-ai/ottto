@@ -35,6 +35,9 @@ pub(in crate::snapshots) struct PendingTail {
     key: String,
     id: HeadIdentity,
     certificate: DurableCertificate,
+    /// The write generation count the completed read kept for the
+    /// certificate's bytes, under the certificate's birth.
+    write_generation: Option<std::num::NonZeroU32>,
     /// Native EOF applied bytes past the sealed offset: never stored.
     unsealed: bool,
     full: bool,
@@ -73,6 +76,7 @@ impl PendingTail {
         if quiet {
             certificate.audit_debt_unix_seconds = None;
         }
+        let write_generation = completed.checkpoint.write_generation_for(birth);
         Some(Self {
             source: S::SOURCE,
             id: HeadIdentity::new(
@@ -85,6 +89,7 @@ impl PendingTail {
             route,
             key: active.key.clone(),
             certificate,
+            write_generation,
             unsealed: completed.unsealed,
             full: matches!(active.mode, ReadMode::Full(_)),
             base,
@@ -177,6 +182,7 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
         } else {
             Change::Ordinary
         },
+        tail.write_generation,
         &mut resident_bytes,
     );
     (encoded, resident_bytes)
@@ -188,6 +194,8 @@ fn tail_encode<S: TailSource>(view: &PreFinalization<'_>, tail: &PendingTail) ->
 #[derive(Default)]
 pub(in crate::snapshots) struct TailBase {
     head: [u8; 32],
+    /// The committed head's write generation count.
+    write_generation: Option<std::num::NonZeroU32>,
     /// In load order: page key, then digest and encoded resident byte length.
     pages: Vec<((Collection, u64), PageStamp)>,
     logs: Vec<(Collection, LogBase)>,
@@ -222,6 +230,15 @@ impl TailBase {
             head: page_digest(head),
             ..Self::default()
         }
+    }
+
+    /// The committed head's write generation count, beside its body.
+    pub(in crate::snapshots) fn with_write_generation(
+        mut self,
+        write_generation: Option<std::num::NonZeroU32>,
+    ) -> Self {
+        self.write_generation = write_generation;
+        self
     }
 
     /// One committed page, in the load's order: by collection, then page.
@@ -278,15 +295,19 @@ impl TailBase {
         id: &HeadIdentity,
         change: Change,
     ) -> Result<Option<StagedFile>, Refuse> {
-        self.stage_counted::<S>(view, certificate, id, change, &mut 0)
+        self.stage_counted::<S>(view, certificate, id, change, None, &mut 0)
     }
 
+    /// A head whose bytes are unchanged still stages when its write
+    /// generation count differs from the committed one, so the count stored
+    /// is always the one the latest completion kept for these bytes.
     fn stage_counted<S: TailSource>(
         &self,
         view: &PreFinalization<'_>,
         certificate: &DurableCertificate,
         id: &HeadIdentity,
         change: Change,
+        write_generation: Option<std::num::NonZeroU32>,
         resident_bytes: &mut u64,
     ) -> Result<Option<StagedFile>, Refuse> {
         let acc = view.accumulator;
@@ -297,6 +318,7 @@ impl TailBase {
             revision: S::REDUCTION_REVISION,
             head: S::encode_head(view, certificate, id)?,
             change,
+            write_generation,
             ..StagedFile::default()
         };
         for spec in S::collections() {
@@ -363,7 +385,8 @@ impl TailBase {
         let changed = change == Change::Reset
             || !staged.pages.is_empty()
             || !staged.obsolete.is_empty()
-            || page_digest(&staged.head) != self.head;
+            || page_digest(&staged.head) != self.head
+            || staged.write_generation != self.write_generation;
         Ok(changed.then_some(staged))
     }
 }

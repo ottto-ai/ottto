@@ -37,6 +37,7 @@ mod durable_tail_codec;
 mod external_scheduler_attribution;
 mod grant_rebind;
 mod hex;
+pub mod homebrew_step_aside;
 mod instruction_inventory;
 mod internal_session;
 pub mod keychain;

@@ -3159,6 +3159,7 @@ fn local_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census:
             .is_some_and(|fold| fold.location_key() == Some(location_key(key)))
     });
     let bodies = index.file_snapshot_fingerprints.get(key);
+    let cutoff = index.backfill_cutoff_nanos;
     let nonempty = match page_body {
         Some(item) => {
             !item.snapshot_fingerprint.is_empty()
@@ -3167,9 +3168,19 @@ fn local_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census:
                     .claude_money
                     .as_deref()
                     .is_some_and(|fold| !fold.entity.held)
+                // A body the claim cutoff will drop owns only as its emptied
+                // file would, so every placement agrees from the first body.
+                && cutoff.is_none_or(|cutoff| {
+                    !crate::backfill::ended_before_backfill_cutoff(item, cutoff)
+                        || cutoff_owner(index, key, cutoff)
+                })
         }
         None => {
-            !index.confirmed_empty_files.contains(key) && bodies.is_some_and(|fps| !fps.is_empty())
+            (!index.confirmed_empty_files.contains(key)
+                && bodies.is_some_and(|fps| !fps.is_empty()))
+                || (need_census
+                    && index.confirmed_empty_files.contains(key)
+                    && cutoff.is_some_and(|cutoff| cutoff_owner(index, key, cutoff)))
         }
     };
     let refused = page_body.map_or_else(
@@ -3192,6 +3203,28 @@ fn local_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census:
                 .claude_request_census
                 .get(key)
                 .is_some_and(|record| record.current_for(&entry.source_file_fingerprint)))
+}
+/// Under the claim cutoff (UTC ns), a main whose body finish drops is the
+/// previous owner's history: never uploaded here, it still owns the requests
+/// its copies hold, so they count nowhere at this destination. Only while its
+/// file was last written before the cutoff (census mtime) and the birth store
+/// records this location as its session's only one (another's body may carry
+/// them). A local proof only (with a current census holding the hash): server
+/// acceptance never reads it.
+fn cutoff_owner(index: &ScanIndex, key: &str, cutoff: i128) -> bool {
+    let here = location_key(key);
+    index
+        .claude_request_census
+        .get(key)
+        .and_then(|record| record.modified())
+        .is_some_and(|modified| (i128::from(modified) + 1) * 1_000_000_000 <= cutoff)
+        && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+            let mut locations = index
+                .claude_money_birth_store
+                .observations(member.root)
+                .map(|(location, _)| location);
+            locations.next() == Some(here) && locations.all(|location| location == here)
+        })
 }
 fn twin_carrier(index: &ScanIndex, key: &str) -> bool {
     index.file_upload_context_enabled()

@@ -1448,7 +1448,7 @@ use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
     directory_entries_per_tick, effective_backfill_window_days, first_read_aged,
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
-    reconcile_missing_index_entries_bounded, DiscoveryRecovery,
+    reconcile_missing_index_entries_bounded, DiscoveryRecovery, TierGate,
 };
 #[cfg(test)]
 pub(crate) use discovery::directory::{with_directory_read_fault, with_test_directory_entries};

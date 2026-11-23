@@ -1039,8 +1039,8 @@ macro_rules! head_fields {
 // and live fields, listed in its `finish_field_nonempty`). Claude's: pages
 // (responses, tool uses, changed files, capability buckets, compactions),
 // finish-only fields (usage ids and occurrences, money, cache observations
-// and requests, usage buckets and totals), live fields (Desktop identity and
-// spawn lineage, account hash). The Pi ledger and Codex's `I` fields are
+// and requests, usage buckets and totals), live fields (Desktop identity,
+// spawn lineage and scheduled-task marker, account hash). The Pi ledger and Codex's `I` fields are
 // written only by those sources' parsers (Codex's by
 // `apply_codex_owned_line`), so a Claude parse leaves them empty.
 // Retired entries retain only the original byte walk and shape descriptors.
@@ -1094,6 +1094,7 @@ head_fields! {
         N codex_creator_evidence_conflicted: bool,
         I claude_desktop_identity: Option<SessionAccountEvidence>,
         I claude_desktop_spawn_lineage: Option<ClaudeDesktopSpawnLineage>,
+        I claude_desktop_scheduled_task: bool,
         N claude_owned_session_id_observed: bool,
         N claude_owned_session_id_conflicted: bool,
         D codex_ownership_boundary: CodexOwnershipBoundary,
@@ -1288,10 +1289,11 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     let mut file = std::fs::File::open(key).unwrap();
     assert!(
         certificate
-            .restore_grown(
+            .restore_grown_counted(
                 &mut file,
                 crate::transcript_acquisition::Scope("e2-pipeline".into()),
-                None
+                None,
+                None,
             )
             .is_ok(),
         "a renumbered device keeps the certificate"

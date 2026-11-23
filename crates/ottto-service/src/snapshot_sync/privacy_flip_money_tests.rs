@@ -96,6 +96,7 @@ pub(super) fn page_under(
         stats: Default::default(),
         delivered: None,
         upload_policy: mode.policy,
+        cutoff_candidates: Vec::new(),
     }
 }
 /// The root with everything a setting governs: a title, a repository, a link,

@@ -363,6 +363,79 @@ child CPU totals; arguments, paths and command output are never included.
 
 ## Stores
 
+**First-read recency tiers.** A destination's first census anchor starts its tier
+at 1 day in `BackfillState.first_read_tiers`; the tiers are 1, 3, 7, 14, 30, then
+the 60-day first-read window, and a tier's bound is the source's anchor minus its
+days (1 day is 24 hours). An absent entry is the final tier, so a daemon upgraded
+mid-import keeps its untiered order and pacing. Claude, Codex and Pi are tiered.
+The participants are the sources rotation runs (`enabled_snapshot_sources_in`:
+granted and without a local disable marker) whose import for the destination is
+not complete and that are not in the tier's `stopped` set, anchored or not: a
+source that has not anchored yet holds the tier until its first prepare, which
+anchors it or, when it may not anchor (an existing index, a completed or
+unverified history), puts it in `stopped`. A policy stop (disabled by an admin, a
+zero receipt window) or a failed prepare also puts the source in `stopped`, so it
+never holds its siblings' tier; its work stays owed and its next anchored prepare
+rejoins. Prepare sets the runtime `first_read_tier_cutoff`. `TierGate` looks at the
+queue once per selection: a queued file never read (no index entry, confirmed
+empty, account hold or a Tail head with a reduction; the census's metadata-only
+head for an owed file is no read) older than the bound sits out page selection; it
+stays queued, so the census, freshness debt, disappearance diagnostics and
+completion keep owing it, and it never asks for a paced pass. A Codex join group is
+read whole once any member is selected, so it takes its newest member's tier;
+within a tier the newest-first order is unchanged.
+
+Claude admits a path family (root, subagents, path twins) whole once any member is
+read or in the tier. A copied or forked file's holder is known only from the request
+census after a read, so no tier holds a child for its holder: whenever the holder
+is older than the bound, the child is read first, counts its unproven prefix and is
+marked `DISCLOSED`. Every main in that copy's folder is then pulled into the current
+tier with its family, and the page that reads a pulled main also re-reads the
+folder's `DISCLOSED` copies, so the copy decision proves the holder in that page and
+both corrected bodies are uploaded together; the server never holds the holder
+beside an uncorrected copy. The copy's first body still differs from an untiered
+read that reads the holder and the copy in one page: it counts and discloses the
+prefix until the holder's page. The existing save-time re-decide
+(`CopyOwnership::reconcile`, changed copy decisions, settled counted copies) still
+settles a holder in another folder, so the final state matches an untiered read.
+Chains follow one read at a time. A folder whose copy never finds its holder
+re-reads that copy on each tier page that reads one of its pulled mains. Under an
+account-switch claim cutoff, a holder whose session ended before the cutoff is
+the previous owner's history: finish never uploads it, yet it still owns the
+requests its copies hold, so a copied prefix from before the cutoff counts
+nowhere at the new destination, whatever the page placement or read order. It
+proves them, in its page or once finish has emptied it (`confirmed_empty_files`),
+only with positive local facts: its file was last written before the cutoff
+(the census record's mtime; a file emptied for another reason, such as a parse
+with no positive usage, may be newer), the birth store records this location
+as its session's only one (a path twin may carry its requests in a body that is
+refused; no observation proves nothing), and its current
+census holds the request. The named-parent fallback never uses it. Otherwise,
+and for a deleted holder, its copies count the prefix and disclose it. The older paths a page selected through a family pull
+and through a folder pull are counted on `source_finish` for diagnostics only.
+
+Finish records a participant's tier done when its walk ended (or its census
+completed, which an empty history does on its first pass), no selectable census
+member is left, no terminal retry is held and its upload settled. A tier waits only
+for work in flight inside the import: a queued file under a Claude account hold, or
+an unchanged file (same listing stamp) whose every current entity has a permanent
+refusal (the upload ledger's or an `UnprovenTerminal` quarantine) whose refused body
+witnesses rebuild the file's stored body digest, stays
+owed, retried and disclosed as before but does not hold the tier, and a
+transport-settled pass whose only holds are account deferrals settles it. A pending
+retry, shed, transport failure, lost ACK or conflict in retry still holds it. Under
+the backfill-state lock the tier advances once every participant is done; the saved
+advance returns the participants, and finish asks each for a paced pass. The census
+cannot complete while deferred files are queued, so bootstrap completion follows the
+final tier. While the destination is in the final tier, paced requests carry
+`first_import = false`: those passes run at background QoS at the unchanged
+`PACED_AC`/`PACED_BATTERY` pace, while tiers 1 to 30 keep first-import QoS on AC.
+`first_read_cutoff` keeps meaning 60 days; `tier_ready_cutoff` reports the highest
+completed tier that the source also finished on its own pass (`finished`, which a
+stop forgets), so a late, resumed or recovered source claims nothing until it
+finishes a tier itself. The field is omitted otherwise, and the receiver keeps its
+last stored value. The terminal report reads both from one backfill-state load.
+
 Terminal scan status optionally reports `first_read_cutoff`, the destination/source's
 first census end minus the fixed 60-day first-read window, as UTC milliseconds.
 The first census end is saved once in `BackfillState.first_census_ends` before
@@ -392,7 +465,27 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   births are known and equal, and both bounded sample digests match. This removes a
   whole-file read for retention touches; ordinary later writes still read Full. A first
   touch after a long gap can still read Full; steady reuse depends on the lease cadence
-  remaining within its backdate interval. Source fingerprints include metadata and
+  remaining within its backdate interval. A same-size mtime move outside that bound,
+  forward or back, continues from stored state only when the file's write
+  generation count proves it a touch: macOS APFS counts every data write, the same
+  bytes rewritten included, and never a metadata change such as setting the mtime.
+  The count is read with `fgetattrlist` on the held descriptor, before the samples,
+  and is kept only when it is nonzero, the file system returned it and the volume
+  is APFS (`fstatfs`, kept per device). A read keeps it only when the held
+  descriptor reports the same count at commit and the read sealed the whole
+  opening length; it is stored beside the certificate in the Tail head (envelope 2,
+  writer capability 7) and compared only under the same inode and the same known
+  birth. A due audit still reads Full, so a touch never stands in for an audit or
+  reaches a quiet retirement. Otherwise a proven touch reads both samples (the
+  retained checkpoint's, or the restore's) and then continues as an unchanged
+  file does: it carries the certificate's verification and debt, earns
+  no Full credit, and never enters `same_content`/`unchanged`, so an exact-stamp
+  seal and Full-verification credit ignore the count. Without a count (another
+  platform or file system, a zero count, a head written before counts, a file set
+  aside) the rule above is unchanged. Freshness debt lists a proven touch at its
+  indexed mtime, so the walk owes what it owed before the touch. Rolling back
+  below the release that writes envelope 2 holds collection until roll-forward.
+  Source fingerprints include metadata and
   bounded content samples, rather than a whole-file digest. Freshness debt clears only
   through the existing receipt proof on a later listing.
   Codex checks its ownership-affecting sidecar binding before reusing a head; changed
@@ -728,6 +821,25 @@ same `collected_at`, empty batches included. The read's last covered day is alwa
 complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
+
+## Install variants
+
+Ottto installs one of two variants per Mac: the app (`Ottto.app` runs
+`serve-xpc` from its bundle) or the headless Homebrew formula (`serve`). Both
+use the per-user launchd label `net.ottto.service`, and the app wins. Before
+it takes the state lock, a launchd-started `serve` whose executable is under
+a Homebrew prefix checks for an installed app (`/Applications` or
+`~/Applications`) with an executable bundled service, a version at least its
+own and a signature that satisfies the Companion code requirement. If that
+app's own process runs for this user, the Homebrew copy hands over: it writes
+its pid to `homebrew-handover` in the support folder and waits, holding no
+state, up to 180 s for the app to take the job back with `--migrate-owner`
+(launchd's bootout ends it). If the app quits or does not take over, it
+removes the marker and serves. With the app installed but not running, or
+while the app's `homebrew-keeps-serving` marker exists (the app restored this
+job after its own takeover failed), it serves at once (`homebrew_step_aside`).
+Doctor reports a second variant under `install_variants`. The release gate
+runs the same decision through the hidden `service step-aside-check`.
 
 ## Local control dispatch
 

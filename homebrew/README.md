@@ -50,14 +50,15 @@ install a public `ottto-service` alias.
 
 ## Service Lifecycle
 
-The Homebrew formula owns the per-user launchd service label
-`net.ottto.service`. It runs:
+The formula is Ottto's headless variant, for a Mac without `Ottto.app`. Its
+service uses the per-user launchd label `net.ottto.service`, the same label
+as the app, and runs:
 
 ```bash
 ottto-service serve --socket "$HOME/Library/Application Support/Ottto/ottto-service.sock"
 ```
 
-Use Homebrew to manage that service:
+On a Mac without the app, use Homebrew to manage that service:
 
 ```bash
 brew services start ottto
@@ -71,9 +72,13 @@ The CLI should be checked after the service starts:
 ottto --no-autostart status --json
 ```
 
-The current CLI autostart path still targets the app/dev LaunchAgent while
-Phase 2 service identity work is incomplete. For Homebrew installs, start the
-service with `brew services start ottto` instead of relying on CLI autostart.
+One Ottto per Mac, and the app wins. A Homebrew `serve` started while this
+user's installed `Ottto.app` is running hands over: it waits, holding no
+state, for the app to take its service back (up to 180 s), and serves if the
+app quits or does not take over. The app then offers to remove the formula.
+With the app quit, the Homebrew service keeps running. On a Mac with the app, don't run `brew services` for ottto; remove the
+formula with `brew uninstall ottto`. See
+[docs/install.md](../docs/install.md#two-variants-one-per-mac).
 
 ## Update And Uninstall
 

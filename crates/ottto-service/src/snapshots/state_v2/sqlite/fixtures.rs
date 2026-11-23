@@ -274,6 +274,10 @@ pub(in super::super) fn set_record_rows_for_test(db: &mut Sqlite, rows: u64) {
 pub(in super::super) fn writer_capability_for_test() -> u64 {
     migrations::WRITER_CAPABILITY
 }
+/// Whether this committed store refuses the previous release's writer.
+pub(in super::super) fn previous_writer_refused_for_test(db: &Sqlite) -> bool {
+    migrations::refused_at_for_test(db.conn().unwrap(), migrations::WRITER_CAPABILITY - 1)
+}
 
 thread_local! {
     static LOSE_COMMIT_REPLY: std::cell::RefCell<Option<std::path::PathBuf>> =

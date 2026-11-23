@@ -276,7 +276,11 @@ Homebrew evidence also has to prove that launching `Ottto.app` before and after
 upgrade preserves the Homebrew-owned LaunchAgent, that doctor reports no owner
 drift, and that update JSON reports the Homebrew install owner. App-bundle
 evidence has to prove a second Homebrew install/start attempt is either a safe
-refusal with instructions or an explicit migration, not silent owner takeover.
+refusal with instructions or an explicit migration, not silent owner takeover. The
+release gate checks the mechanism on the packaged app: `macos_release_gate.sh`
+asks the app's bundled `ottto-service` to decide as a launchd-started Homebrew
+copy (`service step-aside-check`), and a stable release fails unless that copy
+hands over to the packaged app and serves when no app is there.
 The evidence file must match the exact manifest version, commit, and SHA-256,
 prove the expected per-owner local-runtime binding, and it must not contain
 extra required install owners, unknown per-owner check names, local user paths,

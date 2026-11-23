@@ -1780,6 +1780,14 @@ pub(crate) struct PassOutcomes {
     pub(crate) paced_first_import: u64,
     pub(crate) paced_power_allowed: u64,
     pub(crate) paced_power_battery: u64,
+    /// The first-read recency tier gating this pass, and the older Claude
+    /// paths it selected via a family pull and via a `DISCLOSED` folder pull.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_read_tier_days: Option<u64>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) tier_pulled_family: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) tier_pulled_folder: u64,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.
@@ -2434,6 +2442,21 @@ pub(crate) fn claude_state_v2(counts: &impl Serialize) {
 /// wire event.
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
+}
+/// Local alarm: rows the Claude relay journal holds for per-session files that
+/// refuse them passed the alert size, once per drain while they stay past it.
+/// Counts only; the rows are kept, never dropped.
+pub(crate) fn otlp_relay_journal_kept_alarm(rows: u64, bytes: u64) {
+    #[derive(Serialize)]
+    struct Kept {
+        otlp_relay_journal_kept_rows: u64,
+        otlp_relay_journal_kept_bytes: u64,
+    }
+    let counts = Kept {
+        otlp_relay_journal_kept_rows: rows,
+        otlp_relay_journal_kept_bytes: bytes,
+    };
+    traversal_point("otlp_relay_journal_kept_alarm", "claude_code", &counts);
 }
 pub(crate) fn codex_continuation(held: Option<&'static str>) {
     let counts = serde_json::json!({
@@ -4633,6 +4656,12 @@ mod tests {
             "otlp_relay_append_gap_5_30s_cumulative",
             "otlp_relay_append_gap_30_120s_cumulative",
             "otlp_relay_append_gap_ge_120s_or_first_cumulative",
+            "otlp_relay_journal_appends_cumulative",
+            "otlp_relay_journal_drains_cumulative",
+            "otlp_relay_journal_drained_rows_cumulative",
+            "otlp_relay_journal_skipped_lines_cumulative",
+            "otlp_relay_journal_drain_ms_cumulative",
+            "otlp_relay_journal_drains_ge_1s_cumulative",
         ] {
             assert_eq!(record["counts"][field], u64::MAX);
         }
@@ -4643,9 +4672,9 @@ mod tests {
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
         // The four Pi fields, the Codex tier field, the two Claude usage
         // fields, the seven OTLP skip fields, the per-kind JSON cache map and
-        // the relay append fields stay bounded at u64::MAX.
+        // the relay append and journal fields stay bounded at u64::MAX.
         // The six small-file fields add 349 bytes at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 4350);
+        assert!(serde_json::to_string(record).unwrap().len() < 4950);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

@@ -3,7 +3,6 @@
 use crate::control::api_url_with_base;
 use crate::control::backend_error_indicates_account_gone;
 use crate::control::backend_get_json_with_timeout;
-use crate::control::cli_error_message;
 use crate::control::current_rfc3339;
 use crate::control::emit_setup_run_fast_verification_marker_with_refresh_mut;
 use crate::control::empty_source_config;
@@ -27,7 +26,6 @@ use crate::control::recent_pi_session_files;
 use crate::control::reconcile_codex_source_off;
 use crate::control::record_setup_action_event;
 use crate::control::record_smoke_prompt;
-use crate::control::refresh_agent_status_for;
 use crate::control::refresh_setup_run_token_via_device_secret;
 use crate::control::require_authorized_local_client;
 use crate::control::run_bounded_command;
@@ -51,7 +49,6 @@ use crate::control::thread;
 use crate::control::url_with_query_params;
 use crate::control::verification_failure_code;
 use crate::control::verification_failure_message;
-use crate::control::verification_result_should_refresh_agent_status;
 use crate::control::wait_for_setup_run_verification_with_refresh_mut_timeout;
 use crate::control::wait_for_verification_with_refresh_mut;
 use crate::control::BackendErrorDetails;
@@ -675,39 +672,6 @@ fn record_verify_refresh_rejection(
     if let Some(rejection) = terminal_refresh_rejection(error) {
         let _ = daemon.record_setup_run_read_rejected(binding, rejection);
     }
-}
-
-/// Re-run source verification from inside the daemon (the background
-/// re-verify loop), with the same post-verify convergence steps the manual
-/// Verify command performs: refresh agent status for soft failures and push
-/// the local-health projection so the app and backend see the new state on
-/// their next poll instead of dwelling on a stale failure.
-pub(crate) fn reverify_failed_source(
-    daemon: &LocalDaemon,
-    source: SourceKind,
-) -> Result<SourceVerificationResult, LocalApiError> {
-    let authorization = RequestAuthorization::DaemonInternal;
-    let result =
-        crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Schedule, || {
-            verify_source(daemon, &authorization, source, false)
-        })?;
-    if verification_result_should_refresh_agent_status(&result) {
-        if let Err(error) =
-            refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
-        {
-            eprintln!(
-                "background re-verify agent status refresh skipped: {}",
-                cli_error_message(&error)
-            );
-        }
-    }
-    if let Err(error) = crate::snapshot_sync::upload_local_health_projection_now(daemon) {
-        eprintln!(
-            "background re-verify local health projection upload skipped: {}",
-            crate::snapshot_sync::safe_error(&error)
-        );
-    }
-    Ok(result)
 }
 
 /// True when the local OTLP relay can actually forward telemetry to the backend

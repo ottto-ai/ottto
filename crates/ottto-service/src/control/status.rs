@@ -743,6 +743,80 @@ fn install_owner_label(install_owner: InstallOwner) -> &'static str {
     }
 }
 
+/// Doctor's check for a second Ottto install variant. Ottto has two: the app
+/// (its bundle runs the daemon) and the headless Homebrew formula. Both use
+/// launchd label `net.ottto.service` and one LaunchAgent file, so one runs per
+/// Mac and the app wins. Doctor only: it lists two Cellar folders and
+/// checks that a few paths exist; it reads no file.
+///
+/// - `formula_next_to_app`: the daemon belongs to the app and a formula is
+///   also installed. `brew services start`, `restart` or `run` for ottto
+///   would point the app's job at the formula, and `stop` would unload it.
+/// - `homebrew_service_with_app`: the daemon is the formula's and an app
+///   bundle is installed. The app should run the service.
+/// - `system_service`: a root LaunchDaemon (`sudo brew services start`) is
+///   registered next to this user's daemon.
+pub(super) fn install_variant_conflict(owner: InstallOwner) -> Option<serde_json::Value> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut apps = vec![std::path::PathBuf::from("/Applications/Ottto.app")];
+    if let Some(home) = &home {
+        apps.push(home.join("Applications").join("Ottto.app"));
+    }
+    install_variant_conflict_in(
+        owner,
+        &[
+            std::path::Path::new("/opt/homebrew/Cellar/ottto"),
+            std::path::Path::new("/usr/local/Cellar/ottto"),
+        ],
+        &apps,
+        std::path::Path::new("/Library/LaunchDaemons/net.ottto.service.plist"),
+    )
+}
+
+pub(super) fn install_variant_conflict_in(
+    owner: InstallOwner,
+    cellars: &[&std::path::Path],
+    apps: &[std::path::PathBuf],
+    system_plist: &std::path::Path,
+) -> Option<serde_json::Value> {
+    let mut versions = cellars
+        .iter()
+        .filter_map(|cellar| std::fs::read_dir(cellar).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|version| {
+            !version.is_empty()
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    let app = apps.iter().find(|app| {
+        app.join("Contents")
+            .join("Helpers")
+            .join("ottto-service")
+            .is_file()
+    });
+    let system_service = system_plist.exists();
+    let kind = match owner {
+        InstallOwner::AppBundle if !versions.is_empty() => "formula_next_to_app",
+        InstallOwner::Homebrew if app.is_some() => "homebrew_service_with_app",
+        _ if system_service => "system_service",
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "kind": kind,
+        "versions": versions,
+        "daemon_version": compiled_release_version(),
+        "app_installed": app.is_some(),
+        "system_service": system_service,
+    }))
+}
+
 pub(super) fn detect_install_owner() -> InstallOwner {
     std::env::current_exe()
         .ok()
@@ -792,13 +866,32 @@ fn load_persisted_machine_icon() -> Option<(String, String)> {
 }
 
 pub(super) fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
+    service_owner_state_with(
+        client_owner,
+        crate::macos_service::inspect_launch_agent_owner,
+    )
+}
+
+/// The ordinary status request's owner state: the launchd job probe may be
+/// reused for up to 60 s while launchd runs this process as the job.
+pub(super) fn cached_service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
+    service_owner_state_with(
+        client_owner,
+        crate::macos_service::inspect_launch_agent_owner_for_status,
+    )
+}
+
+fn service_owner_state_with(
+    client_owner: InstallOwner,
+    inspect: fn(
+        &std::path::Path,
+        Option<&std::path::Path>,
+    ) -> crate::macos_service::LaunchAgentOwnerState,
+) -> ServiceOwnerState {
     let daemon_owner = detect_install_owner();
     let owner_state = local_lifecycle_home_dir().ok().map(|home| {
         let plist_path = crate::macos_service::launch_agent_path(&home);
-        crate::macos_service::inspect_launch_agent_owner(
-            &plist_path,
-            std::env::current_exe().ok().as_deref(),
-        )
+        inspect(&plist_path, std::env::current_exe().ok().as_deref())
     });
     let (plist_owner, loaded_owner, plist_exists, launchd_loaded, mut owner_drift) =
         if let Some(owner_state) = owner_state {

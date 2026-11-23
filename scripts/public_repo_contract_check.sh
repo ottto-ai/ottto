@@ -2242,16 +2242,16 @@ def check_install_docs_contracts() -> None:
                 "install docs must prohibit mutable binary-copy installs",
             ),
             (
-                "`net.ottto.service` is a single-owner user LaunchAgent",
-                "install docs must document single-owner LaunchAgent authority",
+                "LaunchAgent `net.ottto.service`, so only one can run,\nand the app wins",
+                "install docs must document one service per Mac with the app winning",
             ),
             (
-                "Homebrew-owned LaunchAgent stays managed by `brew services`",
-                "install docs must keep Homebrew-owned services under brew services",
+                "It never runs Homebrew without that click.",
+                "install docs must keep the app's Homebrew migration an explicit click",
             ),
             (
-                "Do not install both the\napp bundle and Homebrew as independent service owners.",
-                "install docs must prohibit independent Homebrew/app-bundle owners",
+                "Ottto ships two install variants. Install one per Mac:",
+                "install docs must prohibit installing both variants",
             ),
             (
                 "The formula must pin immutable artifact URLs and SHA-256 hashes from the stable\nrelease manifest.",

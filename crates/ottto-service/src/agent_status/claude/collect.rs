@@ -711,6 +711,25 @@ pub(in crate::agent_status) fn apply_claude_token_owner(
 /// Also returns this pass's exact Claude Desktop folder pairs, read in the same
 /// single scan as the default snapshot's Desktop readings, and the default
 /// home's owner check.
+/// The lifetime warning is about the default login's own credential: name its
+/// exact account and organization, so the app shows it on that account's row.
+/// Without a proven identity it stays unbound.
+pub(in crate::agent_status) fn bind_claude_relogin_warning(
+    diagnostics: &mut [AgentStatusDiagnostic],
+    identity: Option<&(String, String)>,
+) {
+    let Some((account_hash, organization_hash)) = identity else {
+        return;
+    };
+    for diagnostic in diagnostics
+        .iter_mut()
+        .filter(|diagnostic| diagnostic.code == CLAUDE_RELOGIN_APPROACHING_CODE)
+    {
+        diagnostic.account_identifier_hash = Some(account_hash.clone());
+        diagnostic.organization_identifier_hash = Some(organization_hash.clone());
+    }
+}
+
 pub(in crate::agent_status) fn collect_claude_status(
     captured_at: String,
     expires_at: String,
@@ -1061,6 +1080,7 @@ pub(in crate::agent_status) fn collect_claude_status(
             &account.credential_fingerprint_hash,
         );
     }
+    bind_claude_relogin_warning(&mut snapshot.diagnostics, strong_oauth_identity.as_ref());
     let oauth_outcome = match (
         strong_oauth_identity.as_ref(),
         stable_default_credential.as_ref().ok(),

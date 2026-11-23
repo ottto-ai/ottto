@@ -674,3 +674,147 @@ fn forced_verified_twin_falls_back_without_valid_head() {
         f.compare(&cold, &restart, pages);
     });
 }
+
+/// What decides and proves the session's owner, for each copy: source
+/// witness, entity and body, receipt, entity set, census membership and
+/// owed upload context; and the index's upload-context stamps and copy
+/// removals.
+fn owner_facts(index: &ScanIndex, paths: &[&PathBuf]) -> Value {
+    let files = paths
+        .iter()
+        .map(|path| {
+            let key = path.to_string_lossy().into_owned();
+            let entry = &index.files[key.as_str()];
+            let census = index
+                .claude_request_census_for_test()
+                .get(&key)
+                .map(|record| (record.request_hashes_for_test().to_vec(), record.is_twin()));
+            serde_json::json!({
+                "source_witness": entry.source_file_fingerprint,
+                "entity": entry.last_snapshot_fingerprint,
+                "body": entry.last_upload_body_witness,
+                "receipt": entry.upload_context_receipt,
+                "entities": index.file_snapshot_fingerprints.get(&key),
+                "empty": index.confirmed_empty_files.contains(&key),
+                "census": census,
+                "owed": upload_context_owed_for_test(index, path),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "files": files,
+        "stamps": index.upload_context_proof,
+        "removals": format!("{:?}", index.claude_copy_removals),
+    })
+}
+
+impl Twin {
+    /// One unhinted page a visit later, delivered and committed. Returns the
+    /// committed index (under the setup's destination) and what it offered.
+    fn visit(&mut self) -> (ScanIndex, BTreeMap<String, Value>) {
+        self.now.set(self.now.get() + 7 * 60 * 60);
+        let (mut index, offered) = with_scan_clock(self.now.get(), || {
+            let mut page = self.c.raw(&self.owner, self.prior.clone(), 2, true, &[]);
+            page.enrich(&self.c);
+            page.finish();
+            let offered = mixed_route(&page, &e2_progress(), Mode::Ram).snapshots;
+            accept_page(&mut page);
+            let index = self
+                .disk
+                .commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
+            (index, offered)
+        });
+        self.prior = index.clone();
+        index.activate_upload_context("e2-synthetic-destination".into());
+        (index, offered)
+    }
+    fn acquired(&self, path: &Path) -> bool {
+        let reads = self.owner.acquisitions.lock().unwrap();
+        reads.iter().any(|read| read.path == path)
+    }
+}
+
+/// [money] A twin pair with a settled owner; the copy that does not own the
+/// session changes only its ctime (a permission round trip, or a lease
+/// renewal that sets the mtime it already had): same bytes, size, mtime,
+/// inode and birth. Nothing selects it: the owner, both copies' witnesses,
+/// entities, receipts and the upload-context stamps stay, and nothing is
+/// offered. Write generation counts never enter a ctime-only change, so the
+/// run without counts asserts the same. A real same-size edit of that copy
+/// is still read and re-decided (positive control).
+#[test]
+fn a_ctime_only_touch_of_the_twin_copy_keeps_the_owner() {
+    use crate::transcript_acquisition::{Generations, UseGenerations};
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    with_e2(|| {
+        for generations in [Generations::Simulated, Generations::Off] {
+            for lease in [false, true] {
+                let _counts = UseGenerations::new(generations);
+                let case = format!("{generations:?} lease={lease}");
+                let mut t = Twin::new(&format!("twin-ctime-only-{generations:?}-{lease}"), false);
+                // Settle what setup left (its retired holder head), then
+                // require a quiet visit: the owner is settled.
+                t.visit();
+                t.owner.acquisitions.lock().unwrap().clear();
+                let (settled, offered) = t.visit();
+                assert!(!offered.contains_key(ROOT), "{case}: settled");
+                assert!(!t.acquired(&t.twin), "{case}: settled");
+                let (holder, twin) = (t.holder.clone(), t.twin.clone());
+                let paths = [&holder, &twin];
+                let before = owner_facts(&settled, &paths);
+
+                let stat = std::fs::metadata(&twin).unwrap();
+                if lease {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&twin)
+                        .unwrap()
+                        .set_modified(stat.modified().unwrap())
+                        .unwrap();
+                } else {
+                    let mode = stat.permissions().mode();
+                    std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(mode ^ 0o100))
+                        .unwrap();
+                    std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(mode)).unwrap();
+                }
+                let now = std::fs::metadata(&twin).unwrap();
+                assert_eq!(
+                    (now.len(), now.modified().unwrap(), now.ino()),
+                    (stat.len(), stat.modified().unwrap(), stat.ino()),
+                    "{case}"
+                );
+                assert_ne!(
+                    (now.ctime(), now.ctime_nsec()),
+                    (stat.ctime(), stat.ctime_nsec()),
+                    "{case}: the ctime moved"
+                );
+
+                t.owner.acquisitions.lock().unwrap().clear();
+                let (touched, offered) = t.visit();
+                assert!(
+                    !t.acquired(&twin),
+                    "{case}: a ctime-only change selects nothing"
+                );
+                assert!(!offered.contains_key(ROOT), "{case}: no new offer");
+                assert_eq!(owner_facts(&touched, &paths), before, "{case}");
+
+                if !lease {
+                    let bytes = std::fs::read_to_string(&twin).unwrap();
+                    let edited = bytes.replacen("claude-haiku-4-5", "claude-haiku-4-6", 1);
+                    assert_ne!(edited, bytes);
+                    assert_eq!(edited.len(), bytes.len());
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&twin)
+                        .unwrap()
+                        .write_all(edited.as_bytes())
+                        .unwrap();
+                    t.owner.acquisitions.lock().unwrap().clear();
+                    t.visit();
+                    assert!(t.acquired(&twin), "{case}: an edit is read and re-decided");
+                }
+            }
+        }
+    });
+}

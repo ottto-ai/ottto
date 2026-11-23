@@ -2466,6 +2466,37 @@ fn setup_payload_exit_code(payload: &serde_json::Value) -> i32 {
 /// (message text, daemon, source, account state, status/state) is routed
 /// through `sanitize_for_terminal` so a malicious backend cannot inject
 /// terminal escape sequences into the TTY.
+/// Doctor's line for a second install variant: one Ottto per Mac, and
+/// the app wins. `None` when doctor found none.
+fn install_variant_line(variants: &serde_json::Value) -> Option<String> {
+    let versions = variants["versions"]
+        .as_array()
+        .map(|versions| {
+            versions
+                .iter()
+                .filter_map(|version| version.as_str())
+                .map(sanitize_for_terminal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let mut line = match variants["kind"].as_str()? {
+        "formula_next_to_app" => format!(
+            "A Homebrew ottto formula ({versions}) is also installed, but this Mac's daemon belongs to Ottto.app. One Ottto per Mac: open Ottto.app and choose Remove Homebrew copy, or run `brew uninstall ottto`. Don't run `brew services` for ottto on this Mac: it would replace or stop the app's daemon."
+        ),
+        "homebrew_service_with_app" => "Ottto.app is also installed, but this Mac's daemon is the Homebrew formula's. One Ottto per Mac, and the app wins: open Ottto.app and choose Move service to the app, or run `brew services stop ottto && brew uninstall ottto` and then open Ottto.app. To keep the headless install instead, uninstall the app.".to_string(),
+        "system_service" => String::new(),
+        _ => return None,
+    };
+    if variants["system_service"].as_bool() == Some(true) {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str("A system-wide Ottto service from `sudo brew services` is also registered; remove it with `sudo brew services stop ottto`.");
+    }
+    (!line.is_empty()).then_some(line)
+}
+
 fn human_summary(payload: &serde_json::Value) -> String {
     if payload.get("schema").and_then(|value| value.as_str()) == Some("ottto.upload_receipts.v1") {
         return human_receipts(payload);
@@ -2492,6 +2523,10 @@ fn human_summary(payload: &serde_json::Value) -> String {
             payload["local_otel"]["bytes"].as_u64(),
         ) {
             summary.push_str(&format!("\nLocal OTEL store: {files} files, {bytes} bytes"));
+        }
+        if let Some(line) = install_variant_line(&payload["install_variants"]) {
+            summary.push('\n');
+            summary.push_str(&line);
         }
         summary
     };
@@ -3190,8 +3225,41 @@ mod tests {
         assert_eq!(human_summary(&payload), normal);
     }
 
-    /// [behaviour] Doctor summary: blocker guidance first, then running state
-    /// and the local OTEL store line when present.
+    /// [behaviour] Doctor names the Homebrew service next to the app and a
+    /// system-wide service with their fixes, and says nothing without a kind.
+    #[test]
+    fn doctor_install_variant_lines_name_each_fix() {
+        let line = install_variant_line(&serde_json::json!({
+            "kind": "homebrew_service_with_app",
+            "versions": ["0.1.262"],
+            "app_installed": true,
+            "system_service": true
+        }))
+        .unwrap();
+        for part in [
+            "Move service to the app",
+            "brew services stop ottto && brew uninstall ottto",
+            "uninstall the app",
+            "sudo brew services stop ottto",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        let system = install_variant_line(&serde_json::json!({
+            "kind": "system_service",
+            "versions": [],
+            "system_service": true
+        }))
+        .unwrap();
+        assert!(
+            system.starts_with("A system-wide Ottto service"),
+            "{system}"
+        );
+        assert!(install_variant_line(&serde_json::Value::Null).is_none());
+        assert!(install_variant_line(&serde_json::json!({"kind": "later"})).is_none());
+    }
+
+    /// [behaviour] Doctor summary: blocker guidance first, then running state,
+    /// the local OTEL store line and a Homebrew formula warning when present.
     #[test]
     fn doctor_human_output_surfaces_reconnect_finding_before_daemon_running() {
         let guidance = "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads";
@@ -3205,9 +3273,16 @@ mod tests {
         payload["canonical_health"]["blockers"] = serde_json::json!([]);
         assert_eq!(human_summary(&payload), "Ottto local daemon: running");
         payload["local_otel"] = serde_json::json!({"files": 2, "bytes": 8});
+        payload["install_variants"] = serde_json::json!({
+            "kind": "formula_next_to_app",
+            "versions": ["0.1.258"],
+            "daemon_version": "0.1.260",
+            "app_installed": true,
+            "system_service": false
+        });
         assert_eq!(
             human_summary(&payload),
-            "Ottto local daemon: running\nLocal OTEL store: 2 files, 8 bytes"
+            "Ottto local daemon: running\nLocal OTEL store: 2 files, 8 bytes\nA Homebrew ottto formula (0.1.258) is also installed, but this Mac's daemon belongs to Ottto.app. One Ottto per Mac: open Ottto.app and choose Remove Homebrew copy, or run `brew uninstall ottto`. Don't run `brew services` for ottto on this Mac: it would replace or stop the app's daemon."
         );
     }
 

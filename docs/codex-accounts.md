@@ -185,6 +185,10 @@ directly and does not promise that a provider-revoked login will remain valid.
 When Codex reports that a durable home needs login, the app should offer the
 same provider-owned reconnect flow for that exact home.
 
+A durable connection belongs to the Mac that signed it in; a copied support
+folder (Migration Assistant, restore, manual copy) leaves two holders of one
+refresh token, and one of them will ask to sign in again.
+
 ## Background limit refresh
 
 The daemon reads each Codex home's limits on its own schedule (every 5 minutes

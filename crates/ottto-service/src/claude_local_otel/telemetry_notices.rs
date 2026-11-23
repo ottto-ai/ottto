@@ -4,6 +4,9 @@ use super::*;
 struct Notices {
     active: bool,
     roots: BTreeSet<String>,
+    /// Roots captured while active whose rows are not yet readable; noticed
+    /// when they are, even if notices were deactivated meanwhile.
+    captured: BTreeSet<String>,
 }
 fn notices() -> &'static Mutex<BTreeMap<PathBuf, Notices>> {
     static VALUE: OnceLock<Mutex<BTreeMap<PathBuf, Notices>>> = OnceLock::new();
@@ -25,17 +28,30 @@ pub(crate) fn rest_entries() -> Option<(usize, usize)> {
     let all = notices().try_lock().ok()?;
     Some((all.len(), all.values().map(|state| state.roots.len()).sum()))
 }
-pub(super) fn appended(support: &Path, root: &str) {
+/// The relay stored a row of `root`: eligible for a notice only if notices
+/// are active now.
+pub(super) fn captured(support: &Path, root: &str) {
     if let Ok(mut all) = notices().lock() {
         if let Some(state) = all.get_mut(support).filter(|state| state.active) {
-            state.roots.insert(root.to_owned());
+            state.captured.insert(root.to_owned());
+        }
+    }
+}
+/// The rows of `root` reached its per-session file: notice an eligible root.
+pub(super) fn readable(support: &Path, root: &str) {
+    if let Ok(mut all) = notices().lock() {
+        if let Some(state) = all.get_mut(support) {
+            if state.captured.remove(root) {
+                state.roots.insert(root.to_owned());
+            }
         }
     }
 }
 /// One appended row's notice, as the relay records it.
 #[cfg(test)]
 pub(crate) fn appended_for_test(support: &Path, root: &str) {
-    appended(support, root);
+    captured(support, root);
+    readable(support, root);
 }
 pub(crate) fn pending(support: &Path) -> Result<BTreeSet<String>> {
     Ok(notices()
