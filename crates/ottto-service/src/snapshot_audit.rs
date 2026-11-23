@@ -324,6 +324,15 @@ fn audit_page(
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if options.source == SnapshotSource::ClaudeCode {
         if let Some(support_dir) = options.claude_support_dir.as_deref() {
+            // The audit never drains the daemon's relay journal: rows still
+            // waiting there are missing from the per-session files read here.
+            if let Ok(waiting @ 1..) =
+                crate::claude_local_otel::relay_journal_waiting_rows(support_dir)
+            {
+                eprintln!(
+                    "snapshot audit: Claude evidence input is incomplete: {waiting} rows wait in the relay journal"
+                );
+            }
             crate::snapshots::claude_request_identity::retain_root_accounts(
                 &mut scan.snapshots,
                 index,

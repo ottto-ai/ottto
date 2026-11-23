@@ -32,6 +32,9 @@ pub(crate) mod support_health;
 mod append_handle_tests;
 #[cfg(test)]
 mod decoder_tests;
+mod relay_journal;
+#[cfg(test)]
+mod relay_journal_tests;
 #[cfg(test)]
 mod trace_read_bound_tests;
 
@@ -516,16 +519,11 @@ fn persist_api_evidence(
     let mut handles = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("effort store lock poisoned"))?;
-    append_rows(
+    relay_journal::append(
         &mut handles,
         support_dir,
-        evidence.iter().map(|item| {
-            (
-                item.session_id.as_ref(),
-                evidence_path(support_dir, &item.session_id),
-                item,
-            )
-        }),
+        relay_journal::Kind::Api,
+        evidence.iter().map(|item| (item.session_id.as_ref(), item)),
     )
 }
 
@@ -551,16 +549,11 @@ pub fn capture_claude_llm_request_traces(
     let mut handles = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude local OTEL store lock poisoned"))?;
-    append_rows(
+    relay_journal::append(
         &mut handles,
         support_dir,
-        evidence.iter().map(|item| {
-            (
-                item.session_id.as_ref(),
-                trace_evidence_path(support_dir, &item.session_id),
-                item,
-            )
-        }),
+        relay_journal::Kind::Trace,
+        evidence.iter().map(|item| (item.session_id.as_ref(), item)),
     )
 }
 
@@ -1660,6 +1653,11 @@ fn unlink_telemetry_pair_locked(
     stem: &str,
     pair: &TelemetryPair,
 ) -> std::io::Result<bool> {
+    // A row of this pair still in the relay journal (including one its file
+    // refused) or in `prev` would recreate the pair after the unlink: keep it.
+    if relay_journal::waits_for(support_dir, stem) {
+        return Ok(false);
+    }
     let paths = telemetry_member_paths(support_dir, stem);
     for (path, generation) in paths.iter().zip(&pair.generations) {
         if telemetry_member(path).map_err(|_| std::io::Error::other("member unreadable"))?
@@ -2059,15 +2057,14 @@ fn append_trace_ownership_evidence(
     .map(|stored| stored != 0)
 }
 
-/// Preserve each file's row order and encoding, with one append per request.
-/// The caller holds `append_lock`; writes remain unbuffered and do not fsync.
+/// Test fixtures: preserve each file's row order and encoding, with one append
+/// per file, as a journal drain writes them. The caller holds `append_lock`.
+#[cfg(test)]
 fn append_rows<'a, T: Serialize + 'a>(
     handles: &mut AppendHandles,
     support_dir: &Path,
     rows: impl IntoIterator<Item = (&'a str, PathBuf, &'a T)>,
 ) -> Result<usize> {
-    use crate::local_resource_diagnostics::cache_lifecycle::{self, Event};
-
     anyhow::ensure!(
         !handles.disabled,
         "Claude evidence appends disabled for uninstall"
@@ -2085,29 +2082,117 @@ fn append_rows<'a, T: Serialize + 'a>(
         roots.insert(root);
     }
 
-    let mut prepared_dirs = BTreeSet::new();
     let mut stored = 0;
     for (path, (encoded, count, roots)) in batches {
-        let dir = path.parent().expect("evidence path has parent");
-        if prepared_dirs.insert(dir.to_path_buf()) {
-            fs::create_dir_all(dir).context("create Claude evidence directory")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
-                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-                }
-            }
+        for root in &roots {
+            telemetry_notices::captured(support_dir, root);
         }
-        handles.append(&path, &encoded)?;
-        cache_lifecycle::add(Event::OtlpRelayAppendedRows, count as u64);
-        cache_lifecycle::add(Event::OtlpRelayAppendedBytes, encoded.len() as u64);
-        for root in roots {
-            telemetry_notices::appended(support_dir, root);
-        }
+        append_file_batch(handles, support_dir, &path, &encoded, roots)?;
         stored += count;
     }
     Ok(stored)
+}
+
+/// Create a store directory and keep it private.
+fn prepare_store_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Open a private store file to append (and read its last byte). Its
+/// directory is prepared once per cycle (`prepared` until `clear`), and again
+/// if it has gone since.
+fn open_private_append(prepared: &mut BTreeSet<PathBuf>, path: &Path) -> std::io::Result<File> {
+    let dir = path.parent().expect("store path has parent");
+    if !prepared.contains(dir) {
+        prepare_store_dir(dir)?;
+        prepared.insert(dir.to_path_buf());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            prepare_store_dir(dir)?;
+            options.open(path)
+        }
+        opened => opened,
+    }
+}
+
+/// Whether bytes end inside a row: something other than whitespace follows
+/// their last newline. `None` when they hold only whitespace and no newline.
+fn ends_inside_row(bytes: &[u8]) -> Option<bool> {
+    let last = bytes
+        .iter()
+        .rev()
+        .find(|&&byte| byte == b'\n' || !byte.is_ascii_whitespace())?;
+    Some(*last != b'\n')
+}
+
+/// Whether a file of `len` bytes ends inside a row, read backwards from its
+/// end in growing chunks until its last newline or row byte.
+fn file_ends_inside_row(file: &mut File, len: u64) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let (mut end, mut step, mut chunk) = (len, 1, Vec::new());
+    while end > 0 {
+        let start = end.saturating_sub(step);
+        chunk.resize((end - start) as usize, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        if let Some(inside) = ends_inside_row(&chunk) {
+            return Ok(inside);
+        }
+        (end, step) = (start, (step * 64).min(4 << 20));
+    }
+    Ok(false)
+}
+
+/// Append complete lines. A file ending inside a row (a crash mid-append) is
+/// ended first, so its fragment stays a line of its own that readers skip; a
+/// failed write is cut back to the old length where possible. A tail of only
+/// whitespace after the last newline is left as is: it reads as leading
+/// whitespace of the next row. A fragment that ends in whitespace (inside a
+/// string value) is still a fragment.
+fn append_lines(file: &mut File, encoded: &[u8]) -> Result<()> {
+    let before = file.metadata()?.len();
+    let mut written = Ok(());
+    if file_ends_inside_row(file, before)? {
+        written = append_evidence_bytes(file, b"\n");
+    }
+    let written = written.and_then(|()| append_evidence_bytes(file, encoded));
+    if written.is_err() {
+        let _ = file.set_len(before);
+    }
+    written
+}
+
+/// One append of complete rows to one per-session file. A root captured while
+/// notices were active is noticed only once its rows are in that file, so a
+/// notice never names rows a reader of the per-session files cannot see yet.
+fn append_file_batch<'a>(
+    handles: &mut AppendHandles,
+    support_dir: &Path,
+    path: &Path,
+    encoded: &[u8],
+    roots: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    handles.append(path, encoded)?;
+    for root in roots {
+        telemetry_notices::readable(support_dir, root);
+    }
+    Ok(())
 }
 
 pub(crate) mod telemetry_notices;
@@ -2158,6 +2243,10 @@ struct AppendHandles {
     open: Vec<OpenAppendFile>,
     cap: usize,
     disabled: bool,
+    /// Store directories created and made private since the last `clear`.
+    prepared: BTreeSet<PathBuf>,
+    /// Relay journal facts per support directory.
+    journals: BTreeMap<PathBuf, relay_journal::State>,
     #[cfg(test)]
     opens: usize,
 }
@@ -2169,6 +2258,7 @@ impl AppendHandles {
 
     fn clear(&mut self) {
         self.open.clear(); // Never reset the process-lifetime uninstall fence.
+        self.prepared.clear();
     }
 
     fn disable(&mut self) {
@@ -2181,14 +2271,7 @@ impl AppendHandles {
         {
             self.opens += 1;
         }
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
+        let file = open_private_append(&mut self.prepared, path)?;
         crate::local_resource_diagnostics::cache_lifecycle::record(
             crate::local_resource_diagnostics::cache_lifecycle::Event::OtlpRelayAppendHandleOpens,
         );
@@ -2230,8 +2313,7 @@ impl AppendHandles {
             }
         };
         let entry = &mut self.open[index];
-        let result =
-            append_evidence_bytes(&mut entry.file, encoded).context("append Claude evidence");
+        let result = append_lines(&mut entry.file, encoded).context("append Claude evidence");
         if result.is_ok() {
             use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
             let now = Instant::now();
@@ -2262,12 +2344,38 @@ fn append_lock() -> &'static Mutex<AppendHandles> {
     })
 }
 
-/// Periodic handle release initiates write-back; it is not a durability fence.
-pub(crate) fn close_append_handles() {
-    append_lock()
+#[cfg(test)]
+pub(crate) fn keep_relay_rows_waiting_for_test(keep: bool) {
+    relay_journal::keep_rows_waiting_for_test(keep);
+}
+
+#[cfg(test)]
+pub(crate) fn relay_journal_path_for_test(support_dir: &Path) -> PathBuf {
+    relay_journal::journal_path(support_dir)
+}
+
+/// Rows and bytes waiting for per-session files that refuse them; `None`
+/// while the append lock is busy.
+pub(crate) fn relay_journal_kept() -> Option<(u64, u64)> {
+    Some(relay_journal::kept_totals(&*append_lock().try_lock().ok()?))
+}
+
+/// Complete rows waiting in the relay journal for the daemon's next drain.
+pub(crate) fn relay_journal_waiting_rows(support_dir: &Path) -> std::io::Result<usize> {
+    relay_journal::waiting_rows(support_dir)
+}
+
+/// Move the relay journal's rows to their per-session files, then release
+/// every cached handle. Runs at daemon start and at each scan start, before
+/// any reader. Handle release initiates write-back; it is not a durability
+/// fence. On an error the undrained rows stay in the journal for the next drain.
+pub(crate) fn drain_relay_journal(support_dir: &Path) -> Result<()> {
+    let mut handles = append_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let drained = relay_journal::drain_locked(&mut handles, support_dir);
+    handles.clear();
+    drained
 }
 
 /// Fence admitted relay workers before cleanup, releasing the guard before any
@@ -2992,7 +3100,7 @@ mod tests {
         }
     }
 
-    fn llm_span(request_id: &str, agent_id: Option<&str>) -> otlp_proto::Span {
+    pub(super) fn llm_span(request_id: &str, agent_id: Option<&str>) -> otlp_proto::Span {
         let mut attributes = vec![
             proto_string("request_id", request_id),
             proto_string("client_request_id", &format!("client-{request_id}")),
@@ -3008,7 +3116,7 @@ mod tests {
         }
     }
 
-    fn trace_body(spans: Vec<otlp_proto::Span>) -> Vec<u8> {
+    pub(super) fn trace_body(spans: Vec<otlp_proto::Span>) -> Vec<u8> {
         otlp_proto::ExportTraceServiceRequest {
             resource_spans: vec![otlp_proto::ResourceSpans {
                 resource: Some(otlp_proto::Resource {
@@ -3020,7 +3128,7 @@ mod tests {
         .encode_to_vec()
     }
 
-    fn api_log_body() -> Vec<u8> {
+    pub(super) fn api_log_body() -> Vec<u8> {
         otlp_proto::ExportLogsServiceRequest {
             resource_logs: vec![otlp_proto::ResourceLogs {
                 resource: Some(otlp_proto::Resource {
