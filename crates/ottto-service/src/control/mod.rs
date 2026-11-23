@@ -1205,7 +1205,12 @@ fn handle_command(
             }
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
-            status.service_owner = service_owner_state(client_install_owner);
+            // Doctor (`retry_relay_authorization`) and refresh requests probe launchd live.
+            status.service_owner = if retry_relay_authorization || refresh_agent_status {
+                service_owner_state(client_install_owner)
+            } else {
+                status::cached_service_owner_state(client_install_owner)
+            };
             crate::refresh_canonical_local_health(&mut status);
             status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;

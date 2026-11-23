@@ -593,6 +593,18 @@ command class (`status`, `claude_accounts_status`, `codex_accounts_status`,
 only; no request ids, arguments or peers. Trust fields are absent off macOS.
 The cumulative `observation.cli_children` totals (child starts and CPU per
 fixed argv class) print on `source_prepare` rows only, not on every row.
+The classes are `codex login status`, `codex models`, `claude version`,
+`other codex` (any other `codex` command), then `security`, `launchctl`, `pi`
+and `git` by program file name, and `other` for the rest; a class with no
+starts is omitted. Only the class is kept: no paths, arguments or output.
+The status request's launchd job probe (`launchctl print`) counts as
+`launchctl`. It runs at most once per 60 s while launchd runs this daemon as
+the job, because the job's program cannot change until a bootout ends the
+daemon. Concurrent status requests share one probe. In any other case, such
+as a failed probe, every status request probes again. The LaunchAgent plist
+is read on every request. `ottto doctor`, status refresh requests, repair,
+install, migration and takeover always probe afresh, and so does every status
+request once SIGTERM handling has begun.
 The `offpass_` prefix selects these CPU-only windows in `StageWindow`; ordinary
 in-pass fields and counts remain unchanged. `source` is the existing source
 slug for source-bound work and `unknown` for shared/mixed work. Off-pass names
