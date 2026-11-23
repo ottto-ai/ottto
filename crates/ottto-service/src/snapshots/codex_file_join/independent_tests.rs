@@ -848,3 +848,88 @@ fn independent_fold_keeps_the_original_certified_evidence() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+/// [behaviour] A folded revert session's context posture covers every branch:
+/// the highest peak with its own window (ties keep the earlier branch), the
+/// most recently active branch's last request, every branch's compactions
+/// (count summed, markers kept newest 64 and paired with their timestamps),
+/// and the original's first request.
+#[test]
+fn independent_fold_composes_context_posture_across_branches() {
+    let at = |minute: u64| format!("2026-10-22T{:02}:{:02}:00Z", 9 + minute / 60, minute % 60);
+    let member = |started: u64,
+                  active: u64,
+                  peak: (u64, u64),
+                  last: Option<u64>,
+                  markers: std::ops::Range<u64>| {
+        let timestamps = markers.clone().map(at).collect::<Vec<_>>();
+        SnapshotItem {
+            source_session_id: "019a0000-0000-7000-8000-000000000001".into(),
+            source_started_at: Some(at(started)),
+            source_last_activity_at: Some(at(active)),
+            first_turn_context_tokens: Some(1_000 + started),
+            peak_context_fill_tokens: Some(peak.0),
+            peak_context_fill_window_tokens: Some(peak.1),
+            last_turn_context_tokens: last,
+            last_turn_context_window_tokens: last.map(|_| 400_000 + started),
+            compaction_count: Some(markers.end - markers.start),
+            compaction_events: timestamps
+                .iter()
+                .map(|timestamp| SnapshotCompactionEvent {
+                    at: timestamp.clone(),
+                    before: Some(started + 1),
+                    after: None,
+                    trigger: None,
+                })
+                .collect(),
+            compaction_timestamps: timestamps,
+            ..SnapshotItem::default()
+        }
+    };
+    // Original: 60 markers. Branch A: the latest activity, a tied peak. Branch
+    // B (the carrier): the highest peak, active before A, no last request.
+    let original = member(0, 100, (120_000, 400_000), Some(80_000), 100..160);
+    let branch_a = member(110, 300, (150_000, 272_000), Some(60_000), 160..170);
+    let branch_b = member(120, 250, (180_000, 1_000_000), None, 170..172);
+    let mut last = vec![branch_b];
+    fold_independent(&mut last, vec![branch_a, original]).unwrap();
+    let folded = &last[0];
+    assert_eq!(folded.first_turn_context_tokens, Some(1_000));
+    assert_eq!(
+        (
+            folded.peak_context_fill_tokens,
+            folded.peak_context_fill_window_tokens
+        ),
+        (Some(180_000), Some(1_000_000))
+    );
+    assert_eq!(
+        (
+            folded.last_turn_context_tokens,
+            folded.last_turn_context_window_tokens
+        ),
+        (Some(60_000), Some(400_110)),
+        "the most recently active branch with a last request"
+    );
+    assert_eq!(folded.compaction_count, Some(72));
+    let expected = (108..172).map(at).collect::<Vec<_>>();
+    assert_eq!(folded.compaction_timestamps, expected);
+    assert_eq!(
+        folded
+            .compaction_events
+            .iter()
+            .map(|event| event.at.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(folded.compaction_events[0].before, Some(1));
+    assert_eq!(folded.compaction_events[63].before, Some(121));
+    // A tie keeps the earlier branch's peak and window.
+    let mut last = vec![member(120, 250, (120_000, 9), None, 0..0)];
+    fold_independent(
+        &mut last,
+        vec![member(0, 100, (120_000, 400_000), Some(1), 0..0)],
+    )
+    .unwrap();
+    assert_eq!(last[0].peak_context_fill_window_tokens, Some(400_000));
+    assert_eq!(last[0].last_turn_context_tokens, Some(1));
+}
