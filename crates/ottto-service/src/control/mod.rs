@@ -1,3 +1,6 @@
+//! The local control API: request entry points, command dispatch, the shared setup and backend
+//! constants, and the re-exports of its child modules.
+
 use crate::agent_configs::codex_toml;
 use crate::agent_configs::detection::detect_agent_installation;
 use crate::agent_configs::fence::AgentConfigError;
