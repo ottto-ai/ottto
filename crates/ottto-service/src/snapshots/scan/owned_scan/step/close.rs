@@ -13,6 +13,8 @@ impl OwnedSourceScan {
         active_file: Option<Box<OwnedActiveFile>>,
         _codex_cursor_lease: Option<sampled_scan::codex_cursor::CursorLease>,
     ) -> OwnedSourceScanStep {
+        // Flush the context budget. A continuation-only page returns here
+        // with its ticket and evidence.
         self.context_read_budget
             .flush(&mut self.index, &self.selected_flags);
         if self.codex_page.continuation() {
@@ -43,6 +45,7 @@ impl OwnedSourceScan {
                 },
             };
         }
+        // Fold this page's census into the traversal.
         // Current-page metadata/open uncertainty must reach every F4
         // caller before any hold can retire. The remaining census fold
         // below keeps its existing order; each count is merged once.
@@ -130,6 +133,7 @@ impl OwnedSourceScan {
                 .terminal_dropped_usage_record_count
                 .saturating_add(self.census.terminal_dropped_usage_record_count);
         }
+        // Count-only log lines for Codex and Claude.
         if self.source == SnapshotSource::Codex {
             // Count-only attribution of why Codex files were selected
             // on this page. No path, session, or identifier is named.
@@ -196,6 +200,7 @@ impl OwnedSourceScan {
                 );
             }
         }
+        // Retire paths removed by watcher hints, unless revalidated, held or protected.
         // A remove/rename hint can arrive after bounded reconciliation has already
         // passed this key. Removing it only from `observed_index_keys` is then too
         // late: the reconciliation cursor will never revisit the stale entry and a
@@ -296,6 +301,8 @@ impl OwnedSourceScan {
         }
         crate::local_resource_diagnostics::v2_growth_revalidate(tally);
         self.index.count_unacked_retired(self.source, unacked);
+        // If discovery is done, count Codex protected absences and settle the
+        // residue; then drain the cap counters.
         // G1: only census members hold discovery. A pending re-read
         // (growth after this generation processed its path) is
         // next-generation evidence; retiring drops it and the next
@@ -358,6 +365,8 @@ impl OwnedSourceScan {
         if let Some(traversal) = self.index.traversal.as_mut() {
             traversal.counts.caps.drain(self.source.api_slug());
         }
+        // Census verdict: run reconciliation, decide completeness, settle the Claude
+        // request census, count pending work, arm the unhealthy retry.
         let traversal_snapshot = self
             .index
             .traversal
@@ -474,6 +483,8 @@ impl OwnedSourceScan {
             .saturating_add(usize::from(restart_after_hints))
             .saturating_add(usize::from(terminal_unhealthy))
             .saturating_add(usize::from(needs_clean_followup));
+        // Census status and residue witness; when the generation closes, retire the
+        // traversal and carry its waiting Codex re-reads.
         let traversal = self
             .index
             .traversal
@@ -563,6 +574,8 @@ impl OwnedSourceScan {
             self.index.resume_upper_bound_path = None;
             self.index.resume_census_window_end = None;
         }
+        // Result counts, curve strip, decode holds (which can still withhold
+        // completeness), incidence, next generation, continuation evidence, join validation.
         let counts = traversal_snapshot.counts;
         let zero_snapshot_confirmed_count = self.index.confirmed_empty_files.len();
         let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
@@ -685,6 +698,7 @@ impl OwnedSourceScan {
                 )
             })
         });
+        // Build the scan result.
         let scan = SourceScanResult {
             census_status,
             walk_idle: false,
@@ -764,6 +778,7 @@ impl OwnedSourceScan {
                 },
             ),
         };
+        // Page diagnostics and the final value.
         if self.source == SnapshotSource::ClaudeCode {
             rearm_cause::retain(&self.index);
         }
