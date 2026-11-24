@@ -15,6 +15,7 @@ use super::wire::is_p256_der_signature;
 use super::wire::is_reverse_code;
 use super::wire::proof_header;
 use super::wire::request_sha256;
+use super::wire::ChallengeRequest;
 use super::wire::EnrollBody;
 use super::wire::KEYS_ROUTE_TEMPLATE;
 use serde::de::DeserializeOwned;
@@ -297,9 +298,11 @@ fn dispatch(
         parse_args::<NoArgs>(args)?;
         connections.open(connection);
         queue.record_hello();
+        let facts = server.hello_facts();
         return Ok(json!({
             "signer_protocol": SIGNER_PROTOCOL,
-            "service_version": crate::control::compiled_release_version(),
+            "binding": facts.binding,
+            "agent_connect": facts.agent_connect,
         }));
     }
     // The app sends nothing else before a hello reply on this connection, and the service holds
@@ -316,7 +319,7 @@ fn dispatch(
         "cloud_keys_claim_start" => claim_start(server, parse_args(args)?),
         "cloud_keys_claim_status" => {
             let args = parse_args::<ClaimStatusArgs>(args)?;
-            if !crate::hex::is_uuid(&args.key_claim_id) {
+            if !ottto_protocol::cloud_uuid(&args.key_claim_id) {
                 return Err(Refusal::new("invalid_argument"));
             }
             to_result(server.claim_state(&args.key_claim_id)?)
@@ -367,7 +370,7 @@ fn valid_keys(device: &str, approval: Option<&str>) -> bool {
 }
 
 fn claim_start(server: &dyn CloudKeyServer, args: ClaimStartArgs) -> Result<Value, Refusal> {
-    if !crate::hex::is_uuid(&args.client_claim_id)
+    if !ottto_protocol::cloud_uuid(&args.client_claim_id)
         || !valid_keys(
             &args.device_key_spki_b64,
             args.approval_key_spki_b64.as_deref(),
@@ -396,12 +399,19 @@ fn prepare_write(
         WriteKind::Revoke => ("DELETE", "revoke"),
     };
     let hash = request_sha256(method, KEYS_ROUTE_TEMPLATE, &body);
-    let challenge = server.device_challenge(operation, &hash)?;
+    let request = ChallengeRequest {
+        operation,
+        attempt_id: None,
+        request_sha256: &hash,
+    };
+    let (scope, challenge) = server.device_challenge(&request)?;
     let checked = checked_challenge(
         &challenge.challenge_id,
         &challenge.payload_bytes,
-        operation,
-        &hash,
+        &request,
+        &scope.id,
+        &scope.organization_id,
+        server.now(),
     )
     .ok_or_else(|| Refusal::new("challenge_mismatch"))?;
     let body_b64 = encode_base64url(&body);
@@ -432,7 +442,7 @@ fn enroll_prepare(
     connection: u64,
     args: EnrollPrepareArgs,
 ) -> Result<Value, Refusal> {
-    if !crate::hex::is_uuid(&args.key_claim_id)
+    if !ottto_protocol::cloud_uuid(&args.key_claim_id)
         || !valid_keys(
             &args.device_key_spki_b64,
             args.approval_key_spki_b64.as_deref(),

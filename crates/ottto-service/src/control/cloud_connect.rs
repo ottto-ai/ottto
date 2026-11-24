@@ -1,6 +1,6 @@
 //! Cloud connect on this Mac, service side: the signer channel the Ottto app signs through (start
-//! conditions and entry points), its in-memory sign queue and wake, the cloud-key server calls,
-//! and the CloudFormation template digest check.
+//! conditions and entry points), its in-memory sign queue and wake, and the cloud-key server
+//! calls.
 //!
 //! The channel opens only in a release-signed `ottto-service` the app installed, with no
 //! Companion trust override set. Nothing here is persisted.
@@ -12,7 +12,6 @@ mod queue;
 mod server;
 pub(super) use server::validated_cloud_api_base_url;
 mod signer;
-mod template;
 mod wake;
 mod wire;
 
@@ -23,10 +22,6 @@ pub use queue::SignKind;
 pub use queue::SignOutcome;
 pub use queue::SignQueue;
 pub use queue::SignQueueError;
-pub use queue::MAX_LIVE_SIGN_REQUESTS;
-pub use template::verified_template_url;
-pub use template::TemplateError;
-pub use template::TemplatePinId;
 
 use crate::LocalDaemon;
 use ottto_protocol::InstallOwner;

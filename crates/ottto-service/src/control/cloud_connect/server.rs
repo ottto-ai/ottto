@@ -2,6 +2,7 @@
 //! state, a device challenge, key enrollment and key revoke. Signed writes send the exact bytes
 //! their challenge hashed.
 
+use super::wire::ChallengeRequest;
 use crate::control::api_url_with_base;
 use crate::control::backend_get_json;
 use crate::control::backend_post_json;
@@ -13,6 +14,7 @@ use crate::control::SetupRunRefreshResponse;
 use crate::control::DEFAULT_API_BASE_URL;
 use crate::LocalApiError;
 use crate::LocalDaemon;
+use ottto_protocol::cloud_uuid;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -28,7 +30,8 @@ const CLAIM_ORIGIN_PAIRS: [(&str, &str); 2] = [
 ];
 const CLAIM_WEB_ROUTE: &str = "/setup/cloud-keys?claim=";
 
-fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'static str)> {
+/// The compiled (API, web) origin pair for `api_base_url`, if it is a known Ottto deployment.
+pub(super) fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'static str)> {
     let api_base_url = api_base_url.trim().trim_end_matches('/');
     CLAIM_ORIGIN_PAIRS
         .into_iter()
@@ -73,7 +76,7 @@ pub(super) fn checked_claim_start(
         .claim_url
         .strip_prefix(web_origin)
         .and_then(|route| route.strip_prefix(CLAIM_WEB_ROUTE));
-    if !crate::hex::is_uuid(&started.key_claim_id)
+    if !cloud_uuid(&started.key_claim_id)
         || browser_claim != Some(started.key_claim_id.as_str())
         || !super::wire::is_key_code(&started.key_code)
     {
@@ -94,6 +97,22 @@ pub(super) struct DeviceChallenge {
     pub(super) payload_bytes: String,
 }
 
+/// This Mac's cloud-key identity as the server's challenges name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DeviceBinding {
+    pub(super) device_id: String,
+    pub(super) device_generation: u64,
+    pub(super) org_id: String,
+}
+
+/// What the app reads on every hello. Each field is null when this service cannot tell.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(super) struct HelloFacts {
+    pub(super) binding: Option<DeviceBinding>,
+    /// The server's `agent_connect` status block, as the server sent it.
+    pub(super) agent_connect: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Enrolled {
     pub(super) device_key_id: String,
@@ -104,13 +123,6 @@ pub(super) struct Enrolled {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Revoked {
     pub(super) reason: String,
-}
-
-#[derive(Serialize)]
-struct ChallengeBody<'a> {
-    operation: &'a str,
-    attempt_id: Option<&'a str>,
-    request_sha256: &'a str,
 }
 
 /// A failed server call as the app sees it: the server's own code when it named one.
@@ -169,12 +181,11 @@ pub(super) trait CloudKeyServer {
     /// Starts or replays a claim and verifies its browser link against the connected API.
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError>;
     fn claim_state(&self, key_claim_id: &str) -> Result<ClaimState, ServerError>;
-    /// A challenge committing to `request_sha256` for `operation`.
+    /// A challenge for `request`, with the run and organization it was requested on.
     fn device_challenge(
         &self,
-        operation: &str,
-        request_sha256: &str,
-    ) -> Result<DeviceChallenge, ServerError>;
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError>;
     /// Sends the frozen enrollment body once.
     fn enroll(
         &self,
@@ -182,8 +193,14 @@ pub(super) trait CloudKeyServer {
         device_proof: &str,
         approval_proof: Option<&str>,
     ) -> Result<Enrolled, ServerError>;
-    /// Revokes this Mac's cloud keys (an empty `DELETE` body).
+    /// Revokes this Mac's cloud keys (an empty `DELETE` body). The server answers 204.
     fn revoke(&self, device_proof: &str) -> Result<Revoked, ServerError>;
+    /// This Mac's device binding and the server's agent connect status, for the app's hello.
+    fn hello_facts(&self) -> HelloFacts;
+    /// The current Unix time in seconds.
+    fn now(&self) -> i64 {
+        super::queue::unix_now()
+    }
 }
 
 /// The routes on the Ottto server this Mac is connected to.
@@ -191,10 +208,13 @@ pub(super) struct SetupRunServer<'a> {
     pub(super) daemon: &'a LocalDaemon,
 }
 
+/// The setup run, organization and API a request is sent under: what a challenge's signed facts
+/// must name, and what a token refresh must keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BoundRun {
     pub(super) id: String,
     pub(super) organization_id: String,
-    api_base_url: String,
+    pub(super) api_base_url: String,
 }
 
 impl SetupRunServer<'_> {
@@ -316,21 +336,17 @@ impl CloudKeyServer for SetupRunServer<'_> {
 
     fn device_challenge(
         &self,
-        operation: &str,
-        request_sha256: &str,
-    ) -> Result<DeviceChallenge, ServerError> {
-        let body = ChallengeBody {
-            operation,
-            attempt_id: None,
-            request_sha256,
-        };
-        self.call(|prefix, token| {
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError> {
+        let run = self.bound_run()?;
+        let challenge = self.call_bound(Some(&run), |prefix, token| {
             backend_post_json(
                 &format!("{prefix}/device-challenges"),
-                &body,
+                request,
                 &[("X-Ottto-Setup-Run-Token", token)],
             )
-        })
+        })?;
+        Ok((run, challenge))
     }
 
     fn enroll(
@@ -364,6 +380,36 @@ impl CloudKeyServer for SetupRunServer<'_> {
                 reason: "revoked".into(),
             })
         })
+    }
+
+    fn hello_facts(&self) -> HelloFacts {
+        let org_id = self
+            .daemon
+            .cloud_connect_binding()
+            .ok()
+            .map(|(_, org_id)| org_id);
+        let device = ottto_core::FileDeviceStore::default()
+            .load_with_credential_generation()
+            .ok()
+            .flatten()
+            .filter(|device| device.credential_generation > 0);
+        let binding = org_id.zip(device).map(|(org_id, device)| DeviceBinding {
+            device_id: device.device.device_id,
+            device_generation: device.credential_generation,
+            org_id,
+        });
+        let agent_connect = crate::control::status::cloud_status(
+            self.daemon,
+            &crate::control::RequestAuthorization::TrustedCompanionApp,
+            None,
+        )
+        .ok()
+        .and_then(|mut status| status.get_mut("agent_connect").map(serde_json::Value::take))
+        .filter(serde_json::Value::is_object);
+        HelloFacts {
+            binding,
+            agent_connect,
+        }
     }
 }
 

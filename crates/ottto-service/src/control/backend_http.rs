@@ -599,28 +599,41 @@ pub(super) fn backend_post_json_with_timeout<T: DeserializeOwned>(
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
 
-/// Sends `body` byte for byte (or no body) and decodes a JSON 2xx answer. A signed write's
-/// challenge hashes the exact body, so the HTTP client must not serialize it again.
+/// Sends `body` byte for byte (or no body) within `timeout`. A signed write's challenge hashes the
+/// exact body, so the HTTP client must not serialize it again. Callers choose how to read a
+/// refusal; `backend_send_raw_json` uses the standard backend error.
+pub(super) fn backend_send_raw(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut request = crate::retry_tls::credential_agent()
+        .request(method, url)
+        .set("Accept", "application/json")
+        .timeout(timeout);
+    for (key, value) in headers {
+        request = request.set(key, value);
+    }
+    match body {
+        Some(body) => request
+            .set("Content-Type", "application/json")
+            .send_bytes(body),
+        None => request.call(),
+    }
+}
+
+/// `backend_send_raw` with the standard backend error. A 2xx answer decodes as JSON, and an empty
+/// 204 answer as JSON null.
 pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     headers: &[(&str, &str)],
 ) -> Result<T, LocalApiError> {
-    let mut request = crate::retry_tls::credential_agent()
-        .request(method, url)
-        .set("Accept", "application/json")
-        .timeout(BACKEND_REQUEST_TIMEOUT);
-    for (key, value) in headers {
-        request = request.set(key, value);
-    }
-    let response = match body {
-        Some(body) => request
-            .set("Content-Type", "application/json")
-            .send_bytes(body),
-        None => request.call(),
-    }
-    .map_err(|error| backend_error_from_ureq(url, error))?;
+    let response = backend_send_raw(method, url, body, headers, BACKEND_REQUEST_TIMEOUT)
+        .map_err(|error| backend_error_from_ureq(url, error))?;
     let response = backend_success(url, response)?;
     if response.status() == 204 {
         return serde_json::from_str("null")

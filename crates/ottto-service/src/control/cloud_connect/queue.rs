@@ -1,9 +1,8 @@
-//! The in-memory sign queue between the service and the Mac app: at most four live requests, each
-//! taken by one verified signer connection, and the app's answer handed back to the caller that
-//! queued it. Nothing here is persisted; a restart drops every request.
+//! The in-memory sign queue between the service and the Mac app: each request is taken by one
+//! verified signer connection, bounded by its own expiry, and the app's answer is handed back to
+//! the caller that queued it. Nothing here is persisted; a restart drops every request.
 
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -11,9 +10,6 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-
-/// Requests the app has not answered yet, across every attempt.
-pub const MAX_LIVE_SIGN_REQUESTS: usize = 4;
 
 /// A queued request wakes the app unless a hello arrived this recently.
 const HELLO_FRESH_FOR: Duration = Duration::from_secs(3);
@@ -51,12 +47,8 @@ pub enum SignOutcome {
 pub enum SignQueueError {
     /// No signer channel on this Mac.
     SignerUnavailable,
-    /// Already four live requests.
-    Full,
     /// The expiry is not in the future.
     AlreadyExpired,
-    /// Too many distinct native approvals were offered in the last minute.
-    ApprovalRateLimited,
 }
 
 /// A request handed to a signer connection by `cloud_sign_poll`.
@@ -97,13 +89,11 @@ struct QueueState {
     next_id: u64,
     requests: Vec<QueuedRequest>,
     last_hello: Option<Instant>,
-    approval_offers: VecDeque<Instant>,
     last_wake: Option<Instant>,
 }
 
 struct QueuedRequest {
     id: String,
-    sequence: u64,
     kind: SignKind,
     payload: Vec<u8>,
     expires_at: i64,
@@ -153,33 +143,14 @@ impl SignQueue {
         if expires_at <= now {
             return Err(SignQueueError::AlreadyExpired);
         }
-        let live_count = state
-            .requests
-            .iter()
-            .filter(|request| request.outcome.is_none())
-            .count();
-        if live_count - usize::from(superseded.is_some()) >= MAX_LIVE_SIGN_REQUESTS {
-            return Err(SignQueueError::Full);
-        }
-        if matches!(kind, SignKind::Approval { .. }) {
-            state
-                .approval_offers
-                .retain(|offer| offer.elapsed() < Duration::from_secs(60));
-            if state.approval_offers.len() >= MAX_LIVE_SIGN_REQUESTS {
-                return Err(SignQueueError::ApprovalRateLimited);
-            }
-            state.approval_offers.push_back(Instant::now());
-        }
         if let Some(index) = superseded {
             state.requests[index].outcome = Some(SignOutcome::Superseded);
             self.answered.notify_all();
         }
         state.next_id += 1;
-        let sequence = state.next_id;
-        let request_id = format!("sign_{sequence}");
+        let request_id = format!("sign_{}", state.next_id);
         state.requests.push(QueuedRequest {
             id: request_id.clone(),
-            sequence,
             kind,
             payload,
             expires_at,
@@ -242,17 +213,11 @@ impl SignQueue {
         request.outcome.clone()
     }
 
-    /// Capture before a server read so a poll can only retire approvals it saw queued.
-    pub(super) fn approval_watermark(&self) -> u64 {
-        self.lock().next_id
-    }
-
-    pub(super) fn cancel_attempt(&self, attempt_id: &str, through: u64) {
+    /// Retires the attempt's native approvals once the server no longer offers one.
+    pub(super) fn cancel_attempt(&self, attempt_id: &str) {
         for request in &mut self.lock().requests {
-            if request.sequence <= through
-                && matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
+            if matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
             {
-                // A concurrent poll can still hold a pre-cancel server response.
                 request.outcome = Some(SignOutcome::Superseded);
             }
         }
@@ -425,24 +390,5 @@ mod tests {
         queue.release(1);
         assert!(queue.approval_outcome(&request.request_id).is_none());
         assert_eq!(queue.poll(2)[0].request_id, request.request_id);
-    }
-
-    #[test]
-    fn stale_poll_cannot_retire_an_approval_queued_during_its_read() {
-        let queue = SignQueue::default();
-        let through = queue.approval_watermark();
-        let request = queue
-            .enqueue(
-                SignKind::Approval {
-                    attempt_id: "attempt".into(),
-                    approval_id: "approval".into(),
-                },
-                vec![0],
-                unix_now() + 60,
-            )
-            .unwrap();
-        queue.cancel_attempt("attempt", through);
-        assert!(queue.approval_outcome(&request.request_id).is_none());
-        assert_eq!(queue.poll(1)[0].request_id, request.request_id);
     }
 }

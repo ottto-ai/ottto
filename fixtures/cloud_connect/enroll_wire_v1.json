@@ -1,0 +1,29 @@
+{
+  "schema_version": "enroll_wire_v1",
+  "notes": "Public software test keys. Generate fresh device and approval keys for each client_claim_id.",
+  "enroll": {
+    "method": "POST",
+    "route_template": "/api/v1/setup-runs/{setup_run_id}/local-client/cloud/keys",
+    "raw_body_utf8": "{\"key_claim_id\":\"55555555-5555-4555-8555-555555555555\",\"device_key_spki_b64\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li_hp_m47n60p8D54WK84zV2sxXs7LtkBoN79R9Q\",\"approval_key_spki_b64\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfPJ7GI0DT36KUjgDBLUaw8CJaeJ38hs1pgtI_EdmmXgHd1UQ247QQCk9msafdDDbun2t5jzpgimeBLedInhz0Q\",\"reverse_code\":\"ABC234\"}",
+    "request_sha256": "4187ef0c21d6bfc402453d7226cd2efe7e73351e53bf354b2bc120c951b96393",
+    "challenge_id": "66666666-6666-4666-8666-666666666666",
+    "payload_bytes": "eyJhdHRlbXB0X2lkIjpudWxsLCJjaGFsbGVuZ2VfaWQiOiI2NjY2NjY2Ni02NjY2LTQ2NjYtODY2Ni02NjY2NjY2NjY2NjYiLCJkZXZpY2VfZ2VuZXJhdGlvbiI6MTIsImRldmljZV9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsImV4cCI6MTc2NDAwMDMwMCwiaWF0IjoxNzY0MDAwMDAwLCJub25jZSI6IkFBRUNBd1FGQmdjSUNRb0xEQTBPRHhBUkVoTVVGUllYR0JrYUd4d2RIaDgiLCJvcGVyYXRpb24iOiJlbnJvbGwiLCJvcmdfaWQiOiIzMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzMiLCJyZXF1ZXN0X3NoYTI1NiI6IjQxODdlZjBjMjFkNmJmYzQwMjQ1M2Q3MjI2Y2QyZWZlN2U3MzM1MWU1M2JmMzU0YjJiYzEyMGM5NTFiOTYzOTMiLCJydW5faWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJ2Ijoib3R0dG8uY2xvdWRfY29ubmVjdC5kZXZpY2Vfd3JpdGUudjEifQ",
+    "device_proof": "66666666-6666-4666-8666-666666666666.MEQCIBmW4e8hK5xOjrbDKS6yCraEFKHnyW5tzE7A102KGVkbAiBRqrGGZq_G1umVEJumEKwuGUwDcp071-Q2q6voD5Rd2w",
+    "approval_proof": "66666666-6666-4666-8666-666666666666.MEYCIQCsA998rWS5EyfeMOhrmboCcQvovjw52EEcxHd1IDtPSQIhALuzy2B2-ktanZnLz0hbgq3YayXn3t8sqosz18QRS_i7"
+  },
+  "revoke": {
+    "method": "DELETE",
+    "route_template": "/api/v1/setup-runs/{setup_run_id}/local-client/cloud/keys",
+    "raw_body_utf8": "",
+    "request_sha256": "e6c222dbaffc4ee17434df7299139697f56ed4bb0615a9a30f7cfdcaab903dff",
+    "challenge_id": "77777777-7777-4777-8777-777777777777",
+    "payload_bytes": "eyJhdHRlbXB0X2lkIjpudWxsLCJjaGFsbGVuZ2VfaWQiOiI3Nzc3Nzc3Ny03Nzc3LTQ3NzctODc3Ny03Nzc3Nzc3Nzc3NzciLCJkZXZpY2VfZ2VuZXJhdGlvbiI6MTIsImRldmljZV9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsImV4cCI6MTc2NDAwMDA2MCwiaWF0IjoxNzY0MDAwMDAwLCJub25jZSI6IkFBRUNBd1FGQmdjSUNRb0xEQTBPRHhBUkVoTVVGUllYR0JrYUd4d2RIaDgiLCJvcGVyYXRpb24iOiJyZXZva2UiLCJvcmdfaWQiOiIzMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzMiLCJyZXF1ZXN0X3NoYTI1NiI6ImU2YzIyMmRiYWZmYzRlZTE3NDM0ZGY3Mjk5MTM5Njk3ZjU2ZWQ0YmIwNjE1YTlhMzBmN2NmZGNhYWI5MDNkZmYiLCJydW5faWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJ2Ijoib3R0dG8uY2xvdWRfY29ubmVjdC5kZXZpY2Vfd3JpdGUudjEifQ",
+    "device_proof": "77777777-7777-4777-8777-777777777777.MEUCIQDMQLAxrRDvENMbzLKjgKoTez8S4wd5mExQalkWbG9hyQIgVmdzmWyhs4sCC6H1qzeY1MCui9VdUQXPiXwHvtjr5Tw"
+  },
+  "key_code": {
+    "device_spki_sha256": "5cd252fb0ce8932436faf8ccd1040981b89ee4ad6b9fe9e2a2b7e71aacb27cd3",
+    "approval_spki_sha256": "dc0ce633dbcc913dafafa4b89ac44d8ce683fdfc3f60c8bdf21213b9f2b534ba",
+    "with_approval": "CGJU-NAXZ",
+    "device_only": "6SAE-4XHN"
+  }
+}

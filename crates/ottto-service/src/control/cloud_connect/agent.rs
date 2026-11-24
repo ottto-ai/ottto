@@ -1,18 +1,20 @@
 //! CLI requests use the setup-run token, but only the app can sign a write.
 use super::queue::unix_now;
-use super::server::{BoundRun, ServerError, SetupRunServer};
-use super::template::{verified_template_url_with_timeout, TemplatePinId};
-use super::wire::{decode_base64url, encode_base64url, proof_header, request_sha256};
+use super::server::{claim_origin_pair, BoundRun, DeviceChallenge, ServerError, SetupRunServer};
+use super::wire::{
+    checked_challenge, decode_base64url, encode_base64url, proof_header, request_sha256,
+    ChallengeRequest,
+};
 use super::{
     queue_sign_request, sign_queue, signer_available, SignKind, SignOutcome, SignQueueError,
 };
 use crate::control::backend_http::{
-    backend_error_from_ureq, backend_response_unexpected, backend_success,
+    backend_error_from_ureq, backend_response_unexpected, backend_send_raw, backend_success,
 };
 use crate::{LocalApiError, LocalDaemon};
 use ottto_protocol::{
     cloud_account_id, cloud_stack_name_from_id, cloud_uuid, CloudConnectFailure as Failure,
-    CloudTemplatePin, LocalControlCommand as Command, CLOUD_CONNECT_ATTEMPT_SCHEMA,
+    LocalControlCommand as Command, CLOUD_CONNECT_ATTEMPT_SCHEMA,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -24,6 +26,8 @@ const ENSURE_TEMPLATE: &str =
 const ATTEMPT_TEMPLATE: &str =
     "/api/v1/setup-runs/{setup_run_id}/local-client/cloud/connect-attempts/{attempt_id}";
 const SIGN_WAIT: Duration = Duration::from_secs(20);
+/// One server call's longest wait inside the command deadline.
+const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(in crate::control) fn dispatch(daemon: &LocalDaemon, command: Command) -> Value {
     match dispatch_inner(daemon, command) {
@@ -39,26 +43,9 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
             attempt_id,
             timeout_ms,
         } => {
-            let deadline = deadline(timeout_ms);
-            let Some(id) = attempt_id else {
-                let status = daemon
-                    .status_for_trusted_client()
-                    .map_err(|error| server_failure(ServerError::from_local(&error)))?;
-                if status.account.state != ottto_protocol::LocalAccountState::Connected {
-                    return Err(server_failure(ServerError::local("not_paired")));
-                }
-                let mut status = server.agent_call(None, "GET", "status", None, None, deadline)?;
-                status.as_object_mut().ok_or_else(invalid_server)?.insert(
-                    "signer".into(),
-                    json!(if signer_available() {
-                        "available"
-                    } else {
-                        "unavailable"
-                    }),
-                );
-                return Ok(status);
-            };
-            let mut attempt = server.read_attempt(None, &id, deadline)?;
+            // Feature status is the existing `cloud_status` command; this reads one attempt.
+            let id = attempt_id.ok_or_else(invalid_argument)?;
+            let mut attempt = server.read_attempt(None, &id, deadline(timeout_ms))?;
             remove_approval(&mut attempt);
             Ok(attempt)
         }
@@ -79,16 +66,8 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
                 Some(&bytes(&body)),
                 deadline,
             )?;
+            // The CLI checks `aws.template` against its compiled pin before any AWS write.
             remove_approval(&mut attempt);
-            if let Some(aws) = attempt.get_mut("aws").filter(|aws| !aws.is_null()) {
-                match verify_template(aws, deadline) {
-                    Ok(url) => aws["url"] = json!(url),
-                    Err(error) => {
-                        attempt["aws"] = Value::Null;
-                        attempt["template_error"] = json!(error);
-                    }
-                }
-            }
             Ok(attempt)
         }
         Command::CloudConnectSubmit {
@@ -171,30 +150,6 @@ fn invalid_server() -> Failure {
     )
 }
 
-fn template_unverified() -> Failure {
-    Failure::new(
-        "aws_template_unverified",
-        "The CloudFormation template could not be verified by this release.",
-        "use_web",
-    )
-}
-
-fn check_pin(pin: &CloudTemplatePin) -> Result<(), Failure> {
-    if !TemplatePinId::BedrockCliReadRoleV1.matches_metadata(&pin.key, &pin.version_id, &pin.sha256)
-    {
-        return Err(template_unverified());
-    }
-    Ok(())
-}
-
-fn verify_template(aws: &Value, deadline: Instant) -> Result<String, Failure> {
-    let pin: CloudTemplatePin =
-        serde_json::from_value(aws["template"].clone()).map_err(|_| template_unverified())?;
-    check_pin(&pin)?;
-    verified_template_url_with_timeout(TemplatePinId::BedrockCliReadRoleV1, remaining(deadline)?)
-        .map_err(|_| template_unverified())
-}
-
 fn request_id_valid(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
@@ -228,11 +183,6 @@ fn queue_failure(error: SignQueueError) -> Failure {
             "signer_unavailable",
             "Use the release Ottto app to connect from this Mac.",
             "use_web",
-        ),
-        SignQueueError::Full | SignQueueError::ApprovalRateLimited => Failure::new(
-            "rate_limited",
-            "The Mac signer is busy. Try again shortly.",
-            "run_again",
         ),
         SignQueueError::AlreadyExpired => Failure::new(
             "expired",
@@ -283,49 +233,38 @@ impl SetupRunServer<'_> {
                 return Ok(Err(timeout()));
             };
             let url = format!("{prefix}/{resource}");
-            let mut request = crate::retry_tls::credential_agent()
-                .request(method, &url)
-                .set("Accept", "application/json")
-                .set("X-Ottto-Setup-Run-Token", token)
-                .timeout(timeout.min(Duration::from_secs(20)));
-            if let Some(proof) = proof {
-                request = request.set("X-Ottto-Device-Proof", proof);
-            }
-            let result = match body {
-                Some(body) => request
-                    .set("Content-Type", "application/json")
-                    .send_bytes(body),
-                None => request.call(),
-            };
-            let response = match result {
-                Ok(response) => backend_success(&url, response)?,
-                Err(ureq::Error::Status(status, response)) => {
-                    let value: Value = response.into_json().unwrap_or(Value::Null);
-                    if value["code"] == "setup_run_token_invalid" && status == 401 {
-                        return Err(LocalApiError::Backend(crate::BackendErrorDetails {
-                            kind: crate::BackendErrorKind::Rejected,
-                            endpoint: resource.to_string(),
-                            status: Some(status),
-                            body_excerpt: None,
-                            reason_code: Some("setup_run_token_invalid".into()),
-                        }));
-                    }
-                    if let Ok(error) = serde_json::from_value::<Failure>(value) {
-                        return Ok(Err(error));
-                    }
-                    return Ok(Err(server_failure(ServerError {
-                        code: if status >= 500 {
-                            "server_unavailable"
-                        } else {
-                            "server_rejected"
+            let mut headers = vec![("X-Ottto-Setup-Run-Token", token)];
+            headers.extend(proof.map(|proof| ("X-Ottto-Device-Proof", proof)));
+            let response =
+                match backend_send_raw(method, &url, body, &headers, timeout.min(CALL_TIMEOUT)) {
+                    Ok(response) => backend_success(&url, response)?,
+                    Err(ureq::Error::Status(status, response)) => {
+                        let value: Value = response.into_json().unwrap_or(Value::Null);
+                        if value["code"] == "setup_run_token_invalid" && status == 401 {
+                            return Err(LocalApiError::Backend(crate::BackendErrorDetails {
+                                kind: crate::BackendErrorKind::Rejected,
+                                endpoint: resource.to_string(),
+                                status: Some(status),
+                                body_excerpt: None,
+                                reason_code: Some("setup_run_token_invalid".into()),
+                            }));
                         }
-                        .into(),
-                        status: Some(status),
-                        outcome_unknown: status >= 500,
-                    })));
-                }
-                Err(error) => return Err(backend_error_from_ureq(&url, error)),
-            };
+                        if let Ok(error) = serde_json::from_value::<Failure>(value) {
+                            return Ok(Err(error));
+                        }
+                        return Ok(Err(server_failure(ServerError {
+                            code: if status >= 500 {
+                                "server_unavailable"
+                            } else {
+                                "server_rejected"
+                            }
+                            .into(),
+                            status: Some(status),
+                            outcome_unknown: status >= 500,
+                        })));
+                    }
+                    Err(error) => return Err(backend_error_from_ureq(&url, error)),
+                };
             response
                 .into_json()
                 .map(Ok)
@@ -355,55 +294,44 @@ impl SetupRunServer<'_> {
             ENSURE_TEMPLATE
         };
         let digest = request_sha256(method, template, body.unwrap_or_default());
-        let challenge_body = bytes(&json!({
-            "operation": operation, "attempt_id": attempt_id, "request_sha256": digest,
-        }));
+        let request = ChallengeRequest {
+            operation,
+            attempt_id,
+            request_sha256: &digest,
+        };
+        let challenge_body = bytes(&request);
         let resource = attempt_id.map_or_else(
             || "connect-attempts".into(),
             |id| format!("connect-attempts/{id}"),
         );
         for retry in [false, true] {
-            let challenge = self.agent_call(
+            let challenge: DeviceChallenge = serde_json::from_value(self.agent_call(
                 Some(run),
                 "POST",
                 "device-challenges",
                 Some(&challenge_body),
                 None,
                 deadline,
-            )?;
-            let challenge_id = challenge["challenge_id"]
-                .as_str()
-                .ok_or_else(invalid_server)?;
-            let encoded = challenge["payload_bytes"]
-                .as_str()
-                .ok_or_else(invalid_server)?;
-            let payload = decode_base64url(encoded).ok_or_else(invalid_server)?;
-            let facts: Value = serde_json::from_slice(&payload).map_err(|_| invalid_server())?;
-            let expiry = facts["exp"].as_i64().ok_or_else(invalid_server)?;
-            let issued_at = facts["iat"].as_i64().ok_or_else(invalid_server)?;
-            let now = unix_now();
-            if !cloud_uuid(challenge_id)
-                || facts["v"] != super::wire::DEVICE_WRITE_VERSION
-                || facts["challenge_id"] != challenge_id
-                || facts["run_id"] != run.id
-                || facts["org_id"] != run.organization_id
-                || facts["operation"] != operation
-                || facts["attempt_id"] != json!(attempt_id)
-                || facts["request_sha256"] != digest
-                || expiry <= now
-                || expiry > now + 120
-                || !(1..=60).contains(&expiry.saturating_sub(issued_at))
-            {
-                return Err(invalid_server());
-            }
+            )?)
+            .map_err(|_| invalid_server())?;
+            let checked = checked_challenge(
+                &challenge.challenge_id,
+                &challenge.payload_bytes,
+                &request,
+                &run.id,
+                &run.organization_id,
+                unix_now(),
+            )
+            .ok_or_else(invalid_server)?;
+            let payload = decode_base64url(&checked.payload_b64).ok_or_else(invalid_server)?;
             let wait = remaining(deadline)?.min(SIGN_WAIT);
-            let request = queue_sign_request(SignKind::DeviceProof, payload, expiry)
+            let queued = queue_sign_request(SignKind::DeviceProof, payload, checked.expires_at)
                 .map_err(queue_failure)?;
             let Some(SignOutcome::Signed(signature)) = sign_queue().wait(
-                &request,
+                &queued,
                 wait.min(deadline.saturating_duration_since(Instant::now())),
             ) else {
-                sign_queue().cancel(&request);
+                sign_queue().cancel(&queued);
                 remaining(deadline)?;
                 return Err(Failure::new(
                     "mac_app_unavailable",
@@ -416,7 +344,7 @@ impl SetupRunServer<'_> {
                 method,
                 &resource,
                 body,
-                Some(&proof_header(challenge_id, &signature)),
+                Some(&proof_header(&checked.challenge_id, &signature)),
                 deadline,
             );
             match result {
@@ -461,14 +389,13 @@ impl SetupRunServer<'_> {
 
     fn cancel(&self, run: &BoundRun, id: &str, deadline: Instant) -> Result<Value, Failure> {
         let mut attempt = self.signed_attempt(run, "DELETE", "cancel", Some(id), None, deadline)?;
-        sign_queue().cancel_attempt(id, u64::MAX);
+        sign_queue().cancel_attempt(id);
         remove_approval(&mut attempt);
         Ok(attempt)
     }
 
     fn poll(&self, id: &str, account: &str, deadline: Instant) -> Result<Value, Failure> {
         let run = self.bound_run().map_err(server_failure)?;
-        let approvals_before_read = sign_queue().approval_watermark();
         let mut attempt = self.read_attempt(Some(&run), id, deadline)?;
         let approval = attempt
             .as_object_mut()
@@ -480,7 +407,7 @@ impl SetupRunServer<'_> {
             return Err(account_mismatch());
         }
         if attempt["state"] != "cli_approval" {
-            sign_queue().cancel_attempt(id, approvals_before_read);
+            sign_queue().cancel_attempt(id);
             return Ok(attempt);
         }
         let Some(approval) = approval.filter(|approval| !approval.is_null()) else {
@@ -529,17 +456,12 @@ impl SetupRunServer<'_> {
         let actions = approval["next_actions"]
             .as_array()
             .ok_or_else(invalid_server)?;
-        let browser_path = format!("/connections/cloud-approve?attempt={id}");
         let browser_url = actions
             .iter()
             .any(|action| action == "approve_in_browser")
             .then(|| approval["browser_url"].as_str())
             .flatten()
-            .filter(|url| {
-                *url == browser_path
-                    || url.strip_prefix("https://app.ottto.net") == Some(browser_path.as_str())
-            })
-            .map(|_| format!("https://app.ottto.net{browser_path}"));
+            .and_then(|offered| approval_browser_url(&run.api_base_url, id, offered));
         let native = actions.iter().any(|action| action == "approve_on_mac");
         if native && signer_available() {
             let queued = queue_sign_request(
@@ -578,6 +500,7 @@ impl SetupRunServer<'_> {
                                 if matches!(
                                     error.code.as_str(),
                                     "approval_superseded"
+                                        | "approval_conflict"
                                         | "timed_out"
                                         | "server_unreachable"
                                         | "server_unavailable"
@@ -604,11 +527,6 @@ impl SetupRunServer<'_> {
                         return Ok(attempt);
                     }
                 },
-                Err(SignQueueError::ApprovalRateLimited | SignQueueError::Full)
-                    if browser_url.is_none() =>
-                {
-                    return Ok(attempt)
-                }
                 Err(_) => {}
             }
         }
@@ -625,27 +543,20 @@ impl SetupRunServer<'_> {
     }
 }
 
+/// The browser approval link for attempt `id`: the server's link only when it is the approval
+/// page on the web origin paired with this run's API (or that page's path), rebuilt from the
+/// compiled origin.
+pub(super) fn approval_browser_url(api_base_url: &str, id: &str, offered: &str) -> Option<String> {
+    let (_, web) = claim_origin_pair(api_base_url)?;
+    let path = format!("/connections/cloud-approve?attempt={id}");
+    (offered == path || offered.strip_prefix(web) == Some(path.as_str()))
+        .then(|| format!("{web}{path}"))
+}
+
 fn account_mismatch() -> Failure {
     Failure::new(
         "account_mismatch",
         "The approval is for a different AWS account.",
         "restart",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mismatched_pin_falls_back_to_web_before_any_template_fetch() {
-        let pin = CloudTemplatePin {
-            key: "aws/different.yaml".into(),
-            version_id: "other".into(),
-            sha256: "a".repeat(64),
-        };
-        let error = check_pin(&pin).unwrap_err();
-        assert_eq!(error.code, "aws_template_unverified");
-        assert_eq!(error.next_action, "use_web");
-    }
 }

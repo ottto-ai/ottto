@@ -968,36 +968,42 @@ never sees a key.
   The app and service requirements pin their respective identifiers, the team, and the Apple
   Developer ID leaf and intermediate CA.
 - **Wire.** JSON `{"signer_protocol":1,"id","command","args"}` in, `{"signer_protocol":1,"id",
-  "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. Every connection sends
-  `signer_hello` first; the service refuses anything else on a connection without one. The
+  "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. The shared fixture
+  `fixtures/cloud_connect/signer_wire_v1.json` holds every command and result byte for byte; the
+  service tests and the Mac app's tests both read it. Every connection sends `signer_hello`
+  first; its result names this Mac's `binding` (device, generation, organization) and the
+  server's `agent_connect` status, each null when unknown. The service refuses anything else on
+  a connection without a hello. The
   commands (`cloud_sign_poll`, `cloud_sign_result`, `cloud_keys_claim_start`,
   `cloud_keys_claim_status`, `cloud_keys_enroll_prepare`, `cloud_keys_enroll`,
   `cloud_keys_revoke`) exist only here, never on the control channel.
 - **Signed writes.** A prepare builds the body once, hashes
   `method + "\n" + route template + "\n" + body` with the literal `{setup_run_id}`, gets a
-  device challenge for that hash, checks the challenge's signed facts, and freezes body and
-  challenge on the connection. The send uses those bytes and `{challenge_id}.{signature}` proofs,
-  after the signature shape and required proofs are checked locally. Revoke signs the empty
-  `DELETE` body the same way. When the server specifically refuses the run token, the service
-  refreshes and resends the identical request only if the run and organization both match the
-  original binding. An ambiguous enrollment response requires a claim-state readback.
+  device challenge for that hash, checks the challenge's signed facts (version, challenge id,
+  run, organization, operation, attempt, hash, and an expiry within the operation's lifetime),
+  and freezes body and challenge on the connection. The body and hashes match the server's
+  enrollment vector, vendored unchanged as `fixtures/cloud_connect/enroll_wire_v1.json`. The
+  send uses those bytes and `{challenge_id}.{signature}` proofs, after the signature shape and
+  required proofs are checked locally. Revoke signs the empty `DELETE` body the same way; the
+  server answers it with an empty 204. When the server specifically refuses the run token, the
+  service refreshes and resends the identical request only if the run and organization both
+  match the original binding. An ambiguous enrollment response requires a claim-state readback.
 - **Browser claim.** The service selects the web origin from a compiled production and staging
   table using the API bound to the claim request. It returns a link only for that origin's
   `/setup/cloud-keys?claim=…` route with the returned UUID and a valid forward key code.
   The exact staging API is trusted for cloud setup-run requests and their token refresh.
-- **Sign queue.** In memory only: at most four live requests, a device proof until its
-  challenge expires and an approval until its `sign_by`; one request per approval id, and a new
-  approval supersedes the attempt's older one once the replacement passes expiry and capacity
-  checks. A request goes to the first verified connection
-  that polls it, only that connection's answer counts, and a DER shape check guards signatures.
+- **Sign queue.** In memory only: a device proof lives until its challenge expires and an
+  approval until its `sign_by`; one request per approval id, and a new approval supersedes the
+  attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the
+  server's attempt limits bound how many requests arrive. A request goes to the first verified
+  connection that polls it, only that connection's answer counts, and a DER shape check guards signatures.
   An ended connection drops its prepares and returns its requests to the queue.
 - **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
   three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
   This unauthenticated hint carries no data. The app obtains requests over verified XPC.
-- **Template.** The local flow selects a template ID. The service and CLI use the compiled
-  pin table in `ottto-protocol` for the immutable object key, version and SHA-256. The service
-  checks the downloaded bytes against the selected digest. A missing pin fails verification.
-  Server metadata is used only for comparison with the compiled pin.
+- **Template.** The CLI selects the template ID, compares the server's template metadata with
+  the compiled pin table in `ottto-protocol`, and builds the template URL from the pin. A missing
+  or different pin stops before any AWS write. The service does not fetch templates.
 - **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
   its LaunchAgent. Swapping only the service binary is unsupported because the installed job
   retains the signer Mach service and passes a flag the older binary cannot parse.

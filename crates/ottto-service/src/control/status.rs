@@ -14,11 +14,11 @@ use crate::control::install_owner_for_path;
 use crate::control::local_lifecycle_home_dir;
 use crate::control::local_relay_base_url_for_daemon;
 use crate::control::lock_managed_claude_settings;
-use crate::control::refresh_setup_run_token_via_device_secret;
 use crate::control::release_channel_from_str;
 use crate::control::repair_claude_statusline_for_refresh_at;
 use crate::control::repair_registered_managed_claude_relay_settings_locked;
 use crate::control::require_authorized_local_client;
+use crate::control::setup::claims::credentials::refresh_cloud_setup_run_token_checked;
 use crate::control::setup_run_token_for_connection;
 use crate::control::source_patch_disabled;
 use crate::control::terminal_refresh_rejection;
@@ -168,6 +168,7 @@ fn observe_agent_read(
         daemon,
         authorization,
         command,
+        |api_base_url| validated_api_base_url(Some(api_base_url)),
         |api_base_url, connection, setup_run_token| {
             agent_read_with_refresh(api_base_url, connection, setup_run_token, &read_url)
         },
@@ -206,9 +207,11 @@ fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
+    validate_api: fn(&str) -> Result<String, LocalApiError>,
     read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
-    let (api_base_url, start) = setup_run_agent_read_binding(daemon, authorization, command)?;
+    let (api_base_url, start) =
+        setup_run_agent_read_binding(daemon, authorization, command, validate_api)?;
     let result =
         setup_run_token_for_connection(&api_base_url, &start.binding).and_then(|credentials| {
             read(
@@ -231,17 +234,20 @@ fn observe_setup_run_read<T>(
 }
 
 /// `ottto cloud status`: read-only connector status through the setup-run
-/// bridge. Attempt-specific status and Bedrock setup use the cloud-connect control commands.
+/// bridge, plus whether this service serves the Mac app's signer. Attempt-specific status and
+/// Bedrock setup use the cloud-connect control commands. Like them, it trusts the compiled
+/// staging API as well as production.
 pub(super) fn cloud_status(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     source: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_status_source(source.as_deref())?;
-    observe_setup_run_read(
+    let mut status = observe_setup_run_read(
         daemon,
         authorization,
         "ottto cloud",
+        crate::control::cloud_connect::validated_cloud_api_base_url,
         |api_base_url, connection, setup_run_token| match cloud_status_with_base(
             api_base_url,
             connection,
@@ -251,7 +257,7 @@ pub(super) fn cloud_status(
             Ok(value) => Ok(value),
             Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
                 let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                    refresh_cloud_setup_run_token_checked(api_base_url, connection, |_| Ok(()))?;
                 cloud_status_with_base(
                     api_base_url,
                     &refreshed.connection,
@@ -261,7 +267,16 @@ pub(super) fn cloud_status(
             }
             Err(error) => Err(error),
         },
-    )
+    )?;
+    if let Some(status) = status.as_object_mut() {
+        let signer = if crate::control::cloud_connect::signer_available() {
+            "available"
+        } else {
+            "unavailable"
+        };
+        status.insert("signer".to_string(), serde_json::Value::from(signer));
+    }
+    Ok(status)
 }
 
 pub(super) fn validate_cloud_status_source(source: Option<&str>) -> Result<(), LocalApiError> {
@@ -297,6 +312,7 @@ fn setup_run_agent_read_binding(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
+    validate_api: fn(&str) -> Result<String, LocalApiError>,
 ) -> Result<(String, SetupRunReadStart), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
@@ -307,7 +323,7 @@ fn setup_run_agent_read_binding(
     let start = daemon
         .setup_run_read_start()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let api_base_url = validated_api_base_url(Some(start.binding.api_base_url.as_str()))?;
+    let api_base_url = validate_api(start.binding.api_base_url.as_str())?;
     Ok((api_base_url, start))
 }
 
