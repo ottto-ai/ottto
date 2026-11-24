@@ -315,7 +315,18 @@ pub(crate) fn publish_fixture_at_generation(
     })
     .unwrap();
     fence::publish(path, &identity, &mut false).unwrap();
-    ScanIndex::load(path).unwrap()
+    // A rare CI failure here showed only `state_v2_db_unavailable`. The shared
+    // telemetry cannot say which test caused it, so name this thread's own
+    // content-free cause. No cause means a direct hold, not a storage error.
+    telemetry::take_thread_event_for_test("db_unavailable");
+    telemetry::take_thread_event_for_test("db_unavailable_cause");
+    ScanIndex::load(path).unwrap_or_else(|error| {
+        panic!(
+            "fixture reload after publish: {error}; reason={:?}; cause={:?}",
+            telemetry::take_thread_event_for_test("db_unavailable"),
+            telemetry::take_thread_event_for_test("db_unavailable_cause"),
+        )
+    })
 }
 
 pub(in super::super) use runtime::erase_published;
