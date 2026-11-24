@@ -89,7 +89,8 @@ expect_failure altered-sparkle "Vendored Sparkle license does not match its reco
 
 # [behaviour] The Sparkle pin is read from the committed Package.resolved.
 app_repo="$TMP_DIR/app"
-mkdir -p "$app_repo/tools/ottto-macos-app"
+app_path="fixture-app"
+mkdir -p "$app_repo/$app_path"
 write_resolved() {
   local revision="$1"
   local location="${2:-https://github.com/sparkle-project/Sparkle}"
@@ -101,7 +102,7 @@ write_resolved() {
       state: {revision: $revision, version: "2.9.2"}
     }],
     version: 3
-  }' > "$app_repo/tools/ottto-macos-app/Package.resolved"
+  }' > "$app_repo/$app_path/Package.resolved"
 }
 commit_app() {
   git -C "$app_repo" add .
@@ -115,16 +116,16 @@ write_resolved "$OTTTO_SPARKLE_LICENSE_REVISION"
 pinned_commit="$(commit_app "pinned")"
 # A rewritten working copy must not change what the commit pins.
 write_resolved "0000000000000000000000000000000000000000"
-pin="$(ottto_macos_sparkle_pin "$app_repo" "$pinned_commit" tools/ottto-macos-app)"
+pin="$(ottto_macos_sparkle_pin "$app_repo" "$pinned_commit" "$app_path")"
 if [[ "$(jq -r '.version + " " + .revision' <<<"$pin")" != "2.9.2 $OTTTO_SPARKLE_LICENSE_REVISION" ]]; then
   fail "the Sparkle pin was not read from the committed Package.resolved: $pin"
 fi
 write_resolved "$OTTTO_SPARKLE_LICENSE_REVISION" "https://example.invalid/fork/Sparkle"
 fork_commit="$(commit_app "fork")"
-expect_failure fork-pin "Expected one upstream Sparkle pin" \
-  ottto_macos_sparkle_pin "$app_repo" "$fork_commit" tools/ottto-macos-app
-expect_failure no-resolved "The app source commit has no Package.resolved" \
-  ottto_macos_sparkle_pin "$app_repo" "$fork_commit" tools/missing
+expect_failure fork-pin "Expected one upstream Sparkle pin in Package.resolved" \
+  ottto_macos_sparkle_pin "$app_repo" "$fork_commit" "$app_path"
+expect_failure no-resolved "Could not read the Sparkle pin from the app source commit's Package.resolved" \
+  ottto_macos_sparkle_pin "$app_repo" "$fork_commit" missing-app
 
 # [behaviour] The pin and the embedded framework must be the vendored release.
 mock_bin="$TMP_DIR/bin"
@@ -140,9 +141,9 @@ framework="$TMP_DIR/Sparkle.framework"
 mkdir -p "$framework/Versions/B/Resources"
 printf '2.9.2' > "$framework/Versions/B/Resources/Info.plist"
 PATH="$mock_bin:$PATH" ottto_check_sparkle_license_pin 2.9.2 "$OTTTO_SPARKLE_LICENSE_REVISION" "$framework"
-expect_failure other-revision "update licenses/ first" \
+expect_failure other-revision "Use matching app and license commits." \
   ottto_check_sparkle_license_pin 2.9.2 "1111111111111111111111111111111111111111" "$framework"
-expect_failure other-version "update licenses/ first" \
+expect_failure other-version "Use matching app and license commits." \
   ottto_check_sparkle_license_pin 2.10.0 "$OTTTO_SPARKLE_LICENSE_REVISION" "$framework"
 printf '2.9.1' > "$framework/Versions/B/Resources/Info.plist"
 PATH="$mock_bin:$PATH" expect_failure framework-version "Embedded Sparkle framework version must match" \

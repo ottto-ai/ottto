@@ -30,15 +30,16 @@ ottto_macos_sparkle_pin() {
   local source_path="$3"
   local resolved
   if ! resolved="$(git -C "$git_root" show "$commit:$source_path/Package.resolved" 2>/dev/null)"; then
-    echo "The app source commit has no Package.resolved" >&2
+    echo "Could not read the Sparkle pin from the app source commit's Package.resolved" >&2
     return 1
   fi
   jq -ce '
-    [.pins[] | select(.identity == "sparkle"
+    [.pins[]? | select(.identity == "sparkle"
       and .kind == "remoteSourceControl"
       and .location == "https://github.com/sparkle-project/Sparkle")]
-    | if length == 1 then .[0].state else error("Expected one upstream Sparkle pin") end
-    | select((.version | type) == "string" and (.revision | type) == "string")
+    | if length == 1 then .[0].state else error("Expected one upstream Sparkle pin in Package.resolved") end
+    | if (.version | type) == "string" and (.revision | type) == "string" then .
+      else error("The Sparkle pin in Package.resolved needs a version and a revision") end
   ' <<<"$resolved"
 }
 
@@ -51,12 +52,12 @@ ottto_check_sparkle_license_pin() {
   local framework="$3"
   local embedded_version
   if [[ "$version" != "$OTTTO_SPARKLE_LICENSE_VERSION" || "$revision" != "$OTTTO_SPARKLE_LICENSE_REVISION" ]]; then
-    echo "The app pins Sparkle $version ($revision), but the vendored Sparkle license is for $OTTTO_SPARKLE_LICENSE_VERSION ($OTTTO_SPARKLE_LICENSE_REVISION); update licenses/ first" >&2
+    echo "The app pins Sparkle $version ($revision), but the vendored Sparkle license is for $OTTTO_SPARKLE_LICENSE_VERSION ($OTTTO_SPARKLE_LICENSE_REVISION). Use matching app and license commits." >&2
     return 1
   fi
   if ! embedded_version="$(plutil -extract CFBundleShortVersionString raw -o - "$framework/Versions/B/Resources/Info.plist" 2>/dev/null)" ||
     [[ "$embedded_version" != "$version" ]]; then
-    echo "Embedded Sparkle framework version must match the app source pin $version" >&2
+    echo "Embedded Sparkle framework version must match the app source pin ($version)" >&2
     return 1
   fi
 }

@@ -75,8 +75,12 @@ Its SHA-256 is
 `389a4e4e9a32f059775b13a06e25a591445ba229d2838d26dd3e7c0c45127cfe`. It covers
 Sparkle and the code it bundles, under MIT, BSD and Zlib terms.
 
-Packaging refuses an app whose Sparkle pin (from the app's committed
-`Package.resolved`) or embedded framework version is not this release. To move
-to a new Sparkle version, update this file, its name, and the version,
-commit and SHA-256 in `scripts/macos_license_notices.sh` in one reviewed
-change before the app's pin moves. Never fetch the license at release time.
+Packaging requires the app's committed Sparkle version and revision to match
+the vendored license, and the embedded framework version to match the pin.
+A Sparkle bump changes two paired release inputs. In the public release
+source, update the vendored file, its name, and its version, revision and
+SHA-256 in `scripts/macos_license_notices.sh` in one reviewed change. In the
+app source, update the pin in `Package.resolved` to the same version and
+revision. Keep tagging releases with the previous matching commits until both
+updated commits are available, then tag with the new matching pair. The
+license is vendored ahead of packaging.

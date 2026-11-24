@@ -175,6 +175,10 @@ cat > "$mock_bin/ditto" <<'DITTO'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "-c" && "${2:-}" == "-k" && -d "$3" ]]; then
+  if [[ "${fixture_fail_daemon_zip:-}" == "true" && "$3" == */daemon ]]; then
+    echo "Fixture daemon zip creation failed" >&2
+    exit 1
+  fi
   # A folder "zip" lists its entries with their hashes.
   (cd "$3" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
     printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
@@ -198,8 +202,9 @@ cat > "$mock_bin/otool" <<'OTOOL'
 #!/usr/bin/env bash
 printf 'path @executable_path/../Frameworks\n'
 OTOOL
-# Records the entitlements plist each target is signed with; -d prints it, so
-# the packager's post-sign entitlement check sees what it asked for.
+# Log every signing call and record its entitlements for the packager's
+# post-sign entitlement check.
+export fixture_codesign_calls="$TMP_DIR/codesign.calls"
 cat > "$mock_bin/codesign" <<'CODESIGN'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -221,6 +226,15 @@ record="$target.fixture-entitlements"
 if [[ "$display" == "true" ]]; then
   if [[ -f "$record" ]]; then cat "$record"; fi
   exit 0
+fi
+printf '%s\n' "$target" >> "$fixture_codesign_calls"
+if [[ "$target" == */Ottto.app ]]; then
+  for notice in LICENSE NOTICE LICENSE-THIRD-PARTY.html LICENSE-Sparkle.txt; do
+    if [[ ! -s "$target/Contents/Resources/$notice" ]]; then
+      echo "App is missing $notice at signing time" >&2
+      exit 1
+    fi
+  done
 fi
 if [[ -n "$entitlements" ]]; then cp "$entitlements" "$record"; else rm -f "$record"; fi
 CODESIGN
@@ -437,35 +451,57 @@ if ! jq -e --arg revision "$sparkle_revision" '
   exit 1
 fi
 
+# A failed archive leaves no copied binaries or notices in the temp directory.
+zip_tmp="$TMP_DIR/zip-tmp"
+mkdir "$zip_tmp"
+TMPDIR="$zip_tmp" fixture_fail_daemon_zip=true \
+  package_expect_failure daemon-zip "Fixture daemon zip creation failed" \
+    --app-root "$app_root" --app-source-commit "$private_commit"
+if [[ -n "$(find "$zip_tmp" -name 'ottto-zip-stage.*' -print -quit)" ]]; then
+  echo "Binary zip creation failure left a staging directory behind" >&2
+  exit 1
+fi
+
 # commit_app_fixture <message>: commit the app fixture and print the commit.
 commit_app_fixture() {
   git -C "$private_repo" add .
   git -C "$private_repo" commit -qm "$1"
   git -C "$private_repo" rev-parse HEAD
 }
+
+expect_sparkle_rejection() {
+  : > "$fixture_codesign_calls"
+  package_expect_failure "$@"
+  if [[ -s "$fixture_codesign_calls" ]]; then
+    echo "Packaging signed code before rejecting $1" >&2
+    cat "$fixture_codesign_calls" >&2
+    exit 1
+  fi
+}
+
 # [behaviour] Packaging refuses an embedded Sparkle that differs from the pin.
 plutil -replace CFBundleShortVersionString -string 2.9.3 "$app_root/$sparkle_plist"
 mismatch_commit="$(commit_app_fixture "change the embedded Sparkle version")"
-package_expect_failure sparkle-mismatch "Embedded Sparkle framework version must match the app source pin (2.9.2)" \
+expect_sparkle_rejection sparkle-mismatch "Embedded Sparkle framework version must match the app source pin (2.9.2)" \
   --app-root "$app_root" --app-source-commit "$mismatch_commit"
 git -C "$private_repo" reset -q --hard "$private_commit"
 # [behaviour] A lockfile without exactly one upstream Sparkle pin is refused.
 jq '.pins = []' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
 mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
 no_pin_commit="$(commit_app_fixture "drop the Sparkle pin")"
-package_expect_failure sparkle-no-pin "Expected one upstream Sparkle pin in Package.resolved" \
+expect_sparkle_rejection sparkle-no-pin "Expected one upstream Sparkle pin in Package.resolved" \
   --app-root "$app_root" --app-source-commit "$no_pin_commit"
 # [behaviour] A Sparkle pin without a revision is refused with a reason.
 write_sparkle_pin "$sparkle_revision"
 jq 'del(.pins[0].state.revision)' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
 mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
 no_revision_commit="$(commit_app_fixture "drop the Sparkle revision")"
-package_expect_failure sparkle-no-revision "The Sparkle pin in Package.resolved needs a version and a revision" \
+expect_sparkle_rejection sparkle-no-revision "The Sparkle pin in Package.resolved needs a version and a revision" \
   --app-root "$app_root" --app-source-commit "$no_revision_commit"
 # [behaviour] A different revision of the same Sparkle version is refused.
 write_sparkle_pin "1111111111111111111111111111111111111111"
 other_pin_commit="$(commit_app_fixture "change the Sparkle revision")"
-package_expect_failure other-sparkle-pin "the vendored Sparkle license is for" \
+expect_sparkle_rejection other-sparkle-pin "the vendored Sparkle license is for" \
   --app-root "$app_root" --app-source-commit "$other_pin_commit"
 git -C "$private_repo" reset -q --hard "$private_commit"
 

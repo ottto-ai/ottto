@@ -45,7 +45,7 @@ fi
 for zip_stage in 'CLI_ZIP cli' 'DAEMON_ZIP daemon'; do
   zip_var="${zip_stage% *}"
   stage="${zip_stage#* }"
-  if ! grep -Fxq "ditto -c -k \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
+  if ! grep -Fxq "  ditto -c -k \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
     echo "Package script must zip the $stage staging folder with its license notices." >&2
     exit 1
   fi
