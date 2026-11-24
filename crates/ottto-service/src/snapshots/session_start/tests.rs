@@ -173,6 +173,8 @@ fn claude_fixture_yields_exact_session_start() {
             "instruction_load_cut": false,
             "start_parts_method": "cc_wire_v1",
             "start_chars_tools": 16,
+            // Measured: request 1 sent no MCP tool in full.
+            "start_chars_mcp_schemas": 0,
             "start_chars_system": 15,
             "start_chars_instructions": 75,
             "start_chars_memory": 8,
@@ -213,6 +215,142 @@ fn claude_fixture_yields_exact_session_start() {
     without_attribution.apply_upload_policy(true, true);
     assert_eq!(without_attribution.opening_files.len(), 2);
     assert_eq!(without_attribution.opening_file_overflow, Some(1));
+}
+
+/// The fixture's request 1 with a built-in tool, an MCP tool sent in full and
+/// two deferred tools (one MCP, one built-in).
+fn claude_mcp_fixture_lines() -> Vec<Value> {
+    let mut lines = claude_fixture_lines();
+    lines[2] = json!({"type": "api-request-shape", "shapeHash": "s1", "shape": {
+        "system": [{"type": "text", "text": "You are Claude."}],
+        "tools": [
+            {"name": "Read"},
+            {"name": "mcp__docs__search", "description": "Search the docs.", "input_schema": {"type": "object"}},
+            {"name": "mcp__docs__fetch", "defer_loading": true},
+            {"name": "ToolSearch", "defer_loading": true}]}});
+    lines
+}
+
+/// `start_chars_mcp_schemas` is the part of `start_chars_tools` that is MCP
+/// tools sent in full: a deferred tool counts in the tools only. It is a
+/// number with no names, so it travels with labels and attribution off.
+#[test]
+fn mcp_schemas_count_only_mcp_tools_sent_in_full() {
+    let dir = crate::test_scratch::ScratchDir::new("session-start-mcp");
+    let path = dir.join("ss-claude-mcp.jsonl");
+    write_lines(&path, serde_json::from_str(CLAUDE_COMMON).unwrap(), claude_mcp_fixture_lines());
+    let items = parse_claude(&path, Some(&attribution_context(&dir)));
+    assert_start_verdict(&items[0], StartVerdict::Measured);
+    let mut start = (*items[0].session_start.clone().expect("session_start")).clone();
+    // Built-in 16, MCP in full 100, deferred MCP 51, deferred built-in 45.
+    assert_eq!(start.start_chars_tools, Some(16 + 100 + 51 + 45));
+    assert_eq!(start.start_chars_mcp_schemas, Some(100));
+    start.apply_upload_policy(false, false);
+    let mut actual = serde_json::to_value(&start).expect("serialize");
+    take_fingerprint(&mut actual);
+    assert_eq!(
+        actual,
+        json!({
+            "client_version": "2.1.300",
+            "user_turn_count": 1,
+            "first_request_uncached_input_tokens": 10,
+            "first_request_cache_read_tokens": 100,
+            "first_request_cache_write_5m_tokens": 20,
+            "first_request_cache_write_1h_tokens": 30,
+            "opening_request_count": 3,
+            "request_2_context_tokens": 305,
+            "request_3_context_tokens": 400,
+            "opening_output_tokens": 10,
+            "opening_tool_calls": 3,
+            "opening_truncated_outputs": 1,
+            "opening_file_overflow": 3,
+            "instruction_load_cut": false,
+            "start_parts_method": "cc_wire_v1",
+            "start_chars_tools": 212,
+            "start_chars_mcp_schemas": 100,
+            "start_chars_system": 15,
+            "start_chars_instructions": 75,
+            "start_chars_memory": 8,
+            "start_chars_skills": 0,
+            "start_chars_agents": 0,
+            "start_chars_mcp_names": 21,
+            "start_chars_mcp_instructions": 0,
+            "start_chars_hooks_env": 17,
+            "start_chars_prompt": 8,
+            "start_chars_other": 6
+        })
+    );
+}
+
+/// Unknown, never 0, when request 1 is not fully recorded: no shape record,
+/// or no request record.
+#[test]
+fn mcp_schemas_are_unknown_without_a_recorded_request_one() {
+    let mut no_shape = claude_mcp_fixture_lines();
+    no_shape.remove(2);
+    let mut no_request = claude_mcp_fixture_lines();
+    no_request.remove(5);
+    let dir = crate::test_scratch::ScratchDir::new("session-start-mcp-unknown");
+    for (name, lines) in [("no-shape", no_shape), ("no-request", no_request)] {
+        let path = dir.join(format!("ss-claude-{name}.jsonl"));
+        write_lines(&path, serde_json::from_str(CLAUDE_COMMON).unwrap(), lines);
+        let items = parse_claude(&path, None);
+        let start = items[0].session_start.clone().expect("the window is measured");
+        assert_eq!(start.start_chars_tools, None, "{name}");
+        assert_eq!(start.start_chars_mcp_schemas, None, "{name}");
+    }
+}
+
+/// A checkpoint between request 1's shape and its request record keeps the
+/// staged count in the opening-settings fact, never in the record body, and
+/// the restored state measures what an uninterrupted pass does. A fact
+/// written before this field existed (v1) leaves it unknown beside the
+/// measured tools.
+#[test]
+fn mcp_schemas_survive_a_checkpoint_across_request_one() {
+    use crate::durable_tail_codec::{Dec, Durable, Enc};
+    let lines = claude_mcp_fixture_lines();
+    let cwd = Some(Path::new("/w/repo"));
+    let observe = |state: &mut SessionStartState, lines: &[Value]| {
+        for line in lines {
+            state.observe_claude_line(line, 0, cwd);
+        }
+    };
+    let mut whole = SessionStartState::default();
+    observe(&mut whole, &lines[..6]);
+    assert_eq!(whole.mcp_schemas, Some(100));
+
+    let mut staged = SessionStartState::default();
+    observe(&mut staged, &lines[..5]);
+    assert_eq!(staged.mcp_schemas, Some(100));
+    assert!(staged.has_opening_fact() && staged.has_mcp_schemas());
+    let body = Enc::count_write(1 << 20, |e| staged.put(e)).unwrap();
+    let mut without = staged.clone();
+    without.mcp_schemas = None;
+    assert_eq!(Enc::count_write(1 << 20, |e| without.put(e)).unwrap(), body, "not in the body");
+    let restore = |fact: &[u8], with_mcp_schemas: bool| {
+        let mut restored = SessionStartState::take(&mut Dec::new(&body)).unwrap();
+        assert_eq!(restored.mcp_schemas, None);
+        let mut d = Dec::new(fact);
+        restored.take_opening_fact(&mut d, with_mcp_schemas).unwrap();
+        d.finish().unwrap();
+        observe(&mut restored, &lines[5..6]);
+        restored
+    };
+    let fact = Enc::count_write(1 << 20, |e| staged.put_opening_fact(e)).unwrap();
+    let old_fact = Enc::count_write(1 << 20, |e| without.put_opening_fact(e)).unwrap();
+    assert_eq!(fact[..old_fact.len()], old_fact[..], "v2 appends to v1");
+    let resumed = restore(&fact, true);
+    assert_eq!(resumed.mcp_schemas, whole.mcp_schemas);
+    assert_eq!(resumed.parts, whole.parts);
+
+    let upgraded = restore(&old_fact, false);
+    assert_eq!(upgraded.mcp_schemas, None);
+    let start = upgraded
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, None, None)
+        .expect("measured");
+    assert_eq!(start.start_chars_tools, Some(212));
+    assert_eq!(start.start_chars_mcp_schemas, None);
 }
 
 #[test]
@@ -1456,7 +1594,7 @@ fn config_digest_is_content_and_never_reaches_a_record_body() {
         assert!(state.has_opening_fact(), "{name}");
         let fact = Enc::count_write(1 << 20, |e| state.put_opening_fact(e)).unwrap();
         let mut d = Dec::new(&fact);
-        decoded.take_opening_fact(&mut d).unwrap();
+        decoded.take_opening_fact(&mut d, state.has_mcp_schemas()).unwrap();
         d.finish().unwrap();
         assert_eq!(
             decoded.config_digest.map(ConfigDigest::to_bytes),

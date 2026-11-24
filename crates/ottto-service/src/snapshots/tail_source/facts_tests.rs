@@ -162,6 +162,37 @@ fn an_unknown_fact_version_holds_the_file() {
     assert_eq!(route.head(&key).unwrap().body, head);
 }
 
+/// [format] The request-1 MCP schema count rides in the opening-settings fact
+/// as its v2, and a restart restores it. Without it the fact stays v1, byte
+/// for byte, so every other session's stored state is unchanged.
+#[test]
+fn opening_settings_v2_carries_the_mcp_schema_count() {
+    let mut route = route();
+    let (plain, _) = route.complete("plain.jsonl", &lines(3), None, |acc| {
+        acc.session_start.opening_fact_for_test("RULES", "a.md");
+    });
+    let (tail, native) = route.complete("mcp.jsonl", &lines(3), None, |acc| {
+        acc.session_start.opening_fact_for_test("RULES", "a.md");
+        acc.session_start.set_mcp_schemas_for_test(Some(0));
+    });
+    let page = (Collection::SessionFacts, 3);
+    let v1 = &plain.staged_for_test().unwrap().pages[&page];
+    let v2 = &tail.staged_for_test().unwrap().pages[&page];
+    assert_eq!(v1[..2], [3, 1], "kind 3, version 1");
+    assert_eq!(v2[..2], [3, 2], "kind 3, version 2");
+    assert_eq!(v2[2..v1.len()], v1[2..], "v2 appends the count to v1");
+    let key = tail.key_for_test().to_owned();
+    assert!(tail.publish(&native));
+    route.save(false);
+    let (Load::Reused(taken, _), records) = loaded(&route, &route.dir.join("mcp.jsonl"), &key)
+    else {
+        panic!("the committed head is reused");
+    };
+    assert_eq!(counted(&records), ("hit".into(), vec![]));
+    let (acc, _, _) = taken.state.finish_view();
+    assert_eq!(acc.session_start.mcp_schemas_for_test(), Some(0));
+}
+
 /// [behaviour] Opening-settings counts are checked against the head's call
 /// keys in the same load. A mismatch is corrupt for that file alone: it is
 /// one counted reconstruction, and a sibling on the same route still loads.
