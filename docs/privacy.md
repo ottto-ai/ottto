@@ -344,8 +344,9 @@ that names itself, or a launcher family Ottto does not recognize. No prompt,
 path, command line, environment value, or free text can pass those checks, and
 nothing is read from any other source to complete a partial event. Accepted
 files move to `~/.ottto/launch-events/processed/`, named for the worker session
-they describe so a lookup opens only the files of the sessions it needs, and
-expire after thirty days;
+they describe so a lookup opens only the files of the sessions it needs (files
+an older release filed without that name are renamed once, by a sweep that runs
+at most daily), and expire after thirty days;
 rejected files move to `~/.ottto/launch-events/rejected/` and expire after seven
 days, with the local log line naming only a reason code and never the file's
 contents. Two events naming the same session with different controllers produce

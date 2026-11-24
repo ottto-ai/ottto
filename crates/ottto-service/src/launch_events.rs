@@ -66,9 +66,11 @@
 //! index: a lookup reads `processed/` names only and opens just the demanded
 //! workers' files, so its cost follows the demand, not the 30-day store.
 //! Every claim on one worker shares that prefix, so the two-controllers rule
-//! still sees all of them. Legacy `<digest>.json` names are opened by every
-//! lookup until they expire. Expiry is a slow sweep, at most once a day per
-//! process, never part of each lookup.
+//! still sees all of them. A legacy `<digest>.json` name, written by an older
+//! release, is re-filed under its worker by the slow sweep, before the claim
+//! passes stamp the directories, so later lookups skip it by name too. The
+//! slow sweep, which also expires old events, runs at most once a day per
+//! process, never as part of each lookup.
 
 use crate::hex::is_uuid;
 use serde_json::{Map, Value};
@@ -148,6 +150,18 @@ const CAPTURE_SOURCES: &[(&str, &str)] = &[
 /// never stat files they do not open; expiry is this slow sweep's job.
 const PROCESSED_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Lookup phases, in order. Only intake and re-filing change the directories;
+/// both run before the claim passes stamp them, so neither unsettles the
+/// lookup that made the change.
+const PHASE_INTAKE: usize = 0;
+/// Slow sweep only: re-file legacy `<digest>.json` processed names.
+const PHASE_REFILE: usize = 1;
+const PHASE_PENDING_CLAIMS: usize = 2;
+const PHASE_PROCESSED_CLAIMS: usize = 3;
+/// Slow sweep only: remove expired processed events.
+const PHASE_PROCESSED_EXPIRY: usize = 4;
+const PHASE_REJECTED_EXPIRY: usize = 5;
+
 /// One accepted launch event, reduced to what a fact may carry.
 ///
 /// `pr_ref` is validated on the way in -- a non-integer is a broken emitter and
@@ -180,11 +194,15 @@ struct Lookup {
     entries: Option<fs::ReadDir>,
     complete: bool,
     failed: bool,
+    /// This lookup runs the slow sweep (re-file and expiry).
+    sweep: bool,
     loaded_at: Option<Instant>,
     /// Counts only, for the lookup diagnostic: processed files skipped by
-    /// name, event files opened, and expired files the slow sweep removed.
+    /// name, event files opened, legacy names re-filed, and expired files the
+    /// slow sweep removed.
     skipped_by_name: u64,
     opened: u64,
+    refiled: u64,
     swept: u64,
     pending_stamp: Option<SystemTime>,
     processed_stamp: Option<SystemTime>,
@@ -272,16 +290,22 @@ impl LaunchEventInventory {
             .all(|worker| lookup.workers.contains_key(worker));
         for _ in 0..LOOKUP_ENTRIES_PER_STEP {
             if lookup.entries.is_none() {
-                // Expiry of processed events is a slow sweep, not every lookup.
-                if lookup.phase == 3 && !processed_sweep_due(root) {
+                // Re-filing and expiry of processed events are a slow sweep,
+                // not part of every lookup.
+                if lookup.phase == PHASE_REFILE {
+                    lookup.sweep = processed_sweep_due(root);
+                }
+                if matches!(lookup.phase, PHASE_REFILE | PHASE_PROCESSED_EXPIRY) && !lookup.sweep {
                     if advance_phase(root, &mut lookup) {
                         return finish_lookup(root, &mut lookup).map(|_| demand_matches);
                     }
                     continue;
                 }
                 let subdir = match lookup.phase {
-                    0 | 1 => PENDING_SUBDIR,
-                    2 | 3 => PROCESSED_SUBDIR,
+                    PHASE_INTAKE | PHASE_PENDING_CLAIMS => PENDING_SUBDIR,
+                    PHASE_REFILE | PHASE_PROCESSED_CLAIMS | PHASE_PROCESSED_EXPIRY => {
+                        PROCESSED_SUBDIR
+                    }
                     _ => REJECTED_SUBDIR,
                 };
                 match fs::read_dir(root.join(subdir)) {
@@ -296,7 +320,7 @@ impl LaunchEventInventory {
                         // Rejected files are maintenance only, never claims.
                         // Preserve a complete pending/processed proof when
                         // rejected-directory cleanup is unavailable.
-                        lookup.failed |= lookup.phase != 4;
+                        lookup.failed |= lookup.phase != PHASE_REJECTED_EXPIRY;
                         return finish_lookup(root, &mut lookup).map(|_| demand_matches);
                     }
                 }
@@ -311,7 +335,7 @@ impl LaunchEventInventory {
                     // worker is opened only when that worker is demanded.
                     // Every claim on one worker shares the prefix, so the
                     // two-controllers rule still sees all of them.
-                    if lookup.phase == 2 {
+                    if lookup.phase == PHASE_PROCESSED_CLAIMS {
                         if let Some(worker) = indexed_worker(&path) {
                             if !lookup.workers.contains_key(worker) {
                                 lookup.skipped_by_name += 1;
@@ -322,36 +346,49 @@ impl LaunchEventInventory {
                     match entry.file_type() {
                         Ok(kind) if kind.is_file() => {}
                         Ok(kind) if kind.is_symlink() => {
-                            if lookup.phase == 0 {
+                            if lookup.phase == PHASE_INTAKE {
                                 reject(&path, &root.join(REJECTED_SUBDIR), "not_regular");
                             }
                             continue;
                         }
                         Ok(_) => continue,
                         Err(_) => {
-                            lookup.failed |= lookup.phase != 4;
+                            lookup.failed |= lookup.phase != PHASE_REJECTED_EXPIRY;
                             continue;
                         }
                     }
-                    let retention = if lookup.phase == 4 {
+                    let retention = if lookup.phase == PHASE_REJECTED_EXPIRY {
                         REJECTED_RETENTION
                     } else {
                         PROCESSED_RETENTION
                     };
                     if is_expired(&path, retention) {
-                        if (lookup.phase == 0 || lookup.phase >= 3)
+                        if (lookup.phase == PHASE_INTAKE || lookup.phase >= PHASE_PROCESSED_EXPIRY)
                             && fs::remove_file(&path).is_ok()
                         {
                             lookup.swept += 1;
                         }
                         continue;
                     }
-                    if lookup.phase >= 3 {
+                    if lookup.phase == PHASE_REFILE {
+                        // One open per legacy name, once; a file that fails
+                        // validation stays put for the claim pass to reject.
+                        if indexed_worker(&path).is_none() {
+                            lookup.opened += 1;
+                            if let Ok(event) = read_and_validate(&path) {
+                                if relocate_processed(&path, &root.join(PROCESSED_SUBDIR), &event) {
+                                    lookup.refiled += 1;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if lookup.phase >= PHASE_PROCESSED_EXPIRY {
                         continue;
                     }
                     lookup.opened += 1;
                     match read_and_validate(&path) {
-                        Ok(event) if lookup.phase == 0 => {
+                        Ok(event) if lookup.phase == PHASE_INTAKE => {
                             if !relocate_processed(&path, &root.join(PROCESSED_SUBDIR), &event) {
                                 lookup.failed = true;
                             }
@@ -368,7 +405,7 @@ impl LaunchEventInventory {
                         Err(reason) => {
                             if reason == "unreadable" {
                                 lookup.failed = true;
-                            } else if lookup.phase == 0 {
+                            } else if lookup.phase == PHASE_INTAKE {
                                 reject(&path, &root.join(REJECTED_SUBDIR), reason);
                             } else {
                                 // Quarantine changes the directory fence. This
@@ -379,7 +416,7 @@ impl LaunchEventInventory {
                         }
                     }
                 }
-                Some(Err(_)) => lookup.failed |= lookup.phase != 4,
+                Some(Err(_)) => lookup.failed |= lookup.phase != PHASE_REJECTED_EXPIRY,
                 None => {
                     lookup.entries = None;
                     if advance_phase(root, &mut lookup) {
@@ -471,16 +508,16 @@ fn directory_stamp(dir: &Path) -> Option<SystemTime> {
 
 fn advance_phase(root: &Path, lookup: &mut Lookup) -> bool {
     lookup.phase += 1;
-    if lookup.phase == 1 {
+    if lookup.phase == PHASE_PENDING_CLAIMS {
         lookup.pending_stamp = directory_stamp(&root.join(PENDING_SUBDIR));
         lookup.processed_stamp = directory_stamp(&root.join(PROCESSED_SUBDIR));
     }
-    lookup.phase > 4
+    lookup.phase > PHASE_REJECTED_EXPIRY
 }
 
 fn finish_lookup(root: &Path, lookup: &mut Lookup) -> Result<bool, ()> {
     lookup.entries = None;
-    if lookup.phase != 0
+    if lookup.phase >= PHASE_PENDING_CLAIMS
         && (lookup.pending_stamp != directory_stamp(&root.join(PENDING_SUBDIR))
             || lookup.processed_stamp != directory_stamp(&root.join(PROCESSED_SUBDIR)))
     {
@@ -498,9 +535,10 @@ fn finish_lookup(root: &Path, lookup: &mut Lookup) -> Result<bool, ()> {
     if lookup.failed {
         eprintln!("ottto-service: launch lookup incomplete: local evidence changed or was unreadable; work remains owed");
     }
-    // Only a lookup that touched an event file reports, so a Mac with no
-    // launcher events writes no line per scan.
-    if lookup.phase != 0 && lookup.opened + lookup.skipped_by_name + lookup.swept > 0 {
+    // Only a lookup that opened, re-filed or removed an event file reports.
+    // Skipping a filed name is a directory read, so a Mac whose retained
+    // events are all filed and undemanded writes no line per scan.
+    if lookup.phase != PHASE_INTAKE && lookup.opened + lookup.swept > 0 {
         crate::local_resource_diagnostics::traversal_point(
             "launch_event_lookup",
             "unknown",
@@ -508,6 +546,7 @@ fn finish_lookup(root: &Path, lookup: &mut Lookup) -> Result<bool, ()> {
                 demanded_workers: lookup.workers.len() as u64,
                 processed_skipped_by_name: lookup.skipped_by_name,
                 event_files_opened: lookup.opened,
+                legacy_files_refiled: lookup.refiled,
                 expired_files_removed: lookup.swept,
             },
         );
@@ -527,11 +566,12 @@ struct LookupCounts {
     demanded_workers: u64,
     processed_skipped_by_name: u64,
     event_files_opened: u64,
+    legacy_files_refiled: u64,
     expired_files_removed: u64,
 }
 
 /// The worker a processed event is filed under (`<worker>.<digest>.json`), or
-/// `None` for a legacy `<digest>.json` name, which every lookup still opens.
+/// `None` for a legacy `<digest>.json` name, which the slow sweep re-files.
 fn indexed_worker(path: &Path) -> Option<&str> {
     let (worker, digest) = path.file_stem()?.to_str()?.split_once('.')?;
     (is_uuid(worker)
@@ -552,7 +592,8 @@ pub(crate) fn forget_processed_sweep(home: &Path) {
 }
 
 /// True at most once per [`PROCESSED_SWEEP_INTERVAL`] for one drop root in
-/// this process: the first lookup after a start sweeps, later ones skip.
+/// this process: the first lookup after a start re-files and expires, later
+/// ones skip both.
 fn processed_sweep_due(root: &Path) -> bool {
     let Ok(mut last) = LAST_PROCESSED_SWEEP.lock() else {
         return true;
@@ -1114,7 +1155,7 @@ mod tests {
         let event = validate_event(&raw).unwrap();
         let dir = home.join(DROP_ROOT_DIR).join(PROCESSED_SUBDIR);
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.json", event_digest(&event)));
+        let path = dir.join(format!("{id}.{}.json", event_digest(&event)));
         fs::write(&path, raw).unwrap();
         (id, path)
     }
@@ -1286,6 +1327,63 @@ mod tests {
         assert_eq!(counts.skipped_by_name, 1);
     }
 
+    /// [behaviour] The slow sweep re-files an older release's `<digest>.json`
+    /// processed names under their worker once, in the lookup that sweeps,
+    /// without unsettling it. Later lookups skip them by name, and a lookup
+    /// that only skips names opens and removes nothing, so it writes no line.
+    #[test]
+    fn legacy_processed_names_are_refiled_once_then_skipped_by_name() {
+        let home = TestHome::new();
+        let processed = home.0.join(DROP_ROOT_DIR).join(PROCESSED_SUBDIR);
+        fs::create_dir_all(&processed).unwrap();
+        let (first, second) = (worker(1), worker(2));
+        for id in [&first, &second] {
+            let raw = helper_event(id, CONTROLLER);
+            let event = validate_event(&raw).unwrap();
+            fs::write(
+                processed.join(format!("{}.json", event_digest(&event))),
+                raw,
+            )
+            .unwrap();
+        }
+        let sweeping = LaunchEventInventory::refresh(&home.0);
+        complete(&sweeping, std::slice::from_ref(&second));
+        assert_eq!(
+            sweeping.matching(&second).unwrap().worker_session_ref,
+            second
+        );
+        {
+            let counts = sweeping.lookup.lock().unwrap();
+            assert_eq!(counts.refiled, 2);
+            assert_eq!(
+                counts.opened, 3,
+                "two legacy names once, then the demanded file"
+            );
+            assert_eq!(counts.skipped_by_name, 1);
+        }
+        assert!(bounded_entries(&processed, 8)
+            .iter()
+            .all(|path| indexed_worker(path).is_some()));
+
+        let later = LaunchEventInventory::refresh(&home.0);
+        complete(&later, std::slice::from_ref(&first));
+        assert_eq!(later.matching(&first).unwrap().worker_session_ref, first);
+        let counts = later.lookup.lock().unwrap();
+        assert_eq!(
+            (counts.refiled, counts.opened, counts.skipped_by_name),
+            (0, 1, 1)
+        );
+        drop(counts);
+
+        let undemanded = LaunchEventInventory::refresh(&home.0);
+        complete(&undemanded, &[worker(3)]);
+        let counts = undemanded.lookup.lock().unwrap();
+        assert_eq!(
+            (counts.opened, counts.swept, counts.skipped_by_name),
+            (0, 0, 2)
+        );
+    }
+
     /// [behaviour] Two controllers claiming one worker still withhold both
     /// when both claims are filed under that worker.
     #[test]
@@ -1366,9 +1464,11 @@ impl crate::heap_layout_bound::HeapLayoutBound for Lookup {
             entries,
             complete,
             failed,
+            sweep,
             loaded_at,
             skipped_by_name,
             opened,
+            refiled,
             swept,
             pending_stamp,
             processed_stamp,
@@ -1383,10 +1483,12 @@ impl crate::heap_layout_bound::HeapLayoutBound for Lookup {
         phase.heap_bound(c)?;
         complete.heap_bound(c)?;
         failed.heap_bound(c)?;
+        sweep.heap_bound(c)?;
         let _ = (
             loaded_at,
             skipped_by_name,
             opened,
+            refiled,
             swept,
             pending_stamp,
             processed_stamp,
