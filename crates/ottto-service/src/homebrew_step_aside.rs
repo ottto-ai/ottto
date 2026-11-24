@@ -298,10 +298,6 @@ pub fn hand_over_ended_message(end: HandoverEnd) -> &'static str {
 #[cfg(target_os = "macos")]
 fn installed_app_is_valid(app: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    const CODESIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
     let helper = app.join("Contents").join("Helpers").join("ottto-service");
     if !std::fs::metadata(&helper)
@@ -320,6 +316,17 @@ fn installed_app_is_valid(app: &Path) -> bool {
     let Some(requirement) = crate::control::installed_companion_code_requirement() else {
         return false;
     };
+    bundle_satisfies_requirement(app, &requirement)
+}
+
+/// `codesign --verify --strict` of the bundle at `app` against `requirement`, within 10 s.
+#[cfg(target_os = "macos")]
+pub(crate) fn bundle_satisfies_requirement(app: &Path, requirement: &str) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const CODESIGN_TIMEOUT: Duration = Duration::from_secs(10);
+
     // A leading `=` makes codesign read the argument as requirement text.
     let Ok(mut child) = Command::new("/usr/bin/codesign")
         .arg("--verify")
