@@ -425,113 +425,7 @@ impl OwnedSourceScan {
             );
             return;
         }
-        // After ordinary identity, decision and admission (no seed
-        // pre-open), content twins and mains pull every overlapping live
-        // member of the opposite kind. Pulled candidates pass the ordinary
-        // history and resident gates; the emission fence withholds incomplete
-        // sessions. History-held mains pull nothing.
-        let seed = local_index_key(&candidate.path);
-        let record = (self.source == SnapshotSource::ClaudeCode)
-            .then(|| self.index.claude_request_census.get(&seed))
-            .flatten();
-        let walk = std::time::Instant::now();
-        let pulls: Vec<String> = match record {
-            Some(record) if record.is_twin() => {
-                let mains = self
-                    .index
-                    .claude_request_census
-                    .records()
-                    .filter(|(key, main)| {
-                        !main.is_twin()
-                            && claude_request_census::held_candidates(main, record.request_hashes())
-                                .next()
-                                .is_some()
-                            && Path::new(key).is_file()
-                    });
-                mains.map(|(key, _)| key.clone()).collect()
-            }
-            // Holder choice for copied history does not define all of a
-            // session's contributors.
-            Some(record)
-                if !history_held
-                    && claude_request_census::held_candidates(
-                        record,
-                        self.claude_twin_schedule
-                            .twin_hashes(&self.index.claude_request_census),
-                    )
-                    .next()
-                    .is_some() =>
-            {
-                let twins = self
-                    .index
-                    .claude_request_census
-                    .records()
-                    .filter(|(key, twin)| {
-                        twin.is_twin()
-                            && claude_request_census::held_candidates(twin, record.request_hashes())
-                                .next()
-                                .is_some()
-                            && Path::new(key).is_file()
-                    });
-                twins.map(|(key, _)| key.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
-        claude_request_money::e2::diag("copy_holder_walk_ms", walk.elapsed().as_millis() as u64);
-        for path in pulls.into_iter().map(PathBuf::from) {
-            let key = local_index_key(&path);
-            #[cfg(test)]
-            twin_diagnostics::event(&path, || {
-                format!(
-                    "pull requested already_scheduled={} fold_present={} queued={}",
-                    self.claude_twin_schedule.root_homes.contains(&key),
-                    self.snapshots.iter().any(|item| item
-                        .claude_money
-                        .as_deref()
-                        .and_then(claude_request_money::e2::FileFold::location_key)
-                        == Some(claude_money_birth_store::location_key(&key))),
-                    self.identified_candidates
-                        .iter()
-                        .any(|queued| queued.path == path),
-                )
-            });
-            if self.claude_twin_schedule.root_homes.contains(&key)
-                || self.snapshots.iter().any(|item| {
-                    item.claude_money
-                        .as_deref()
-                        .and_then(claude_request_money::e2::FileFold::location_key)
-                        == Some(claude_money_birth_store::location_key(&key))
-                })
-            {
-                continue;
-            }
-            self.claude_twin_schedule.root_homes.insert(key);
-            claude_request_money::e2::diag("copy_holder_pulled", 1);
-            if self
-                .identified_candidates
-                .iter()
-                .any(|queued| queued.path == path)
-            {
-                continue;
-            }
-            let mut discovery = CandidateDiscovery::new(
-                &mut self.index,
-                Some(&self.resource_probe.discovery_growth),
-            );
-            if let Some(holder) = scan::owned_scan::forced_index_candidate(
-                self.source,
-                &self.roots,
-                (path, false),
-                &mut self.census,
-                self.census_unix_seconds,
-                self.backfill_window_days,
-                &mut discovery,
-            ) {
-                #[cfg(test)]
-                twin_diagnostics::event(&holder.path, || "pull enqueued".into());
-                self.identified_candidates.push_back(holder);
-            }
-        }
+        self.pull_claude_copy_holders(&candidate, history_held);
         #[cfg(test)]
         sampled_scan::test_hooks::after_selection(&mut self.index, parse_reason);
         if let Some(context) = self.sampling.as_ref().filter(|_| {
@@ -1480,5 +1374,118 @@ impl OwnedSourceScan {
             delivery.arm();
         }
         *active_file = Some(active);
+    }
+
+    /// Pull the live copy holders of a dequeued Claude twin or main into
+    /// the queue. History-held mains pull nothing.
+    #[inline(never)]
+    fn pull_claude_copy_holders(&mut self, candidate: &CandidateFile, history_held: bool) {
+        // After ordinary identity, decision and admission (no seed
+        // pre-open), content twins and mains pull every overlapping live
+        // member of the opposite kind. Pulled candidates pass the ordinary
+        // history and resident gates; the emission fence withholds incomplete
+        // sessions. History-held mains pull nothing.
+        let seed = local_index_key(&candidate.path);
+        let record = (self.source == SnapshotSource::ClaudeCode)
+            .then(|| self.index.claude_request_census.get(&seed))
+            .flatten();
+        let walk = std::time::Instant::now();
+        let pulls: Vec<String> = match record {
+            Some(record) if record.is_twin() => {
+                let mains = self
+                    .index
+                    .claude_request_census
+                    .records()
+                    .filter(|(key, main)| {
+                        !main.is_twin()
+                            && claude_request_census::held_candidates(main, record.request_hashes())
+                                .next()
+                                .is_some()
+                            && Path::new(key).is_file()
+                    });
+                mains.map(|(key, _)| key.clone()).collect()
+            }
+            // Holder choice for copied history does not define all of a
+            // session's contributors.
+            Some(record)
+                if !history_held
+                    && claude_request_census::held_candidates(
+                        record,
+                        self.claude_twin_schedule
+                            .twin_hashes(&self.index.claude_request_census),
+                    )
+                    .next()
+                    .is_some() =>
+            {
+                let twins = self
+                    .index
+                    .claude_request_census
+                    .records()
+                    .filter(|(key, twin)| {
+                        twin.is_twin()
+                            && claude_request_census::held_candidates(twin, record.request_hashes())
+                                .next()
+                                .is_some()
+                            && Path::new(key).is_file()
+                    });
+                twins.map(|(key, _)| key.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        claude_request_money::e2::diag("copy_holder_walk_ms", walk.elapsed().as_millis() as u64);
+        for path in pulls.into_iter().map(PathBuf::from) {
+            let key = local_index_key(&path);
+            #[cfg(test)]
+            twin_diagnostics::event(&path, || {
+                format!(
+                    "pull requested already_scheduled={} fold_present={} queued={}",
+                    self.claude_twin_schedule.root_homes.contains(&key),
+                    self.snapshots.iter().any(|item| item
+                        .claude_money
+                        .as_deref()
+                        .and_then(claude_request_money::e2::FileFold::location_key)
+                        == Some(claude_money_birth_store::location_key(&key))),
+                    self.identified_candidates
+                        .iter()
+                        .any(|queued| queued.path == path),
+                )
+            });
+            if self.claude_twin_schedule.root_homes.contains(&key)
+                || self.snapshots.iter().any(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(claude_request_money::e2::FileFold::location_key)
+                        == Some(claude_money_birth_store::location_key(&key))
+                })
+            {
+                continue;
+            }
+            self.claude_twin_schedule.root_homes.insert(key);
+            claude_request_money::e2::diag("copy_holder_pulled", 1);
+            if self
+                .identified_candidates
+                .iter()
+                .any(|queued| queued.path == path)
+            {
+                continue;
+            }
+            let mut discovery = CandidateDiscovery::new(
+                &mut self.index,
+                Some(&self.resource_probe.discovery_growth),
+            );
+            if let Some(holder) = scan::owned_scan::forced_index_candidate(
+                self.source,
+                &self.roots,
+                (path, false),
+                &mut self.census,
+                self.census_unix_seconds,
+                self.backfill_window_days,
+                &mut discovery,
+            ) {
+                #[cfg(test)]
+                twin_diagnostics::event(&holder.path, || "pull enqueued".into());
+                self.identified_candidates.push_back(holder);
+            }
+        }
     }
 }
