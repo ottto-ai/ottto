@@ -8,6 +8,8 @@ source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
 source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 # shellcheck source=scripts/macos_companion_entitlements.sh
 source "$SCRIPT_DIR/macos_companion_entitlements.sh"
+# shellcheck source=scripts/macos_license_notices.sh
+source "$SCRIPT_DIR/macos_license_notices.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -346,6 +348,13 @@ else
   echo "Expected SwiftPM resource bundle is missing: $SWIFTPM_RESOURCE_BUNDLE" >&2
   exit 1
 fi
+# License notices go into Resources before the app is signed. The Sparkle pin
+# comes from the verified app commit and must match the vendored license.
+sparkle_pin="$(ottto_macos_sparkle_pin "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
+sparkle_version="$(jq -r '.version' <<< "$sparkle_pin")"
+sparkle_revision="$(jq -r '.revision' <<< "$sparkle_pin")"
+ottto_check_sparkle_license_pin "$sparkle_version" "$sparkle_revision" "$APP_FRAMEWORKS/Sparkle.framework" || exit 2
+ottto_copy_app_license_notices "$ROOT" "$APP_RESOURCES"
 cp "$CLI_BINARY" "$OUTPUT_DIR/ottto"
 cp "$DAEMON_BINARY" "$OUTPUT_DIR/ottto-service"
 
@@ -573,35 +582,21 @@ sign_container "$APP_DMG"
 rm -rf "$DMG_STAGING"
 CLI_ZIP="$OUTPUT_DIR/ottto-macos-$ARCH.zip"
 DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
-ditto -c -k "$OUTPUT_DIR/ottto" "$CLI_ZIP"
-ditto -c -k "$OUTPUT_DIR/ottto-service" "$DAEMON_ZIP"
+# Each zip holds its executable plus the license notices at the zip root. The
+# staging folders live outside the release output folder, so a failed run
+# cannot leave them where release files are collected.
+(
+  ZIP_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ottto-zip-stage.XXXXXX")"
+  trap 'rm -rf "$ZIP_STAGE_ROOT"' EXIT
+  ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto" "$ZIP_STAGE_ROOT/cli"
+  ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto-service" "$ZIP_STAGE_ROOT/daemon"
+  ditto -c -k "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
+  ditto -c -k "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
+)
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
-# The SBOM describes the Apple Silicon build and the Sparkle version the app
-# source commit pins; the embedded framework must be that version.
+# The SBOM describes the Apple Silicon build and the validated Sparkle pin.
 if [[ "$ARCH" != "arm64" ]]; then
   echo "The macOS release SBOM requires Apple Silicon artifacts" >&2
-  exit 2
-fi
-if ! sparkle_pin="$(
-  git -C "$MAC_APP_GIT_ROOT" show "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH/Package.resolved" 2>/dev/null |
-    jq -ce '
-      [.pins[]? | select(.identity == "sparkle"
-        and .kind == "remoteSourceControl"
-        and .location == "https://github.com/sparkle-project/Sparkle")]
-      | if length == 1 then .[0].state else error("Expected one upstream Sparkle pin in Package.resolved") end
-      | if (.version | type) == "string" and (.revision | type) == "string" then .
-        else error("The Sparkle pin in Package.resolved needs a version and a revision") end
-    '
-)"; then
-  echo "Could not read the Sparkle pin from the app source commit's Package.resolved" >&2
-  exit 2
-fi
-sparkle_version="$(jq -r '.version' <<<"$sparkle_pin")"
-sparkle_revision="$(jq -r '.revision' <<<"$sparkle_pin")"
-sparkle_plist="$APP_FRAMEWORKS/Sparkle.framework/Versions/B/Resources/Info.plist"
-if ! embedded_sparkle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$sparkle_plist" 2>/dev/null)" ||
-  [[ "$embedded_sparkle_version" != "$sparkle_version" ]]; then
-  echo "Embedded Sparkle framework version must match the app source pin ($sparkle_version)" >&2
   exit 2
 fi
 "$ROOT/scripts/cyclonedx_sbom.sh" --output "$SBOM_PATH" --version "$VERSION" \
