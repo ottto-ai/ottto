@@ -1589,17 +1589,17 @@ fn entity_ack_rejection_is_not_counted_before_quarantine_persists() {
 
 mod packing_count_tests {
     use super::*;
-    include!("../packing_count_tests.rs");
+    include!("packing_count_tests.rs");
 }
 
 mod e2_upload_tests {
     use super::*;
-    include!("../e2_upload_tests.rs");
+    include!("e2_upload_tests.rs");
 }
 
 pub(in crate::snapshot_sync) mod class_split_tests {
     use super::*;
-    include!("../class_split_tests.rs");
+    include!("class_split_tests.rs");
 }
 
 #[derive(Clone, Serialize)]
@@ -2071,7 +2071,7 @@ fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
 }
 
 mod inplace_retry_tests {
-    include!("../inplace_retry_tests.rs");
+    include!("inplace_retry_tests.rs");
 }
 
 #[test]

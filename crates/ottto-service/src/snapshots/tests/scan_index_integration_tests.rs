@@ -19,7 +19,7 @@ impl Fixture {
         fs::create_dir(&shards).unwrap();
         fs::set_permissions(&shards, fs::Permissions::from_mode(0o700)).unwrap();
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/scan_index/real-shaped-v1.json"
+            "../../../tests/fixtures/scan_index/real-shaped-v1.json"
         ))
         .unwrap();
         for (name, text) in fixture["payloads"].as_object().unwrap() {

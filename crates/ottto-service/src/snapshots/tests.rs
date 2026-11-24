@@ -1,48 +1,48 @@
 mod job_template;
 mod claude_file_cap_tests {
-    include!("claude_file_cap_tests.rs");
+    include!("tests/claude_file_cap_tests.rs");
 }
-include!("claude_request_account_tests.rs");
+include!("tests/claude_request_account_tests.rs");
 mod claude_request_identity_tests {
-    include!("claude_request_identity_tests.rs");
+    include!("tests/claude_request_identity_tests.rs");
 }
 mod census_p2_kept_tests {
-    include!("census_p2_kept_tests.rs");
+    include!("tests/census_p2_kept_tests.rs");
 }
 #[cfg(unix)]
 mod reread_trigger_content_tests {
-    include!("reread_trigger_content_tests.rs");
+    include!("tests/reread_trigger_content_tests.rs");
 }
 mod checkpoint_main_tests {
-    include!("checkpoint_main_tests.rs");
+    include!("tests/checkpoint_main_tests.rs");
 }
 
 mod authority_proof_correction_tests {
-    include!("authority_proof_correction_tests.rs");
+    include!("tests/authority_proof_correction_tests.rs");
 }
 mod load_containment_tests {
-    include!("load_containment_tests.rs");
+    include!("tests/load_containment_tests.rs");
 }
 mod claude_context_file_birth_tests {
-    include!("claude_context_file_birth_tests.rs");
+    include!("tests/claude_context_file_birth_tests.rs");
     mod claude_cache_gate_tests {
-        include!("claude_cache_gate_tests.rs");
+        include!("tests/claude_cache_gate_tests.rs");
     }
 }
 mod claude_request_census_tests {
-    include!("claude_request_census_tests.rs");
+    include!("tests/claude_request_census_tests.rs");
 }
 mod claude_census_money_invariant_tests {
-    include!("claude_census_money_invariant_tests.rs");
+    include!("tests/claude_census_money_invariant_tests.rs");
 }
 mod e2_disposition_tests {
-    include!("e2_disposition_tests.rs");
+    include!("tests/e2_disposition_tests.rs");
 }
 mod claude_family_stamp_removal_tests {
-    include!("claude_family_stamp_removal_tests.rs");
+    include!("tests/claude_family_stamp_removal_tests.rs");
 }
 mod e2_identity_pipeline_tests {
-    include!("e2_identity_pipeline_tests.rs");
+    include!("tests/e2_identity_pipeline_tests.rs");
 }
 use super::*;
 use base64::Engine as _;

@@ -624,7 +624,7 @@ pub(super) fn reduction_dependencies(
 }
 
 #[cfg(test)]
-#[path = "claude_sidecar_reduction_tests.rs"]
+#[path = "tests/claude_sidecar_reduction_tests.rs"]
 mod claude_sidecar_reduction_tests;
 
 #[cfg(test)]

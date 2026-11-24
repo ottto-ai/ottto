@@ -245,5 +245,5 @@ impl ScanIndex {
 }
 
 #[cfg(test)]
-#[path = "scan_index_integration_tests.rs"]
+#[path = "tests/scan_index_integration_tests.rs"]
 mod tests;
