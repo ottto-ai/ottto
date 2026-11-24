@@ -12,6 +12,17 @@ impl OwnedSourceScan {
         active_file: &mut Option<Box<OwnedActiveFile>>,
         codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
     ) -> bool {
+        self.prepare_codex_join()
+            || self.advance_codex_group_boot(launch_lookup, active_file, codex_cursor_lease)
+            || self.resume_codex_cursor_job(active_file, codex_cursor_lease)
+            || self.start_next_codex_group(active_file)
+    }
+
+    /// Plan the page's Codex groups from the header inventory. Planning can
+    /// take several calls; each one pauses the page, including the call
+    /// that finishes the plan.
+    #[inline(never)]
+    fn prepare_codex_join(&mut self) -> bool {
         if self.source == SnapshotSource::Codex && !self.codex_join_prepared {
             if let Some(inventory) = self.codex_join_inventory.as_mut() {
                 if let Some(context) = self.sampling.as_ref() {
@@ -492,6 +503,18 @@ impl OwnedSourceScan {
             self.codex_join_prepared = true;
             return true;
         }
+        false
+    }
+
+    /// Advance the group being booted: its header and probe reads, then its
+    /// start as the active file, through the shared cursor when it pages.
+    #[inline(never)]
+    fn advance_codex_group_boot(
+        &mut self,
+        launch_lookup: Option<&crate::launch_events::LaunchEventInventory>,
+        active_file: &mut Option<Box<OwnedActiveFile>>,
+        codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
         if let Some(mut boot) = self.codex_join_active.take() {
             if boot
                 .group
@@ -830,6 +853,19 @@ impl OwnedSourceScan {
             *active_file = Some(job);
             return true;
         }
+        false
+    }
+
+    /// With no file and no boot active: drop a lease left without its job,
+    /// tick the Codex page clock, try this page's one resume of the paused
+    /// cursor job, and on a continuation page hand the untouched selection
+    /// back to the queue.
+    #[inline(never)]
+    fn resume_codex_cursor_job(
+        &mut self,
+        active_file: &mut Option<Box<OwnedActiveFile>>,
+        codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
         if self.source == SnapshotSource::Codex
             && active_file.is_none()
             && self.codex_join_active.is_none()
@@ -948,6 +984,16 @@ impl OwnedSourceScan {
                 }
             }
         }
+        false
+    }
+
+    /// Start booting the next planned group, unless this page's census
+    /// singletons or context reads go first. The popped group can instead
+    /// be deferred with the rest of the page, requeued when the context
+    /// read budget refuses it, left under a decode hold or skipped as
+    /// fenced; each of those pauses the page too.
+    #[inline(never)]
+    fn start_next_codex_group(&mut self, active_file: &Option<Box<OwnedActiveFile>>) -> bool {
         // G1 (fix 2): a group whose selected members are all re-reads
         // waits until this page's census singletons are read, so its
         // replay cannot spend the singleton budget a first read needs.
