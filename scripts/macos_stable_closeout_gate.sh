@@ -206,8 +206,7 @@ else
   exit 1
 fi
 
-private_repo_pattern="coding-agents-""observability"
-if grep -Eiq "/Users/|${private_repo_pattern}|docs/dev|\\.agents|\\.claude|Bearer[[:space:]]+|claim_code|setup_run_token|account_id|machine_id|api[_-]?key|password" "$evidence_path"; then
+if grep -Eiq "/Users/|docs/dev|\\.agents|\\.claude|Bearer[[:space:]]+|claim_code|setup_run_token|account_id|machine_id|api[_-]?key|password" "$evidence_path"; then
   echo "Stable clean-machine QA evidence contains private path or secret-like material: $evidence_path" >&2
   exit 1
 fi

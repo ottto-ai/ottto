@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/macos_release_gate.sh"
 HELPER_GENERATOR="$ROOT/scripts/hosted_native_installer.sh"
+# shellcheck source=scripts/macos_release_paths.sh
+source "$ROOT/scripts/macos_release_paths.sh"
 
 MANIFEST=""
 SIGN_IDENTITY="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
@@ -200,40 +202,27 @@ if [[ "$REQUIRE_INSTALLER_SHA256" == "true" || "$verified_installer_has_sha" == 
   fail "Stable manifest install_methods.verified_native_installer.sha256 must be a lowercase SHA-256"
 fi
 
-manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
+manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
+# Resolve a release filename beside the manifest to an existing regular file.
 resolve_manifest_file() {
-  local manifest_path="$1"
-  if [[ "$manifest_path" == /* && -f "$manifest_path" ]]; then
-    echo "$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_path" ]]; then
-    echo "$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_dir/$manifest_path" ]]; then
-    echo "$manifest_dir/$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_dir/$(basename "$manifest_path")" ]]; then
-    echo "$manifest_dir/$(basename "$manifest_path")"
-    return
-  fi
-  return 1
+  local resolved
+  resolved="$(macos_release_path "$manifest_dir" "$1")" || return 1
+  [[ -f "$resolved" ]] || return 1
+  printf '%s\n' "$resolved"
 }
 
 if [[ -n "$verified_installer_path" ]]; then
   if ! verified_installer_resolved_path="$(resolve_manifest_file "$verified_installer_path")"; then
-    fail "Stable manifest verified native installer helper is missing: $verified_installer_path"
+    fail "Stable manifest verified native installer helper must name a release file beside the manifest"
   else
     if [[ ! -f "$verified_installer_resolved_path" ]]; then
-      fail "Stable manifest verified native installer helper is not a regular file: $verified_installer_path"
+      fail "Stable manifest verified native installer helper is not a regular file"
     fi
     if [[ ! -x "$verified_installer_resolved_path" ]]; then
-      fail "Stable manifest verified native installer helper must be executable: $verified_installer_path"
+      fail "Stable manifest verified native installer helper must be executable"
     fi
     if ! bash -n "$verified_installer_resolved_path"; then
-      fail "Stable manifest verified native installer helper has invalid shell syntax: $verified_installer_path"
+      fail "Stable manifest verified native installer helper has invalid shell syntax"
     fi
     expected_installer="$(mktemp)"
     trap 'rm -f "$expected_installer"' EXIT
@@ -290,9 +279,8 @@ REQUIRED_CHECKS = [
     "stable_hosted_installer_static",
 ]
 
-PRIVATE_REPO_NAME = "coding-agents-" "observability"
 SECRET_PATTERN = re.compile(
-    r"/Users/|" + re.escape(PRIVATE_REPO_NAME) + r"|docs/dev|\.agents|\.claude|"
+    r"/Users/|docs/dev|\.agents|\.claude|"
     r"Bearer\s+|claim_code|setup_run_token|account_id|machine_id|"
     r"api[_-]?key|password",
     re.IGNORECASE,
@@ -316,23 +304,32 @@ def require_string(value: Any, label: str) -> str:
     return value
 
 
+RELEASE_FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+
+
 def app_source_commit(manifest: dict[str, Any], label: str) -> str:
     materials = require_object(manifest.get("supply_chain"), f"{label} supply_chain").get("materials")
     commits = [
         material.get("commit")
         for material in (materials if isinstance(materials, list) else [])
-        if isinstance(material, dict) and material.get("kind") == "git_subtree"
+        if isinstance(material, dict) and material.get("kind") == "private_source"
     ]
     if len(commits) != 1:
         die(f"{label} must record exactly one app source commit in supply_chain.materials")
-    return require_string(commits[0], f"{label} app source commit")
+    commit = require_string(commits[0], f"{label} app source commit")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        die(f"{label} app source commit must be a 40-hex commit")
+    return commit
 
 
 def resolve_reference(reference: str) -> Path:
-    path = Path(reference)
-    if path.is_absolute():
-        return path.resolve()
-    return (manifest_dir / path).resolve()
+    # Release records name local files by plain filename beside the manifest.
+    if not RELEASE_FILENAME.fullmatch(reference):
+        die("evidence reference must be a release filename beside the manifest")
+    path = manifest_dir / reference
+    if path.is_symlink():
+        die("evidence reference must not be a symlink")
+    return path
 
 
 try:
@@ -534,14 +531,14 @@ if [[ ! "$sbom_expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
   fail "Stable manifest SBOM SHA-256 is invalid: $sbom_expected_sha"
 fi
 if ! sbom_resolved_path="$(resolve_manifest_file "$sbom_path")"; then
-  fail "Stable manifest SBOM file is missing: $sbom_path"
+  fail "Stable manifest SBOM path must name a release file beside the manifest"
 else
   sbom_actual_sha="$(sha256_file "$sbom_resolved_path")"
   if [[ "$sbom_actual_sha" != "$sbom_expected_sha" ]]; then
     fail "Stable manifest SBOM SHA mismatch: expected $sbom_expected_sha, got $sbom_actual_sha"
   fi
   if ! jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.7"' "$sbom_resolved_path" >/dev/null; then
-    fail "Stable manifest SBOM file is not CycloneDX JSON 1.7: $sbom_resolved_path"
+    fail "Stable manifest SBOM file is not CycloneDX JSON 1.7"
   fi
 fi
 if [[ "$sbom_attested" != "true" || "$sbom_verified" != "true" ]]; then
@@ -577,9 +574,9 @@ while IFS= read -r artifact; do
   name="$(jq -r '.name' <<<"$artifact")"
   kind="$(jq -r '.kind' <<<"$artifact")"
   platform="$(jq -r '.platform' <<<"$artifact")"
-  path="$(jq -r '.path' <<<"$artifact")"
+  path_ref="$(jq -r '.path' <<<"$artifact")"
   url="$(jq -r '.url // empty' <<<"$artifact")"
-  verification_path="$(jq -r '.verification_path // empty' <<<"$artifact")"
+  verification_ref="$(jq -r '.verification_path // empty' <<<"$artifact")"
   expected_sha="$(jq -r '.sha256' <<<"$artifact")"
   signed="$(jq -r '.signed' <<<"$artifact")"
   notarized="$(jq -r '.notarized' <<<"$artifact")"
@@ -600,8 +597,8 @@ while IFS= read -r artifact; do
   if [[ "$kind" == "macos_app" && "$url" != *.dmg ]]; then
     fail "Stable macOS app artifact must be published as a DMG: $name ($url)"
   fi
-  if [[ ! -f "$path" ]]; then
-    fail "Missing artifact: $name ($path)"
+  if ! path="$(resolve_manifest_file "$path_ref")"; then
+    fail "Missing artifact: $name (path must name a release file beside the manifest)"
     continue
   fi
   actual_sha="$(sha256_file "$path")"
@@ -609,8 +606,9 @@ while IFS= read -r artifact; do
     fail "SHA mismatch for $name: expected $expected_sha, got $actual_sha"
   fi
 
-  if [[ -z "$verification_path" || ! -e "$verification_path" ]]; then
-    fail "Verification path does not exist for $name: $verification_path"
+  if ! verification_path="$(macos_release_path "$manifest_dir" "$verification_ref")" || \
+    [[ ! -e "$verification_path" ]]; then
+    fail "Verification path does not exist for $name"
     continue
   fi
 

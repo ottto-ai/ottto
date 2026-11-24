@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/macos_release_paths.sh
+source "$SCRIPT_DIR/macos_release_paths.sh"
+
 MANIFEST=""
 KEYCHAIN_PROFILE="${OTTTO_NOTARY_PROFILE:-}"
 NOTARY_WAIT_TIMEOUT="${OTTTO_NOTARY_WAIT_TIMEOUT:-}"
@@ -377,6 +381,9 @@ matches_filter() {
   return 1
 }
 
+# Artifact paths are filenames beside the input manifest; resolve them there,
+# never against the working directory or the temporary copy below.
+manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
 tmp_manifest="$(mktemp)"
 trap 'rm -f "$tmp_manifest"' EXIT
 cp "$MANIFEST" "$tmp_manifest"
@@ -385,8 +392,8 @@ index=0
 processed=0
 while IFS= read -r artifact; do
   platform="$(jq -r '.platform' <<<"$artifact")"
-  path="$(jq -r '.path' <<<"$artifact")"
-  verification_path="$(jq -r '.verification_path // empty' <<<"$artifact")"
+  path_ref="$(jq -r '.path' <<<"$artifact")"
+  verification_ref="$(jq -r '.verification_path // empty' <<<"$artifact")"
   kind="$(jq -r '.kind' <<<"$artifact")"
   name="$(jq -r '.name' <<<"$artifact")"
 
@@ -398,12 +405,20 @@ while IFS= read -r artifact; do
     index=$((index + 1))
     continue
   fi
-  if [[ ! -f "$path" ]]; then
-    echo "Artifact archive does not exist for $name: $path" >&2
+  if ! path="$(macos_release_path "$manifest_dir" "$path_ref")"; then
+    echo "Artifact path for $name must be a release filename beside the manifest" >&2
     exit 1
   fi
-  if [[ -z "$verification_path" || ! -e "$verification_path" ]]; then
-    echo "Verification path does not exist for $name: $verification_path" >&2
+  if [[ ! -f "$path" ]]; then
+    echo "Artifact archive does not exist for $name: $path_ref" >&2
+    exit 1
+  fi
+  if ! verification_path="$(macos_release_path "$manifest_dir" "$verification_ref")"; then
+    echo "Verification path for $name must be a release filename beside the manifest" >&2
+    exit 1
+  fi
+  if [[ ! -e "$verification_path" ]]; then
+    echo "Verification path does not exist for $name: $verification_ref" >&2
     exit 1
   fi
 

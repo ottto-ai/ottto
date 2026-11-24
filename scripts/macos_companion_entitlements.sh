@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # The Companion app executable is the only code signed with an entitlement
-# plist. The plist lives in the private app subtree (tools/ottto-macos-app),
-# so the dev build and this release packager sign the same permission
-# surface. It may grant exactly one thing: sending Apple Events, which the
+# plist. The plist lives in the private app's Swift package, so the dev
+# build and this release packager sign the same permission surface. It may
+# grant exactly one thing: sending Apple Events, which the
 # "Terminal folder" action uses to read the front terminal tab's folder, and
 # Claude Code sign-in uses to open Terminal, after the person allows
 # Automation. No App Sandbox, no Accessibility, and never on

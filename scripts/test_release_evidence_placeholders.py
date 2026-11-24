@@ -35,7 +35,7 @@ class ReleaseEvidencePlaceholdersTests(unittest.TestCase):
                 "product": "ottto-local-platform", "channel": "stable-candidate",
                 "version": "0.1.252-rc1", "commit": "a" * 40,
                 "min_protocol_version": 15,
-                "supply_chain": {"materials": [{"kind": "git_subtree", "commit": "b" * 40}]},
+                "supply_chain": {"materials": [{"kind": "private_source", "commit": "b" * 40}]},
             }))
             result = subprocess.run([
                 "bash", str(SCRIPTS / "macos_public_rc_evidence_template.sh"),

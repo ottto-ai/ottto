@@ -85,6 +85,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -152,11 +153,13 @@ materials = require_object(manifest.get("supply_chain"), "manifest.supply_chain"
 app_source_commits = [
     material.get("commit")
     for material in (materials if isinstance(materials, list) else [])
-    if isinstance(material, dict) and material.get("kind") == "git_subtree"
+    if isinstance(material, dict) and material.get("kind") == "private_source"
 ]
 if len(app_source_commits) != 1:
     die("manifest must record exactly one app source commit in supply_chain.materials")
 app_source_commit = require_string(app_source_commits[0], "manifest app source commit")
+if not re.fullmatch(r"[0-9a-f]{40}", app_source_commit):
+    die("manifest app source commit must be a 40-hex commit")
 min_protocol_version = manifest.get("min_protocol_version")
 if product != "ottto-local-platform":
     die(f"expected product=ottto-local-platform, got {product}")
