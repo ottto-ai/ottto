@@ -370,10 +370,6 @@ for subject in "${required_subjects[@]}"; do
   fi
 done
 if [[ "$CHANNEL" == "stable" ]]; then
-  if [[ "$slsa_level" == "build_l1" ]]; then
-    echo "Stable releases require SLSA Build L2 or better provenance metadata" >&2
-    exit 1
-  fi
   if [[ "$slsa_attested" != "true" || "$slsa_verified" != "true" ]]; then
     echo "Stable releases require verified SLSA provenance attestations" >&2
     exit 1

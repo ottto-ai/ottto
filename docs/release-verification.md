@@ -109,8 +109,11 @@ Releases are built from the protected release tag `v<version>`; releases built
 before tag-based releases verify with `--source-ref refs/heads/main`.
 
 The attestation subject must match the artifact digest. The SLSA provenance must
-use the expected source repository, workflow, commit, and Build L2-or-better
-predicate.
+use the `https://slsa.dev/provenance/v1` predicate and authenticate the
+artifact digest, source repository, workflow, source ref and source commit.
+Releases are built on a self-hosted signing Mac, so the manifest records SLSA
+Build L1 for that build; the verified attestations are signed evidence about it,
+not a higher build level.
 
 Stable manifests should be bound with `macos_attestation_bind.sh` using the
 published `subject.checksums.txt`; the helper updates only the SLSA and SBOM

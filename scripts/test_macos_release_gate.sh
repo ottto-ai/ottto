@@ -312,7 +312,7 @@ jq '.channel = "stable"
     | .rollback.latest_manifest_url = "https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json"
     | .artifacts[0].url = "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto"
     | .supply_chain.sbom.url = "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-local-platform-sbom.cdx.json"
-    | .supply_chain.slsa_build.level = "build_l2"
+    | .supply_chain.slsa_build.level = "build_l1"
     | .supply_chain.slsa_build.attested = true
     | .supply_chain.slsa_build.verified = true
     | .supply_chain.sbom.attested = true
@@ -323,16 +323,34 @@ if "$GATE" --manifest "$stable_unsigned_manifest" >/dev/null 2>&1; then
   exit 1
 fi
 
-stable_unverified_manifest="$TMP_DIR/stable-unverified-manifest.json"
+# [behaviour] A signing-Mac (SLSA Build L1) stable release passes with verified
+# provenance and SBOM attestations. No verification_path keeps this synthetic
+# CLI artifact away from codesign/spctl on macOS runners.
+stable_l1_manifest="$TMP_DIR/stable-l1-manifest.json"
 jq '.artifacts[0].signed = true
     | .artifacts[0].notarized = true
     | .artifacts[0].gatekeeper_assessed = true
-    | .supply_chain.slsa_build.level = "build_l1"
-    | .supply_chain.slsa_build.attested = false
+    | del(.artifacts[0].verification_path)' \
+  "$stable_unsigned_manifest" > "$stable_l1_manifest"
+if ! "$GATE" --manifest "$stable_l1_manifest" >"$TMP_DIR/stable-l1.out" 2>&1; then
+  echo "Expected a verified Build L1 stable manifest to pass" >&2
+  cat "$TMP_DIR/stable-l1.out" >&2
+  exit 1
+fi
+
+# [behaviour] Stable still refuses L1 provenance that was not attested and verified.
+stable_unverified_manifest="$TMP_DIR/stable-unverified-manifest.json"
+jq '.supply_chain.slsa_build.attested = false
     | .supply_chain.slsa_build.verified = false' \
-  "$stable_unsigned_manifest" > "$stable_unverified_manifest"
-if "$GATE" --manifest "$stable_unverified_manifest" >/dev/null 2>&1; then
+  "$stable_l1_manifest" > "$stable_unverified_manifest"
+if "$GATE" --manifest "$stable_unverified_manifest" >"$TMP_DIR/stable-unverified.out" 2>&1; then
   echo "Expected unverified stable supply-chain manifest to fail" >&2
+  exit 1
+fi
+if ! grep -Fq "Stable releases require verified SLSA provenance attestations" "$TMP_DIR/stable-unverified.out" ||
+  grep -Fq "Build L2" "$TMP_DIR/stable-unverified.out"; then
+  echo "Unverified stable manifest must fail on the verified-provenance check:" >&2
+  cat "$TMP_DIR/stable-unverified.out" >&2
   exit 1
 fi
 

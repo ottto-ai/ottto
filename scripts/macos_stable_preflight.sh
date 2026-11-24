@@ -505,9 +505,10 @@ sbom_verification_command="$(jq -r '.supply_chain.sbom.verification_command // e
 if [[ "$slsa_spec_version" != "1.2" ]]; then
   fail "Stable manifest supply_chain.slsa_build.spec_version must be 1.2"
 fi
-if [[ "$slsa_level" != "build_l2" && "$slsa_level" != "build_l3" ]]; then
-  fail "Stable manifest requires SLSA Build L2 or better provenance metadata"
-fi
+case "$slsa_level" in
+  build_l1 | build_l2 | build_l3) ;;
+  *) fail "Stable manifest supply_chain.slsa_build.level is invalid: $slsa_level" ;;
+esac
 if [[ "$slsa_predicate_type" != "https://slsa.dev/provenance/v1" ]]; then
   fail "Stable manifest SLSA predicate type is invalid: $slsa_predicate_type"
 fi
