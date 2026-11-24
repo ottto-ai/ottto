@@ -889,6 +889,37 @@ class UseBindingTests(unittest.TestCase):
                 base, head = self.move_f(macro, macro + 'use crate::snapshots::x::*;\n')
                 self.fails(base, head, 'new glob import:')
 
+    def test_heap_layout_split_and_no_heap_calls_allow_new_explicit_bindings(self):
+        # Both expand only to `impl crate::heap_layout_bound::HeapLayoutBound for $t {..}`, like `fields!`.
+        for macro in ('crate::heap_layout_bound::split_fields!(Holder; inline: [count]; heap: [names]);\n',
+                      'crate::heap_layout_bound::no_heap!(true; Holder);\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.passes(base, head)
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::*;\n')
+                self.fails(base, head, 'new glob import:')
+
+    def test_unlisted_heap_layout_macros_and_aliases_still_reject_new_explicit_bindings(self):
+        # Only the exact listed paths are trusted: another macro of the same module, or an alias of a listed
+        # one, still guards an added binding.
+        for macro in ('crate::heap_layout_bound::unit_enum!(true; Holder: A | B);\n',
+                      'money_heap_fields!(Holder; inline: [count]; heap: [names]);\n',
+                      'split_fields!(Holder; inline: [count]; heap: [names]);\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.fails(base, head, 'use added beside an item-level macro call:')
+
+    def test_macro_calls_inside_an_impl_block_allow_new_explicit_bindings(self):
+        # An impl body holds only associated items, so a call there cannot expand to a module-level `use`.
+        method = 'macro_rules! method {\n    () => {\n        fn m(&self) {}\n    };\n}\n'
+        inside = method + 'struct Holder;\nimpl Holder {\n    method!();\n}\n'
+        base, head = self.move_f(inside, inside + 'use crate::snapshots::x::v;\n')
+        self.passes(base, head)
+        # The same macro called at module level still guards an added binding.
+        outside = method + 'method!();\n'
+        base, head = self.move_f(outside, outside + 'use crate::snapshots::x::v;\n')
+        self.fails(base, head, 'use added beside an item-level macro call:')
+
     def test_unknown_macro_paths_still_reject_new_explicit_bindings(self):
         for macro in ('unknown!();\n', 'fields!(Holder; value);\n',
                       'other::thread_local! { static FLAG: u8 = 0; }\n'):
