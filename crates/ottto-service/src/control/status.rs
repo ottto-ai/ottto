@@ -948,11 +948,18 @@ pub(super) fn client_owner_conflict(
     // The signed app bundle is also the supported UI for a Homebrew-owned
     // daemon. Client/service packaging can differ without service drift; the
     // launchd/plist/loaded owners still decide whether mutation is safe.
+    //
+    // A Homebrew `ottto` reading an app-owned daemon is the normal state after
+    // a Homebrew serve hands over to Ottto.app with the formula still
+    // installed. Doctor's `install_variants` names that copy and how to remove
+    // it; any Homebrew attempt to rewrite the job is still refused by the
+    // launch agent owner check unless it passes `--migrate-owner`.
     if matches!(
         (client_owner, service_owner),
         (InstallOwner::AppBundle, InstallOwner::HostedInstaller)
             | (InstallOwner::AppBundle, InstallOwner::Homebrew)
             | (InstallOwner::HostedInstaller, InstallOwner::AppBundle)
+            | (InstallOwner::Homebrew, InstallOwner::AppBundle)
     ) {
         return false;
     }
