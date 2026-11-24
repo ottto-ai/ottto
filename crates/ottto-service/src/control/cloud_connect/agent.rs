@@ -374,6 +374,8 @@ impl SetupRunServer<'_> {
             let payload = decode_base64url(encoded).ok_or_else(invalid_server)?;
             let facts: Value = serde_json::from_slice(&payload).map_err(|_| invalid_server())?;
             let expiry = facts["exp"].as_i64().ok_or_else(invalid_server)?;
+            let issued_at = facts["iat"].as_i64().ok_or_else(invalid_server)?;
+            let now = unix_now();
             if !cloud_uuid(challenge_id)
                 || facts["v"] != super::wire::DEVICE_WRITE_VERSION
                 || facts["challenge_id"] != challenge_id
@@ -381,8 +383,9 @@ impl SetupRunServer<'_> {
                 || facts["operation"] != operation
                 || facts["attempt_id"] != json!(attempt_id)
                 || facts["request_sha256"] != digest
-                || expiry <= unix_now()
-                || expiry > unix_now() + 60
+                || expiry <= now
+                || expiry > now + 120
+                || !(1..=60).contains(&expiry.saturating_sub(issued_at))
             {
                 return Err(invalid_server());
             }
