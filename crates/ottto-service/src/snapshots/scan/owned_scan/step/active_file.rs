@@ -518,188 +518,14 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            // N4 (fe-seam-ack §5): the file branch decides its H3c route
-            // before its completion.
-            let file_acquisition = file_sampling
-                .as_ref()
-                .filter(|_| cursor_certificate.is_none());
-            let (current_scope, prefix) = match file_acquisition {
-                Some(acquisition) => {
-                    // Known dependencies and the current path are separate from the
-                    // sampled prefix promise. Neither may be stale at completion.
-                    let current_scope = sampled_scan::reduction_dependencies(
-                        self.source,
-                        &candidate,
-                        &self.codex_title_metadata,
-                        &self.claude_title_metadata,
-                        self.claude_effort_support_dir.as_deref(),
-                    )
-                    .zip(self.sampling.as_ref())
-                    .map(|(dependency, context)| {
-                        context.file_scope(self.source, &candidate, &dependency)
-                    });
-                    // H3c: a passed certificate permits native finish of
-                    // this prefix only. Discard its checkpoint: no cache copy,
-                    // audit credit or source verification can follow it.
-                    let prefix = current_scope
-                        .as_ref()
-                        .filter(|_| aliases.is_empty())
-                        .filter(|scope| *scope == &acquisition.scope)
-                        .and_then(|scope| {
-                            parser.commit_grown_prefix(
-                                &candidate.path,
-                                scope,
-                                self.index
-                                    .files
-                                    .get(&acquisition.key)
-                                    .map_or(0, |entry| entry.size_bytes),
-                            )
-                        });
-                    if prefix.is_none()
-                        && current_scope.as_ref() == Some(&acquisition.scope)
-                        && parser.reader.acquisition.as_ref().is_some_and(|plan| {
-                            // A short EOF proves truncation, even if the file
-                            // has regrown by completion. Keep strict failure.
-                            plan.start_offset()
-                                .checked_add(parser.reader.consumed_bytes())
-                                == Some(plan.frozen_length())
-                                && parser.reader.reader.get_ref().metadata().is_ok_and(|held| {
-                                    held.len() > plan.frozen_length()
-                                        && fs::symlink_metadata(&candidate.path).is_ok_and(
-                                            |current| metadata_describes_same_file(&held, &current),
-                                        )
-                                })
-                        })
-                    {
-                        // Unchanged, or a trailing record already applied at
-                        // genuine EOF: retry only this file, never the walk.
-                        scan::owned_scan::retry_grown_file(
-                            &mut self.index,
-                            &self.selected_flags,
-                            &candidate,
-                            &mut self.census,
-                            false,
-                        );
-                        return true;
-                    }
-                    (current_scope, prefix)
-                }
-                None => (None, None),
-            };
-            // Cursor finish grants also occupy sealed_prefix, including
-            // quiescent reads and withheld fragments. Only this in-page
-            // growth certificate needs the new debt/provenance handling.
-            let grown_prefix = prefix.as_ref().is_some_and(|result| result.is_ok());
-            let completed_acquisition = if let Some(certificate) = cursor_certificate {
-                certificate.map(|checkpoint| sampled_jsonl::CompletedNativeAcquisition {
-                    checkpoint,
-                    unsealed: true,
-                })
-            } else if let Some(acquisition) = file_sampling.as_ref() {
-                if let Some(prefix) = prefix {
-                    match prefix {
-                        Ok(grant) => {
-                            parser.reader.sealed_prefix = Some(grant);
-                            file_sampling
-                                .as_mut()
-                                .expect("prefix acquisition")
-                                .audit_due
-                                .get_or_insert_with(|| {
-                                    sampled_scan::now_seconds().saturating_add(
-                                        crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-                                    )
-                                });
-                        }
-                        Err(crate::transcript_acquisition::PrefixRefusal::Invalidated(
-                            crate::transcript_acquisition::FullReason::InvalidCheckpoint,
-                        )) if parser.reader.acquisition.is_some() => {
-                            // A withheld row would weaken the last committed
-                            // body. Keep it and retry this file alone.
-                            scan::owned_scan::retry_grown_file(
-                                &mut self.index,
-                                &self.selected_flags,
-                                &candidate,
-                                &mut self.census,
-                                false,
-                            );
-                            return true;
-                        }
-                        Err(crate::transcript_acquisition::PrefixRefusal::AuditDue) => {
-                            scan::owned_scan::retry_grown_file(
-                                &mut self.index,
-                                &self.selected_flags,
-                                &candidate,
-                                &mut self.census,
-                                false,
-                            );
-                            return true;
-                        }
-                        Err(_) => {
-                            claude_request_census::invalidate_claude_request_census(
-                                &mut self.index,
-                                &candidate.path,
-                            );
-                            self.census.record_unreadable_file(
-                                UnreadableCause::ScopeObject,
-                                &candidate.path,
-                            );
-                            return true;
-                        }
-                    }
-                    None
-                } else {
-                    let mut current_path = candidate.clone();
-                    if let Some(cause) = sampled_revalidation_cause(
-                        current_scope.as_ref() == Some(&acquisition.scope),
-                        || {
-                            drop(open_candidate_file(self.source, &mut current_path)?);
-                            Ok(current_path.opened_object_identity
-                                == candidate.opened_object_identity)
-                        },
-                    ) {
-                        if self.source == SnapshotSource::ClaudeCode {
-                            claude_request_census::invalidate_claude_request_census(
-                                &mut self.index,
-                                &candidate.path,
-                            );
-                        }
-                        // Nothing of this read is kept. A changed object
-                        // or scope uses the file's one same-walk retry,
-                        // which holds the walk; a second refusal keeps
-                        // the census red.
-                        if !matches!(cause, UnreadableCause::ScopeObject)
-                            || !scan::owned_scan::retry_file_once(
-                                &mut self.index,
-                                &self.selected_flags,
-                                &candidate,
-                                Some(&mut self.discovered_file_count),
-                            )
-                        {
-                            self.census.record_unreadable_file(cause, &candidate.path);
-                        }
-                        return true;
-                    }
-                    #[cfg(test)]
-                    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeRetain);
-                    match parser.retain_reduction(&acquisition.scope, sampled_scan::now_seconds()) {
-                        Ok(completed) => completed,
-                        Err(_) => {
-                            if self.source == SnapshotSource::ClaudeCode {
-                                claude_request_census::invalidate_claude_request_census(
-                                    &mut self.index,
-                                    &candidate.path,
-                                );
-                            }
-                            self.census.record_unreadable_file(
-                                UnreadableCause::Reduction,
-                                &candidate.path,
-                            );
-                            return true;
-                        }
-                    }
-                }
-            } else {
-                None
+            let Some((completed_acquisition, grown_prefix)) = self.complete_read_acquisition(
+                &candidate,
+                &aliases,
+                &mut parser,
+                &mut file_sampling,
+                cursor_certificate,
+            ) else {
+                return true;
             };
             // Retain the obligation until native finish and RAM admission.
             // Only due complete-c Unchanged acquisitions can retire it;
@@ -1939,5 +1765,198 @@ impl OwnedSourceScan {
                 context.audit_slots = context.audit_slots.saturating_sub(1);
             }
         }
+    }
+
+    /// Complete this read's acquisition: a cursor certificate, a grown-prefix
+    /// grant, or a revalidated retained reduction. `None` means the phase
+    /// stops; the inner `None` continues without a retained acquisition.
+    #[inline(never)]
+    fn complete_read_acquisition(
+        &mut self,
+        candidate: &CandidateFile,
+        aliases: &[CandidateFile],
+        parser: &mut OwnedJsonlParser,
+        file_sampling: &mut Option<sampled_scan::Active>,
+        cursor_certificate: Option<Option<crate::transcript_acquisition::Checkpoint>>,
+    ) -> Option<(Option<sampled_jsonl::CompletedNativeAcquisition>, bool)> {
+        // N4 (fe-seam-ack §5): the file branch decides its H3c route
+        // before its completion.
+        let file_acquisition = file_sampling
+            .as_ref()
+            .filter(|_| cursor_certificate.is_none());
+        let (current_scope, prefix) = match file_acquisition {
+            Some(acquisition) => {
+                // Known dependencies and the current path are separate from the
+                // sampled prefix promise. Neither may be stale at completion.
+                let current_scope = sampled_scan::reduction_dependencies(
+                    self.source,
+                    candidate,
+                    &self.codex_title_metadata,
+                    &self.claude_title_metadata,
+                    self.claude_effort_support_dir.as_deref(),
+                )
+                .zip(self.sampling.as_ref())
+                .map(|(dependency, context)| {
+                    context.file_scope(self.source, candidate, &dependency)
+                });
+                // H3c: a passed certificate permits native finish of
+                // this prefix only. Discard its checkpoint: no cache copy,
+                // audit credit or source verification can follow it.
+                let prefix = current_scope
+                    .as_ref()
+                    .filter(|_| aliases.is_empty())
+                    .filter(|scope| *scope == &acquisition.scope)
+                    .and_then(|scope| {
+                        parser.commit_grown_prefix(
+                            &candidate.path,
+                            scope,
+                            self.index
+                                .files
+                                .get(&acquisition.key)
+                                .map_or(0, |entry| entry.size_bytes),
+                        )
+                    });
+                if prefix.is_none()
+                    && current_scope.as_ref() == Some(&acquisition.scope)
+                    && parser.reader.acquisition.as_ref().is_some_and(|plan| {
+                        // A short EOF proves truncation, even if the file
+                        // has regrown by completion. Keep strict failure.
+                        plan.start_offset()
+                            .checked_add(parser.reader.consumed_bytes())
+                            == Some(plan.frozen_length())
+                            && parser.reader.reader.get_ref().metadata().is_ok_and(|held| {
+                                held.len() > plan.frozen_length()
+                                    && fs::symlink_metadata(&candidate.path).is_ok_and(|current| {
+                                        metadata_describes_same_file(&held, &current)
+                                    })
+                            })
+                    })
+                {
+                    // Unchanged, or a trailing record already applied at
+                    // genuine EOF: retry only this file, never the walk.
+                    scan::owned_scan::retry_grown_file(
+                        &mut self.index,
+                        &self.selected_flags,
+                        candidate,
+                        &mut self.census,
+                        false,
+                    );
+                    return None;
+                }
+                (current_scope, prefix)
+            }
+            None => (None, None),
+        };
+        // Cursor finish grants also occupy sealed_prefix, including
+        // quiescent reads and withheld fragments. Only this in-page
+        // growth certificate needs the new debt/provenance handling.
+        let grown_prefix = prefix.as_ref().is_some_and(|result| result.is_ok());
+        let completed_acquisition = if let Some(certificate) = cursor_certificate {
+            certificate.map(|checkpoint| sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint,
+                unsealed: true,
+            })
+        } else if let Some(acquisition) = file_sampling.as_ref() {
+            if let Some(prefix) = prefix {
+                match prefix {
+                    Ok(grant) => {
+                        parser.reader.sealed_prefix = Some(grant);
+                        file_sampling
+                            .as_mut()
+                            .expect("prefix acquisition")
+                            .audit_due
+                            .get_or_insert_with(|| {
+                                sampled_scan::now_seconds().saturating_add(
+                                    crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+                                )
+                            });
+                    }
+                    Err(crate::transcript_acquisition::PrefixRefusal::Invalidated(
+                        crate::transcript_acquisition::FullReason::InvalidCheckpoint,
+                    )) if parser.reader.acquisition.is_some() => {
+                        // A withheld row would weaken the last committed
+                        // body. Keep it and retry this file alone.
+                        scan::owned_scan::retry_grown_file(
+                            &mut self.index,
+                            &self.selected_flags,
+                            candidate,
+                            &mut self.census,
+                            false,
+                        );
+                        return None;
+                    }
+                    Err(crate::transcript_acquisition::PrefixRefusal::AuditDue) => {
+                        scan::owned_scan::retry_grown_file(
+                            &mut self.index,
+                            &self.selected_flags,
+                            candidate,
+                            &mut self.census,
+                            false,
+                        );
+                        return None;
+                    }
+                    Err(_) => {
+                        claude_request_census::invalidate_claude_request_census(
+                            &mut self.index,
+                            &candidate.path,
+                        );
+                        self.census
+                            .record_unreadable_file(UnreadableCause::ScopeObject, &candidate.path);
+                        return None;
+                    }
+                }
+                None
+            } else {
+                let mut current_path = candidate.clone();
+                if let Some(cause) = sampled_revalidation_cause(
+                    current_scope.as_ref() == Some(&acquisition.scope),
+                    || {
+                        drop(open_candidate_file(self.source, &mut current_path)?);
+                        Ok(current_path.opened_object_identity == candidate.opened_object_identity)
+                    },
+                ) {
+                    if self.source == SnapshotSource::ClaudeCode {
+                        claude_request_census::invalidate_claude_request_census(
+                            &mut self.index,
+                            &candidate.path,
+                        );
+                    }
+                    // Nothing of this read is kept. A changed object
+                    // or scope uses the file's one same-walk retry,
+                    // which holds the walk; a second refusal keeps
+                    // the census red.
+                    if !matches!(cause, UnreadableCause::ScopeObject)
+                        || !scan::owned_scan::retry_file_once(
+                            &mut self.index,
+                            &self.selected_flags,
+                            candidate,
+                            Some(&mut self.discovered_file_count),
+                        )
+                    {
+                        self.census.record_unreadable_file(cause, &candidate.path);
+                    }
+                    return None;
+                }
+                #[cfg(test)]
+                sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeRetain);
+                match parser.retain_reduction(&acquisition.scope, sampled_scan::now_seconds()) {
+                    Ok(completed) => completed,
+                    Err(_) => {
+                        if self.source == SnapshotSource::ClaudeCode {
+                            claude_request_census::invalidate_claude_request_census(
+                                &mut self.index,
+                                &candidate.path,
+                            );
+                        }
+                        self.census
+                            .record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        Some((completed_acquisition, grown_prefix))
     }
 }
