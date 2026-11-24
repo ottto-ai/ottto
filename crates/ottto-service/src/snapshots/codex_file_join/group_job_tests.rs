@@ -1,4 +1,4 @@
-//! P2 group StreamProof, ordinal domain and census fencing tests (§n P2).
+//! Group StreamProof, ordinal domain and census fencing tests.
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
 use super::super::tests::{
@@ -165,7 +165,7 @@ fn plan_refuses_an_equal_header_and_size_as_a_candidate_copy() {
     );
 }
 
-/// Feed rows to `proof` with the parser's S10 tap after every UI record.
+/// Feed rows to `proof` with the parser's `admitted_usage` tap after every UI record.
 fn feed(proof: &mut StreamProof, rows: &[Value], starts: impl IntoIterator<Item = u64>) {
     let mut turn = None;
     for (row, start) in rows.iter().zip(starts) {

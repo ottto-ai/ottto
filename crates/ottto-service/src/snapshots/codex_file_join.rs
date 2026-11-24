@@ -1130,7 +1130,7 @@ pub(super) struct Group {
     pub(super) home: PathBuf,
     pub(super) members: Vec<CandidateFile>,
     /// A paged group's live member (index key) and the grant its sealed-prefix
-    /// certificate passed with (S12): validation then accepts that member's
+    /// certificate passed with: validation then accepts that member's
     /// growth past the frozen extent on the same object, like `finish`.
     pub(super) live: Option<(String, sampled_scan::codex_cursor::SealedPrefix)>,
 }
@@ -1479,7 +1479,7 @@ impl TierReplay {
             self.tiers.insert(key, source);
         }
     }
-    /// S10: the parser admitted usage from `value` (after actual admission),
+    /// The parser admitted usage from `value` (after actual admission),
     /// under V2 turn binding.
     pub(super) fn admitted_usage(
         &mut self,
@@ -1578,7 +1578,7 @@ pub(super) struct MemberPlan {
     pub(super) watch: Vec<u64>,
     /// `(predecessor position, end_ordinal_exclusive, end_byte_offset)`.
     pub(super) binding: Option<(usize, u64, u64)>,
-    /// A duplicate origin that must end neutral (F1).
+    /// A duplicate origin that must end neutral.
     pub(super) stub: bool,
 }
 crate::heap_layout_bound::fields!(MemberPlan; first, watch, binding, stub);
@@ -1634,7 +1634,7 @@ fn independent_fork_references_prefix(value: &Value, meta: &Value, owner: &str) 
 }
 
 /// The group proof, fed inside the one native replay: the native side in
-/// `TierReplay::observe`, the UI side by the parser admission tap (S10)
+/// `TierReplay::observe`, the UI side by the parser admission tap
 /// after actual admission. It moves from member to member with the replay.
 /// Only compact identities, counters and per-member ordinal witnesses are kept.
 #[derive(Clone, Debug)]
@@ -1925,7 +1925,7 @@ impl StreamProof {
         Ok(())
     }
 
-    /// S10: the parser admitted UI usage from this record. `from_last` is
+    /// The parser admitted UI usage from this record. `from_last` is
     /// false when it used a cumulative delta; `identity` is the parser's own
     /// usage event identity and `turn` its running turn id.
     pub(super) fn admitted_usage(

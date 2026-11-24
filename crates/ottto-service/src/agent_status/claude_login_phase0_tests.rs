@@ -1201,7 +1201,7 @@ fn slot_whose_token_changes_owner_stays_mismatched_without_requests() {
     );
 }
 
-/// T7: a locally expired default login sends nothing and serves its
+/// A locally expired default login sends nothing and serves its
 /// last reading as stale.
 #[test]
 #[serial]
@@ -1225,7 +1225,7 @@ fn expired_default_login_makes_no_request_and_serves_its_stale_reading() {
     }));
 }
 
-/// T7: once a managed slot that owned the account's reads is paused, the
+/// Once a managed slot that owned the account's reads is paused, the
 /// default login (same account, valid) becomes the provider caller again.
 #[test]
 #[serial]
@@ -1343,7 +1343,7 @@ fn api_key_only_default_install_is_signed_in_without_subscription_identity() {
     assert_only_version_probes(&fixture.spawns(), "api-key");
 }
 
-/// Review round 1: a working API key outranks the OAuth state, so a
+/// A working API key outranks the OAuth state, so a
 /// CLI-cleared OAuth item does not make the default login look signed
 /// out; a Bedrock-only default login is signed in too.
 #[test]
@@ -1396,7 +1396,7 @@ fn api_key_or_bedrock_outranks_a_cleared_oauth_login() {
     assert_only_version_probes(&fixture.spawns(), "api-key-over-cleared");
 }
 
-/// Review round 1: the expiry check uses a clock read immediately before
+/// The expiry check uses a clock read immediately before
 /// the request, not the sample taken when collection started. A token
 /// that lapses while the collection path blocks is never sent.
 #[test]
@@ -1455,7 +1455,7 @@ fn settings_api_key_presence_is_reported_without_reading_values() {
     fs::write(&vertex_off, r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"0"}}"#).expect("vertex");
     assert_eq!(detect(&vertex_off), None);
 
-    // Review round 2: the highest settings layer wins. Managed settings
+    // The highest settings layer wins. Managed settings
     // turning Bedrock off override user settings turning it on.
     let managed_off = root.join("managed.json");
     fs::write(&managed_off, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"0"}}"#).expect("managed");
@@ -1482,7 +1482,7 @@ fn settings_api_key_presence_is_reported_without_reading_values() {
         None
     );
 
-    // Review round 2: ANTHROPIC_API_KEY outranks a usable OAuth login only
+    // ANTHROPIC_API_KEY outranks a usable OAuth login only
     // once approved in Claude Code; otherwise only without OAuth.
     let key = "sk-ant-fixture-0123456789abcdefghijklmnop";
     let suffix = key[key.len() - 20..].to_string();

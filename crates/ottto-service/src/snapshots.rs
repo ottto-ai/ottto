@@ -629,7 +629,7 @@ pub struct SourceScanResult {
     /// Request-census shadow, measured by a complete Claude terminal scan.
     /// Count-only; the local evidence line reports it.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
-    /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
+    /// The paused cursor job's continuation ticket, minted
     /// at this page's pause (`PauseEnd::Paused` only). None on every other
     /// end, and on an unaccelerated attempt.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
@@ -661,7 +661,7 @@ impl SourceScanResult {
     pub(crate) fn take_continuation_evidence(&mut self) -> Option<CodexContinuationEvidence> {
         self.continuation_evidence.take()?.lock().ok()?.take()
     }
-    /// Stage 1 hunk A: the ticket `CodexCursorPort::ticket_for` reads.
+    /// The ticket `CodexCursorPort::ticket_for` reads.
     pub(crate) fn continuation_ticket(
         &self,
     ) -> Option<&sampled_scan::codex_cursor::CodexCursorTicket> {
@@ -2290,7 +2290,7 @@ crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_token
 // bounds until a qualified build re-pins them after the record store's removal.
 #[cfg(all(unix, target_pointer_width = "64", not(test)))]
 const _: () = {
-    // The L04 lineage clocks (`Option<(i128, i128)>`) add at most 48 B.
+    // The lineage clocks (`Option<(i128, i128)>`) add at most 48 B.
     assert!(size_of::<OwnedJsonlParser>() <= 5360);
     assert!(std::mem::align_of::<OwnedJsonlParser>() == 16);
     // CandidateFile.withheld_content_stamp adds 24 B (Option<String>) to the

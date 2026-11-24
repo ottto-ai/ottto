@@ -619,7 +619,7 @@ mod tests {
         assert!(events.iter().any(|event| event.after.is_some()));
         assert!(events.iter().any(|event| event.trigger.is_none()));
 
-        // Points: round 2 collected the own requests, sorted them by
+        // Points: the reference collected the own requests, sorted them by
         // sequence and pushed them in that order, which is exactly the
         // in-order path (a plain push loop, checked against `push` in
         // `local_context_points`). The map is not in request order, so the

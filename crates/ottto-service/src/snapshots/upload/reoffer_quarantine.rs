@@ -74,7 +74,7 @@ impl ScanIndex {
     /// (owner B): only downward, and only below the active revision (before
     /// any activation, below the highest revision with a policy row), so the
     /// file is owed again and goes back through the history gate. Counts
-    /// `history_reowed`. Returns false and writes nothing otherwise. MONEY's
+    /// `history_reowed`. Returns false and writes nothing otherwise. The request-owned money
     /// census 3 -> 2 path calls it.
     pub(crate) fn re_owe_effective_upload_body_witness_revision(
         &mut self,

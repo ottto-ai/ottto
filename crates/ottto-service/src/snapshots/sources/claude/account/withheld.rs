@@ -32,7 +32,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Seen {
 const PARSED: &str = "claude_withheld_account_evidence:v1";
 const CONTENT: &str = "claude_withheld_account_content:v1";
 
-/// One bounded entry keeps the boxed completion witness and W2 gauge in
+/// One bounded entry keeps the boxed completion witness and owed-token gauge in
 /// the same capped population. `None` tokens mean unknown, never zero owed.
 #[derive(Debug)]
 struct Entry {

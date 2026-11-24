@@ -511,7 +511,7 @@ pub(super) fn try_collect_preparation_with_rotation(
 }
 
 /// The upload-context fingerprint a cycle activates on its index (pure; the
-/// ordinary prepare and a Stage 1 continuation page share it).
+/// ordinary prepare and a continuation page share it).
 pub(super) fn cycle_upload_context(
     upload_policy: SnapshotUploadPolicy,
     checkpoint_namespace: Option<&str>,
@@ -570,7 +570,7 @@ pub(super) fn cycle_replay_generation(
 }
 
 /// The sampled-acquisition scope of a cycle: the cursor and retained
-/// namespace (pure; a continuation page must use the same bytes, K5).
+/// namespace (pure; a continuation page must use the same bytes).
 pub(crate) fn cycle_sampled_scope(
     account_witness: &[u8; 32],
     upload_destination_namespace: &str,

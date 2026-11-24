@@ -327,7 +327,7 @@ pub(crate) struct IoBytes {
     pub(crate) rederive_head: u64,
     pub(crate) rederive_named: u64,
     /// None is UNMEASURED, never a zero-byte receipt. Future acquisition seams
-    /// must measure cheap checks/raw reads before claiming DoD 6/12 complete.
+    /// must measure cheap checks/raw reads before claiming I/O accounting complete.
     pub(crate) cheap_checks: Option<u64>,
     /// Head/boundary identity hashes detect mtime-restored replacement. These
     /// are separate from body/fragment re-derivation and other cheap/raw reads;

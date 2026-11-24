@@ -9,7 +9,7 @@ const POST: &str = "2026-10-18T10:00:00Z";
 const MODEL: &str = "gpt-5.6-sol";
 /// S1: one response, then its equal-total re-emission before an abort.
 const S1: T6 = [31_143, 0, 0, 420, 169, 31_563];
-/// S2: two responses of one turn, with the thread counter before the first.
+/// Two responses of one turn, with the thread counter before the first.
 const S2_FIRST: T6 = [226_675, 225_408, 0, 1_143, 399, 227_818];
 const S2_SECOND: T6 = [228_308, 0, 0, 782, 201, 229_090];
 const S2_BASE: T6 = [36_339_992, 34_588_032, 0, 150_617, 41_641, 36_490_609];

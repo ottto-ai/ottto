@@ -20,7 +20,7 @@ mod retired_records;
 #[cfg(all(test, unix))]
 pub(crate) mod transition_fixture;
 
-// RAM-only per-key cap pacing; unify with P2's shared paced_full at integration.
+// RAM-only per-key cap pacing; unify with the shared Full-read pacing at integration.
 // Fixed slots charge their full inline size through SharedCache, with no path heap.
 pub(super) const CAP_PACE_SECONDS: u64 = 6 * 60 * 60;
 const CAP_CLOCK_SANITY_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -195,11 +195,11 @@ impl SharedCache {
         let (admitted, evicted) = pace.admit(key, now);
         (admitted, evicted, pace.entries.iter().flatten().count())
     }
-    /// Stage 1 K8, tests only: panic while holding the cursor lock.
+    /// Tests only: panic while holding the cursor lock.
     pub(crate) fn panic_under_cursor_lock_for_test(&self) {
         self.with_cursor(|_| panic!("W9: panic under the cursor lock (test)"));
     }
-    /// Stage 1 K8, tests only: whether the cursor lock is poisoned now.
+    /// Tests only: whether the cursor lock is poisoned now.
     pub(crate) fn cursor_poisoned_for_test(&self) -> bool {
         self.cursor.is_poisoned()
     }
@@ -613,7 +613,7 @@ pub(super) fn reduction_dependencies(
         // Claude's sidecar evidence and its Desktop and child naming are live
         // inputs joined at finish, never in the pre-finish reduction: a
         // rename re-selects the file (its sidecar fingerprint) and never voids
-        // its reduction (L05).
+        // its reduction.
         SnapshotSource::ClaudeCode => Some("claude_reduction_dependencies:v2".to_owned()),
         SnapshotSource::Pi => {
             let mut scoped = candidate.clone();

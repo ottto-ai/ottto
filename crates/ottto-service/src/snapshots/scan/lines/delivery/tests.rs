@@ -400,7 +400,7 @@ fn sealed_fragment_is_delivered_only_after_its_newline() {
 
 /// A read without a ReadPlan: `Full` on the held object, every physical line
 /// including an inherited CRLF row, `Complete` without the unterminated tail,
-/// and the K10 page counts. With the newline written, the next read delivers
+/// and the line-delivery page counts. With the newline written, the next read delivers
 /// that line exactly once.
 #[test]
 fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
@@ -2472,7 +2472,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
     assert_eq!(reparses(), BTreeMap::new(), "a new hold is no re-parse");
     touch(); // Before the very first memo lookup: completion must store content.
 
-    // Before round 2 every pass re-read the key (TranscriptChanged against
+    // Before memoization every pass re-read the key (TranscriptChanged against
     // its old committed revision).
     for pass in 0..3 {
         let (_, _, reads) = page(committed.clone(), &cache);
@@ -2865,7 +2865,7 @@ fn codex_scan_destruction_counts_nonterminal_prelude_gap() {
     });
     drop(scan);
     // The terminal parser row was beyond the interrupted page. A resumed
-    // suffix is deliberately unarmed before LD2 and cannot repair this prefix.
+    // suffix is deliberately unarmed and cannot repair this prefix.
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 1);
     assert_eq!(metric(&feed, "pending"), 0);
 }

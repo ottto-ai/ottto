@@ -37,7 +37,7 @@ fn splits(accounts: &RequestAccounts) -> Vec<u64> {
 
 /// [money] B1/B1b: a flip refused before `trust_from` keeps its earlier org
 /// up to it and governs from it through one split run. A real line at
-/// `trust_from` needs no split, so no same-position collision (B7).
+/// `trust_from` needs no split, so no same-position collision.
 #[test]
 fn flip_line_before_t_governs_requests_from_trust_from() {
     let markers = flipped();
@@ -67,7 +67,7 @@ fn flip_line_before_t_governs_requests_from_trust_from() {
     assert_eq!(orgs(&at_line, [2, 3]), [one, two]);
 }
 
-/// [money] B8: classify and `trust_from` gate on the same provider time; an
+/// [money] Classify and `trust_from` gate on the same provider time; an
 /// unparseable time keeps the earlier rule in both.
 #[test]
 fn account_rule_gates_on_the_request_provider_time() {
@@ -87,7 +87,7 @@ fn account_rule_gates_on_the_request_provider_time() {
     );
 }
 
-/// [money] B9: the native-copy rebuild keeps `trust_from`, so a copied
+/// [money] The native-copy rebuild keeps `trust_from`, so a copied
 /// prefix straddling T keeps the org line from it.
 #[test]
 fn native_copy_rebuilds_keep_trust_from() {

@@ -27,7 +27,7 @@ pub(in crate::snapshots) fn codex_last_usage(value: &Value) -> Option<UsageTotal
 }
 
 /// The one `last_token_usage` root the parser admits (shared with the group
-/// proof, S10).
+/// proof).
 pub(in crate::snapshots) fn codex_last_usage_root(value: &Value) -> Option<&Value> {
     value
         .pointer("/token_count/info/last_token_usage")
@@ -465,7 +465,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if admitted.is_some() {
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.admitted(applied_tier);
-                // S10: the group proof sees only actually admitted usage.
+                // The group proof sees only actually admitted usage.
                 replay.admitted_usage(
                     value,
                     last_usage.is_some(),

@@ -522,7 +522,7 @@ crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest
 crate::durable_tail_codec::durable_struct!(ClaudeBlob {
     G parts: [u64; PARTS],
     N unmeasurable: bool,
-    // A reversible rolling digest of instruction text (F1): content, never
+    // A reversible rolling digest of instruction text: content, never
     // in a record body; stored with the opening-settings session fact.
     X config_digest: Option<ConfigDigest>,
 });

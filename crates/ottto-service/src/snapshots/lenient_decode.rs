@@ -544,7 +544,7 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
-    // Exact-ACK stamps of the carried acknowledgements (P2). Damage only
+    // Exact-ACK stamps of the carried acknowledgements. Damage only
     // means owed, as on a load.
     "upload_context_proof",
 ];
@@ -2466,10 +2466,10 @@ impl ScanIndex {
     }
 }
 
-// Extension contract for MONEY's independently owned field: its record codec
+// Extension contract for the ledger's independently owned field: its record codec
 // must drop/count only the bad selection and leave that file recensus-due.
 // Ledger/version/decode errors return Err with the file unchanged. Add the
-// field policy here when MONEY composes its codec, together with the ScanIndex
+// field policy here when the ledger composes its codec, together with the ScanIndex
 // serializer, FIELDS registry and index() dispatch; census sequence_fields()
 // asserts their agreement. Never default a failed ledger read, quarantine its
 // file, or borrow census/parser-copy credit for it.

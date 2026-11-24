@@ -1,8 +1,8 @@
-//! Shared Stage2-pre fixture harness for the Claude frozen-extent extension.
-//! Codex Stage2-pre RED rows remain in their independent draft PR.
+//! Shared in-page Tail fixture harness for the Claude frozen-extent extension.
+//! Codex in-page Tail RED rows remain in their independent draft PR.
 //!
 //! Every test asserts the behavior the ACKed seam (H1 reader-relative extent
-//! limit, H2 in-page genuine-EOF apply, H3 grown-Tail sealed-prefix commit) must produce.
+//! limit, in-page genuine-EOF apply, grown-Tail sealed-prefix commit) must produce.
 //! Tests marked RED fail on main today, for the reason in their doc comment;
 //! tests marked PARITY assert main's behavior, which the seam must keep, and
 //! pass on main. Production code is unchanged here.
@@ -19,8 +19,8 @@
 //! - `sp5_residual_...`: a rewrite of already-read tail bytes that preserves
 //!   both sample windows, followed by growth, is accepted (append-only
 //!   sampled-prefix semantics, as the cursor).
-//! - SP-10: Unchanged-mode growth keeps dropping the copy.
-//! - SP-12 (a Codex file crossing 2 GiB) is not added: it needs support that is not on main yet.
+//! - Unchanged-mode growth keeps dropping the copy.
+//! - A test for a Codex file crossing 2 GiB is not added: it needs support that is not on main yet.
 //! - The N2 `sealed_fragment_withheld` counter is cursor-only (`finish_job`) and
 //!   private to `codex_cursor`; the unmodified `codex_cursor_tests` pin it.
 use super::*;
@@ -329,8 +329,8 @@ fn assert_refused(result: &SourceScanResult, seen: &Seen, cause: usize, id: &str
     assert!(result.snapshots.is_empty(), "{id}: nothing published");
 }
 
-/// SP-11, updated for FE: Claude's in-page Tail with an append publishes
-/// its sealed prefix uncertified and drops the copy. Codex Stage2-pre is
+/// Updated for frozen extents: Claude's in-page Tail with an append publishes
+/// its sealed prefix uncertified and drops the copy. Codex in-page reads are
 /// independent; FE changes the formerly pinned Claude "acquisition exceeds stable source" failure.
 #[test]
 fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {

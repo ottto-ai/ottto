@@ -315,13 +315,13 @@ fn removed_root_witnesses_drain_only_with_proof() {
         let removed = dir.join("removed");
         let key = removed.join("rollout.jsonl");
 
-        // U1: known, unconfigured, absent.
+        // Known, unconfigured, absent.
         let (witness, unresolved, drained) =
             removed_root_retry(source, &roots, &removed, &key, true);
         assert_eq!((witness, unresolved), (false, 0), "{source:?}");
         assert!(!drained.traversal.as_ref().unwrap().has_errors());
 
-        // U3: known, unconfigured, still present.
+        // Known, unconfigured, still present.
         fs::create_dir(&removed).unwrap();
         for persisted in [true, false] {
             let (witness, unresolved, _) =
@@ -330,13 +330,13 @@ fn removed_root_witnesses_drain_only_with_proof() {
         }
         fs::remove_dir(&removed).unwrap();
 
-        // U2: configured but missing keeps today's +1 and never a witness.
+        // Configured but missing keeps today's +1 and never a witness.
         let configured = [kept.clone(), dir.join("optional-absent"), removed.clone()];
         let (witness, unresolved, _) =
             removed_root_retry(source, &configured, &removed, &key, false);
         assert_eq!((witness, unresolved), (false, 1), "{source:?}");
 
-        // U5: a key also under a configured (missing) root is kept, with
+        // A key also under a configured (missing) root is kept, with
         // today's two counts: that root, inferred known from its old key,
         // and the witness.
         let nested = [kept.clone(), removed.join("nested")];
@@ -345,7 +345,7 @@ fn removed_root_witnesses_drain_only_with_proof() {
             removed_root_retry(source, &nested, &removed, &nested_key, true);
         assert_eq!((witness, unresolved), (true, 2), "{source:?}");
 
-        // U6: a non-NotFound lstat error (not a directory) is no proof.
+        // A non-NotFound lstat error (not a directory) is no proof.
         let file = dir.join("plain-file");
         fs::write(&file, b"synthetic").unwrap();
         let blocked = file.join("home");
@@ -353,7 +353,7 @@ fn removed_root_witnesses_drain_only_with_proof() {
             removed_root_retry(source, &roots, &blocked, &blocked.join("a.jsonl"), true);
         assert_eq!((witness, unresolved), (true, 1), "{source:?}");
 
-        // U4: a removed symlinked root indexed its keys under the canonical
+        // A removed symlinked root indexed its keys under the canonical
         // target, which is not lexically under the removed link.
         let link = dir.join("removed-link");
         let target_key = dir.join("canonical-target").join("rollout.jsonl");
@@ -363,7 +363,7 @@ fn removed_root_witnesses_drain_only_with_proof() {
     }
 }
 
-/// [behaviour] U8: a changed root set still clears the witness set at its
+/// [behaviour] A changed root set still clears the witness set at its
 /// start, whatever the root's state, and adds nothing.
 #[test]
 fn removed_root_context_change_still_clears_witnesses() {
@@ -643,7 +643,7 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
     let fixture = ForcedFamilyFixture::new("absence-forced-family");
     let member_key = local_index_key(&fixture.member_path);
     let mut index = fixture.index();
-    // N3 keeps snapshot incidence; proven absence now releases the
+    // Audit retirement keeps snapshot incidence; proven absence now releases the
     // unfulfillable account hold without granting body/ACK credit.
     let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
     index
@@ -1070,7 +1070,7 @@ fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
 
 /// [behaviour] The audit-debt path also drops the member's request-census
 /// record with its entry and counts both retirements, while the
-/// member's snapshot fingerprints stay (N3).
+/// member's snapshot fingerprints stay.
 #[test]
 fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
     for account_held in [false, true] {

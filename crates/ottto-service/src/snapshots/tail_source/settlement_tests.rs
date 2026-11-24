@@ -163,7 +163,7 @@ fn a_head_ahead_of_progress_resumes_from_the_head() {
     assert_eq!(parser.reader.consumed_bytes(), 0);
 }
 
-/// [money] R6: a head behind the accepted entry replays through it to the
+/// [money] A head behind the accepted entry replays through it to the
 /// cold Full's body (no floor, no hold).
 #[test]
 fn a_head_behind_the_accepted_entry_replays_through_it() {
@@ -185,7 +185,7 @@ fn a_head_behind_the_accepted_entry_replays_through_it() {
     assert_eq!(warm, cold(&route, &path));
 }
 
-/// [money] R8: load plus a zero suffix restates nothing, and load plus an
+/// [money] Load plus a zero suffix restates nothing, and load plus an
 /// append keeps the committed verification clock: no Full credit either way.
 #[test]
 fn a_load_earns_no_credit() {
@@ -230,7 +230,7 @@ fn a_load_earns_no_credit() {
     );
 }
 
-/// [behaviour] R9: a lower revision this build cannot decode is a counted
+/// [behaviour] A lower revision this build cannot decode is a counted
 /// reconstruction, then an ordinary Full.
 #[test]
 fn a_lower_revision_without_a_decoder_reconstructs() {
@@ -284,7 +284,7 @@ fn a_proven_change_names_its_full() {
     );
 }
 
-/// [behaviour] §6: which selections continue from stored state.
+/// [behaviour] Which selections continue from stored state.
 #[test]
 fn the_shipped_selections_reuse_stored_state() {
     let index = ScanIndex::default();
@@ -332,7 +332,7 @@ fn the_shipped_selections_reuse_stored_state() {
     assert!(!held_new(CandidateParseReason::BodyWitnessAdoption));
 }
 
-/// [money] §6: a forced member reads natively only for evidence stored state
+/// [money] A forced member reads natively only for evidence stored state
 /// cannot supply; the rest recompose.
 #[test]
 fn a_forced_member_reads_natively_only_for_missing_evidence() {

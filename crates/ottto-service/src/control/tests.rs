@@ -7980,7 +7980,7 @@ fn seed_private_literal_canary(support: &Path) -> &'static str {
         .open(record)
         .unwrap();
     file.write_all(CANARY.as_bytes()).unwrap();
-    // F8: the support collector must also omit transient replay input,
+    // The support collector must also omit transient replay input,
     // including raw-value magic keys and malformed-selector material.
     std::fs::write(support.join("bounded-replay-private.jsonl"), format!(
         "{{\"$serde_json::private::RawValue\":\"{CANARY}\"}}\n{{\"selector\":{{\"model\":[\"{CANARY}\"]}},\"content\":\"{CANARY}\"}}\n"
@@ -16865,7 +16865,7 @@ fn owner_return_claim_restart_recovers_v2_and_v3_boundaries() {
 
 #[test]
 #[serial]
-/// [regress] R1/R4: a same-account claim re-login keeps the local
+/// [regress] A same-account claim re-login keeps the local
 /// namespace for each source, re-claimed while bound or after a local
 /// logout of a legacy (owner-less) device, along A→B and A→B→C. A grant
 /// added by the successor, or dropped by the next, changes nothing; the

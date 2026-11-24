@@ -22326,7 +22326,7 @@ fn held_page_subset_applies_debt_and_audit_carries() {
     ));
 }
 
-/// R11/R12: an exact refusal re-offer lease re-reads an unchanged,
+/// An exact refusal re-offer lease re-reads an unchanged,
 /// already-passed file through the ordinary retry predicate, but a
 /// Claude family hold keeps its own earlier gate.
 #[test]

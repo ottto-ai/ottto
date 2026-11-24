@@ -56,7 +56,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Most history files one page may upgrade, for every revision (MONEY P2).
+/// Most history files one page may upgrade, for every revision.
 pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. Every
 /// page admits its first file or native twin group even when it exceeds this budget.
@@ -93,10 +93,10 @@ pub(super) enum ListedEmission {
 pub(super) struct RevisionPolicy {
     /// A listed family's ordinary sync, a genuine change included. Revision
     /// 2 adds only context numbers; revision 3 adds request-owned money,
-    /// which listed roots must never emit (F3, Amendment 14).
+    /// which listed roots must never emit.
     pub(super) listed_emission: ListedEmission,
     /// Before the list was ever installed, history born before this second,
-    /// or at an unknown time, is held under this revision (F4b).
+    /// or at an unknown time, is held under this revision.
     pub(super) no_list_birth_cutoff_unix_seconds: u64,
     /// The revision changes uploaded money, so owing it is a finalizer
     /// revision rather than a format change. Counts only.
@@ -227,7 +227,7 @@ pub(super) struct FileExtent {
 /// `stored_below_active` is the index's own revision comparison for the
 /// entry (true for a zero or missing stamp while a revision is active).
 /// Only a size change is a genuine change: a same-size file whose mtime
-/// alone moved (a touch, a copy, a restore) is unchanged history (F5).
+/// alone moved (a touch, a copy, a restore) is unchanged history.
 pub(super) fn classify(
     entry: Option<FileExtent>,
     candidate: FileExtent,
@@ -1403,7 +1403,7 @@ impl ScanIndex {
 
     /// The one reason-independent history decision for a Claude candidate,
     /// against its entry before this parse. Every caller (the candidate loop,
-    /// MONEY's emitter) uses it; the parse reason stays diagnostic only.
+    /// the request-owned money emitter) uses it; the parse reason stays diagnostic only.
     pub(in crate::snapshots) fn claude_history_upgrade_decision(
         &mut self,
         candidate: &CandidateFile,

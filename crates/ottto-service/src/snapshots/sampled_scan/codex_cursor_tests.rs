@@ -1,4 +1,4 @@
-//! Offline cursor-job, page-budget, S5 reader and singleton-memo tests.
+//! Offline cursor-job, page-budget, cursor reader and singleton-memo tests.
 //! Every fixture is synthetic; no provider account content.
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
@@ -49,7 +49,7 @@ fn page_budget_plans_cursor_singleton_and_deferral() {
     // One slot: a second large file waits for the next page. There is no
     // unpaged fallback on a supported build.
     assert_eq!(page.plan(limits, 60, false, true), StartPlan::Defer);
-    // C4: without layout support the cursor is off as a whole and a large
+    // Without layout support the cursor is off as a whole and a large
     // file reads in its page as before; small reads keep their budget.
     assert_eq!(page.plan(limits, 60, true, false), StartPlan::Unpaged);
     assert_eq!(page.plan(limits, 60, false, false), StartPlan::Unpaged);
@@ -209,7 +209,7 @@ fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_
             );
         }
         assert_eq!(cursor.parked.len(), PARKED_KEYS);
-        // The least recently used record goes first (L1).
+        // The least recently used record goes first.
         assert!(!cursor.parked.contains_key("key-000"));
         assert!(cursor.parked.contains_key(&format!("key-{PARKED_KEYS:03}")));
         assert_eq!(cursor.counters.parked_hits, 2);
@@ -282,7 +282,7 @@ fn sealed_completion_withholds_unterminated_record_even_at_end_of_file() {
     assert_eq!(report.parsed_json_line_count, 3);
 }
 
-/// S12: `finish` honours a grown object only for the identity the
+/// `finish` honours a grown object only for the identity the
 /// passed certificate proved, and only while the held FD is still that
 /// object and no shorter than the frozen extent.
 #[test]
@@ -454,7 +454,7 @@ fn strict(reason: DebtReason) -> Disclosure {
     }
 }
 
-/// K2: `JoinStateBound` and `MemberChanged` keep the
+/// `JoinStateBound` and `MemberChanged` keep the
 /// strict census gate (a retryable unreadable file, never residue) with the
 /// prior body kept; only a held terminal refusal is settleable residue. One writer classifies fresh, memo and parked debt.
 #[test]
@@ -1225,7 +1225,7 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         assert_eq!(certified.verified_unix_seconds, t_start);
         assert_eq!(certified.audit_debt_unix_seconds, None);
         // Appends during the job were never marked read: the path stays
-        // pending as a watcher hint (C7) and the next page tails from `s`.
+        // pending as a watcher hint and the next page tails from `s`.
         assert_eq!(pending_hint(&index, &path), Some(true));
         fixture.append(SESSION, &token_line(next_line));
         next_line += 1;
@@ -1438,7 +1438,7 @@ fn grown_member_with_in_place_head_edit_restarts_and_publishes_nothing() {
     });
 }
 
-/// C7: a singleton deferred by the aggregate page budget goes back to
+/// A singleton deferred by the aggregate page budget goes back to
 /// `pending_candidates` with its selection flags, watcher hint included.
 #[test]
 fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
@@ -1495,7 +1495,7 @@ fn singleton_aggregate_page_budget_defers_via_pending_keeps_hint() {
         .all(|path| pending_hint(&index, path).is_none()));
 }
 
-/// K10: a live paused job of another namespace is never evicted by a
+/// A live paused job of another namespace is never evicted by a
 /// concurrent scan (no ping-pong); its own namespace keeps resuming it. Only
 /// a stale job, untouched for `NAMESPACE_STALE_PAGES` cursor pages because
 /// its namespace stopped scanning, is evicted, and its file restarts there.
@@ -1562,7 +1562,7 @@ fn concurrent_namespace_leaves_live_job_and_evicts_only_stale_one() {
     });
 }
 
-/// K1: a session larger than B with 400 distinct usage-bearing turns
+/// A session larger than B with 400 distinct usage-bearing turns
 /// (UUID-shaped turn ids in `task_started`, `turn_context`, `token_count`,
 /// `task_complete` shapes) pages to a certificate, publishes once and matches
 /// the unpaged read. A new read records no priority decision, so no pause
@@ -1633,7 +1633,7 @@ fn turn_heavy_session_pages_and_publishes_once() {
     assert_eq!(fingerprints(&paged), fingerprints(&unpaged));
 }
 
-/// K12 (R2-H3): dropping a scan frame mid-job returns the intact job to the
+/// Dropping a scan frame mid-job returns the intact job to the
 /// slot; the next page resumes it instead of restarting from byte zero.
 #[test]
 fn frame_drop_mid_job_returns_job_to_slot() {
@@ -1794,7 +1794,7 @@ fn eof_launch_demand_carries_the_parser_until_the_lookup_fails() {
     });
 }
 
-/// N3 (R2-N-B1): a session larger than B with 320 distinct active usage
+/// A session larger than B with 320 distinct active usage
 /// hours, three models and efforts and two capability surfaces per hour
 /// outgrows the ordinary walk's 4,096-visit limit. Its pause charge is the
 /// byte-limited completed walk, so it pauses, resumes, certifies and
@@ -2017,7 +2017,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
             );
             index = next;
             if page < u64::from(UNAVAILABLE_RESUMES) {
-                // One resume attempt per page, deferred uncounted (K9).
+                // One resume attempt per page, deferred uncounted.
                 assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), page);
                 assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
                 assert!(!cache.cursor_slot_free());
@@ -2668,7 +2668,7 @@ fn grown_unterminated_last_record_stays_withheld() {
     });
 }
 
-/// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
+/// For singletons and re-reads: a Codex watcher hint for a path this
 /// generation already processed (observed, no longer pending) re-enters as
 /// a non-member and is counted; a pending path is not duplicated; a path the
 /// walk has not observed, and every non-Codex hint, stays a census member.
@@ -2795,18 +2795,18 @@ fn hinted_scan(
     .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()))
 }
 
-/// G1/G2 at scan level. Three medium files grow on every page and are
+/// At scan level: Three medium files grow on every page and are
 /// hinted, and their retained state is gone each page (as after a restart or
 /// a cache eviction), so each growth needs a full re-read; together they
 /// exceed the page's singleton budget. A fourth file larger than the budget
 /// is read by the cursor, one slice per page, while it also grows.
 ///
-/// Before G1 the re-hinted files re-entered the census on every page and one
+/// Previously, the re-hinted files re-entered the census on every page and one
 /// was always deferred, so the generation never closed. Now the generation
 /// closes once the large job ends (within `ceil(L/B)` pages plus a small
 /// constant), each page completes a first read ahead of the hints, and the
 /// re-reads are counted as next-generation evidence. After growth stops, the
-/// follow-up generation re-reads every grown file (G2), and the published
+/// follow-up generation re-reads every grown file, and the published
 /// totals equal a fresh full read of the final files: no byte lost, none
 /// counted twice.
 #[test]
@@ -2902,7 +2902,7 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
             counters(&cache)
         );
         assert!(closed > 1, "the large file really paged");
-        // G2: growth stops; the follow-up generation re-reads every grown
+        // Growth stops; the follow-up generation re-reads every grown
         // file, including the growth a closed generation left pending.
         let mut converged = false;
         for _ in 0..bound * 2 {
@@ -4089,7 +4089,7 @@ fn only_roster_discovered_directories_mark_their_sessions_fresh() {
     assert_eq!(flags(&index, &old), Some((true, false, false)));
 }
 
-/// G1 carry: a census that closes while a re-read is still waiting hands it
+/// A census that closes while a re-read is still waiting hands it
 /// to the next generation as a member instead of dropping it. Two small
 /// files, one full read per page. Page 0 reads one (X) and defers the other
 /// (Y). X then grows and is hinted with its retained state gone: a re-read,
@@ -5232,7 +5232,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
         counters(&cache)
     );
     assert_oracle(&home, &cache, &held, 0, true);
-    // NC1: unchanged, the hold stays quiet: two exact-stamp hits, each
+    // Unchanged, the hold stays quiet: two exact-stamp hits, each
     // disclosing what a cold parse does.
     for n in 1..=2 {
         let (next, quiet) = home.generation(index, &cache, n);
@@ -5313,7 +5313,7 @@ fn copied_created_thread_binds_from_its_header_not_file_birth() {
     }
 }
 
-/// B1 (N1b): the same rollout-declared hold on an unchanged file, cured by
+/// B1: the same rollout-declared hold on an unchanged file, cured by
 /// the projection catching up with it. The entry wakes on its sidecar (a
 /// miss), and the re-read binds the spawn parent: the usage-free thread is
 /// no longer ownership-incomplete, exactly as a cold parse.
@@ -5565,7 +5565,7 @@ fn replayed_census(scan: &SourceScanResult) -> Vec<(&'static str, u64)> {
 ///   discloses exactly what a cold full parse does: every replayed census
 ///   count, `scanned_session_count` and the blocked set. The before-parse
 ///   seam never runs for a hit.
-/// - T18: growth with every other input unchanged is counted as an
+/// - growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
 #[test]
 #[cfg_attr(
@@ -5610,7 +5610,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     assert_eq!(replayed_census(&quiet), replayed_census(&home.oracle(1).1));
     assert_oracle(&home, &cache, &quiet, 1, true);
 
-    // T18: growth alone.
+    // Growth alone.
     let extra = codex_line(json!({
         "timestamp": bounded_rfc3339_millis(home.base_ms + 7_000).unwrap(),
         "type": "turn_context",
@@ -5718,7 +5718,7 @@ fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
 
 /// One page stepped to completion, with `between` run before every step
 /// call: a deterministic point between two records of the active file. It
-/// may change the scan's own index there (fix round 6's proof transition).
+/// may change the scan's own index there (for the proof transition).
 fn page_between(
     fixture: &ScanRoot,
     index: ScanIndex,
@@ -5803,7 +5803,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
     assert_oracle(&home, &cache, &admitted, 1, true);
 }
 
-/// T1c: kind (i) with usage (a rollout-declared created thread whose file
+/// Kind (i) with usage (a rollout-declared created thread whose file
 /// is ahead of its projection) hits while unchanged; growth is an
 /// exact-stamp miss with the grown extent, re-read and held again as cold.
 #[test]
@@ -5865,8 +5865,8 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
 /// T3: a non-monotone hold (`AwaitingLegacyTrigger`: a subagent fork with
 /// copied usage and no trigger turn) is memoized at its read end: unchanged
 /// it hits exactly; grown, it is an exact-stamp miss and is read again. Its
-/// parent is not on disk, so no parent ledger ever arrives (T15c covers
-/// that). (An `Undetermined` file, usage before any header, never reaches
+/// parent is not on disk, so no parent ledger ever arrives.
+/// (An `Undetermined` file, usage before any header, never reaches
 /// the memo: its first record is not an owning header, so the header
 /// inventory holds the page, as on main.)
 #[test]
@@ -5935,7 +5935,7 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 2, "{}", counters(&cache));
 }
 
-/// T6 and T18 (second half): growth together with a sidecar change is not
+/// Growth together with a sidecar change is not
 /// an exact-stamp miss (a tail could not replay it): it counts
 /// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
 #[test]
@@ -5984,7 +5984,7 @@ fn growth_with_a_sidecar_change_counts_an_other_miss() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
 }
 
-/// T8: the held file's object changes without new records: a same-size
+/// The held file's object changes without new records: a same-size
 /// touch (mtime and ctime), a replacement (new inode, same bytes) and a
 /// shrink each miss once, re-read equal to cold; a shrink is never counted
 /// as an exact-stamp (growth) miss.
@@ -6049,7 +6049,7 @@ fn touched_replaced_or_shrunk_held_file_misses() {
     );
 }
 
-/// T19 and the T9 fences, at the digest: a tier-receipt content
+/// Memo fences, at the digest: a tier-receipt content
 /// change with the same `required` (Some → Some), the upload context, each
 /// unscoped-incomplete census flag and the owner member count each change
 /// the memo digest; the same inputs give the same digest.
@@ -6144,7 +6144,7 @@ fn memo_digest_fences_receipt_contents_census_flags_and_members() {
     assert_ne!(reference, digest(&base, &codex, 2), "owner members");
 }
 
-/// T16: the memo has no clock input. The same unchanged hold collected a
+/// The memo has no clock input. The same unchanged hold collected a
 /// week later hits with the same disclosure.
 #[test]
 #[cfg_attr(
@@ -6165,7 +6165,7 @@ fn memo_hit_a_week_later_is_the_same_hit() {
 
 // Cursor resource claims, admission and credit settlement.
 
-/// [money] R3: the residue no longer vetoes retirement. A vanished file
+/// [money] The residue no longer vetoes retirement. A vanished file
 /// whose filename owner sits in the residue (a plain ownership refusal,
 /// checkpointed and reloaded) retires exactly like an unrelated vanished
 /// entry, on both absence paths, and nothing is re-emitted for either owner.
@@ -6568,7 +6568,7 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 
 /// One continuation page of the paused job whose member index keys are
 /// `members`, over `root` (`days` as the ordinary pages used),
-/// standing for `ordinary` of the ordinary cadence (§6).
+/// standing for `ordinary` of the ordinary cadence.
 #[expect(clippy::too_many_arguments, reason = "test helper, 8 case inputs")]
 fn continuation_page_in(
     root: &Path,
@@ -6627,7 +6627,7 @@ fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex,
     (index, members)
 }
 
-/// §7 D: a continuation page selects only the paused job's pending paths:
+/// A continuation page selects only the paused job's pending paths:
 /// it resumes the job and leaves every other pending path queued and
 /// unread. It never plans or starts an attempt and pages the job to its
 /// one completion without a group replay,
@@ -6726,7 +6726,7 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
     });
 }
 
-/// §7 D (N3): group preparation on a continuation page. The paused group's
+/// Group preparation on a continuation page. The paused group's
 /// job stays parked: continuation refuses it before stepping or applying EOF.
 /// The ordinary pass continues the same group to completion.
 #[test]
@@ -6935,7 +6935,7 @@ fn continuation_prepares_no_group_attempt() {
     );
 }
 
-/// §7 ready: `cursor_continuation_ready` readies the exact paused,
+/// `cursor_continuation_ready` readies the exact paused,
 /// accelerated attempt (its members are the job's), and refuses a foreign,
 /// stale or restarted ticket and an unaccelerated attempt. A refused ticket
 /// names no members. No IO: only the cursor lock.
@@ -7025,7 +7025,7 @@ fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
     });
 }
 
-// Stage 1: the accelerate guard, its pace table and their accounting.
+// The accelerate guard, its pace table and their accounting.
 
 fn rev(ino: u64, extent: u64) -> OpenStamp {
     OpenStamp {
@@ -7078,7 +7078,7 @@ fn paced(
 
 const START_UNACCELERATED: PaceVerdict = PaceVerdict::Start { accelerate: false };
 
-/// §7 Guard, through the scan: an accelerated attempt that took a
+/// Guard, through the scan: an accelerated attempt that took a
 /// continuation page standing for ten minutes, then was lost (its
 /// equivalent kept), is not restarted on the same revision before that
 /// equivalent. The paced deferral leaves the file pending (owed), and is not
@@ -7301,7 +7301,7 @@ fn rotation_deferred_member_is_not_first_read_progress() {
     });
 }
 
-/// §7 Guard, condition 2: a clock failure, an unknown ordinary interval or an
+/// Guard: a clock failure, an unknown ordinary interval or an
 /// overflow is unknown coverage. The attempt loses its acceleration for good
 /// (no further ticket); its pause or end forgets its slot and holds
 /// `unknown_until` past its deadline and at least an hour ahead, so its next
@@ -7691,11 +7691,11 @@ fn an_unproven_share_mints_nothing_and_ordinary_pages_resume_the_job() {
     });
 }
 
-// Stage 1 integration (StateMissing, under c22's K5/K6/K7/W9 rulings): the
+// Continuation integration (StateMissing): the
 // leased deadline and capture lines, the no-save continuation contract and a
 // worker panic's next ordinary page. New tests only.
 
-/// K6 through the scan: a continuation page past its deadline pauses the
+/// Through the scan: a continuation page past its deadline pauses the
 /// job at the next `step()` return, still paused and resumable, and mints no
 /// ticket (`PausedContended`); the same page without a deadline keeps the
 /// attempt accelerated.
@@ -7751,7 +7751,7 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
     });
 }
 
-/// K7.2 proof: a continuation page whose job's member changed under it is
+/// Proof: a continuation page whose job's member changed under it is
 /// not saved. The ordinary pages that follow, from the index the minting
 /// page saved, re-derive the whole debt: they publish exactly the unpaged
 /// read of the changed file, nothing older and nothing lost. Pace clock: the

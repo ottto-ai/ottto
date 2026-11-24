@@ -1485,8 +1485,8 @@ where
         }
     }
     let mut batches = VecDeque::new();
-    // Request-owned literal bodies travel with their Claude family (early-t7
-    // Q1). A family that fits one batch is packed whole; a larger one is cut
+    // Request-owned literal bodies travel with their Claude family.
+    // A family that fits one batch is packed whole; a larger one is cut
     // into consecutive batch-sized groups, root first, never refused. Each
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so

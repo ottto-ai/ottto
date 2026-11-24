@@ -174,7 +174,7 @@ fn scrub_drops_a_pending_change_and_remembers_a_blank_sentence() {
     assert_eq!(blank.verdict(1, false), MarkerVerdict::UntrustedFlip);
 }
 
-/// SOURCE condition 1 with no sentence digest to clear: a blank no-key sentence
+/// With no sentence digest to clear: a blank no-key sentence
 /// or a lone marker leaves no position, and still no flip is trusted afterwards.
 /// One count per scrubbed parse.
 #[test]

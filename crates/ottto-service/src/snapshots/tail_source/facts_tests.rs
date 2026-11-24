@@ -78,7 +78,7 @@ fn a_restart_restores_session_facts_from_the_database() {
 }
 
 /// [behaviour] A changed title rewrites its slot alone and stages
-/// `DropsPrivate`, so the old value is purged (F3); a restage with the same
+/// `DropsPrivate`, so the old value is purged; a restage with the same
 /// facts restates no fact and stays `Ordinary`. The new title then loads.
 #[test]
 fn a_title_change_rewrites_its_slot_and_drops_the_old_value() {

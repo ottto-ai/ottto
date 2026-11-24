@@ -316,7 +316,7 @@ impl ScanIndex {
     /// revision stays, and one local alarm is raised and counted.
     pub fn activate_effective_upload_body_witness_revision(&mut self, revision: u64) {
         // A refused revision keeps only the previous revision and its flag;
-        // the per-pass resets below run either way (StateMissing R6).
+        // the per-pass resets below run either way.
         if claude_history_upgrade::admit_activation(
             revision,
             self.active_effective_upload_body_witness_revision,
@@ -330,7 +330,7 @@ impl ScanIndex {
         self.claude_reemission_exclusions.begin_pass();
     }
 
-    /// Claude only (MONEY P2), after activating: re-read a file only when its
+    /// Claude only, after activating: re-read a file only when its
     /// stored revision is below the active one (a missing stored value is 0),
     /// so a newer stored revision is never re-read by an older build.
     pub fn adopt_effective_upload_body_witness_revision_monotonically(&mut self) {

@@ -51,7 +51,7 @@ fn body_witnesses(page: &Page) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// [money] G1: an accepted `e2` family that grows while the list is paused
+/// [money] An accepted `e2` family that grows while the list is paused
 /// uploads the same literal bodies, placement and side call as the unpaused
 /// cold Full, through the emission seam and the resend hook.
 #[test]
@@ -91,7 +91,7 @@ fn paused_list_unlisted_family_uploads_e2_literal() {
     });
 }
 
-/// [money] G2: owed, unchanged history of an accepted family stays held while
+/// [money] Owed, unchanged history of an accepted family stays held while
 /// the list is paused: no body, and its accepted body and revision stay.
 #[test]
 fn paused_list_owed_unchanged_history_held() {
@@ -187,7 +187,7 @@ fn e2_uploaded_under_pause_restamps_after_resume_counted_once() {
     });
 }
 
-/// [money] G6: under a pause, a lost ACK settles nothing; the restart from
+/// [money] Under a pause, a lost ACK settles nothing; the restart from
 /// the last saved index sends the same bodies, equal to the unpaused cold
 /// Full. A partial answer settles only the accepted entity.
 #[test]

@@ -212,7 +212,7 @@ pub(super) struct CodexUsageProbe {
     pub(super) response_completed_at: Option<String>,
     /// Fixed vocabulary and aggregate counts only; never provider ids/titles.
     pub(super) reset_credit_detail_summary: Option<String>,
-    /// Counts-only view of the non-selected rate-limit pools (design C2a).
+    /// Counts-only view of the non-selected rate-limit pools.
     pub(super) rate_limit_pool_summary: Option<String>,
 }
 

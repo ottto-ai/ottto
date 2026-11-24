@@ -174,7 +174,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) sampling: Option<sampled_scan::Context>,
     pub(in crate::snapshots) source: SnapshotSource,
     /// Configured scan roots, for a Codex census close that starts the next
-    /// generation in the same page (G1 carry).
+    /// generation in the same page.
     pub(in crate::snapshots) roots: Vec<PathBuf>,
     pub(in crate::snapshots) index: ScanIndex,
     pub(in crate::snapshots) collected_at: String,
@@ -229,7 +229,7 @@ pub(crate) struct OwnedSourceScan {
     /// Selection flags of all this page's candidates, so a budget deferral
     /// returns a file to `pending_candidates` with its original priority.
     pub(in crate::snapshots) selected_flags: BTreeMap<String, (bool, bool)>,
-    /// Stage 1 hunk A: the ticket this page's pause minted, carried across
+    /// The ticket this page's pause minted, carried across
     /// `step` calls into the result.
     pub(in crate::snapshots) continuation_ticket:
         Option<sampled_scan::codex_cursor::CodexCursorTicket>,
@@ -265,7 +265,7 @@ pub(in crate::snapshots) struct OwnedActiveFile {
     pub(in crate::snapshots) charged_bytes: u64,
     /// End of the record after which a hold no append can cure first held.
     pub(in crate::snapshots) hold_offset: Option<u64>,
-    /// Present while this job replays a Codex file group (P2).
+    /// Present while this job replays a Codex file group.
     pub(in crate::snapshots) group: Option<Box<codex_file_join::GroupJob>>,
 }
 #[allow(clippy::large_enum_variant, reason = "one context moves between steps")]
@@ -464,7 +464,7 @@ impl OwnedSourceScan {
         Ok(())
     }
 
-    /// Stage 1 (K6): the cooperative deadline of a continuation page, on the
+    /// The cooperative deadline of a continuation page, on the
     /// pace clock; ignored on an ordinary page. Past it the page pauses its
     /// job at the next `step()` return without minting a ticket.
     pub(crate) fn with_continuation_deadline(mut self, deadline: std::time::Instant) -> Self {
@@ -942,7 +942,7 @@ impl OwnedSourceScan {
         }
         let page_file_limit_hit = file_limit > 0 && pending_paths.len() >= file_limit;
         if source == SnapshotSource::Codex {
-            // G1 (fix 2): the same selection, read census members first. The
+            // The same selection, read census members first. The
             // reserved census member and every other first read are charged
             // to the page's singleton budget before any re-read (a watcher
             // hint for a path this generation already processed), so each
@@ -1529,7 +1529,7 @@ impl OwnedSourceScan {
 crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason, prior_stamp);
 
 /// `requeue` for every member of a group in one pass over the pending
-/// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path
+/// paths: O(P + n), not O(P) per member, and no pending path
 /// is cloned.
 pub(in crate::snapshots) fn requeue_members<'a>(
     index: &mut ScanIndex,

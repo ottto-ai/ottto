@@ -259,7 +259,7 @@ pub(in crate::snapshots) struct CollectionSpec {
     /// empty collection from a missing one.
     pub(in crate::snapshots) required: bool,
     /// Its pages hold private strings: a rewrite or removal of a committed
-    /// page stages `Change::DropsPrivate`, so the old value is purged (F3).
+    /// page stages `Change::DropsPrivate`, so the old value is purged.
     pub(in crate::snapshots) private: bool,
 }
 

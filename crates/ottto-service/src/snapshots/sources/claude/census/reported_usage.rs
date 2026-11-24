@@ -438,7 +438,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
                 .quarantined_source_session_ids
                 .insert(item.source_session_id.clone())
             {
-                // R7: the demotion hold stays; its sessions upload no
+                // The demotion hold stays; its sessions upload no
                 // scalars this pass whatever their basis. Counted locally.
                 disposition
                     .context_file_birth

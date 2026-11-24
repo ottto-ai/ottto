@@ -1333,8 +1333,8 @@ fn an_unrouted_codec_source_keeps_no_ram_copy() {
 
 /// [regress] A codec source's route that cannot be read now (a poisoned
 /// session: `DbUnavailable`) is kept as an error, never read as "no route":
-/// the file is held for its next selection, unread, and RAM is no fallback
-/// (conformance B2). The page holds before it reaches the candidate.
+/// the file is held for its next selection, unread, and RAM is no fallback.
+/// The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
     use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;

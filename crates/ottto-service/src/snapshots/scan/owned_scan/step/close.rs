@@ -303,7 +303,7 @@ impl OwnedSourceScan {
         self.index.count_unacked_retired(self.source, unacked);
         // If discovery is done, count Codex protected absences and settle the
         // residue; then drain the cap counters.
-        // G1: only census members hold discovery. A pending re-read
+        // Only census members hold discovery. A pending re-read
         // (growth after this generation processed its path) is
         // next-generation evidence; retiring drops it and the next
         // walk re-reads the file if it is stale.
@@ -551,7 +551,7 @@ impl OwnedSourceScan {
                     census_complete,
                 },
             );
-            // G1 carry: the closing generation's waiting re-reads
+            // Carry: the closing generation's waiting re-reads
             // (watcher hints, budget-deferred re-reads, growth past
             // its window end) are next-generation evidence. Hand them
             // to the next generation as members rather than dropping
@@ -624,7 +624,7 @@ impl OwnedSourceScan {
             });
             self.index.accepted_incidence_pending_census =
                 !self.index.accepted_rebuild_incidence.is_empty();
-            // A4d: the same proof retires a Tail whose file is gone.
+            // The same proof retires a Tail whose file is gone.
             #[cfg(unix)]
             tail_source::load::retire_absent(
                 self.source,

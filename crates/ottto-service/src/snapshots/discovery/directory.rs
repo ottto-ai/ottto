@@ -753,7 +753,7 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 index.retire_vanished_claude_audit_debt_entry(key);
             }
             crate::local_resource_diagnostics::audit_retired_absent(source.api_slug());
-            continue; // SOURCE: debt retirement alone does not prune incidence.
+            continue; // Debt retirement alone does not prune incidence.
         }
         if !observed
             && !index.decode_holds_file(key)

@@ -454,7 +454,7 @@ fn base_of(route: &Route, key: &str) -> TailBase {
     base
 }
 
-/// [behaviour] F3 on Codex: a title, first-prompt or workspace rewrite
+/// [behaviour] On Codex: a title, first-prompt or workspace rewrite
 /// restages only its own session-fact slot and stages `DropsPrivate`, so the
 /// old value is purged; an unchanged restage restates no fact. The new value
 /// then loads from the database.
@@ -532,7 +532,7 @@ fn a_codex_content_rewrite_restages_its_fact_and_drops_the_old_value() {
 // arms on the real database route, in totals and placement (the transition
 // fixture's money oracle). Codex places a session by its creator pair
 // (`session_account_evidence`); it has no per-request identity tags or side
-// calls, so the plan §5 controls map to: two accounts, a mid-session creator
+// calls, so the controls map to: two accounts, a mid-session creator
 // switch (a contradicting header clears the witness), an evidence gap (no
 // creator pair) and tagged sessions (those that keep their pair).
 use crate::snapshots::sampled_scan::transition_fixture::{
