@@ -739,6 +739,29 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// [behaviour] A Homebrew `ottto-service` must not rewrite a job the app
+    /// owns: its own owner check reports drift, so registration refuses
+    /// without `--migrate-owner`, whatever the status client reports.
+    #[test]
+    fn homebrew_writer_drifts_against_an_app_owned_job() {
+        let app = "/Applications/Ottto.app/Contents/Helpers/ottto-service";
+        let state = inspect_launch_agent_owner_with_loaded_program(
+            Path::new("/Users/test/Library/LaunchAgents/net.ottto.service.plist"),
+            Some(Path::new(
+                "/opt/homebrew/Cellar/ottto/0.1.0/bin/ottto-service",
+            )),
+            true,
+            Some(PathBuf::from(app)),
+            None,
+            Some(PathBuf::from(app)),
+        );
+
+        assert_eq!(state.plist_owner, InstallOwner::AppBundle);
+        assert_eq!(state.loaded_owner, InstallOwner::AppBundle);
+        assert_eq!(state.expected_owner, InstallOwner::Homebrew);
+        assert!(state.owner_drift);
+    }
+
     #[test]
     fn parses_loaded_launchd_program_path() {
         let output = r#"

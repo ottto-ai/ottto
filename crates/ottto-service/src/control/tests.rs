@@ -7447,6 +7447,29 @@ fn app_bundle_client_can_report_supported_service_owner_health() {
     ));
 }
 
+/// [behaviour] A Homebrew `ottto` next to an app-owned daemon (the state after
+/// a Homebrew serve hands over to Ottto.app) reports no owner conflict; a
+/// Homebrew client against a hosted-installer or dev service still does.
+#[test]
+fn homebrew_client_reads_an_app_owned_service_without_owner_conflict() {
+    assert!(!client_owner_conflict(
+        InstallOwner::Homebrew,
+        InstallOwner::AppBundle
+    ));
+    assert!(!client_owner_conflict(
+        InstallOwner::Homebrew,
+        InstallOwner::Homebrew
+    ));
+    assert!(client_owner_conflict(
+        InstallOwner::Homebrew,
+        InstallOwner::HostedInstaller
+    ));
+    assert!(client_owner_conflict(
+        InstallOwner::Homebrew,
+        InstallOwner::Dev
+    ));
+}
+
 #[test]
 fn version_tuple_collapses_dev_suffixes() {
     // Documents the prior false-current bug: dev builds with different
