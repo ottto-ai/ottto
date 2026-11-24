@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/macos_release_paths.sh
+source "$ROOT/scripts/macos_release_paths.sh"
 MANIFEST="$ROOT/dist/macos/release-manifest.json"
 APP_DIR="$HOME/Applications"
 BIN_DIR="$HOME/.ottto/bin"
@@ -301,9 +303,16 @@ if [[ "$channel" == "stable" ]]; then
   exit 2
 fi
 
+# Artifact paths are filenames beside the manifest (the release gate above
+# already checked them); resolve them there, not in the working directory.
+manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
 artifact_path() {
-  local kind="$1"
-  jq -er --arg kind "$kind" '.artifacts[] | select(.kind == $kind) | .path' "$MANIFEST"
+  local kind="$1" name
+  name="$(jq -er --arg kind "$kind" 'first(.artifacts[] | select(.kind == $kind) | .path)' "$MANIFEST")"
+  macos_release_path "$manifest_dir" "$name" || {
+    echo "Artifact path for $kind must be a release filename beside the manifest" >&2
+    exit 1
+  }
 }
 
 app_zip="$(artifact_path macos_app)"

@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/macos_public_rc_gate.sh"
 TEMPLATE="$ROOT/scripts/macos_public_rc_evidence_template.sh"
@@ -75,14 +73,32 @@ daemon_zip="$TMP_DIR/ottto-service-macos-arm64.zip"
 sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
 launch_evidence="$TMP_DIR/packaged-app-launch-smoke.json"
 printf 'fake stable-candidate app dmg\n' > "$app_dmg"
-printf 'fake stable-candidate cli archive\n' > "$cli_zip"
-printf 'fake stable-candidate daemon archive\n' > "$daemon_zip"
+# The binaries are copies of a signed system executable on macOS, so codesign
+# verifies them, and they ship in real ZIPs, as in a release.
+cli_bin="$TMP_DIR/ottto"
+daemon_bin="$TMP_DIR/ottto-service"
+true_bin="$(type -P true)"
+cp "$true_bin" "$cli_bin"
+cp "$true_bin" "$daemon_bin"
+python3 - "$cli_bin" "$cli_zip" "$daemon_bin" "$daemon_zip" <<'PY_ZIP'
+import os
+import sys
+import zipfile
+
+for binary, archive in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    entry = zipfile.ZipInfo(os.path.basename(binary), date_time=(2026, 5, 21, 0, 0, 0))
+    entry.create_system = 3
+    entry.external_attr = 0o100755 << 16
+    with open(binary, "rb") as source, zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr(entry, source.read())
+PY_ZIP
 jq -n '{bomFormat: "CycloneDX", specVersion: "1.7", version: 1}' > "$sbom"
 jq -n '{
   schema_version: 1,
   gate: "packaged_app_launch",
   status: "passed",
   checked_at: "2026-05-21T00:00:00Z",
+  app_path: "Ottto.app",
   wait_seconds: 1,
   bundle_id: "net.ottto.Companion",
   bundle_version: "0.1.0-rc1",
@@ -102,12 +118,14 @@ write_candidate_manifest() {
     --arg channel "$channel" \
     --arg version "$version" \
     --arg prefix "$prefix" \
-    --arg app_dmg "$app_dmg" \
-    --arg app_bundle "$app_bundle" \
-    --arg cli_zip "$cli_zip" \
-    --arg daemon_zip "$daemon_zip" \
-    --arg sbom "$sbom" \
-    --arg launch_evidence "$launch_evidence" \
+    --arg app_dmg "$(basename "$app_dmg")" \
+    --arg app_bundle "$(basename "$app_bundle")" \
+    --arg cli_bin "$(basename "$cli_bin")" \
+    --arg daemon_bin "$(basename "$daemon_bin")" \
+    --arg cli_zip "$(basename "$cli_zip")" \
+    --arg daemon_zip "$(basename "$daemon_zip")" \
+    --arg sbom "$(basename "$sbom")" \
+    --arg launch_evidence "$(basename "$launch_evidence")" \
     --arg app_sha "$(sha256_file "$app_dmg")" \
     --arg cli_sha "$(sha256_file "$cli_zip")" \
     --arg daemon_sha "$(sha256_file "$daemon_zip")" \
@@ -146,10 +164,10 @@ write_candidate_manifest() {
             commit: "abcdef123456abcdef123456abcdef123456abcd"
           },
           {
-            kind: "git_subtree",
-            repository: "example-org/example-app",
+            kind: "private_source",
+            name: "ottto-macos-app",
+            visibility: "private",
             commit: "123456abcdef123456abcdef123456abcdef1234",
-            path: "tools/ottto-macos-app",
             tree: "fedcba654321fedcba654321fedcba654321fedc",
             clean: true
           }
@@ -169,7 +187,7 @@ write_candidate_manifest() {
           ],
           attested: false,
           verified: false,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto"
+          verification_command: "gh attestation verify ./Ottto-macos-arm64.dmg -R ottto-ai/ottto"
         },
         sbom: {
           format: "cyclonedx-json",
@@ -180,7 +198,7 @@ write_candidate_manifest() {
           sha256: $sbom_sha,
           attested: false,
           verified: false,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
+          verification_command: "gh attestation verify ./Ottto-macos-arm64.dmg -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
         }
       },
       quality_gates: {
@@ -218,7 +236,7 @@ write_candidate_manifest() {
           arch: "arm64",
           path: $cli_zip,
           url: ($prefix + "/ottto-macos-arm64.zip"),
-          verification_path: "",
+          verification_path: $cli_bin,
           sha256: $cli_sha,
           signed: true,
           notarized: true,
@@ -231,7 +249,7 @@ write_candidate_manifest() {
           arch: "arm64",
           path: $daemon_zip,
           url: ($prefix + "/ottto-service-macos-arm64.zip"),
-          verification_path: "",
+          verification_path: $daemon_bin,
           sha256: $daemon_sha,
           signed: true,
           notarized: true,
@@ -440,8 +458,7 @@ grep -q "not marked Gatekeeper-assessed" /tmp/macos-public-rc-gate.out
 
 private_path_evidence="$TMP_DIR/private-path-stable-candidate-rc-qa.json"
 private_root="/""Users"
-private_repo_name="coding-agents-""observability"
-private_path="$private_root/operator/private/$private_repo_name"
+private_path="$private_root/example-operator/work/app-checkout"
 jq --arg private_path "$private_path" '.operator_notes += [$private_path]' \
   "$passed_evidence" > "$private_path_evidence"
 expect_failure "private path evidence" \
@@ -520,6 +537,32 @@ expect_failure "stable binding stable-candidate SHA mismatch" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_sha"
 
+host_path_stable="$TMP_DIR/host-path-stable-manifest.json"
+write_stable_binding_manifest \
+  "$host_path_stable" \
+  "abcdef123456" \
+  "$candidate_sha" \
+  "$passed_evidence"
+expect_failure "stable binding host-path evidence reference" \
+  "$GATE" \
+  --candidate-manifest "$candidate_manifest" \
+  --evidence "$passed_evidence" \
+  --stable-manifest "$host_path_stable"
+grep -q "evidence reference must be a release filename beside the manifest" /tmp/macos-public-rc-gate.out
+if grep -Fq "$TMP_DIR" /tmp/macos-public-rc-gate.out; then
+  echo "Stable-candidate RC gate printed the rejected evidence path" >&2
+  exit 1
+fi
+
+legacy_material_manifest="$TMP_DIR/legacy-material-stable-candidate-release-manifest.json"
+jq '.supply_chain.materials[1] |= (.kind = "git_subtree" | .repository = "example-org/example-app" | del(.name, .visibility))' \
+  "$candidate_manifest" > "$legacy_material_manifest"
+if "$TEMPLATE" --candidate-manifest "$legacy_material_manifest" --output - >/tmp/macos-public-rc-template.out 2>&1; then
+  echo "Expected stable-candidate RC template generation to reject a legacy app material" >&2
+  exit 1
+fi
+grep -q "exactly one app source commit" /tmp/macos-public-rc-template.out
+
 bad_stable_path="$TMP_DIR/bad-stable-path-manifest.json"
 write_stable_binding_manifest \
   "$bad_stable_path" \
@@ -531,5 +574,98 @@ expect_failure "stable binding evidence path mismatch" \
   --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_path"
+
+# A downloaded candidate holds the published archives, not the app and
+# binaries the manifest names as verification targets, so the gate refuses it.
+# The verification folder copies the record byte for byte, checks each archive
+# against its SHA-256 and unpacks all three targets under their recorded
+# names; the gate then passes on it with the same evidence.
+DOWNLOAD="$TMP_DIR/download/run-1/ottto-macos-stable-candidate-0.1.0-rc1"
+mkdir -p "$DOWNLOAD"
+cp "$candidate_manifest" "$DOWNLOAD/release-manifest.json"
+printf 'synthetic signature\n' > "$DOWNLOAD/release-manifest.json.sig"
+cp "$app_dmg" "$cli_zip" "$daemon_zip" "$sbom" "$launch_evidence" "$DOWNLOAD/"
+expect_failure "downloaded candidate without verification targets" \
+  "$GATE" --candidate-manifest "$DOWNLOAD/release-manifest.json" --evidence "$passed_evidence"
+
+# hdiutil is stubbed: the disk image "mounts" the fixture app. ditto is
+# emulated where the host has none (Linux CI); macOS uses the real one.
+STUB_BIN="$TMP_DIR/stub-bin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/hdiutil" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  attach)
+    mountpoint=""
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "-mountpoint" ]]; then mountpoint="$2"; shift 2; else shift; fi
+    done
+    [[ -d "$mountpoint" ]]
+    cp -pR "$FAKE_DMG_APP" "$mountpoint/"
+    ;;
+  detach)
+    find "$2" -mindepth 1 -delete
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+SH
+if ! command -v ditto >/dev/null 2>&1; then
+  cat > "$STUB_BIN/ditto" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "-x" && "$2" == "-k" ]]; then
+  exec python3 - "$3" "$4" <<'PY_UNZIP'
+import os
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    for entry in archive.infolist():
+        target = archive.extract(entry, sys.argv[2])
+        mode = (entry.external_attr >> 16) & 0o777
+        if mode:
+            os.chmod(target, mode)
+PY_UNZIP
+fi
+cp -pR "$1" "$2"
+SH
+fi
+chmod +x "$STUB_BIN"/*
+STAGE="$ROOT/scripts/macos_release_verification_folder.sh"
+VERIFY="$TMP_DIR/download/rc-verify"
+PATH="$STUB_BIN:$PATH" FAKE_DMG_APP="$app_bundle" \
+  "$STAGE" --manifest "$DOWNLOAD/release-manifest.json" --output "$VERIFY" >/dev/null
+cmp "$DOWNLOAD/release-manifest.json" "$VERIFY/release-manifest.json"
+test -d "$VERIFY/Ottto.app/Contents"
+cmp "$cli_bin" "$VERIFY/ottto"
+cmp "$daemon_bin" "$VERIFY/ottto-service"
+test ! -e "$DOWNLOAD/Ottto.app"
+test ! -e "$DOWNLOAD/ottto"
+test ! -e "$DOWNLOAD/ottto-service"
+jq -e '[.artifacts[].verification_path] == ["Ottto.app", "ottto", "ottto-service"]' \
+  "$VERIFY/release-manifest.json" >/dev/null
+"$GATE" --candidate-manifest "$VERIFY/release-manifest.json" --evidence "$passed_evidence" >/dev/null
+
+expect_failure "verification folder already exists" \
+  env PATH="$STUB_BIN:$PATH" FAKE_DMG_APP="$app_bundle" \
+  "$STAGE" --manifest "$DOWNLOAD/release-manifest.json" --output "$VERIFY"
+grep -q "output folder already exists" /tmp/macos-public-rc-gate.out
+expect_failure "verification folder inside the publish input" \
+  env PATH="$STUB_BIN:$PATH" FAKE_DMG_APP="$app_bundle" \
+  "$STAGE" --manifest "$DOWNLOAD/release-manifest.json" --output "$DOWNLOAD/rc-verify"
+grep -q "outside the downloaded release folder" /tmp/macos-public-rc-gate.out
+test ! -e "$DOWNLOAD/rc-verify"
+TAMPERED="$TMP_DIR/tampered/release"
+mkdir -p "$TAMPERED"
+cp "$DOWNLOAD"/* "$TAMPERED/"
+printf 'other bytes\n' >> "$TAMPERED/ottto-macos-arm64.zip"
+expect_failure "verification folder from a tampered archive" \
+  env PATH="$STUB_BIN:$PATH" FAKE_DMG_APP="$app_bundle" \
+  "$STAGE" --manifest "$TAMPERED/release-manifest.json" --output "$TMP_DIR/tampered/rc-verify"
+grep -q "archive does not match its manifest SHA-256: ottto" /tmp/macos-public-rc-gate.out
+test ! -e "$TMP_DIR/tampered/rc-verify"
 
 echo "macos_public_rc_gate tests passed"

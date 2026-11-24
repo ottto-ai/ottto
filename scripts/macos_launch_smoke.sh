@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP=""
 OUTPUT=""
+MANIFEST_DIR=""
 WAIT_SECONDS="${OTTTO_MACOS_LAUNCH_SMOKE_WAIT_SECONDS:-10}"
 
 usage() {
@@ -20,6 +22,9 @@ clean exit still fails the smoke.
 Options:
   --app <path>            Packaged .app bundle to launch.
   --output <path>         JSON evidence output path.
+  --manifest-dir <path>   Release folder for packaged-app evidence. The app and
+                          the output must sit directly in it, and the evidence
+                          records the app's filename instead of the path.
   --wait-seconds <n>      Startup survival window. Default: 10.
   -h, --help             Show help.
 USAGE
@@ -37,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --wait-seconds)
       WAIT_SECONDS="${2:?--wait-seconds requires a value}"
+      shift 2
+      ;;
+    --manifest-dir)
+      MANIFEST_DIR="${2:?--manifest-dir requires a value}"
       shift 2
       ;;
     -h|--help)
@@ -76,6 +85,33 @@ fi
 if [[ ! -d "$APP" ]]; then
   echo "App bundle does not exist: $APP" >&2
   exit 1
+fi
+
+# Packaged evidence travels with the release record, so it names the app by its
+# filename in the release folder and never by a path on the build host.
+RECORDED_APP_PATH="$APP"
+if [[ -n "$MANIFEST_DIR" ]]; then
+  # shellcheck source=scripts/macos_release_paths.sh
+  source "$SCRIPT_DIR/macos_release_paths.sh"
+  if [[ ! -d "$MANIFEST_DIR" ]]; then
+    echo "--manifest-dir does not exist: $MANIFEST_DIR" >&2
+    exit 2
+  fi
+  release_dir="$(cd "$MANIFEST_DIR" && pwd -P)"
+  app_name="$(basename "$APP")"
+  if [[ "$(macos_release_manifest_dir "$APP")" != "$release_dir" ]] || \
+    ! macos_release_path "$release_dir" "$app_name" >/dev/null; then
+    echo "--app must be a bundle directly inside --manifest-dir with a plain release filename" >&2
+    exit 2
+  fi
+  output_parent="$(dirname "$OUTPUT")"
+  if [[ ! -d "$output_parent" ]] || \
+    [[ "$(cd "$output_parent" && pwd -P)" != "$release_dir" ]] || \
+    ! macos_release_path "$release_dir" "$(basename "$OUTPUT")" >/dev/null; then
+    echo "--output must be a plain release filename directly inside --manifest-dir" >&2
+    exit 2
+  fi
+  RECORDED_APP_PATH="$app_name"
 fi
 
 INFO_PLIST="$APP/Contents/Info.plist"
@@ -167,6 +203,9 @@ fi
 
 # CrashReporter can lag process exit slightly; give it a short window before
 # deciding that no new diagnostic report was created for this launch attempt.
+# Report filenames carry the host name, so evidence records one fixed entry per
+# report (at most five) and never the name itself. awk reads all input, so the
+# pipeline never fails on a closed pipe.
 sleep 0.75
 : > "$REPORTS_FILE"
 DIAGNOSTIC_DIR="$HOME/Library/Logs/DiagnosticReports"
@@ -174,9 +213,7 @@ if [[ -d "$DIAGNOSTIC_DIR" ]]; then
   find "$DIAGNOSTIC_DIR" -type f \
     \( -name "${EXECUTABLE_NAME}_*.crash" -o -name "${EXECUTABLE_NAME}_*.ips" \) \
     -newer "$MARKER" -print 2>/dev/null \
-    | sort \
-    | while IFS= read -r report; do basename "$report"; done \
-    | head -5 > "$REPORTS_FILE"
+    | awk 'NR <= 5 { print "diagnostic_report" }' > "$REPORTS_FILE"
 fi
 
 CRASH_REPORTS_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' "$REPORTS_FILE")"
@@ -198,7 +235,7 @@ jq -n \
   --arg gate "packaged_app_launch" \
   --arg status "$STATUS" \
   --arg checked_at "$CHECKED_AT" \
-  --arg app_path "$APP" \
+  --arg app_path "$RECORDED_APP_PATH" \
   --arg bundle_id "$BUNDLE_ID" \
   --arg bundle_version "$BUNDLE_VERSION" \
   --arg bundle_short_version "$BUNDLE_SHORT_VERSION" \

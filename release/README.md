@@ -42,34 +42,44 @@ requires Developer ID signing.
 From this directory's parent:
 
 ```bash
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+./scripts/macos_package.sh --app-root /path/to/app-checkout/AppPackage \
   --version 0.1.0 --channel dev
 ./scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
 ./scripts/macos_dev_install.sh --manifest dist/macos/release-manifest.json
 ```
 
-`--app-root` names the `tools/ottto-macos-app` Swift package inside its clean
-Git checkout. Stable-candidate and stable builds also take
-`--app-source-commit`, the 40-hex commit that checkout must be at.
+`--app-root` names the macOS app's Swift package: a tracked subdirectory of
+its clean Git checkout, not the checkout root. Stable-candidate and stable
+builds also take `--app-source-commit`, the 40-hex commit that checkout must be
+at.
 
-Export `OTTTO_MACOS_APP_SOURCE_REPOSITORY` with the app source repository
-identity in `owner/name` form before packaging or running release gates,
-preflight, closeout, or the dev installer. The packager records it unchanged in
-`supply_chain.materials[1].repository`; the release gate compares that field
-against the expected value from the same environment variable. Supply the gate
-value from trusted release configuration, never from the manifest being checked.
-The caller validates the checkout ownership before invoking the packager; the
-packager checks the identity shape and the clean, pinned app subtree.
+The app source is private. The manifest records it as
+`supply_chain.materials[1]`, a `private_source` entry with a fixed name
+(`ottto-macos-app`), `visibility: private`, the app commit, the package's Git
+tree and `clean: true`, and no repository name or path. The packager checks
+that the package is a clean tracked subdirectory at the pinned commit and
+records its tree. It cannot tell from public data which subdirectory is the
+canonical app source; the release operator's own source check proves that
+before the run starts.
 
-For `macos-stable-release.yml`, configure the
-`OTTTO_MACOS_APP_SOURCE_REPOSITORY` secret in the `macos-stable-release`
-environment (or at repository scope). The workflow exports it for packaging and
-all downstream gates, and rejects missing or malformed values before building.
-Local release tooling must export the same expected identity for its gate calls.
-This changes only the value source; the manifest field and schema version remain
-unchanged, and already shipped manifests remain valid with their expected
-repository supplied.
+Release records name every local file (artifact archives, verification
+targets, the SBOM and evidence files) by plain filename. Each file sits beside
+`release-manifest.json`. The notarization, attestation, release, preflight and
+RC gates resolve it in the manifest's directory, whatever the working
+directory, so a release folder can be moved or downloaded and still verify. A
+filename starts with a letter, digit or underscore and contains no slash; those
+gates refuse absolute paths, traversal and symlinks, and name the field, not the
+rejected value, when they refuse one. A downloaded release folder holds the
+archives but not the unpacked app and binaries the verification targets name:
+`macos_release_verification_folder.sh --manifest <download>/release-manifest.json --output <new folder>`
+stages a disposable copy, outside the download, with the manifest byte for byte
+and each target unpacked from its checked archive, for the release and RC gates. The stable closeout gate
+still looks for its QA evidence in the working directory before the manifest's
+directory: run it where no other `stable-clean-machine-qa.json` is present. The
+recorded `gh attestation verify ./<file>` commands are examples to run from the
+release folder; no gate evaluates them. Manifests from releases before this
+contract hold absolute build-host paths: check them with the scripts from their
+own release tag.
 
 The package manifest uses URL-safe artifact names such as
 `Ottto-macos-arm64.dmg`, `ottto-macos-arm64.zip`, and
@@ -267,7 +277,7 @@ the Companion's dSYM and the build tools' logs there, and never uploads them:
 ```bash
 OTTTO_MACOS_DSYM_DIR=/path/to/private/release-work/dsym \
 OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Ottto Inc (...)" \
-  ./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
+  ./scripts/macos_package.sh --app-root /path/to/app-checkout/AppPackage \
     --app-source-commit <40-hex app commit> --version 0.1.0 --channel stable
 ```
 
@@ -380,16 +390,17 @@ its embedded default base URL stays pinned to the immutable versioned prefix.
 
 For stable releases, the generated supply-chain defaults are intentionally not
 publishable. After the trusted stable release workflow creates attestations,
-verify each native artifact with GitHub CLI:
+verify each native artifact with GitHub CLI from the release folder:
 
 ```bash
-gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
+cd dist/macos
+gh attestation verify ./Ottto-macos-arm64.dmg \
   -R ottto-ai/ottto \
   --predicate-type https://slsa.dev/provenance/v1 \
   --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
   --source-ref refs/tags/v<version> \
   --source-digest <release-commit>
-gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
+gh attestation verify ./Ottto-macos-arm64.dmg \
   -R ottto-ai/ottto \
   --predicate-type https://cyclonedx.org/bom \
   --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
@@ -544,9 +555,10 @@ AWS/CDN prerequisites before publish:
 16. Update the stable `latest/` pointer only after download, checksum, stapler,
     Gatekeeper, install, service, update, uninstall, rollback, and closeout-gate
     evidence are attached to the release record.
-17. Optionally publish a public GitHub Release verification mirror by dispatching
-    the stable release workflow with `github_release_mirror: true` (stable channel
-    only). The mirror is verification-only: it never writes to the CDN and never
+17. The GitHub Release verification mirror is disabled for now: the
+    `github_release_mirror` input has no effect until the step publishes the
+    operator-checked release folder. When enabled, it publishes a public GitHub
+    Release verification mirror for the stable channel only. The mirror is verification-only: it never writes to the CDN and never
     promotes a channel pointer, and it refuses to overwrite an existing
     `v<version>` release. It publishes the release for the existing release tag
     only and never creates a tag. It attaches the app, CLI, and daemon archives, the
@@ -608,7 +620,9 @@ verification commands. To roll back, repoint the stable `latest/` manifest or
 installer to the last known good version, invalidate CloudFront for the changed
 `latest` paths, and run the download plus Gatekeeper smoke again. Do not delete
 or overwrite the failed versioned artifacts; preserve them for audit and
-notarization troubleshooting.
+notarization troubleshooting. To re-verify an older release record before
+pointing `latest/` back at it, run its gates from a checkout of that release's
+own tag: a release's scripts read the record shape of their own release.
 
 ## QA Evidence
 
