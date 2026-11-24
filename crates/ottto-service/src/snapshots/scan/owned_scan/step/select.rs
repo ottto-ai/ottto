@@ -226,132 +226,8 @@ impl OwnedSourceScan {
             decision = logical;
             parse_reason = reason;
         }
-        // History-upgrade gate, whatever selected the file:
-        // unchanged Claude history that would carry a new body-witness
-        // revision passes the list, the no-list birth hold, the family
-        // skip, the stop latch and this page's budget (reserved once per
-        // file). A held file that only owes the upgrade is skipped with
-        // its old stamp, and so is one that also owes only its upload
-        // context. A held file selected for another reason (re-arm,
-        // family, audit, authority, a rebuilt or replayed index) still
-        // parses for its local work, but none of its bodies
-        // is emitted and its upload tuple stays (`veto_claude_history_emission`).
-        // A new Claude file held only by this page's budget is skipped too.
-        // A skipped Claude file held only by this page's budget is queued
-        // again as a re-read for the next page of the walk. Codex and Pi
-        // keep the adoption-only page budget.
-        let mut history_held = false;
-        if decision == CandidateDecision::Parse {
-            let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                && (self
-                    .index
-                    .candidate_requires_only_body_witness_adoption(&candidate, self.audit_now)
-                    || (self.source == SnapshotSource::ClaudeCode
-                        && claude_copy_prefix_reread::unchanged_requested(
-                            &self.index,
-                            &candidate,
-                            self.audit_now,
-                        )));
-            let history = if self.source == SnapshotSource::ClaudeCode {
-                self.index.claude_history_upgrade_decision(
-                    &candidate,
-                    opened_file
-                        .metadata()
-                        .and_then(|metadata| metadata.created())
-                        .ok()
-                        .and_then(unix_seconds),
-                    &mut self.history_upgrade,
-                )
-            } else if adoption_only
-                && !self.history_upgrade.reserve_admitting_first_file(
-                    &local_index_key(&candidate.path),
-                    candidate.size_bytes,
-                )
-            {
-                self.history_upgrade.note_denied(
-                    HistoryHold::Budget,
-                    self.index.claude_reemission_exclusions.state(),
-                );
-                HistoryDecision::Held(HistoryHold::Budget)
-            } else {
-                HistoryDecision::NotOwed
-            };
-            if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
-                // Held for a later walk: this walk cannot settle it.
-                if let Some(traversal) = self.index.traversal.as_mut() {
-                    traversal.rewalk_owed = true;
-                }
-            }
-            // A held, unchanged member owed only a proof correction is not
-            // re-read every traversal either: its bodies would be vetoed,
-            // and the correction waits for the gate (StateMissing).
-            let correction_only = parse_reason == Some(CandidateParseReason::AuthorityQuarantine)
-                && self.index.claude_authority_correction_only(&candidate);
-            // A new Claude file held only by this page's budget is not
-            // read now: a vetoed read would save it unoffered. It waits
-            // in the queue, keeping its census membership. A family root
-            // (a `<root>/subagents` directory) still takes the held read:
-            // its census record lets a fork read first drop its copy.
-            let budget_held_new = self.source == SnapshotSource::ClaudeCode
-                && parse_reason == Some(CandidateParseReason::NewFile)
-                && history == HistoryDecision::Held(HistoryHold::Budget)
-                && !candidate.path.with_extension("").join("subagents").is_dir();
-            // A listed genuine change is never held (it is literal-only
-            // denied), so a held correction-only member is unchanged.
-            match history {
-                HistoryDecision::Held(hold)
-                    if adoption_only || correction_only || budget_held_new =>
-                {
-                    if self.source == SnapshotSource::ClaudeCode {
-                        let carried = self
-                            .index
-                            .accepted_rebuild_incidence
-                            .get(&local_index_key(&candidate.path))
-                            .map_or(0, BTreeSet::len);
-                        self.index.claude_history_emission.skipped_carried_entries = self
-                            .index
-                            .claude_history_emission
-                            .skipped_carried_entries
-                            .saturating_add(carried);
-                        // A budget hold paces the upgrade page by page:
-                        // the file goes back to the walk's queue as a
-                        // re-read, so the next page of this walk continues
-                        // the upgrade (the switch-on
-                        // re-read). A re-read is not a census member
-                        // (G1): it never holds the census, and a walk
-                        // that ends first drops it for the next walk to
-                        // list again. Only once this page admitted
-                        // history: a file that cannot fit an empty page
-                        // waits for the next walk as before.
-                        if hold == HistoryHold::Budget && self.history_upgrade.admitted_any() {
-                            if let Some(traversal) = self.index.traversal.as_mut() {
-                                traversal.pending_candidates.push_back(ScanTraversalPath {
-                                    scan_root: candidate.scan_root.clone(),
-                                    path: candidate.path.clone(),
-                                    census_member: budget_held_new
-                                        && self
-                                            .selected_flags
-                                            .get(&local_index_key(&candidate.path))
-                                            .is_some_and(|&(member, _)| member),
-                                    watcher_hint: false,
-                                });
-                            }
-                        }
-                    }
-                    decision = CandidateDecision::Skip;
-                }
-                HistoryDecision::Held(hold) => {
-                    history_held = true;
-                    self.index
-                        .gate_claude_history_candidate(&candidate, Some(hold));
-                }
-                HistoryDecision::Owed => self.index.gate_claude_history_candidate(&candidate, None),
-                HistoryDecision::LiteralDenied => {
-                    self.index.deny_claude_history_literal(&candidate);
-                }
-                HistoryDecision::NotOwed => {}
-            }
-        }
+        let (mut decision, history_held) =
+            self.apply_history_upgrade_gate(&candidate, &opened_file, parse_reason, decision);
         // A file whose Tail failed alone is selected by its set-aside
         // marker before an ordinary Skip, even with equal stamps, and
         // re-reads from its committed head.
@@ -425,295 +301,11 @@ impl OwnedSourceScan {
             );
             return;
         }
-        // After ordinary identity, decision and admission (no seed
-        // pre-open), content twins and mains pull every overlapping live
-        // member of the opposite kind. Pulled candidates pass the ordinary
-        // history and resident gates; the emission fence withholds incomplete
-        // sessions. History-held mains pull nothing.
-        let seed = local_index_key(&candidate.path);
-        let record = (self.source == SnapshotSource::ClaudeCode)
-            .then(|| self.index.claude_request_census.get(&seed))
-            .flatten();
-        let walk = std::time::Instant::now();
-        let pulls: Vec<String> = match record {
-            Some(record) if record.is_twin() => {
-                let mains = self
-                    .index
-                    .claude_request_census
-                    .records()
-                    .filter(|(key, main)| {
-                        !main.is_twin()
-                            && claude_request_census::held_candidates(main, record.request_hashes())
-                                .next()
-                                .is_some()
-                            && Path::new(key).is_file()
-                    });
-                mains.map(|(key, _)| key.clone()).collect()
-            }
-            // Holder choice for copied history does not define all of a
-            // session's contributors.
-            Some(record)
-                if !history_held
-                    && claude_request_census::held_candidates(
-                        record,
-                        self.claude_twin_schedule
-                            .twin_hashes(&self.index.claude_request_census),
-                    )
-                    .next()
-                    .is_some() =>
-            {
-                let twins = self
-                    .index
-                    .claude_request_census
-                    .records()
-                    .filter(|(key, twin)| {
-                        twin.is_twin()
-                            && claude_request_census::held_candidates(twin, record.request_hashes())
-                                .next()
-                                .is_some()
-                            && Path::new(key).is_file()
-                    });
-                twins.map(|(key, _)| key.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
-        claude_request_money::e2::diag("copy_holder_walk_ms", walk.elapsed().as_millis() as u64);
-        for path in pulls.into_iter().map(PathBuf::from) {
-            let key = local_index_key(&path);
-            #[cfg(test)]
-            twin_diagnostics::event(&path, || {
-                format!(
-                    "pull requested already_scheduled={} fold_present={} queued={}",
-                    self.claude_twin_schedule.root_homes.contains(&key),
-                    self.snapshots.iter().any(|item| item
-                        .claude_money
-                        .as_deref()
-                        .and_then(claude_request_money::e2::FileFold::location_key)
-                        == Some(claude_money_birth_store::location_key(&key))),
-                    self.identified_candidates
-                        .iter()
-                        .any(|queued| queued.path == path),
-                )
-            });
-            if self.claude_twin_schedule.root_homes.contains(&key)
-                || self.snapshots.iter().any(|item| {
-                    item.claude_money
-                        .as_deref()
-                        .and_then(claude_request_money::e2::FileFold::location_key)
-                        == Some(claude_money_birth_store::location_key(&key))
-                })
-            {
-                continue;
-            }
-            self.claude_twin_schedule.root_homes.insert(key);
-            claude_request_money::e2::diag("copy_holder_pulled", 1);
-            if self
-                .identified_candidates
-                .iter()
-                .any(|queued| queued.path == path)
-            {
-                continue;
-            }
-            let mut discovery = CandidateDiscovery::new(
-                &mut self.index,
-                Some(&self.resource_probe.discovery_growth),
-            );
-            if let Some(holder) = scan::owned_scan::forced_index_candidate(
-                self.source,
-                &self.roots,
-                (path, false),
-                &mut self.census,
-                self.census_unix_seconds,
-                self.backfill_window_days,
-                &mut discovery,
-            ) {
-                #[cfg(test)]
-                twin_diagnostics::event(&holder.path, || "pull enqueued".into());
-                self.identified_candidates.push_back(holder);
-            }
-        }
+        self.pull_claude_copy_holders(&candidate, history_held);
         #[cfg(test)]
         sampled_scan::test_hooks::after_selection(&mut self.index, parse_reason);
-        if let Some(context) = self.sampling.as_ref().filter(|_| {
-            self.source == SnapshotSource::Codex && !codex_archive_path(&candidate.path)
-        }) {
-            let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(&opened_file)
-                .ok()
-                .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
-            let key = local_index_key(&candidate.path);
-            // Keyed per namespace: the digest carries the upload
-            // context, so concurrent namespaces must not evict each other.
-            let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
-            use crate::local_resource_diagnostics::codex_memo_lifecycle;
-            if let Some(entry) = context.cache.memo_lookup(&memo_key) {
-                // The match re-reads two samples of the held file.
-                self.codex_page
-                    .charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
-                let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
-                    &self.codex_title_metadata,
-                    &candidate.path,
-                );
-                let digest = sampled_scan::reduction_dependencies(
-                    self.source,
-                    &candidate,
-                    &self.codex_title_metadata,
-                    &self.claude_title_metadata,
-                    self.claude_effort_support_dir.as_deref(),
-                )
-                .and_then(|dependencies| {
-                    sampled_scan::codex_cursor::memo_digest(
-                        &self.index,
-                        &candidate,
-                        &opened_file,
-                        &dependencies,
-                        &self.codex_title_metadata,
-                        sampled_scan::codex_cursor::owner_members(
-                            self.codex_join_inventory.as_ref(),
-                            &candidate.path,
-                        ),
-                    )
-                });
-                let hit = digest.as_deref().and_then(|digest| {
-                    entry.matches_stamp(
-                        &candidate.path,
-                        digest,
-                        &opened_file,
-                        &sidecar_now,
-                        wake_stamp.clone()?,
-                    )
-                });
-                if let Some(stamp) = hit {
-                    // An append cannot cure this hold and no wake
-                    // dependency changed: disclose the same terminal
-                    // debt again at zero transcript bytes.
-                    codex_memo_lifecycle::add(
-                        codex_memo_lifecycle::Event::HitEstimatedAvoidedParserBytes,
-                        stamp.extent(),
-                    );
-                    context.cache.memo_hit(&memo_key, stamp);
-                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
-                        && !self
-                            .index
-                            .effective_upload_body_witness_revision_requires_adoption(&key);
-                    let previous = (
-                        keep_previous
-                            .then(|| self.index.last_snapshot_fingerprint(&candidate))
-                            .flatten(),
-                        keep_previous
-                            .then(|| self.index.last_upload_body_witness(&candidate))
-                            .flatten(),
-                    );
-                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
-                        entry.disclosure(),
-                        &candidate,
-                        previous,
-                        &mut self.index,
-                        targets!(self),
-                    );
-                    // The fresh path's session count, replayed.
-                    self.scanned_session_count += entry.disclosure().parsed_snapshot_count;
-                    return;
-                }
-                match digest.as_deref().and_then(|digest| {
-                    entry.grew_past_exact(&candidate.path, digest, &opened_file, &sidecar_now)
-                }) {
-                    Some(extent) => {
-                        codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissExactStamp);
-                        codex_memo_lifecycle::add(
-                            codex_memo_lifecycle::Event::MissExactStampBytes,
-                            extent,
-                        );
-                    }
-                    None => codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther),
-                }
-                context.cache.memo_forget(&memo_key);
-            }
-            // A parked `JoinStateBound` file is not read again until it
-            // is replaced, shrunk or edited, or its reduction dependencies
-            // change; growth cannot cure it (§c.2, M-2).
-            let parked = context.cache.cursor_parked_stamp(
-                &key,
-                wake_stamp.clone(),
-                sampled_scan::reduction_dependencies(
-                    self.source,
-                    &candidate,
-                    &self.codex_title_metadata,
-                    &self.claude_title_metadata,
-                    self.claude_effort_support_dir.as_deref(),
-                )
-                .as_deref(),
-            );
-            if let Some(disclosure) = parked {
-                let keep_previous = decision != CandidateDecision::ReconcileLegacy
-                    && !self
-                        .index
-                        .effective_upload_body_witness_revision_requires_adoption(&key);
-                let previous = (
-                    keep_previous
-                        .then(|| self.index.last_snapshot_fingerprint(&candidate))
-                        .flatten(),
-                    keep_previous
-                        .then(|| self.index.last_upload_body_witness(&candidate))
-                        .flatten(),
-                );
-                sampled_scan::codex_cursor::disclose_terminal_codex_debt(
-                    &disclosure,
-                    &candidate,
-                    previous,
-                    &mut self.index,
-                    targets!(self),
-                );
-                return;
-            }
-            #[cfg(test)]
-            CODEX_BEFORE_PARSE.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(&candidate.path);
-                }
-            });
-            // Fresh-first page budget, decided before any stored state is
-            // consumed: the optimistic read is the tail extent when a
-            // continuation exists, the whole file otherwise. The
-            // continuation is the committed head on its route, so an
-            // append is sized from the head's sealed offset.
-            let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
-            let continued = tail_source::committed_sealed_offset(self.source, &self.index, &key);
-            let expected = extent.saturating_sub(continued.unwrap_or(0));
-            if self.index.context_only_read(&candidate) {
-                self.context_read_budget
-                    .charge_cursor_ordinary(&mut self.codex_page);
-            }
-            match context.cache.cursor_plan_paced(
-                &mut self.codex_page,
-                sampled_scan::codex_cursor::Limits::current(),
-                expected,
-                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                crate::heap_layout_bound::layout_supported(),
-                &context.namespace,
-                &key,
-                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
-                sampled_scan::codex_cursor::census_member(
-                    &self.selected_flags,
-                    [candidate.path.as_path()],
-                ),
-                Some(sampled_scan::codex_cursor::PaceProbe { file: &opened_file }),
-            ) {
-                sampled_scan::codex_cursor::StartPlan::Defer => {
-                    context.cache.cursor_note_deferred();
-                    sampled_scan::codex_cursor::requeue(
-                        &mut self.index,
-                        &self.selected_flags,
-                        &candidate,
-                    );
-                    return;
-                }
-                // Processed for this generation (K7 fence): not requeued,
-                // so the census can complete; the next generation reads it.
-                sampled_scan::codex_cursor::StartPlan::Fenced => return,
-                sampled_scan::codex_cursor::StartPlan::Singleton
-                | sampled_scan::codex_cursor::StartPlan::Cursor
-                | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
-            }
+        if self.skip_codex_parse(&candidate, &opened_file, decision, codex_cursor_lease) {
+            return;
         }
         self.scanned_file_count += 1;
         let previous_snapshot_fingerprint = self.index.last_snapshot_fingerprint(&candidate);
@@ -1338,6 +930,351 @@ impl OwnedSourceScan {
             hold_offset: None,
             group: None,
         });
+        if !self.admit_paced_codex_read(&mut active, retained_offset, codex_cursor_lease) {
+            return;
+        }
+        if let Some(context) = self.sampling.as_mut() {
+            if let Some((mode, audit_due)) = planned_mode {
+                context.record_mode(mode, audit_due);
+                context.same_size_touch_proven +=
+                    usize::from(active.parser.reader.acquisition.as_ref().is_some_and(
+                        crate::transcript_acquisition::ReadPlan::same_size_touch_proven,
+                    ));
+                self.resource_probe
+                    .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
+                self.resource_probe.full_parse_reason(
+                    mode,
+                    active.parse_reason,
+                    active.prior_stamp,
+                    1,
+                    0,
+                );
+            }
+        }
+        if let Some(delivery) = self.line_delivery.as_mut() {
+            delivery.arm();
+        }
+        *active_file = Some(active);
+    }
+
+    /// Pull the live copy holders of a dequeued Claude twin or main into
+    /// the queue. History-held mains pull nothing.
+    #[inline(never)]
+    fn pull_claude_copy_holders(&mut self, candidate: &CandidateFile, history_held: bool) {
+        // After ordinary identity, decision and admission (no seed
+        // pre-open), content twins and mains pull every overlapping live
+        // member of the opposite kind. Pulled candidates pass the ordinary
+        // history and resident gates; the emission fence withholds incomplete
+        // sessions. History-held mains pull nothing.
+        let seed = local_index_key(&candidate.path);
+        let record = (self.source == SnapshotSource::ClaudeCode)
+            .then(|| self.index.claude_request_census.get(&seed))
+            .flatten();
+        let walk = std::time::Instant::now();
+        let pulls: Vec<String> = match record {
+            Some(record) if record.is_twin() => {
+                let mains = self
+                    .index
+                    .claude_request_census
+                    .records()
+                    .filter(|(key, main)| {
+                        !main.is_twin()
+                            && claude_request_census::held_candidates(main, record.request_hashes())
+                                .next()
+                                .is_some()
+                            && Path::new(key).is_file()
+                    });
+                mains.map(|(key, _)| key.clone()).collect()
+            }
+            // Holder choice for copied history does not define all of a
+            // session's contributors.
+            Some(record)
+                if !history_held
+                    && claude_request_census::held_candidates(
+                        record,
+                        self.claude_twin_schedule
+                            .twin_hashes(&self.index.claude_request_census),
+                    )
+                    .next()
+                    .is_some() =>
+            {
+                let twins = self
+                    .index
+                    .claude_request_census
+                    .records()
+                    .filter(|(key, twin)| {
+                        twin.is_twin()
+                            && claude_request_census::held_candidates(twin, record.request_hashes())
+                                .next()
+                                .is_some()
+                            && Path::new(key).is_file()
+                    });
+                twins.map(|(key, _)| key.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        claude_request_money::e2::diag("copy_holder_walk_ms", walk.elapsed().as_millis() as u64);
+        for path in pulls.into_iter().map(PathBuf::from) {
+            let key = local_index_key(&path);
+            #[cfg(test)]
+            twin_diagnostics::event(&path, || {
+                format!(
+                    "pull requested already_scheduled={} fold_present={} queued={}",
+                    self.claude_twin_schedule.root_homes.contains(&key),
+                    self.snapshots.iter().any(|item| item
+                        .claude_money
+                        .as_deref()
+                        .and_then(claude_request_money::e2::FileFold::location_key)
+                        == Some(claude_money_birth_store::location_key(&key))),
+                    self.identified_candidates
+                        .iter()
+                        .any(|queued| queued.path == path),
+                )
+            });
+            if self.claude_twin_schedule.root_homes.contains(&key)
+                || self.snapshots.iter().any(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(claude_request_money::e2::FileFold::location_key)
+                        == Some(claude_money_birth_store::location_key(&key))
+                })
+            {
+                continue;
+            }
+            self.claude_twin_schedule.root_homes.insert(key);
+            claude_request_money::e2::diag("copy_holder_pulled", 1);
+            if self
+                .identified_candidates
+                .iter()
+                .any(|queued| queued.path == path)
+            {
+                continue;
+            }
+            let mut discovery = CandidateDiscovery::new(
+                &mut self.index,
+                Some(&self.resource_probe.discovery_growth),
+            );
+            if let Some(holder) = scan::owned_scan::forced_index_candidate(
+                self.source,
+                &self.roots,
+                (path, false),
+                &mut self.census,
+                self.census_unix_seconds,
+                self.backfill_window_days,
+                &mut discovery,
+            ) {
+                #[cfg(test)]
+                twin_diagnostics::event(&holder.path, || "pull enqueued".into());
+                self.identified_candidates.push_back(holder);
+            }
+        }
+    }
+
+    /// Codex before parse: a memo hit, a parked file or this page's pacing
+    /// can end this selection step without building a parser. `true`
+    /// means selection returns for this page.
+    #[inline(never)]
+    fn skip_codex_parse(
+        &mut self,
+        candidate: &CandidateFile,
+        opened_file: &std::fs::File,
+        decision: CandidateDecision,
+        codex_cursor_lease: &Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
+        if let Some(context) = self.sampling.as_ref().filter(|_| {
+            self.source == SnapshotSource::Codex && !codex_archive_path(&candidate.path)
+        }) {
+            let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(opened_file)
+                .ok()
+                .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
+            let key = local_index_key(&candidate.path);
+            // Keyed per namespace: the digest carries the upload
+            // context, so concurrent namespaces must not evict each other.
+            let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
+            use crate::local_resource_diagnostics::codex_memo_lifecycle;
+            if let Some(entry) = context.cache.memo_lookup(&memo_key) {
+                // The match re-reads two samples of the held file.
+                self.codex_page
+                    .charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
+                    &self.codex_title_metadata,
+                    &candidate.path,
+                );
+                let digest = sampled_scan::reduction_dependencies(
+                    self.source,
+                    candidate,
+                    &self.codex_title_metadata,
+                    &self.claude_title_metadata,
+                    self.claude_effort_support_dir.as_deref(),
+                )
+                .and_then(|dependencies| {
+                    sampled_scan::codex_cursor::memo_digest(
+                        &self.index,
+                        candidate,
+                        opened_file,
+                        &dependencies,
+                        &self.codex_title_metadata,
+                        sampled_scan::codex_cursor::owner_members(
+                            self.codex_join_inventory.as_ref(),
+                            &candidate.path,
+                        ),
+                    )
+                });
+                let hit = digest.as_deref().and_then(|digest| {
+                    entry.matches_stamp(
+                        &candidate.path,
+                        digest,
+                        opened_file,
+                        &sidecar_now,
+                        wake_stamp.clone()?,
+                    )
+                });
+                if let Some(stamp) = hit {
+                    // An append cannot cure this hold and no wake
+                    // dependency changed: disclose the same terminal
+                    // debt again at zero transcript bytes.
+                    codex_memo_lifecycle::add(
+                        codex_memo_lifecycle::Event::HitEstimatedAvoidedParserBytes,
+                        stamp.extent(),
+                    );
+                    context.cache.memo_hit(&memo_key, stamp);
+                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                        && !self
+                            .index
+                            .effective_upload_body_witness_revision_requires_adoption(&key);
+                    let previous = (
+                        keep_previous
+                            .then(|| self.index.last_snapshot_fingerprint(candidate))
+                            .flatten(),
+                        keep_previous
+                            .then(|| self.index.last_upload_body_witness(candidate))
+                            .flatten(),
+                    );
+                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                        entry.disclosure(),
+                        candidate,
+                        previous,
+                        &mut self.index,
+                        targets!(self),
+                    );
+                    // The fresh path's session count, replayed.
+                    self.scanned_session_count += entry.disclosure().parsed_snapshot_count;
+                    return true;
+                }
+                match digest.as_deref().and_then(|digest| {
+                    entry.grew_past_exact(&candidate.path, digest, opened_file, &sidecar_now)
+                }) {
+                    Some(extent) => {
+                        codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissExactStamp);
+                        codex_memo_lifecycle::add(
+                            codex_memo_lifecycle::Event::MissExactStampBytes,
+                            extent,
+                        );
+                    }
+                    None => codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther),
+                }
+                context.cache.memo_forget(&memo_key);
+            }
+            // A parked `JoinStateBound` file is not read again until it
+            // is replaced, shrunk or edited, or its reduction dependencies
+            // change; growth cannot cure it (§c.2, M-2).
+            let parked = context.cache.cursor_parked_stamp(
+                &key,
+                wake_stamp.clone(),
+                sampled_scan::reduction_dependencies(
+                    self.source,
+                    candidate,
+                    &self.codex_title_metadata,
+                    &self.claude_title_metadata,
+                    self.claude_effort_support_dir.as_deref(),
+                )
+                .as_deref(),
+            );
+            if let Some(disclosure) = parked {
+                let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                    && !self
+                        .index
+                        .effective_upload_body_witness_revision_requires_adoption(&key);
+                let previous = (
+                    keep_previous
+                        .then(|| self.index.last_snapshot_fingerprint(candidate))
+                        .flatten(),
+                    keep_previous
+                        .then(|| self.index.last_upload_body_witness(candidate))
+                        .flatten(),
+                );
+                sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                    &disclosure,
+                    candidate,
+                    previous,
+                    &mut self.index,
+                    targets!(self),
+                );
+                return true;
+            }
+            #[cfg(test)]
+            CODEX_BEFORE_PARSE.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(&candidate.path);
+                }
+            });
+            // Fresh-first page budget, decided before any stored state is
+            // consumed: the optimistic read is the tail extent when a
+            // continuation exists, the whole file otherwise. The
+            // continuation is the committed head on its route, so an
+            // append is sized from the head's sealed offset.
+            let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
+            let continued = tail_source::committed_sealed_offset(self.source, &self.index, &key);
+            let expected = extent.saturating_sub(continued.unwrap_or(0));
+            if self.index.context_only_read(candidate) {
+                self.context_read_budget
+                    .charge_cursor_ordinary(&mut self.codex_page);
+            }
+            match context.cache.cursor_plan_paced(
+                &mut self.codex_page,
+                sampled_scan::codex_cursor::Limits::current(),
+                expected,
+                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                crate::heap_layout_bound::layout_supported(),
+                &context.namespace,
+                &key,
+                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
+                sampled_scan::codex_cursor::census_member(
+                    &self.selected_flags,
+                    [candidate.path.as_path()],
+                ),
+                Some(sampled_scan::codex_cursor::PaceProbe { file: opened_file }),
+            ) {
+                sampled_scan::codex_cursor::StartPlan::Defer => {
+                    context.cache.cursor_note_deferred();
+                    sampled_scan::codex_cursor::requeue(
+                        &mut self.index,
+                        &self.selected_flags,
+                        candidate,
+                    );
+                    return true;
+                }
+                // Processed for this generation (K7 fence): not requeued,
+                // so the census can complete; the next generation reads it.
+                sampled_scan::codex_cursor::StartPlan::Fenced => return true,
+                sampled_scan::codex_cursor::StartPlan::Singleton
+                | sampled_scan::codex_cursor::StartPlan::Cursor
+                | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
+            }
+        }
+        false
+    }
+
+    /// Codex cursor start or deferral for the built file. `true` means the
+    /// file may become active: in its page, or as a cursor job with its
+    /// lease stored.
+    #[inline(never)]
+    fn admit_paced_codex_read(
+        &mut self,
+        active: &mut OwnedActiveFile,
+        retained_offset: Option<u64>,
+        codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
         if let Some(context) = self.sampling.as_ref().filter(|_| {
             self.source == SnapshotSource::Codex && !codex_archive_path(&active.candidate.path)
         }) {
@@ -1394,7 +1331,7 @@ impl OwnedSourceScan {
                         .and_then(|inventory| inventory.owner_for_path(&active.candidate.path))
                         .map(str::to_owned);
                     match context.cache.cursor_start(
-                        &mut active,
+                        active,
                         &context.namespace,
                         dependencies,
                         owner,
@@ -1425,7 +1362,7 @@ impl OwnedSourceScan {
                                 UnreadableCause::Reduction,
                                 &active.candidate.path,
                             );
-                            return;
+                            return false;
                         }
                         Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
                             // Never an unbounded in-page read of a file
@@ -1434,7 +1371,7 @@ impl OwnedSourceScan {
                                 UnreadableCause::OpenRead,
                                 &active.candidate.path,
                             );
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -1442,7 +1379,7 @@ impl OwnedSourceScan {
                 // Processed for this generation (K7 fence).
                 sampled_scan::codex_cursor::StartPlan::Fenced => {
                     self.scanned_file_count = self.scanned_file_count.saturating_sub(1);
-                    return;
+                    return false;
                 }
             };
             if defer {
@@ -1455,30 +1392,149 @@ impl OwnedSourceScan {
                     &self.selected_flags,
                     &active.candidate,
                 );
-                return;
+                return false;
             }
         }
-        if let Some(context) = self.sampling.as_mut() {
-            if let Some((mode, audit_due)) = planned_mode {
-                context.record_mode(mode, audit_due);
-                context.same_size_touch_proven +=
-                    usize::from(active.parser.reader.acquisition.as_ref().is_some_and(
-                        crate::transcript_acquisition::ReadPlan::same_size_touch_proven,
-                    ));
-                self.resource_probe
-                    .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
-                self.resource_probe.full_parse_reason(
-                    mode,
-                    active.parse_reason,
-                    active.prior_stamp,
-                    1,
-                    0,
+        true
+    }
+
+    /// The history-upgrade gate. Returns the decision, unchanged or `Skip`,
+    /// and `history_held`: this gate held the file's history emission and
+    /// left its decision at `Parse`.
+    #[inline(never)]
+    fn apply_history_upgrade_gate(
+        &mut self,
+        candidate: &CandidateFile,
+        opened_file: &std::fs::File,
+        parse_reason: Option<CandidateParseReason>,
+        mut decision: CandidateDecision,
+    ) -> (CandidateDecision, bool) {
+        // History-upgrade gate, whatever selected the file:
+        // unchanged Claude history that would carry a new body-witness
+        // revision passes the list, the no-list birth hold, the family
+        // skip, the stop latch and this page's budget (reserved once per
+        // file). A held file that only owes the upgrade is skipped with
+        // its old stamp, and so is one that also owes only its upload
+        // context. A held file selected for another reason (re-arm,
+        // family, audit, authority, a rebuilt or replayed index) still
+        // parses for its local work, but none of its bodies
+        // is emitted and its upload tuple stays (`veto_claude_history_emission`).
+        // A new Claude file held only by this page's budget is skipped too.
+        // A skipped Claude file held only by this page's budget is queued
+        // again as a re-read for the next page of the walk. Codex and Pi
+        // keep the adoption-only page budget.
+        let mut history_held = false;
+        if decision == CandidateDecision::Parse {
+            let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
+                && (self
+                    .index
+                    .candidate_requires_only_body_witness_adoption(candidate, self.audit_now)
+                    || (self.source == SnapshotSource::ClaudeCode
+                        && claude_copy_prefix_reread::unchanged_requested(
+                            &self.index,
+                            candidate,
+                            self.audit_now,
+                        )));
+            let history = if self.source == SnapshotSource::ClaudeCode {
+                self.index.claude_history_upgrade_decision(
+                    candidate,
+                    opened_file
+                        .metadata()
+                        .and_then(|metadata| metadata.created())
+                        .ok()
+                        .and_then(unix_seconds),
+                    &mut self.history_upgrade,
+                )
+            } else if adoption_only
+                && !self.history_upgrade.reserve_admitting_first_file(
+                    &local_index_key(&candidate.path),
+                    candidate.size_bytes,
+                )
+            {
+                self.history_upgrade.note_denied(
+                    HistoryHold::Budget,
+                    self.index.claude_reemission_exclusions.state(),
                 );
+                HistoryDecision::Held(HistoryHold::Budget)
+            } else {
+                HistoryDecision::NotOwed
+            };
+            if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
+                // Held for a later walk: this walk cannot settle it.
+                if let Some(traversal) = self.index.traversal.as_mut() {
+                    traversal.rewalk_owed = true;
+                }
+            }
+            // A held, unchanged member owed only a proof correction is not
+            // re-read every traversal either: its bodies would be vetoed,
+            // and the correction waits for the gate (StateMissing).
+            let correction_only = parse_reason == Some(CandidateParseReason::AuthorityQuarantine)
+                && self.index.claude_authority_correction_only(candidate);
+            // A new Claude file held only by this page's budget is not
+            // read now: a vetoed read would save it unoffered. It waits
+            // in the queue, keeping its census membership. A family root
+            // (a `<root>/subagents` directory) still takes the held read:
+            // its census record lets a fork read first drop its copy.
+            let budget_held_new = self.source == SnapshotSource::ClaudeCode
+                && parse_reason == Some(CandidateParseReason::NewFile)
+                && history == HistoryDecision::Held(HistoryHold::Budget)
+                && !candidate.path.with_extension("").join("subagents").is_dir();
+            // A listed genuine change is never held (it is literal-only
+            // denied), so a held correction-only member is unchanged.
+            match history {
+                HistoryDecision::Held(hold)
+                    if adoption_only || correction_only || budget_held_new =>
+                {
+                    if self.source == SnapshotSource::ClaudeCode {
+                        let carried = self
+                            .index
+                            .accepted_rebuild_incidence
+                            .get(&local_index_key(&candidate.path))
+                            .map_or(0, BTreeSet::len);
+                        self.index.claude_history_emission.skipped_carried_entries = self
+                            .index
+                            .claude_history_emission
+                            .skipped_carried_entries
+                            .saturating_add(carried);
+                        // A budget hold paces the upgrade page by page:
+                        // the file goes back to the walk's queue as a
+                        // re-read, so the next page of this walk continues
+                        // the upgrade (the switch-on
+                        // re-read). A re-read is not a census member
+                        // (G1): it never holds the census, and a walk
+                        // that ends first drops it for the next walk to
+                        // list again. Only once this page admitted
+                        // history: a file that cannot fit an empty page
+                        // waits for the next walk as before.
+                        if hold == HistoryHold::Budget && self.history_upgrade.admitted_any() {
+                            if let Some(traversal) = self.index.traversal.as_mut() {
+                                traversal.pending_candidates.push_back(ScanTraversalPath {
+                                    scan_root: candidate.scan_root.clone(),
+                                    path: candidate.path.clone(),
+                                    census_member: budget_held_new
+                                        && self
+                                            .selected_flags
+                                            .get(&local_index_key(&candidate.path))
+                                            .is_some_and(|&(member, _)| member),
+                                    watcher_hint: false,
+                                });
+                            }
+                        }
+                    }
+                    decision = CandidateDecision::Skip;
+                }
+                HistoryDecision::Held(hold) => {
+                    history_held = true;
+                    self.index
+                        .gate_claude_history_candidate(candidate, Some(hold));
+                }
+                HistoryDecision::Owed => self.index.gate_claude_history_candidate(candidate, None),
+                HistoryDecision::LiteralDenied => {
+                    self.index.deny_claude_history_literal(candidate);
+                }
+                HistoryDecision::NotOwed => {}
             }
         }
-        if let Some(delivery) = self.line_delivery.as_mut() {
-            delivery.arm();
-        }
-        *active_file = Some(active);
+        (decision, history_held)
     }
 }

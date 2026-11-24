@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use ottto_protocol::{DetectedUse, DetectedUseQuotaWindowState, DetectedUseTokenSample};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
-use crate::snapshots::{SnapshotItem, SnapshotModelUsage};
+use crate::snapshots::{SnapshotItem, SnapshotModelUsage, SnapshotRequestEvidence};
 
 /// Maximum number of token-volume sparkline points retained per destination,
 /// most recent first dropped from the front. Bounds the cache file size.
@@ -36,10 +36,13 @@ const MAX_TOKEN_SAMPLES: usize = 24;
 pub const DETECTED_USE_RETENTION_DAYS: i64 = 90;
 
 /// Grouping key matching the Companion's `DetectedUse.id`:
-/// `(gateway_provider, plan_fingerprint, account_identifier_hash)`. The daemon
-/// never populates `account_identifier_hash` (an identity_probe/backend
-/// concern), so the third element is always the empty string here.
-type GroupKey = (String, String, String);
+/// `(gateway_provider, plan_fingerprint, account_identifier_hash)`, plus the
+/// account's organization. The account is each row's proven account, or each
+/// share's for a row split across accounts, and the organization is the one
+/// its request evidence names. Usage with no proven account keys on empty
+/// strings: one unidentified destination per gateway and plan, never folded
+/// into a named account.
+type GroupKey = (String, String, String, String);
 
 /// Aggregate one scan cycle's snapshots into detected uses, one entry per
 /// `(gateway_provider, plan_fingerprint, account_identifier_hash)` group.
@@ -51,23 +54,6 @@ pub fn aggregate_detected_uses(snapshots: &[SnapshotItem]) -> Vec<DetectedUse> {
                 let gateway_provider = row_gateway_provider(row);
                 let plan_fingerprint = row_plan_fingerprint(row);
                 let subscription_product = row_subscription_product(row);
-                let key = (
-                    gateway_provider.clone(),
-                    plan_fingerprint.clone().unwrap_or_default(),
-                    String::new(),
-                );
-                let builder = groups.entry(key).or_default();
-                builder.gateway_provider = gateway_provider;
-                if builder.plan_fingerprint.is_none() {
-                    builder.plan_fingerprint = plan_fingerprint;
-                }
-                if builder.subscription_product.is_none() {
-                    builder.subscription_product = subscription_product;
-                }
-                *builder
-                    .bucket_tokens
-                    .entry(bucket.bucket_start.clone())
-                    .or_insert(0) += row_total_tokens(row);
                 // last_seen prefers the bucket's last activity, then the
                 // snapshot's, then the bucket start so the field is always set.
                 let candidate = bucket
@@ -75,13 +61,35 @@ pub fn aggregate_detected_uses(snapshots: &[SnapshotItem]) -> Vec<DetectedUse> {
                     .clone()
                     .or_else(|| snapshot.source_last_activity_at.clone())
                     .unwrap_or_else(|| bucket.bucket_start.clone());
-                if builder
-                    .last_seen_at
-                    .as_ref()
-                    .map(|current| &candidate > current)
-                    .unwrap_or(true)
-                {
-                    builder.last_seen_at = Some(candidate);
+                for share in row_account_shares(row, &snapshot.request_evidence) {
+                    let key = (
+                        gateway_provider.clone(),
+                        plan_fingerprint.clone().unwrap_or_default(),
+                        share.account.clone().unwrap_or_default(),
+                        share.organization.clone().unwrap_or_default(),
+                    );
+                    let builder = groups.entry(key).or_default();
+                    builder.gateway_provider = gateway_provider.clone();
+                    builder.account_identifier_hash = share.account;
+                    builder.organization_identifier_hash = share.organization;
+                    if builder.plan_fingerprint.is_none() {
+                        builder.plan_fingerprint = plan_fingerprint.clone();
+                    }
+                    if builder.subscription_product.is_none() {
+                        builder.subscription_product = subscription_product.clone();
+                    }
+                    *builder
+                        .bucket_tokens
+                        .entry(bucket.bucket_start.clone())
+                        .or_insert(0) += share.tokens;
+                    if builder
+                        .last_seen_at
+                        .as_ref()
+                        .map(|current| &candidate > current)
+                        .unwrap_or(true)
+                    {
+                        builder.last_seen_at = Some(candidate.clone());
+                    }
                 }
             }
         }
@@ -91,6 +99,27 @@ pub fn aggregate_detected_uses(snapshots: &[SnapshotItem]) -> Vec<DetectedUse> {
         .into_values()
         .map(GroupBuilder::into_detected_use)
         .collect()
+}
+
+/// The persisted cache to merge into, or nothing when it predates per-account
+/// destinations: a cache whose every entry lacks an account was written by a
+/// daemon that never filled one, so its single record holds all of a source's
+/// usage. It is dropped once a fresh delta names an account, so that record
+/// does not linger as an "unidentified" destination for the whole retention.
+pub fn without_pre_account_cache(
+    existing: Vec<DetectedUse>,
+    fresh: &[DetectedUse],
+) -> Vec<DetectedUse> {
+    let named = |entries: &[DetectedUse]| {
+        entries
+            .iter()
+            .any(|entry| entry.account_identifier_hash.is_some())
+    };
+    if !existing.is_empty() && !named(&existing) && named(fresh) {
+        Vec::new()
+    } else {
+        existing
+    }
 }
 
 /// Fold a freshly aggregated delta into the persisted detected uses. Groups are
@@ -146,6 +175,8 @@ fn detected_use_is_fresh(entry: &DetectedUse, cutoff: OffsetDateTime) -> bool {
 struct GroupBuilder {
     gateway_provider: String,
     plan_fingerprint: Option<String>,
+    account_identifier_hash: Option<String>,
+    organization_identifier_hash: Option<String>,
     subscription_product: Option<String>,
     bucket_tokens: BTreeMap<String, u64>,
     last_seen_at: Option<String>,
@@ -160,7 +191,8 @@ impl GroupBuilder {
         DetectedUse {
             gateway_provider: self.gateway_provider,
             plan_fingerprint: self.plan_fingerprint,
-            account_identifier_hash: None,
+            account_identifier_hash: self.account_identifier_hash,
+            organization_identifier_hash: self.organization_identifier_hash,
             subscription_product: self.subscription_product,
             account_label,
             last_seen_at: self.last_seen_at.unwrap_or_default(),
@@ -177,6 +209,10 @@ fn detected_use_key(entry: &DetectedUse) -> GroupKey {
         entry.gateway_provider.clone(),
         entry.plan_fingerprint.clone().unwrap_or_default(),
         entry.account_identifier_hash.clone().unwrap_or_default(),
+        entry
+            .organization_identifier_hash
+            .clone()
+            .unwrap_or_default(),
     )
 }
 
@@ -200,6 +236,9 @@ fn merge_pair(previous: DetectedUse, incoming: DetectedUse) -> DetectedUse {
         account_identifier_hash: incoming
             .account_identifier_hash
             .or(previous.account_identifier_hash),
+        organization_identifier_hash: incoming
+            .organization_identifier_hash
+            .or(previous.organization_identifier_hash),
         subscription_product: incoming
             .subscription_product
             .or(previous.subscription_product),
@@ -264,6 +303,63 @@ fn row_plan_fingerprint(row: &SnapshotModelUsage) -> Option<String> {
     match (subscription_product, plan_window_bucket) {
         (Some(product), Some(bucket)) => Some(format!("{product}::{bucket}")),
         _ => None,
+    }
+}
+
+/// One proven account's share of a row's tokens; `organization` only with an
+/// account.
+struct AccountShare {
+    account: Option<String>,
+    organization: Option<String>,
+    tokens: u64,
+}
+
+/// A row's tokens by proven account: one share for a row with a single
+/// identity (or none), or each exact share of a row split across accounts. The
+/// organization is the one the share's request evidence names. An empty hash
+/// is none.
+fn row_account_shares(
+    row: &SnapshotModelUsage,
+    evidence: &[SnapshotRequestEvidence],
+) -> Vec<AccountShare> {
+    let share = |account: Option<&String>, evidence_ref: Option<u16>, tokens: u64| {
+        let account = account.filter(|value| !value.is_empty()).cloned();
+        let organization = account.as_ref().and_then(|_| {
+            evidence
+                .get(usize::from(evidence_ref?))?
+                .provider_workspace_hash
+                .clone()
+                .filter(|value| !value.is_empty())
+        });
+        AccountShare {
+            account,
+            organization,
+            tokens,
+        }
+    };
+    match row.identity_parts.as_deref() {
+        Some(parts) if !parts.is_empty() => parts
+            .iter()
+            .map(|part| {
+                let tokens = part
+                    .input_tokens
+                    .saturating_add(part.output_tokens)
+                    .saturating_add(part.cache_read_tokens)
+                    .saturating_add(part.cache_creation_5m_tokens)
+                    .saturating_add(part.cache_creation_1h_tokens)
+                    .saturating_add(part.unattributed_total_tokens);
+                share(
+                    part.account_identifier_hash.as_ref(),
+                    part.evidence_ref,
+                    tokens,
+                )
+            })
+            .collect(),
+        _ => vec![share(
+            row.account_identifier_hash.as_ref(),
+            row.evidence_ref,
+            row_total_tokens(row),
+        )],
     }
 }
 
@@ -559,6 +655,142 @@ mod tests {
         assert_eq!(anthropic.last_seen_at, "2026-05-28T09:30:00Z");
     }
 
+    fn named_usage(
+        account: Option<&str>,
+        evidence_ref: Option<u16>,
+        input_tokens: u64,
+    ) -> SnapshotModelUsage {
+        let mut row = model_usage(
+            Some("anthropic"),
+            Some("anthropic"),
+            Some("claude_max_20x"),
+            None,
+            input_tokens,
+            0,
+        );
+        row.account_identifier_hash = account.map(str::to_string);
+        row.evidence_ref = evidence_ref;
+        row
+    }
+
+    fn share(
+        account: Option<&str>,
+        evidence_ref: Option<u16>,
+        input_tokens: u64,
+    ) -> crate::snapshots::SnapshotIdentityPart {
+        crate::snapshots::SnapshotIdentityPart {
+            account_identifier_hash: account.map(str::to_string),
+            evidence_ref,
+            input_tokens,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+        }
+    }
+
+    fn organization(hash: &str) -> SnapshotRequestEvidence {
+        SnapshotRequestEvidence {
+            identity_basis: "telemetry".to_string(),
+            provider_workspace_hash: Some(hash.to_string()),
+            account_source: None,
+        }
+    }
+
+    /// [behaviour] Claude usage is one destination per proven account and
+    /// organization, with a split row divided by its exact shares. Usage with
+    /// no proven account stays in its own unidentified destination, with no
+    /// organization, never in a named one.
+    #[test]
+    fn claude_usage_is_a_destination_per_account_and_organization() {
+        let mut split = named_usage(None, None, 0);
+        split.identity_parts = Some(vec![
+            share(Some("acct-a"), Some(1), 30),
+            share(None, Some(1), 7),
+        ]);
+        let mut first = snapshot(
+            "one",
+            "2026-11-24T10:30:00Z",
+            vec![usage_bucket(
+                "2026-11-24T10:00:00Z",
+                "2026-11-24T10:30:00Z",
+                vec![
+                    named_usage(Some("acct-a"), Some(0), 100),
+                    named_usage(Some("acct-b"), Some(0), 40),
+                    split,
+                ],
+            )],
+        );
+        first.request_evidence = vec![organization("org-1"), organization("org-2")];
+        let second = snapshot(
+            "two",
+            "2026-11-24T10:40:00Z",
+            vec![usage_bucket(
+                "2026-11-24T10:00:00Z",
+                "2026-11-24T10:40:00Z",
+                vec![named_usage(None, None, 5), named_usage(Some(""), None, 1)],
+            )],
+        );
+
+        let detected = aggregate_detected_uses(&[first, second]);
+        let mut by_account = detected
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.gateway_provider, "anthropic");
+                assert_eq!(entry.plan_fingerprint, None);
+                assert_eq!(
+                    entry.subscription_product.as_deref(),
+                    Some("claude_max_20x")
+                );
+                assert_eq!(entry.account_label.as_deref(), Some("Ultra"));
+                (
+                    entry.account_identifier_hash.as_deref(),
+                    entry.organization_identifier_hash.as_deref(),
+                    entry.token_volume_recent[0].tokens,
+                )
+            })
+            .collect::<Vec<_>>();
+        by_account.sort();
+        assert_eq!(
+            by_account,
+            [
+                (None, None, 13),
+                (Some("acct-a"), Some("org-1"), 100),
+                (Some("acct-a"), Some("org-2"), 30),
+                (Some("acct-b"), Some("org-1"), 40),
+            ]
+        );
+    }
+
+    /// [behaviour] A cache from before per-account destinations holds all of
+    /// a source's usage in unnamed records. It is dropped once a delta names
+    /// an account, and kept otherwise.
+    #[test]
+    fn a_pre_account_cache_is_dropped_once_an_account_is_named() {
+        let unnamed = detected_use("anthropic", "2026-11-24T09:00:00Z");
+        let mut named = detected_use("anthropic", "2026-11-24T10:00:00Z");
+        named.account_identifier_hash = Some("acct-a".to_string());
+
+        let reset = without_pre_account_cache(vec![unnamed.clone()], std::slice::from_ref(&named));
+        assert!(reset.is_empty());
+        let unchanged =
+            without_pre_account_cache(vec![unnamed.clone()], std::slice::from_ref(&unnamed));
+        assert_eq!(unchanged, std::slice::from_ref(&unnamed));
+        let current = without_pre_account_cache(
+            vec![unnamed.clone(), named.clone()],
+            std::slice::from_ref(&named),
+        );
+        assert_eq!(current.len(), 2, "a cache that names an account is current");
+    }
+
     #[test]
     fn reasoning_tokens_are_not_counted_on_top_of_output() {
         let mut row = model_usage(Some("anthropic"), Some("anthropic"), None, None, 1000, 900);
@@ -701,6 +933,7 @@ mod tests {
             gateway_provider: "openai".to_string(),
             plan_fingerprint: Some("pro::20598".to_string()),
             account_identifier_hash: None,
+            organization_identifier_hash: None,
             subscription_product: Some("pro".to_string()),
             account_label: Some("Pro".to_string()),
             last_seen_at: "2026-05-26T10:00:00Z".to_string(),
@@ -786,6 +1019,7 @@ mod tests {
             gateway_provider: gateway.to_string(),
             plan_fingerprint: None,
             account_identifier_hash: None,
+            organization_identifier_hash: None,
             subscription_product: None,
             account_label: None,
             last_seen_at: last_seen_at.to_string(),
