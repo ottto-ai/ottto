@@ -116,8 +116,8 @@ base URLs. This repository has four parts:
   signed in** turns it off. When you set up an app or press Verify, it sends one short test prompt,
   and retries it in the background while a check is failing. These runs don't count as your usage.
 - **Collects Claude Code's telemetry on your Mac** for a complete picture of your usage. Setup
-  points Claude Code's telemetry to a receiver on 127.0.0.1 (in `~/.claude/settings.json` and a
-  marked line in `~/.zshrc`) and adds Ottto's status line, which shows how full the context window
+  points Claude Code's telemetry to a receiver on 127.0.0.1 (in `~/.claude/settings.json` only)
+  and adds Ottto's status line, which shows how full the context window
   is and gives fresher limits while you work. The raw telemetry never goes to Ottto's servers; only its content-free numbers (model,
   effort, speed, reported cost, token counts) feed the usage Ottto uploads.
 
