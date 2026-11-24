@@ -2109,7 +2109,7 @@ fn tally_unproven_prefix(item: &mut SnapshotItem, metadata_lost: bool) {
 /// Removal decisions of one page for the index's stored copy removals.
 #[derive(Debug, Default)]
 pub(crate) struct CopyRemovalUpdates {
-    state: Option<super::copy_removals::CopyRemovals>,
+    state: Option<crate::snapshots::claude_request_money::copy_removals::CopyRemovals>,
     added: u64,
 }
 impl CopyRemovalUpdates {
@@ -2127,17 +2127,17 @@ impl CopyRemovalUpdates {
 /// The committed ownership facts retained with the save baseline. Census clones
 /// share their hash buffers; no upload, account-window or usage graph is copied.
 #[derive(Default)]
-pub(in super::super) struct CopyOwnership(Owners, pub(in super::super) Links, AcceptedRows);
+pub(in crate::snapshots) struct CopyOwnership(Owners, pub(in crate::snapshots) Links, AcceptedRows);
 type Owners = BTreeMap<String, CopyOwner>;
 struct CopyOwner {
     owned: bool,
     group_owned: bool,
     carrier: bool,
     order: Option<(i128, LocationKey)>,
-    census: Option<super::super::claude_request_census::ClaudeRequestCensusRecord>,
+    census: Option<crate::snapshots::claude_request_census::ClaudeRequestCensusRecord>,
     groups: Vec<(LocationKey, Box<[u64]>)>,
 }
-pub(in super::super) type Links = BTreeMap<String, String>;
+pub(in crate::snapshots) type Links = BTreeMap<String, String>;
 type HeadReader<'a> = dyn FnMut(&[&str]) -> Links + 'a;
 impl CopyOwnership {
     pub(in crate::snapshots) fn capture(index: &ScanIndex) -> Self {
@@ -2171,7 +2171,7 @@ impl CopyOwnership {
         )
     }
 
-    pub(in super::super) fn seed(&mut self, read: &mut HeadReader) {
+    pub(in crate::snapshots) fn seed(&mut self, read: &mut HeadReader) {
         let keys = self
             .0
             .iter()
@@ -2179,7 +2179,7 @@ impl CopyOwnership {
             .collect::<Vec<_>>();
         self.1 = read(&keys);
     }
-    pub(in super::super) fn sessions(&self, index: &ScanIndex, keys: &[&str]) -> Links {
+    pub(in crate::snapshots) fn sessions(&self, index: &ScanIndex, keys: &[&str]) -> Links {
         keys.iter()
             .filter_map(|&key| {
                 let old = self.0.get(key)?.census.as_ref()?;
@@ -2190,7 +2190,11 @@ impl CopyOwnership {
     }
     /// Publish marks with the facts that invalidate them. Progress may already
     /// be ahead after a crash; only the two committed index images matter here.
-    pub(in super::super) fn reconcile(&self, next: &mut ScanIndex, read: &mut HeadReader) -> Links {
+    pub(in crate::snapshots) fn reconcile(
+        &self,
+        next: &mut ScanIndex,
+        read: &mut HeadReader,
+    ) -> Links {
         let before = &self.0;
         let old_carried = self.1.values().cloned().collect::<BTreeSet<_>>();
         let mut live = main_files_with(next, &mut *read, None);
@@ -2550,7 +2554,7 @@ pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next:
 }
 
 fn committed_holder_order(
-    store: &super::super::claude_money_birth_store::BirthStore,
+    store: &crate::snapshots::claude_money_birth_store::BirthStore,
     root: &str,
     key: &str,
 ) -> Option<(i128, LocationKey)> {
@@ -2686,7 +2690,7 @@ fn main_files_with(
 fn indexed_main_files(index: &ScanIndex) -> Live<'_> {
     main_files_with(
         index,
-        |keys| super::super::state_v2::carried_sessions(index, keys).unwrap_or_default(),
+        |keys| crate::snapshots::state_v2::carried_sessions(index, keys).unwrap_or_default(),
         None,
     )
 }
@@ -2819,7 +2823,7 @@ fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> O
 /// proves the file.
 enum Witness<'a> {
     Page(&'a BTreeSet<String>),
-    Census(&'a super::super::claude_request_census::ClaudeRequestCensusRecord),
+    Census(&'a crate::snapshots::claude_request_census::ClaudeRequestCensusRecord),
 }
 impl Witness<'_> {
     fn holds(&self, request_id: &str) -> bool {
@@ -3069,7 +3073,7 @@ enum Evidence {
 fn scan_evidence(
     index: &ScanIndex,
     key: &str,
-    record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
+    record: &crate::snapshots::claude_request_census::ClaudeRequestCensusRecord,
 ) -> Evidence {
     if !record.proves_scan() {
         return Evidence::None;
@@ -3083,7 +3087,7 @@ fn scan_evidence(
         let now = metadata
             .modified()
             .ok()
-            .and_then(super::super::unix_seconds);
+            .and_then(crate::snapshots::unix_seconds);
         if matches!((record.modified(), now), (Some(read), Some(now)) if read != now) {
             return Evidence::Stale;
         }
@@ -3095,7 +3099,7 @@ fn scan_evidence(
             metadata
                 .modified()
                 .ok()
-                .and_then(super::super::unix_seconds)
+                .and_then(crate::snapshots::unix_seconds)
                 != Some(at)
         }),
         (None, None) => return Evidence::None,
@@ -3120,7 +3124,7 @@ fn queued(index: &ScanIndex, key: &str) -> bool {
 /// A holder's place in the total copy order: (effective birth, location).
 /// A holder without a stored birth is probed once.
 fn holder_order(
-    store: &super::super::claude_money_birth_store::BirthStore,
+    store: &crate::snapshots::claude_money_birth_store::BirthStore,
     root: &str,
     key: &str,
 ) -> Option<(i128, LocationKey)> {
@@ -4217,7 +4221,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
         let start_bucket = report
             .rows
             .first()
-            .and_then(|row| super::super::activity_bucket_from_timestamp(&row.observed_at))
+            .and_then(|row| crate::snapshots::activity_bucket_from_timestamp(&row.observed_at))
             .map(|(bucket, _)| bucket);
         let membership = timed("attach.membership", || {
             family_membership(&items.borrow(), members)
@@ -4465,7 +4469,7 @@ pub(crate) fn side_calls_page(
             family
                 .iter()
                 .map(|row| {
-                    super::super::claude_request_census::claude_request_hash(&row.request_id)
+                    crate::snapshots::claude_request_census::claude_request_hash(&row.request_id)
                 })
                 .collect::<Vec<_>>()
         });
@@ -5410,8 +5414,8 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
                 prefix = false;
             }
             let line: serde_json::Value = serde_json::from_slice(&a).ok()?;
-            if super::super::claude_code_usage_dedup_key(&line).is_some()
-                || super::super::claude_code_usage_root(&line).is_some()
+            if crate::snapshots::claude_code_usage_dedup_key(&line).is_some()
+                || crate::snapshots::claude_code_usage_root(&line).is_some()
             {
                 return Some(false);
             }
