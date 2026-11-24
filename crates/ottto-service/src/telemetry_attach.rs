@@ -116,5 +116,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "telemetry_attach_tests.rs"]
+#[path = "telemetry_attach/tests.rs"]
 mod tests;

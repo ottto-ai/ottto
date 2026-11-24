@@ -1,6 +1,6 @@
 use super::*;
 mod upload_borrowed_tests {
-    include!("../upload_borrowed_tests.rs");
+    include!("upload_borrowed_tests.rs");
 }
 #[test]
 fn owner_return_presence_uses_only_selected_source_custody() {
@@ -66,16 +66,16 @@ fn owner_return_presence_uses_only_selected_source_custody() {
 }
 
 mod upload_error_tests {
-    include!("../upload_error_tests.rs");
+    include!("upload_error_tests.rs");
 }
 pub(super) mod codex_archive_tests {
-    include!("../codex_archive_tests.rs");
+    include!("codex_archive_tests.rs");
 }
 mod terminal_contract_retry_tests {
-    include!("../terminal_contract_retry_tests.rs");
+    include!("terminal_contract_retry_tests.rs");
 }
 mod ack_retention_tests {
-    include!("../ack_retention_tests.rs");
+    include!("ack_retention_tests.rs");
 }
 use crate::snapshots::finalize_scan_after_policy;
 /// [behaviour] Pinned: changing a history revision or replay string re-reads all history.

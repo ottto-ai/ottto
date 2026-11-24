@@ -1836,9 +1836,9 @@ fn copied_file_version_three_converges_once() {
 }
 
 mod subagent_twins {
-    include!("subagent_copy_twin_tests.rs");
-    include!("subagent_copy_twin_replace_tests.rs");
-    include!("subagent_twin_tail_route_tests.rs");
+    include!("tests/subagent_copy_twin_tests.rs");
+    include!("tests/subagent_copy_twin_replace_tests.rs");
+    include!("tests/subagent_twin_tail_route_tests.rs");
 }
 
 const CARRIER: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -2473,11 +2473,11 @@ fn committed_content_carrier_requires_bound_receipt_after_reload() {
 }
 
 mod accepted_holder_row_tests {
-    include!("accepted_holder_row_tests.rs");
+    include!("tests/accepted_holder_row_tests.rs");
 }
 
 mod entity_last_clock_tests {
-    include!("entity_last_clock_tests.rs");
+    include!("tests/entity_last_clock_tests.rs");
 }
 
 /// [money] A current carrier keeps the main's Local proof for both a stored

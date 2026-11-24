@@ -3,9 +3,9 @@ use super::*;
 use upload_context_receipt::{Candidate, RearmCounts};
 #[path = "privacy_flip_tests.rs"]
 mod privacy_flip;
-#[path = "privacy_flip_launch_tests.rs"]
+#[path = "tests/privacy_flip_launch_tests.rs"]
 mod privacy_flip_launch;
-#[path = "upload_context_released_entry_fixture.rs"]
+#[path = "tests/upload_context_released_entry_fixture.rs"]
 mod released;
 
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";

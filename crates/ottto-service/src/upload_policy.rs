@@ -444,5 +444,5 @@ pub(crate) fn filter_footprint(request: &mut ContextFootprintIngestRequest, rule
 }
 
 #[cfg(test)]
-#[path = "upload_policy_tests.rs"]
+#[path = "upload_policy/tests.rs"]
 mod tests;
