@@ -39,6 +39,11 @@ pub enum TemplatePinId {
     BedrockCliReadRoleV1,
 }
 
+/// The public bucket Ottto's CloudFormation templates are published to (Object Lock, immutable
+/// object versions). CloudFormation reads the pinned version from here.
+pub const TEMPLATE_ORIGIN: &str =
+    "https://ottto-cloud-connect-templates.s3.us-east-1.amazonaws.com";
+
 /// Add the immutable object version and its digest after the template is published.
 /// An absent pin keeps CLI setup disabled for that template.
 const TEMPLATE_PINS: &[(TemplatePinId, TemplatePin)] = &[];
@@ -67,13 +72,36 @@ impl TemplatePinId {
     }
 }
 
-impl CloudTemplatePin {
-    pub fn is_compiled_pin(&self) -> bool {
-        TemplatePinId::BedrockCliReadRoleV1.matches_metadata(
-            &self.key,
-            &self.version_id,
-            &self.sha256,
-        )
+impl TemplatePin {
+    /// `TEMPLATE_ORIGIN/<key>?versionId=<version_id>`, for a key under `aws/` ending `.yaml`, a
+    /// URL-safe version id and a lowercase hex SHA-256, so no pin value can change the host, path
+    /// or query. `None` for any other shape.
+    pub fn url(&self) -> Option<String> {
+        let key_ok = self.key.starts_with("aws/")
+            && self.key.ends_with(".yaml")
+            && self.key.len() <= 128
+            && !self.key.contains("..")
+            && !self.key.contains("//")
+            && self.key.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"/-_.".contains(&byte)
+            });
+        let version_ok = !self.version_id.is_empty()
+            && self.version_id.len() <= 1024
+            && self
+                .version_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+        let sha256_ok = self.sha256.len() == 64
+            && self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        (key_ok && version_ok && sha256_ok).then(|| {
+            format!(
+                "{TEMPLATE_ORIGIN}/{}?versionId={}",
+                self.key, self.version_id
+            )
+        })
     }
 }
 
@@ -146,4 +174,45 @@ pub fn cloud_stack_name_from_id<'a>(value: &'a str, account: &str) -> Option<&'a
     ))?;
     let (name, _) = rest.split_once('/')?;
     cloud_stack_id(value, account, name).then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pin(key: &'static str, version_id: &'static str, sha256: &'static str) -> TemplatePin {
+        TemplatePin {
+            key,
+            version_id,
+            sha256,
+        }
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn template_url_is_built_only_from_a_well_formed_pin() {
+        assert_eq!(
+            pin("aws/bedrock-cli-read-role-v1.yaml", "v1.A_b-c", SHA).url(),
+            Some(format!(
+                "{TEMPLATE_ORIGIN}/aws/bedrock-cli-read-role-v1.yaml?versionId=v1.A_b-c"
+            )),
+        );
+        for bad in [
+            pin("gcp/role.yaml", "v1", SHA),
+            pin("aws/role.json", "v1", SHA),
+            pin("aws/../role.yaml", "v1", SHA),
+            pin("aws//role.yaml", "v1", SHA),
+            pin("aws/Role.yaml", "v1", SHA),
+            pin("aws/role.yaml", "", SHA),
+            pin("aws/role.yaml", "v1&x=y", SHA),
+            pin("aws/role.yaml", "v1", "ABCDEF"),
+            pin("aws/role.yaml", "v1", "0123456789abcdef"),
+        ] {
+            assert_eq!(bad.url(), None, "{bad:?}");
+        }
+        for (_, compiled) in TEMPLATE_PINS {
+            assert!(compiled.url().is_some(), "{compiled:?}");
+        }
+    }
 }
