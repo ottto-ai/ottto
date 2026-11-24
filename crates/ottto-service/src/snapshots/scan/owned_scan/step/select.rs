@@ -428,186 +428,8 @@ impl OwnedSourceScan {
         self.pull_claude_copy_holders(&candidate, history_held);
         #[cfg(test)]
         sampled_scan::test_hooks::after_selection(&mut self.index, parse_reason);
-        if let Some(context) = self.sampling.as_ref().filter(|_| {
-            self.source == SnapshotSource::Codex && !codex_archive_path(&candidate.path)
-        }) {
-            let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(&opened_file)
-                .ok()
-                .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
-            let key = local_index_key(&candidate.path);
-            // Keyed per namespace: the digest carries the upload
-            // context, so concurrent namespaces must not evict each other.
-            let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
-            use crate::local_resource_diagnostics::codex_memo_lifecycle;
-            if let Some(entry) = context.cache.memo_lookup(&memo_key) {
-                // The match re-reads two samples of the held file.
-                self.codex_page
-                    .charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
-                let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
-                    &self.codex_title_metadata,
-                    &candidate.path,
-                );
-                let digest = sampled_scan::reduction_dependencies(
-                    self.source,
-                    &candidate,
-                    &self.codex_title_metadata,
-                    &self.claude_title_metadata,
-                    self.claude_effort_support_dir.as_deref(),
-                )
-                .and_then(|dependencies| {
-                    sampled_scan::codex_cursor::memo_digest(
-                        &self.index,
-                        &candidate,
-                        &opened_file,
-                        &dependencies,
-                        &self.codex_title_metadata,
-                        sampled_scan::codex_cursor::owner_members(
-                            self.codex_join_inventory.as_ref(),
-                            &candidate.path,
-                        ),
-                    )
-                });
-                let hit = digest.as_deref().and_then(|digest| {
-                    entry.matches_stamp(
-                        &candidate.path,
-                        digest,
-                        &opened_file,
-                        &sidecar_now,
-                        wake_stamp.clone()?,
-                    )
-                });
-                if let Some(stamp) = hit {
-                    // An append cannot cure this hold and no wake
-                    // dependency changed: disclose the same terminal
-                    // debt again at zero transcript bytes.
-                    codex_memo_lifecycle::add(
-                        codex_memo_lifecycle::Event::HitEstimatedAvoidedParserBytes,
-                        stamp.extent(),
-                    );
-                    context.cache.memo_hit(&memo_key, stamp);
-                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
-                        && !self
-                            .index
-                            .effective_upload_body_witness_revision_requires_adoption(&key);
-                    let previous = (
-                        keep_previous
-                            .then(|| self.index.last_snapshot_fingerprint(&candidate))
-                            .flatten(),
-                        keep_previous
-                            .then(|| self.index.last_upload_body_witness(&candidate))
-                            .flatten(),
-                    );
-                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
-                        entry.disclosure(),
-                        &candidate,
-                        previous,
-                        &mut self.index,
-                        targets!(self),
-                    );
-                    // The fresh path's session count, replayed.
-                    self.scanned_session_count += entry.disclosure().parsed_snapshot_count;
-                    return;
-                }
-                match digest.as_deref().and_then(|digest| {
-                    entry.grew_past_exact(&candidate.path, digest, &opened_file, &sidecar_now)
-                }) {
-                    Some(extent) => {
-                        codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissExactStamp);
-                        codex_memo_lifecycle::add(
-                            codex_memo_lifecycle::Event::MissExactStampBytes,
-                            extent,
-                        );
-                    }
-                    None => codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther),
-                }
-                context.cache.memo_forget(&memo_key);
-            }
-            // A parked `JoinStateBound` file is not read again until it
-            // is replaced, shrunk or edited, or its reduction dependencies
-            // change; growth cannot cure it (§c.2, M-2).
-            let parked = context.cache.cursor_parked_stamp(
-                &key,
-                wake_stamp.clone(),
-                sampled_scan::reduction_dependencies(
-                    self.source,
-                    &candidate,
-                    &self.codex_title_metadata,
-                    &self.claude_title_metadata,
-                    self.claude_effort_support_dir.as_deref(),
-                )
-                .as_deref(),
-            );
-            if let Some(disclosure) = parked {
-                let keep_previous = decision != CandidateDecision::ReconcileLegacy
-                    && !self
-                        .index
-                        .effective_upload_body_witness_revision_requires_adoption(&key);
-                let previous = (
-                    keep_previous
-                        .then(|| self.index.last_snapshot_fingerprint(&candidate))
-                        .flatten(),
-                    keep_previous
-                        .then(|| self.index.last_upload_body_witness(&candidate))
-                        .flatten(),
-                );
-                sampled_scan::codex_cursor::disclose_terminal_codex_debt(
-                    &disclosure,
-                    &candidate,
-                    previous,
-                    &mut self.index,
-                    targets!(self),
-                );
-                return;
-            }
-            #[cfg(test)]
-            CODEX_BEFORE_PARSE.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(&candidate.path);
-                }
-            });
-            // Fresh-first page budget, decided before any stored state is
-            // consumed: the optimistic read is the tail extent when a
-            // continuation exists, the whole file otherwise. The
-            // continuation is the committed head on its route, so an
-            // append is sized from the head's sealed offset.
-            let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
-            let continued = tail_source::committed_sealed_offset(self.source, &self.index, &key);
-            let expected = extent.saturating_sub(continued.unwrap_or(0));
-            if self.index.context_only_read(&candidate) {
-                self.context_read_budget
-                    .charge_cursor_ordinary(&mut self.codex_page);
-            }
-            match context.cache.cursor_plan_paced(
-                &mut self.codex_page,
-                sampled_scan::codex_cursor::Limits::current(),
-                expected,
-                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                crate::heap_layout_bound::layout_supported(),
-                &context.namespace,
-                &key,
-                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
-                sampled_scan::codex_cursor::census_member(
-                    &self.selected_flags,
-                    [candidate.path.as_path()],
-                ),
-                Some(sampled_scan::codex_cursor::PaceProbe { file: &opened_file }),
-            ) {
-                sampled_scan::codex_cursor::StartPlan::Defer => {
-                    context.cache.cursor_note_deferred();
-                    sampled_scan::codex_cursor::requeue(
-                        &mut self.index,
-                        &self.selected_flags,
-                        &candidate,
-                    );
-                    return;
-                }
-                // Processed for this generation (K7 fence): not requeued,
-                // so the census can complete; the next generation reads it.
-                sampled_scan::codex_cursor::StartPlan::Fenced => return,
-                sampled_scan::codex_cursor::StartPlan::Singleton
-                | sampled_scan::codex_cursor::StartPlan::Cursor
-                | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
-            }
+        if self.skip_codex_parse(&candidate, &opened_file, decision, codex_cursor_lease) {
+            return;
         }
         self.scanned_file_count += 1;
         let previous_snapshot_fingerprint = self.index.last_snapshot_fingerprint(&candidate);
@@ -1487,5 +1309,200 @@ impl OwnedSourceScan {
                 self.identified_candidates.push_back(holder);
             }
         }
+    }
+
+    /// Codex before parse: a memo hit, a parked file or this page's pacing
+    /// can end this selection step without building a parser. `true`
+    /// means selection returns for this page.
+    #[inline(never)]
+    fn skip_codex_parse(
+        &mut self,
+        candidate: &CandidateFile,
+        opened_file: &std::fs::File,
+        decision: CandidateDecision,
+        codex_cursor_lease: &Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
+        if let Some(context) = self.sampling.as_ref().filter(|_| {
+            self.source == SnapshotSource::Codex && !codex_archive_path(&candidate.path)
+        }) {
+            let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(opened_file)
+                .ok()
+                .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
+            let key = local_index_key(&candidate.path);
+            // Keyed per namespace: the digest carries the upload
+            // context, so concurrent namespaces must not evict each other.
+            let memo_key = sampled_scan::codex_cursor::memo_key(&context.namespace, &key);
+            use crate::local_resource_diagnostics::codex_memo_lifecycle;
+            if let Some(entry) = context.cache.memo_lookup(&memo_key) {
+                // The match re-reads two samples of the held file.
+                self.codex_page
+                    .charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                let sidecar_now = sampled_scan::codex_cursor::sidecar_fingerprint(
+                    &self.codex_title_metadata,
+                    &candidate.path,
+                );
+                let digest = sampled_scan::reduction_dependencies(
+                    self.source,
+                    candidate,
+                    &self.codex_title_metadata,
+                    &self.claude_title_metadata,
+                    self.claude_effort_support_dir.as_deref(),
+                )
+                .and_then(|dependencies| {
+                    sampled_scan::codex_cursor::memo_digest(
+                        &self.index,
+                        candidate,
+                        opened_file,
+                        &dependencies,
+                        &self.codex_title_metadata,
+                        sampled_scan::codex_cursor::owner_members(
+                            self.codex_join_inventory.as_ref(),
+                            &candidate.path,
+                        ),
+                    )
+                });
+                let hit = digest.as_deref().and_then(|digest| {
+                    entry.matches_stamp(
+                        &candidate.path,
+                        digest,
+                        opened_file,
+                        &sidecar_now,
+                        wake_stamp.clone()?,
+                    )
+                });
+                if let Some(stamp) = hit {
+                    // An append cannot cure this hold and no wake
+                    // dependency changed: disclose the same terminal
+                    // debt again at zero transcript bytes.
+                    codex_memo_lifecycle::add(
+                        codex_memo_lifecycle::Event::HitEstimatedAvoidedParserBytes,
+                        stamp.extent(),
+                    );
+                    context.cache.memo_hit(&memo_key, stamp);
+                    let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                        && !self
+                            .index
+                            .effective_upload_body_witness_revision_requires_adoption(&key);
+                    let previous = (
+                        keep_previous
+                            .then(|| self.index.last_snapshot_fingerprint(candidate))
+                            .flatten(),
+                        keep_previous
+                            .then(|| self.index.last_upload_body_witness(candidate))
+                            .flatten(),
+                    );
+                    sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                        entry.disclosure(),
+                        candidate,
+                        previous,
+                        &mut self.index,
+                        targets!(self),
+                    );
+                    // The fresh path's session count, replayed.
+                    self.scanned_session_count += entry.disclosure().parsed_snapshot_count;
+                    return true;
+                }
+                match digest.as_deref().and_then(|digest| {
+                    entry.grew_past_exact(&candidate.path, digest, opened_file, &sidecar_now)
+                }) {
+                    Some(extent) => {
+                        codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissExactStamp);
+                        codex_memo_lifecycle::add(
+                            codex_memo_lifecycle::Event::MissExactStampBytes,
+                            extent,
+                        );
+                    }
+                    None => codex_memo_lifecycle::record(codex_memo_lifecycle::Event::MissOther),
+                }
+                context.cache.memo_forget(&memo_key);
+            }
+            // A parked `JoinStateBound` file is not read again until it
+            // is replaced, shrunk or edited, or its reduction dependencies
+            // change; growth cannot cure it (§c.2, M-2).
+            let parked = context.cache.cursor_parked_stamp(
+                &key,
+                wake_stamp.clone(),
+                sampled_scan::reduction_dependencies(
+                    self.source,
+                    candidate,
+                    &self.codex_title_metadata,
+                    &self.claude_title_metadata,
+                    self.claude_effort_support_dir.as_deref(),
+                )
+                .as_deref(),
+            );
+            if let Some(disclosure) = parked {
+                let keep_previous = decision != CandidateDecision::ReconcileLegacy
+                    && !self
+                        .index
+                        .effective_upload_body_witness_revision_requires_adoption(&key);
+                let previous = (
+                    keep_previous
+                        .then(|| self.index.last_snapshot_fingerprint(candidate))
+                        .flatten(),
+                    keep_previous
+                        .then(|| self.index.last_upload_body_witness(candidate))
+                        .flatten(),
+                );
+                sampled_scan::codex_cursor::disclose_terminal_codex_debt(
+                    &disclosure,
+                    candidate,
+                    previous,
+                    &mut self.index,
+                    targets!(self),
+                );
+                return true;
+            }
+            #[cfg(test)]
+            CODEX_BEFORE_PARSE.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(&candidate.path);
+                }
+            });
+            // Fresh-first page budget, decided before any stored state is
+            // consumed: the optimistic read is the tail extent when a
+            // continuation exists, the whole file otherwise. The
+            // continuation is the committed head on its route, so an
+            // append is sized from the head's sealed offset.
+            let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
+            let continued = tail_source::committed_sealed_offset(self.source, &self.index, &key);
+            let expected = extent.saturating_sub(continued.unwrap_or(0));
+            if self.index.context_only_read(candidate) {
+                self.context_read_budget
+                    .charge_cursor_ordinary(&mut self.codex_page);
+            }
+            match context.cache.cursor_plan_paced(
+                &mut self.codex_page,
+                sampled_scan::codex_cursor::Limits::current(),
+                expected,
+                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                crate::heap_layout_bound::layout_supported(),
+                &context.namespace,
+                &key,
+                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
+                sampled_scan::codex_cursor::census_member(
+                    &self.selected_flags,
+                    [candidate.path.as_path()],
+                ),
+                Some(sampled_scan::codex_cursor::PaceProbe { file: opened_file }),
+            ) {
+                sampled_scan::codex_cursor::StartPlan::Defer => {
+                    context.cache.cursor_note_deferred();
+                    sampled_scan::codex_cursor::requeue(
+                        &mut self.index,
+                        &self.selected_flags,
+                        candidate,
+                    );
+                    return true;
+                }
+                // Processed for this generation (K7 fence): not requeued,
+                // so the census can complete; the next generation reads it.
+                sampled_scan::codex_cursor::StartPlan::Fenced => return true,
+                sampled_scan::codex_cursor::StartPlan::Singleton
+                | sampled_scan::codex_cursor::StartPlan::Cursor
+                | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
+            }
+        }
+        false
     }
 }
