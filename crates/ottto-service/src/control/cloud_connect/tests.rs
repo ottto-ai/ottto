@@ -439,8 +439,13 @@ fn revoke_signs_the_empty_delete_body() {
         "prepare_id": prepared["result"]["prepare_id"],
         "device_signature_b64": DER_SIGNATURE_B64,
     });
+    // One nonzero byte plus 32 more bytes exceeds the width of a P-256 scalar.
+    let mut oversized = vec![0x30, 38, 0x02, 33, 0x01];
+    oversized.extend([0x00; 32]);
+    oversized.extend([0x02, 0x01, 0x01]);
+    assert!(!wire::is_p256_der_signature(&oversized));
     let mut malformed = revoke.clone();
-    malformed["device_signature_b64"] = json!("AAAA");
+    malformed["device_signature_b64"] = json!(wire::encode_base64url(&oversized));
     assert_eq!(
         error_code(&channel.send(1, "cloud_keys_revoke", malformed)),
         "signature_invalid"

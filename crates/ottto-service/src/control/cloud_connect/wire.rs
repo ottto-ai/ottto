@@ -101,7 +101,7 @@ fn der_positive_integer(input: &[u8]) -> Option<&[u8]> {
     let (value, rest) = rest.split_at(length);
     let minimal = match value {
         [0x00, next, ..] => next & 0x80 != 0,
-        [first, ..] => first & 0x80 == 0,
+        [first, ..] => length <= 32 && first & 0x80 == 0,
         [] => false,
     };
     (minimal && value.iter().any(|byte| *byte != 0)).then_some(rest)
