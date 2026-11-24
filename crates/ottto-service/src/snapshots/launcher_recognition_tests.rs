@@ -21,7 +21,7 @@ impl Home {
         let dir = self.0.join(".ottto/launch-events/processed");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!(
-            "{}.json",
+            "{worker}.{}.json",
             crate::launch_events::event_digest(&reduced)
         ));
         fs::write(&path, raw).unwrap();
