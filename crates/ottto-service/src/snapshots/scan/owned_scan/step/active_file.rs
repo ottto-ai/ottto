@@ -1016,7 +1016,6 @@ impl OwnedSourceScan {
                     .as_deref()
                     .map(resolve_codex_identity)
             };
-            let codex_counting_v2 = true;
             // Counting receipts reach the scan's local diagnostics only
             // when this parse finishes: once per finished active file (a
             // joined group is one).
@@ -1613,7 +1612,7 @@ impl OwnedSourceScan {
                 // The counting version travels in the same entry as the
                 // fingerprint it describes; no separate save can split them.
                 if let Some(entry) = self.index.files.get_mut(&index_key) {
-                    entry.codex_counting_v2 = codex_counting_v2;
+                    entry.codex_counting_v2 = true;
                     entry.codex_counting_owner = counting_owner.clone().map(String::into_boxed_str);
                     entry.codex_fragment = bound_fragment.map(Box::new);
                 }
@@ -1778,7 +1777,7 @@ impl OwnedSourceScan {
                         entry.codex_joined_member_set = joined_marker.clone();
                         entry.codex_protected_owner = protected_owner.clone();
                         // Every completed Codex replacement carries V2.
-                        entry.codex_counting_v2 = codex_counting_v2;
+                        entry.codex_counting_v2 = true;
                         entry.codex_counting_owner =
                             counting_owner.clone().map(String::into_boxed_str);
                     }
