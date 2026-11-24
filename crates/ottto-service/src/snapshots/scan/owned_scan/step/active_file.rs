@@ -1354,25 +1354,12 @@ impl OwnedSourceScan {
                         ),
                 };
                 if let Some(debt) = obligation {
-                    let was_pending = self
-                        .index
-                        .files
-                        .get(&index_key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source);
-                    // Held retries bypass cap Full/counting, not the
-                    // committed-slot reservation for a NEW marker.
-                    if !slot_unfunded
-                        && self.index.stage_sampled_audit(
-                            &index_key,
-                            &source_file_fingerprint,
-                            debt,
-                        )
-                        && !was_pending
-                    {
-                        if let Some(context) = self.sampling.as_mut() {
-                            context.audit_slots = context.audit_slots.saturating_sub(1);
-                        }
-                    }
+                    self.stage_audit_debt(
+                        &index_key,
+                        &source_file_fingerprint,
+                        debt,
+                        slot_unfunded,
+                    );
                 } else if source_verified {
                     self.index
                         .complete_full_audit(&index_key, &source_file_fingerprint);
@@ -1397,23 +1384,12 @@ impl OwnedSourceScan {
                         .complete_native_recomposition(&index_key, &source_file_fingerprint);
                 }
                 if let Some(fragment) = cursor_fragment {
-                    let was_pending = self
-                        .index
-                        .files
-                        .get(&index_key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source);
-                    if !slot_unfunded
-                        && self.index.stage_sampled_audit(
-                            &index_key,
-                            &source_file_fingerprint,
-                            fragment.debt,
-                        )
-                        && !was_pending
-                    {
-                        if let Some(context) = self.sampling.as_mut() {
-                            context.audit_slots = context.audit_slots.saturating_sub(1);
-                        }
-                    }
+                    self.stage_audit_debt(
+                        &index_key,
+                        &source_file_fingerprint,
+                        fragment.debt,
+                        slot_unfunded,
+                    );
                 }
                 // Codex: after every audit staging above (staging
                 // matches the fingerprint), before this entry's save
@@ -1933,6 +1909,35 @@ impl OwnedSourceScan {
             }
         } else {
             false
+        }
+    }
+
+    /// Stage an audit obligation on the file's entry. A newly marked entry
+    /// spends one of the page's audit slots.
+    #[inline(never)]
+    fn stage_audit_debt(
+        &mut self,
+        index_key: &str,
+        source_file_fingerprint: &str,
+        debt: crate::transcript_acquisition::AuditDebt,
+        slot_unfunded: bool,
+    ) {
+        let was_pending = self
+            .index
+            .files
+            .get(index_key)
+            .is_some_and(ScanIndexEntry::has_unverified_source);
+        // Held retries bypass cap Full/counting, not the
+        // committed-slot reservation for a NEW marker.
+        if !slot_unfunded
+            && self
+                .index
+                .stage_sampled_audit(index_key, source_file_fingerprint, debt)
+            && !was_pending
+        {
+            if let Some(context) = self.sampling.as_mut() {
+                context.audit_slots = context.audit_slots.saturating_sub(1);
+            }
         }
     }
 }
