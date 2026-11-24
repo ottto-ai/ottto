@@ -25,7 +25,7 @@
 // writes one count/hash-only JSON receipt line directly to stderr, outside the
 // test harness capture.
 
-use super::p12_pipeline_original_tests::{
+use super::claude_family_lines_fixture::{
     rearm_evidence_lines as apc_evidence_lines, rearm_family_sessions as apc_family_sessions,
     rearm_member_session as apc_member_session, rearm_transcript_line as apc_transcript_line,
 };
