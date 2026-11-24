@@ -34,13 +34,16 @@ const CHALLENGE_ID: &str = "99999999-8888-4777-8666-555555555555";
 /// `30 06 02 01 01 02 01 01`: r = 1, s = 1.
 const DER_SIGNATURE_B64: &str = "MAYCAQECAQE";
 
+/// An enrollment as sent: raw body, device proof, approval proof.
+type SentEnrollment = (Vec<u8>, String, Option<String>);
+
 /// Answers like the server's cloud-key routes and records what it was sent.
 #[derive(Default)]
 struct FakeServer {
     /// Return a challenge whose signed hash differs from the one asked for.
     tamper_challenge: bool,
     challenges: RefCell<Vec<(String, String)>>,
-    enrolls: RefCell<Vec<(Vec<u8>, String, Option<String>)>>,
+    enrolls: RefCell<Vec<SentEnrollment>>,
     revokes: RefCell<Vec<String>>,
 }
 
