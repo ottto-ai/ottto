@@ -31,8 +31,8 @@ fn transcript(home: &OracleHome) -> PathBuf {
     }
 }
 
-/// New usage that no hint announces. Codex gains a second thread, which
-/// also moves its state store, so Codex wakes on its own stamps.
+/// New usage that no hint announces. Codex gains a second thread (a new
+/// rollout and its state rows); its home side files are not gate inputs.
 fn change(home: &OracleHome) {
     let at = "2026-11-01T07:03:00Z";
     let line = match home.source {
@@ -303,13 +303,9 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         request_listing_all(ListingTrigger::Overflow);
         let cycle = pass(&mut home, &server, &recording, STEP);
         expect(cycle, true, &mut cycles);
-        // An unannounced change waits for the backstop. Codex's state store
-        // moved too, which wakes it at once; it then idles to the backstop.
+        // An unannounced change waits for the backstop, Codex's moved state
+        // store included.
         change(&home);
-        if source == SnapshotSource::Codex {
-            let cycle = pass(&mut home, &server, &recording, STEP);
-            expect(cycle, true, &mut cycles);
-        }
         let mut since_walk = 0;
         loop {
             since_walk += STEP;
@@ -398,6 +394,126 @@ fn walk_gate_lifecycle_codex_on_a_moving_clock() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn walk_gate_lifecycle_pi_on_a_moving_clock() {
     walk_gate_lifecycle_moving(SnapshotSource::Pi, "w12_pi", "w12_pi_today");
+}
+
+/// Writes one spawn edge into the Codex home's state store. The rollouts
+/// stay byte-identical.
+fn add_spawn_edge(home: &OracleHome, parent: &str, child: &str) {
+    let state = roots(home)[0].parent().unwrap().join("state_5.sqlite");
+    rusqlite::Connection::open(state)
+        .unwrap()
+        .execute(
+            "INSERT INTO thread_spawn_edges VALUES (?1,?2)",
+            [parent, child],
+        )
+        .unwrap();
+}
+
+/// complete -> a spawn edge binds a created thread whose rollout never
+/// changes -> passes to the backstop. With `gated` false every pass walks
+/// (today's back-to-back walks over the same timeline). Also returns, per
+/// pass after the edge, whether the rollout's index entry took the change.
+fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<bool>) {
+    let source = SnapshotSource::Codex;
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    install_created_thread(&home, false, SECOND_CODEX_THREAD, false);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        if !gated {
+            crate::snapshot_watcher::cover_paths_for_test(None);
+        }
+        let mut cycles = settle(&mut home, &server, &recording);
+        let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
+        let mut seen = Seen::now(source, &server);
+        let key = transcript(&home).to_string_lossy().into_owned();
+        let fingerprint = |cycle: &Cycle| {
+            (cycle.index.files.get(&key)).map(|entry| entry.source_file_fingerprint.clone())
+        };
+        let before = fingerprint(cycles.last().unwrap());
+        assert!(before.is_some(), "{row}: the rollout is indexed");
+        let rollout = std::fs::read(transcript(&home)).unwrap();
+        add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+        let mut applied = Vec::new();
+        let mut since_walk = 0;
+        loop {
+            since_walk += STEP;
+            let backstop = since_walk >= WALK_GAP;
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            let walk = backstop || !gated;
+            expect_pass(source, row, &cycle, walk, &server, &mut seen);
+            walks += usize::from(walk);
+            applied.push(fingerprint(&cycle) != before);
+            cycles.push(cycle);
+            if backstop {
+                break;
+            }
+        }
+        assert_eq!(
+            std::fs::read(transcript(&home)).unwrap(),
+            rollout,
+            "{row}: the rollout never changed"
+        );
+        (Lifecycle::of(&server, &cycles, walks), applied)
+    })
+}
+
+/// A side-only Codex change on an unchanged rollout does not wake a settled
+/// source: the backstop walk applies it, with the money of back-to-back
+/// walks over the same timeline.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_side_only_change_waits_for_the_backstop_walk() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (gated, rested) = codex_side_only_lifecycle("w20_codex_side", true);
+    let (today, walked_each) = codex_side_only_lifecycle("w20_codex_side_today", false);
+    assert!(walked_each[0], "the next walk applies the edge");
+    let (backstop, rests) = rested.split_last().unwrap();
+    assert!(
+        rests.iter().all(|applied| !applied),
+        "a rest applies nothing"
+    );
+    assert!(*backstop, "the backstop walk applies the edge");
+    assert!(gated.walks < today.walks, "the edge woke no walk");
+    gated.assert_matches(&today, "w20_codex_side");
+}
+
+/// An unreadable Codex state store still walks an armed source: home side
+/// files left the gate key, the scan's census health check did not.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_unreadable_state_store_walks_an_armed_source() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w21_codex_health";
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        assert!(walk_idle::armed_for_test(source).is_some());
+        let state = roots(&home)[0].parent().unwrap().join("state_5.sqlite");
+        std::fs::write(state, b"not a state store").unwrap();
+        let cycle = pass(&mut home, &server, &recording, STEP);
+        assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+        assert!(
+            walk_idle::armed_for_test(source).is_none(),
+            "the pass walked: {}",
+            cycle.gate
+        );
+    });
 }
 
 /// Settles `home` under the simulated watcher, with one idle pass behind it.

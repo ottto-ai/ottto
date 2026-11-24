@@ -88,12 +88,18 @@ impl OwnedSourceScan {
             self.claude_effort_support_dir.as_deref(),
         );
         let unchanged = if self.source == SnapshotSource::Codex {
-            match self.index.codex_unchanged_decision(
+            let mut side_moved = false;
+            let decision = self.index.codex_unchanged_decision(
                 &mut candidate,
                 &self.codex_title_metadata,
                 self.audit_now,
                 true,
-            ) {
+                &mut side_moved,
+            );
+            if let Some(context) = self.sampling.as_mut() {
+                context.codex_side_only_reselect += usize::from(side_moved);
+            }
+            match decision {
                 Ok(input) => input,
                 Err(_) => {
                     sampled_scan::codex_cursor::requeue(

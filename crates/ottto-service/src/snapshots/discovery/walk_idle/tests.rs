@@ -351,26 +351,50 @@ fn uncovered_roots_never_idle() {
     assert!(!fixture.gate(&index, START + 60));
 }
 
+/// Codex home side files are not gate inputs: an edit to any of them during
+/// a walk still arms it, and while resting neither wakes the source nor moves
+/// the start-to-start backstop. The launch inbox still wakes Codex.
 #[test]
-fn codex_absent_stamps_stay_stable() {
+fn codex_home_side_files_neither_wake_nor_move_the_backstop() {
     let fixture = Fixture::new(SnapshotSource::Codex);
     let home = fixture.roots[0].parent().unwrap().to_path_buf();
-    // A journal makes the state store unstampable; a directory where the
-    // session index belongs makes that stamp fail too.
-    std::fs::write(home.join("state_5.sqlite"), b"").unwrap();
-    std::fs::write(home.join("state_5.sqlite-journal"), b"").unwrap();
-    std::fs::create_dir_all(home.join("session_index.jsonl")).unwrap();
+    let side = [
+        "state_5.sqlite",
+        "thread_history_1.sqlite",
+        "session_index.jsonl",
+        "config.toml",
+    ];
+    let edit = |n: u64| {
+        for name in side {
+            std::fs::write(home.join(name), format!("edit {n}\n")).unwrap();
+        }
+    };
     let index = ScanIndex::default();
-    let first = fixture.pass(&index, "a");
-    assert_eq!(first.codex_homes.iter().filter(|s| s.is_none()).count(), 2);
-    assert!(
-        first.same(&fixture.pass(&index, "a")),
-        "None == None is stable"
+    assert!(!fixture.gate(&index, START), "nothing armed yet");
+    edit(0);
+    fixture.arm(&index, START);
+    assert_eq!(
+        armed_for_test(SnapshotSource::Codex),
+        Some((0, START)),
+        "a side edit during the walk still arms it"
     );
-    fixture.walk(&index, START);
-    assert!(fixture.gate(&index, START + 60));
-    std::fs::write(home.join("config.toml"), b"model = \"synthetic\"\n").unwrap();
-    assert!(!fixture.gate(&index, START + 120), "a config edit walks");
+    for (n, gap) in (1_u64..).zip((600..WALK_GAP).step_by(600)) {
+        edit(n);
+        assert!(fixture.gate(&index, START + gap), "rests at +{gap}s");
+        assert_eq!(armed_for_test(SnapshotSource::Codex), Some((0, START)));
+    }
+    assert!(
+        !fixture.gate(&index, START + WALK_GAP),
+        "the backstop walks on the first walk's clock"
+    );
+    fixture.walk(&index, START + WALK_GAP);
+    assert!(fixture.gate(&index, START + WALK_GAP + 60));
+    let [pending, _] = crate::launch_events::inbox_dirs(&fixture.scratch);
+    std::fs::create_dir_all(&pending).unwrap();
+    assert!(
+        !fixture.gate(&index, START + WALK_GAP + 120),
+        "the launch inbox still wakes Codex"
+    );
 }
 
 #[test]

@@ -259,6 +259,11 @@ emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
+A nonzero-only `codex_side_only_reselect` record counts physically unchanged
+Codex rollouts whose stored reduction binding (created thread, spawn family,
+identity conflict) no longer matches the current home side files, so the walk
+reads them again. It counts decisions, not distinct files. Side-file changes do
+not wake the walk gate, so these show up on the next walk.
 Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
 paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
@@ -1734,7 +1739,8 @@ and manifest stay current; check-in beats keep them fresh, and while a record is
 armed the cycle-start beat carries no scan start. Nothing was read, uploaded or
 saved. A hint, a listing request, a changed input, a failure, an account switch
 or a restart makes the next pass walk, and a settled source still walks at
-least once every listing interval (three hours).
+least once every listing interval (three hours). Codex home side files are not
+inputs: a change to them waits for the next walk.
 
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher

@@ -41,12 +41,15 @@ impl ScanIndex {
 
     /// Physical equality refines the ordinary decision without replacing its
     /// audit, evidence, exact-body/context or sidecar dependency authority.
+    /// `side_moved` is set when the rollout is physically unchanged but its
+    /// stored reduction binding differs from the current side facts.
     pub(super) fn codex_unchanged_decision(
         &self,
         candidate: &mut CandidateFile,
         metadata: &CodexTitleMetadata,
         now: u64,
         body_witness_adoption: bool,
+        side_moved: &mut bool,
     ) -> Result<Option<(File, CandidateDecision, Option<CandidateParseReason>)>> {
         let key = local_index_key(&candidate.path);
         let file = open_candidate_beneath_root(candidate)?;
@@ -58,11 +61,11 @@ impl ScanIndex {
             Some((true, head)) => {
                 let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
                     .filter(|value| !value.is_empty());
-                if tail_source::codex::header_facts(head.revision, &head.body)
+                let stored = tail_source::codex::header_facts(head.revision, &head.body)
                     .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
-                    .0
-                    != binding
-                {
+                    .0;
+                if stored != binding {
+                    *side_moved = stored.is_some();
                     return Ok(None);
                 }
             }

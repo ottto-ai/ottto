@@ -46,6 +46,14 @@ file-system hint / periodic listing → select file → read new bytes from save
   Back-to-back walks narrow that window to about one walk but do not close it.
   Desktop store-only edits to idle sessions (rename, archive, removal) do not wake the gate:
   their titles, lineage and placement can show up to `WALK_GAP` late. Amounts are unaffected.
+  Codex home side files (`state_5.sqlite`, `thread_history_1.sqlite`, `session_index.jsonl`,
+  `config.toml`) are not gate inputs either: a change to them neither wakes a settled Codex
+  source nor keeps a walk from arming. Every walk reloads them and checks each rollout it
+  reaches, so a side-only change (a created-thread or spawn link, an identity conflict, a title)
+  on an unchanged rollout is applied by the next walk, at the latest the backstop plus the time
+  to reach the file. A side fact that changes and changes back before that walk is never
+  applied, and a rollout that leaves the backfill window or is deleted in the wait is not read
+  again. `codex_side_only_reselect` counts the rollouts a walk reads again for this reason.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
