@@ -182,7 +182,7 @@ impl Corpus {
                     _ => 4 * 1024,
                 };
                 // MCP-shaped lines take part of the padding, by bucket.
-                let (opening, late) = mcp_shapes::lines(source, &id, bucket);
+                let (opening, late) = mcp_shapes::lines(source, n, bucket);
                 for line in opening {
                     writeln!(body, "{line}").unwrap();
                 }
@@ -508,19 +508,20 @@ fn resource_corpus_is_reproducible() {
     assert_ne!(a.support, b.support);
 }
 
-/// [format] MCP-shaped lines go to fixed shares per hundred files, keep each
-/// file's size bucket, and carry the request-1 and late shapes.
+/// [format] MCP-shaped lines go to fixed shares (per hundred Claude files,
+/// per thousand Codex files), keep each file's size bucket, and carry the
+/// request-1 and late shapes.
 #[test]
 #[ignore = "resource-regression advisory workflow only"]
 fn resource_corpus_mcp_shares() {
     fn server(name: &str) -> Option<&str> {
         Some(name.strip_prefix("mcp__")?.split_once("__")?.0)
     }
-    /// MCP names and distinct servers among `values`.
-    fn names(values: &[Value]) -> (usize, usize) {
+    /// Distinct MCP names and servers.
+    fn names(seen: &BTreeSet<String>) -> (usize, usize) {
         let mut count = 0;
         let mut servers = BTreeSet::new();
-        for name in values.iter().filter_map(Value::as_str) {
+        for name in seen {
             if let Some(server) = server(name) {
                 count += 1;
                 servers.insert(server);
@@ -537,39 +538,44 @@ fn resource_corpus_mcp_shares() {
         }
         rows
     }
-    let corpus = Corpus::generate([100, 100, 2]);
+    let corpus = Corpus::generate([100, 1_000, 2]);
     let sized: u64 = 90 * 4096 + 9 * 64 * 1024 + 1024 * 1024;
-    assert_eq!(corpus.manifest.bytes[..2], [sized; 2]);
+    assert_eq!(corpus.manifest.bytes[..2], [sized, 10 * sized]);
     let mut shapes = BTreeMap::<String, usize>::new();
     for path in &corpus.files[0] {
         let mut responses = 0;
-        let mut opening = (0, 0);
-        let mut full = None;
+        let mut full = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut late = 0;
+        // Instructions deltas before and after response 1.
+        let mut notes = [0; 2];
         for row in rows(path) {
-            match row["type"].as_str() {
-                Some("assistant") => responses += 1,
-                Some("attachment") if responses == 0 => {
-                    opening = names(row["attachment"]["addedNames"].as_array().unwrap());
+            let attachment = &row["attachment"];
+            match (row["type"].as_str(), attachment["type"].as_str()) {
+                (Some("assistant"), _) => responses += 1,
+                (_, Some("deferred_tools_delta")) => {
+                    late += usize::from(responses > 0);
+                    for name in attachment["addedNames"].as_array().unwrap() {
+                        seen.insert(name.as_str().unwrap().to_owned());
+                    }
                 }
-                Some("attachment") => late += 1,
-                Some("api-request-shape") => {
-                    let mut sent = Vec::new();
+                (_, Some("mcp_instructions_delta")) => notes[usize::from(responses > 0)] += 1,
+                (Some("api-request-shape"), _) => {
                     for tool in row["shape"]["tools"].as_array().unwrap() {
                         if tool.get("defer_loading").is_none() {
-                            sent.push(tool["name"].clone());
+                            full.insert(tool["name"].as_str().unwrap().to_owned());
                         }
                     }
-                    full = Some(names(&sent));
                 }
                 _ => {}
             }
         }
-        let shape = match (full, opening) {
-            (Some((32, 7)), (400, 20)) => "desktop",
-            (Some((32, 7)), (2_000, 60)) => "max",
-            (None, (55, 4)) => "headless",
-            (None, (0, 0)) => "plain",
+        seen.extend(full.iter().cloned());
+        let shape = match (names(&full), names(&seen), notes) {
+            ((32, 7), (635, 26), [1, 1]) => "desktop",
+            ((32, 7), (739, 31), [1, 1]) => "max",
+            ((0, 0), (58, 5), [0, 0]) => "headless",
+            ((0, 0), (0, 0), [0, 0]) => "plain",
             other => panic!("unexpected Claude MCP shape: {other:?}"),
         };
         let key = format!("claude/{shape}/late{late}");
@@ -593,16 +599,17 @@ fn resource_corpus_mcp_shares() {
         *shapes.entry(key).or_default() += 1;
     }
     let expected = [
-        ("claude/desktop/late1", 4),
-        ("claude/desktop/late2", 5),
+        ("claude/desktop/late0", 4),
+        ("claude/desktop/late1", 2),
+        ("claude/desktop/late2", 3),
         ("claude/headless/late0", 7),
         ("claude/headless/late1", 3),
-        ("claude/max/late2", 1),
+        ("claude/max/late1", 1),
         ("claude/plain/late0", 80),
-        ("codex/[18, 2]", 4),
-        ("codex/[18]", 15),
-        ("codex/[19, 2]", 1),
-        ("codex/[]", 80),
+        ("codex/[19, 1]", 5),
+        ("codex/[19, 2]", 11),
+        ("codex/[19]", 184),
+        ("codex/[]", 800),
     ];
     let expected = expected.map(|(shape, files)| (shape.to_owned(), files));
     assert_eq!(shapes, BTreeMap::from(expected));

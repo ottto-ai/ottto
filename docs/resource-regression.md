@@ -12,12 +12,14 @@ The generated fixed-seed corpus has 12,000 Claude, 5,500 Codex and 500 Pi
 transcripts, eight Codex homes and five homes with synthetic SQLite sidecars.
 All files live in private temporary directories and are removed on fixture drop.
 The exact 90/9/1% mix is 4KiB/64KiB/1MiB. MCP-shaped lines with made-up
-names fill part of a fixed share's padding, so file sizes stay the same: per
-hundred Claude files, one 1MiB Desktop-shaped session (32 MCP tools in full in
-request 1, 2,000 deferred names from 60 servers, late deltas), nine 64KiB
-Desktop-shaped sessions (400 names from 20 servers) and ten 4KiB headless
-sessions (55 connector names); per hundred Codex files, twenty with a deferred
-namespaces block at start, five of them re-sent. Native acquisition, policy, exact ACK,
+names fill part of a fixed share's padding, so file sizes stay the same. Per
+hundred Claude files: nine 64KiB Desktop-shaped sessions with 635 MCP names from
+26 servers (32 tools in full in request 1, the rest deferred, instructions
+deltas before and after response 1) and one 1MiB one with 739 names from 31
+servers; six of these ten get some names after response 1. Ten 4KiB headless
+sessions carry 58 connector names from 5 servers. Per hundred Codex files,
+twenty list 19 deferred namespaces at start; per thousand, sixteen re-send the
+block, eleven of them with a new namespace. Native acquisition, policy, exact ACK,
 accepted fingerprint, state save and reload helpers seed the corpus. No live
 provider input, auth material or generated transcript is checked in.
 
