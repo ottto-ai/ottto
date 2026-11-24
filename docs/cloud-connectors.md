@@ -24,8 +24,8 @@ add `--metrics`. Use `--reconnect` to replace a connected AWS account.
 Approve saving the connection with Touch ID in the Ottto app or a passkey in
 your browser. Ottto checks access before saving, then emails workspace admins
 when a connection is saved from the Mac. If you leave or the wait times out,
-run the same command again with the same AWS account to resume. Pass
-`--restart` to replace an open attempt.
+run the connect command again with the same AWS account to resume. Include
+`--restart` only when you want to replace an open attempt.
 
 `--json` prints the final result. Add `--watch` for NDJSON progress and a final
 event. The final result includes the attempt ID, a next action, and resume or

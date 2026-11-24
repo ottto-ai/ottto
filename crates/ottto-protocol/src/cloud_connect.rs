@@ -1,3 +1,5 @@
+//! CLI control requests and shared cloud-connect wire validation.
+
 use serde::{Deserialize, Serialize};
 
 pub const CLOUD_CONNECT_CONTROL_PROTOCOL_VERSION: u16 = 29;
@@ -24,6 +26,7 @@ pub struct CloudConnectSubmit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudTemplatePin {
     pub key: String,
     pub version_id: String,

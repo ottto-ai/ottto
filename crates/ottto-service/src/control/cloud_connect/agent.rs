@@ -58,7 +58,7 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
                 );
                 return Ok(status);
             };
-            let mut attempt = server.read_attempt(&id, deadline)?;
+            let mut attempt = server.read_attempt(None, &id, deadline)?;
             remove_approval(&mut attempt);
             Ok(attempt)
         }
@@ -342,12 +342,7 @@ impl SetupRunServer<'_> {
         if !signer_available() {
             return Err(queue_failure(SignQueueError::SignerUnavailable));
         }
-        let run = self
-            .daemon
-            .connection_for_authorized_client()
-            .map_err(|error| server_failure(ServerError::from_local(&error)))?
-            .ok_or_else(|| server_failure(ServerError::local("not_paired")))?
-            .setup_run_id;
+        let run = self.current_run()?;
         let template = if attempt_id.is_some() {
             ATTEMPT_TEMPLATE
         } else {
@@ -391,11 +386,13 @@ impl SetupRunServer<'_> {
             {
                 return Err(invalid_server());
             }
+            let wait = remaining(deadline)?.min(SIGN_WAIT);
             let request = queue_sign_request(SignKind::DeviceProof, payload, expiry)
                 .map_err(queue_failure)?;
-            let Some(SignOutcome::Signed(signature)) =
-                sign_queue().wait(&request, remaining(deadline)?.min(SIGN_WAIT))
-            else {
+            let Some(SignOutcome::Signed(signature)) = sign_queue().wait(
+                &request,
+                wait.min(deadline.saturating_duration_since(Instant::now())),
+            ) else {
                 sign_queue().cancel(&request);
                 remaining(deadline)?;
                 return Err(Failure::new(
@@ -432,12 +429,25 @@ impl SetupRunServer<'_> {
         unreachable!("the second send settles the request")
     }
 
-    fn read_attempt(&self, id: &str, deadline: Instant) -> Result<Value, Failure> {
+    fn current_run(&self) -> Result<String, Failure> {
+        self.daemon
+            .connection_for_authorized_client()
+            .map_err(|error| server_failure(ServerError::from_local(&error)))?
+            .map(|connection| connection.setup_run_id)
+            .ok_or_else(|| server_failure(ServerError::local("not_paired")))
+    }
+
+    fn read_attempt(
+        &self,
+        run: Option<&str>,
+        id: &str,
+        deadline: Instant,
+    ) -> Result<Value, Failure> {
         if !cloud_uuid(id) {
             return Err(invalid_argument());
         }
         let value = self.agent_call(
-            None,
+            run,
             "GET",
             &format!("connect-attempts/{id}"),
             None,
@@ -455,7 +465,8 @@ impl SetupRunServer<'_> {
     }
 
     fn poll(&self, id: &str, account: &str, deadline: Instant) -> Result<Value, Failure> {
-        let mut attempt = self.read_attempt(id, deadline)?;
+        let run = self.current_run()?;
+        let mut attempt = self.read_attempt(Some(&run), id, deadline)?;
         let approval = attempt
             .as_object_mut()
             .and_then(|value| value.remove("approval"));
@@ -542,7 +553,7 @@ impl SetupRunServer<'_> {
                             &json!({"approval_id": approval_id, "signature": encode_base64url(&signature)}),
                         );
                         let response = self.agent_call(
-                            None,
+                            Some(&run),
                             "POST",
                             &format!("connect-attempts/{id}/approval"),
                             Some(&body),
@@ -551,7 +562,10 @@ impl SetupRunServer<'_> {
                         );
                         match response {
                             Ok(value) => {
-                                let mut value = verify_attempt(value, Some(id))?;
+                                let mut value = match verify_attempt(value, Some(id)) {
+                                    Ok(attempt) => attempt,
+                                    Err(_) => self.read_attempt(Some(&run), id, deadline)?,
+                                };
                                 remove_approval(&mut value);
                                 value["approval_accepted"] = json!(true);
                                 return Ok(value);
@@ -565,7 +579,7 @@ impl SetupRunServer<'_> {
                                         | "server_unavailable"
                                 ) =>
                             {
-                                let mut value = self.read_attempt(id, deadline)?;
+                                let mut value = self.read_attempt(Some(&run), id, deadline)?;
                                 remove_approval(&mut value);
                                 return Ok(value);
                             }

@@ -3,6 +3,7 @@ use super::queue::SignKind;
 use super::queue::SignOutcome;
 use super::queue::SignQueue;
 use super::queue::SignQueueError;
+use super::queue::MAX_LIVE_SIGN_REQUESTS;
 use super::resolve_signer_start;
 use super::server::ClaimStartBody;
 use super::server::ClaimStarted;
@@ -662,4 +663,48 @@ fn wake_targets_the_bundle_around_this_service() {
     ] {
         assert_eq!(app_bundle_of(Path::new(executable)), None, "{executable}");
     }
+}
+
+#[test]
+fn queue_caps_distinct_native_approvals_and_keeps_the_retained_answer() {
+    let channel = Channel::new(FakeServer::default());
+    let approval = |index| SignKind::Approval {
+        attempt_id: format!("attempt_{index}"),
+        approval_id: format!("approval_{index}"),
+    };
+    channel.hello(1);
+    let queue = &channel.queue;
+    let deadline = unix_now() + 60;
+    let first = queue.enqueue(approval(0), vec![0], deadline).unwrap();
+    channel.send(1, "cloud_sign_poll", json!({}));
+    assert_eq!(
+        channel.send(
+            1,
+            "cloud_sign_result",
+            json!({"request_id": first.request_id, "outcome": "declined"}),
+        )["ok"],
+        true,
+    );
+    for index in 1..MAX_LIVE_SIGN_REQUESTS {
+        let next = queue.enqueue(approval(index), vec![0], deadline).unwrap();
+        queue.cancel(&next.request_id);
+    }
+    assert_eq!(
+        queue
+            .enqueue(approval(0), vec![0], deadline)
+            .unwrap()
+            .request_id,
+        first.request_id,
+    );
+    assert_eq!(
+        queue.approval_outcome(&first.request_id),
+        Some(SignOutcome::Declined)
+    );
+    assert_eq!(
+        queue.enqueue(approval(MAX_LIVE_SIGN_REQUESTS), vec![0], deadline),
+        Err(SignQueueError::ApprovalRateLimited),
+    );
+    assert!(queue
+        .enqueue(SignKind::DeviceProof, vec![0], deadline)
+        .is_ok());
 }

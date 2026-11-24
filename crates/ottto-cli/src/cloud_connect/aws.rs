@@ -1,10 +1,12 @@
+//! AWS CLI subprocesses and their attempt-local credential session.
+
 use super::{invalid_server, sleep_until, timed_out, Failure};
 use ottto_protocol::{cloud_account_id, CLOUD_CONNECT_REGION};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -146,6 +148,7 @@ impl Aws {
     }
 
     pub(super) fn export(&self, deadline: Instant) -> Result<Session, Failure> {
+        let bundle_output = self.configure(&["get", "ca_bundle"], deadline)?;
         let output = self.configure(&["export-credentials", "--format", "process"], deadline)?;
         if !output.status.success() {
             let error = output.error();
@@ -176,7 +179,6 @@ impl Aws {
         {
             return Err(not_signed_in());
         }
-        let bundle_output = self.configure(&["get", "ca_bundle"], deadline)?;
         let bundle = std::env::var_os("AWS_CA_BUNDLE")
             .filter(|path| !path.is_empty())
             .or_else(|| {
@@ -293,7 +295,7 @@ fn aws_path() -> Option<PathBuf> {
         .find(|path| path.parent() != Some(cwd.as_path()) && is_executable(path))
 }
 
-fn is_executable(path: &PathBuf) -> bool {
+fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = path.metadata() else {
         return false;
     };
@@ -380,20 +382,22 @@ fn run(mut command: Command, deadline: Instant) -> Result<Output, Failure> {
         }
     })();
     if result.is_err() {
-        stop_child(&mut child);
+        stop_child(child);
     }
     result
 }
 
-fn stop_child(child: &mut Child) {
+fn stop_child(mut child: Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // The non-reaped child is the leader of its own process group.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     let _ = child.kill();
-    // A blocked kernel I/O operation must not extend the frontend deadline.
-    let _ = child.try_wait();
+    // Reap without letting a blocked kernel operation extend the frontend deadline.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn aws_failure(code: &str, message: &str, action: &str) -> Failure {
@@ -422,4 +426,45 @@ pub(super) fn access_denied() -> Failure {
         "AWS denied permission to create or read the stack.",
         "fix_aws_permissions",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exported_credentials_replace_the_aws_environment() {
+        let session = Session {
+            credentials: Credentials {
+                access_key_id: Zeroizing::new("synthetic-access".into()),
+                secret_access_key: Zeroizing::new("synthetic-secret".into()),
+                session_token: Some(Zeroizing::new("synthetic-session".into())),
+                expiration: None,
+            },
+            ca_bundle: None,
+        };
+        let mut command = Command::new("aws");
+        session.apply(&mut command);
+        let aws_variables: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("AWS_"))
+            .collect();
+        assert_eq!(aws_variables.len(), 7);
+        assert_eq!(
+            aws_variables
+                .get(std::ffi::OsStr::new("AWS_CONFIG_FILE"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("/dev/null")),
+        );
+        assert_eq!(
+            aws_variables
+                .get(std::ffi::OsStr::new("AWS_SESSION_TOKEN"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("synthetic-session")),
+        );
+        assert!(!aws_variables.contains_key(std::ffi::OsStr::new("AWS_PROFILE")));
+        assert!(!aws_variables.contains_key(std::ffi::OsStr::new("AWS_ENDPOINT_URL")));
+    }
 }

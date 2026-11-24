@@ -17,6 +17,7 @@ pub const MAX_LIVE_SIGN_REQUESTS: usize = 4;
 
 /// A queued request wakes the app unless a hello arrived this recently.
 const HELLO_FRESH_FOR: Duration = Duration::from_secs(3);
+const APPROVAL_TAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// An answered or expired request stays this long past its expiry for its caller to collect.
 const KEEP_AFTER_EXPIRY_SECONDS: i64 = 60;
@@ -103,6 +104,7 @@ struct QueuedRequest {
     kind: SignKind,
     payload: Vec<u8>,
     expires_at: i64,
+    queued_at: Instant,
     taken_by: Option<u64>,
     outcome: Option<SignOutcome>,
 }
@@ -175,6 +177,7 @@ impl SignQueue {
             kind,
             payload,
             expires_at,
+            queued_at: Instant::now(),
             taken_by: None,
             outcome: None,
         });
@@ -225,13 +228,14 @@ impl SignQueue {
 
     /// Retains a native answer for readback and identical R5 retries.
     pub(super) fn approval_outcome(&self, request_id: &str) -> Option<SignOutcome> {
-        let state = self.lock();
-        state
-            .requests
-            .iter()
-            .find(|request| request.id == request_id)?
-            .outcome
-            .clone()
+        let mut state = self.lock();
+        let request = state.requests.iter_mut().find(|request| {
+            request.id == request_id && matches!(request.kind, SignKind::Approval { .. })
+        })?;
+        if request.taken_by.is_none() && request.queued_at.elapsed() >= APPROVAL_TAKE_TIMEOUT {
+            request.outcome.get_or_insert(SignOutcome::AppUnavailable);
+        }
+        request.outcome.clone()
     }
 
     pub(super) fn cancel_attempt(&self, attempt_id: &str) {

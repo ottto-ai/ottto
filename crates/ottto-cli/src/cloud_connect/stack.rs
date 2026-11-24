@@ -1,3 +1,5 @@
+//! Typed CloudFormation plans, stack reconciliation and cleanup output.
+
 use super::aws::{access_denied, Aws, Session};
 use super::{invalid_server, sleep_until, Failure};
 use ottto_protocol::{
@@ -425,4 +427,31 @@ pub(super) fn cleanup(account: &str, arn: &str) -> Value {
             "--region", CLOUD_CONNECT_REGION,
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_names_only_a_full_arn_verified_for_the_observed_account() {
+        let reference = CleanupReference {
+            stack_name: "ottto-read-b-abcde234".into(),
+            account_id: "000000000001".into(),
+            stack_id: Some("arn:aws:cloudformation:us-east-1:000000000001:stack/ottto-read-b-abcde234/00000000-0000-0000-0000-000000000001".into()),
+        };
+        let arn = reference.stack_id.as_deref().unwrap();
+        assert!(cloud_stack_id(
+            arn,
+            &reference.account_id,
+            &reference.stack_name
+        ));
+        assert!(!cloud_stack_id(arn, "000000000002", &reference.stack_name));
+        let unverified = reference.resolve(None, Instant::now()).unwrap();
+        assert_eq!(unverified["verified"], false);
+        assert!(unverified.get("argv").is_none());
+        let verified = cleanup(&reference.account_id, arn);
+        assert_eq!(verified["verified"], true);
+        assert_eq!(verified["argv"][4], arn);
+    }
 }

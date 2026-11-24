@@ -1,3 +1,5 @@
+//! Cloud setup orchestration and CLI output.
+
 mod aws;
 mod stack;
 
@@ -774,7 +776,11 @@ fn resume(args: &CloudConnectArgs, mode: OutputMode, next: &str) -> Vec<String> 
     if next == "restart" {
         argv.push("--restart".into());
     }
-    if let Some(profile) = &args.profile {
+    if let Some(profile) = args
+        .profile
+        .as_deref()
+        .filter(|name| aws::profile_valid(name))
+    {
         argv.push(format!("--profile={profile}"));
     }
     if args.timeout != 1200 {
