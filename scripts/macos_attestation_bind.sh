@@ -250,6 +250,9 @@ sbom_verification_command="gh attestation verify $first_subject_path --repo $REP
 tmp_manifest="$(mktemp "$manifest_dir/release-manifest.attestation-bind.XXXXXX")"
 trap 'rm -f "$tmp_manifest"' EXIT
 
+# Releases are built on a self-hosted signing Mac, which SLSA counts as Build
+# L1. Verified GitHub attestations add signed provenance and SBOM evidence for
+# that build; they do not raise the build level.
 jq \
   --arg repository "$REPOSITORY" \
   --arg signer_workflow "$SIGNER_WORKFLOW" \
@@ -266,7 +269,7 @@ jq \
     .supply_chain.slsa_build
     + {
         spec_version: "1.2",
-        level: "build_l2",
+        level: "build_l1",
         predicate_type: $slsa_predicate_type,
         repository: $repository,
         signer_workflow: $signer_workflow,

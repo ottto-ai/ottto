@@ -206,7 +206,7 @@ if ! cmp -s "$before_without_supply" "$after_without_supply"; then
 fi
 
 jq -e '
-  .supply_chain.slsa_build.level == "build_l2"
+  .supply_chain.slsa_build.level == "build_l1"
   and .supply_chain.slsa_build.attested == true
   and .supply_chain.slsa_build.verified == true
   and .supply_chain.slsa_build.repository == "ottto-ai/ottto"

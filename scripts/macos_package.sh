@@ -576,7 +576,36 @@ DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
 ditto -c -k "$OUTPUT_DIR/ottto" "$CLI_ZIP"
 ditto -c -k "$OUTPUT_DIR/ottto-service" "$DAEMON_ZIP"
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
-"$ROOT/scripts/cyclonedx_sbom.sh" --output "$SBOM_PATH" --version "$VERSION" >/dev/null
+# The SBOM describes the Apple Silicon build and the Sparkle version the app
+# source commit pins; the embedded framework must be that version.
+if [[ "$ARCH" != "arm64" ]]; then
+  echo "The macOS release SBOM requires Apple Silicon artifacts" >&2
+  exit 2
+fi
+if ! sparkle_pin="$(
+  git -C "$MAC_APP_GIT_ROOT" show "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH/Package.resolved" 2>/dev/null |
+    jq -ce '
+      [.pins[]? | select(.identity == "sparkle"
+        and .kind == "remoteSourceControl"
+        and .location == "https://github.com/sparkle-project/Sparkle")]
+      | if length == 1 then .[0].state else error("Expected one upstream Sparkle pin in Package.resolved") end
+      | if (.version | type) == "string" and (.revision | type) == "string" then .
+        else error("The Sparkle pin in Package.resolved needs a version and a revision") end
+    '
+)"; then
+  echo "Could not read the Sparkle pin from the app source commit's Package.resolved" >&2
+  exit 2
+fi
+sparkle_version="$(jq -r '.version' <<<"$sparkle_pin")"
+sparkle_revision="$(jq -r '.revision' <<<"$sparkle_pin")"
+sparkle_plist="$APP_FRAMEWORKS/Sparkle.framework/Versions/B/Resources/Info.plist"
+if ! embedded_sparkle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$sparkle_plist" 2>/dev/null)" ||
+  [[ "$embedded_sparkle_version" != "$sparkle_version" ]]; then
+  echo "Embedded Sparkle framework version must match the app source pin ($sparkle_version)" >&2
+  exit 2
+fi
+"$ROOT/scripts/cyclonedx_sbom.sh" --output "$SBOM_PATH" --version "$VERSION" \
+  --sparkle-version "$sparkle_version" --sparkle-revision "$sparkle_revision" >/dev/null
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
