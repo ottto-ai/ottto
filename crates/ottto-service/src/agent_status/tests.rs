@@ -5191,6 +5191,79 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
     }
 }
 
+/// [regress] `account/read` answers from the local login without a refresh,
+/// so a refresh token another holder already used is first rejected on the
+/// rate-limits read. That refresh rejection reads as a dead login too; a 401
+/// or any other rate-limits failure stays a plain failure.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_quota_stage_auth_rejection_is_a_dead_login() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (label, text, dead) in [
+        (
+            "reused",
+            "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+            true,
+        ),
+        ("unavailable", "rate limits are temporarily unavailable", false),
+        // A 401 on the rate-limits read may be transient: never a sign-out.
+        ("unauthorized", "unauthorized (401)", false),
+    ] {
+        let (root, home) = synthetic_codex_collector_home(&format!("quota-rejected-{label}"), 0o600);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = |registered_binding: Option<(String, String)>, quota_read: CodexQuotaRead| {
+            collect_codex_home_candidate(
+                CodexHomeSlot {
+                    slot_id: "codex_slot_quota_rejected".to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    home: home.clone(),
+                    registered_binding,
+                },
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+                quota_read,
+            )
+        };
+        let registered = collect(None, CodexQuotaRead::Provider)
+            .binding
+            .expect("validated binding");
+
+        // The account read still answers; only the rate-limits read fails.
+        let executable = root.join("codex");
+        let script = std::fs::read_to_string(&executable).expect("fake Codex");
+        let answer = r#"print('{"id":"' + request_id + '","result":"#;
+        assert!(script.contains(answer));
+        let rejected = format!(
+            r#"print('{{"id":"' + request_id + '","error":{{"code":-32603,"message":"{text}"}}}}', flush=True)
+        _ = dict(unused='{{"id":"' + request_id + '","result":"#
+        );
+        std::fs::write(&executable, script.replace(answer, &rejected))
+            .expect("rejecting rate-limits read");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+
+        for quota_read in [CodexQuotaRead::Provider, CodexQuotaRead::Saved] {
+            let read = collect(Some(registered.clone()), quota_read);
+            assert_eq!(
+                read.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
+                dead,
+                "{label}"
+            );
+        }
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]

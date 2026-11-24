@@ -325,6 +325,18 @@ pub(in crate::agent_status) fn codex_app_server_auth_rejected(error: &Value) -> 
         })
 }
 
+/// The refresh rejection alone ("sign in again", e.g. a refresh token another
+/// holder already used) on a rate-limits read that ended the session.
+/// `account/read` answers from the local login without a refresh, so a spent
+/// token is first rejected there. A 401 or any other text on that read stays a
+/// plain failure: it may be transient.
+pub(in crate::agent_status) fn codex_app_server_refresh_rejected(error: &Value) -> bool {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.to_ascii_lowercase().contains("sign in again"))
+}
+
 /// `ended`: the child's own exit status, when it ended before our cleanup;
 /// never report our own stop signal.
 pub(in crate::agent_status) fn codex_app_server_end_failure(
@@ -369,8 +381,10 @@ pub(in crate::agent_status) struct CodexAppServerRun {
     pub(in crate::agent_status) timed_out: bool,
     /// `account/read` answered with no account
     /// ([`codex_app_server_account_absent`]), or the provider rejected the
-    /// login there ([`codex_app_server_auth_rejected`]), whatever the rest of
-    /// the session did.
+    /// login there ([`codex_app_server_auth_rejected`]) or refused its refresh
+    /// on the rate-limits read that ended the session
+    /// ([`codex_app_server_refresh_rejected`]), whatever the rest of the
+    /// session did.
     pub(in crate::agent_status) account_absent: bool,
     /// The binary whose bundled model list was passed to Codex
     /// ([`codex_probe_catalog`]), so it sent no models request.
@@ -721,6 +735,7 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
                 run.routine_read_rejected = true;
             }
             (Some("ottto_rate_limits"), Some(error)) => {
+                run.account_absent |= codex_app_server_refresh_rejected(error);
                 break Err(rpc_failure("quota", error));
             }
             (Some("ottto_rate_limits"), None) if rate_limits_result.is_none() => {
@@ -731,6 +746,7 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), Some(error)) => {
                 if rate_limits_result.is_none() {
+                    run.account_absent |= codex_app_server_refresh_rejected(error);
                     break Err(rpc_failure("quota", error));
                 }
                 detail_failed = true;

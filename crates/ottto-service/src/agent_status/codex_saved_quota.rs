@@ -24,7 +24,8 @@
 //! one with the lowest home key. Its interval is the in-use one when any of
 //! them is in use; the others are read by themselves only once a day (each
 //! read lets Codex refresh that home's own login when due, and a dead login
-//! there is noticed), and their status serves the reader's reading. Homes hold the same login only while
+//! there is noticed), or every 30 min while a Codex process runs in that home
+//! itself, and their status serves the reader's reading. Homes hold the same login only while
 //! both their saved readings and their current credentials name the same
 //! account and workspace, and their latest reads did not fail; anything else
 //! is read on its own, as before.
@@ -1687,7 +1688,8 @@ struct ScheduledRound {
 
 /// Each home's interval this round: its own 5 or 30 minutes, the in-use one
 /// for a home that reads for others when any of them is in use, and the
-/// keep-alive for the homes it reads for. With the grouping.
+/// keep-alive for the homes it reads for, or the unused interval while one of
+/// those is itself in use. With the grouping.
 fn round_intervals(
     support_dir: &Path,
     homes: &[ScheduledHome],
@@ -1704,6 +1706,11 @@ fn round_intervals(
         .map(|index| {
             if readers[index] == index {
                 refresh_interval_seconds(group_in_use[index])
+            } else if in_use[index] {
+                // Codex runs in this home on its own login (a helper, say):
+                // a login that died there must show within the unused
+                // interval, not a day later behind the reader's readings.
+                UNUSED_REFRESH_SECONDS
             } else {
                 SAME_LOGIN_KEEPALIVE_SECONDS
             }
@@ -2857,6 +2864,8 @@ mod tests {
         homes: Vec<(&'static str, CodexAccountSlotOwnershipV1, PathBuf)>,
         logins: Mutex<BTreeMap<PathBuf, (String, String)>>,
         failing: Mutex<BTreeSet<&'static str>>,
+        /// What a failing read answers (a timeout unless a test sets it).
+        failure: Mutex<String>,
         reads: Mutex<Vec<String>>,
     }
 
@@ -2881,6 +2890,7 @@ mod tests {
                 root,
                 logins: Mutex::default(),
                 failing: Mutex::default(),
+                failure: Mutex::new("Codex app-server quota read timed out.".to_string()),
                 reads: Mutex::default(),
             };
             for (name, _, user, workspace) in homes {
@@ -2954,7 +2964,7 @@ mod tests {
                 .0;
             self.reads.lock().unwrap().push(name.to_string());
             if self.failing.lock().unwrap().contains(name) {
-                return Err("Codex app-server quota read timed out.".to_string());
+                return Err(self.failure.lock().unwrap().clone());
             }
             let (user, workspace) = self.logins.lock().unwrap()[&home.home].clone();
             Ok(bound_probe(&user, &workspace, at))
@@ -3078,26 +3088,34 @@ mod tests {
         assert_eq!(fixture.round(start + 10 * 60 + u, false, &[]), ["default"]);
         // The slot only would be in use (a running Codex there): the shared
         // read is at 5 minutes again (the other account is left out of this
-        // round, whatever its own interval).
-        let busy = start + 10 * 60 + u + 5 * 60;
-        let mut homes = fixture.scheduled(&["other"], busy);
-        for home in &mut homes {
-            if &home.home == fixture.home("twin") {
-                home.process_seen_at = Some(busy - 60);
+        // round, whatever its own interval), and the slot, last read by
+        // itself 45 minutes ago, checks its own login at the unused interval.
+        let busy_round = |at: u64| {
+            let mut homes = fixture.scheduled(&["other"], at);
+            for home in &mut homes {
+                if &home.home == fixture.home("twin") {
+                    home.process_seen_at = Some(at - 60);
+                }
             }
-        }
-        scheduled_round_for(
-            &fixture.root,
-            homes,
-            &[],
-            busy,
-            || true,
-            |home| fixture.read(home, busy),
-        );
-        assert_eq!(fixture.taken_reads(), ["default"]);
+            scheduled_round_for(
+                &fixture.root,
+                homes,
+                &[],
+                at,
+                || true,
+                |home| fixture.read(home, at),
+            );
+            fixture.taken_reads()
+        };
+        let busy = start + 10 * 60 + u + 5 * 60;
+        assert_eq!(busy_round(busy), ["default", "twin"]);
+        // While it stays in use: its own read every 30 minutes, not sooner.
+        assert!(!busy_round(busy + u - 60).contains(&"twin".to_string()));
+        assert!(busy_round(busy + u).contains(&"twin".to_string()));
 
-        // Keep-alive: the slot reads by itself once a day, not before.
-        let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
+        // Keep-alive: once nothing runs there, the slot reads by itself once
+        // a day after its last own read, not before.
+        let day = busy + u + SAME_LOGIN_KEEPALIVE_SECONDS;
         assert!(!fixture
             .round(day - 60, false, &[])
             .contains(&"twin".to_string()));
@@ -3305,6 +3323,35 @@ mod tests {
         );
         assert_eq!(fixture.round(day + 5 * 60, true, &[]), ["default"]);
         // Its failed read is retried at the unused interval, not before.
+        let u = UNUSED_REFRESH_SECONDS;
+        assert_eq!(fixture.round(day + u - 1, true, &[]), ["default"]);
+        assert_eq!(fixture.round(day + u, true, &[]), ["twin"]);
+    }
+
+    /// The twin's own read finds its refresh token spent (a dead login): that
+    /// is what its card shows, never the reader's fresh reading, and it reads
+    /// on its own schedule from then on.
+    #[test]
+    fn a_dead_login_on_the_twin_is_served_and_leaves_the_shared_reading() {
+        let fixture = SameLoginFixture::new(
+            "same-login-dead-twin",
+            &[
+                ("default", true, "user-a", "workspace-a"),
+                ("twin", false, "user-a", "workspace-a"),
+            ],
+        );
+        let start = current_unix_seconds();
+        assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
+        let dead = format!(
+            "{}Codex app-server quota RPC failed with code -32603.",
+            crate::agent_status::CODEX_NO_ACCOUNT_FAILURE_PREFIX
+        );
+        *fixture.failure.lock().unwrap() = dead.clone();
+        fixture.failing.lock().unwrap().insert("twin");
+        let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
+        assert_eq!(fixture.round(day, true, &[]), ["default", "twin"]);
+        assert_eq!(fixture.served_at("twin", day + 60), Err(dead));
+        assert_eq!(fixture.round(day + 5 * 60, true, &[]), ["default"]);
         let u = UNUSED_REFRESH_SECONDS;
         assert_eq!(fixture.round(day + u - 1, true, &[]), ["default"]);
         assert_eq!(fixture.round(day + u, true, &[]), ["twin"]);
