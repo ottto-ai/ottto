@@ -993,9 +993,10 @@ never sees a key.
 - **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
   three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
   This unauthenticated hint carries no data. The app obtains requests over verified XPC.
-- **Template.** The local flow selects a template ID. The service uses its compiled pin table for
-  the immutable object key, version and SHA-256. A missing pin fails verification. Server
-  metadata is used only for comparison with the compiled pin.
+- **Template.** The local flow selects a template ID. The service and CLI use the compiled
+  pin table in `ottto-protocol` for the immutable object key, version and SHA-256. The service
+  checks the downloaded bytes against the selected digest. A missing pin fails verification.
+  Server metadata is used only for comparison with the compiled pin.
 - **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
   its LaunchAgent. Swapping only the service binary is unsupported because the installed job
   retains the signer Mach service and passes a flag the older binary cannot parse.

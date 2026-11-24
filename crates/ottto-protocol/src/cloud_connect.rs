@@ -33,18 +33,47 @@ pub struct CloudTemplatePin {
     pub sha256: String,
 }
 
-/// Filled in after publication of the immutable CLI template. An unset pin
-/// matches no server response, including one carrying these placeholder values.
-pub const CLOUD_CLI_TEMPLATE_PIN: Option<(&str, &str, &str)> = None;
+/// A template chosen by the local cloud connect flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplatePinId {
+    BedrockCliReadRoleV1,
+}
+
+/// Add the immutable object version and its digest after the template is published.
+/// An absent pin keeps CLI setup disabled for that template.
+const TEMPLATE_PINS: &[(TemplatePinId, TemplatePin)] = &[];
+
+/// One published template object version and the SHA-256 of its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplatePin {
+    pub key: &'static str,
+    pub version_id: &'static str,
+    pub sha256: &'static str,
+}
+
+impl TemplatePinId {
+    /// The immutable object metadata compiled for this flow.
+    pub fn pin(self) -> Option<&'static TemplatePin> {
+        TEMPLATE_PINS
+            .iter()
+            .find_map(|(id, pin)| (*id == self).then_some(pin))
+    }
+
+    /// Checks server metadata against the locally selected pin.
+    pub fn matches_metadata(self, key: &str, version_id: &str, sha256: &str) -> bool {
+        self.pin().is_some_and(|pin| {
+            pin.key == key && pin.version_id == version_id && pin.sha256 == sha256
+        })
+    }
+}
 
 impl CloudTemplatePin {
     pub fn is_compiled_pin(&self) -> bool {
-        CLOUD_CLI_TEMPLATE_PIN
-            == Some((
-                self.key.as_str(),
-                self.version_id.as_str(),
-                self.sha256.as_str(),
-            ))
+        TemplatePinId::BedrockCliReadRoleV1.matches_metadata(
+            &self.key,
+            &self.version_id,
+            &self.sha256,
+        )
     }
 }
 

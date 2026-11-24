@@ -6,8 +6,8 @@ use zeroize::Zeroize;
 mod cloud_connect;
 pub use cloud_connect::{
     cloud_account_id, cloud_stack_id, cloud_stack_name, cloud_stack_name_from_id, cloud_uuid,
-    CloudConnectEnsure, CloudConnectFailure, CloudConnectSubmit, CloudTemplatePin,
-    CLOUD_CLI_TEMPLATE_PIN, CLOUD_CONNECT_ATTEMPT_SCHEMA, CLOUD_CONNECT_CONTROL_PROTOCOL_VERSION,
+    CloudConnectEnsure, CloudConnectFailure, CloudConnectSubmit, CloudTemplatePin, TemplatePin,
+    TemplatePinId, CLOUD_CONNECT_ATTEMPT_SCHEMA, CLOUD_CONNECT_CONTROL_PROTOCOL_VERSION,
     CLOUD_CONNECT_REGION, CLOUD_CONNECT_WEB_URL,
 };
 

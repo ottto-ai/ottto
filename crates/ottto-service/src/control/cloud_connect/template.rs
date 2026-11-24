@@ -1,7 +1,8 @@
 //! CloudFormation template verification against a build-time table of published object versions
 //! and digests.
 
-use ottto_protocol::CLOUD_CLI_TEMPLATE_PIN;
+use ottto_protocol::TemplatePin;
+pub use ottto_protocol::TemplatePinId;
 use std::io::Read as _;
 use std::time::Duration;
 
@@ -13,40 +14,6 @@ const TEMPLATE_ORIGIN: &str = "https://ottto-cloud-connect-templates.s3.us-east-
 const MAX_TEMPLATE_BYTES: u64 = 1024 * 1024;
 
 const TEMPLATE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// A template chosen by the local cloud connect flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TemplatePinId {
-    BedrockCliReadRoleV1,
-}
-
-/// One published template object version and the SHA-256 of its bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TemplatePin {
-    pub(super) key: &'static str,
-    pub(super) version_id: &'static str,
-    pub(super) sha256: &'static str,
-}
-
-impl TemplatePinId {
-    fn pin(self) -> Option<TemplatePin> {
-        let (key, version_id, sha256) = match self {
-            Self::BedrockCliReadRoleV1 => CLOUD_CLI_TEMPLATE_PIN?,
-        };
-        Some(TemplatePin {
-            key,
-            version_id,
-            sha256,
-        })
-    }
-
-    /// Checks server metadata against the locally selected pin.
-    pub fn matches_metadata(self, key: &str, version_id: &str, sha256: &str) -> bool {
-        self.pin().is_some_and(|pin| {
-            pin.key == key && pin.version_id == version_id && pin.sha256 == sha256
-        })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateError {
@@ -68,7 +35,7 @@ pub(super) fn verified_template_url_with_timeout(
     timeout: Duration,
 ) -> Result<String, TemplateError> {
     let pin = id.pin().ok_or(TemplateError::InvalidPin)?;
-    let url = template_url(&pin)?;
+    let url = template_url(pin)?;
     let response = crate::retry_tls::credential_agent()
         .get(&url)
         .timeout(timeout.min(TEMPLATE_FETCH_TIMEOUT))
@@ -83,7 +50,7 @@ pub(super) fn verified_template_url_with_timeout(
         .take(MAX_TEMPLATE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| TemplateError::Unreachable)?;
-    template_bytes_match(&pin, &bytes)?;
+    template_bytes_match(pin, &bytes)?;
     Ok(url)
 }
 
