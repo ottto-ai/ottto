@@ -374,7 +374,9 @@ jobs:
     # fits the 2 MiB default; an overflow aborts the test binary.
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.scan_stack_margin && !inputs.money_equivalence }}
-    timeout-minutes: 40
+    # The uncached release build alone can take about 40 minutes, so give it
+    # the same limit as the other macOS build jobs.
+    timeout-minutes: 55
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
