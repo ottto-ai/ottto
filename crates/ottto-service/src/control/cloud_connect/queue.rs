@@ -1,6 +1,6 @@
-//! The in-memory sign queue between the service and the Mac app: at most four live requests, each
-//! taken by one verified signer connection, and the app's answer handed back to the caller that
-//! queued it. Nothing here is persisted; a restart drops every request.
+//! The in-memory sign queue between the service and the Mac app: each request is taken by one
+//! verified signer connection, bounded by its own expiry, and the app's answer is handed back to
+//! the caller that queued it. Nothing here is persisted; a restart drops every request.
 
 use serde::Serialize;
 use std::sync::Condvar;
@@ -10,9 +10,6 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-
-/// Requests the app has not answered yet, across every attempt.
-pub const MAX_LIVE_SIGN_REQUESTS: usize = 4;
 
 /// A queued request wakes the app unless a hello arrived this recently.
 const HELLO_FRESH_FOR: Duration = Duration::from_secs(3);
@@ -49,8 +46,6 @@ pub enum SignOutcome {
 pub enum SignQueueError {
     /// No signer channel on this Mac.
     SignerUnavailable,
-    /// Already four live requests.
-    Full,
     /// The expiry is not in the future.
     AlreadyExpired,
 }
@@ -146,14 +141,6 @@ impl SignQueue {
         }
         if expires_at <= now {
             return Err(SignQueueError::AlreadyExpired);
-        }
-        let live_count = state
-            .requests
-            .iter()
-            .filter(|request| request.outcome.is_none())
-            .count();
-        if live_count - usize::from(superseded.is_some()) >= MAX_LIVE_SIGN_REQUESTS {
-            return Err(SignQueueError::Full);
         }
         if let Some(index) = superseded {
             state.requests[index].outcome = Some(SignOutcome::Superseded);

@@ -2,6 +2,7 @@
 //! state, a device challenge, key enrollment and key revoke. Signed writes send the exact bytes
 //! their challenge hashed.
 
+use super::wire::ChallengeRequest;
 use crate::control::api_url_with_base;
 use crate::control::backend_get_json;
 use crate::control::backend_post_json;
@@ -46,6 +47,30 @@ pub(super) struct DeviceChallenge {
     pub(super) payload_bytes: String,
 }
 
+/// The setup run and organization a request was sent under: what a challenge's signed facts must
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RunScope {
+    pub(super) run_id: String,
+    pub(super) org_id: String,
+}
+
+/// This Mac's cloud-key identity as the server's challenges name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DeviceBinding {
+    pub(super) device_id: String,
+    pub(super) device_generation: u64,
+    pub(super) org_id: String,
+}
+
+/// What the app reads on every hello. Each field is null when this service cannot tell.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(super) struct HelloFacts {
+    pub(super) binding: Option<DeviceBinding>,
+    /// The server's `agent_connect` status block, as the server sent it.
+    pub(super) agent_connect: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Enrolled {
     pub(super) device_key_id: String,
@@ -56,13 +81,6 @@ pub(super) struct Enrolled {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Revoked {
     pub(super) reason: String,
-}
-
-#[derive(Serialize)]
-struct ChallengeBody<'a> {
-    operation: &'a str,
-    attempt_id: Option<&'a str>,
-    request_sha256: &'a str,
 }
 
 /// A failed server call as the app sees it: the server's own code when it named one.
@@ -116,12 +134,11 @@ pub(super) trait CloudKeyServer {
     /// Starts (or replays) a key claim for these public keys.
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError>;
     fn claim_state(&self, key_claim_id: &str) -> Result<ClaimState, ServerError>;
-    /// A challenge committing to `request_sha256` for `operation`.
+    /// A challenge for `request`, with the run and organization it was requested on.
     fn device_challenge(
         &self,
-        operation: &str,
-        request_sha256: &str,
-    ) -> Result<DeviceChallenge, ServerError>;
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(RunScope, DeviceChallenge), ServerError>;
     /// Sends the frozen enrollment body once.
     fn enroll(
         &self,
@@ -129,8 +146,14 @@ pub(super) trait CloudKeyServer {
         device_proof: &str,
         approval_proof: Option<&str>,
     ) -> Result<Enrolled, ServerError>;
-    /// Revokes this Mac's cloud keys (an empty `DELETE` body).
+    /// Revokes this Mac's cloud keys (an empty `DELETE` body). The server answers 204.
     fn revoke(&self, device_proof: &str) -> Result<Revoked, ServerError>;
+    /// This Mac's device binding and the server's agent connect status, for the app's hello.
+    fn hello_facts(&self) -> HelloFacts;
+    /// The current Unix time in seconds.
+    fn now(&self) -> i64 {
+        super::queue::unix_now()
+    }
 }
 
 /// The routes on the Ottto server this Mac is connected to.
@@ -228,21 +251,24 @@ impl CloudKeyServer for SetupRunServer<'_> {
 
     fn device_challenge(
         &self,
-        operation: &str,
-        request_sha256: &str,
-    ) -> Result<DeviceChallenge, ServerError> {
-        let body = ChallengeBody {
-            operation,
-            attempt_id: None,
-            request_sha256,
-        };
-        self.call(|prefix, token| {
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
+        let (connection, org_id) = self
+            .daemon
+            .cloud_connect_binding()
+            .map_err(|error| ServerError::from_local(&error))?;
+        let challenge = self.call(|prefix, token| {
             backend_post_json(
                 &format!("{prefix}/device-challenges"),
-                &body,
+                request,
                 &[("X-Ottto-Setup-Run-Token", token)],
             )
-        })
+        })?;
+        let scope = RunScope {
+            run_id: connection.setup_run_id,
+            org_id,
+        };
+        Ok((scope, challenge))
     }
 
     fn enroll(
@@ -263,7 +289,7 @@ impl CloudKeyServer for SetupRunServer<'_> {
 
     fn revoke(&self, device_proof: &str) -> Result<Revoked, ServerError> {
         self.call(|prefix, token| {
-            backend_send_raw_json(
+            backend_send_raw_json::<serde_json::Value>(
                 "DELETE",
                 &keys_url(prefix),
                 None,
@@ -272,7 +298,40 @@ impl CloudKeyServer for SetupRunServer<'_> {
                     ("X-Ottto-Device-Proof", device_proof),
                 ],
             )
+            .map(|_| Revoked {
+                reason: "revoked".into(),
+            })
         })
+    }
+
+    fn hello_facts(&self) -> HelloFacts {
+        let org_id = self
+            .daemon
+            .cloud_connect_binding()
+            .ok()
+            .map(|(_, org_id)| org_id);
+        let device = ottto_core::FileDeviceStore::default()
+            .load_with_credential_generation()
+            .ok()
+            .flatten()
+            .filter(|device| device.credential_generation > 0);
+        let binding = org_id.zip(device).map(|(org_id, device)| DeviceBinding {
+            device_id: device.device.device_id,
+            device_generation: device.credential_generation,
+            org_id,
+        });
+        let agent_connect = crate::control::status::cloud_status(
+            self.daemon,
+            &crate::control::RequestAuthorization::TrustedCompanionApp,
+            None,
+        )
+        .ok()
+        .and_then(|mut status| status.get_mut("agent_connect").map(serde_json::Value::take))
+        .filter(serde_json::Value::is_object);
+        HelloFacts {
+            binding,
+            agent_connect,
+        }
     }
 }
 

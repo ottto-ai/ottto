@@ -8,21 +8,20 @@ use super::server::ClaimStartBody;
 use super::server::ClaimStarted;
 use super::server::ClaimState;
 use super::server::CloudKeyServer;
+use super::server::DeviceBinding;
 use super::server::DeviceChallenge;
 use super::server::Enrolled;
+use super::server::HelloFacts;
 use super::server::Revoked;
+use super::server::RunScope;
 use super::server::ServerError;
 use super::server::{check_refresh_binding, send_with_refresh};
 use super::signer;
-use super::template::template_bytes_match;
-use super::template::template_url;
-use super::template::TemplateError;
-use super::template::TemplatePin;
 use super::wake::app_bundle_of;
 use super::wire;
+use super::wire::ChallengeRequest;
 use super::SignerOff;
 use super::SignerStartFacts;
-use super::{verified_template_url, TemplatePinId};
 use crate::control::SetupRunRefreshResponse;
 use crate::{BackendErrorDetails, BackendErrorKind, LocalApiError};
 use ottto_protocol::InstallOwner;
@@ -36,6 +35,8 @@ use std::time::Duration;
 
 const CLAIM_ID: &str = "11111111-2222-4333-8444-555555555555";
 const CHALLENGE_ID: &str = "99999999-8888-4777-8666-555555555555";
+const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
+const ORG_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CLAIM_URL: &str =
     "https://app.ottto.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
 /// `30 06 02 01 01 02 01 01`: r = 1, s = 1.
@@ -74,28 +75,26 @@ impl CloudKeyServer for FakeServer {
 
     fn device_challenge(
         &self,
-        operation: &str,
-        request_sha256: &str,
-    ) -> Result<DeviceChallenge, ServerError> {
-        self.challenges
-            .borrow_mut()
-            .push((operation.to_string(), request_sha256.to_string()));
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
+        self.challenges.borrow_mut().push((
+            request.operation.to_string(),
+            request.request_sha256.to_string(),
+        ));
         let signed_hash = if self.tamper_challenge {
             "0".repeat(64)
         } else {
-            request_sha256.to_string()
+            request.request_sha256.to_string()
         };
-        let payload = json!({
-            "v": wire::DEVICE_WRITE_VERSION,
-            "challenge_id": CHALLENGE_ID,
-            "operation": operation,
-            "request_sha256": signed_hash,
-            "exp": unix_now() + 60,
-        });
-        Ok(DeviceChallenge {
-            challenge_id: CHALLENGE_ID.to_string(),
-            payload_bytes: wire::encode_base64url(payload.to_string().as_bytes()),
-        })
+        let now = unix_now();
+        let payload = device_write(request.operation, None, &signed_hash, now, now + 60);
+        Ok((
+            run_scope(),
+            DeviceChallenge {
+                challenge_id: CHALLENGE_ID.to_string(),
+                payload_bytes: wire::encode_base64url(payload.to_string().as_bytes()),
+            },
+        ))
     }
 
     fn enroll(
@@ -121,6 +120,44 @@ impl CloudKeyServer for FakeServer {
             reason: "revoked".to_string(),
         })
     }
+
+    fn hello_facts(&self) -> HelloFacts {
+        HelloFacts {
+            binding: None,
+            agent_connect: None,
+        }
+    }
+}
+
+fn run_scope() -> RunScope {
+    RunScope {
+        run_id: RUN_ID.to_string(),
+        org_id: ORG_ID.to_string(),
+    }
+}
+
+/// The signed facts of a device-write challenge for `operation` on the test run and organization.
+fn device_write(
+    operation: &str,
+    attempt_id: Option<&str>,
+    request_sha256: &str,
+    iat: i64,
+    exp: i64,
+) -> Value {
+    json!({
+        "v": wire::DEVICE_WRITE_VERSION,
+        "challenge_id": CHALLENGE_ID,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "run_id": RUN_ID,
+        "device_id": "22222222-2222-4222-8222-222222222222",
+        "device_generation": 12,
+        "org_id": ORG_ID,
+        "operation": operation,
+        "attempt_id": attempt_id,
+        "request_sha256": request_sha256,
+        "iat": iat,
+        "exp": exp,
+    })
 }
 
 struct Channel {
@@ -179,29 +216,356 @@ fn enroll_args() -> Value {
     })
 }
 
-/// [behaviour] The request hash covers the method, the literal route template and the raw body
-/// (shared vector with the server's formula), and revoke hashes an empty body.
+/// The server's enrollment vector, vendored byte for byte from the server repository.
+const ENROLL_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/enroll_wire_v1.json");
+/// The signer channel's wire, shared with the Mac app's tests.
+const SIGNER_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/signer_wire_v1.json");
+
+fn fixture(text: &str) -> Value {
+    serde_json::from_str(text).expect("fixture is JSON")
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("{key} in {value}"))
+}
+
+/// The signature half of a `{challenge_id}.{signature}` proof header.
+fn proof_signature(proof: &str) -> &str {
+    proof.split_once('.').expect("proof header").1
+}
+
+/// [behaviour] The enrollment body, request hashes, challenges and proof headers match the
+/// server's shared enrollment vector exactly.
 #[test]
-fn request_hash_matches_the_server_formula() {
-    let body = wire::EnrollBody {
-        device_key_spki_b64: "BBBB",
-        approval_key_spki_b64: Some("CCCC"),
-        key_claim_id: CLAIM_ID,
-        reverse_code: "ABC234",
+fn enroll_and_revoke_match_the_server_vector() {
+    let vector = fixture(ENROLL_WIRE);
+    let enroll = &vector["enroll"];
+    let raw_body = text(enroll, "raw_body_utf8");
+    let body: Value = serde_json::from_str(raw_body).unwrap();
+    let rebuilt = wire::EnrollBody {
+        key_claim_id: text(&body, "key_claim_id"),
+        device_key_spki_b64: text(&body, "device_key_spki_b64"),
+        approval_key_spki_b64: body["approval_key_spki_b64"].as_str(),
+        reverse_code: text(&body, "reverse_code"),
     }
     .to_bytes();
+    assert_eq!(rebuilt, raw_body.as_bytes());
+    assert!(wire::is_reverse_code(text(&body, "reverse_code")));
+    for (name, spki, digest) in [
+        ("device", "device_key_spki_b64", "device_spki_sha256"),
+        ("approval", "approval_key_spki_b64", "approval_spki_sha256"),
+    ] {
+        let encoded = text(&body, spki);
+        assert!(wire::is_encoded_spki(encoded), "{name}");
+        assert_eq!(
+            crate::hex::sha256_lower(&wire::decode_base64url(encoded).unwrap()),
+            text(&vector["key_code"], digest),
+            "{name}"
+        );
+    }
+    for code in ["with_approval", "device_only"] {
+        assert!(wire::is_key_code(text(&vector["key_code"], code)), "{code}");
+    }
+
+    for (operation, write) in [("enroll", enroll), ("revoke", &vector["revoke"])] {
+        assert_eq!(text(write, "route_template"), wire::KEYS_ROUTE_TEMPLATE);
+        let hash = wire::request_sha256(
+            text(write, "method"),
+            wire::KEYS_ROUTE_TEMPLATE,
+            text(write, "raw_body_utf8").as_bytes(),
+        );
+        assert_eq!(hash, text(write, "request_sha256"), "{operation}");
+        let challenge_id = text(write, "challenge_id");
+        let payload: Value =
+            serde_json::from_slice(&wire::decode_base64url(text(write, "payload_bytes")).unwrap())
+                .unwrap();
+        let request = ChallengeRequest {
+            operation,
+            attempt_id: None,
+            request_sha256: &hash,
+        };
+        let now = payload["iat"].as_i64().unwrap() + 10;
+        let checked = wire::checked_challenge(
+            challenge_id,
+            text(write, "payload_bytes"),
+            &request,
+            text(&payload, "run_id"),
+            text(&payload, "org_id"),
+            now,
+        )
+        .unwrap_or_else(|| panic!("{operation} challenge"));
+        assert_eq!(checked.expires_at, payload["exp"].as_i64().unwrap());
+        let mut proofs = vec!["device_proof"];
+        if operation == "enroll" {
+            proofs.push("approval_proof");
+        }
+        for proof in proofs {
+            let proof = text(write, proof);
+            let signature = wire::decode_base64url(proof_signature(proof)).unwrap();
+            assert!(wire::is_p256_der_signature(&signature), "{operation}");
+            assert_eq!(wire::proof_header(challenge_id, &signature), proof);
+        }
+    }
+}
+
+/// [behaviour] A challenge is handed to the app only when its signed facts name the run,
+/// organization, operation, attempt and request hash asked for, and expire within the operation's
+/// lifetime.
+#[test]
+fn challenge_facts_must_match_the_request_and_expire_soon() {
+    let hash = "a".repeat(64);
+    let now = 1_800_000_000;
+    let check = |request: &ChallengeRequest<'_>, facts: Value| {
+        wire::checked_challenge(
+            CHALLENGE_ID,
+            &wire::encode_base64url(facts.to_string().as_bytes()),
+            request,
+            RUN_ID,
+            ORG_ID,
+            now,
+        )
+    };
+    let revoke = ChallengeRequest {
+        operation: "revoke",
+        attempt_id: None,
+        request_sha256: &hash,
+    };
+    assert!(check(&revoke, device_write("revoke", None, &hash, now, now + 60)).is_some());
+    let enroll = ChallengeRequest {
+        operation: "enroll",
+        ..revoke
+    };
+    assert!(check(&enroll, device_write("enroll", None, &hash, now, now + 300)).is_some());
+    assert!(check(&revoke, device_write("revoke", None, &hash, now, now + 300)).is_none());
+    let attempt = "44444444-4444-4444-8444-444444444444";
+    let cancel = ChallengeRequest {
+        operation: "cancel",
+        attempt_id: Some(attempt),
+        request_sha256: &hash,
+    };
+    assert!(check(
+        &cancel,
+        device_write("cancel", Some(attempt), &hash, now, now + 60)
+    )
+    .is_some());
+    for (field, value) in [
+        ("run_id", json!("55555555-5555-4555-8555-555555555555")),
+        ("org_id", json!("55555555-5555-4555-8555-555555555555")),
+        ("operation", json!("submit")),
+        ("attempt_id", Value::Null),
+        ("request_sha256", json!("b".repeat(64))),
+        (
+            "challenge_id",
+            json!("55555555-5555-4555-8555-555555555555"),
+        ),
+        ("v", json!("ottto.cloud_connect.device_write.v2")),
+        ("exp", json!(now)),
+        ("exp", json!(now + 200)),
+    ] {
+        let mut facts = device_write("cancel", Some(attempt), &hash, now, now + 60);
+        facts[field] = value;
+        assert!(check(&cancel, facts).is_none(), "{field}");
+    }
+}
+
+/// [behaviour] Every exchange in the shared signer wire fixture gets exactly the fixture's
+/// response, and enroll and revoke send the server vector's exact body and proofs.
+#[test]
+fn signer_wire_matches_the_shared_fixture() {
+    let wire_fixture = fixture(SIGNER_WIRE);
+    let state = &wire_fixture["service_state"];
+    let binding = &state["binding"];
+    let server = FixtureServer {
+        hello: HelloFacts {
+            binding: Some(DeviceBinding {
+                device_id: text(binding, "device_id").to_string(),
+                device_generation: binding["device_generation"].as_u64().unwrap(),
+                org_id: text(binding, "org_id").to_string(),
+            }),
+            agent_connect: Some(state["agent_connect"].clone()),
+        },
+        scope: RunScope {
+            run_id: text(state, "run_id").to_string(),
+            org_id: text(binding, "org_id").to_string(),
+        },
+        now: state["now"].as_i64().unwrap(),
+        vector: fixture(ENROLL_WIRE),
+        enrolls: RefCell::default(),
+        revokes: RefCell::default(),
+    };
+    let queue = SignQueue::default();
+    let connections = signer::Connections::default();
+    let exchanges = wire_fixture["exchanges"].as_array().unwrap();
+    assert!(exchanges.len() >= 10);
+    for exchange in exchanges {
+        let name = text(exchange, "name");
+        for queued in exchange["queue_before"].as_array().into_iter().flatten() {
+            let kind = match text(queued, "kind") {
+                "device_proof" => SignKind::DeviceProof,
+                _ => SignKind::Approval {
+                    attempt_id: text(queued, "attempt_id").to_string(),
+                    approval_id: text(queued, "approval_id").to_string(),
+                },
+            };
+            let payload = wire::decode_base64url(text(queued, "payload_b64")).unwrap();
+            queue
+                .enqueue(kind, payload, queued["expires_at"].as_i64().unwrap())
+                .unwrap();
+        }
+        let response = signer::handle(
+            &queue,
+            &connections,
+            &server,
+            1,
+            &exchange["request"].to_string(),
+        );
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response, exchange["response"], "{name}");
+    }
+
+    let vector = &server.vector;
     assert_eq!(
-        String::from_utf8(body.clone()).unwrap(),
-        r#"{"device_key_spki_b64":"BBBB","approval_key_spki_b64":"CCCC","key_claim_id":"11111111-2222-4333-8444-555555555555","reverse_code":"ABC234"}"#
+        server.enrolls.borrow().as_slice(),
+        &[(
+            text(&vector["enroll"], "raw_body_utf8").as_bytes().to_vec(),
+            text(&vector["enroll"], "device_proof").to_string(),
+            Some(text(&vector["enroll"], "approval_proof").to_string()),
+        )]
     );
     assert_eq!(
-        wire::request_sha256("POST", wire::KEYS_ROUTE_TEMPLATE, &body),
-        "1ee02ddbf0394f813dff846fe9f84916ebbd2a087be38f8d5412d9e4cb59c12f"
+        server.revokes.borrow().as_slice(),
+        &[text(&vector["revoke"], "device_proof").to_string()]
     );
-    assert_eq!(
-        wire::request_sha256("DELETE", wire::KEYS_ROUTE_TEMPLATE, b""),
-        "e6c222dbaffc4ee17434df7299139697f56ed4bb0615a9a30f7cfdcaab903dff"
+}
+
+/// Answers like the server for the shared signer wire fixture: its challenges come from the
+/// server's enrollment vector.
+struct FixtureServer {
+    hello: HelloFacts,
+    scope: RunScope,
+    now: i64,
+    vector: Value,
+    enrolls: RefCell<Vec<SentEnrollment>>,
+    revokes: RefCell<Vec<String>>,
+}
+
+impl CloudKeyServer for FixtureServer {
+    fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
+        let enrolled: Value =
+            serde_json::from_str(text(&self.vector["enroll"], "raw_body_utf8")).unwrap();
+        let key_claim_id = text(&enrolled, "key_claim_id").to_string();
+        assert_eq!(
+            body.device_key_spki_b64,
+            text(&enrolled, "device_key_spki_b64")
+        );
+        Ok(ClaimStarted {
+            claim_url: format!("https://app.ottto.net/setup/cloud-keys?claim={key_claim_id}"),
+            key_claim_id,
+            key_code: text(&self.vector["key_code"], "with_approval").to_string(),
+            expires_at: "2025-11-24T16:05:00Z".to_string(),
+        })
+    }
+
+    fn claim_state(&self, key_claim_id: &str) -> Result<ClaimState, ServerError> {
+        match key_claim_id {
+            "00000000-0000-4000-8000-000000000404" => Err(ServerError {
+                code: "claim_not_found".to_string(),
+                status: Some(404),
+                outcome_unknown: false,
+            }),
+            "00000000-0000-4000-8000-000000000504" => Err(ServerError {
+                code: "server_timeout".to_string(),
+                status: None,
+                outcome_unknown: true,
+            }),
+            _ => Ok(ClaimState {
+                state: "awaiting_code".to_string(),
+            }),
+        }
+    }
+
+    fn device_challenge(
+        &self,
+        request: &ChallengeRequest<'_>,
+    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
+        let write = &self.vector[request.operation];
+        Ok((
+            self.scope.clone(),
+            DeviceChallenge {
+                challenge_id: text(write, "challenge_id").to_string(),
+                payload_bytes: text(write, "payload_bytes").to_string(),
+            },
+        ))
+    }
+
+    fn enroll(
+        &self,
+        raw_body: &[u8],
+        device_proof: &str,
+        approval_proof: Option<&str>,
+    ) -> Result<Enrolled, ServerError> {
+        self.enrolls.borrow_mut().push((
+            raw_body.to_vec(),
+            device_proof.to_string(),
+            approval_proof.map(str::to_string),
+        ));
+        Ok(Enrolled {
+            device_key_id: "88888888-8888-4888-8888-888888888888".to_string(),
+            approval_key_id: approval_proof
+                .map(|_| "99999999-9999-4999-8999-999999999999".to_string()),
+        })
+    }
+
+    fn revoke(&self, device_proof: &str) -> Result<Revoked, ServerError> {
+        self.revokes.borrow_mut().push(device_proof.to_string());
+        Ok(Revoked {
+            reason: "revoked".to_string(),
+        })
+    }
+
+    fn hello_facts(&self) -> HelloFacts {
+        self.hello.clone()
+    }
+
+    fn now(&self) -> i64 {
+        self.now
+    }
+}
+
+/// [behaviour] Key revoke's empty 204 answer decodes through the real HTTP sender.
+#[test]
+fn empty_no_content_answer_decodes_through_the_raw_sender() {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("local port");
+    let url = format!("http://{}/keys", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("request");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header == "\r\n" || header.is_empty() {
+                break;
+            }
+        }
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        request_line
+    });
+    let answer = crate::control::backend_send_raw_json::<Value>(
+        "DELETE",
+        &url,
+        None,
+        &[("X-Ottto-Device-Proof", "proof")],
     );
+    assert_eq!(answer.unwrap(), Value::Null);
+    assert!(server.join().unwrap().starts_with("DELETE /keys "));
 }
 
 /// [behaviour] Only canonical unpadded base64url, P-256-sized DER signatures and six-character
@@ -642,9 +1006,9 @@ fn sign_results_count_only_from_the_polling_connection() {
 }
 
 /// [behaviour] One live request per approval id, a new approval supersedes the attempt's older
-/// one, at most four requests are live, and expired requests are refused.
+/// one, and expired requests are refused.
 #[test]
-fn queue_supersedes_caps_and_expires() {
+fn queue_supersedes_and_expires() {
     let queue = SignQueue::default();
     let approval = |approval_id: &str| SignKind::Approval {
         attempt_id: "attempt_1".to_string(),
@@ -669,16 +1033,10 @@ fn queue_supersedes_caps_and_expires() {
     );
 
     queue.record_hello();
-    for _ in 0..3 {
-        let queued = queue
-            .enqueue(SignKind::DeviceProof, b"d".to_vec(), unix_now() + 60)
-            .unwrap();
-        assert!(!queued.wake_app);
-    }
-    assert_eq!(
-        queue.enqueue(SignKind::DeviceProof, b"d".to_vec(), unix_now() + 60),
-        Err(SignQueueError::Full)
-    );
+    let queued = queue
+        .enqueue(SignKind::DeviceProof, b"d".to_vec(), unix_now() + 60)
+        .unwrap();
+    assert!(!queued.wake_app);
     queue.cancel(&renewed.request_id);
     assert_eq!(
         queue.enqueue(SignKind::DeviceProof, b"d".to_vec(), unix_now()),
@@ -694,7 +1052,7 @@ fn queue_supersedes_caps_and_expires() {
     );
 }
 
-/// [behaviour] A rejected renewal keeps the old approval. A valid renewal can reuse its slot.
+/// [behaviour] A rejected renewal keeps the old approval; a valid renewal supersedes it.
 #[test]
 fn queue_replaces_an_approval_only_after_admission() {
     let queue = SignQueue::default();
@@ -705,18 +1063,9 @@ fn queue_replaces_an_approval_only_after_admission() {
     let old = queue
         .enqueue(approval("attempt", "old"), vec![], unix_now() + 60)
         .unwrap();
-    for _ in 1..super::MAX_LIVE_SIGN_REQUESTS {
-        queue
-            .enqueue(SignKind::DeviceProof, vec![], unix_now() + 60)
-            .unwrap();
-    }
     assert_eq!(
         queue.enqueue(approval("attempt", "expired"), vec![], unix_now()),
         Err(SignQueueError::AlreadyExpired)
-    );
-    assert_eq!(
-        queue.enqueue(approval("other", "new"), vec![], unix_now() + 60),
-        Err(SignQueueError::Full)
     );
     assert_eq!(queue.wait(&old.request_id, Duration::ZERO), None);
     assert_eq!(queue.poll(1)[0].request_id, old.request_id);
@@ -729,10 +1078,8 @@ fn queue_replaces_an_approval_only_after_admission() {
         Some(SignOutcome::Superseded)
     );
     let live = queue.poll(1);
-    assert_eq!(live.len(), super::MAX_LIVE_SIGN_REQUESTS);
-    assert!(live
-        .iter()
-        .any(|request| request.request_id == replacement.request_id));
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].request_id, replacement.request_id);
 }
 
 /// [behaviour] The signer opens only in a release-signed service the app installed, with no
@@ -773,56 +1120,6 @@ fn signer_starts_only_for_the_release_app_service() {
     ] {
         assert_eq!(resolve_signer_start(&case), Err(off));
     }
-}
-
-/// [behaviour] The template URL is built from a pinned key and version only, and the served bytes
-/// must hash to the pin.
-#[test]
-fn template_url_comes_from_the_pin_and_bytes_must_match() {
-    let pin = TemplatePin {
-        key: "aws/bedrock-cli-read-role/v1.yaml",
-        version_id: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY",
-        sha256: "5cde0f1298f41f7d1c8b907a36992a7a513225a2615bd6e307bf1a9149b06b40",
-    };
-    assert_eq!(
-        template_url(&pin).unwrap(),
-        "https://ottto-cloud-connect-templates.s3.us-east-1.amazonaws.com/aws/bedrock-cli-read-role/v1.yaml?versionId=3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY"
-    );
-    assert_eq!(template_bytes_match(&pin, b"template"), Ok(()));
-    assert_eq!(
-        template_bytes_match(&pin, b"template "),
-        Err(TemplateError::DigestMismatch)
-    );
-    for (key, version_id) in [
-        ("aws/../v1.yaml", "v"),
-        ("https://evil/v1.yaml", "v"),
-        ("aws/role/v1.json", "v"),
-        ("aws/role/v1.yaml", "v&x=1"),
-        ("aws/role/v1.yaml", ""),
-    ] {
-        let bad = TemplatePin {
-            key,
-            version_id,
-            ..pin
-        };
-        assert_eq!(
-            template_url(&bad),
-            Err(TemplateError::InvalidPin),
-            "{key} {version_id}"
-        );
-    }
-}
-
-/// [behaviour] A server cannot enable an unpublished template by supplying a complete pin.
-#[test]
-fn unpublished_template_has_no_server_fallback() {
-    let id = TemplatePinId::BedrockCliReadRoleV1;
-    assert!(!id.matches_metadata(
-        "aws/bedrock-cli-read-role/v1.yaml",
-        "object-version",
-        &crate::hex::sha256_lower(b"server-selected bytes")
-    ));
-    assert_eq!(verified_template_url(id), Err(TemplateError::InvalidPin));
 }
 
 /// [behaviour] Both XPC endpoints require the Apple Developer ID intermediate and the signed

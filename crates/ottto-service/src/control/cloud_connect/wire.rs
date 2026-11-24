@@ -112,13 +112,14 @@ pub(super) fn proof_header(challenge_id: &str, signature: &[u8]) -> String {
     format!("{challenge_id}.{}", encode_base64url(signature))
 }
 
-/// The enrollment body, serialized once and sent byte for byte.
+/// The enrollment body, serialized once and sent byte for byte, in the field order of the shared
+/// enrollment fixture.
 #[derive(Serialize)]
 pub(super) struct EnrollBody<'a> {
+    pub(super) key_claim_id: &'a str,
     pub(super) device_key_spki_b64: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) approval_key_spki_b64: Option<&'a str>,
-    pub(super) key_claim_id: &'a str,
     pub(super) reverse_code: &'a str,
 }
 
@@ -128,12 +129,38 @@ impl EnrollBody<'_> {
     }
 }
 
+/// A device challenge request: `C1 POST device-challenges`. Enroll and revoke send no attempt.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(super) struct ChallengeRequest<'a> {
+    pub(super) operation: &'a str,
+    pub(super) attempt_id: Option<&'a str>,
+    pub(super) request_sha256: &'a str,
+}
+
+impl ChallengeRequest<'_> {
+    /// The longest challenge the server issues for this operation, in seconds.
+    fn max_lifetime(&self) -> i64 {
+        if self.operation == "enroll" {
+            300
+        } else {
+            60
+        }
+    }
+}
+
+/// How far ahead of this Mac's clock a challenge may expire beyond its lifetime.
+const CLOCK_SKEW_SECONDS: i64 = 60;
+
 #[derive(Deserialize)]
 struct DeviceWriteFacts {
     v: String,
     challenge_id: String,
+    run_id: String,
+    org_id: String,
     operation: String,
+    attempt_id: Option<String>,
     request_sha256: String,
+    iat: i64,
     exp: i64,
 }
 
@@ -146,25 +173,36 @@ pub(super) struct CheckedChallenge {
     pub(super) expires_at: i64,
 }
 
-/// Checks the payload the server will verify the signature against: the version, the challenge id
-/// it was returned with, the operation and the request hash the service asked for. Anything else
-/// is not handed to the app.
+/// Checks the payload the server will verify the signature against before the app signs it: the
+/// version, the challenge id it was returned with, the run and organization the request was sent
+/// on, the operation, attempt and request hash asked for, and a live expiry no longer than the
+/// operation allows. The device write and its enroll, revoke and attempt requests share this one
+/// check.
 pub(super) fn checked_challenge(
     challenge_id: &str,
     payload_b64: &str,
-    operation: &str,
-    request_sha256: &str,
+    request: &ChallengeRequest<'_>,
+    run_id: &str,
+    org_id: &str,
+    now: i64,
 ) -> Option<CheckedChallenge> {
     let payload = decode_base64url(payload_b64)?;
     let facts = serde_json::from_slice::<DeviceWriteFacts>(&payload).ok()?;
+    let lifetime = request.max_lifetime();
     (crate::hex::is_uuid(challenge_id)
         && facts.v == DEVICE_WRITE_VERSION
         && facts.challenge_id == challenge_id
-        && facts.operation == operation
-        && facts.request_sha256 == request_sha256)
-        .then(|| CheckedChallenge {
-            challenge_id: challenge_id.to_string(),
-            payload_b64: payload_b64.to_string(),
-            expires_at: facts.exp,
-        })
+        && facts.run_id == run_id
+        && facts.org_id == org_id
+        && facts.operation == request.operation
+        && facts.attempt_id.as_deref() == request.attempt_id
+        && facts.request_sha256 == request.request_sha256
+        && facts.exp > now
+        && facts.exp <= now + lifetime + CLOCK_SKEW_SECONDS
+        && (1..=lifetime).contains(&(facts.exp - facts.iat)))
+    .then(|| CheckedChallenge {
+        challenge_id: challenge_id.to_string(),
+        payload_b64: payload_b64.to_string(),
+        expires_at: facts.exp,
+    })
 }
