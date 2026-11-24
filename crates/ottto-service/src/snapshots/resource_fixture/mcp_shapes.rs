@@ -8,16 +8,16 @@ use super::*;
 pub(super) type Lines = (Vec<Value>, Vec<Value>);
 
 const WORDS: [&str; 16] = [
-    "amber", "birch", "cedar", "delta", "ember", "fjord", "garnet", "harbor", "indigo",
-    "juniper", "kestrel", "lumen", "meadow", "nimbus", "orchid", "pebble",
+    "amber", "birch", "cedar", "delta", "ember", "fjord", "garnet", "harbor", "indigo", "juniper",
+    "kestrel", "lumen", "meadow", "nimbus", "orchid", "pebble",
 ];
 const SUFFIXES: [&str; 4] = ["tools", "docs", "sync", "hub"];
 const VERBS: [&str; 10] = [
     "search", "get", "list", "create", "update", "delete", "fetch", "send", "read", "write",
 ];
 const NOUNS: [&str; 12] = [
-    "items", "records", "threads", "notes", "events", "files", "pages", "tasks", "users",
-    "labels", "comments", "reports",
+    "items", "records", "threads", "notes", "events", "files", "pages", "tasks", "users", "labels",
+    "comments", "reports",
 ];
 const CONNECTORS: [&str; 5] = [
     "Amber_Mail",
