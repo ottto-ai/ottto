@@ -446,12 +446,12 @@ enum SideOnly {
 /// changes -> passes to the backstop. With `gated` false every pass walks
 /// (today's back-to-back walks over the same timeline). Also returns, per
 /// pass after the change, whether the rollout's index entry or the server's
-/// placement took it.
+/// placement took it, and the pass's side-only reselect counts.
 fn codex_side_only_lifecycle(
     row: &'static str,
     gated: bool,
     side: SideOnly,
-) -> (Lifecycle, Vec<bool>) {
+) -> (Lifecycle, Vec<(bool, [u64; 2])>) {
     let source = SnapshotSource::Codex;
     let recording = Recording::start();
     let server = OracleServer::new(source, recording.handle());
@@ -494,7 +494,8 @@ fn codex_side_only_lifecycle(
             let walk = backstop || !gated;
             expect_pass(source, row, &cycle, walk, &server, &mut seen);
             walks += usize::from(walk);
-            applied.push(fingerprint(&cycle) != before || placement(&server) != placed);
+            let took = fingerprint(&cycle) != before || placement(&server) != placed;
+            applied.push((took, cycle.side_only));
             cycles.push(cycle);
             if backstop {
                 break;
@@ -521,13 +522,25 @@ fn codex_side_only_waits_for_the_backstop(
     }
     let (gated, rested) = codex_side_only_lifecycle(row, true, side);
     let (today, walked_each) = codex_side_only_lifecycle(control, false, side);
-    assert!(walked_each[0], "{row}: the next walk applies the change");
-    let (backstop, rests) = rested.split_last().unwrap();
+    assert!(walked_each[0].0, "{row}: the next walk applies the change");
+    let ((backstop, counted), rests) = rested.split_last().unwrap();
     assert!(
-        rests.iter().all(|applied| !applied),
-        "{row}: a rest applies nothing"
+        rests
+            .iter()
+            .all(|&(took, counts)| !took && counts == [0, 0]),
+        "{row}: a rest applies and reads nothing"
     );
     assert!(*backstop, "{row}: the backstop walk applies the change");
+    // A changed binding on a certified head is counted; a held thread's
+    // memo miss is an ordinary re-read and is not.
+    match side {
+        SideOnly::SpawnEdge => assert_eq!(counted[1], 0, "{row}: {counted:?}"),
+        SideOnly::ExtentCatchUp => assert_eq!(*counted, [0, 0], "{row}"),
+    }
+    if let SideOnly::SpawnEdge = side {
+        assert!(counted[0] >= 1, "{row}: the reselect is counted");
+        assert_eq!(walked_each[0].1, *counted, "{row}: on either schedule");
+    }
     assert!(gated.walks < today.walks, "{row}: the change woke no walk");
     gated.assert_matches(&today, row);
 }

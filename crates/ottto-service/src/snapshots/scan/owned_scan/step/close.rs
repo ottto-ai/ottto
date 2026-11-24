@@ -821,6 +821,10 @@ impl OwnedSourceScan {
                 crate::local_resource_diagnostics::traversal_point("codex_side_only_reselect", self.source.api_slug(),
                     &serde_json::json!({"codex_side_only_reselect": context.codex_side_only_reselect}));
             }
+            if context.codex_side_only_first_binding > 0 {
+                crate::local_resource_diagnostics::traversal_point("codex_side_only_first_binding", self.source.api_slug(),
+                    &serde_json::json!({"codex_side_only_first_binding": context.codex_side_only_first_binding}));
+            }
             crate::local_resource_diagnostics::ReadCounts {
                 full_selections: context.full_files,
                 tail_selections: context.tail_files,

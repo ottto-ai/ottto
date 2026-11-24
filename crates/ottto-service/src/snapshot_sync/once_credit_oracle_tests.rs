@@ -499,6 +499,9 @@ struct Cycle {
     unacked_lost: BTreeMap<String, u64>,
     /// Pages of this pass that read the Codex first-import page total.
     first_import_pages: usize,
+    /// This pass's `codex_side_only_reselect` and
+    /// `codex_side_only_first_binding` counts.
+    side_only: [u64; 2],
 }
 
 impl Cycle {
@@ -915,7 +918,16 @@ impl OracleHome {
         let _ = group_eofs;
         let mut unacked_lost = BTreeMap::<String, u64>::new();
         let mut first_import_pages = 0;
+        let mut side_only = [0; 2];
         for page in pages.into_inner().unwrap() {
+            for (slot, stage) in ["codex_side_only_reselect", "codex_side_only_first_binding"]
+                .into_iter()
+                .enumerate()
+            {
+                if page["stage"] == stage {
+                    side_only[slot] += page["counts"][stage].as_u64().unwrap();
+                }
+            }
             if page["stage"] != "native_collection_page" {
                 continue;
             }
@@ -1044,6 +1056,7 @@ impl OracleHome {
             debt,
             unacked_lost,
             first_import_pages,
+            side_only,
         };
         let mut expected = Vec::new();
         if self.restarted {

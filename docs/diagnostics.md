@@ -260,10 +260,15 @@ emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
 A nonzero-only `codex_side_only_reselect` record counts physically unchanged
-Codex rollouts whose stored reduction binding (created thread, spawn family,
-identity conflict) no longer matches the current home side files, so the walk
-reads them again. It counts decisions, not distinct files. Side-file changes do
-not wake the walk gate, so these show up on the next walk.
+Codex rollouts whose stored head binding (created thread, spawn family,
+identity conflict) no longer matches the current home side files, so the
+certified unchanged shortcut does not apply. A nonzero-only
+`codex_side_only_first_binding` record counts the same for a head that stored
+no binding at its last read: the side facts arrived after that read. A head
+written before bindings were stored also counts there, on each walk, until its
+file is read again. Both count decisions, not distinct files. A held created
+thread re-read because its hold memo's side facts moved is not counted. Side-file
+changes do not wake the walk gate, so these show up on the next walk.
 Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
 paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its

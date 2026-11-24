@@ -53,7 +53,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   on an unchanged rollout is applied by the next walk, at the latest the backstop plus the time
   to reach the file. A side fact that changes and changes back before that walk is never
   applied, and a rollout that leaves the backfill window or is deleted in the wait is not read
-  again. `codex_side_only_reselect` counts the rollouts a walk reads again for this reason.
+  again. `codex_side_only_reselect` and `codex_side_only_first_binding` count unchanged
+  rollouts whose stored head binding no longer matches the side files. A held created thread
+  re-read because its hold memo's side facts moved is not counted there.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
