@@ -173,7 +173,6 @@ impl Corpus {
                 if let Some(header) = header {
                     writeln!(body, "{header}").unwrap();
                 }
-                writeln!(body, "{}", record(source, &id, 1)).unwrap();
                 // Exact mix per hundred: 90% 4KiB, 9% 64KiB, 1% 1MiB.
                 // Rotation is fixed by the seed; no OS entropy affects content.
                 let bucket = (n + SEED as usize % 100) % 100;
@@ -182,6 +181,16 @@ impl Corpus {
                     1..=9 => 64 * 1024,
                     _ => 4 * 1024,
                 };
+                // MCP-shaped lines take part of the padding, by bucket.
+                let (opening, late) = mcp_shapes::lines(source, &id, bucket);
+                for line in opening {
+                    writeln!(body, "{line}").unwrap();
+                }
+                writeln!(body, "{}", record(source, &id, 1)).unwrap();
+                for line in late {
+                    writeln!(body, "{line}").unwrap();
+                }
+                assert!(body.len() < target, "MCP lines fit the size bucket");
                 let padding = target - body.len() - 1;
                 body.resize(body.len() + padding, b' ');
                 body.push(b'\n');
@@ -497,6 +506,106 @@ fn resource_corpus_is_reproducible() {
     let b = Corpus::generate([10, 8, 2]);
     assert_eq!(a.manifest, b.manifest);
     assert_ne!(a.support, b.support);
+}
+
+/// [format] MCP-shaped lines go to fixed shares per hundred files, keep each
+/// file's size bucket, and carry the request-1 and late shapes.
+#[test]
+#[ignore = "resource-regression advisory workflow only"]
+fn resource_corpus_mcp_shares() {
+    fn server(name: &str) -> Option<&str> {
+        Some(name.strip_prefix("mcp__")?.split_once("__")?.0)
+    }
+    /// MCP names and distinct servers among `values`.
+    fn names(values: &[Value]) -> (usize, usize) {
+        let mut count = 0;
+        let mut servers = BTreeSet::new();
+        for name in values.iter().filter_map(Value::as_str) {
+            if let Some(server) = server(name) {
+                count += 1;
+                servers.insert(server);
+            }
+        }
+        (count, servers.len())
+    }
+    fn rows(path: &Path) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for line in fs::read_to_string(path).unwrap().lines() {
+            if !line.trim().is_empty() {
+                rows.push(serde_json::from_str(line).unwrap());
+            }
+        }
+        rows
+    }
+    let corpus = Corpus::generate([100, 100, 2]);
+    let sized: u64 = 90 * 4096 + 9 * 64 * 1024 + 1024 * 1024;
+    assert_eq!(corpus.manifest.bytes[..2], [sized; 2]);
+    let mut shapes = BTreeMap::<String, usize>::new();
+    for path in &corpus.files[0] {
+        let mut responses = 0;
+        let mut opening = (0, 0);
+        let mut full = None;
+        let mut late = 0;
+        for row in rows(path) {
+            match row["type"].as_str() {
+                Some("assistant") => responses += 1,
+                Some("attachment") if responses == 0 => {
+                    opening = names(row["attachment"]["addedNames"].as_array().unwrap());
+                }
+                Some("attachment") => late += 1,
+                Some("api-request-shape") => {
+                    let mut sent = Vec::new();
+                    for tool in row["shape"]["tools"].as_array().unwrap() {
+                        if tool.get("defer_loading").is_none() {
+                            sent.push(tool["name"].clone());
+                        }
+                    }
+                    full = Some(names(&sent));
+                }
+                _ => {}
+            }
+        }
+        let shape = match (full, opening) {
+            (Some((32, 7)), (400, 20)) => "desktop",
+            (Some((32, 7)), (2_000, 60)) => "max",
+            (None, (55, 4)) => "headless",
+            (None, (0, 0)) => "plain",
+            other => panic!("unexpected Claude MCP shape: {other:?}"),
+        };
+        let key = format!("claude/{shape}/late{late}");
+        *shapes.entry(key).or_default() += 1;
+    }
+    for path in &corpus.files[1] {
+        let mut blocks = Vec::new();
+        for row in rows(path) {
+            let payload = &row["payload"];
+            let meta = &payload["internal_chat_message_metadata_passthrough"];
+            let kinds = meta["content_item_kinds"].as_array();
+            for (n, kind) in kinds.into_iter().flatten().enumerate() {
+                if kind.as_str() == Some("tools.deferred_namespaces") {
+                    let text = payload["content"][n]["text"].as_str().unwrap();
+                    let entries = text.lines().filter(|line| line.starts_with("- mcp__"));
+                    blocks.push(entries.count());
+                }
+            }
+        }
+        let key = format!("codex/{blocks:?}");
+        *shapes.entry(key).or_default() += 1;
+    }
+    let expected = [
+        ("claude/desktop/late1", 4),
+        ("claude/desktop/late2", 5),
+        ("claude/headless/late0", 7),
+        ("claude/headless/late1", 3),
+        ("claude/max/late2", 1),
+        ("claude/plain/late0", 80),
+        ("codex/[18, 2]", 4),
+        ("codex/[18]", 15),
+        ("codex/[19, 2]", 1),
+        ("codex/[]", 80),
+    ];
+    let expected = expected.map(|(shape, files)| (shape.to_owned(), files));
+    assert_eq!(shapes, BTreeMap::from(expected));
 }
 
 /// [behaviour] Every provider fixture traverses the native acquisition/ACK seam.
@@ -1135,6 +1244,7 @@ fn resource_paced_rewalk_replay() {
     );
 }
 
+mod mcp_shapes;
 mod native_qos;
 
 /// [regress] A real watcher hint drains the changed last file ahead of an
