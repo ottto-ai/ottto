@@ -148,8 +148,9 @@ fi
 cat <<'NEXT'
 macOS signing readiness passed.
 
-Next stable release commands:
-  ./scripts/macos_package.sh --app-root <app-root> --app-source-commit <app-commit> --version <version> --channel stable
+Next stable release commands (OTTTO_MACOS_DSYM_DIR: a private folder outside
+this checkout and the release output, for example /path/to/private/dsym):
+  OTTTO_MACOS_DSYM_DIR=<private-dsym-folder> ./scripts/macos_package.sh --app-root <app-root> --app-source-commit <app-commit> --version <version> --channel stable
   ./scripts/macos_notarize.sh --manifest dist/macos/release-manifest.json --keychain-profile "$OTTTO_NOTARY_PROFILE"
   ./scripts/macos_stable_preflight.sh --manifest dist/macos/release-manifest.json --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" --keychain-profile "$OTTTO_NOTARY_PROFILE"
 NEXT
