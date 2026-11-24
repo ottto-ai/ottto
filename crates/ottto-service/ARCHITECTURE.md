@@ -499,8 +499,11 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   worktrees keep the shared common-directory identity. Explicit non-Git and unknown folders can
   carry a sanitized directory basename under the workspace-label upload policy; labels never
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
-  write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
-  reconstructing them. No historical sessions are selected just to enrich metadata.
+  write v2. OpeningSettings has its own v2: the v1 payload followed by the request-1 MCP schema
+  count, written only when that count is present (a measured zero included); without it the
+  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact as
+  future state: a per-file hold that keeps the checkpoint, loses no data and re-reads nothing
+  until a compatible build returns. No historical sessions are selected just to enrich metadata.
 - Claude Desktop store discovery reads ordinary directories at any depth, retaining
   symlink rejection and the per-scan entry budget. Its identity census token enters a
   session fingerprint only when that session carries original Desktop identity evidence.
