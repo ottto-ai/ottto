@@ -608,7 +608,7 @@ pub(super) fn backend_send_raw(
     body: Option<&[u8]>,
     headers: &[(&str, &str)],
     timeout: Duration,
-) -> Result<ureq::Response, ureq::Error> {
+) -> Result<ureq::Response, Box<ureq::Error>> {
     let mut request = crate::retry_tls::credential_agent()
         .request(method, url)
         .set("Accept", "application/json")
@@ -622,6 +622,7 @@ pub(super) fn backend_send_raw(
             .send_bytes(body),
         None => request.call(),
     }
+    .map_err(Box::new)
 }
 
 /// `backend_send_raw` with the standard backend error. A 2xx answer decodes as JSON, and an empty
@@ -633,7 +634,7 @@ pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
     headers: &[(&str, &str)],
 ) -> Result<T, LocalApiError> {
     let response = backend_send_raw(method, url, body, headers, BACKEND_REQUEST_TIMEOUT)
-        .map_err(|error| backend_error_from_ureq(url, error))?;
+        .map_err(|error| backend_error_from_ureq(url, *error))?;
     let response = backend_success(url, response)?;
     if response.status() == 204 {
         return serde_json::from_str("null")

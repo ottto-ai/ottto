@@ -236,7 +236,9 @@ impl SetupRunServer<'_> {
             let mut headers = vec![("X-Ottto-Setup-Run-Token", token)];
             headers.extend(proof.map(|proof| ("X-Ottto-Device-Proof", proof)));
             let response =
-                match backend_send_raw(method, &url, body, &headers, timeout.min(CALL_TIMEOUT)) {
+                match backend_send_raw(method, &url, body, &headers, timeout.min(CALL_TIMEOUT))
+                    .map_err(|error| *error)
+                {
                     Ok(response) => backend_success(&url, response)?,
                     Err(ureq::Error::Status(status, response)) => {
                         let value: Value = response.into_json().unwrap_or(Value::Null);
@@ -472,8 +474,8 @@ impl SetupRunServer<'_> {
                 payload,
                 sign_by,
             );
-            match queued {
-                Ok(request) => match sign_queue().approval_outcome(&request) {
+            if let Ok(request) = queued {
+                match sign_queue().approval_outcome(&request) {
                     Some(SignOutcome::Signed(signature)) => {
                         let body = bytes(
                             &json!({"approval_id": approval_id, "signature": encode_base64url(&signature)}),
@@ -526,8 +528,7 @@ impl SetupRunServer<'_> {
                         attempt["local_approval"] = json!({"where": "mac", "browser_url": browser_url, "approval_id": approval_id});
                         return Ok(attempt);
                     }
-                },
-                Err(_) => {}
+                }
             }
         }
         if let Some(url) = browser_url {
