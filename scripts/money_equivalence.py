@@ -130,19 +130,30 @@ _TRACE_CYCLES = {
     "c11_both": 16, "c11_marker": 17, "c12": 10, "c12_cold": 1,
     "c13": 3, "c13_cold": 1,
 }
+# Every cycle of every run of the five scheduling rows. A run's traces are
+# numbered from run * 128; each run's full drain length is listed, so a drain
+# that gets shorter fails coverage and one that gets longer on the head shows
+# as an added trace. The claude, codex and pi rows also write one result trace
+# per run. A change that means to alter these traces declares every one it
+# changes, like any other row.
+_SCHEDULE_RUN_CYCLES = {
+    "schedule_claude": (5, 5, 7, 5, 7, 9, 7, 9, 10, 13, 10, 10, 10, 10, 10, 13,
+                        7, 5, 5, 5, 7, 9, 7, 9, 10, 10, 10, 13, 10, 13, 10, 10),
+    "schedule_codex": (8, 8, 9, 9, 9, 9, 10, 10, 8, 8, 9, 9, 9, 9, 10, 10),
+    "schedule_pi": (7, 7, 7, 7, 10, 10, 10, 10, 7, 7, 7, 7, 10, 10, 10, 10),
+    "schedule_equal_birth_twins": (3,) * 32,
+    "schedule_equal_birth_twins_before_cutoff": (4,) * 32,
+}
+_SCHEDULE_RESULT_ROWS = ("schedule_claude", "schedule_codex", "schedule_pi")
 REQUIRED_STEP_TRACES = {
     f"{row}-{i}" for row, count in _TRACE_CYCLES.items() for i in range(count)
+} | {
+    f"{row}-{run * 128 + i}" for row, runs in _SCHEDULE_RUN_CYCLES.items()
+    for run, count in enumerate(runs) for i in range(count)
+} | {
+    f"{row}-result-{run}" for row in _SCHEDULE_RESULT_ROWS
+    for run in range(len(_SCHEDULE_RUN_CYCLES[row]))
 }
-# The trace comparison covers the fixed rows above only. The five scheduling
-# rows below are NOT compared and NOT required here: their traces differ
-# between two builds of the same code, because the result trace holds physical
-# file fingerprints and the twin rows order their homes by a key of the full
-# temporary path. Those rows stay ordinary test assertions, so "step traces
-# equal" says nothing about them. Every trace outside these five rows keeps
-# the rules below.
-_UNCOMPARED_TRACE = re.compile(
-    r"schedule_(?:equal_birth_twins(?:_before_cutoff)?-|(?:claude|codex|pi)-(?:result-)?)"
-    r"(?:0|[1-9][0-9]*)")
 # A new row is required on the head and can be uncompared only when absent
 # from the base. Once present on both sides its receipt must match.
 HEAD_ONLY_STEP_TRACES = frozenset()
@@ -660,23 +671,17 @@ def compare_step_traces(left, right, logs, declared_changed=()):
 
     Every difference is printed, one line per trace, before the verdict. A
     difference is fatal unless the row is in `declared_changed`; a declared row
-    must exist on both sides and must differ. The scheduling rows named by
-    _UNCOMPARED_TRACE are left out entirely and cannot be declared.
+    must exist on both sides and must differ.
     """
     declared_changed = set(declared_changed)
-    if (REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES or HEAD_ONLY_STEP_TRACES & declared_changed
-            or any(_UNCOMPARED_TRACE.fullmatch(name)
-                   for name in REQUIRED_STEP_TRACES | HEAD_ONLY_STEP_TRACES | declared_changed)):
+    if REQUIRED_STEP_TRACES & HEAD_ONLY_STEP_TRACES or HEAD_ONLY_STEP_TRACES & declared_changed:
         raise RuntimeError("step-trace declarations overlap")
     manifests = {}
     for arm, directory in (("base", left), ("head", right)):
-        lines = [line for line in re.findall(
-            r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
-            if not _UNCOMPARED_TRACE.fullmatch(line[0])]
+        lines = re.findall(r"\bSTEP_TRACE ([\w-]+) sha256=([a-f0-9]{64})$", logs[arm], re.M)
         digests = dict(lines)
         required = REQUIRED_STEP_TRACES | (HEAD_ONLY_STEP_TRACES if arm == "head" else set())
-        files = {path.stem for path in (directory / "step-trace").glob("*.json")
-                 if not _UNCOMPARED_TRACE.fullmatch(path.stem)}
+        files = {path.stem for path in (directory / "step-trace").glob("*.json")}
         if len(lines) != len(digests) or files != digests.keys() or not required <= files:
             raise RuntimeError(f"incomplete {arm} step-trace coverage")
         manifests[arm] = digests

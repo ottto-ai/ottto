@@ -1072,33 +1072,18 @@ class StepTraceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "step_traces must list"):
                     parse_declarations(pr_body(block))
 
-    def test_scheduling_rows_are_left_out_and_lookalikes_are_not(self):
-        base = {"existing-0": b"[]"}
-        left_out = ("schedule_claude-0", "schedule_codex-result-15", "schedule_pi-result-0",
-                    "schedule_equal_birth_twins-4034", "schedule_equal_birth_twins_before_cutoff-3")
-        # Changed, added, removed, duplicated, or without a file: none of it is read.
-        old = base | {name: b"[1]" for name in left_out[:3]}
-        new = base | {name: b"[2]" for name in left_out[1:]}
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            for missing_file in (None, ("head", "schedule_pi-result-0")):
-                self.assertEqual(
-                    self.compare(old, new, missing_file,
-                                 log=lambda lines: "\n".join(lines + lines[-1:])),
-                    {"compared": 1, "uncompared_head_only": [], "changed": []})
-        self.assertEqual(out.getvalue(), "")
-        for name in ("schedule_other-0", "schedule_claude-x", "schedule_claude-result-",
-                     "xschedule_claude-0", "schedule_claude-0-1", "schedule_pi-01",
-                     "schedule_equal_birth_twins-result-0", "schedule_codex-\u0663"):
+    def test_scheduling_rows_are_compared_like_any_other_row(self):
+        base = {"existing-0": b"[]", "schedule_claude-0": b"[]", "schedule_pi-result-0": b"[]"}
+        for name in ("schedule_claude-0", "schedule_pi-result-0"):
             with self.subTest(name=name):
-                with self.assertRaisesRegex(RuntimeError, "1 added; first"):
-                    self.compare(base, base | {name: b"[]"})
-        with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
-            self.compare(old, new, declared={"schedule_codex-result-15"})
-        for listed in ("REQUIRED_STEP_TRACES", "HEAD_ONLY_STEP_TRACES"):
-            with mock.patch.object(money_equivalence, listed, {"schedule_pi-0"}):
-                with self.assertRaisesRegex(RuntimeError, "declarations overlap"):
-                    self.compare(base, base)
+                with self.assertRaisesRegex(RuntimeError, f"1 changed; first {name}"):
+                    self.compare(base, base | {name: b"[1]"})
+                with self.assertRaisesRegex(RuntimeError, "step-trace coverage"):
+                    self.compare(base, base, ("head", name))
+                self.assertEqual(
+                    self.compare(base, base | {name: b"[1]"}, declared={name})["changed"], [name])
+        with self.assertRaisesRegex(RuntimeError, "1 added; first schedule_claude-1"):
+            self.compare(base, base | {"schedule_claude-1": b"[]"})
 
     def test_every_difference_is_printed_before_the_verdict(self):
         base = {"existing-0": b'{"io":1,"steps":[1]}', "gone-0": b"[]", "other-0": b'{"io":1}'}
@@ -1116,13 +1101,24 @@ class StepTraceTests(unittest.TestCase):
 
 
 class RequiredStepTraceTests(unittest.TestCase):
-    def test_the_required_list_is_the_fixed_rows(self):
+    def test_the_required_list_is_every_fixed_and_scheduling_cycle(self):
         required = money_equivalence.REQUIRED_STEP_TRACES
-        self.assertEqual(len(required), 84)
+        self.assertEqual(len(required), 932)
+        self.assertEqual(sum(name.startswith("schedule_") for name in required), 848)
         self.assertLessEqual({"c11_both-15", "c11_marker-16"}, required)
         self.assertFalse({"c11_both-16", "c11_marker-17"} & required)
-        self.assertFalse(any(money_equivalence._UNCOMPARED_TRACE.fullmatch(name) or
-                             name.startswith("schedule_") for name in required))
+        # Each scheduling run is listed at its full length, and each result row once per run.
+        self.assertLessEqual({"schedule_claude-0", "schedule_claude-4", "schedule_claude-1164",
+                              "schedule_codex-1929", "schedule_pi-1929",
+                              "schedule_equal_birth_twins-3970",
+                              "schedule_equal_birth_twins_before_cutoff-3971",
+                              "schedule_claude-result-31", "schedule_codex-result-15",
+                              "schedule_pi-result-15"}, required)
+        self.assertFalse({"schedule_claude-5", "schedule_claude-1165", "schedule_codex-1930",
+                          "schedule_pi-1930", "schedule_equal_birth_twins-3971",
+                          "schedule_equal_birth_twins_before_cutoff-3972",
+                          "schedule_claude-result-32", "schedule_codex-result-16",
+                          "schedule_equal_birth_twins-result-0"} & required)
 
 
 class DistinctCommitTests(unittest.TestCase):
