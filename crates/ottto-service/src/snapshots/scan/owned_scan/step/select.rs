@@ -1054,125 +1054,8 @@ impl OwnedSourceScan {
             hold_offset: None,
             group: None,
         });
-        if let Some(context) = self.sampling.as_ref().filter(|_| {
-            self.source == SnapshotSource::Codex && !codex_archive_path(&active.candidate.path)
-        }) {
-            let extent = active
-                .parser
-                .reader
-                .reader
-                .get_ref()
-                .metadata()
-                .map_or(0, |metadata| metadata.len());
-            let expected = match active.sampling.as_ref().map(|acquisition| acquisition.mode) {
-                Some(crate::transcript_acquisition::ReadMode::Unchanged) => 0,
-                Some(crate::transcript_acquisition::ReadMode::Tail) => {
-                    extent.saturating_sub(retained_offset.unwrap_or(0))
-                }
-                _ => extent,
-            };
-
-            let defer = match context.cache.cursor_plan_paced(
-                &mut self.codex_page,
-                sampled_scan::codex_cursor::Limits::current(),
-                expected,
-                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
-                crate::heap_layout_bound::layout_supported(),
-                &context.namespace,
-                &local_index_key(&active.candidate.path),
-                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
-                sampled_scan::codex_cursor::census_member(
-                    &self.selected_flags,
-                    [active.candidate.path.as_path()],
-                ),
-                Some(sampled_scan::codex_cursor::PaceProbe {
-                    file: active.parser.reader.reader.get_ref(),
-                }),
-            ) {
-                sampled_scan::codex_cursor::StartPlan::Singleton => false,
-                sampled_scan::codex_cursor::StartPlan::Unpaged => {
-                    // Layout-unsupported build: the cursor is off as a
-                    // whole and this file reads in its page, as before.
-                    self.codex_page.disclose_disabled(&context.cache);
-                    false
-                }
-                sampled_scan::codex_cursor::StartPlan::Cursor => {
-                    let dependencies = sampled_scan::reduction_dependencies(
-                        self.source,
-                        &active.candidate,
-                        &self.codex_title_metadata,
-                        &self.claude_title_metadata,
-                        self.claude_effort_support_dir.as_deref(),
-                    );
-                    let owner = self
-                        .codex_join_inventory
-                        .as_ref()
-                        .and_then(|inventory| inventory.owner_for_path(&active.candidate.path))
-                        .map(str::to_owned);
-                    match context.cache.cursor_start(
-                        &mut active,
-                        &context.namespace,
-                        dependencies,
-                        owner,
-                        self.state_census_complete && self.sidecar_census_complete,
-                        &self.index,
-                    ) {
-                        Ok(lease) => {
-                            // The job's path holds the strict census until
-                            // its attempt ends (accepted or debt).
-                            sampled_scan::codex_cursor::requeue(
-                                &mut self.index,
-                                &self.selected_flags,
-                                &active.candidate,
-                            );
-                            *codex_cursor_lease = Some(lease);
-                            false
-                        }
-                        // The slot frees when its job ends: wait in turn.
-                        Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
-                        // N1: no acquisition even cursor-only (no current
-                        // owning header or no reduction dependencies, where
-                        // main holds the file too). Never requeued: the
-                        // path is processed for this generation with a
-                        // retryable cause, so discovery finishes and the
-                        // bounded unhealthy retry starts the next one.
-                        Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
-                            self.census.record_unreadable_file(
-                                UnreadableCause::Reduction,
-                                &active.candidate.path,
-                            );
-                            return;
-                        }
-                        Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
-                            // Never an unbounded in-page read of a file
-                            // larger than the singleton budget.
-                            self.census.record_unreadable_file(
-                                UnreadableCause::OpenRead,
-                                &active.candidate.path,
-                            );
-                            return;
-                        }
-                    }
-                }
-                sampled_scan::codex_cursor::StartPlan::Defer => true,
-                // Processed for this generation (K7 fence).
-                sampled_scan::codex_cursor::StartPlan::Fenced => {
-                    self.scanned_file_count = self.scanned_file_count.saturating_sub(1);
-                    return;
-                }
-            };
-            if defer {
-                // Only a full read reaches here (a tail was planned
-                // before its retained state was consumed).
-                context.cache.cursor_note_deferred();
-                self.scanned_file_count = self.scanned_file_count.saturating_sub(1);
-                sampled_scan::codex_cursor::requeue(
-                    &mut self.index,
-                    &self.selected_flags,
-                    &active.candidate,
-                );
-                return;
-            }
+        if !self.admit_paced_codex_read(&mut active, retained_offset, codex_cursor_lease) {
+            return;
         }
         if let Some(context) = self.sampling.as_mut() {
             if let Some((mode, audit_due)) = planned_mode {
@@ -1504,5 +1387,138 @@ impl OwnedSourceScan {
             }
         }
         false
+    }
+
+    /// Codex cursor start or deferral for the built file. `true` means the
+    /// file may become active: in its page, or as a cursor job with its
+    /// lease stored.
+    #[inline(never)]
+    fn admit_paced_codex_read(
+        &mut self,
+        active: &mut OwnedActiveFile,
+        retained_offset: Option<u64>,
+        codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
+        if let Some(context) = self.sampling.as_ref().filter(|_| {
+            self.source == SnapshotSource::Codex && !codex_archive_path(&active.candidate.path)
+        }) {
+            let extent = active
+                .parser
+                .reader
+                .reader
+                .get_ref()
+                .metadata()
+                .map_or(0, |metadata| metadata.len());
+            let expected = match active.sampling.as_ref().map(|acquisition| acquisition.mode) {
+                Some(crate::transcript_acquisition::ReadMode::Unchanged) => 0,
+                Some(crate::transcript_acquisition::ReadMode::Tail) => {
+                    extent.saturating_sub(retained_offset.unwrap_or(0))
+                }
+                _ => extent,
+            };
+
+            let defer = match context.cache.cursor_plan_paced(
+                &mut self.codex_page,
+                sampled_scan::codex_cursor::Limits::current(),
+                expected,
+                codex_cursor_lease.is_none() && context.cache.cursor_slot_free(),
+                crate::heap_layout_bound::layout_supported(),
+                &context.namespace,
+                &local_index_key(&active.candidate.path),
+                sampled_scan::codex_cursor::census_token(&self.index).as_deref(),
+                sampled_scan::codex_cursor::census_member(
+                    &self.selected_flags,
+                    [active.candidate.path.as_path()],
+                ),
+                Some(sampled_scan::codex_cursor::PaceProbe {
+                    file: active.parser.reader.reader.get_ref(),
+                }),
+            ) {
+                sampled_scan::codex_cursor::StartPlan::Singleton => false,
+                sampled_scan::codex_cursor::StartPlan::Unpaged => {
+                    // Layout-unsupported build: the cursor is off as a
+                    // whole and this file reads in its page, as before.
+                    self.codex_page.disclose_disabled(&context.cache);
+                    false
+                }
+                sampled_scan::codex_cursor::StartPlan::Cursor => {
+                    let dependencies = sampled_scan::reduction_dependencies(
+                        self.source,
+                        &active.candidate,
+                        &self.codex_title_metadata,
+                        &self.claude_title_metadata,
+                        self.claude_effort_support_dir.as_deref(),
+                    );
+                    let owner = self
+                        .codex_join_inventory
+                        .as_ref()
+                        .and_then(|inventory| inventory.owner_for_path(&active.candidate.path))
+                        .map(str::to_owned);
+                    match context.cache.cursor_start(
+                        active,
+                        &context.namespace,
+                        dependencies,
+                        owner,
+                        self.state_census_complete && self.sidecar_census_complete,
+                        &self.index,
+                    ) {
+                        Ok(lease) => {
+                            // The job's path holds the strict census until
+                            // its attempt ends (accepted or debt).
+                            sampled_scan::codex_cursor::requeue(
+                                &mut self.index,
+                                &self.selected_flags,
+                                &active.candidate,
+                            );
+                            *codex_cursor_lease = Some(lease);
+                            false
+                        }
+                        // The slot frees when its job ends: wait in turn.
+                        Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
+                        // N1: no acquisition even cursor-only (no current
+                        // owning header or no reduction dependencies, where
+                        // main holds the file too). Never requeued: the
+                        // path is processed for this generation with a
+                        // retryable cause, so discovery finishes and the
+                        // bounded unhealthy retry starts the next one.
+                        Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
+                            self.census.record_unreadable_file(
+                                UnreadableCause::Reduction,
+                                &active.candidate.path,
+                            );
+                            return false;
+                        }
+                        Err(sampled_scan::codex_cursor::StartRefusal::Unstartable) => {
+                            // Never an unbounded in-page read of a file
+                            // larger than the singleton budget.
+                            self.census.record_unreadable_file(
+                                UnreadableCause::OpenRead,
+                                &active.candidate.path,
+                            );
+                            return false;
+                        }
+                    }
+                }
+                sampled_scan::codex_cursor::StartPlan::Defer => true,
+                // Processed for this generation (K7 fence).
+                sampled_scan::codex_cursor::StartPlan::Fenced => {
+                    self.scanned_file_count = self.scanned_file_count.saturating_sub(1);
+                    return false;
+                }
+            };
+            if defer {
+                // Only a full read reaches here (a tail was planned
+                // before its retained state was consumed).
+                context.cache.cursor_note_deferred();
+                self.scanned_file_count = self.scanned_file_count.saturating_sub(1);
+                sampled_scan::codex_cursor::requeue(
+                    &mut self.index,
+                    &self.selected_flags,
+                    &active.candidate,
+                );
+                return false;
+            }
+        }
+        true
     }
 }
