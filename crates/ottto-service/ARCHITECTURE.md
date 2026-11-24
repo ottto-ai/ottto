@@ -982,19 +982,20 @@ never sees a key.
   device challenge for that hash, checks the challenge's signed facts (version, challenge id,
   run, organization, operation, attempt, hash, and an expiry within the operation's lifetime),
   and freezes body and challenge on the connection. The body and hashes match the server's
-  enrollment vector, vendored unchanged as `fixtures/cloud_connect/enroll_wire_v1.json`. The send uses those bytes and `{challenge_id}.{signature}` proofs,
-  after the signature shape and required proofs are checked locally. Revoke signs the empty
-  `DELETE` body the same way; the server answers it with an empty 204. When the server specifically refuses the run token, the service
-  refreshes and resends the identical request only if the run and organization both match the
-  original binding. An ambiguous enrollment response requires a claim-state readback.
+  enrollment vector, vendored unchanged as `fixtures/cloud_connect/enroll_wire_v1.json`. The
+  send uses those bytes and `{challenge_id}.{signature}` proofs, after the signature shape and
+  required proofs are checked locally. Revoke signs the empty `DELETE` body the same way; the
+  server answers it with an empty 204. When the server specifically refuses the run token, the
+  service refreshes and resends the identical request only if the run and organization both
+  match the original binding. An ambiguous enrollment response requires a claim-state readback.
 - **Browser claim.** The service returns the claim link only when it names the returned UUID on
   `https://app.ottto.net/setup/cloud-keys?claim=…` and the forward key code has the expected
   Base32 shape.
 - **Sign queue.** In memory only: a device proof lives until its challenge expires and an
   approval until its `sign_by`; one request per approval id, and a new approval supersedes the
   attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the
-  server's attempt limits bound how many requests arrive. A request goes to the first verified connection
-  that polls it, only that connection's answer counts, and a DER shape check guards signatures.
+  server's attempt limits bound how many requests arrive. A request goes to the first verified
+  connection that polls it, only that connection's answer counts, and a DER shape check guards signatures.
   An ended connection drops its prepares and returns its requests to the queue.
 - **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
   three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.

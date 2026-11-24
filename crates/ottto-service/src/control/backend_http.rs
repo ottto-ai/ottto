@@ -599,8 +599,9 @@ pub(super) fn backend_post_json_with_timeout<T: DeserializeOwned>(
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
 
-/// Sends `body` byte for byte (or no body) and decodes a JSON 2xx answer. A signed write's
-/// challenge hashes the exact body, so the HTTP client must not serialize it again.
+/// Sends `body` byte for byte (or no body) and decodes a JSON 2xx answer, or an empty 204 answer
+/// as JSON null. A signed write's challenge hashes the exact body, so the HTTP client must not
+/// serialize it again.
 pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
     method: &str,
     url: &str,
@@ -621,7 +622,12 @@ pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
         None => request.call(),
     }
     .map_err(|error| backend_error_from_ureq(url, error))?;
-    backend_success(url, response)?
+    let response = backend_success(url, response)?;
+    if response.status() == 204 {
+        return serde_json::from_str("null")
+            .map_err(|error| backend_response_unexpected(url, error.to_string()));
+    }
+    response
         .into_json()
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
