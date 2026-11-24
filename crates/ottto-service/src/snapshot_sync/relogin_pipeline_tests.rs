@@ -75,15 +75,12 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
                 preparation,
                 index,
                 scan,
-                &client,
                 device,
                 secret,
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &fixture.home,
                 &support,
                 &daemon,
-                &mut transport,
             )
         })
         .unwrap();
@@ -402,15 +399,12 @@ fn owner_return_preserves_all_source_carry() {
                             preparation,
                             index,
                             scan,
-                            &client,
                             device,
                             secret,
-                            source,
                             "machine_test",
                             &fixture.home,
                             &support,
                             &daemon,
-                            &mut transport,
                         )
                     })
                     .unwrap();
@@ -922,15 +916,12 @@ fn account_return_history_row(recorded_a: bool) {
                         preparation,
                         index,
                         scan,
-                        &client,
                         device,
                         secret,
-                        source,
                         "machine_test",
                         &fixture.home,
                         &support,
                         &daemon,
-                        &mut transport,
                     )
                 })
                 .unwrap();

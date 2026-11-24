@@ -216,15 +216,12 @@ impl LateMemberPipeline {
                 preparation,
                 index,
                 scan,
-                &client,
                 &self.device,
                 SECRET,
-                SnapshotSource::ClaudeCode,
                 "otm_test",
                 &self.fixture.home,
                 &self.support,
                 &daemon,
-                &mut transport,
             )
         })
         .unwrap();

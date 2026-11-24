@@ -470,15 +470,12 @@ fn idle_page_that_starts_a_walk_finishes_ordinarily() {
                     preparation,
                     index,
                     scan,
-                    &home.client,
                     &home.device,
                     "device-secret",
-                    source,
                     "otm_test",
                     &home.fixture.home,
                     &home.support,
                     &home.daemon,
-                    &mut home.transport,
                 )
             })
         });
@@ -1494,15 +1491,12 @@ fn recensus_after_restart(row: &'static str, forget: bool) -> bool {
                     preparation,
                     index,
                     scan,
-                    &home.client,
                     &home.device,
                     "device-secret",
-                    source,
                     "otm_test",
                     &home.fixture.home,
                     &home.support,
                     &home.daemon,
-                    &mut home.transport,
                 )
             })
         });

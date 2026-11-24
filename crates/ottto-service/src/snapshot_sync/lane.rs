@@ -612,20 +612,16 @@ impl SnapshotCycleOwner<'_> {
                 ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
             },
         )?;
-        let source = preparation.source;
         finish_sync_source(
             preparation,
             index,
             scan,
-            self.client,
             self.device,
             self.device_secret,
-            source,
             self.machine_id,
             self.home,
             self.support_dir,
             self.daemon,
-            self.transport_cycle,
         )
     }
 }

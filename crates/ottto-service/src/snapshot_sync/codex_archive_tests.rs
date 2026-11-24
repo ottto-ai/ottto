@@ -325,20 +325,16 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         backfill_pending: true,
         ..fixture.preparation(false)
     };
-    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
     finish_sync_source(
         preparation,
         index,
         scan,
-        &client,
         &device,
         "device-secret",
-        SnapshotSource::Codex,
         "otm_test",
         &root,
         &support,
         &daemon,
-        &mut transport,
     )
     .unwrap();
     let backfill = load_backfill_state(&support);
