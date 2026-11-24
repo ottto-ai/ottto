@@ -244,12 +244,12 @@ Options:
       --json               Print one final JSON object and no human summary text
       --socket <SOCKET>    Override the ottto-service Unix socket path
       --source <SOURCE>    Cloud billing source [possible values: bedrock, vertex]
-      --token <TOKEN>      Override the local-control token for CLI and agent requests
       --metrics            Also read Bedrock usage numbers from CloudWatch
+      --token <TOKEN>      Override the local-control token for CLI and agent requests
       --no-autostart       Do not kickstart the standard per-user ottto-service
       --reconnect          Replace the AWS account already connected
-      --watch              Emit NDJSON progress events and a final event; requires --json
       --restart            Drop this Mac's open setup and start a new one
+      --watch              Emit NDJSON progress events and a final event; requires --json
       --profile <PROFILE>  AWS CLI profile to use
       --timeout <SECONDS>  Stop waiting after this many seconds [default: 1200]
       --verbose            Show AWS CLI error text on this terminal
@@ -265,8 +265,8 @@ Options:
       --json             Print one final JSON object and no human summary text
       --socket <SOCKET>  Override the ottto-service Unix socket path
       --source <SOURCE>  [possible values: bedrock, vertex]
-      --token <TOKEN>    Override the local-control token for CLI and agent requests
       --attempt <ID>     Cloud setup attempt UUID
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
       --no-autostart     Do not kickstart the standard per-user ottto-service
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
@@ -276,9 +276,9 @@ Cancel a setup started from this Mac
 Usage: ottto cloud cancel [OPTIONS] --attempt <ID>
 
 Options:
+      --attempt <ID>     Cloud setup attempt UUID
       --json             Print one final JSON object and no human summary text
       --socket <SOCKET>  Override the ottto-service Unix socket path
-      --attempt <ID>     Cloud setup attempt UUID
       --token <TOKEN>    Override the local-control token for CLI and agent requests
       --no-autostart     Do not kickstart the standard per-user ottto-service
       --watch            Emit NDJSON progress events and a final event; requires --json
