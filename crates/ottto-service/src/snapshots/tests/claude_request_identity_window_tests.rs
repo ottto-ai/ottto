@@ -3028,3 +3028,160 @@ fn advertised_cap_absent_or_invalid_is_byte_identical_to_main() {
         assert_eq!(identity::effective_item_cap(Some(advertised)), expected);
     }
 }
+
+/// Every counted request position at its widest. A session start gets sizes
+/// only where one exists, so clearing them restores the exact body.
+fn with_counted_positions(item: &SnapshotItem) -> SnapshotItem {
+    let mut item = item.clone();
+    item.context_request_count = Some(u64::MAX);
+    for event in &mut item.compaction_events {
+        event.request_index = Some(u64::MAX);
+    }
+    if let Some(start) = item.session_start.as_deref_mut() {
+        start.counted_request_10_context_tokens = Some(u64::MAX);
+        start.counted_request_20_context_tokens = Some(u64::MAX);
+        start.counted_request_50_context_tokens = Some(u64::MAX);
+    }
+    item
+}
+
+/// [money] [behaviour] Counted request positions are display data. They
+/// change no digest, witness or envelope, so they never offer a body. A
+/// tagged body that fits without them drops them before any cache row or
+/// tag and is byte-identical to the body without them; a body over the cap
+/// even without them sheds exactly as it would without them.
+#[test]
+fn counted_curve_does_not_offer_or_change_money() {
+    let mut request = valid_v6_batch_request();
+    let policy = request.upload_policy;
+    let mut base = request.snapshots.remove(0);
+    base.compaction_count = Some(1);
+    base.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
+    base.compaction_events = vec![SnapshotCompactionEvent {
+        at: "2026-08-14T09:00:00Z".to_string(),
+        before: Some(250_000),
+        after: Some(59_000),
+        request_index: None,
+        trigger: None,
+    }];
+    let with = with_counted_positions(&base);
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        assert_eq!(
+            snapshot_semantic_component_hashes(source, &with),
+            snapshot_semantic_component_hashes(source, &base),
+            "{source:?}"
+        );
+        assert_eq!(
+            snapshot_fingerprint(source, &with),
+            snapshot_fingerprint(source, &base)
+        );
+        assert_eq!(
+            snapshot_semantic_envelope(source, &with, policy),
+            snapshot_semantic_envelope(source, &base, policy)
+        );
+    }
+    assert_eq!(
+        snapshot_upload_body_witness(&with),
+        snapshot_upload_body_witness(&base)
+    );
+    assert_eq!(
+        snapshot_upload_body_witness_version(&with),
+        snapshot_upload_body_witness_version(&base)
+    );
+
+    let full_cache = || {
+        let upsert = crate::snapshots::cache_adapter_tests::cache_fixture_item()
+            .cache_observations
+            .unwrap()
+            .operations
+            .remove(0);
+        cache_observations::CacheObservations {
+            schema_version: 1,
+            operations: (0..cache_observations::MAX_OPERATIONS)
+                .map(|n| {
+                    let mut operation = upsert.clone();
+                    let cache_observations::Operation::Upsert { observation } = &mut operation
+                    else {
+                        panic!("fixture upsert");
+                    };
+                    observation.event_id = format!("cache:{n:064x}");
+                    operation
+                })
+                .collect(),
+            coverage: "complete".into(),
+            omitted_observation_count: Some(0),
+            full_replacement: false,
+        }
+    };
+    // (label, over the cap even without the positions)
+    for (label, over) in [
+        ("fits without positions", false),
+        ("over without positions", true),
+    ] {
+        let (mut item, mut proof) = sticky_session(48);
+        item.session_display_name = Some("x".into());
+        item.workspace_display_label = Some("x".into());
+        item.repository_label = Some("x".into());
+        let mut accepted = identity::AcceptedBuckets::for_test();
+        sticky_apply(&mut item, &proof, &accepted).unwrap();
+        let clean = stripped(&item);
+        let overhead = identity::item_bytes(&item) - identity::item_bytes(&clean);
+        let positions =
+            identity::item_bytes(&with_counted_positions(&clean)) - identity::item_bytes(&clean);
+        let below = if over { 1_024 } else { positions / 2 };
+        let (mut padded, filler) =
+            sticky_pad_to_bytes(&clean, identity::MAX_ITEM_BYTES - overhead - below);
+        proof.extend(filler);
+        let mut first = padded.clone();
+        assert!(matches!(
+            sticky_apply(&mut first, &proof, &accepted).unwrap(),
+            Tagged::Sent { .. }
+        ));
+        accepted.record(&serde_json::to_value(&first).unwrap());
+        if over {
+            padded.cache_observations = Some(full_cache());
+        }
+        let mut expected = padded.clone();
+        let mut charted = with_counted_positions(&padded);
+        assert!(matches!(
+            sticky_apply(&mut expected, &proof, &accepted).unwrap(),
+            Tagged::Sent { .. }
+        ));
+        if !over {
+            assert!(
+                identity::item_bytes(&expected) <= identity::MAX_ITEM_BYTES,
+                "{label}"
+            );
+            assert!(
+                identity::item_bytes(&with_counted_positions(&expected)) > identity::MAX_ITEM_BYTES,
+                "{label}: the positions alone cross the cap"
+            );
+        }
+        assert!(matches!(
+            sticky_apply(&mut charted, &proof, &accepted).unwrap(),
+            Tagged::Sent { .. }
+        ));
+        assert!(
+            !crate::snapshots::has_counted_request_positions(&charted),
+            "{label}"
+        );
+        assert_eq!(
+            charted.snapshot_fingerprint, expected.snapshot_fingerprint,
+            "{label}"
+        );
+        assert_eq!(
+            snapshot_upload_body_witness(&charted),
+            snapshot_upload_body_witness(&expected),
+            "{label}"
+        );
+        assert_eq!(
+            serde_json::to_value(&charted).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "{label}"
+        );
+    }
+}

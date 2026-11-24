@@ -481,6 +481,14 @@ fn codex_legacy_group_mixed_page_checkpoint() {
     }
 }
 
+fn assert_no_counted_request_positions(scan: &SourceScanResult) {
+    assert!(!scan.snapshots.is_empty());
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| !crate::snapshots::has_counted_request_positions(item)));
+}
+
 /// [money] One changed Legacy head reconstructs, then durable V2 resumes Tail.
 #[test]
 fn codex_legacy_growth_recounts_cold_v2() {
@@ -521,10 +529,20 @@ fn codex_legacy_growth_recounts_cold_v2() {
                 (0, 1, 0)
             }
         );
-        oracle::money_oracle::assert_equivalent(
-            &f.cold(),
-            &oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan),
-        );
+        // The revision-1 Tail and its successor keep positions unknown.
+        // The Legacy reconstruct starts at byte zero and compares exactly.
+        let compare = |f: &LegacyFixture, scan: &SourceScanResult| {
+            let cold = f.cold();
+            let actual = oracle::scan_money(SnapshotSource::Codex, &f.route.index, scan);
+            if matches!(kind, Frozen::V2) {
+                assert_no_counted_request_positions(scan);
+                oracle::money_oracle::assert_equivalent_resuming_revision_one(&cold, &actual);
+            } else {
+                assert!(scan.snapshots.iter().any(crate::snapshots::has_counted_request_positions));
+                oracle::money_oracle::assert_equivalent(&cold, &actual);
+            }
+        };
+        compare(&f, &scan);
         assert!(f.route.index.files[&f.key].codex_counting_v2);
         f.accept(&scan);
         f.restore();
@@ -537,16 +555,15 @@ fn codex_legacy_growth_recounts_cold_v2() {
         f.change(&extra);
         let (scan, modes) = f.page(&E2ScanFixture::default());
         assert_eq!(modes, (0, 1, 0));
-        oracle::money_oracle::assert_equivalent(
-            &f.cold(),
-            &oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan),
-        );
+        compare(&f, &scan);
     }
     let mut group = LegacyFixture::under(Frozen::StickyLegacy);
     group.continuation();
     group.change("\n");
     let (scan, _) = group.page(&E2ScanFixture::default());
+    // A changed joined group reads from byte zero even with a legacy ACK.
     assert!(!scan.snapshots.is_empty());
+    assert!(scan.snapshots.iter().any(crate::snapshots::has_counted_request_positions));
     oracle::money_oracle::assert_equivalent(
         &group.cold(),
         &oracle::scan_money(SnapshotSource::Codex, &group.route.index, &scan),
@@ -603,6 +620,10 @@ fn codex_legacy_growth_recounts_cold_v2() {
                 pages += 1;
                 let (scan, _) = group.page(&scanner);
                 if !scan.snapshots.is_empty() {
+                    assert!(scan
+                        .snapshots
+                        .iter()
+                        .any(crate::snapshots::has_counted_request_positions));
                     let cold = sampled_scan::codex_cursor::with_test_limits(
                         16 * 1024 * 1024,
                         16 * 1024 * 1024,
@@ -654,6 +675,7 @@ fn codex_legacy_growth_recounts_cold_v2() {
         for _ in 0..1000 {
             let (scan, _) = paged.page(&scanner);
             if !scan.snapshots.is_empty() {
+                assert!(scan.snapshots.iter().any(crate::snapshots::has_counted_request_positions));
                 oracle::money_oracle::assert_equivalent(
                     &sampled_scan::codex_cursor::with_test_limits(
                         16 * 1024 * 1024,
@@ -907,4 +929,25 @@ fn codex_legacy_baseline_unknown_and_new_usage() {
         }
         retained = Some(bound);
     }
+}
+
+/// [behaviour] Rollback: a stored revision-2 Codex head is held by a
+/// revision-1 reader through the real store read, while the current reader
+/// loads it with every counted position unknown.
+#[test]
+fn codex_revision_two_head_holds_a_revision_one_reader() {
+    let f = LegacyFixture::under(Frozen::RevisionOne);
+    let read = |revision| state_v2::load_head(&f.route.index, &f.key, revision);
+    let error = read(1).err().expect("a revision-1 reader holds the head");
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::Future)
+    );
+    let head = read(Codex::REDUCTION_REVISION).unwrap().unwrap();
+    assert_eq!(head.revision, 2);
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    Codex::decode_head(head.revision, &head.body, &mut acc).unwrap();
+    assert_eq!(acc.counted_requests, None);
+    let mut older = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert!(Codex::decode_head(1, &head.body, &mut older).is_err());
 }

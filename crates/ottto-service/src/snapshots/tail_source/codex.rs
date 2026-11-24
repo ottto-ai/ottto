@@ -7,7 +7,8 @@
 //! walk's `I` fields Codex keeps in its head: whether priority decisions
 //! exist, the parse-time totals (head state on Codex, not finish output), the
 //! retired parent-proof slots, and the sidecar's projected ordinal this
-//! head was made under. Pages: the four dictionaries in
+//! head was made under; from revision 2 then the counted requests and each
+//! kept marker's request index. Pages: the four dictionaries in
 //! stable slots (tombstones for the three that remove), the physical
 //! retired signatures, the cache requests, the compaction timestamps, the usage and
 //! capability hours through the shared hour codec, the changed-file hashes,
@@ -172,7 +173,10 @@ fn adopt<K: Ord + crate::heap_layout_bound::HeapLayoutBound>(
 
 impl TailSource for Codex {
     const SOURCE: SnapshotSource = SnapshotSource::Codex;
-    const REDUCTION_REVISION: u32 = 1;
+    /// 2 appends the counted requests to the trailer. A revision-1 head reads
+    /// with them unknown, and they stay unknown as that file continues.
+    const REDUCTION_REVISION: u32 = 2;
+    const OLDEST_DECODED_REVISION: u32 = 1;
     /// Codex accepts usage while it reads: the trailer stores the totals.
     const USAGE_BEFORE_FINISH: bool = true;
 
@@ -259,7 +263,17 @@ impl TailSource for Codex {
             return Err(Refuse::NonEmpty(SLOTS_FIELD));
         }
         let trailer = Trailer::of(acc);
-        encode_envelope(view, certificate, id, |_| Ok(()), |e| trailer.put(e))
+        let counted = CountedTrailer::of(acc);
+        encode_envelope(
+            view,
+            certificate,
+            id,
+            |_| Ok(()),
+            |e| {
+                trailer.put(e)?;
+                counted.put(e)
+            },
+        )
     }
 
     fn encode_pages(
@@ -345,12 +359,26 @@ impl TailSource for Codex {
         head: &[u8],
         into: &mut SnapshotAccumulator,
     ) -> Result<DecodedHead, ReconstructCause> {
-        let (mut acc, (), trailer, decoded) =
-            decode_envelope::<Self, _, _>(revision, head, |_| Ok(()), Trailer::take)?;
+        let (mut acc, (), (trailer, counted), decoded) = decode_envelope::<Self, _, _>(
+            revision,
+            head,
+            |_| Ok(()),
+            |d| {
+                let trailer = Trailer::take(d)?;
+                // A revision-1 head ends here: its counts stay unknown.
+                let counted = (revision >= 2)
+                    .then(|| CountedTrailer::take(d))
+                    .transpose()?;
+                Ok((trailer, counted))
+            },
+        )?;
         if acc.source != Self::SOURCE {
             return Err(ReconstructCause::Corrupt);
         }
         trailer.restore(&mut acc);
+        if let Some(counted) = counted {
+            counted.restore(&mut acc)?;
+        }
         *into = acc;
         Ok(decoded)
     }
@@ -645,10 +673,45 @@ impl Trailer {
     }
 }
 
+/// Revision 2's trailer extension: the walk's `I` counted requests (`None`
+/// stays unknown, never zero) and each kept marker's request index, in
+/// `codex_compaction_sizes` entry order.
+struct CountedTrailer {
+    counted_requests: Option<CountedRequests>,
+    request_indices: Vec<Option<std::num::NonZeroU64>>,
+}
+durable_struct!(CountedTrailer {
+    D counted_requests: Option<CountedRequests>,
+    N request_indices: Vec<Option<std::num::NonZeroU64>>,
+});
+impl CountedTrailer {
+    fn of(acc: &SnapshotAccumulator) -> Self {
+        Self {
+            counted_requests: acc.counted_requests,
+            request_indices: acc.codex_compaction_sizes.request_indices(),
+        }
+    }
+    fn restore(self, acc: &mut SnapshotAccumulator) -> Result<(), ReconstructCause> {
+        acc.counted_requests = self.counted_requests;
+        acc.codex_compaction_sizes
+            .restore_request_indices(self.request_indices)
+            .map_err(|_| ReconstructCause::Corrupt)
+    }
+}
+
+/// The revision-2 extension bytes a re-encode of `acc` appends to a
+/// revision-1 head.
+#[cfg(test)]
+pub(in crate::snapshots) fn counted_trailer_bytes(acc: &SnapshotAccumulator) -> Vec<u8> {
+    crate::durable_tail_codec::Enc::count_write(usize::MAX, |e| CountedTrailer::of(acc).put(e))
+        .unwrap()
+}
+
 /// The Codex-specific stored layout following the common head envelope.
 #[cfg(test)]
 pub(super) fn shape_layout(s: &mut crate::durable_tail_codec::Shape) {
     Trailer::shape(s);
+    CountedTrailer::shape(s);
     for spec in Codex::collections() {
         s.push(&format!(
             "{:?} {:?} g={}",

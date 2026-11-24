@@ -349,6 +349,9 @@ pub(in crate::snapshots) fn fold(
     ) = features;
     item.source_file_fingerprint = source;
     item.collected_at = collected_at;
+    // Each member counted its own revert branch: no single request axis runs
+    // through the folded body, so it carries no counted request positions.
+    crate::snapshots::clear_counted_request_positions(&mut item);
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
     last.push(item);
     Ok(())

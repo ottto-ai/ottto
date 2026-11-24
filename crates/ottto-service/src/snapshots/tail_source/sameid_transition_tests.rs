@@ -110,6 +110,8 @@ fn codex_independent_fold_matches_fixed_vectors_cost_presence_and_placement() {
             set(&mut revert, b, right);
             let mut expected = base[0].clone();
             set(&mut expected, total, sum);
+            // A folded body has no single request axis: no counted positions.
+            crate::snapshots::clear_counted_request_positions(&mut expected);
             let singleton = codex_emitted(
                 Mode::ColdFull,
                 &route.index,

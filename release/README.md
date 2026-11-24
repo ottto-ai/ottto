@@ -258,9 +258,14 @@ manifest unless `quality_gates.stable_candidate_rc` points at passing evidence
 from a stable-candidate manifest with the same base version, commit, app source
 commit, and local-runtime binding.
 
-To produce a distribution-signed package, pass a Developer ID identity:
+To produce a distribution-signed package, pass a Developer ID identity and a
+private dSYM folder. Stable and stable-candidate packaging refuse to run
+without `OTTTO_MACOS_DSYM_DIR`: an absolute folder outside this checkout, the
+release output, the app checkout and the runner's folders. The packager keeps
+the Companion's dSYM and the build tools' logs there, and never uploads them:
 
 ```bash
+OTTTO_MACOS_DSYM_DIR=/path/to/private/release-work/dsym \
 OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Ottto Inc (...)" \
   ./scripts/macos_package.sh --app-root /path/to/tools/ottto-macos-app \
     --app-source-commit <40-hex app commit> --version 0.1.0 --channel stable
@@ -463,6 +468,10 @@ Local Apple prerequisites:
   pass `--sign-identity`.
 - A notarytool keychain profile created with `xcrun notarytool store-credentials`.
 - `OTTTO_NOTARY_PROFILE` set to that profile name, or pass `--keychain-profile`.
+- `OTTTO_MACOS_DSYM_DIR` set to a private absolute folder outside the public
+  checkout, the release output, the app checkout and the runner's folders,
+  for example `/path/to/private/release-work/dsym`. It keeps the Companion
+  dSYM and the private build logs; stable packaging fails without it.
 
 AWS/CDN prerequisites before publish:
 

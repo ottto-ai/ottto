@@ -278,6 +278,17 @@ fn lookup_order_fixture() -> (
     crate::snapshots::StateV2ColdSession,
     ScanIndex,
 ) {
+    lookup_order_fixture_at(None)
+}
+/// [`lookup_order_fixture`]; with `joined_head`, `a` first commits a
+/// reduction head at that revision, as a rollout carry leaves it.
+fn lookup_order_fixture_at(
+    joined_head: Option<u32>,
+) -> (
+    crate::test_scratch::ScratchDir,
+    crate::snapshots::StateV2ColdSession,
+    ScanIndex,
+) {
     // State v2 refuses a store under a symlinked or shared ancestor.
     let root = crate::test_scratch::ScratchDir::canonical("codex-header-order");
     let sessions = root.join("sessions");
@@ -319,6 +330,17 @@ fn lookup_order_fixture() -> (
         &state,
     );
     accept_order(&mut index, &keys);
+    if let Some(revision) = joined_head {
+        let route = state_v2::runtime_path(&index).unwrap().unwrap();
+        let staged = state_v2::StagedFile {
+            revision,
+            head: b"head".to_vec(),
+            ..Default::default()
+        };
+        state_v2::stage_tail(&route, &keys[0], staged).unwrap();
+        index = session.save_reload(&mut index);
+        accept_order(&mut index, &keys);
+    }
     stage_independent_inventory(
         &index,
         &[native.headers[0].candidate.clone()],
@@ -328,9 +350,10 @@ fn lookup_order_fixture() -> (
     stage_physical(&root, &index, 42, true);
     let mut index = session.save_reload(&mut index);
     accept_order(&mut index, &keys);
-    let head = |n: usize| state_v2::load_head(&index, &keys[n], 1).unwrap();
+    let head = |n: usize| state_v2::load_head(&index, &keys[n], u32::MAX).unwrap();
     let joined = head(0).unwrap();
-    assert!(joined.metadata_only);
+    assert_eq!(joined.metadata_only, joined_head.is_none());
+    assert_eq!(joined.revision, joined_head.unwrap_or(joined.revision));
     assert_eq!(joined.common.inventory.unwrap().created_unix_ms, None);
     let physical = head(1).unwrap();
     assert!(!physical.metadata_only);
@@ -420,87 +443,92 @@ fn ordered(
 #[test]
 fn joined_archive_hit_runs_one_durable_lookup_and_keeps_durable_facts() {
     let _decoder = sampled_scan::transition_fixture::codex_decoder_test_lock();
-    let (root, session, mut index) = lookup_order_fixture();
-    let keys = order_paths(&root).into_iter().collect::<Vec<_>>();
-    let expected = vec![
-        (keys[0].clone(), ORDER_OWNERS[0].to_owned(), None),
-        (keys[1].clone(), ORDER_OWNERS[1].to_owned(), Some(42)),
-        (
-            keys[2].clone(),
-            ORDER_OWNERS[2].to_owned(),
-            Some(ORDER_CREATED[2]),
-        ),
-    ];
-    // `a` alone: one joined lookup, no physical lookup.
-    let sessions = root.join("sessions");
-    let mut census = DirectoryCensus::new();
-    census.observe(&sessions, &fs::metadata(&sessions).unwrap());
-    let mut alone = HeaderInventory::new(
-        &[sessions],
-        &BTreeSet::from([keys[0].clone()]),
-        Some(&census),
-    );
-    state_v2::LOAD_HEAD_CALLS.set((0, None));
-    let cold = Arc::new(sampled_scan::SharedCache::default());
-    while !alone.step_selected(
-        &CodexTitleMetadata::default(),
-        &mut index,
-        &BTreeMap::new(),
-        Some(&cold),
-    ) {}
-    assert_eq!(state_v2::LOAD_HEAD_CALLS.get().0, 1, "joined hit: 1 lookup");
-    assert_eq!(facts(&alone), expected[..1]);
-    // All three: `a` carries its durable facts (base: 1 lookup), b 1 + c 2.
-    let (first, calls) = ordered(&root, &mut index, &cold, None);
-    assert_eq!(calls, 3);
-    assert!(first.complete);
-    assert_eq!(facts(&first), expected);
-    assert_eq!((first.reuse_hits, first.reuse_misses), (2, 1));
-    assert!(first.read_bytes > 0, "c is read natively");
-    let staged_bytes = MAX_HEADER_BYTES + PHYSICAL_READ_BYTES as usize;
-    assert_eq!(first.bytes_avoided, staged_bytes);
-    // Warm: only `c` looks up (base: 4); `a` keeps its durable None.
-    let (warm, calls) = ordered(&root, &mut index, &cold, None);
-    assert_eq!(calls, 2);
-    assert_eq!(facts(&warm), expected);
-    assert_eq!((warm.reuse_hits, warm.read_bytes), (3, 0));
-    assert_eq!(warm.bytes_avoided, staged_bytes + first.read_bytes);
-    let counted = cold.counters_for_test();
-    assert_eq!(counted.header_durable_lookups, 1 + 3 + 2);
-    assert_eq!(counted.header_reuse_hits, 1 + 2 + 3);
-    assert_eq!(
-        counted.header_bytes_avoided as usize,
-        MAX_HEADER_BYTES + staged_bytes + staged_bytes + first.read_bytes
-    );
-    // A carried member runs no lookup that could fail it: the warm
-    // cache's 1st lookup is `c`'s joined lookup.
-    let (failed, _) = ordered(&root, &mut index, &cold, Some(1));
-    assert_eq!(
-        failed.refused.keys().cloned().collect::<Vec<_>>(),
-        vec![keys[2].clone()]
-    );
-    assert_eq!(facts(&failed), expected[..2]);
-    // An evaluated lookup's error fails its member as before: `a`'s
-    // joined lookup (1st), and `c`'s physical lookup after its joined miss
-    // (4th), even with `c`'s facts in RAM.
-    for (fail, member) in [(1, 0), (4, 2)] {
-        let fresh = Arc::new(sampled_scan::SharedCache::default());
-        let (failed, _) = ordered(&root, &mut index, &fresh, Some(fail));
-        assert!(!failed.complete, "lookup {fail}");
+    // `a` also with a head a rollout carry left at the current Codex
+    // reduction revision: both common-only reads still load it.
+    let current = <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION;
+    for joined_head in [None, Some(current)] {
+        let (root, session, mut index) = lookup_order_fixture_at(joined_head);
+        let keys = order_paths(&root).into_iter().collect::<Vec<_>>();
+        let expected = vec![
+            (keys[0].clone(), ORDER_OWNERS[0].to_owned(), None),
+            (keys[1].clone(), ORDER_OWNERS[1].to_owned(), Some(42)),
+            (
+                keys[2].clone(),
+                ORDER_OWNERS[2].to_owned(),
+                Some(ORDER_CREATED[2]),
+            ),
+        ];
+        // `a` alone: one joined lookup, no physical lookup.
+        let sessions = root.join("sessions");
+        let mut census = DirectoryCensus::new();
+        census.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let mut alone = HeaderInventory::new(
+            &[sessions],
+            &BTreeSet::from([keys[0].clone()]),
+            Some(&census),
+        );
+        state_v2::LOAD_HEAD_CALLS.set((0, None));
+        let cold = Arc::new(sampled_scan::SharedCache::default());
+        while !alone.step_selected(
+            &CodexTitleMetadata::default(),
+            &mut index,
+            &BTreeMap::new(),
+            Some(&cold),
+        ) {}
+        assert_eq!(state_v2::LOAD_HEAD_CALLS.get().0, 1, "joined hit: 1 lookup");
+        assert_eq!(facts(&alone), expected[..1]);
+        // All three: `a` carries its durable facts (base: 1 lookup), b 1 + c 2.
+        let (first, calls) = ordered(&root, &mut index, &cold, None);
+        assert_eq!(calls, 3);
+        assert!(first.complete);
+        assert_eq!(facts(&first), expected);
+        assert_eq!((first.reuse_hits, first.reuse_misses), (2, 1));
+        assert!(first.read_bytes > 0, "c is read natively");
+        let staged_bytes = MAX_HEADER_BYTES + PHYSICAL_READ_BYTES as usize;
+        assert_eq!(first.bytes_avoided, staged_bytes);
+        // Warm: only `c` looks up (base: 4); `a` keeps its durable None.
+        let (warm, calls) = ordered(&root, &mut index, &cold, None);
+        assert_eq!(calls, 2);
+        assert_eq!(facts(&warm), expected);
+        assert_eq!((warm.reuse_hits, warm.read_bytes), (3, 0));
+        assert_eq!(warm.bytes_avoided, staged_bytes + first.read_bytes);
+        let counted = cold.counters_for_test();
+        assert_eq!(counted.header_durable_lookups, 1 + 3 + 2);
+        assert_eq!(counted.header_reuse_hits, 1 + 2 + 3);
+        assert_eq!(
+            counted.header_bytes_avoided as usize,
+            MAX_HEADER_BYTES + staged_bytes + staged_bytes + first.read_bytes
+        );
+        // A carried member runs no lookup that could fail it: the warm
+        // cache's 1st lookup is `c`'s joined lookup.
+        let (failed, _) = ordered(&root, &mut index, &cold, Some(1));
         assert_eq!(
             failed.refused.keys().cloned().collect::<Vec<_>>(),
-            vec![keys[member].clone()],
-            "lookup {fail}"
+            vec![keys[2].clone()]
         );
-        let survivors = expected
-            .iter()
-            .filter(|(key, _, _)| *key != keys[member])
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(facts(&failed), survivors, "lookup {fail}");
+        assert_eq!(facts(&failed), expected[..2]);
+        // An evaluated lookup's error fails its member as before: `a`'s
+        // joined lookup (1st), and `c`'s physical lookup after its joined miss
+        // (4th), even with `c`'s facts in RAM.
+        for (fail, member) in [(1, 0), (4, 2)] {
+            let fresh = Arc::new(sampled_scan::SharedCache::default());
+            let (failed, _) = ordered(&root, &mut index, &fresh, Some(fail));
+            assert!(!failed.complete, "lookup {fail}");
+            assert_eq!(
+                failed.refused.keys().cloned().collect::<Vec<_>>(),
+                vec![keys[member].clone()],
+                "lookup {fail}"
+            );
+            let survivors = expected
+                .iter()
+                .filter(|(key, _, _)| *key != keys[member])
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(facts(&failed), survivors, "lookup {fail}");
+        }
+        drop(session);
+        drop(root);
     }
-    drop(session);
-    drop(root);
 }
 /// [regress] Carried durable facts end, per key, with every commit that
 /// may change the key's committed head, even on an unchanged file: a
@@ -584,7 +612,7 @@ fn carried_header_facts_end_with_each_head_write() {
     index.files.remove(&keys[0]);
     index.file_snapshot_fingerprints.remove(&keys[0]);
     reload(&mut index);
-    assert!(state_v2::load_head(&index, &keys[0], 1).unwrap().is_none());
+    assert!(state_v2::load_head(&index, &keys[0], u32::MAX).unwrap().is_none());
     expected[0].2 = Some(ORDER_CREATED[0]);
     assert_eq!(pass(&mut index), (expected.clone(), 2 + 1 + 2));
     drop(session);

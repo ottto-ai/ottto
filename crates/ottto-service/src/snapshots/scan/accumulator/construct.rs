@@ -5,8 +5,8 @@ use crate::snapshots::{
     claude_request_identity, codex_identity_at, codex_session_id_candidates_from_path,
     codex_session_id_is_native_parent, codex_sidecar_rollout_file_matches, codex_usage_occurrence,
     resolve_codex_identity_option, rfc3339_unix_nanos, ClaudeFileBirth, ClaudeResponseBook,
-    CodexCompactionSizes, CodexPathSidecarCandidate, CodexTitleMetadata, LocalContextPoints,
-    PiLedger, SnapshotOrigin, SnapshotSource, UsageTotals,
+    CodexCompactionSizes, CodexPathSidecarCandidate, CodexTitleMetadata, CountedRequests,
+    LocalContextPoints, PiLedger, SnapshotOrigin, SnapshotSource, UsageTotals,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -152,6 +152,8 @@ impl SnapshotAccumulator {
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
             codex_compaction_sizes: CodexCompactionSizes::default(),
+            // A new Codex parser reads from byte zero: its count starts known.
+            counted_requests: (source == SnapshotSource::Codex).then(CountedRequests::default),
             local_context_points: LocalContextPoints::default(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
             claude_compaction_link_tip: None,
