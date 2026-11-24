@@ -18,6 +18,7 @@ pub const MAX_LIVE_SIGN_REQUESTS: usize = 4;
 /// A queued request wakes the app unless a hello arrived this recently.
 const HELLO_FRESH_FOR: Duration = Duration::from_secs(3);
 const APPROVAL_TAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const MIN_WAKE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// An answered or expired request stays this long past its expiry for its caller to collect.
 const KEEP_AFTER_EXPIRY_SECONDS: i64 = 60;
@@ -81,7 +82,7 @@ pub(super) enum AnswerRefused {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Queued {
     pub(super) request_id: String,
-    /// No signer connection said hello in the last few seconds.
+    /// No recent hello or wake attempt and this request reserved a wake.
     pub(super) wake_app: bool,
 }
 
@@ -97,6 +98,7 @@ struct QueueState {
     requests: Vec<QueuedRequest>,
     last_hello: Option<Instant>,
     approval_offers: VecDeque<Instant>,
+    last_wake: Option<Instant>,
 }
 
 struct QueuedRequest {
@@ -125,9 +127,10 @@ impl SignQueue {
         payload: Vec<u8>,
         expires_at: i64,
     ) -> Result<Queued, SignQueueError> {
-        let now = unix_now();
         let mut state = self.lock();
+        let now = unix_now();
         state.settle(now);
+        let mut superseded = None;
         if let SignKind::Approval {
             attempt_id,
             approval_id,
@@ -141,24 +144,20 @@ impl SignQueue {
                     wake_app: false,
                 });
             }
-            for request in state.requests.iter_mut().filter(|request| {
+            superseded = state.requests.iter().position(|request| {
                 request.outcome.is_none()
                     && matches!(&request.kind, SignKind::Approval { attempt_id: live, .. } if live == attempt_id)
-            }) {
-                request.outcome = Some(SignOutcome::Superseded);
-            }
-            self.answered.notify_all();
+            });
         }
         if expires_at <= now {
             return Err(SignQueueError::AlreadyExpired);
         }
-        if state
+        let live_count = state
             .requests
             .iter()
             .filter(|request| request.outcome.is_none())
-            .count()
-            >= MAX_LIVE_SIGN_REQUESTS
-        {
+            .count();
+        if live_count - usize::from(superseded.is_some()) >= MAX_LIVE_SIGN_REQUESTS {
             return Err(SignQueueError::Full);
         }
         if matches!(kind, SignKind::Approval { .. }) {
@@ -169,6 +168,10 @@ impl SignQueue {
                 return Err(SignQueueError::ApprovalRateLimited);
             }
             state.approval_offers.push_back(Instant::now());
+        }
+        if let Some(index) = superseded {
+            state.requests[index].outcome = Some(SignOutcome::Superseded);
+            self.answered.notify_all();
         }
         state.next_id += 1;
         let request_id = format!("sign_{}", state.next_id);
@@ -181,9 +184,7 @@ impl SignQueue {
             taken_by: None,
             outcome: None,
         });
-        let wake_app = state
-            .last_hello
-            .is_none_or(|hello| hello.elapsed() >= HELLO_FRESH_FOR);
+        let wake_app = state.reserve_wake(Instant::now());
         Ok(Queued {
             request_id,
             wake_app,
@@ -334,6 +335,21 @@ impl SignQueue {
 }
 
 impl QueueState {
+    /// Reserve before releasing the mutex so concurrent callers share the same throttle.
+    fn reserve_wake(&mut self, now: Instant) -> bool {
+        if self
+            .last_hello
+            .is_some_and(|hello| now.duration_since(hello) < HELLO_FRESH_FOR)
+            || self
+                .last_wake
+                .is_some_and(|wake| now.duration_since(wake) < MIN_WAKE_INTERVAL)
+        {
+            return false;
+        }
+        self.last_wake = Some(now);
+        true
+    }
+
     /// Expires unanswered requests past their expiry and forgets requests well past it.
     fn settle(&mut self, now: i64) {
         for request in self
@@ -354,4 +370,28 @@ pub(super) fn unix_now() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueueState, HELLO_FRESH_FOR, MIN_WAKE_INTERVAL};
+    use std::time::{Duration, Instant};
+
+    /// [behaviour] A wake is reserved once per interval, and a more recent hello suppresses it.
+    #[test]
+    fn wake_reservations_are_throttled_even_without_a_hello() {
+        let mut state = QueueState::default();
+        let now = Instant::now();
+        let one_ms = Duration::from_millis(1);
+        assert!(state.reserve_wake(now));
+        assert!(!state.reserve_wake(now));
+        assert!(!state.reserve_wake(now + MIN_WAKE_INTERVAL - one_ms));
+
+        let hello = now + MIN_WAKE_INTERVAL;
+        state.last_hello = Some(hello);
+        assert!(!state.reserve_wake(hello));
+        assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR - one_ms));
+        assert!(state.reserve_wake(hello + HELLO_FRESH_FOR));
+        assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR));
+    }
 }

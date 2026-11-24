@@ -665,6 +665,34 @@ mod tests {
         }
     }
 
+    /// [behaviour] App registration rewrites an installed descriptor and plans a bootstrap of
+    /// the rewritten file. A stale service argument or Mach name cannot survive re-rendering.
+    #[test]
+    fn app_registration_replaces_the_installed_launch_agent() {
+        let home = crate::test_scratch::ScratchDir::new("launch-agent-registration");
+        let config = LaunchAgentConfig::local_user_default(
+            &home,
+            PathBuf::from("/Applications/Ottto.app/Contents/Helpers/ottto-service"),
+        );
+        let path = launch_agent_path(&home);
+        let rendered = render_launch_agent_plist(&config).expect("render app LaunchAgent");
+        let stale = String::from_utf8(rendered.clone())
+            .expect("XML plist")
+            .replace("--signer-mach-service", "--stale-option")
+            .replace(SIGNER_MACH_SERVICE_NAME, "net.ottto.service.stale");
+        assert_ne!(stale.as_bytes(), rendered.as_slice());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, stale).unwrap();
+
+        let plan = write_launch_agent(&config, &path).expect("replace installed LaunchAgent");
+        assert_eq!(fs::read(&path).unwrap(), rendered);
+        assert_eq!(plan.plist_path, path);
+        assert_eq!(
+            plan.bootstrap_command.last().map(String::as_str),
+            path.to_str()
+        );
+    }
+
     fn plist_environment(config: &LaunchAgentConfig) -> Dictionary {
         let bytes = render_launch_agent_plist(config).expect("plist should render");
         Value::from_reader_xml(bytes.as_slice())

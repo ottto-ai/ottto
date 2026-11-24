@@ -964,8 +964,9 @@ never sees a key.
   that cannot start is logged and leaves the signer unavailable; the control listener and socket
   keep serving.
 - **Peers.** Each peer must run as this user and pass
-  `xpc_connection_set_peer_code_signing_requirement` with the release app's identifier and team;
-  libxpc then checks every message it delivers. The app pins the service the same way.
+  `xpc_connection_set_peer_code_signing_requirement`; libxpc then checks every message it delivers.
+  The app and service requirements pin their respective identifiers, the team, and the Apple
+  Developer ID leaf and intermediate CA.
 - **Wire.** JSON `{"signer_protocol":1,"id","command","args"}` in, `{"signer_protocol":1,"id",
   "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. Every connection sends
   `signer_hello` first; the service refuses anything else on a connection without one. The
@@ -976,18 +977,28 @@ never sees a key.
   `method + "\n" + route template + "\n" + body` with the literal `{setup_run_id}`, gets a
   device challenge for that hash, checks the challenge's signed facts, and freezes body and
   challenge on the connection. The send uses those bytes and `{challenge_id}.{signature}` proofs,
-  at most once: key enrollment is never retried by the service. Revoke signs the empty `DELETE`
-  body the same way. A refused run token is refreshed and the identical request sent again.
+  after the signature shape and required proofs are checked locally. Revoke signs the empty
+  `DELETE` body the same way. When the server specifically refuses the run token, the service
+  refreshes and resends the identical request only if the run and organization both match the
+  original binding. An ambiguous enrollment response requires a claim-state readback.
+- **Browser claim.** The service returns the claim link only when it names the returned UUID on
+  `https://app.ottto.net/setup/cloud-keys?claim=…` and the forward key code has the expected
+  Base32 shape.
 - **Sign queue.** In memory only: at most four live requests, a device proof until its
   challenge expires and an approval until its `sign_by`; one request per approval id, and a new
-  approval supersedes the attempt's older one. A request goes to the first verified connection
+  approval supersedes the attempt's older one once the replacement passes expiry and capacity
+  checks. A request goes to the first verified connection
   that polls it, only that connection's answer counts, and a DER shape check guards signatures.
   An ended connection drops its prepares and returns its requests to the queue.
-- **Wake.** A queued request with no hello in the last 3 s checks the app bundle around this
-  service against the app requirement and runs `open -g -a <app> ottto://cloud/sign`. The URL
-  carries no data.
-- **Template.** The CloudFormation template URL is built from a pinned object key and version,
-  never taken from the server, and the bytes served there must hash to the pinned sha256.
+- **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
+  three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
+  This unauthenticated hint carries no data. The app obtains requests over verified XPC.
+- **Template.** The local flow selects a template ID. The service uses its compiled pin table for
+  the immutable object key, version and SHA-256. A missing pin fails verification. Server
+  metadata is used only for comparison with the compiled pin.
+- **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
+  its LaunchAgent. Swapping only the service binary is unsupported because the installed job
+  retains the signer Mach service and passes a flag the older binary cannot parse.
 
 - **CLI.** Command-scoped local-control requests require the CLI token. Passive attempt
   status never presents an approval. Ensure, submit and cancel obtain a fresh app device

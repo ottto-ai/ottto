@@ -226,6 +226,8 @@ pub(super) struct SetupRunApiRun {
     pub(super) id: String,
     pub(super) status: String,
     pub(super) machine_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub(super) organization_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

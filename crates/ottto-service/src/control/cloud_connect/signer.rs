@@ -11,6 +11,7 @@ use super::wire::checked_challenge;
 use super::wire::decode_base64url;
 use super::wire::encode_base64url;
 use super::wire::is_encoded_spki;
+use super::wire::is_key_code;
 use super::wire::is_p256_der_signature;
 use super::wire::is_reverse_code;
 use super::wire::proof_header;
@@ -215,18 +216,25 @@ impl Connections {
         Some(prepare_id)
     }
 
-    /// Takes the prepared write: it is sent at most once, whatever happens next.
-    fn take(&self, connection: u64, kind: WriteKind, prepare_id: &str) -> Option<Prepared> {
+    /// Takes the prepared write after the supplied signatures pass local checks.
+    fn take(
+        &self,
+        connection: u64,
+        kind: WriteKind,
+        prepare_id: &str,
+        has_approval_signature: bool,
+    ) -> Result<Prepared, Refusal> {
         let mut open = self.lock();
-        let slot = open.get_mut(&connection)?.slot(kind);
-        if slot
+        let missing = || Refusal::new("prepare_not_found");
+        let slot = open.get_mut(&connection).ok_or_else(missing)?.slot(kind);
+        let prepared = slot
             .as_ref()
-            .is_some_and(|prepared| prepared.prepare_id == prepare_id)
-        {
-            slot.take()
-        } else {
-            None
+            .filter(|prepared| prepared.prepare_id == prepare_id)
+            .ok_or_else(missing)?;
+        if prepared.approval_key != has_approval_signature {
+            return Err(Refusal::new("signature_invalid"));
         }
+        slot.take().ok_or_else(missing)
     }
 }
 
@@ -368,11 +376,23 @@ fn claim_start(server: &dyn CloudKeyServer, args: ClaimStartArgs) -> Result<Valu
     {
         return Err(Refusal::new("invalid_argument"));
     }
-    to_result(server.start_claim(&ClaimStartBody {
+    let started = server.start_claim(&ClaimStartBody {
         client_claim_id: &args.client_claim_id,
         device_key_spki_b64: &args.device_key_spki_b64,
         approval_key_spki_b64: args.approval_key_spki_b64.as_deref(),
-    })?)
+    })?;
+    // The app can open this URL in a browser. Accept only the exact web route
+    // and a single claim parameter that names the returned claim.
+    let browser_claim = started
+        .claim_url
+        .strip_prefix("https://app.ottto.net/setup/cloud-keys?claim=");
+    if !crate::hex::is_uuid(&started.key_claim_id)
+        || browser_claim != Some(started.key_claim_id.as_str())
+        || !is_key_code(&started.key_code)
+    {
+        return Err(Refusal::new("server_untrusted"));
+    }
+    to_result(started)
 }
 
 /// Gets a challenge for `body` and freezes both on the connection.
@@ -459,21 +479,20 @@ fn enroll(
     connection: u64,
     args: EnrollArgs,
 ) -> Result<Value, Refusal> {
-    let prepared = connections
-        .take(connection, WriteKind::Enroll, &args.prepare_id)
-        .ok_or_else(|| Refusal::new("prepare_not_found"))?;
-    let device_proof = proof_header(
-        &prepared.challenge_id,
-        &signature(&args.device_signature_b64)?,
-    );
-    let approval_proof = match (
-        prepared.approval_key,
-        args.approval_signature_b64.as_deref(),
-    ) {
-        (true, Some(encoded)) => Some(proof_header(&prepared.challenge_id, &signature(encoded)?)),
-        (false, None) => None,
-        _ => return Err(Refusal::new("signature_invalid")),
-    };
+    let device_signature = signature(&args.device_signature_b64)?;
+    let approval_signature = args
+        .approval_signature_b64
+        .as_deref()
+        .map(signature)
+        .transpose()?;
+    let prepared = connections.take(
+        connection,
+        WriteKind::Enroll,
+        &args.prepare_id,
+        approval_signature.is_some(),
+    )?;
+    let device_proof = proof_header(&prepared.challenge_id, &device_signature);
+    let approval_proof = approval_signature.map(|der| proof_header(&prepared.challenge_id, &der));
     to_result(server.enroll(&prepared.body, &device_proof, approval_proof.as_deref())?)
 }
 
@@ -495,10 +514,9 @@ fn revoke(
             false,
         ),
         (Some(prepare_id), Some(encoded)) => {
-            let prepared = connections
-                .take(connection, WriteKind::Revoke, &prepare_id)
-                .ok_or_else(|| Refusal::new("prepare_not_found"))?;
-            let device_proof = proof_header(&prepared.challenge_id, &signature(&encoded)?);
+            let signature = signature(&encoded)?;
+            let prepared = connections.take(connection, WriteKind::Revoke, &prepare_id, false)?;
+            let device_proof = proof_header(&prepared.challenge_id, &signature);
             to_result(server.revoke(&device_proof)?)
         }
         _ => Err(Refusal::new("invalid_argument")),

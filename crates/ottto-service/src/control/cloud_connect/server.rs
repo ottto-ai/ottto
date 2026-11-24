@@ -6,10 +6,10 @@ use crate::control::api_url_with_base;
 use crate::control::backend_get_json;
 use crate::control::backend_post_json;
 use crate::control::backend_send_raw_json;
-use crate::control::refresh_setup_run_token_via_device_secret;
-use crate::control::setup_run_token_for_connection;
+use crate::control::setup::claims::credentials::refresh_setup_run_token_checked;
+use crate::control::setup::claims::credentials::setup_run_token_for_connection_with_refresh;
 use crate::control::validated_api_base_url;
-use crate::control::LocalConnectionBinding;
+use crate::control::SetupRunRefreshResponse;
 use crate::LocalApiError;
 use crate::LocalDaemon;
 use serde::Deserialize;
@@ -108,7 +108,8 @@ impl ServerError {
                 status: None,
                 outcome_unknown: true,
             },
-            LocalApiError::SetupRunConnectionMissing => Self::local("not_paired"),
+            LocalApiError::SetupRunConnectionMissing
+            | LocalApiError::SetupRunConnectionMismatch => Self::local("not_paired"),
             LocalApiError::NetworkUnavailable => Self::local("server_untrusted"),
             _ => Self::local("local_error"),
         }
@@ -142,10 +143,25 @@ pub(super) struct SetupRunServer<'a> {
     pub(super) daemon: &'a LocalDaemon,
 }
 
+pub(super) struct BoundRun {
+    pub(super) id: String,
+    pub(super) organization_id: String,
+    api_base_url: String,
+}
+
 impl SetupRunServer<'_> {
-    /// Runs `send` with the run's cloud route prefix and run token. A refused run token is
-    /// refreshed once with the device secret and the identical request sent again; the server
-    /// checks the token before it reads a proof, so nothing was spent.
+    pub(super) fn bound_run(&self) -> Result<BoundRun, ServerError> {
+        let (connection, organization_id) = self
+            .daemon
+            .cloud_connect_binding()
+            .map_err(|error| ServerError::from_local(&error))?;
+        Ok(BoundRun {
+            id: connection.setup_run_id,
+            organization_id,
+            api_base_url: connection.api_base_url,
+        })
+    }
+
     fn call<T>(
         &self,
         send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
@@ -153,56 +169,78 @@ impl SetupRunServer<'_> {
         self.call_bound(None, send)
     }
 
+    /// The exact signed request may be resent after a refused token if the
+    /// refreshed authority still names the same run and organization.
     pub(super) fn call_bound<T>(
         &self,
-        run: Option<&str>,
+        run: Option<&BoundRun>,
         send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
     ) -> Result<T, ServerError> {
-        let connection = self
+        let (connection, organization_id) = self
             .daemon
-            .connection_for_authorized_client()
-            .map_err(|error| ServerError::from_local(&error))?
-            .ok_or_else(|| ServerError::local("not_paired"))?;
-        if run.is_some_and(|run| run != connection.setup_run_id) {
+            .cloud_connect_binding()
+            .map_err(|error| ServerError::from_local(&error))?;
+        if run.is_some_and(|run| {
+            run.id != connection.setup_run_id
+                || run.organization_id != organization_id
+                || run.api_base_url != connection.api_base_url
+        }) {
             return Err(ServerError::local("not_paired"));
         }
         let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))
             .map_err(|error| ServerError::from_local(&error))?;
-        let credentials = setup_run_token_for_connection(&api_base_url, &connection)
-            .map_err(|error| ServerError::from_local(&error))?;
-        if run.is_some_and(|run| run != credentials.connection.setup_run_id) {
-            return Err(ServerError::local("not_paired"));
-        }
-        let prefix = |connection: &LocalConnectionBinding| {
-            api_url_with_base(
-                &api_base_url,
-                &format!(
-                    "/api/v1/setup-runs/{}/local-client/cloud",
-                    connection.setup_run_id
-                ),
-            )
+        let refresh = || {
+            refresh_setup_run_token_checked(&api_base_url, &connection, |response| {
+                check_refresh_binding(response, &connection.setup_run_id, &organization_id)
+            })
         };
-        match send(
-            &prefix(&credentials.connection),
+        let credentials = setup_run_token_for_connection_with_refresh(&connection, refresh)
+            .map_err(|error| ServerError::from_local(&error))?;
+        let prefix = api_url_with_base(
+            &api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/cloud",
+                connection.setup_run_id
+            ),
+        );
+        send_with_refresh(
             &credentials.setup_run_token,
-        ) {
-            Err(LocalApiError::Backend(details))
-                if details.reason_code.as_deref() == Some(SETUP_RUN_TOKEN_INVALID) =>
-            {
-                let refreshed = refresh_setup_run_token_via_device_secret(
-                    &api_base_url,
-                    &credentials.connection,
-                )
-                .map_err(|error| ServerError::from_local(&error))?;
-                if run.is_some_and(|run| run != refreshed.connection.setup_run_id) {
-                    return Err(ServerError::local("not_paired"));
-                }
-                send(&prefix(&refreshed.connection), &refreshed.setup_run_token)
-                    .map_err(|error| ServerError::from_local(&error))
-            }
-            result => result.map_err(|error| ServerError::from_local(&error)),
-        }
+            |token| send(&prefix, token),
+            || refresh().map(|refreshed| refreshed.setup_run_token),
+        )
     }
+}
+
+pub(super) fn check_refresh_binding(
+    response: &SetupRunRefreshResponse,
+    run_id: &str,
+    organization_id: &str,
+) -> Result<(), LocalApiError> {
+    if response.setup_run_id.as_deref() == Some(run_id)
+        && response.run.as_ref().is_some_and(|run| {
+            run.id == run_id && run.organization_id.as_deref() == Some(organization_id)
+        })
+    {
+        Ok(())
+    } else {
+        Err(LocalApiError::SetupRunConnectionMismatch)
+    }
+}
+
+pub(super) fn send_with_refresh<T>(
+    token: &str,
+    send: impl Fn(&str) -> Result<T, LocalApiError>,
+    refresh: impl FnOnce() -> Result<String, LocalApiError>,
+) -> Result<T, ServerError> {
+    let result = match send(token) {
+        Err(LocalApiError::Backend(details))
+            if details.reason_code.as_deref() == Some(SETUP_RUN_TOKEN_INVALID) =>
+        {
+            refresh().and_then(|fresh_token| send(&fresh_token))
+        }
+        result => result,
+    };
+    result.map_err(|error| ServerError::from_local(&error))
 }
 
 impl CloudKeyServer for SetupRunServer<'_> {

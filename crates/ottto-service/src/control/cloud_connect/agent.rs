@@ -1,7 +1,7 @@
 //! CLI requests use the setup-run token, but only the app can sign a write.
 use super::queue::unix_now;
-use super::server::{ServerError, SetupRunServer};
-use super::template::{verified_template_url_with_timeout, TemplatePin};
+use super::server::{BoundRun, ServerError, SetupRunServer};
+use super::template::{verified_template_url_with_timeout, TemplatePinId};
 use super::wire::{decode_base64url, encode_base64url, proof_header, request_sha256};
 use super::{
     queue_sign_request, sign_queue, signer_available, SignKind, SignOutcome, SignQueueError,
@@ -70,8 +70,15 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
                 return Err(invalid_argument());
             }
             let deadline = deadline(timeout_ms);
-            let mut attempt =
-                server.signed_attempt("POST", "ensure", None, Some(&bytes(&body)), deadline)?;
+            let run = server.bound_run().map_err(server_failure)?;
+            let mut attempt = server.signed_attempt(
+                &run,
+                "POST",
+                "ensure",
+                None,
+                Some(&bytes(&body)),
+                deadline,
+            )?;
             remove_approval(&mut attempt);
             if let Some(aws) = attempt.get_mut("aws").filter(|aws| !aws.is_null()) {
                 match verify_template(aws, deadline) {
@@ -95,7 +102,9 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
             {
                 return Err(invalid_argument());
             }
+            let run = server.bound_run().map_err(server_failure)?;
             let mut attempt = server.signed_attempt(
+                &run,
                 "PATCH",
                 "submit",
                 Some(&attempt_id),
@@ -118,7 +127,10 @@ fn dispatch_inner(daemon: &LocalDaemon, command: Command) -> Result<Value, Failu
         Command::CloudConnectCancel {
             attempt_id,
             timeout_ms,
-        } => server.cancel(&attempt_id, deadline(timeout_ms)),
+        } => {
+            let run = server.bound_run().map_err(server_failure)?;
+            server.cancel(&run, &attempt_id, deadline(timeout_ms))
+        }
         _ => unreachable!("only cloud connect control commands are dispatched here"),
     }
 }
@@ -168,7 +180,8 @@ fn template_unverified() -> Failure {
 }
 
 fn check_pin(pin: &CloudTemplatePin) -> Result<(), Failure> {
-    if !pin.is_compiled_pin() {
+    if !TemplatePinId::BedrockCliReadRoleV1.matches_metadata(&pin.key, &pin.version_id, &pin.sha256)
+    {
         return Err(template_unverified());
     }
     Ok(())
@@ -178,12 +191,7 @@ fn verify_template(aws: &Value, deadline: Instant) -> Result<String, Failure> {
     let pin: CloudTemplatePin =
         serde_json::from_value(aws["template"].clone()).map_err(|_| template_unverified())?;
     check_pin(&pin)?;
-    let pin = TemplatePin {
-        key: pin.key,
-        version_id: pin.version_id,
-        sha256: pin.sha256,
-    };
-    verified_template_url_with_timeout(&pin, remaining(deadline)?)
+    verified_template_url_with_timeout(TemplatePinId::BedrockCliReadRoleV1, remaining(deadline)?)
         .map_err(|_| template_unverified())
 }
 
@@ -263,7 +271,7 @@ fn server_failure(error: ServerError) -> Failure {
 impl SetupRunServer<'_> {
     fn agent_call(
         &self,
-        run: Option<&str>,
+        run: Option<&BoundRun>,
         method: &str,
         resource: &str,
         body: Option<&[u8]>,
@@ -328,6 +336,7 @@ impl SetupRunServer<'_> {
 
     fn signed_attempt(
         &self,
+        run: &BoundRun,
         method: &str,
         operation: &str,
         attempt_id: Option<&str>,
@@ -340,7 +349,6 @@ impl SetupRunServer<'_> {
         if !signer_available() {
             return Err(queue_failure(SignQueueError::SignerUnavailable));
         }
-        let run = self.current_run()?;
         let template = if attempt_id.is_some() {
             ATTEMPT_TEMPLATE
         } else {
@@ -356,7 +364,7 @@ impl SetupRunServer<'_> {
         );
         for retry in [false, true] {
             let challenge = self.agent_call(
-                Some(&run),
+                Some(run),
                 "POST",
                 "device-challenges",
                 Some(&challenge_body),
@@ -377,7 +385,8 @@ impl SetupRunServer<'_> {
             if !cloud_uuid(challenge_id)
                 || facts["v"] != super::wire::DEVICE_WRITE_VERSION
                 || facts["challenge_id"] != challenge_id
-                || facts["run_id"] != run
+                || facts["run_id"] != run.id
+                || facts["org_id"] != run.organization_id
                 || facts["operation"] != operation
                 || facts["attempt_id"] != json!(attempt_id)
                 || facts["request_sha256"] != digest
@@ -403,7 +412,7 @@ impl SetupRunServer<'_> {
                 ));
             };
             let result = self.agent_call(
-                Some(&run),
+                Some(run),
                 method,
                 &resource,
                 body,
@@ -430,17 +439,9 @@ impl SetupRunServer<'_> {
         unreachable!("the second send settles the request")
     }
 
-    fn current_run(&self) -> Result<String, Failure> {
-        self.daemon
-            .connection_for_authorized_client()
-            .map_err(|error| server_failure(ServerError::from_local(&error)))?
-            .map(|connection| connection.setup_run_id)
-            .ok_or_else(|| server_failure(ServerError::local("not_paired")))
-    }
-
     fn read_attempt(
         &self,
-        run: Option<&str>,
+        run: Option<&BoundRun>,
         id: &str,
         deadline: Instant,
     ) -> Result<Value, Failure> {
@@ -458,15 +459,15 @@ impl SetupRunServer<'_> {
         verify_attempt(value, Some(id))
     }
 
-    fn cancel(&self, id: &str, deadline: Instant) -> Result<Value, Failure> {
-        let mut attempt = self.signed_attempt("DELETE", "cancel", Some(id), None, deadline)?;
+    fn cancel(&self, run: &BoundRun, id: &str, deadline: Instant) -> Result<Value, Failure> {
+        let mut attempt = self.signed_attempt(run, "DELETE", "cancel", Some(id), None, deadline)?;
         sign_queue().cancel_attempt(id);
         remove_approval(&mut attempt);
         Ok(attempt)
     }
 
     fn poll(&self, id: &str, account: &str, deadline: Instant) -> Result<Value, Failure> {
-        let run = self.current_run()?;
+        let run = self.bound_run().map_err(server_failure)?;
         let mut attempt = self.read_attempt(Some(&run), id, deadline)?;
         let approval = attempt
             .as_object_mut()
@@ -505,6 +506,7 @@ impl SetupRunServer<'_> {
         if facts["v"] != "ottto.cloud_connect.approval.v4"
             || facts["aud"] != "app.ottto.net"
             || facts["source"] != "bedrock"
+            || facts["org_id"] != run.organization_id
             || facts["attempt_id"] != id
             || facts["approval_id"] != approval_id
             || facts["input_revision"] != attempt["input_revision"]
@@ -588,7 +590,7 @@ impl SetupRunServer<'_> {
                         }
                     }
                     Some(SignOutcome::Declined) => {
-                        let mut value = self.cancel(id, deadline)?;
+                        let mut value = self.cancel(&run, id, deadline)?;
                         if value["state"] == "cancelled" {
                             value["code"] = json!("approval_declined");
                         }

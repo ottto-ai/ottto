@@ -953,6 +953,24 @@ impl LocalDaemon {
         load_connection_into(&mut state, load_connection)
     }
 
+    /// Read the run and its local organization under the same state lock.
+    pub(crate) fn cloud_connect_binding(
+        &self,
+    ) -> Result<(LocalConnectionBinding, String), LocalApiError> {
+        let mut state = self.state()?;
+        let connection = load_connection_into(&mut state, load_persisted_connection)?
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        let organization_id = state
+            .account
+            .organization
+            .as_ref()
+            .filter(|organization| !organization.id.is_empty())
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?
+            .id
+            .clone();
+        Ok((connection, organization_id))
+    }
+
     /// The setup-run binding an agent read starts with, together with the
     /// read-rejection revision it starts from. Both are captured under one
     /// state lock, so the revision describes exactly what this binding's
