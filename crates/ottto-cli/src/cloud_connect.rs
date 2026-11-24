@@ -44,7 +44,8 @@ pub(super) fn run(invocation: Invocation, command: CloudCommand) -> i32 {
                 Ok(value) => {
                     result.account_id = string(&value, "account_id").map(str::to_owned);
                     result.state = string(&value, "state").map(str::to_owned);
-                    result.cleanup = cleanup_from(&value, None, deadline);
+                    result.cleanup =
+                        cleanup_reference(&value).and_then(|reference| reference.unverified());
                     result.finish(
                         &invocation,
                         None,
@@ -86,25 +87,14 @@ pub(super) fn run(invocation: Invocation, command: CloudCommand) -> i32 {
                     timeout_ms,
                 }
             });
-            match reply {
-                Ok(value) => {
-                    result.account_id = string(&value, "account_id").map(str::to_owned);
-                    result.state = string(&value, "state").map(str::to_owned);
-                    if value["ended_attempt_cleanup"].is_object() {
-                        // Cancellation succeeds even when AWS is unavailable or signed into a different account.
-                        let identity_deadline =
-                            deadline.min(Instant::now() + Duration::from_secs(15));
-                        let identity = (|| {
-                            let aws = Aws::resolve(None, false, identity_deadline).ok()?;
-                            let session = aws.export(identity_deadline).ok()?;
-                            let account = aws.identity(&session, identity_deadline).ok()?;
-                            Some((aws, session, account))
-                        })();
-                        let identity = identity
-                            .as_ref()
-                            .map(|(aws, session, account)| (aws, session, account.as_str()));
-                        result.cleanup = cleanup_from(&value, identity, identity_deadline);
-                    }
+            let settled = reply.and_then(|value| {
+                result.account_id = string(&value, "account_id").map(str::to_owned);
+                result.state = string(&value, "state").map(str::to_owned);
+                result.cleanup = cancellation_cleanup(&value, deadline)?;
+                Ok(())
+            });
+            match settled {
+                Ok(()) => {
                     let message = match result.state.as_deref() {
                         Some("cancelled") => "Cloud setup cancelled.",
                         Some("expired") => "This cloud setup has already expired.",
@@ -415,7 +405,7 @@ fn connect(
     if let Some(reference) = cleanup_reference(&attempt)
         && attempt["ended_attempt_cleanup"]["attempt_id"] != id
     {
-        result.cleanup = reference.resolve(Some((&aws, &session, &account)), deadline);
+        result.cleanup = reference.resolve(Some((&aws, &session, &account)), deadline)?;
     }
     if let Some(error) = attempt
         .as_object_mut()
@@ -588,7 +578,9 @@ fn poll(
         let stage = match state {
             "saved" | "connected" => return Ok(()),
             "cli_failed" | "cancelled" | "expired" => {
-                if let Some(cleanup) = cleanup_from(&attempt, Some(identity), deadline) {
+                if let Some(reference) = cleanup_reference(&attempt)
+                    && let Some(cleanup) = reference.resolve(Some(identity), deadline)?
+                {
                     result.cleanup = Some(cleanup);
                 }
                 let code = string(&attempt, "code").unwrap_or(state);
@@ -691,12 +683,30 @@ fn cleanup_reference(value: &Value) -> Option<CleanupReference> {
     serde_json::from_value(value["ended_attempt_cleanup"].clone()).ok()
 }
 
-fn cleanup_from(
-    value: &Value,
-    identity: Option<(&Aws, &Session, &str)>,
-    deadline: Instant,
-) -> Option<Value> {
-    cleanup_reference(value)?.resolve(identity, deadline)
+fn cancellation_cleanup(value: &Value, deadline: Instant) -> Result<Option<Value>, Failure> {
+    let Some(reference) = cleanup_reference(value) else {
+        return Ok(None);
+    };
+    // AWS may be missing or signed into another account after server cancellation.
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(15));
+    let identity = best_effort_aws((|| {
+        let aws = Aws::resolve(None, false, deadline)?;
+        let session = aws.export(deadline)?;
+        let account = aws.identity(&session, deadline)?;
+        Ok((aws, session, account))
+    })())?;
+    let identity = identity
+        .as_ref()
+        .map(|(aws, session, account)| (aws, session, account.as_str()));
+    reference.resolve(identity, deadline)
+}
+
+fn best_effort_aws<T>(result: Result<T, Failure>) -> Result<Option<T>, Failure> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code == "interrupted" => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn new_request_id() -> Result<String, Failure> {
@@ -920,5 +930,14 @@ mod tests {
         assert_eq!(missing_key.reason.as_deref(), Some("revoked"));
         assert_eq!(exit_code(&timed_out()), 61);
         assert_eq!(exit_code(&invalid_server()), 17);
+    }
+    #[test]
+    fn optional_aws_reads_preserve_interruption() {
+        let mut error = Failure::new("interrupted", "Interrupted.", "run_again");
+        error.reason = Some("sigterm".into());
+        let interruption = best_effort_aws::<()>(Err(error)).unwrap_err();
+        assert_eq!(exit_code(&interruption), 143);
+        let unavailable = best_effort_aws::<()>(Err(timed_out())).unwrap();
+        assert_eq!(unavailable, None);
     }
 }

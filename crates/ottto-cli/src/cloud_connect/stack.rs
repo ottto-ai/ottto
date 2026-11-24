@@ -1,7 +1,7 @@
 //! Typed CloudFormation plans, stack reconciliation and cleanup output.
 
 use super::aws::{access_denied, Aws, Session};
-use super::{invalid_server, sleep_until, Failure};
+use super::{best_effort_aws, invalid_server, sleep_until, Failure};
 use ottto_protocol::{
     cloud_account_id, cloud_stack_id, cloud_stack_name, CloudTemplatePin, CLOUD_CONNECT_REGION,
 };
@@ -320,7 +320,7 @@ impl Reconcile<'_> {
     }
 
     fn stack_failure(&self, arn: &str, deadline: Instant) -> Failure {
-        let denied = self
+        let events = self
             .aws
             .cloudformation(
                 self.session,
@@ -332,22 +332,26 @@ impl Reconcile<'_> {
                 ],
                 deadline,
             )
-            .and_then(|output| self.aws.json(output))
-            .is_ok_and(|value| {
-                value["StackEvents"]
-                    .as_array()
-                    .and_then(|events| {
-                        events.iter().find(|event| {
-                            event["ResourceStatus"]
-                                .as_str()
-                                .is_some_and(|status| status.ends_with("_FAILED"))
-                        })
+            .and_then(|output| self.aws.json(output));
+        let events = match best_effort_aws(events) {
+            Ok(events) => events,
+            Err(interrupted) => return interrupted,
+        };
+        let denied = events.is_some_and(|value| {
+            value["StackEvents"]
+                .as_array()
+                .and_then(|events| {
+                    events.iter().find(|event| {
+                        event["ResourceStatus"]
+                            .as_str()
+                            .is_some_and(|status| status.ends_with("_FAILED"))
                     })
-                    .and_then(|event| event["ResourceStatusReason"].as_str())
-                    .is_some_and(|reason| {
-                        reason.contains("AccessDenied") || reason.contains("not authorized")
-                    })
-            });
+                })
+                .and_then(|event| event["ResourceStatusReason"].as_str())
+                .is_some_and(|reason| {
+                    reason.contains("AccessDenied") || reason.contains("not authorized")
+                })
+        });
         if denied {
             access_denied()
         } else {
@@ -380,17 +384,17 @@ impl CleanupReference {
         &self,
         identity: Option<(&Aws, &Session, &str)>,
         deadline: Instant,
-    ) -> Option<Value> {
-        if !cloud_account_id(&self.account_id) || !cloud_stack_name(&self.stack_name) {
-            return None;
+    ) -> Result<Option<Value>, Failure> {
+        if !self.is_valid() {
+            return Ok(None);
         }
         if let Some((aws, session, account)) =
             identity.filter(|(_, _, account)| *account == self.account_id)
         {
             let selector = self.stack_id.as_deref().unwrap_or(&self.stack_name);
             if self.stack_id.is_none() || cloud_stack_id(selector, account, &self.stack_name) {
-                match describe(aws, session, selector, deadline) {
-                    Ok(Some(stack))
+                match best_effort_aws(describe(aws, session, selector, deadline))? {
+                    Some(Some(stack))
                         if stack.stack_name == self.stack_name
                             && stack.stack_status != "DELETE_COMPLETE"
                             && self
@@ -399,22 +403,32 @@ impl CleanupReference {
                                 .is_none_or(|expected| expected == &stack.stack_id)
                             && cloud_stack_id(&stack.stack_id, account, &self.stack_name) =>
                     {
-                        return Some(cleanup(account, &stack.stack_id, aws.profile()));
+                        return Ok(Some(cleanup(account, &stack.stack_id, aws.profile())));
                     }
-                    Ok(None) => return None,
+                    Some(None) => return Ok(None),
                     _ => {}
                 }
             }
         }
-        Some(json!({
-            "account_id": self.account_id,
-            "region": CLOUD_CONNECT_REGION,
-            "verified": false,
-            "message": format!(
-                "Sign in to AWS account {} to see the delete command.",
-                super::display_account(&self.account_id),
-            ),
-        }))
+        Ok(self.unverified())
+    }
+
+    fn is_valid(&self) -> bool {
+        cloud_account_id(&self.account_id) && cloud_stack_name(&self.stack_name)
+    }
+
+    pub(super) fn unverified(&self) -> Option<Value> {
+        self.is_valid().then(|| {
+            json!({
+                "account_id": self.account_id,
+                "region": CLOUD_CONNECT_REGION,
+                "verified": false,
+                "message": format!(
+                    "Sign in to AWS account {} to see the delete command.",
+                    super::display_account(&self.account_id),
+                ),
+            })
+        })
     }
 }
 
@@ -458,7 +472,7 @@ mod tests {
             &reference.stack_name
         ));
         assert!(!cloud_stack_id(arn, "000000000002", &reference.stack_name));
-        let unverified = reference.resolve(None, Instant::now()).unwrap();
+        let unverified = reference.resolve(None, Instant::now()).unwrap().unwrap();
         assert_eq!(unverified["verified"], false);
         assert!(unverified.get("argv").is_none());
         let verified = cleanup(&reference.account_id, arn, Some("billing"));
