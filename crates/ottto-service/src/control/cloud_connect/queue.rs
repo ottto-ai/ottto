@@ -117,7 +117,7 @@ impl SignQueue {
     }
 
     /// Queues `payload` for the app to sign until `expires_at` (Unix seconds). One request per
-    /// approval id: queuing the same approval again returns the live request, and a new approval
+    /// approval id: queuing the same approval again returns the retained request, and a new approval
     /// for the same attempt supersedes the old one.
     pub(super) fn enqueue(
         &self,
@@ -239,9 +239,13 @@ impl SignQueue {
     }
 
     pub(super) fn cancel_attempt(&self, attempt_id: &str) {
-        self.lock().requests.retain(|request| {
-            !matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
-        });
+        for request in &mut self.lock().requests {
+            if matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
+            {
+                // A concurrent poll can still hold a pre-cancel server response.
+                request.outcome = Some(SignOutcome::Superseded);
+            }
+        }
     }
 
     /// Drops a request its caller no longer waits for.

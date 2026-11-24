@@ -707,4 +707,11 @@ fn queue_caps_distinct_native_approvals_and_keeps_the_retained_answer() {
     assert!(queue
         .enqueue(SignKind::DeviceProof, vec![0], deadline)
         .is_ok());
+    queue.cancel_attempt("attempt_0");
+    let replay = queue.enqueue(approval(0), vec![0], deadline).unwrap();
+    assert_eq!(replay.request_id, first.request_id);
+    assert_eq!(
+        queue.approval_outcome(&replay.request_id),
+        Some(SignOutcome::Superseded)
+    );
 }
