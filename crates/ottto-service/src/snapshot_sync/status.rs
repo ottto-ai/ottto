@@ -20,6 +20,7 @@ use super::safe_error;
 use super::small_source_upload;
 use super::snapshot_upload_destination_namespace;
 use super::withdraw_source_manifest;
+use super::without_pre_account_cache;
 use super::AgentStatusSnapshot;
 use super::AgentStatusSnapshotUploadRequest;
 use super::BTreeMap;
@@ -647,9 +648,10 @@ pub(super) fn update_detected_uses_cache(
 ) -> Result<()> {
     let dir = support_dir.join("detected_uses");
     let path = detected_uses_cache_path(support_dir, source);
+    let fresh = aggregate_detected_uses(snapshots);
     let merged = merge_detected_uses(
-        read_detected_uses_cache(&path),
-        aggregate_detected_uses(snapshots),
+        without_pre_account_cache(read_detected_uses_cache(&path), &fresh),
+        fresh,
         OffsetDateTime::now_utc(),
         TimeDuration::days(DETECTED_USE_RETENTION_DAYS),
     );

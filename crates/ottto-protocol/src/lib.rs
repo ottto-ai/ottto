@@ -1056,8 +1056,9 @@ pub type ActiveSessionContextPoint = (i64, u64);
 /// One detected billing destination for a source, as observed from local
 /// session telemetry. The Companion keys rows on
 /// `[gateway_provider, plan_fingerprint ?? "", account_identifier_hash ?? ""]`
-/// (see `DetectedUse.id` in the Swift client), so that triple is the grouping
-/// key the daemon produces one entry per. Optionals use
+/// (see `DetectedUse.id` in the Swift client). The daemon produces one entry
+/// per (gateway, plan fingerprint, account, organization): the organization
+/// tells apart one Claude account's uses in two organizations. Optionals use
 /// `skip_serializing_if = "Option::is_none"` to match the Swift lenient
 /// decoder, which tolerates absent keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1067,6 +1068,10 @@ pub struct DetectedUse {
     pub plan_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    /// The organization (workspace) of `account_identifier_hash`, when a
+    /// row proves one; Claude only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8396,6 +8401,7 @@ mod tests {
             gateway_provider: "vertex".to_string(),
             plan_fingerprint: Some("pro::20604".to_string()),
             account_identifier_hash: Some("hash123".to_string()),
+            organization_identifier_hash: None,
             subscription_product: Some("pro".to_string()),
             account_label: Some("Pro".to_string()),
             last_seen_at: "2026-05-28T10:00:00Z".to_string(),
@@ -8677,6 +8683,7 @@ mod tests {
             gateway_provider: "anthropic".to_string(),
             plan_fingerprint: None,
             account_identifier_hash: None,
+            organization_identifier_hash: None,
             subscription_product: None,
             account_label: None,
             last_seen_at: "2026-05-28T10:00:00Z".to_string(),
