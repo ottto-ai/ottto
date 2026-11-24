@@ -78,47 +78,7 @@ impl OwnedSourceScan {
                     .saturating_sub(before_body_read),
             );
 
-            if self.source == SnapshotSource::ClaudeCode
-                && before_body_read == 0
-                && active.parser.reader.consumed_bytes() > 0
-            {
-                // Count only the first actual body bytes. SourceChanged
-                // includes Desktop/usage sidecar and object revisions;
-                // ScopeChanged also catches a metadata change concurrent
-                // with growth (whose selection reason is TranscriptChanged).
-                // LegacyIdentity is the separate one-time legacy upgrade.
-                if self
-                    .claude_title_metadata
-                    .recovered_account_holds
-                    .contains(&local_index_key(&active.candidate.path))
-                {
-                    crate::local_resource_diagnostics::claude_reread::desktop_recovered_hold_body_read();
-                } else {
-                    match self
-                        .index
-                        .candidate_decision_with_reason_at(&active.candidate, self.audit_now)
-                        .1
-                    {
-                        Some(CandidateParseReason::LegacyIdentity) => {
-                            crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
-                        }
-                        reason
-                            if reason == Some(CandidateParseReason::SourceChanged)
-                                || active.sampling.as_ref().is_some_and(|read| {
-                                    matches!(
-                                        read.mode,
-                                        crate::transcript_acquisition::ReadMode::Full(
-                                            crate::transcript_acquisition::FullReason::ScopeChanged
-                                        )
-                                    )
-                                }) =>
-                        {
-                            crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            self.note_claude_first_body_read(&active, before_body_read);
             if self.source == SnapshotSource::Codex {
                 let consumed = active.parser.reader.consumed_bytes();
                 let moved = codex_file_join::take_charge(&mut active);
@@ -327,74 +287,7 @@ impl OwnedSourceScan {
                     Ok(true) => {}
                 }
             }
-            if let Some(context) = self.sampling.as_mut() {
-                if let Some(plan) = active.parser.reader.acquisition.as_ref() {
-                    context.record_input(
-                        plan.metrics(),
-                        matches!(
-                            plan.mode(),
-                            crate::transcript_acquisition::ReadMode::Full(_)
-                        ),
-                    );
-                    // From-start replays, with the bytes they read: a group
-                    // from its first member, and a file with protected
-                    // tiers re-read from its start.
-                    #[cfg(unix)]
-                    {
-                        let replay = if let Some(group) = active.group.as_deref() {
-                            Some((
-                                tail_source::counters::Replay::Group,
-                                group
-                                    .consumed_before
-                                    .saturating_add(active.parser.reader.consumed_bytes()),
-                            ))
-                        } else {
-                            active
-                                .sampling
-                                .as_ref()
-                                .is_some_and(|acquisition| acquisition.tier_prefix_replay)
-                                .then_some((
-                                    tail_source::counters::Replay::TierPrefix,
-                                    plan.metrics().native_bytes,
-                                ))
-                        };
-                        if let Some((cause, bytes)) = replay {
-                            tail_source::counters::replay(self.source, cause, bytes);
-                        }
-                    }
-                    self.resource_probe.rearm_full_completed(
-                        &local_index_key(&active.candidate.path),
-                        plan.mode(),
-                        plan.metrics().native_bytes,
-                    );
-                    self.resource_probe.full_parse_reason(
-                        plan.mode(),
-                        active.parse_reason,
-                        active.prior_stamp,
-                        0,
-                        plan.metrics().native_bytes,
-                    );
-                    crate::local_resource_diagnostics::change_reason::read(
-                        self.source.api_slug(),
-                        &local_index_key(&active.candidate.path),
-                        plan.mode(),
-                        plan.metrics().native_bytes,
-                        plan.metrics().sample_bytes as u64,
-                    );
-                }
-            }
-            crate::local_resource_diagnostics::change_reason::admin_read(
-                self.source.api_slug(),
-                &local_index_key(&active.candidate.path),
-                active
-                    .parser
-                    .reader
-                    .acquisition
-                    .as_ref()
-                    .filter(|_| self.sampling.is_some())
-                    .map(|plan| (plan.mode(), plan.metrics().native_bytes)),
-                active.parser.reader.consumed_bytes(),
-            );
+            self.record_completed_read(&active);
             if active.sampling.as_ref().is_some_and(|acquisition| {
                 !matches!(
                     acquisition.mode,
@@ -501,32 +394,10 @@ impl OwnedSourceScan {
                 *active_file = Some(active);
                 return true;
             }
+            self.note_codex_tail_repeat(&active);
             // The bytes this attempt read, taken before
             // `finish_job` consumes the acquisition's start offset. An
             // exact-stamp memo below must not cover anything past them.
-            if self.source == SnapshotSource::Codex && active.group.is_none() {
-                if let (Some(entry), Some(plan)) = (
-                    active
-                        .sampling
-                        .as_ref()
-                        .and_then(|sampled| self.index.files.get(&sampled.key)),
-                    active.parser.reader.acquisition.as_ref(),
-                ) {
-                    let start = plan.start_offset();
-                    sources::codex::eof_fragment::note_tail_repeat(
-                        entry,
-                        &active.candidate,
-                        sources::codex::eof_fragment::TailRead {
-                            mode: plan.mode(),
-                            start,
-                            end: start.saturating_add(active.parser.reader.consumed_bytes()),
-                            terminated_end: active.parser.reader.last_complete_line_end(),
-                        },
-                        self.census_unix_seconds,
-                        self.backfill_window_days,
-                    );
-                }
-            }
             let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
             // S6: a cursor job commits only through its sealed-prefix
             // certificate; an invalidated attempt publishes nothing.
@@ -1884,6 +1755,155 @@ impl OwnedSourceScan {
                 .insert(local_index_key(&alias.path));
             if !independent_group {
                 self.snapshots.extend(alias_items);
+            }
+        }
+    }
+
+    /// Count a Claude file's first body bytes under the reason it was read.
+    #[inline(never)]
+    fn note_claude_first_body_read(&self, active: &OwnedActiveFile, before_body_read: u64) {
+        if self.source == SnapshotSource::ClaudeCode
+            && before_body_read == 0
+            && active.parser.reader.consumed_bytes() > 0
+        {
+            // Count only the first actual body bytes. SourceChanged
+            // includes Desktop/usage sidecar and object revisions;
+            // ScopeChanged also catches a metadata change concurrent
+            // with growth (whose selection reason is TranscriptChanged).
+            // LegacyIdentity is the separate one-time legacy upgrade.
+            if self
+                .claude_title_metadata
+                .recovered_account_holds
+                .contains(&local_index_key(&active.candidate.path))
+            {
+                crate::local_resource_diagnostics::claude_reread::desktop_recovered_hold_body_read(
+                );
+            } else {
+                match self
+                    .index
+                    .candidate_decision_with_reason_at(&active.candidate, self.audit_now)
+                    .1
+                {
+                    Some(CandidateParseReason::LegacyIdentity) => {
+                        crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(true);
+                    }
+                    reason
+                        if reason == Some(CandidateParseReason::SourceChanged)
+                            || active.sampling.as_ref().is_some_and(|read| {
+                                matches!(
+                                    read.mode,
+                                    crate::transcript_acquisition::ReadMode::Full(
+                                        crate::transcript_acquisition::FullReason::ScopeChanged
+                                    )
+                                )
+                            }) =>
+                    {
+                        crate::local_resource_diagnostics::claude_reread::desktop_revision_body_read(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Report what a file's read to its end cost: input bytes by mode,
+    /// from-start replays and the read's reason.
+    #[inline(never)]
+    fn record_completed_read(&mut self, active: &OwnedActiveFile) {
+        if let Some(context) = self.sampling.as_mut() {
+            if let Some(plan) = active.parser.reader.acquisition.as_ref() {
+                context.record_input(
+                    plan.metrics(),
+                    matches!(
+                        plan.mode(),
+                        crate::transcript_acquisition::ReadMode::Full(_)
+                    ),
+                );
+                // From-start replays, with the bytes they read: a group
+                // from its first member, and a file with protected
+                // tiers re-read from its start.
+                #[cfg(unix)]
+                {
+                    let replay = if let Some(group) = active.group.as_deref() {
+                        Some((
+                            tail_source::counters::Replay::Group,
+                            group
+                                .consumed_before
+                                .saturating_add(active.parser.reader.consumed_bytes()),
+                        ))
+                    } else {
+                        active
+                            .sampling
+                            .as_ref()
+                            .is_some_and(|acquisition| acquisition.tier_prefix_replay)
+                            .then_some((
+                                tail_source::counters::Replay::TierPrefix,
+                                plan.metrics().native_bytes,
+                            ))
+                    };
+                    if let Some((cause, bytes)) = replay {
+                        tail_source::counters::replay(self.source, cause, bytes);
+                    }
+                }
+                self.resource_probe.rearm_full_completed(
+                    &local_index_key(&active.candidate.path),
+                    plan.mode(),
+                    plan.metrics().native_bytes,
+                );
+                self.resource_probe.full_parse_reason(
+                    plan.mode(),
+                    active.parse_reason,
+                    active.prior_stamp,
+                    0,
+                    plan.metrics().native_bytes,
+                );
+                crate::local_resource_diagnostics::change_reason::read(
+                    self.source.api_slug(),
+                    &local_index_key(&active.candidate.path),
+                    plan.mode(),
+                    plan.metrics().native_bytes,
+                    plan.metrics().sample_bytes as u64,
+                );
+            }
+        }
+        crate::local_resource_diagnostics::change_reason::admin_read(
+            self.source.api_slug(),
+            &local_index_key(&active.candidate.path),
+            active
+                .parser
+                .reader
+                .acquisition
+                .as_ref()
+                .filter(|_| self.sampling.is_some())
+                .map(|plan| (plan.mode(), plan.metrics().native_bytes)),
+            active.parser.reader.consumed_bytes(),
+        );
+    }
+
+    /// Note a Codex singleton tail that read the same bytes again.
+    #[inline(never)]
+    fn note_codex_tail_repeat(&self, active: &OwnedActiveFile) {
+        if self.source == SnapshotSource::Codex && active.group.is_none() {
+            if let (Some(entry), Some(plan)) = (
+                active
+                    .sampling
+                    .as_ref()
+                    .and_then(|sampled| self.index.files.get(&sampled.key)),
+                active.parser.reader.acquisition.as_ref(),
+            ) {
+                let start = plan.start_offset();
+                sources::codex::eof_fragment::note_tail_repeat(
+                    entry,
+                    &active.candidate,
+                    sources::codex::eof_fragment::TailRead {
+                        mode: plan.mode(),
+                        start,
+                        end: start.saturating_add(active.parser.reader.consumed_bytes()),
+                        terminated_end: active.parser.reader.last_complete_line_end(),
+                    },
+                    self.census_unix_seconds,
+                    self.backfill_window_days,
+                );
             }
         }
     }
