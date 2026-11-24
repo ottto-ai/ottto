@@ -1,4 +1,4 @@
-#[path = "upload_context_progress_decoder_fixture.rs"]
+#[path = "tests/upload_context_progress_decoder_fixture.rs"]
 mod released_progress;
 use super::*;
 

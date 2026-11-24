@@ -3,17 +3,17 @@ include!("tests/part_02.rs");
 include!("tests/part_03.rs");
 include!("tests/part_04.rs");
 include!("tests/part_05.rs");
-include!("../retry_integrated_driver.rs");
-include!("../retry_bounded_native_tests.rs");
-include!("../retry_allocation_native_tests.rs");
-include!("continuation_prepare_tests.rs");
+include!("tests/retry_integrated_driver.rs");
+include!("tests/retry_bounded_native_tests.rs");
+include!("tests/retry_allocation_native_tests.rs");
+include!("tests/continuation_prepare_tests.rs");
 include!("tests/part_06.rs");
 // Main's original shared pipeline assertions run at the production OFF
 // default, independently of the explicit-ON containment fixtures above.
 
-include!("claude_request_census_pipeline_tests.rs");
+include!("tests/claude_request_census_pipeline_tests.rs");
 include!("tests/part_07.rs");
-include!("request_identity_pipeline_tests.rs");
+include!("tests/request_identity_pipeline_tests.rs");
 include!("tests/part_08.rs");
 
 /// Attach a synthetic working ledger to the same native owner the service uses.
@@ -108,5 +108,5 @@ fn clear_fixture_progress(progress: &mut SnapshotUploadProgress, path: &Path) ->
 
 // Every server answer to a page or a pass and the ledger it leaves.
 mod answer_table_tests {
-    include!("answer_table_tests.rs");
+    include!("tests/answer_table_tests.rs");
 }

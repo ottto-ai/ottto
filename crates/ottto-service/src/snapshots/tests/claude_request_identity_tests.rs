@@ -3195,7 +3195,7 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
     // Config selection is the existing health observation, independent of
     // which snapshot upload carries the two exact rows.
     let mut health: ottto_protocol::AgentStatusSnapshot = serde_json::from_str(include_str!(
-        "../../../../fixtures/agent-status/display-carrier.json"
+        "../../../../../fixtures/agent-status/display-carrier.json"
     ))
     .unwrap();
     health.plan_observations = vec![serde_json::from_value(json!({

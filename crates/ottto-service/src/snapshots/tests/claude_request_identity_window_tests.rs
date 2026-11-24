@@ -2066,7 +2066,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     use sha2::Digest;
     use std::io::Write;
     let actual = sticky_golden_cases();
-    let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
+    let fixture = include_str!("../fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
     for case in [
         "mixed_presence",
@@ -2093,7 +2093,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
         panic!("emitted identity goldens changed; regenerate from the CI receipt");
     }
     let manifest: Value = serde_json::from_str(include_str!(
-        "fixtures/claude_identity_cap_emitted.manifest.json"
+        "../fixtures/claude_identity_cap_emitted.manifest.json"
     ))
     .unwrap();
     assert_eq!(

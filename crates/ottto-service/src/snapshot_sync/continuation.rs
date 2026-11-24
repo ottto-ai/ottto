@@ -1301,7 +1301,7 @@ fn page_on_worker(
 }
 
 #[cfg(test)]
-#[path = "continuation_tests.rs"]
+#[path = "tests/continuation_tests.rs"]
 mod tests;
 
 #[cfg(all(test, unix))]

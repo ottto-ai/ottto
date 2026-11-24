@@ -1,5 +1,5 @@
 mod census_p2_kept_pipeline_tests {
-    include!("../census_p2_kept_pipeline_tests.rs");
+    include!("census_p2_kept_pipeline_tests.rs");
 }
 use census_p2_kept_pipeline_tests::{
     assert_listed_fold_absent, pipeline_transcript_line, PipelineCycle, PipelineFixture,

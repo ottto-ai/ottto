@@ -257,7 +257,7 @@ fn refusal_is_visible_before_the_first_legacy_source_row_exists() {
 fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restoration() {
     use std::os::unix::fs::PermissionsExt;
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../tests/fixtures/scan_index/real-shaped-v1.json"
+        "../../tests/fixtures/scan_index/real-shaped-v1.json"
     ))
     .unwrap();
     let seed = |scratch: &std::path::Path| {

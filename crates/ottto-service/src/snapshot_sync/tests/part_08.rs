@@ -1,14 +1,14 @@
 pub(super) mod permanent_finish_pipeline_tests {
-    include!("../permanent_finish_pipeline_tests.rs");
+    include!("permanent_finish_pipeline_tests.rs");
 }
 mod reason_reoffer_tests {
-    include!("../reason_reoffer_tests.rs");
+    include!("reason_reoffer_tests.rs");
 }
 mod authority_proof_correction_pipeline_tests {
-    include!("../authority_proof_correction_pipeline_tests.rs");
+    include!("authority_proof_correction_pipeline_tests.rs");
 }
 mod load_containment_tests {
-    include!("../load_containment_tests.rs");
+    include!("load_containment_tests.rs");
 }
 #[test]
 fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
@@ -232,7 +232,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
     }
 }
 mod codex_counting_lifecycle_tests {
-    include!("../codex_counting_lifecycle_tests.rs");
+    include!("codex_counting_lifecycle_tests.rs");
 }
 fn prepare_codex_union_fixture(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(

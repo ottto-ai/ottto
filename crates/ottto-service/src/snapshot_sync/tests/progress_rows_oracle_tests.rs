@@ -1729,7 +1729,7 @@ fn progress_rows_retired_reoffer_token_hydrates_as_done_beside_its_sibling() {
     use reason_reoffer::RefusalReoffer;
     with_e2(|| {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/state_v2/progress-ledger-retired-reoffer.json"
+            "../../../tests/fixtures/state_v2/progress-ledger-retired-reoffer.json"
         ))
         .unwrap();
         let fixture = fixture["permanent_rejections"].as_object().unwrap().clone();
