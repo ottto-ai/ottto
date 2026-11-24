@@ -669,12 +669,12 @@ mod tests {
     /// the rewritten file. A stale service argument or Mach name cannot survive re-rendering.
     #[test]
     fn app_registration_replaces_the_installed_launch_agent() {
-        let home = tempfile::tempdir().expect("temporary home");
+        let home = crate::test_scratch::ScratchDir::new("launch-agent-registration");
         let config = LaunchAgentConfig::local_user_default(
-            home.path(),
+            &home,
             PathBuf::from("/Applications/Ottto.app/Contents/Helpers/ottto-service"),
         );
-        let path = launch_agent_path(home.path());
+        let path = launch_agent_path(&home);
         let rendered = render_launch_agent_plist(&config).expect("render app LaunchAgent");
         let stale = String::from_utf8(rendered.clone())
             .expect("XML plist")
