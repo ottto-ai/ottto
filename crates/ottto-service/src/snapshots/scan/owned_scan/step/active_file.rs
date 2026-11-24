@@ -299,99 +299,9 @@ impl OwnedSourceScan {
                     .as_ref()
                     .is_some_and(codex_file_join::TierReplay::has_protected_tiers)
             }) {
-                // Native finish compares the reopened descriptor to the captured
-                // identity, so replacement during fallback cannot publish.
-                let reopened =
-                    reopen_for_replay(self.source, &active.candidate, &active.parser.reader.reader);
-                let Ok(file) = reopened else {
-                    self.census
-                        .record_unreadable_file(UnreadableCause::OpenRead, &active.candidate.path);
-                    return true;
-                };
-                let Ok(mut parser) = sampled_scan::new_source_parser(
-                    file,
-                    &active.candidate,
-                    &self.index,
-                    sampled_scan::ParserOptions {
-                        source: self.source,
-                        metadata: &self.codex_title_metadata,
-                        identity_capture: self.claude_request_identity_capture,
-                        cache: self.sampling.as_ref().map(|c| &c.cache),
-                    },
-                ) else {
-                    self.census
-                        .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
-                    return true;
-                };
-
-                let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                let debt = sampled_audit::debt_for_key(
-                    &self.index,
-                    &acquisition.key,
-                    sampled_scan::now_seconds(),
-                );
-                let Ok(mode) = parser.prepare_acquisition(
-                    None,
-                    &acquisition.scope,
-                    debt,
-                    sampled_scan::now_seconds(),
-                ) else {
-                    self.census
-                        .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
-                    return true;
-                };
-                if tail_source::seed_full_job_template(
-                    &self.index,
-                    &active.candidate,
-                    &[],
-                    &mut parser.accumulator,
-                )
-                .is_err()
-                {
-                    self.residue_index_keys
-                        .insert(local_index_key(&active.candidate.path));
-                    return true;
+                if self.restart_protected_tier_replay(&mut active, codex_cursor_lease) {
+                    *active_file = Some(active);
                 }
-                acquisition.mode = mode;
-                if let Some(plan) = parser.reader.acquisition.as_ref() {
-                    parser
-                        .reader
-                        .set_extent_limit(plan.frozen_length() - plan.start_offset());
-                }
-                acquisition.tier_prefix_replay = true;
-                if let Some(context) = self.sampling.as_mut() {
-                    context.priority_replays += 1;
-                    context.record_mode(mode, acquisition.audit_due);
-                }
-                self.resource_probe.full_parse_reason(
-                    mode,
-                    active.parse_reason,
-                    active.prior_stamp,
-                    1,
-                    0,
-                );
-                active.parser = parser;
-                active.charged_bytes = 0;
-                active.hold_offset = None;
-                if active.cursor.is_some()
-                    && !sampled_scan::codex_cursor::restart_in_place(&mut active)
-                {
-                    // The full replay cannot be frozen: end this attempt
-                    // (a retryable failure), never an unpaged read.
-                    active.cursor = None;
-                    if let Some(lease) = codex_cursor_lease.take() {
-                        lease.release();
-                    }
-                    sampled_scan::codex_cursor::dequeue(&mut self.index, &active.candidate);
-                    self.census
-                        .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
-                    return true;
-                }
-                // LD: the replay is a fresh Full delivery from 0.
-                if let Some(delivery) = self.line_delivery.as_mut() {
-                    delivery.arm();
-                }
-                *active_file = Some(active);
                 return true;
             }
             self.note_codex_tail_repeat(&active);
@@ -1906,5 +1816,96 @@ impl OwnedSourceScan {
                 );
             }
         }
+    }
+
+    /// Replace a non-Full read that met protected tiers with a Full replay
+    /// from the file's start. Returns whether the file stays active; a
+    /// failed restart has already disclosed the file.
+    #[inline(never)]
+    fn restart_protected_tier_replay(
+        &mut self,
+        active: &mut OwnedActiveFile,
+        codex_cursor_lease: &mut Option<sampled_scan::codex_cursor::CursorLease>,
+    ) -> bool {
+        // Native finish compares the reopened descriptor to the captured
+        // identity, so replacement during fallback cannot publish.
+        let reopened =
+            reopen_for_replay(self.source, &active.candidate, &active.parser.reader.reader);
+        let Ok(file) = reopened else {
+            self.census
+                .record_unreadable_file(UnreadableCause::OpenRead, &active.candidate.path);
+            return false;
+        };
+        let Ok(mut parser) = sampled_scan::new_source_parser(
+            file,
+            &active.candidate,
+            &self.index,
+            sampled_scan::ParserOptions {
+                source: self.source,
+                metadata: &self.codex_title_metadata,
+                identity_capture: self.claude_request_identity_capture,
+                cache: self.sampling.as_ref().map(|c| &c.cache),
+            },
+        ) else {
+            self.census
+                .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
+            return false;
+        };
+
+        let acquisition = active.sampling.as_mut().expect("sampled acquisition");
+        let debt =
+            sampled_audit::debt_for_key(&self.index, &acquisition.key, sampled_scan::now_seconds());
+        let Ok(mode) =
+            parser.prepare_acquisition(None, &acquisition.scope, debt, sampled_scan::now_seconds())
+        else {
+            self.census
+                .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
+            return false;
+        };
+        if tail_source::seed_full_job_template(
+            &self.index,
+            &active.candidate,
+            &[],
+            &mut parser.accumulator,
+        )
+        .is_err()
+        {
+            self.residue_index_keys
+                .insert(local_index_key(&active.candidate.path));
+            return false;
+        }
+        acquisition.mode = mode;
+        if let Some(plan) = parser.reader.acquisition.as_ref() {
+            parser
+                .reader
+                .set_extent_limit(plan.frozen_length() - plan.start_offset());
+        }
+        acquisition.tier_prefix_replay = true;
+        if let Some(context) = self.sampling.as_mut() {
+            context.priority_replays += 1;
+            context.record_mode(mode, acquisition.audit_due);
+        }
+        self.resource_probe
+            .full_parse_reason(mode, active.parse_reason, active.prior_stamp, 1, 0);
+        active.parser = parser;
+        active.charged_bytes = 0;
+        active.hold_offset = None;
+        if active.cursor.is_some() && !sampled_scan::codex_cursor::restart_in_place(active) {
+            // The full replay cannot be frozen: end this attempt
+            // (a retryable failure), never an unpaged read.
+            active.cursor = None;
+            if let Some(lease) = codex_cursor_lease.take() {
+                lease.release();
+            }
+            sampled_scan::codex_cursor::dequeue(&mut self.index, &active.candidate);
+            self.census
+                .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
+            return false;
+        }
+        // LD: the replay is a fresh Full delivery from 0.
+        if let Some(delivery) = self.line_delivery.as_mut() {
+            delivery.arm();
+        }
+        true
     }
 }
