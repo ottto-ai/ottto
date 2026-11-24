@@ -1365,7 +1365,7 @@ pub(super) fn capture_codex_recovery_evidence(
                 .codex_joining_validator()
                 .context("Codex recovery capture lacks a source witness")?;
             validator.validate(&protected)?;
-            captured.save_with_progress_owner(index_path, None, &progress_owner)
+            captured.save_with_progress_owner(index_path, &progress_owner)
         })();
         match saved {
             Ok(()) => {

@@ -413,7 +413,6 @@ pub(crate) fn checkpoint_account_release_for_test(
         paths.0,
         &progress_path,
         || Ok(()),
-        None,
         Some(UnsettledUploadCause::UploadError),
         Some(AccountAuditRelease {
             previous,
@@ -856,7 +855,6 @@ pub(crate) fn checkpoint_page_for_test(
         || Ok(()),
         None,
         None,
-        None,
         Default::default(),
     )
 }
@@ -887,7 +885,6 @@ pub(super) fn checkpoint_partial_snapshot_index(
         index_path,
         progress_path,
         validate_destination,
-        None,
         None,
         None,
         Default::default(),
@@ -934,7 +931,6 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
     index_path: &Path,
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
-    read_limit: Option<usize>,
     cause: Option<UnsettledUploadCause>,
     audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
@@ -949,16 +945,10 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
     let durable: SnapshotUploadProgress = if progress.rows.is_some() {
         progress.durable_rows(index_path, &progress_owner)?
     } else {
-        match match read_limit {
-            Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
-            None => std::fs::read(progress_path),
-        } {
-            Ok(bytes) => (if read_limit.is_some() {
-                crate::snapshot_retry::decode_state(&bytes)
-            } else {
-                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
-            })
-            .context("parse snapshot progress for partial checkpoint")?,
+        match std::fs::read(progress_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(anyhow::Error::from)
+                .context("parse snapshot progress for partial checkpoint")?,
             Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
                 SnapshotUploadProgress::new(
                     progress.destination_namespace_hash.clone(),
@@ -1066,7 +1056,7 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
     committable.accept_request_contributions(progress);
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
-        .save_with_progress_owner(index_path, read_limit, &progress_owner)
+        .save_with_progress_owner(index_path, &progress_owner)
         .context(CHECKPOINT_INDEX_SAVE)?;
     if let Some(scan) = correction_scan {
         scan.report_discovery_growth_after_save(&committable);
@@ -1657,7 +1647,6 @@ pub(super) fn finish_sync_source(
                 validate_recovery_save()?;
                 ensure_destination_authority()
             },
-            None,
             Some(UnsettledUploadCause::UploadError),
             (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                 previous: &committed_index,
@@ -2110,7 +2099,6 @@ pub(super) fn finish_sync_source(
                     ensure_authority()?;
                     scan_result.validate_codex_checkpoint()
                 },
-                None,
                 Some(cause),
                 (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
                     previous: &committed_index,

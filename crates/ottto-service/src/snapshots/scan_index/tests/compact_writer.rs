@@ -67,7 +67,7 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
                 lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
                     .unwrap(),
             ),
-            // Bounded reader: the save_with_read_limit CAS.
+            // Bounded reader: the capped index read.
             (
                 "bounded_cas",
                 claude_request_census::decode_bounded_index(bytes).unwrap(),

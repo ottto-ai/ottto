@@ -506,14 +506,14 @@ fn published_with_json_ledger(
         .bind_test_key(Some([0x42; 32]));
     let mut page = native_page(source, c, ScanIndex::default(), 100, false);
     let (status, _) = send_with(source, &page, &mut progress, ack, |progress| {
-        progress.save_legacy_fixture(&path, None)
+        progress.save_legacy_fixture(&path)
     });
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     for n in 1..=3 {
         seed_keyed(&mut progress, n);
     }
     seed_money_maps(&mut progress);
-    progress.save_legacy_fixture(&path, None).unwrap();
+    progress.save_legacy_fixture(&path).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     if let Some(generation) = generation {
         let mut value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -775,7 +775,6 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                     path,
                     &progress_path(path),
                     || Ok(()),
-                    None,
                     None,
                     None,
                     Default::default(),
@@ -1124,7 +1123,6 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
                     path,
                     &progress_path(path),
                     || Ok(()),
-                    None,
                     None,
                     None,
                     Default::default(),
