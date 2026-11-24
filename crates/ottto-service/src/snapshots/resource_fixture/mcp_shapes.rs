@@ -50,11 +50,11 @@ const SKILLS: &str = concat!(
 
 /// Claude, per hundred files: the 1MiB file is a Desktop session with 739
 /// MCP names from 31 servers; the nine 64KiB files are Desktop sessions with
-/// 635 names from 26 servers; six of these ten get some names after response
-/// 1. Ten 4KiB files are headless sessions with 58 connector names from 5
-/// servers. Codex: twenty per hundred carry 19 deferred namespaces at start;
-/// 16 per thousand re-send the block after response 1, 11 of them with a new
-/// namespace. Pi has no MCP lines.
+/// 635 names from 26 servers; six of these ten get some names after the first
+/// response. Ten 4KiB files are headless sessions with 58 connector names
+/// from 5 servers. Codex: twenty per hundred carry 19 deferred namespaces at
+/// start; 16 per thousand re-send the block after the first response, 11 of
+/// them with a new namespace. Pi has no MCP lines.
 pub(super) fn lines(source: SnapshotSource, n: usize, bucket: usize) -> Lines {
     let id = session(n);
     let late = if bucket % 5 < 3 { 1 + bucket % 2 } else { 0 };
