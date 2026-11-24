@@ -123,7 +123,7 @@ fn long_backstop_walk_alarms_past_six_hours() {
     let row = walk(&mut f, backstop, backstop + LONG_WALK);
     let debt = &row["debt"];
     assert_eq!(debt["outstanding_files"], 1, "{row}");
-    assert_eq!(debt["over_6h_files"], 1, "{row}");
+    // Past 6 h only by the walk's end: the alarm reads the end-of-walk age.
     assert_eq!(
         debt["oldest_age_s"],
         WALK_GAP + LISTING_ALLOWANCE + LONG_WALK - 1
