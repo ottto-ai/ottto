@@ -10,6 +10,8 @@ source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 source "$SCRIPT_DIR/macos_companion_entitlements.sh"
 # shellcheck source=scripts/macos_license_notices.sh
 source "$SCRIPT_DIR/macos_license_notices.sh"
+# shellcheck source=scripts/macos_release_archive.sh
+source "$SCRIPT_DIR/macos_release_archive.sh"
 # shellcheck source=scripts/macos_app_binary.sh
 source "$SCRIPT_DIR/macos_app_binary.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
@@ -622,8 +624,8 @@ DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
   trap 'rm -rf "$ZIP_STAGE_ROOT"' EXIT
   ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto" "$ZIP_STAGE_ROOT/cli"
   ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto-service" "$ZIP_STAGE_ROOT/daemon"
-  ditto -c -k "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
-  ditto -c -k "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
+  ottto_release_zip "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
+  ottto_release_zip "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
 )
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
 # The SBOM describes the Apple Silicon build and the validated Sparkle pin.
