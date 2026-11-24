@@ -197,10 +197,10 @@ if [[ "$INCLUDE_APP" == "true" ]]; then
       },
       {
         type: "library",
-        "bom-ref": ("pkg:github/sparkle-project/sparkle@" + $sparkle_version),
+        "bom-ref": ("pkg:github/sparkle-project/sparkle@" + ($sparkle_version | @uri)),
         name: "Sparkle",
         version: $sparkle_version,
-        purl: ("pkg:github/sparkle-project/sparkle@" + $sparkle_version),
+        purl: ("pkg:github/sparkle-project/sparkle@" + ($sparkle_version | @uri)),
         licenses: [{expression: "MIT AND BSD-2-Clause AND Zlib"}],
         externalReferences: [{
           type: "vcs",

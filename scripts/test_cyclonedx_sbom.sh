@@ -150,6 +150,41 @@ if [[ -n "$(find "$TMP_DIR" -maxdepth 1 -name '*missing-license.cdx.json*' -prin
   exit 1
 fi
 
+# [behaviour] Private Cargo paths never reach the SBOM or its serial number.
+path_bin="$TMP_DIR/path-bin"
+mkdir -p "$path_bin"
+cat > "$path_bin/cargo" <<'CARGO'
+#!/usr/bin/env bash
+case "$1" in
+  metadata)
+    cat <<JSON
+{"workspace_members":["cli-id","service-id"],"workspace_root":"$FAKE_ROOT","packages":[
+ {"id":"cli-id","name":"ottto-cli","version":"0.1.0","license":"Apache-2.0","source":null,"manifest_path":"$FAKE_ROOT/ottto-cli/Cargo.toml"},
+ {"id":"service-id","name":"ottto-service","version":"0.1.0","license":"Apache-2.0","source":null,"manifest_path":"$FAKE_ROOT/ottto-service/Cargo.toml"},
+ {"id":"dep-id","name":"licensed-dep","version":"1.2.3","license":"MIT/Apache-2.0","source":"registry+https://github.com/rust-lang/crates.io-index","manifest_path":"$FAKE_ROOT/registry/licensed-dep/Cargo.toml"}
+]}
+JSON
+    ;;
+  tree)
+    printf 'ottto-cli v0.1.0 (%s/ottto-cli)\nlicensed-dep v1.2.3\nottto-service v0.1.0 (%s/ottto-service)\nlicensed-dep v1.2.3 (*)\n' "$FAKE_ROOT" "$FAKE_ROOT"
+    ;;
+  *) exit 2 ;;
+esac
+CARGO
+chmod +x "$path_bin/cargo"
+for variant in first second; do
+  FAKE_ROOT="/synthetic-$variant-checkout/workspace" PATH="$path_bin:$PATH" \
+    "$GENERATOR" --output "$TMP_DIR/path-$variant.cdx.json" --version 0.1.0-test >/dev/null
+  if grep -Fq "synthetic-$variant-checkout" "$TMP_DIR/path-$variant.cdx.json"; then
+    echo "The SBOM must not contain Cargo paths ($variant)" >&2
+    exit 1
+  fi
+done
+if [[ "$(jq -r .serialNumber "$TMP_DIR/path-first.cdx.json")" != "$(jq -r .serialNumber "$TMP_DIR/path-second.cdx.json")" ]]; then
+  echo "Cargo paths must not change the SBOM serial number" >&2
+  exit 1
+fi
+
 # [behaviour] Sparkle options are paired and validated before Cargo runs.
 rm -f "$cargo_calls"
 expect_usage_error() {

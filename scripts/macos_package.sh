@@ -583,7 +583,7 @@ if [[ "$ARCH" != "arm64" ]]; then
   exit 2
 fi
 if ! sparkle_pin="$(
-  git -C "$MAC_APP_GIT_ROOT" show "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH/Package.resolved" |
+  git -C "$MAC_APP_GIT_ROOT" show "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH/Package.resolved" 2>/dev/null |
     jq -ce '
       [.pins[]? | select(.identity == "sparkle"
         and .kind == "remoteSourceControl"
