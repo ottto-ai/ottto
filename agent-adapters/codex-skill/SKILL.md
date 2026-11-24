@@ -201,11 +201,14 @@ Follow the final `next_action`:
 - `use_web` or `approve_in_browser` → Share `connect_url`.
 - `set_up_on_mac` → Ask the user to open Ottto Settings and set up command-line connect.
 - `fix_aws_sign_in` → Ask the user to sign in to AWS and then run `resume.argv`.
-- `run_again` → Run `resume.argv` when the user is ready.
+- `run_again` → Run `resume.argv` when the user is ready. Keep its
+  `--request-id`: it resumes the same attempt instead of creating a new stack.
 - `restart` → Explain the change and ask before replacing the open setup.
 - For other actions, relay `message`.
 
-Show a verified `cleanup.argv` when present. Run it only if the user asks.
+Show `cleanup.argv` when present; it appears only for a stack whose attempt
+Ottto ended without saving. Run it only if the user asks. If the outcome is
+unclear, run `status_argv` before suggesting any cleanup.
 Use `ottto cloud status --source bedrock --json` to find an attempt,
 `ottto cloud status --attempt ID --json` to read it, and
 `ottto cloud cancel --attempt ID --json` if the user asks to cancel.
