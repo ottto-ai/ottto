@@ -304,6 +304,9 @@ run_step P "test public contract check" bash scripts/test_public_repo_contract_c
 run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step P "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
 run_step B "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
+run_step B "test macOS app binary helpers" bash scripts/test_macos_app_binary.sh
+run_step M "test macOS app dSYM on a real Swift executable" bash scripts/test_macos_app_dsym_real.sh
+run_step B "test macOS resource bundle guard" bash scripts/test_macos_resource_bundle_guard.sh
 run_step M "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
 run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_companion_entitlements.sh
 run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh

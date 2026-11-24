@@ -63,6 +63,7 @@ cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_sc
 cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 11;
 RS
