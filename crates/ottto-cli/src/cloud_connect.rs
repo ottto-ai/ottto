@@ -136,6 +136,7 @@ struct ResultState {
     cleanup: Option<Value>,
     browser_url: Option<String>,
     known_stack: Option<String>,
+    profile: Option<String>,
 }
 
 impl ResultState {
@@ -151,7 +152,9 @@ impl ResultState {
         let cleanup = self.cleanup.or_else(|| {
             let account = self.account_id.as_deref()?;
             let arn = self.known_stack.as_deref()?;
-            error.as_ref().map(|_| cleanup(account, arn))
+            error
+                .as_ref()
+                .map(|_| cleanup(account, arn, self.profile.as_deref()))
         });
         let action = error
             .as_ref()
@@ -360,6 +363,7 @@ fn connect(
         && invocation.output_mode == OutputMode::Human
         && std::io::IsTerminal::is_terminal(&std::io::stderr());
     let aws = Aws::resolve(args.profile.clone(), verbose, deadline)?;
+    result.profile = args.profile.clone();
     let mut session = aws.export(deadline)?;
     let account = aws.identity(&session, deadline)?;
     result.account_id = Some(account.clone());
@@ -737,6 +741,8 @@ fn normalize_error(mut error: Failure) -> Failure {
 fn exit_code(error: &Failure) -> i32 {
     match error.code.as_str() {
         "internal" => 70,
+        "interrupted" if error.reason.as_deref() == Some("sigterm") => 143,
+        "interrupted" => 130,
         "daemon_unavailable" => 10,
         "local_auth_failed" => 11,
         "local_client_not_trusted" => 12,

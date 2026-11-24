@@ -399,7 +399,7 @@ impl CleanupReference {
                                 .is_none_or(|expected| expected == &stack.stack_id)
                             && cloud_stack_id(&stack.stack_id, account, &self.stack_name) =>
                     {
-                        return Some(cleanup(account, &stack.stack_id));
+                        return Some(cleanup(account, &stack.stack_id, aws.profile()));
                     }
                     Ok(None) => return None,
                     _ => {}
@@ -418,14 +418,25 @@ impl CleanupReference {
     }
 }
 
-pub(super) fn cleanup(account: &str, arn: &str) -> Value {
+pub(super) fn cleanup(account: &str, arn: &str, profile: Option<&str>) -> Value {
+    let mut argv: Vec<String> = [
+        "aws",
+        "cloudformation",
+        "delete-stack",
+        "--stack-name",
+        arn,
+        "--region",
+        CLOUD_CONNECT_REGION,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if let Some(profile) = profile {
+        argv.push(format!("--profile={profile}"));
+    }
     json!({
         "stack_id": arn, "account_id": account, "region": CLOUD_CONNECT_REGION,
-        "verified": true,
-        "argv": [
-            "aws", "cloudformation", "delete-stack", "--stack-name", arn,
-            "--region", CLOUD_CONNECT_REGION,
-        ],
+        "verified": true, "argv": argv,
     })
 }
 
@@ -450,8 +461,9 @@ mod tests {
         let unverified = reference.resolve(None, Instant::now()).unwrap();
         assert_eq!(unverified["verified"], false);
         assert!(unverified.get("argv").is_none());
-        let verified = cleanup(&reference.account_id, arn);
+        let verified = cleanup(&reference.account_id, arn, Some("billing"));
         assert_eq!(verified["verified"], true);
         assert_eq!(verified["argv"][4], arn);
+        assert_eq!(verified["argv"][7], "--profile=billing");
     }
 }

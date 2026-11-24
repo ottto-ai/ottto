@@ -103,6 +103,7 @@ struct QueueState {
 
 struct QueuedRequest {
     id: String,
+    sequence: u64,
     kind: SignKind,
     payload: Vec<u8>,
     expires_at: i64,
@@ -174,9 +175,11 @@ impl SignQueue {
             self.answered.notify_all();
         }
         state.next_id += 1;
-        let request_id = format!("sign_{}", state.next_id);
+        let sequence = state.next_id;
+        let request_id = format!("sign_{sequence}");
         state.requests.push(QueuedRequest {
             id: request_id.clone(),
+            sequence,
             kind,
             payload,
             expires_at,
@@ -239,9 +242,15 @@ impl SignQueue {
         request.outcome.clone()
     }
 
-    pub(super) fn cancel_attempt(&self, attempt_id: &str) {
+    /// Capture before a server read so a poll can only retire approvals it saw queued.
+    pub(super) fn approval_watermark(&self) -> u64 {
+        self.lock().next_id
+    }
+
+    pub(super) fn cancel_attempt(&self, attempt_id: &str, through: u64) {
         for request in &mut self.lock().requests {
-            if matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
+            if request.sequence <= through
+                && matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
             {
                 // A concurrent poll can still hold a pre-cancel server response.
                 request.outcome = Some(SignOutcome::Superseded);
@@ -330,6 +339,7 @@ impl SignQueue {
             .filter(|request| request.taken_by == Some(connection) && request.outcome.is_none())
         {
             request.taken_by = None;
+            request.queued_at = Instant::now();
         }
     }
 }
@@ -374,7 +384,10 @@ pub(super) fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueState, HELLO_FRESH_FOR, MIN_WAKE_INTERVAL};
+    use super::{
+        unix_now, QueueState, SignKind, SignQueue, APPROVAL_TAKE_TIMEOUT, HELLO_FRESH_FOR,
+        MIN_WAKE_INTERVAL,
+    };
     use std::time::{Duration, Instant};
 
     /// [behaviour] A wake is reserved once per interval, and a more recent hello suppresses it.
@@ -393,5 +406,43 @@ mod tests {
         assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR - one_ms));
         assert!(state.reserve_wake(hello + HELLO_FRESH_FOR));
         assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR));
+    }
+    #[test]
+    fn released_approval_gets_a_new_window_to_reconnect() {
+        let queue = SignQueue::default();
+        let request = queue
+            .enqueue(
+                SignKind::Approval {
+                    attempt_id: "attempt".into(),
+                    approval_id: "approval".into(),
+                },
+                vec![0],
+                unix_now() + 60,
+            )
+            .unwrap();
+        queue.lock().requests[0].queued_at = Instant::now() - APPROVAL_TAKE_TIMEOUT;
+        assert_eq!(queue.poll(1)[0].request_id, request.request_id);
+        queue.release(1);
+        assert!(queue.approval_outcome(&request.request_id).is_none());
+        assert_eq!(queue.poll(2)[0].request_id, request.request_id);
+    }
+
+    #[test]
+    fn stale_poll_cannot_retire_an_approval_queued_during_its_read() {
+        let queue = SignQueue::default();
+        let through = queue.approval_watermark();
+        let request = queue
+            .enqueue(
+                SignKind::Approval {
+                    attempt_id: "attempt".into(),
+                    approval_id: "approval".into(),
+                },
+                vec![0],
+                unix_now() + 60,
+            )
+            .unwrap();
+        queue.cancel_attempt("attempt", through);
+        assert!(queue.approval_outcome(&request.request_id).is_none());
+        assert_eq!(queue.poll(1)[0].request_id, request.request_id);
     }
 }

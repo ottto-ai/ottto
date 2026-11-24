@@ -461,13 +461,14 @@ impl SetupRunServer<'_> {
 
     fn cancel(&self, run: &BoundRun, id: &str, deadline: Instant) -> Result<Value, Failure> {
         let mut attempt = self.signed_attempt(run, "DELETE", "cancel", Some(id), None, deadline)?;
-        sign_queue().cancel_attempt(id);
+        sign_queue().cancel_attempt(id, u64::MAX);
         remove_approval(&mut attempt);
         Ok(attempt)
     }
 
     fn poll(&self, id: &str, account: &str, deadline: Instant) -> Result<Value, Failure> {
         let run = self.bound_run().map_err(server_failure)?;
+        let approvals_before_read = sign_queue().approval_watermark();
         let mut attempt = self.read_attempt(Some(&run), id, deadline)?;
         let approval = attempt
             .as_object_mut()
@@ -479,7 +480,7 @@ impl SetupRunServer<'_> {
             return Err(account_mismatch());
         }
         if attempt["state"] != "cli_approval" {
-            sign_queue().cancel_attempt(id);
+            sign_queue().cancel_attempt(id, approvals_before_read);
             return Ok(attempt);
         }
         let Some(approval) = approval.filter(|approval| !approval.is_null()) else {

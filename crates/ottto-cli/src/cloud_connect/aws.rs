@@ -1,6 +1,8 @@
 //! AWS CLI subprocesses and their attempt-local credential session.
 
-use super::{invalid_server, sleep_until, timed_out, Failure};
+mod interrupt;
+
+use super::{invalid_server, remaining, sleep_until, timed_out, Failure};
 use ottto_protocol::{cloud_account_id, CLOUD_CONNECT_REGION};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -119,6 +121,10 @@ impl Aws {
             return Err(unsupported());
         }
         Ok(aws)
+    }
+
+    pub(super) fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
     }
 
     fn command(&self) -> Command {
@@ -344,10 +350,13 @@ fn take_pipe(
     pipe: &mpsc::Receiver<PipeData>,
     deadline: Instant,
 ) -> Result<Zeroizing<Vec<u8>>, Failure> {
-    match pipe.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(Ok(bytes)) => Ok(bytes),
-        Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => Err(invalid_server()),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
+    loop {
+        interrupt::check()?;
+        match pipe.recv_timeout(remaining(deadline)?.min(Duration::from_millis(25))) {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Err(invalid_server()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
@@ -356,6 +365,9 @@ fn run(mut command: Command, deadline: Instant) -> Result<Output, Failure> {
     if Instant::now() >= deadline {
         return Err(timed_out());
     }
+    let _signals = interrupt::InterruptGuard::install()
+        .map_err(|_| Failure::new("internal", "Could not supervise AWS CLI v2.", "none"))?;
+    interrupt::check()?;
     let mut child = command.spawn().map_err(|_| {
         aws_failure(
             "aws_cli_missing",
@@ -371,6 +383,7 @@ fn run(mut command: Command, deadline: Instant) -> Result<Output, Failure> {
         let stdout = take_pipe(&stdout, deadline)?;
         let stderr = take_pipe(&stderr, deadline)?;
         loop {
+            interrupt::check()?;
             if let Some(status) = child.try_wait().map_err(|_| invalid_server())? {
                 return Ok(Output {
                     status,
@@ -394,7 +407,15 @@ fn stop_child(mut child: Child) {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
     let _ = child.kill();
-    // Reap without letting a blocked kernel operation extend the frontend deadline.
+    // Reap promptly when possible. A subprocess blocked in the kernel must
+    // not keep the CLI alive after its deadline.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     thread::spawn(move || {
         let _ = child.wait();
     });
@@ -466,5 +487,27 @@ mod tests {
         );
         assert!(!aws_variables.contains_key(std::ffi::OsStr::new("AWS_PROFILE")));
         assert!(!aws_variables.contains_key(std::ffi::OsStr::new("AWS_ENDPOINT_URL")));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn interruption_stops_the_aws_subprocess_group() {
+        let aws = Aws {
+            path: PathBuf::from("/bin/sh"),
+            profile: None,
+            verbose: false,
+        };
+        for (shell_signal, reason) in [("INT", "sigint"), ("TERM", "sigterm")] {
+            let mut command = aws.command();
+            command.args([
+                "-c",
+                &format!("kill -{shell_signal} \"$PPID\"; exec /bin/sleep 30"),
+            ]);
+            let result = run(command, Instant::now() + Duration::from_secs(5));
+            let Err(error) = result else {
+                panic!("the AWS subprocess must be interrupted");
+            };
+            assert_eq!(error.code, "interrupted");
+            assert_eq!(error.reason.as_deref(), Some(reason));
+        }
     }
 }
