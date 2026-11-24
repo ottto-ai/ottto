@@ -1914,9 +1914,9 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert_eq!(receipt(&resumed, &sibling), receipt(&cold, &cold_sibling));
 }
 
-/// [money] c01's identity-positive control (two accounts, a side call, an
-/// evidence gap, the effort tag) through the changed transition. At a moved
-/// destination, every head already holds its usage: each body is answered
+/// [money] `c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags`'s identity-positive
+/// control (two accounts, a side call, an evidence gap, the effort tag) through the changed
+/// transition. At a moved destination, every head already holds its usage: each body is answered
 /// `usage_identical` and held, with the same body and the same account split
 /// as the cold offer, and nothing is accepted. Growth then earns its own
 /// exact ACK. Its body, placement and account split equal a cold Full of the

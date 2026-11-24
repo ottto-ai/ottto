@@ -945,7 +945,7 @@ fn unproven_root_removal_stays_red_and_restored_files_skip() {
 /// removed entries stay indexed; the held session keeps its accepted body.
 /// The release catches it up cold-equal, leaves the generation healthy and
 /// retires the removed entries through tombstones. A symlinked removed root
-/// (C1b, canonical keys stay witnesses) and a configured missing root (C1c)
+/// (canonical keys stay witnesses) and a configured missing root
 /// keep the generation red after the release.
 #[test]
 fn removed_root_drain_waits_for_the_inventory_hold() {

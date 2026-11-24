@@ -9095,7 +9095,7 @@ fn account_from_legacy_auth_status(
     account
 }
 
-/// T8: the plan comes from the stored login's `subscriptionType` and the
+/// The plan comes from the stored login's `subscriptionType` and the
 /// `.claude.json` refinements, and the account matches what `claude auth
 /// status` produced, for Max 20x and Team Premium. No CLI runs.
 #[test]

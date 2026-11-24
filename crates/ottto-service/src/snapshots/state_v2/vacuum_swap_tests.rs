@@ -209,7 +209,7 @@ fn next_attempt(path: &Path, identity: &Identity, before: &[(Header, Vec<u8>)], 
 #[test]
 fn erasure_swap_faults_keep_custody_for_every_source() {
     // (row, seam, post-close: the store must reload)
-    // `close` is W2: the seam fails just before `Connection::close` (not a
+    // `close` is the pre-close fault: the seam fails just before `Connection::close` (not a
     // real close error), with the copy validated and the store still open.
     const ROWS: [(&str, Option<&str>, bool); 7] = [
         ("W1", None, false),

@@ -1376,7 +1376,7 @@ fn opening_call_ids_are_the_only_l_span_and_request_keys_are_digests() {
     assert!(!state.parts_unmeasurable);
 }
 
-/// F1: `ConfigDigest` is a reversible rolling digest of instruction text,
+/// `ConfigDigest` is a reversible rolling digest of instruction text,
 /// so it is content (`X`) on both sources: an encoded record carries none
 /// of its state (the body equals the body of the same state with every
 /// config digest cleared), a decoded record has none, and the Claude

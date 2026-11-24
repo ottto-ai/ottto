@@ -1166,7 +1166,7 @@ crate::durable_tail_codec::durable_struct!(OccurrenceReducer {
     L closed_turns: VecDeque<String>,
     // A membership filter over closed turn ids: a nested type whose one
     // field is L (provider ids; it carries strictly less than the ids, so
-    // it is L, not H (F1)).
+    // it is L, not H).
     D closed_filter: Option<ClosedTurnFilter>,
     N counters: OccurrenceCounters,
 });

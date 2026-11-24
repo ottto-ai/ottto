@@ -1,4 +1,4 @@
-//! F5–F7 route fixtures over native stores: the shipped import adapter writes,
+//! Route fixtures over native stores: the shipped import adapter writes,
 //! loads and saves every graph; these tests make no hydration parity claim.
 use super::*;
 use std::collections::BTreeSet;
@@ -186,7 +186,7 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
     crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
-/// [regress] F5: uninstall must not flock or latch a paused v1 import route.
+/// [regress] Uninstall must not flock or latch a paused v1 import route.
 #[test]
 fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
     let f = Fixture::new();

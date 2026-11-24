@@ -3707,7 +3707,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             };
             accounts.fallback = accounts.starting.clone();
             if settled || accounts.reconciled {
-                // Own request logins survive; only missing shares inherit RD47.
+                // Own request logins survive; only missing shares inherit the fallback account.
                 fold.entity.inherit_missing(accounts.fallback.clone());
             } else {
                 fold.entity.repartition(accounts.fallback.clone());

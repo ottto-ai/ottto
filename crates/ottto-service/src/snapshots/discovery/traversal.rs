@@ -848,7 +848,7 @@ fn refresh_retained_codex_directories(
     }
 }
 
-/// F5: queue `keys` again as census members of the generation that observed
+/// Queue `keys` again as census members of the generation that observed
 /// them. Each passes the ordinary candidate gate on a later page: one counted
 /// read. Keys not observed, already queued or outside every root are skipped.
 pub(in crate::snapshots) fn requeue_observed_keys(
@@ -886,7 +886,7 @@ pub(in crate::snapshots) fn requeue_observed_keys(
     traversal.pending_candidates.extend(owed);
 }
 
-/// F5, checkpoints an older binary wrote: once per process, queue again the
+/// Checkpoints an older binary wrote: once per process, queue again the
 /// files a retained generation observed but never indexed. Its partial
 /// checkpoint kept the page's traversal (file dequeued and observed) without
 /// the unacknowledged entry, so the file waited for the next generation (K7).

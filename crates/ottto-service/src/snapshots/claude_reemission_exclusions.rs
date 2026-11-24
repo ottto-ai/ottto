@@ -55,7 +55,7 @@ const MAX_CLOSED_DIGESTS: usize = 2 * MAX_LINES;
 /// 2026-10-21T00:00:00Z. Before the list was ever installed, entities first
 /// indexed before this instant are not re-emitted by adoption. This is the
 /// revision 2 row's cutoff; each revision carries its own in the history
-/// policy table (F4b).
+/// policy table.
 pub(super) const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
 /// Family roots one pass remembers as walked. Past it, a
 /// family is walked again for each of its candidates: slower, never skipped.
@@ -294,7 +294,7 @@ impl ReemissionExclusions {
         self.holds_without_list_before(first_indexed_unix_seconds, NO_LIST_HOLD_BEFORE_UNIX_SECONDS)
     }
 
-    /// The same hold against one revision's cutoff (F4b).
+    /// The same hold against one revision's cutoff.
     pub(crate) fn holds_without_list_before(
         &self,
         first_indexed_unix_seconds: Option<u64>,

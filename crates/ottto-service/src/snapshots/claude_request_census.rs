@@ -37,7 +37,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-// N1 diagnostics only: process totals on the existing local census line.
+// Diagnostics only: process totals on the existing local census line.
 // Reloading a held record does not enter it again; a lost/over-budget record
 // is not a successful clearance. No persisted or uploaded bookkeeping.
 // Slots: entered, cleared.
@@ -291,7 +291,7 @@ impl ClaudeRequestCensusRecord {
         self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
     }
 
-    /// Not source-verified (S2, prefix-certified reads included) or a path
+    /// Not source-verified (prefix-certified reads included) or a path
     /// twin: never complete evidence for a negative claim.
     pub(crate) fn is_twin(&self) -> bool {
         self.twin
@@ -412,7 +412,7 @@ impl ClaudeRequestCensusRecord {
             )
             && fingerprint_matches(self, fp)
     }
-    /// Strict freshness (Sol N6): this record is the current census of the
+    /// Strict freshness: this record is the current census of the
     /// entry whose fingerprint is `entry_fingerprint`. Lossy, identity
     /// incomplete, unverified, over-budget, retired or other-derivation
     /// records are unknown, never current.
@@ -2028,7 +2028,7 @@ pub(crate) enum ClaudeCensusMemberStatus {
     SharesHash,
     /// The own family is census-unknown.
     FamilyUnknown,
-    /// Covered, but by a record that may not back a positive verdict (S2(a)).
+    /// Covered, but by a record that may not back a positive verdict.
     Unverified,
     /// The predicate is false, or the own record is missing or inert.
     Unobserved,

@@ -588,7 +588,7 @@ fn newest_session_start_wins_over_recent_activity() {
         chosen
     );
     // Once that start is sent it is one observation: a week later it is
-    // still not replayed (BR3) and frees its slot for other repositories;
+    // still not replayed and frees its slot for other repositories;
     // another destination still needs it.
     let week_ago = OffsetDateTime::now_utc() - time::Duration::days(8);
     write_json_atomic(

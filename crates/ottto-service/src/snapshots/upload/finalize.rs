@@ -353,7 +353,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
             index
                 .carry_upload_context_receipt(&pending.index_key, &pending.source_file_fingerprint);
         }
-        // P2: the file receipt only from this complete parse of the current
+        // The file receipt only from this complete parse of the current
         // revision that found exactly the carried accepted set, every entity
         // stamp-proven with its body, under the A1-A3 exclusions.
         if receipt_eligible

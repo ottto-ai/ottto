@@ -226,7 +226,7 @@ fn forked_first_line_is_removed_once() {
     remove(&paths);
 }
 
-/// [money] T13: a zero-usage held id before the first own turn, in the
+/// [money] A zero-usage held id before the first own turn, in the
 /// grain of a later own response (and, second, in no counted grain), is
 /// never dropped: nothing is subtracted, the own response still counts.
 #[test]

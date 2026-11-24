@@ -432,7 +432,7 @@ fn presence(
         .collect()
 }
 
-/// R7b: alternation, restart (the stored reading round-trips through
+/// Alternation, restart (the stored reading round-trips through
 /// JSON) and A→B→A never toggle presence, `grants`, `grants_state` or
 /// `status`; a re-sent section keeps its original read times.
 #[test]

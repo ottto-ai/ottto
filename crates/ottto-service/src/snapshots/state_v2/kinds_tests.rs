@@ -1284,7 +1284,7 @@ fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
     }
 }
 
-/// [money] H8. Past both old caps (65,537 records; one record holding one
+/// [money] Past both old caps (65,537 records; one record holding one
 /// hash more than the old 2,097,152 cap), the census survives a v2 save and
 /// hydrate whole, and the restored graph's v1 bytes decode to it too. The
 /// synthetic keys have no index entry: held-new custody restores as well.
@@ -1322,7 +1322,7 @@ fn no_cap_money_survives_v1_v2_restore() {
     assert_eq!(v1.claude_request_census, index.claude_request_census);
 }
 
-/// [format] H10. Transcript records as an older release wrote them (every
+/// [format] Transcript records as an older release wrote them (every
 /// field and shape, retired and over-budget included) decode through the v1
 /// index map, write back byte-identical, and hydrate from v2 rows to the
 /// same records: one record codec for both stores.

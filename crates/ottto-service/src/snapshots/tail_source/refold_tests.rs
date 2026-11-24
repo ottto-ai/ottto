@@ -53,7 +53,7 @@ fn fresh(route: &Route, path: &Path) -> Vec<SnapshotItem> {
     native.unwrap().snapshots
 }
 
-/// [money] SOURCE (a), golden: every selection that continues an unchanged
+/// [money] Golden: every selection that continues an unchanged
 /// file from stored state reads no transcript byte, and its wire bodies and
 /// envelopes equal a fresh native read's, byte for byte. A grown file selected
 /// by a quarantine retry reads only past the sealed offset, and its body and
@@ -103,7 +103,7 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
     assert_eq!(money, cold(&route, &path));
 }
 
-/// [money] SOURCE (c): a body that waits on a server retry with no head-CAS
+/// [money] A body that waits on a server retry with no head-CAS
 /// answer owed re-folds from stored state for every late-evidence selection:
 /// an identity deferral (503), a non-permanent rejection and a refusal
 /// re-offer lease each resend the same body, so the re-fold reads no
@@ -305,9 +305,9 @@ fn a_cleared_challenge_continues_from_the_tail() {
     assert_eq!(wire(&grown.unwrap().snapshots), wire(&fresh(&route, &path)));
 }
 
-/// [money] SOURCE (b): stored state incomplete for the file never re-folds.
+/// [money] Stored state incomplete for the file never re-folds.
 /// A set-aside file reads natively for late evidence (an append still resumes
-/// from its head, A5); a file with no head is a counted bootstrap Full.
+/// from its head); a file with no head is a counted bootstrap Full.
 #[test]
 fn incomplete_stored_state_never_refolds() {
     let mut route = route();

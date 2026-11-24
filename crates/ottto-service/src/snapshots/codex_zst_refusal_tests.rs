@@ -53,7 +53,7 @@ pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -
     result
 }
 
-/// §13: a pass flushes one sparse line when the counters changed, none when not.
+/// A pass flushes one sparse line when the counters changed, none when not.
 #[test]
 fn refusals_flush_one_sparse_line_per_changed_pass_and_none_when_unchanged() {
     use crate::local_resource_diagnostics::codex_zst_refused;

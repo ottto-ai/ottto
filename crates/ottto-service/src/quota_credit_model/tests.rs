@@ -785,7 +785,7 @@ fn disabled_balance_shape_and_reason_code() {
     assert_eq!(silent.disabled_reason, None);
 }
 
-// ---- R7b SectionCache sequences -------------------------------------------
+// ---- SectionCache sequences -------------------------------------------
 
 /// The Claude usage-credit balance as the adapter reports it switched off.
 fn usage_credits(observed_at: &str) -> AgentCreditBalance {

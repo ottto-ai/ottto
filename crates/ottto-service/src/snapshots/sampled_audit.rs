@@ -762,7 +762,7 @@ mod provenance_tests {
         assert!(!index.files["file"].has_unverified_source());
     }
 
-    /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
+    /// `record` carries only an existing sampled stem. A replay-reset
     /// or legacy entry (never a prefix) re-recorded without
     /// verification or obligation becomes the clean identity; the same
     /// completion's FE mark still tags `p`.
@@ -2138,7 +2138,7 @@ mod growth_tests {
             0
         );
     }
-    /// [regress] N5: revalidation rewrote debt rows every generation.
+    /// [regress] Revalidation rewrote debt rows every generation.
     #[test]
     fn growth_revalidation_records_checked_status_once() {
         let fixture = Fixture::new();

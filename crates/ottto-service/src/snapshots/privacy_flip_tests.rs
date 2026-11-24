@@ -262,7 +262,7 @@ fn copy_prefix_reread_mode_flip_reads_nothing() {
     assert!(f.reads_nothing(), "a mode mark alone selects no read");
 }
 
-/// [money] T4: one entity shared by two files. Its proof follows the body
+/// [money] One entity shared by two files. Its proof follows the body
 /// delivered for it: the same body acknowledged through the alias under B
 /// keeps the untouched file owing delivery only in A -> B -> A. Additive
 /// evidence through the alias, which keeps the entity's hash, selects no read
@@ -380,7 +380,7 @@ fn shared_entity_body_not_context_decides_the_untouched_alias() {
     );
 }
 
-/// [behaviour] T5: values persisted by the previous binary. A traversal and
+/// [behaviour] Values persisted by the previous binary. A traversal and
 /// carry origin bound to the active delivery context and replay generation
 /// are rewritten to the new form; one bound to another context keeps today's
 /// mismatch, which starts the walk. Tier receipts and archive contexts are
@@ -458,7 +458,7 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
     }
 }
 
-/// [behaviour] T9: links are collected whatever the toggle says, and the toggle
+/// [behaviour] Links are collected whatever the toggle says, and the toggle
 /// decides the wire.
 #[test]
 fn links_are_scraped_with_links_off_and_absent_on_the_wire() {
@@ -489,7 +489,7 @@ fn links_are_scraped_with_links_off_and_absent_on_the_wire() {
         .contains("pull/0"));
 }
 
-/// [behaviour] T9: the server's limit, 512 characters, applies at upload;
+/// [behaviour] The server's limit, 512 characters, applies at upload;
 /// nothing is dropped locally and the item is still sent.
 #[test]
 fn over_limit_link_is_dropped_only_at_upload() {
