@@ -51,12 +51,12 @@ impl CloudTemplatePin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudConnectFailure {
     pub code: String,
-    pub message: String,
+    pub message: Box<str>,
     pub next_action: String,
     #[serde(default)]
     pub retryable: bool,
-    pub reason: Option<String>,
-    pub connect_url: Option<String>,
+    pub reason: Option<Box<str>>,
+    pub connect_url: Option<Box<str>>,
     pub retry_after_seconds: Option<u64>,
 }
 

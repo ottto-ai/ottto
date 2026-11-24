@@ -270,62 +270,60 @@ impl SetupRunServer<'_> {
         proof: Option<&str>,
         deadline: Instant,
     ) -> Result<Value, Failure> {
-        let result = self
-            .call_bound(run, |prefix, token| {
-                let Ok(timeout) = remaining(deadline) else {
-                    return Ok(Err(timeout()));
-                };
-                let url = format!("{prefix}/{resource}");
-                let mut request = crate::retry_tls::credential_agent()
-                    .request(method, &url)
-                    .set("Accept", "application/json")
-                    .set("X-Ottto-Setup-Run-Token", token)
-                    .timeout(timeout.min(Duration::from_secs(20)));
-                if let Some(proof) = proof {
-                    request = request.set("X-Ottto-Device-Proof", proof);
-                }
-                let result = match body {
-                    Some(body) => request
-                        .set("Content-Type", "application/json")
-                        .send_bytes(body),
-                    None => request.call(),
-                };
-                let response = match result {
-                    Ok(response) => backend_success(&url, response)?,
-                    Err(ureq::Error::Status(status, response)) => {
-                        let value: Value = response.into_json().unwrap_or(Value::Null);
-                        if value["code"] == "setup_run_token_invalid" && status == 401 {
-                            return Err(LocalApiError::Backend(crate::BackendErrorDetails {
-                                kind: crate::BackendErrorKind::Rejected,
-                                endpoint: resource.to_string(),
-                                status: Some(status),
-                                body_excerpt: None,
-                                reason_code: Some("setup_run_token_invalid".into()),
-                            }));
-                        }
-                        if let Ok(error) = serde_json::from_value::<Failure>(value) {
-                            return Ok(Err(error));
-                        }
-                        return Ok(Err(server_failure(ServerError {
-                            code: if status >= 500 {
-                                "server_unavailable"
-                            } else {
-                                "server_rejected"
-                            }
-                            .into(),
+        self.call_bound(run, |prefix, token| {
+            let Ok(timeout) = remaining(deadline) else {
+                return Ok(Err(timeout()));
+            };
+            let url = format!("{prefix}/{resource}");
+            let mut request = crate::retry_tls::credential_agent()
+                .request(method, &url)
+                .set("Accept", "application/json")
+                .set("X-Ottto-Setup-Run-Token", token)
+                .timeout(timeout.min(Duration::from_secs(20)));
+            if let Some(proof) = proof {
+                request = request.set("X-Ottto-Device-Proof", proof);
+            }
+            let result = match body {
+                Some(body) => request
+                    .set("Content-Type", "application/json")
+                    .send_bytes(body),
+                None => request.call(),
+            };
+            let response = match result {
+                Ok(response) => backend_success(&url, response)?,
+                Err(ureq::Error::Status(status, response)) => {
+                    let value: Value = response.into_json().unwrap_or(Value::Null);
+                    if value["code"] == "setup_run_token_invalid" && status == 401 {
+                        return Err(LocalApiError::Backend(crate::BackendErrorDetails {
+                            kind: crate::BackendErrorKind::Rejected,
+                            endpoint: resource.to_string(),
                             status: Some(status),
-                            outcome_unknown: status >= 500,
-                        })));
+                            body_excerpt: None,
+                            reason_code: Some("setup_run_token_invalid".into()),
+                        }));
                     }
-                    Err(error) => return Err(backend_error_from_ureq(&url, error)),
-                };
-                response
-                    .into_json()
-                    .map(Ok)
-                    .map_err(|error| backend_response_unexpected(&url, error.to_string()))
-            })
-            .map_err(server_failure)?;
-        result
+                    if let Ok(error) = serde_json::from_value::<Failure>(value) {
+                        return Ok(Err(error));
+                    }
+                    return Ok(Err(server_failure(ServerError {
+                        code: if status >= 500 {
+                            "server_unavailable"
+                        } else {
+                            "server_rejected"
+                        }
+                        .into(),
+                        status: Some(status),
+                        outcome_unknown: status >= 500,
+                    })));
+                }
+                Err(error) => return Err(backend_error_from_ureq(&url, error)),
+            };
+            response
+                .into_json()
+                .map(Ok)
+                .map_err(|error| backend_response_unexpected(&url, error.to_string()))
+        })
+        .map_err(server_failure)?
     }
 
     fn signed_attempt(

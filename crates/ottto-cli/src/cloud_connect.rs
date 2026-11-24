@@ -158,7 +158,7 @@ impl ResultState {
             .map_or("none", |error| error.next_action.as_str());
         let message = error.as_ref().map_or_else(
             || message.unwrap_or_default(),
-            |error| error.message.as_str(),
+            |error| error.message.as_ref(),
         );
         let connect_url = if action == "approve_in_browser" {
             self.browser_url.as_deref()
@@ -554,7 +554,7 @@ fn check_features(status: &Value) -> Result<(), Failure> {
             "Open Ottto Settings and set up command-line connect.",
             "set_up_on_mac",
         );
-        error.reason = string(&status["agent_connect"]["keys"], "reason").map(str::to_owned);
+        error.reason = string(&status["agent_connect"]["keys"], "reason").map(Into::into);
         return Err(error);
     }
     Ok(())
@@ -705,7 +705,7 @@ fn new_request_id() -> Result<String, Failure> {
 fn normalize_error(mut error: Failure) -> Failure {
     if error.code == "use_web" {
         if let Some(reason) = &error.reason {
-            error.code.clone_from(reason);
+            error.code = reason.to_string();
         }
     }
     let action = match error.code.as_str() {
