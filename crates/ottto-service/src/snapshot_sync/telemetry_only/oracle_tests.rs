@@ -876,3 +876,42 @@ fn telemetry_growth_uses_saved_ack_then_rebuilds_to_answer_a_conflict_without_a_
         }
     });
 }
+
+/// [format] A real telemetry-only row sends no counted request position on
+/// the wire, even with every one of them set on its body.
+#[test]
+fn telemetry_only_row_sends_no_counted_request_position() {
+    with_e2(|| {
+        let c = Corpus::new("otel-only-counted-positions");
+        positive(&c);
+        let page = build(&c, &mut progress());
+        let mut item = only(&page).clone();
+        item.context_request_count = Some(12);
+        item.compaction_events = vec![crate::snapshots::SnapshotCompactionEvent {
+            at: "2026-10-07T10:00:00Z".into(),
+            before: Some(1_000),
+            after: Some(100),
+            request_index: Some(4),
+            trigger: None,
+        }];
+        item.session_start = Some(Box::new(crate::snapshots::SnapshotSessionStart {
+            counted_request_10_context_tokens: Some(1_000),
+            counted_request_20_context_tokens: Some(2_000),
+            counted_request_50_context_tokens: Some(5_000),
+            ..Default::default()
+        }));
+        assert!(crate::snapshots::has_counted_request_positions(&item));
+        let wire = encode(&request(std::slice::from_ref(&item))).unwrap();
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("\"evidence_basis\":\"otel_only\""));
+        for key in [
+            "context_request_count",
+            "request_index",
+            "counted_request_10_context_tokens",
+            "counted_request_20_context_tokens",
+            "counted_request_50_context_tokens",
+        ] {
+            assert!(!wire.contains(key), "{key}");
+        }
+    });
+}

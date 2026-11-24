@@ -148,10 +148,11 @@ thread_local! {
 /// The body fields (as `money_oracle::diff` paths) a request id reported by
 /// two families' side files can change: one pass over the page sees both
 /// owners and withholds ROOT's context posture; a chunk sees one and admits
-/// it. Seventeen posture fields and the fingerprint.
+/// it. Twenty-one posture fields and the fingerprint.
 const CONTEXT_FIELDS: &[&str] = &[
     "/cache_observations",
     "/compaction_count",
+    "/context_request_count",
     "/first_own_request_at",
     "/first_turn_context_tokens",
     "/last_turn_context_tokens",
@@ -167,6 +168,9 @@ const CONTEXT_FIELDS: &[&str] = &[
     "/session_start/opening_truncated_outputs",
     "/session_start/request_2_context_tokens",
     "/session_start/request_3_context_tokens",
+    "/session_start/counted_request_10_context_tokens",
+    "/session_start/counted_request_20_context_tokens",
+    "/session_start/counted_request_50_context_tokens",
     "/snapshot_fingerprint",
 ];
 
@@ -177,6 +181,7 @@ fn match_context_posture(item: &mut SnapshotItem, from: &SnapshotItem) {
     item.peak_context_fill_tokens = from.peak_context_fill_tokens;
     item.first_turn_context_tokens = from.first_turn_context_tokens;
     item.last_turn_context_tokens = from.last_turn_context_tokens;
+    item.context_request_count = from.context_request_count;
     item.compaction_count = from.compaction_count;
     item.compaction_timestamps = from.compaction_timestamps.clone();
     item.compaction_events = from.compaction_events.clone();

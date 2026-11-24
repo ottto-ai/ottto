@@ -1562,3 +1562,6 @@ pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static 
 
 #[path = "tail_carry_tests.rs"]
 mod carry_tests;
+
+#[path = "tail_codex_matrix_tests.rs"]
+mod codex_matrix_tests;

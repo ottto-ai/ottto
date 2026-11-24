@@ -1768,6 +1768,7 @@ pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedByte
 pub(crate) struct PassOutcomes {
     pub(crate) selected: u64,
     pub(crate) accepted: u64,
+    pub(crate) counted_positions_trimmed_items: u64,
     pub(crate) index_saved: u64,
     pub(crate) progress_committed: u64,
     pub(crate) progress_unchanged: u64,
@@ -3637,6 +3638,7 @@ mod tests {
                     pass_outcomes(|counts| {
                         counts.selected = 5;
                         counts.accepted = 3;
+                        counts.counted_positions_trimmed_items += 2;
                         counts.index_saved = 1;
                         counts.progress_committed += 2;
                         counts.progress_unchanged += 1;
@@ -3653,6 +3655,7 @@ mod tests {
             for (field, expected) in [
                 ("selected", 5_u64),
                 ("accepted", 3),
+                ("counted_positions_trimmed_items", 2),
                 ("index_saved", 1),
                 ("progress_committed", 2),
                 ("progress_unchanged", 2),

@@ -787,7 +787,8 @@ impl HeaderInventory {
             let carried_hit = carried.is_some();
             let joined_archive = if !carried_hit && joined {
                 lookups += 1;
-                state_v2::load_head(index, &key, 1)?
+                // Common facts only: any stored reduction revision serves.
+                state_v2::load_head(index, &key, u32::MAX)?
                     .filter(|head| {
                         head.common
                             .inventory
@@ -1219,7 +1220,8 @@ pub(super) fn stage_independent_inventory(
         let key = local_index_key(&member.path);
         let file = open_candidate_beneath_root(member)?;
         let stamp = sampled_scan::codex_cursor::OpenStamp::capture(&file)?.content_stamp();
-        let prior = state_v2::load_head(index, &key, 1)?;
+        // Common facts only: any stored reduction revision serves.
+        let prior = state_v2::load_head(index, &key, u32::MAX)?;
         let (representation, summary) = prior.map_or(
             (
                 state_v2::Representation::Archive,

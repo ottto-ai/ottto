@@ -456,6 +456,17 @@ impl SnapshotAccumulator {
                 self.cache_requests_complete,
             ));
         }
+        // Codex counts while it reads the owned prefix. Claude's total comes
+        // from the ownership fold, which must match this tentative count for
+        // the opening sizes at counted positions to stay.
+        let counted_sizes = self.counted_requests.map(|counted| counted.sizes());
+        let (context_request_count, claude_counted_request_candidates) = match self.source {
+            SnapshotSource::Codex => (self.counted_requests.map(|counted| counted.count()), None),
+            SnapshotSource::ClaudeCode => {
+                (None, self.counted_requests.map(|counted| counted.count()))
+            }
+            SnapshotSource::Pi => (None, None),
+        };
         let session_start = match self.source {
             SnapshotSource::ClaudeCode => std::mem::take(&mut *self.session_start).finish(
                 true,
@@ -463,6 +474,7 @@ impl SnapshotAccumulator {
                 session_start::CLAUDE_PARTS_METHOD,
                 attribution_context,
                 crate::context_file_counts::device_salt().as_ref(),
+                counted_sizes,
             ),
             SnapshotSource::Codex => std::mem::take(&mut *self.session_start).finish(
                 !self.codex_is_fork,
@@ -470,6 +482,7 @@ impl SnapshotAccumulator {
                 session_start::CODEX_PARTS_METHOD,
                 attribution_context,
                 crate::context_file_counts::device_salt().as_ref(),
+                counted_sizes,
             ),
             _ => None,
         }
@@ -537,6 +550,8 @@ impl SnapshotAccumulator {
             } else {
                 None
             },
+            context_request_count,
+            claude_counted_request_candidates,
             // Codex only, and each only beside its own emitted watermark.
             first_turn_context_window_tokens: self.first_turn_context_window_tokens.filter(|_| {
                 self.source == SnapshotSource::Codex && self.first_turn_context_tokens.is_some()

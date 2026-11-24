@@ -134,8 +134,18 @@ impl Route {
     pub(in crate::snapshots::tail_source) fn save(&mut self, claim_only: bool) {
         state_v2::save_locked(&self.path, &mut self.index, claim_only).unwrap();
     }
+    /// The committed head at any revision a current codec writes.
     pub(in crate::snapshots::tail_source) fn head(&self, key: &str) -> Option<TailHead> {
-        state_v2::load_head(&self.index, key, Claude::REDUCTION_REVISION).unwrap()
+        let newest = [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ]
+        .map(super::super::reduction_revision)
+        .into_iter()
+        .max()
+        .unwrap();
+        state_v2::load_head(&self.index, key, newest).unwrap()
     }
     pub(in crate::snapshots::tail_source) fn marker(&self, key: &str) -> Option<SetAside> {
         state_v2::tail_set_aside(&self.index, key).unwrap()

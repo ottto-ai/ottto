@@ -549,6 +549,17 @@ pub(crate) mod money_oracle {
         }
     }
     pub(crate) fn assert_equivalent(cold: &RouteResult, other: &RouteResult) {
+        equivalent(cold, other, false);
+    }
+    /// `assert_equivalent` for a Codex route that may resume a head written
+    /// at reduction revision 1: a body there carries none of the five counted
+    /// request positions, and the cold Full's are set aside for it. A body
+    /// with any position compares exactly, as does everything else.
+    pub(crate) fn assert_equivalent_resuming_revision_one(cold: &RouteResult, other: &RouteResult) {
+        assert_eq!(cold.source, SnapshotSource::Codex);
+        equivalent(cold, other, true);
+    }
+    fn equivalent(cold: &RouteResult, other: &RouteResult, resumes_revision_one: bool) {
         assert_placement_equivalent(cold, other);
         assert_eq!(cold.source, other.source);
         assert!(
@@ -574,9 +585,13 @@ pub(crate) mod money_oracle {
             &other.codex_evidence,
             &mut differences,
         );
+        let mut cold_normalized = cold.normalized.clone();
+        if resumes_revision_one {
+            set_aside_unknown_positions(&mut cold_normalized, &other.normalized);
+        }
         diff(
             "normalized_batch",
-            &cold.normalized,
+            &cold_normalized,
             &other.normalized,
             &mut differences,
         );
@@ -588,10 +603,92 @@ pub(crate) mod money_oracle {
             differences.join("\n")
         );
         assert_eq!(
-            crate::canonical_json::canonicalize(&cold.normalized).unwrap(),
+            crate::canonical_json::canonicalize(&cold_normalized).unwrap(),
             crate::canonical_json::canonicalize(&other.normalized).unwrap(),
             "normalized bytes"
         );
+    }
+
+    /// Remove the five counted request positions from one wire body; whether
+    /// any was there.
+    fn strip_positions(snapshot: &mut Value) -> bool {
+        let mut present = false;
+        let mut remove = |object: &mut Value, keys: &[&str]| {
+            for key in keys {
+                present |= object
+                    .as_object_mut()
+                    .is_some_and(|object| object.remove(*key).is_some());
+            }
+        };
+        remove(snapshot, &["context_request_count"]);
+        if let Some(start) = snapshot.get_mut("session_start") {
+            let sizes = [
+                "counted_request_10_context_tokens",
+                "counted_request_20_context_tokens",
+                "counted_request_50_context_tokens",
+            ];
+            remove(start, &sizes);
+        }
+        let events = snapshot.get_mut("compaction_events");
+        for event in events.and_then(Value::as_array_mut).into_iter().flatten() {
+            remove(event, &["request_index"]);
+        }
+        present
+    }
+
+    /// Each cold body whose counterpart in `other` carries no counted request
+    /// position loses its own (a Tail on a revision-1 head knows none).
+    fn set_aside_unknown_positions(cold: &mut Value, other: &Value) {
+        let batches = cold.as_array_mut().into_iter().flatten();
+        for (batch, other) in batches.zip(other.as_array().into_iter().flatten()) {
+            let snapshots = batch.get_mut("snapshots").and_then(Value::as_array_mut);
+            let others = other.get("snapshots").and_then(Value::as_array);
+            for (snapshot, other) in snapshots
+                .into_iter()
+                .flatten()
+                .zip(others.into_iter().flatten())
+            {
+                if !strip_positions(&mut other.clone()) {
+                    strip_positions(snapshot);
+                }
+            }
+        }
+    }
+
+    /// [behaviour] The exact comparator fails on one missing counted size;
+    /// the revision-1 comparator accepts a body that knows no position and
+    /// still fails a body that lost only some.
+    #[test]
+    fn counted_positions_compare_exactly_unless_all_unknown() {
+        let batch = |snapshot: Value| json!([{ "snapshots": [snapshot] }]);
+        let cold = batch(json!({
+            "context_request_count": 12,
+            "compaction_events": [{"at": "a", "before": 9, "request_index": 11}],
+            "session_start": {"client_version": "1", "counted_request_10_context_tokens": 9},
+        }));
+        let mut missing_size = cold.clone();
+        missing_size[0]["snapshots"][0]["session_start"]
+            .as_object_mut()
+            .unwrap()
+            .remove("counted_request_10_context_tokens");
+        let mut unknown = cold.clone();
+        assert!(strip_positions(&mut unknown[0]["snapshots"][0]));
+        assert!(!strip_positions(&mut unknown[0]["snapshots"][0].clone()));
+        for (label, other, resumes, equal) in [
+            ("exact, missing size", &missing_size, false, false),
+            ("exact, all unknown", &unknown, false, false),
+            ("revision 1, missing size", &missing_size, true, false),
+            ("revision 1, all unknown", &unknown, true, true),
+            ("revision 1, same", &cold, true, true),
+        ] {
+            let mut compared = cold.clone();
+            if resumes {
+                set_aside_unknown_positions(&mut compared, other);
+            }
+            let mut differences = Vec::new();
+            diff("normalized_batch", &compared, other, &mut differences);
+            assert_eq!(differences.is_empty(), equal, "{label}: {differences:?}");
+        }
     }
 
     // Placement oracle: keep this block beside the existing totals comparator.
