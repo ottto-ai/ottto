@@ -2,6 +2,46 @@
 //! process-global diagnostic drain used concurrently by other scanner tests.
 use super::*;
 
+type Holders = BTreeMap<LocationKey, Option<LocationKey>>;
+
+thread_local! {
+    static HOLDERS: std::cell::RefCell<Option<Holders>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn record_holder(file: LocationKey, first: Option<&(i128, LocationKey)>) {
+    HOLDERS.with_borrow_mut(|capture| {
+        if let Some(holders) = capture {
+            holders.insert(file, first.map(|(_, location)| *location));
+        }
+    });
+}
+
+pub(crate) fn capture_holders<T>(run: impl FnOnce() -> T) -> (T, Holders) {
+    struct Reset(Option<Holders>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HOLDERS.with_borrow_mut(|capture| *capture = self.0.take());
+        }
+    }
+    let _reset = Reset(HOLDERS.with_borrow_mut(|capture| capture.replace(BTreeMap::new())));
+    let result = run();
+    (
+        result,
+        HOLDERS.with_borrow_mut(|capture| capture.take().unwrap()),
+    )
+}
+
+pub(crate) fn counted_ids(item: &SnapshotItem) -> BTreeSet<String> {
+    let fold = item.claude_money.as_deref().expect("native decision fold");
+    item.claude_usage_occurrences
+        .iter()
+        .filter(|(_, occurrence)| {
+            !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 pub(crate) fn root_fallbacks(items: &[SnapshotItem]) -> u64 {
     items
         .iter()

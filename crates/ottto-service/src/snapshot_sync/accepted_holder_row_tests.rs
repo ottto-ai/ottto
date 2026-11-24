@@ -42,14 +42,10 @@ fn contributions(items: &[SnapshotItem], progress: &mut SnapshotUploadProgress) 
 fn send(
     c: &Corpus,
     before: &ScanIndex,
-    mut page: Page,
+    page: Page,
     refused: Option<&str>,
 ) -> (ScanIndex, Vec<SnapshotItem>, SnapshotUploadProgress) {
-    let holds = page.finish();
-    let sent = page.scan.snapshots.clone();
-    let mut progress = e2_progress();
-    contributions(&sent, &mut progress);
-    upload(&sent, &mut progress, |items| {
+    let (index, sent, progress, _) = send_with_answer(c, before, page, |items| {
         let mut response = ack(items)?;
         for item in items
             .iter()
@@ -72,15 +68,33 @@ fn send(
                 });
         }
         Ok(response)
-    })
-    .0
-    .unwrap();
+    });
+    (index, sent, progress)
+}
+
+fn send_with_answer(
+    c: &Corpus,
+    before: &ScanIndex,
+    mut page: Page,
+    answer: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+) -> (
+    ScanIndex,
+    Vec<SnapshotItem>,
+    SnapshotUploadProgress,
+    Vec<Vec<u8>>,
+) {
+    let holds = page.finish();
+    let sent = page.scan.snapshots.clone();
+    let mut progress = e2_progress();
+    contributions(&sent, &mut progress);
+    let (status, wire, _) = upload(&sent, &mut progress, answer);
+    let status = status.unwrap();
     let mut settled = settle_checkpointed_upload(
         page.index,
         before,
         &progress,
         &holds,
-        true,
+        !matches!(status, ResumableUploadResult::Deferred { .. }),
         UnsettledUploadCause::DeferredConflict,
     );
     settle_index_after_upload(&mut settled.index, before, &progress);
@@ -90,7 +104,11 @@ fn send(
         &progress.fresh_context_body_acks,
     );
     settled.index.accept_request_contributions(&progress);
-    (c.reload(&mut settled.index), sent, progress)
+    (c.reload(&mut settled.index), sent, progress, wire)
+}
+
+mod money_equivalence_tests {
+    include!("claude_copy_decision_rows_tests.rs");
 }
 fn seed(c: &Corpus) -> ScanIndex {
     send(
