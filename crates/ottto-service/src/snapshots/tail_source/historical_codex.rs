@@ -8,14 +8,21 @@ pub(in crate::snapshots) enum Frozen {
     Legacy,
     V2,
     StickyLegacy,
+    /// Released revision-1 head with three markers and no counted curve.
+    RevisionOne,
 }
 
-fn decode(kind: Frozen) -> (SnapshotAccumulator, Vec<String>, DecodedHead) {
+pub(in crate::snapshots) fn decode(
+    kind: Frozen,
+) -> (SnapshotAccumulator, Vec<String>, DecodedHead) {
     let text = match kind {
         Frozen::Legacy => include_str!("../../../tests/fixtures/codex-counting/legacy-head.json"),
         Frozen::V2 => include_str!("../../../tests/fixtures/codex-counting/v2-head.json"),
         Frozen::StickyLegacy => {
             include_str!("../../../tests/fixtures/codex-counting/sticky-legacy-head.json")
+        }
+        Frozen::RevisionOne => {
+            include_str!("../../../tests/fixtures/codex-counting/revision-one-head.json")
         }
     };
     let frozen: Value = serde_json::from_str(text).unwrap();
@@ -47,12 +54,22 @@ fn decode(kind: Frozen) -> (SnapshotAccumulator, Vec<String>, DecodedHead) {
     }
     let id = HeadIdentity::take(&mut Dec::new(&bytes)).unwrap();
     let view = PreFinalization::new(&acc, &decoded.report, decoded.scalars);
+    // Revision 1 bytes stay exact; the re-encode only appends revision 2's
+    // extension, here with every counted position unknown.
+    assert_eq!(acc.counted_requests, None);
+    assert!(acc
+        .codex_compaction_sizes
+        .request_indices()
+        .iter()
+        .all(Option::is_none));
     assert_eq!(
         codex::Codex::encode_head(&view, &decoded.certificate, &id).unwrap(),
-        bytes,
+        [bytes.clone(), codex::counted_trailer_bytes(&acc)].concat(),
         "historical head bytes and shape must remain exact"
     );
-    assert_eq!(acc.codex_counting_v2(), matches!(kind, Frozen::V2));
+    if !matches!(kind, Frozen::RevisionOne) {
+        assert_eq!(acc.codex_counting_v2(), matches!(kind, Frozen::V2));
+    }
     (
         acc,
         serde_json::from_value(frozen["lines"].clone()).unwrap(),

@@ -169,7 +169,10 @@ mod codex_zst_refusal_tests;
 mod compaction_events;
 pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
-use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
+pub(crate) use compaction_events::{
+    clear_counted_request_positions, has_counted_request_positions,
+};
+use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes, CountedRequests};
 #[cfg(test)]
 mod codex_counting_v2_tests;
 use sources::codex::dictionary_slots as codex_dictionary_slots;
@@ -350,7 +353,9 @@ use sources::claude::context_posture::{
 
 mod wire;
 pub use wire::batch_validation::validate_snapshot_batch_request;
-pub(crate) use wire::batch_validation::validate_snapshot_batch_request_with_item_limit;
+pub(crate) use wire::batch_validation::{
+    snapshot_items_refused_at, validate_snapshot_batch_request_with_item_limit,
+};
 #[cfg(test)]
 use wire::content_hash::{
     policy_neutral_component_hashes, snapshot_content_hash, snapshot_content_identity_body,

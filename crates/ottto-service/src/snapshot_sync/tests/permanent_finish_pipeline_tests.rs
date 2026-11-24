@@ -810,6 +810,40 @@ pub(crate) mod once_credit_oracle_tests {
 thread_local! {
     static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COUNTED_CAP_BODY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Supply chart output after the identity fold, just before finish finalizes
+/// the upload body and fingerprint.
+pub(in crate::snapshot_sync) fn prepare_counted_cap_body_for_test(
+    source: SnapshotSource,
+    policy: SnapshotUploadPolicy,
+    items: &mut [SnapshotItem],
+) {
+    let Some(at_item_cap) = COUNTED_CAP_BODY.take() else {
+        return;
+    };
+    let [item] = items else {
+        panic!("expected one finish body");
+    };
+    crate::snapshots::clear_counted_request_positions(item);
+    if at_item_cap {
+        item.session_display_name = Some(String::new());
+        let mut wire = item.clone();
+        prepare_snapshot_cache_for_upload(&mut wire, &test_upload_progress(), false, false);
+        let request = snapshot_batch_request(
+            source,
+            "otm_test",
+            vec![&wire],
+            policy,
+            crate::client_report::ClientReport::empty(),
+        );
+        let json = serde_json::to_value(request).unwrap();
+        let bytes = serde_json::to_vec(&json["snapshots"][0]).unwrap().len();
+        let cap = crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+        item.session_display_name = Some("x".repeat(cap - bytes));
+    }
+    item.context_request_count = Some(item.request_count);
 }
 
 /// The cache producer's ownership proof is covered separately. Supply a
@@ -1184,6 +1218,49 @@ impl AckFinishHome {
                 &self.daemon,
             )
         })
+    }
+}
+
+/// [behaviour] The real finish posts one body with the chart count cleared
+/// only when its wire form would cross the item cap.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn finish_trims_counted_request_positions_only_at_the_item_cap() {
+    use crate::local_resource_diagnostics::{capture, source_finish};
+
+    for at_item_cap in [false, true] {
+        let server = AckScriptedServer::new();
+        let mut home = AckFinishHome::new(&server);
+        let (preparation, index, scan) = home.prepare("counted request positions");
+        COUNTED_CAP_BODY.set(Some(at_item_cap));
+        let (result, rows) = capture(|| {
+            source_finish("claude_code", false, || {
+                home.finish(preparation, index, scan)
+            })
+        });
+        result.unwrap();
+        let offered = server.offered.lock().unwrap();
+        assert_eq!(offered.len(), 1, "exactly one body reached a POST");
+        let sent_count = offered[0].get("context_request_count");
+        if at_item_cap {
+            assert!(sent_count.is_none());
+            assert_eq!(
+                serde_json::to_vec(&offered[0]).unwrap().len(),
+                crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
+            );
+        } else {
+            assert_eq!(sent_count, offered[0].get("request_count"));
+            assert!(sent_count.is_some());
+        }
+        let finish = rows
+            .iter()
+            .find(|row| row["stage"] == "source_finish")
+            .unwrap();
+        assert_eq!(
+            finish["counts"]["pass"]["counted_positions_trimmed_items"].as_u64(),
+            Some(u64::from(at_item_cap))
+        );
     }
 }
 

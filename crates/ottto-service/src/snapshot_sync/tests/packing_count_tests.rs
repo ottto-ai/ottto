@@ -299,3 +299,206 @@ fn snapshot_packing_count_refuses_length_overflow_without_wrapping() {
     assert_eq!(length.bytes, usize::MAX);
     assert_eq!(length.write(&[]).unwrap(), 0);
 }
+
+// ---- counted request positions at the item cap ------------------------------
+
+fn counted_request(snapshots: Vec<&SnapshotItem>) -> SnapshotBatchRequest<&SnapshotItem> {
+    crate::snapshot_sync::upload::snapshot_batch_request(
+        SnapshotSource::Codex,
+        "machine",
+        snapshots,
+        SnapshotUploadPolicy::default(),
+        crate::client_report::ClientReport::empty(),
+    )
+}
+
+/// Each body's wire bytes in `request`, its semantic envelope included: what
+/// the item preflight measures.
+fn counted_wire_sizes(request: &SnapshotBatchRequest<&SnapshotItem>) -> Vec<usize> {
+    let wire = serde_json::to_value(request).unwrap();
+    wire["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| serde_json::to_vec(item).unwrap().len())
+        .collect()
+}
+
+/// The Codex cache fixture body, with or without its cache patch and with no
+/// counted request position, padded to `room` wire bytes under the item cap.
+fn counted_cap_body(cache: bool, room: usize) -> SnapshotItem {
+    let cap = crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    assert!(item
+        .cache_observations
+        .as_ref()
+        .is_some_and(|patch| !patch.operations.is_empty()));
+    if !cache {
+        item.cache_observations = None;
+    }
+    crate::snapshots::clear_counted_request_positions(&mut item);
+    let pad = |item: &mut SnapshotItem, chars: usize| {
+        item.session_display_name = Some("x".repeat(chars));
+        item.snapshot_fingerprint =
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, item);
+        counted_wire_sizes(&counted_request(vec![&*item]))[0]
+    };
+    let bare = pad(&mut item, 0);
+    assert_eq!(pad(&mut item, cap - room - bare), cap - room);
+    item
+}
+
+/// `item` with a counted request total 45 wire bytes wide.
+fn with_counted_total(item: &SnapshotItem) -> SnapshotItem {
+    let mut item = item.clone();
+    item.context_request_count = Some(u64::MAX);
+    item
+}
+
+/// The ledger a pass leaves: ACKs, witnesses and every owed or held body.
+fn counted_ledger(progress: &SnapshotUploadProgress) -> Value {
+    json!({
+        "accepted": progress.accepted_fingerprints,
+        "witnesses": progress.accepted_body_witnesses,
+        "cache_states": progress.accepted_cache_states,
+        "pending_cache_heads": progress.pending_cache_heads,
+        "quarantined": progress.quarantined_fingerprints,
+        "permanent": progress.permanent_rejections,
+    })
+}
+
+/// One pass over `items` through the real selector, packer and ACK
+/// settlement, each POST behind the production item preflight: the bodies
+/// each POST sent, and the ledger after.
+fn counted_pass(
+    items: &[SnapshotItem],
+    mut progress: SnapshotUploadProgress,
+) -> (Vec<Vec<SnapshotItem>>, SnapshotUploadProgress) {
+    let cap = crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+    let mut posts = Vec::new();
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_literal_families(
+        items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |_| None,
+        |_| 0,
+        |_| None,
+        &mut InplaceRetryBudget::default(),
+        |batch| {
+            let request = counted_request(batch.to_vec());
+            crate::snapshot_sync::upload::preflight_snapshot_request(&request, cap, |sent, _| {
+                // The bytes the POST carries: every body within the cap.
+                assert!(counted_wire_sizes(sent).iter().all(|bytes| *bytes <= cap));
+                posts.push(sent.snapshots.iter().copied().cloned().collect());
+                Ok(accept_batch_with(batch, |item| item.snapshot_fingerprint.as_str()))
+            })
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Completed);
+    (posts, progress)
+}
+
+/// [money] [behaviour] Through the real selector, packer and item preflight,
+/// for a Codex body with and without a cache patch that fits the item cap
+/// only without its counted request positions: one POST sends it without
+/// them and otherwise unchanged (cache patch, fingerprint, witness), a small
+/// sibling in the same POST keeps its positions, and the ledger is the one
+/// the undecorated bodies leave. A body accepted before and now decorated
+/// only with positions is not offered at all.
+#[test]
+fn counted_positions_at_the_item_cap_never_refuse_or_offer() {
+    let cap = crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+    for (label, cache) in [("cache patch", true), ("no cache patch", false)] {
+        let plain = counted_cap_body(cache, 16);
+        let charted = with_counted_total(&plain);
+        assert_eq!(
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &charted),
+            plain.snapshot_fingerprint,
+            "{label}: positions stay outside the fingerprint"
+        );
+        let refused = |item: &SnapshotItem| {
+            let request = counted_request(vec![item]);
+            crate::snapshots::snapshot_items_refused_at(&request, cap, |_| true)
+        };
+        assert!(refused(&plain).is_empty(), "{label}");
+        assert_eq!(refused(&charted), [0], "{label}: only the positions cross");
+        let mut sibling = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        sibling.source_session_id = "00000000-0000-7000-8000-000000000002".into();
+        sibling.snapshot_fingerprint =
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &sibling);
+        let small = with_counted_total(&sibling);
+
+        let (plain_posts, plain_ledger) =
+            counted_pass(&[plain.clone(), sibling.clone()], test_upload_progress());
+        let (posts, ledger) =
+            counted_pass(&[charted.clone(), small.clone()], test_upload_progress());
+        assert_eq!(plain_posts.len(), 1, "{label}");
+        assert_eq!(posts.len(), 1, "{label}: one POST, no refusal");
+        let sent = |fingerprint: &str| {
+            posts[0]
+                .iter()
+                .find(|item| item.snapshot_fingerprint == fingerprint)
+                .unwrap()
+                .clone()
+        };
+        let big = sent(&plain.snapshot_fingerprint);
+        assert!(!crate::snapshots::has_counted_request_positions(&big), "{label}");
+        assert_eq!(
+            serde_json::to_value(&big).unwrap(),
+            serde_json::to_value(&plain).unwrap(),
+            "{label}: every other byte stays"
+        );
+        assert_eq!(big.cache_observations.is_some(), cache, "{label}");
+        assert_eq!(
+            snapshot_upload_body_witness(&big),
+            snapshot_upload_body_witness(&charted),
+            "{label}"
+        );
+        assert_eq!(
+            sent(&sibling.snapshot_fingerprint).context_request_count,
+            Some(u64::MAX),
+            "{label}: a body under the cap keeps its positions"
+        );
+        assert_eq!(
+            counted_ledger(&ledger),
+            counted_ledger(&plain_ledger),
+            "{label}"
+        );
+
+        // Accepted before; decorated only with positions now: no offer.
+        let (posts, again) = counted_pass(&[charted, small], plain_ledger.clone());
+        assert!(posts.is_empty(), "{label}");
+        assert_eq!(
+            counted_ledger(&again),
+            counted_ledger(&plain_ledger),
+            "{label}"
+        );
+    }
+}
+
+/// [behaviour] A body over the item cap even without its counted request
+/// positions is still refused at the preflight and never sent.
+#[test]
+fn counted_positions_never_hide_an_item_cap_refusal() {
+    let cap = crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+    let mut over = with_counted_total(&counted_cap_body(true, 0));
+    let title = over.session_display_name.take().unwrap_or_default();
+    over.session_display_name = Some(title + &"x".repeat(64));
+    over.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &over);
+    let request = counted_request(vec![&over]);
+    let send = |_: &SnapshotBatchRequest<&SnapshotItem>, _: usize| -> Result<()> {
+        panic!("a refused body was sent")
+    };
+    let error =
+        crate::snapshot_sync::upload::preflight_snapshot_request(&request, cap, send).unwrap_err();
+    assert!(error
+        .downcast_ref::<crate::snapshot_sync::upload::SnapshotBatchPreflightRejected>()
+        .is_some());
+}

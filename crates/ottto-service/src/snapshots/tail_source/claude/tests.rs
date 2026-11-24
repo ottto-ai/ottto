@@ -310,3 +310,18 @@ fn head_identity_binds_route_file_and_capture_mode_only() {
         Err(ReconstructCause::INCOMPATIBLE)
     );
 }
+
+/// [behaviour] The Claude head stores no counted request position: a forced
+/// count leaves the head and pages byte-identical.
+#[test]
+fn claude_head_stores_no_counted_requests() {
+    let (mut reduction, certificate) = parse(&lines(12));
+    let staged = stage(&reduction, &certificate);
+    let forced = &mut reduction.accumulator_for_test().counted_requests;
+    *forced = Some(Default::default());
+    crate::snapshots::CountedRequests::note(forced, 100);
+    let again = stage(&reduction, &certificate);
+    assert!(again.head == staged.head, "the head stores no count");
+    assert!(again.pages == staged.pages);
+    assert!(again.collections == staged.collections);
+}

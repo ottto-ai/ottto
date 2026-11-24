@@ -132,6 +132,7 @@
     "cache_read_tokens": 180000,
     "collected_at": "2026-09-30T10:00:03Z",
     "compaction_count": 0,
+    "context_request_count": 3,
     "first_turn_context_tokens": 100000,
     "input_tokens": 300000,
     "last_turn_context_tokens": 100000,

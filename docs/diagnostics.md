@@ -457,6 +457,9 @@ The pass reports each of the following outcome counts even when it is zero.
 
 - `selected` counts snapshots after policy and local hold filtering, including telemetry-only snapshots.
 - `accepted` is the accepted snapshot count used by the terminal Success receipt.
+- `counted_positions_trimmed_items` counts items sent with counted request
+  positions cleared at the item-size preflight, per offer: a resend, a split
+  half or a cache-head probe counts again; a failed POST still counts.
 - `index_saved` is 1 when a scan-index save or state-v2 graph commit advanced the generation.
 - `progress_committed` counts state-v2 progress pages that committed.
 - `progress_unchanged` counts state-v2 progress pages that already matched the saved rows.

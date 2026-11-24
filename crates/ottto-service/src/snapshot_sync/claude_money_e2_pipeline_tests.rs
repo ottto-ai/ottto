@@ -5205,10 +5205,11 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             copy.output_tokens, 20,
             "the two own turns keep their tokens"
         );
+        // The released body predates counted request positions.
+        let mut other = body(&on, OTHER).unwrap().clone();
+        crate::snapshots::clear_counted_request_positions(&mut other);
         assert_eq!(
-            canonical(&without_file_fingerprint_or_cache(
-                body(&on, OTHER).unwrap()
-            )),
+            canonical(&without_file_fingerprint_or_cache(&other)),
             canonical(&without_file_fingerprint_or_cache(&released("audit.other"))),
             "unrelated body unchanged"
         );

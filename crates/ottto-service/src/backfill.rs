@@ -1431,6 +1431,8 @@ mod tests {
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: None,
             last_turn_context_tokens: None,
+            context_request_count: None,
+            claude_counted_request_candidates: None,
             first_turn_context_window_tokens: None,
             peak_context_fill_window_tokens: None,
             last_turn_context_window_tokens: None,

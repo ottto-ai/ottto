@@ -16,6 +16,14 @@
 //! Code builds it only in the ownership fold (`claude_compaction_events`),
 //! from the same owned boundaries and requests as the session's
 //! first/peak/last, so a copied request is never a size.
+//!
+//! Counted request positions ride the same paths: a counted request is one of
+//! the session's own requests with a size above 0 (Claude: with a request id;
+//! Codex: admitted). `request_index` is how many came before a compaction, so
+//! its `before` is counted request number `request_index`;
+//! `context_request_count` is the session total, and the opening block's
+//! `request_10/20/50_context_tokens` are the sizes at those positions. All are
+//! absent when not proven, and stay outside every digest like the sizes.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
@@ -35,13 +43,131 @@ pub struct SnapshotCompactionEvent {
     pub before: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
+    /// Counted requests before this compaction, at least 1. Absent before
+    /// the first one and wherever `before` is not proven to be the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_index: Option<u64>,
     /// Closed values `auto`, `manual` or `idle` (Claude Code only). Codex
     /// states no trigger, so its events never carry one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
 
-crate::heap_layout_bound::fields!(SnapshotCompactionEvent; at, before, after, trigger);
+crate::heap_layout_bound::fields!(SnapshotCompactionEvent; at, before, after, request_index, trigger);
+
+/// The counted requests of one transcript so far and the sizes at counted
+/// positions 10, 20 and 50. `None` beside it means unknown, never zero: a
+/// count only exists when the whole owned prefix was counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct CountedRequests {
+    count: u64,
+    /// Codex: the posture's last size is the last counted request's, so a
+    /// marker's `before` is counted request number `count`.
+    pub(in crate::snapshots) aligned: bool,
+    request_10: Option<NonZeroU64>,
+    request_20: Option<NonZeroU64>,
+    request_50: Option<NonZeroU64>,
+}
+crate::durable_tail_codec::durable_struct!(CountedRequests {
+    N count: u64,
+    N aligned: bool,
+    N request_10: Option<NonZeroU64>,
+    N request_20: Option<NonZeroU64>,
+    N request_50: Option<NonZeroU64>,
+});
+crate::heap_layout_bound::no_heap!(true; CountedRequests { count, aligned, request_10, request_20, request_50 });
+
+impl CountedRequests {
+    /// One counted request of `context_tokens`; a zero size is not one. An
+    /// exhausted count becomes unknown.
+    pub(in crate::snapshots) fn note(counted: &mut Option<Self>, context_tokens: u64) {
+        let (Some(curve), Some(size)) = (counted.as_mut(), NonZeroU64::new(context_tokens)) else {
+            return;
+        };
+        let Some(count) = curve.count.checked_add(1) else {
+            *counted = None;
+            return;
+        };
+        curve.count = count;
+        match count {
+            10 => curve.request_10 = Some(size),
+            20 => curve.request_20 = Some(size),
+            50 => curve.request_50 = Some(size),
+            _ => {}
+        }
+    }
+
+    pub(in crate::snapshots) fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The index a marker noted now takes: the count, when aligned and not 0.
+    pub(in crate::snapshots) fn marker_index(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.count).filter(|_| self.aligned)
+    }
+
+    /// Sizes at counted positions 10, 20 and 50; unreached ones are `None`.
+    pub(in crate::snapshots) fn sizes(&self) -> [Option<u64>; 3] {
+        [self.request_10, self.request_20, self.request_50].map(|size| size.map(NonZeroU64::get))
+    }
+}
+
+/// The opening's sizes at counted positions 10, 20 and 50, each borrowed
+/// with `$borrow` (`&` or `&mut`).
+macro_rules! counted_start_sizes {
+    ($start:expr; $($borrow:tt)+) => {
+        [
+            $($borrow)+ $start.counted_request_10_context_tokens,
+            $($borrow)+ $start.counted_request_20_context_tokens,
+            $($borrow)+ $start.counted_request_50_context_tokens,
+        ]
+    };
+}
+
+/// Every counted request position of an item: its count, each event's
+/// index and the opening's sizes, each borrowed with `$borrow` (`&` or
+/// `&mut`, with the matching `iter`/`as_deref` accessors). The one list both
+/// the presence check and the clear walk.
+macro_rules! counted_request_leaves {
+    ($item:expr; $iter:ident, $as_deref:ident; $($borrow:tt)+) => {
+        std::iter::once($($borrow)+ $item.context_request_count)
+            .chain(
+                $item
+                    .compaction_events
+                    .$iter()
+                    .map(|event| $($borrow)+ event.request_index),
+            )
+            .chain(
+                $item
+                    .session_start
+                    .$as_deref()
+                    .into_iter()
+                    .flat_map(|start| counted_start_sizes!(start; $($borrow)+)),
+            )
+    };
+}
+
+/// Drop every counted request position from `item`: display data outside
+/// every digest, cleared wherever a body meets a size ceiling or composes
+/// more than one request axis. Returns whether anything was present.
+pub(crate) fn clear_counted_request_positions(item: &mut crate::snapshots::SnapshotItem) -> bool {
+    counted_request_leaves!(item; iter_mut, as_deref_mut; &mut)
+        .fold(false, |present, leaf| leaf.take().is_some() | present)
+}
+
+/// Whether `item` carries any counted request position.
+pub(crate) fn has_counted_request_positions(item: &crate::snapshots::SnapshotItem) -> bool {
+    counted_request_leaves!(item; iter, as_deref; &).any(Option::is_some)
+}
+
+/// Drop only the opening's sizes at counted positions.
+pub(in crate::snapshots) fn clear_counted_start_sizes(
+    start: &mut crate::snapshots::SnapshotSessionStart,
+) {
+    for size in counted_start_sizes!(start; &mut) {
+        *size = None;
+    }
+}
 
 /// The same set and order `bounded_compaction_timestamps` yields for the
 /// events' `at` values: sorted by `at`, one event per distinct `at` (the first
@@ -125,12 +251,13 @@ crate::heap_layout_bound::no_heap!(true; ClaudeCompactionTrigger);
 /// item without an owned boundary does no request work. Called only by the
 /// fold's posture writers through `set_claude_compaction_scalars`, never by
 /// `finish()`. Also returns how many of these events sit next to an id-less
-/// response (local counters only).
+/// response (local counters only), and the count of non-zero `own_requests`.
+/// `request_index` is that count below the event's cut, absent when 0.
 pub(in crate::snapshots) fn claude_compaction_events<'a>(
     owned_observations: &[ClaudeCompactionObservation],
     paired: &BTreeSet<usize>,
     own_requests: impl Iterator<Item = &'a ClaudeTranscriptUsageOccurrence>,
-) -> (Vec<SnapshotCompactionEvent>, ClaudeIdLessNeighbours) {
+) -> (Vec<SnapshotCompactionEvent>, ClaudeIdLessNeighbours, u64) {
     let mut candidates = NewestDistinctAt::default();
     for (index, observation) in owned_observations.iter().enumerate() {
         if observation.kind == ClaudeCompactionKind::CurrentBoundary || !paired.contains(&index) {
@@ -141,7 +268,10 @@ pub(in crate::snapshots) fn claude_compaction_events<'a>(
     }
     let candidates = candidates.entries;
     if candidates.is_empty() {
-        return (Vec::new(), ClaudeIdLessNeighbours::default());
+        let counted = own_requests
+            .filter(|request| request.effective_input_context > 0)
+            .count() as u64;
+        return (Vec::new(), ClaudeIdLessNeighbours::default(), counted);
     }
     let mut id_less = ClaudeIdLessNeighbours::default();
     for (_, observation) in &candidates {
@@ -165,6 +295,7 @@ pub(in crate::snapshots) fn claude_compaction_events<'a>(
             continue;
         }
         let gap = &mut gaps[cuts.partition_point(|cut| *cut <= request.sequence)];
+        gap.counted += 1;
         if !matches!(gap.last, Some((sequence, ..)) if sequence >= request.sequence) {
             gap.last = Some((
                 request.sequence,
@@ -176,14 +307,16 @@ pub(in crate::snapshots) fn claude_compaction_events<'a>(
             gap.first = Some((request.sequence, request.effective_input_context));
         }
     }
-    // before[k]: the latest request at or before gap k; after[k]: the earliest
-    // request in gap k + 1 or later.
+    // before[k]: the latest request at or before gap k, and how many requests
+    // those gaps hold; after[k]: the earliest request in gap k + 1 or later.
     let mut before = Vec::with_capacity(cuts.len());
-    let mut latest = None;
+    let (mut latest, mut counted) = (None, 0_u64);
     for gap in &gaps[..cuts.len()] {
         latest = gap.last.or(latest);
-        before.push(latest);
+        counted += gap.counted;
+        before.push((latest, counted));
     }
+    let total = counted + gaps[cuts.len()].counted;
     let mut after = vec![None; cuts.len()];
     let mut earliest = None;
     for (index, gap) in gaps.iter().enumerate().skip(1).rev() {
@@ -195,7 +328,7 @@ pub(in crate::snapshots) fn claude_compaction_events<'a>(
         .into_iter()
         .map(|(at, observation)| {
             let cut = cuts.partition_point(|cut| *cut < observation.response_count_before);
-            let before = before[cut];
+            let (before, counted) = before[cut];
             let trigger = match observation.trigger {
                 Some(ClaudeCompactionTrigger::Auto)
                     if idle_gap(before.and_then(|(_, _, timestamp)| timestamp), at) =>
@@ -208,11 +341,12 @@ pub(in crate::snapshots) fn claude_compaction_events<'a>(
                 at: at.to_string(),
                 before: before.map(|(_, context, _)| context),
                 after: after[cut].map(|(_, context)| context),
+                request_index: (counted > 0).then_some(counted),
                 trigger: trigger.map(|trigger| trigger.wire().to_string()),
             }
         })
         .collect();
-    (events, id_less)
+    (events, id_less, total)
 }
 
 /// Shipped Claude compactions whose response just before (or just after) had
@@ -266,11 +400,13 @@ impl<'a, T> NewestDistinctAt<'a, T> {
 }
 
 /// The owned requests of one gap between compactions that the sizes need:
-/// the last one (with its time, for the idle rule) and the first one.
+/// the last one (with its time, for the idle rule), the first one and how
+/// many there are.
 #[derive(Debug, Clone, Copy, Default)]
 struct ClaudeRequestGap<'a> {
     last: Option<(u64, u64, Option<&'a str>)>,
     first: Option<(u64, u64)>,
+    counted: u64,
 }
 
 fn idle_gap(last_request_at: Option<&str>, compaction_at: &str) -> bool {
@@ -287,10 +423,13 @@ fn idle_gap(last_request_at: Option<&str>, compaction_at: &str) -> bool {
 struct CodexCompactionSize {
     before: Option<NonZeroU64>,
     after: Option<NonZeroU64>,
+    /// Stored in the Codex trailer (revision 2), never in these entry bytes.
+    request_index: Option<NonZeroU64>,
 }
 crate::durable_tail_codec::durable_struct!(CodexCompactionSize {
     N before: Option<NonZeroU64>,
     N after: Option<NonZeroU64>,
+    I request_index: Option<NonZeroU64>,
 });
 
 /// Sizes for the newest distinct Codex marker timestamps, sorted by the same
@@ -310,7 +449,12 @@ crate::durable_tail_codec::durable_struct!(CodexCompactionSizes {
 impl CodexCompactionSizes {
     /// Keep the first marker at each timestamp. Once a timestamp falls below
     /// the newest-64 cutoff it can never return: that cutoff only increases.
-    pub(in crate::snapshots) fn note_marker(&mut self, at: &str, before: Option<u64>) {
+    pub(in crate::snapshots) fn note_marker(
+        &mut self,
+        at: &str,
+        before: Option<u64>,
+        request_index: Option<NonZeroU64>,
+    ) {
         let Err(mut index) = self
             .entries
             .binary_search_by(|(timestamp, _)| timestamp.as_str().cmp(at))
@@ -337,6 +481,7 @@ impl CodexCompactionSizes {
                 CodexCompactionSize {
                     before: before.and_then(NonZeroU64::new),
                     after: None,
+                    request_index,
                 },
             ),
         );
@@ -368,9 +513,32 @@ impl CodexCompactionSizes {
                 at,
                 before: size.before.map(NonZeroU64::get),
                 after: size.after.map(NonZeroU64::get),
+                request_index: size.request_index.map(NonZeroU64::get),
                 trigger: None,
             })
             .collect()
+    }
+
+    /// Each kept marker's request index, in entry order (the Codex trailer).
+    pub(in crate::snapshots) fn request_indices(&self) -> Vec<Option<NonZeroU64>> {
+        self.entries
+            .iter()
+            .map(|(_, size)| size.request_index)
+            .collect()
+    }
+
+    /// Restore `request_indices` output; another length is corrupt.
+    pub(in crate::snapshots) fn restore_request_indices(
+        &mut self,
+        indices: Vec<Option<NonZeroU64>>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        if indices.len() != self.entries.len() {
+            return Err(crate::durable_tail_codec::Corrupt);
+        }
+        for ((_, size), index) in self.entries.iter_mut().zip(indices) {
+            size.request_index = index;
+        }
+        Ok(())
     }
 }
 
@@ -484,6 +652,7 @@ mod tests {
                     at: at.to_string(),
                     before: before.map(|(_, context, _)| context),
                     after: after[cut].map(|(_, context)| context),
+                    request_index: None,
                     trigger: trigger.map(|trigger| trigger.wire().to_string()),
                 }
             })
@@ -603,7 +772,20 @@ mod tests {
         assert_eq!(selection.entries.len(), MAX_COMPACTION_TIMESTAMPS);
 
         let own = || occurrences.values().filter(|occurrence| is_own(occurrence));
-        let streamed = claude_compaction_events(&observations, &paired, own());
+        let (mut events, id_less, counted) =
+            claude_compaction_events(&observations, &paired, own());
+        // The oracle predates request indices: each event that has a `before`
+        // has an index within the counted total, and only those do.
+        let total = own()
+            .filter(|occurrence| occurrence.effective_input_context > 0)
+            .count() as u64;
+        assert_eq!(counted, total);
+        for event in &mut events {
+            let index = event.request_index.take();
+            assert_eq!(index.is_some(), event.before.is_some());
+            assert!(index.is_none_or(|index| index <= total));
+        }
+        let streamed = (events, id_less);
         let oracle = round_two_claude_compaction_events(&observations, own());
         assert_eq!(streamed, oracle);
         let (events, _) = &streamed;
@@ -657,21 +839,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_size_entry_is_sixteen_bytes() {
-        assert_eq!(std::mem::size_of::<CodexCompactionSize>(), 16);
+    fn codex_size_entry_is_twenty_four_bytes() {
+        assert_eq!(std::mem::size_of::<CodexCompactionSize>(), 24);
     }
 
     #[test]
     fn markers_without_a_request_between_share_one_after() {
         let mut sizes = CodexCompactionSizes::default();
         sizes.note_counted_request(10);
-        sizes.note_marker(&at(1), Some(240_000));
-        sizes.note_marker(&at(2), Some(240_000));
+        sizes.note_marker(&at(1), Some(240_000), None);
+        sizes.note_marker(&at(2), Some(240_000), None);
         sizes.note_counted_request(0);
         sizes.note_counted_request(59_000);
         sizes.note_counted_request(61_000);
-        sizes.note_marker(&at(3), Some(61_000));
-        sizes.note_marker(&at(4), None);
+        sizes.note_marker(&at(3), Some(61_000), None);
+        sizes.note_marker(&at(4), None, None);
         let events = sizes.into_events();
         let pairs = events
             .iter()
@@ -711,11 +893,12 @@ mod tests {
                 at: timestamp.clone(),
                 before,
                 after: None,
+                request_index: None,
                 trigger: None,
             });
-            sizes.note_marker(&timestamp, before);
+            sizes.note_marker(&timestamp, before, None);
             if let Some(tail) = tail.as_mut() {
-                tail.note_marker(&timestamp, before);
+                tail.note_marker(&timestamp, before, None);
             }
             // Zero requests leave pending markers alone; the first positive
             // request fills them, later requests must never overwrite it.
@@ -772,6 +955,7 @@ mod tests {
             at: at(1),
             before: Some(240_000),
             after: None,
+            request_index: None,
             trigger: None,
         };
         assert_eq!(
