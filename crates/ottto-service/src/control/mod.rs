@@ -1319,6 +1319,13 @@ fn handle_command(
             agent_provider_impact(daemon, &authorization, query)
         }
         LocalControlCommand::CloudStatus { source } => cloud_status(daemon, &authorization, source),
+        command @ (LocalControlCommand::CloudConnectStatus { .. }
+        | LocalControlCommand::CloudConnectEnsure { .. }
+        | LocalControlCommand::CloudConnectSubmit { .. }
+        | LocalControlCommand::CloudConnectPoll { .. }
+        | LocalControlCommand::CloudConnectCancel { .. }) => {
+            Ok(cloud_connect::dispatch_agent(daemon, command))
+        }
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)

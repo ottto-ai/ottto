@@ -76,7 +76,7 @@ pub(super) struct ServerError {
 }
 
 impl ServerError {
-    fn local(code: &str) -> Self {
+    pub(super) fn local(code: &str) -> Self {
         Self {
             code: code.to_string(),
             status: None,
@@ -84,8 +84,13 @@ impl ServerError {
         }
     }
 
-    fn from_local(error: &LocalApiError) -> Self {
+    pub(super) fn from_local(error: &LocalApiError) -> Self {
         match error {
+            LocalApiError::Backend(details)
+                if details.kind == crate::BackendErrorKind::ResponseUnexpected =>
+            {
+                Self::local("invalid_server_field")
+            }
             LocalApiError::Backend(details) => Self {
                 code: details.reason_code.clone().unwrap_or_else(|| {
                     match details.status {
@@ -145,15 +150,29 @@ impl SetupRunServer<'_> {
         &self,
         send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
     ) -> Result<T, ServerError> {
+        self.call_bound(None, send)
+    }
+
+    pub(super) fn call_bound<T>(
+        &self,
+        run: Option<&str>,
+        send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
+    ) -> Result<T, ServerError> {
         let connection = self
             .daemon
             .connection_for_authorized_client()
             .map_err(|error| ServerError::from_local(&error))?
             .ok_or_else(|| ServerError::local("not_paired"))?;
+        if run.is_some_and(|run| run != connection.setup_run_id) {
+            return Err(ServerError::local("not_paired"));
+        }
         let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))
             .map_err(|error| ServerError::from_local(&error))?;
         let credentials = setup_run_token_for_connection(&api_base_url, &connection)
             .map_err(|error| ServerError::from_local(&error))?;
+        if run.is_some_and(|run| run != credentials.connection.setup_run_id) {
+            return Err(ServerError::local("not_paired"));
+        }
         let prefix = |connection: &LocalConnectionBinding| {
             api_url_with_base(
                 &api_base_url,
@@ -175,6 +194,9 @@ impl SetupRunServer<'_> {
                     &credentials.connection,
                 )
                 .map_err(|error| ServerError::from_local(&error))?;
+                if run.is_some_and(|run| run != refreshed.connection.setup_run_id) {
+                    return Err(ServerError::local("not_paired"));
+                }
                 send(&prefix(&refreshed.connection), &refreshed.setup_run_token)
                     .map_err(|error| ServerError::from_local(&error))
             }
@@ -240,7 +262,7 @@ impl CloudKeyServer for SetupRunServer<'_> {
 
     fn revoke(&self, device_proof: &str) -> Result<Revoked, ServerError> {
         self.call(|prefix, token| {
-            backend_send_raw_json(
+            backend_send_raw_json::<serde_json::Value>(
                 "DELETE",
                 &keys_url(prefix),
                 None,
@@ -249,6 +271,9 @@ impl CloudKeyServer for SetupRunServer<'_> {
                     ("X-Ottto-Device-Proof", device_proof),
                 ],
             )
+            .map(|_| Revoked {
+                reason: "revoked".into(),
+            })
         })
     }
 }

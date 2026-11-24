@@ -1,3 +1,4 @@
+mod cloud_connect;
 mod launch_check;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -76,7 +77,7 @@ enum Command {
     Context(ContextArgs),
     #[command(about = "Print cloud cost breakdown for AI agents")]
     Costs(CostsArgs),
-    #[command(about = "Show cloud connector status; connect clouds on the web")]
+    #[command(about = "Connect clouds and show their status")]
     Cloud(CloudArgs),
     #[command(about = "Print cloud sessions for AI agents")]
     Sessions(SessionsArgs),
@@ -139,9 +140,7 @@ struct UninstallArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(
-    after_help = "Connect or change AWS and Google Cloud connectors in the web app: https://app.ottto.net/apps"
-)]
+#[command(after_help = "Google Vertex AI: connect at https://app.ottto.net/connections")]
 struct CloudArgs {
     #[arg(
         long,
@@ -153,10 +152,41 @@ struct CloudArgs {
     command: CloudCommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum CloudCommand {
-    #[command(about = "Show configured cloud connector status; makes no changes")]
+    #[command(
+        about = "Connect Amazon Bedrock billing from this Mac",
+        after_help = "Uses your AWS CLI sign-in to create one read-only role, then waits for you to approve saving it with Touch ID or a passkey. Run the same command again to resume."
+    )]
+    Connect(CloudConnectArgs),
+    #[command(about = "Show connectors and any setup in progress")]
     Status(CloudStatusArgs),
+    #[command(about = "Cancel a setup started from this Mac")]
+    Cancel(CloudCancelArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct CloudConnectArgs {
+    #[arg(long, value_enum, help = "Cloud billing source")]
+    source: CloudSourceArg,
+    #[arg(long, help = "Also read Bedrock usage numbers from CloudWatch")]
+    metrics: bool,
+    #[arg(long, help = "Replace the AWS account already connected")]
+    reconnect: bool,
+    #[arg(long, help = "Drop this Mac's open setup and start a new one")]
+    restart: bool,
+    #[arg(long, help = "AWS CLI profile to use")]
+    profile: Option<String>,
+    #[arg(long, value_name = "SECONDS", default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=86400), help = "Stop waiting after this many seconds")]
+    timeout: u64,
+    #[arg(long, help = "Show AWS CLI error text on this terminal")]
+    verbose: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CloudCancelArgs {
+    #[arg(long, value_name = "ID", value_parser = cloud_connect::valid_attempt, help = "Cloud setup attempt UUID")]
+    attempt: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -174,10 +204,12 @@ impl CloudSourceArg {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct CloudStatusArgs {
     #[arg(long, value_enum)]
     source: Option<CloudSourceArg>,
+    #[arg(long, value_name = "ID", value_parser = cloud_connect::valid_attempt, conflicts_with = "source", help = "Cloud setup attempt UUID")]
+    attempt: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -831,8 +863,14 @@ fn main() {
         let code = run_provider_requests(output_mode, args);
         std::process::exit(code);
     }
+    let cloud_command = match &cli.command {
+        Command::Cloud(args) => Some(args.command.clone()),
+        _ => None,
+    };
     let invocation = build_invocation(cli, output_mode);
-    let code = if let Some(setup_args) = setup_args {
+    let code = if let Some(command) = cloud_command {
+        cloud_connect::run(invocation, command)
+    } else if let Some(setup_args) = setup_args {
         run_setup(invocation, setup_args)
     } else {
         run(invocation)
@@ -2161,8 +2199,26 @@ fn local_command(command: Command) -> LocalControlCommand {
             query: args.query(),
         },
         Command::Cloud(args) => match args.command {
-            CloudCommand::Status(args) => LocalControlCommand::CloudStatus {
-                source: args.source.map(|source| source.slug().to_string()),
+            CloudCommand::Status(CloudStatusArgs {
+                source,
+                attempt: None,
+            }) => LocalControlCommand::CloudStatus {
+                source: source.map(|source| source.slug().to_string()),
+            },
+            CloudCommand::Status(CloudStatusArgs {
+                attempt: Some(attempt_id),
+                ..
+            }) => LocalControlCommand::CloudConnectStatus {
+                attempt_id: Some(attempt_id),
+                timeout_ms: 30_000,
+            },
+            CloudCommand::Connect(_) => LocalControlCommand::CloudConnectStatus {
+                attempt_id: None,
+                timeout_ms: 30_000,
+            },
+            CloudCommand::Cancel(args) => LocalControlCommand::CloudConnectCancel {
+                attempt_id: args.attempt,
+                timeout_ms: 90_000,
             },
         },
         Command::Sessions(args) => LocalControlCommand::AgentSessions {
@@ -2359,6 +2415,11 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AgentRecommendations { .. } => "agent_recommendations",
         LocalControlCommand::AgentProviderImpact { .. } => "agent_provider_impact",
         LocalControlCommand::CloudStatus { .. } => "cloud_status",
+        LocalControlCommand::CloudConnectStatus { .. } => "cloud_connect_status",
+        LocalControlCommand::CloudConnectEnsure { .. } => "cloud_connect_ensure",
+        LocalControlCommand::CloudConnectSubmit { .. } => "cloud_connect_submit",
+        LocalControlCommand::CloudConnectPoll { .. } => "cloud_connect_poll",
+        LocalControlCommand::CloudConnectCancel { .. } => "cloud_connect_cancel",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
@@ -2876,7 +2937,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 27] = [
+        let commands: [(&str, &[&str]); 29] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto receipts --help", &["ottto", "receipts", "--help"]),
@@ -2901,8 +2962,16 @@ mod tests {
             ("ottto costs --help", &["ottto", "costs", "--help"]),
             ("ottto cloud --help", &["ottto", "cloud", "--help"]),
             (
+                "ottto cloud connect --help",
+                &["ottto", "cloud", "connect", "--help"],
+            ),
+            (
                 "ottto cloud status --help",
                 &["ottto", "cloud", "status", "--help"],
+            ),
+            (
+                "ottto cloud cancel --help",
+                &["ottto", "cloud", "cancel", "--help"],
             ),
             ("ottto sessions --help", &["ottto", "sessions", "--help"]),
             (

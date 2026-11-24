@@ -5,6 +5,9 @@
 //! The channel opens only in a release-signed `ottto-service` the app installed, with no
 //! Companion trust override set. Nothing here is persisted.
 
+mod agent;
+pub(super) use agent::dispatch as dispatch_agent;
+
 mod queue;
 mod server;
 mod signer;

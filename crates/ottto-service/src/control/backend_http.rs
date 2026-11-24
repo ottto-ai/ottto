@@ -621,7 +621,12 @@ pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
         None => request.call(),
     }
     .map_err(|error| backend_error_from_ureq(url, error))?;
-    backend_success(url, response)?
+    let response = backend_success(url, response)?;
+    if response.status() == 204 {
+        return serde_json::from_str("null")
+            .map_err(|error| backend_response_unexpected(url, error.to_string()));
+    }
+    response
         .into_json()
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }

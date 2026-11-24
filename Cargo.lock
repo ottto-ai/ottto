@@ -736,10 +736,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.4.3",
+ "libc",
  "ottto-core",
  "ottto-protocol",
  "serde",
  "serde_json",
+ "time",
+ "zeroize",
 ]
 
 [[package]]

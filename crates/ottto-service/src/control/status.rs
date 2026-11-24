@@ -231,7 +231,7 @@ fn observe_setup_run_read<T>(
 }
 
 /// `ottto cloud status`: read-only connector status through the setup-run
-/// bridge. Connecting or changing a cloud connector happens in the web app.
+/// bridge. Attempt-specific status and Bedrock setup use the cloud-connect control commands.
 pub(super) fn cloud_status(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,

@@ -3,6 +3,7 @@
 //! queued it. Nothing here is persisted; a restart drops every request.
 
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -52,6 +53,8 @@ pub enum SignQueueError {
     Full,
     /// The expiry is not in the future.
     AlreadyExpired,
+    /// Too many distinct native approvals were offered in the last minute.
+    ApprovalRateLimited,
 }
 
 /// A request handed to a signer connection by `cloud_sign_poll`.
@@ -92,6 +95,7 @@ struct QueueState {
     next_id: u64,
     requests: Vec<QueuedRequest>,
     last_hello: Option<Instant>,
+    approval_offers: VecDeque<Instant>,
 }
 
 struct QueuedRequest {
@@ -128,8 +132,7 @@ impl SignQueue {
         } = &kind
         {
             if let Some(live) = state.requests.iter().find(|request| {
-                request.outcome.is_none()
-                    && matches!(&request.kind, SignKind::Approval { approval_id: live, .. } if live == approval_id)
+                matches!(&request.kind, SignKind::Approval { approval_id: live, .. } if live == approval_id)
             }) {
                 return Ok(Queued {
                     request_id: live.id.clone(),
@@ -155,6 +158,15 @@ impl SignQueue {
             >= MAX_LIVE_SIGN_REQUESTS
         {
             return Err(SignQueueError::Full);
+        }
+        if matches!(kind, SignKind::Approval { .. }) {
+            state
+                .approval_offers
+                .retain(|offer| offer.elapsed() < Duration::from_secs(60));
+            if state.approval_offers.len() >= MAX_LIVE_SIGN_REQUESTS {
+                return Err(SignQueueError::ApprovalRateLimited);
+            }
+            state.approval_offers.push_back(Instant::now());
         }
         state.next_id += 1;
         let request_id = format!("sign_{}", state.next_id);
@@ -209,6 +221,23 @@ impl SignQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
+    }
+
+    /// Retains a native answer for readback and identical R5 retries.
+    pub(super) fn approval_outcome(&self, request_id: &str) -> Option<SignOutcome> {
+        let state = self.lock();
+        state
+            .requests
+            .iter()
+            .find(|request| request.id == request_id)?
+            .outcome
+            .clone()
+    }
+
+    pub(super) fn cancel_attempt(&self, attempt_id: &str) {
+        self.lock().requests.retain(|request| {
+            !matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
+        });
     }
 
     /// Drops a request its caller no longer waits for.

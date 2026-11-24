@@ -34,10 +34,17 @@ pub enum TemplateError {
 
 /// The template URL for `pin`, once the bytes served there hash to `pin.sha256`.
 pub fn verified_template_url(pin: &TemplatePin) -> Result<String, TemplateError> {
+    verified_template_url_with_timeout(pin, TEMPLATE_FETCH_TIMEOUT)
+}
+
+pub(super) fn verified_template_url_with_timeout(
+    pin: &TemplatePin,
+    timeout: Duration,
+) -> Result<String, TemplateError> {
     let url = template_url(pin)?;
     let response = crate::retry_tls::credential_agent()
         .get(&url)
-        .timeout(TEMPLATE_FETCH_TIMEOUT)
+        .timeout(timeout.min(TEMPLATE_FETCH_TIMEOUT))
         .call()
         .map_err(|_| TemplateError::Unreachable)?;
     if response.status() != 200 {

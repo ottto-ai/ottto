@@ -989,6 +989,20 @@ never sees a key.
 - **Template.** The CloudFormation template URL is built from a pinned object key and version,
   never taken from the server, and the bytes served there must hash to the pinned sha256.
 
+- **CLI.** Command-scoped local-control requests require the CLI token. Passive attempt
+  status never presents an approval. Ensure, submit and cancel obtain a fresh app device
+  signature over the frozen HTTP request, with the literal attempt placeholder in the
+  digest for attempt-specific routes. One lost reply or invalid proof can retry with
+  a fresh challenge and the same request body. The native approval queue offers at most
+  four new approvals per minute, and a retained answer allows an identical approval
+  retry after readback. The daemon checks the approval's attempt, revision and AWS
+  account before it reaches the app.
+- **AWS.** The CLI checks the same compiled template pin as the daemon and uses a
+  single exported AWS credential session for identity and CloudFormation. Setup
+  state lives on the server. A resume re-reads the attempt and reconciles the verified
+  stack ARN before submission. Cancellation can return a separate delete command for
+  an ARN verified in the relevant account.
+
 ## Local health diagnostics
 
 Verification authorizes before source reads or result writes; setup authorizes
