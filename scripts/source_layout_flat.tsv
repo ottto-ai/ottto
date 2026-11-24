@@ -1,0 +1,4 @@
+# directory	max_rs_files
+crates/ottto-service/src	98
+crates/ottto-service/src/snapshots	93
+crates/ottto-service/src/snapshot_sync	95

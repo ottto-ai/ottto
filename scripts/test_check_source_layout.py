@@ -27,7 +27,7 @@ GIT_ENV = {
 SRC = 'crates/ottto-service/src'
 CLEAN = {
     'crates/ottto-service/Cargo.toml': '',
-    f'{SRC}/lib.rs': 'pub mod snapshots;\n',
+    f'{SRC}/lib.rs': '//! Demo.\n\npub mod snapshots;\n',
     f'{SRC}/snapshots.rs': '//! Snapshots.\n\nmod state_v2;\nmod wire;\nmod tests;\n',
     f'{SRC}/snapshots/wire.rs': '//! Wire.\n\nmod frame;\n',
     f'{SRC}/snapshots/wire/frame.rs': '//! Frames.\n',
@@ -39,6 +39,7 @@ CLEAN = {
     f'{SRC}/snapshots/state_v2/sqlite/migrations/0001_init.sql': 'select 1;\n',
     'scripts/source_layout_limits.tsv': '# path\tmax_lines\n',
     'scripts/source_layout_includes.tsv': '# file\tkind\tliteral\n',
+    'scripts/source_layout_flat.tsv': '# directory\tmax_rs_files\n',
 }
 
 
@@ -77,14 +78,16 @@ class LayoutTests(unittest.TestCase):
 
     def findings(self, *extra):
         status, out = self.run_check(*extra)
-        lines = [line for line in out.splitlines() if line.count(': ') >= 2 and ': note: ' not in line]
+        # The `enforced: <rules>` and `enforced rules with findings: <rules>` status lines are not findings.
+        lines = [line for line in out.splitlines() if line.count(': ') >= 2 and ': note: ' not in line
+                 and not line.startswith('source-layout: enforced')]
         return status, [line.removeprefix('source-layout: ').replace(f'{SRC}/', '') for line in lines], out
 
     def test_a_clean_tree_reports_nothing_and_exits_zero(self):
         status, found, out = self.findings()
         self.assertEqual((status, found), (0, []), out)
         self.assertIn('size 0, tree 0, budget 0, path-include 0, names 0, header 0, stutter 0, tests 0, '
-                      'isolation 0, test-stem 0', out)
+                      'isolation 0, test-stem 0, flat 0', out)
         self.assertIn('report only', out)
 
     def test_size_needs_a_row_and_the_ceilings_only_fall(self):
@@ -199,7 +202,35 @@ class LayoutTests(unittest.TestCase):
         })
         _, found, _ = self.findings()
         self.assertEqual([f for f in found if f.startswith('tests')], [
-            'tests: snapshots/wire.rs: 2 #[test] outside tests.rs and tests/',
+            'tests: snapshots/wire.rs: 2 #[test] outside tests.rs, tests/ and an inline mod tests',
+        ])
+
+    def test_a_files_own_inline_mod_tests_is_not_a_finding(self):
+        self.write({f'{SRC}/snapshots/wire/frame.rs': ('//! Frames.\n\nfn f() {}\n\n#[cfg(test)]\nmod tests {\n'
+                                                       '    #[test]\n    fn a() {}\n}\n')})
+        _, found, _ = self.findings()
+        self.assertEqual(found, [])
+
+    def test_the_whole_crate_is_in_scope(self):
+        self.write({
+            f'{SRC}/lib.rs': '//! Demo.\n\npub mod snapshots;\nmod relay;\nmod e2_probe;\n',
+            f'{SRC}/relay.rs': 'mod sender_tests;\n',
+            f'{SRC}/relay/sender_tests.rs': '#[test]\nfn t() {}\n',
+            f'{SRC}/relay/legacy/mod.rs': '//! Old style.\n',
+            f'{SRC}/e2_probe.rs': '//! Coded.\n',
+            f'{SRC}/shim.c': 'int x;\n',
+            f'{SRC}/relay/notes.txt': 'x\n',
+        })
+        _, found, _ = self.findings()
+        self.assertEqual(sorted(found), [
+            'header: relay.rs: no //! module doc at the top',
+            'names: e2_probe.rs: coded stem e2',
+            'test-stem: relay/sender_tests.rs: stem ends in _tests; use tests.rs or tests/<topic>.rs',
+            'tests: relay/sender_tests.rs: 1 #[test] outside tests.rs, tests/ and an inline mod tests',
+            'tree: relay/legacy/mod.rs: mod.rs; name the module file after its directory',
+            'tree: relay/legacy/mod.rs: not reachable by mod from the crate root',
+            'tree: relay/legacy: module directory without legacy.rs',
+            'tree: relay/notes.txt: not a .rs file outside tests/fixtures/ and state_v2/sqlite/migrations/*.sql',
         ])
 
     def test_isolation_keeps_each_source_to_its_own_paths(self):
@@ -233,6 +264,46 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual([f for f in found if f.startswith('test-stem')], [
             'test-stem: snapshots/wire/frame_tests.rs: stem ends in _tests; use tests.rs or tests/<topic>.rs',
         ])
+        # Under a tests/ directory the stem is fine: the folder is what keeps tests apart.
+        self.write({f'{SRC}/snapshots/wire/frame_tests.rs': None,
+                    f'{SRC}/snapshots/wire.rs': '//! Wire.\n\nmod frame;\n',
+                    f'{SRC}/snapshots/tests.rs': 'mod frame;\nmod frame_tests;\n\n#[test]\nfn hub() {}\n',
+                    f'{SRC}/snapshots/tests/frame_tests.rs': '#[test]\nfn t() {}\n'})
+        _, found, _ = self.findings()
+        self.assertEqual(found, [])
+
+    def test_flat_ceilings_hold_and_only_fall(self):
+        directory = f'{SRC}/snapshots'
+        table = 'scripts/source_layout_flat.tsv'
+        self.write({table: f'{directory}\t3\n'})
+        base = self.commit()
+        status, found, out = self.findings('--enforce', 'flat', '--base', base)
+        self.assertEqual((status, found), (0, []), out)
+        # A file in a child folder does not count; a file directly in the directory does.
+        self.write({f'{SRC}/snapshots/wire/extra.rs': '//! Extra.\n',
+                    f'{SRC}/snapshots/wire.rs': '//! Wire.\n\nmod frame;\nmod extra;\n'})
+        self.assertEqual(self.findings('--enforce', 'flat', '--base', base)[:2], (0, []))
+        self.write({f'{SRC}/snapshots/extra.rs': '//! Extra.\n',
+                    f'{SRC}/snapshots.rs': CLEAN[f'{SRC}/snapshots.rs'] + 'mod extra;\n'})
+        status, found, out = self.findings('--base', base)
+        self.assertEqual(status, 0, out)
+        self.assertEqual(found, [f'flat: snapshots: 4 .rs files directly in it, over its ceiling of 3 in {table}; '
+                                 'put a new file in the folder of its feature'])
+        self.assertEqual(self.run_check('--enforce', 'flat', '--base', base)[0], 1)
+        self.write({table: f'{directory}\t4\n'})
+        status, found, _ = self.findings('--enforce', 'flat', '--base', base)
+        self.assertEqual((status, found), (1, ['flat: snapshots: ceiling rose from 3 to 4']))
+        self.write({table: '# directory\tmax_rs_files\n'})
+        status, found, _ = self.findings('--enforce', 'flat', '--base', base)
+        self.assertEqual((status, found), (1, [f'flat: snapshots: its row is gone from {table}']))
+        # Fewer files than the ceiling is a note; the row may fall.
+        self.write({table: f'{directory}\t3\n', f'{SRC}/snapshots/extra.rs': None,
+                    f'{SRC}/snapshots.rs': CLEAN[f'{SRC}/snapshots.rs']})
+        self.commit()
+        self.write({table: f'{directory}\t5\n'})
+        base = self.commit()
+        self.write({table: f'{directory}\t3\n'})
+        self.assertEqual(self.findings('--enforce', 'flat', '--base', base)[:2], (0, []))
 
     def test_enforce_fails_only_on_named_rules(self):
         self.write({f'{SRC}/snapshots/wire/frame.rs': 'fn f() {}\n'})
@@ -302,6 +373,33 @@ class LayoutTests(unittest.TestCase):
         status, out = self.run_check('--enforce-new', '--base', base)
         self.assertEqual(status, 0, out)
         self.assertNotIn('new file:', out)
+
+    def test_an_added_mod_rs_or_headerless_production_file_fails(self):
+        # Existing files that break the same rules stay report-only.
+        self.write({f'{SRC}/snapshots/wire/frame.rs': 'fn f() {}\n',
+                    f'{SRC}/snapshots/state_v2/mod.rs': '//! Old style.\n'})
+        base = self.commit()
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 0, out)
+        for name, path, text, message in (
+            ('mod.rs', f'{SRC}/snapshots/wire/codec/mod.rs', '//! Codec.\n', 'mod.rs; name the module file'),
+            ('no module doc', f'{SRC}/snapshots/wire/codec.rs', 'fn f() {}\n', 'no //! module doc at the top'),
+        ):
+            with self.subTest(name):
+                self.write({path: text})
+                self.commit()
+                status, out = self.run_check('--enforce-new', '--base', base)
+                self.assertEqual(status, 1, out)
+                self.assertIn(f'{path}: {message}', out)
+                self.assertIn('added files break the rules for new files', out)
+                self.git('rm', '-q', path)
+                self.commit()
+        # A test file needs no module doc, and a good new file passes.
+        self.write({f'{SRC}/snapshots/wire/tests.rs': '#[test]\nfn t() {}\n',
+                    f'{SRC}/snapshots/wire/codec.rs': '//! Codec.\n'})
+        self.commit()
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 0, out)
 
     def test_new_file_enforcement_requires_a_valid_base(self):
         self.commit()

@@ -255,7 +255,9 @@ file_move_check() {
   fi
 }
 
-# Existing files report only; new production Rust files have a hard line ceiling.
+# Existing files report only. Added files have hard rules (line ceiling, no
+# mod.rs, a module doc). The flat-directory ceilings are reported; add
+# `--enforce flat` to make them fail.
 source_layout_report() {
   local base
   base="$(move_check_base)"
@@ -286,7 +288,7 @@ run_step P "check that an absolutize change only makes super paths absolute" fil
 # their labels also make the test-ID map blocking.
 run_step P "check test IDs and never-retry decisions" \
   move_check scripts/check_test_id_map.py 'Move-only:|File-move:|Absolutize:'
-run_step P "report source layout and enforce new file ceilings" source_layout_report
+run_step P "report source layout and enforce the rules for new files" source_layout_report
 
 run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
 # PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree

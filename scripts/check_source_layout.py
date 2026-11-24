@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Report how the ottto-service snapshots module tree measures up to its target layout.
+"""Report how the ottto-service module tree measures up to its layout rules.
 
-Scope: crates/ottto-service/src/snapshots.rs and everything under
-crates/ottto-service/src/snapshots/. Each finding belongs to one rule. The
-check reports and exits 0; `--enforce <rule,...>` makes findings of those rules
-fail (exit 1). Notes never fail.
+Scope: everything under crates/ottto-service/src/. Each finding belongs to one
+rule. The check reports and exits 0; `--enforce <rule,...>` makes findings of
+those rules fail (exit 1). Notes never fail.
 
-`--enforce-new --base <ref>` additionally checks added production .rs files
-throughout the repository against HEAD: over 3,000 lines fails, over 1,500 warns.
-Exact (R100) renames and test files are excluded. Existing files stay report-only
+`--enforce-new --base <ref>` additionally checks .rs files added against the
+base. An added production file anywhere in the repository fails over 3,000
+lines and warns over 1,500. An added file under crates/ottto-service/src/ also
+fails when it is named mod.rs or, for a production file, when it has no `//!`
+module doc. Exact (R100) renames are not added files; test files are excluded
+from the line ceiling and the module doc. Existing files stay report-only
 unless their rules are explicitly enforced with --enforce.
 
   size          a .rs file over 3,000 lines needs a row in
@@ -18,10 +20,11 @@ unless their rules are explicitly enforced with --enforce.
   tree          every .rs file is reachable by `mod` from the crate root; every
                 module directory has its `<dir>.rs`; no `mod.rs`; files other
                 than .rs only under tests/fixtures/ and
-                state_v2/sqlite/migrations/*.sql.
+                state_v2/sqlite/migrations/*.sql (and the native .c and .m
+                shims directly in src/).
   budget        at most 25 entries per directory; at most 3 directories below
-                snapshots/ (sources/claude/census/x.rs is 3), 5 inside a tests/
-                directory.
+                a top-level module directory (snapshots/sources/claude/census/x.rs
+                is 3), 5 inside a tests/ directory.
   path-include  `#[path]` and item-level `include!` only as listed in
                 scripts/source_layout_includes.tsv, a list that may only shrink:
                 against the base commit a new row must replace a removed row
@@ -33,13 +36,17 @@ unless their rules are explicitly enforced with --enforce.
   header        a non-test .rs file starts with a `//!` module doc.
   stutter       a file or directory name does not start with its parent
                 directory's name.
-  tests         a `#[test]` attribute only in a file named tests.rs or under a
-                tests/ directory.
+  tests         a `#[test]` attribute only in a file named tests.rs, under a
+                tests/ directory, or in a file's own inline `mod tests`.
   isolation     inside a source (snapshots/sources/<src>.rs and everything
                 under snapshots/sources/<src>/) no path names
                 `sources::<other source>`.
-  test-stem     no file stem ends in `_tests` (tests live in tests.rs or
-                tests/<topic>.rs).
+  test-stem     no file stem ends in `_tests` outside a tests/ directory
+                (tests live in tests.rs or under tests/).
+  flat          the number of .rs files directly in each directory listed in
+                scripts/source_layout_flat.tsv stays at or under its ceiling.
+                The ceilings are a ratchet: against the base commit no row may
+                rise or disappear while its directory exists.
 
 Exit status: 0, or 1 when an enforced rule has findings, 2 on a usage error (or a
 setup error while a rule is enforced).
@@ -58,12 +65,12 @@ from pathlib import Path
 import rust_source_tree as rst
 
 CRATE = "crates/ottto-service"
-SCOPE_FILE = f"{CRATE}/src/snapshots.rs"
-SCOPE_DIR = f"{CRATE}/src/snapshots"
+SCOPE_DIR = f"{CRATE}/src"
 LIMITS = "scripts/source_layout_limits.tsv"
 INCLUDES = "scripts/source_layout_includes.tsv"
+FLAT = "scripts/source_layout_flat.tsv"
 RULES = ("size", "tree", "budget", "path-include", "names", "header", "stutter", "tests", "isolation",
-         "test-stem")
+         "test-stem", "flat")
 MAX_LINES, NOTE_LINES = 3000, 1500
 MAX_ENTRIES, MAX_DEPTH, TESTS_EXTRA_DEPTH = 25, 3, 2
 BANNED = {"util", "utils", "helper", "helpers", "misc", "common", "shared", "base", "core", "types",
@@ -110,7 +117,7 @@ def limits_table(text: str | None, where: str) -> dict[str, int]:
 
 
 def scope_files(root: Path) -> list[str]:
-    found = [SCOPE_FILE] if (root / SCOPE_FILE).is_file() else []
+    found = []
     for directory, dirs, files in os.walk(root / SCOPE_DIR):
         dirs.sort()
         for name in sorted(files):
@@ -127,14 +134,19 @@ def scope_dirs(root: Path) -> list[str]:
 
 
 def inside(path: str) -> str:
-    """`path` relative to the snapshots directory ('' for the directory itself)."""
+    """`path` relative to the crate's src directory ('' for the directory itself)."""
     return posixpath.relpath(path, SCOPE_DIR) if path != SCOPE_DIR else ""
 
 
 def is_fixture(path: str) -> bool:
     rel = inside(path)
     return (rel.startswith("tests/fixtures/") or "/tests/fixtures/" in rel
-            or bool(re.match(r"^state_v2/sqlite/migrations/[^/]+\.sql$", rel)))
+            or bool(re.match(r"^snapshots/state_v2/sqlite/migrations/[^/]+\.sql$", rel)))
+
+
+def is_native_shim(path: str) -> bool:
+    """A C or Objective-C source directly in src/, compiled by the crate's build script."""
+    return posixpath.dirname(path) == SCOPE_DIR and path.endswith((".c", ".m"))
 
 
 def is_test_file(path: str) -> bool:
@@ -142,16 +154,16 @@ def is_test_file(path: str) -> bool:
     return stem == "tests" or stem.endswith("_tests") or "tests" in path.split("/")[:-1]
 
 
-def added_production_files(root: Path, base: str) -> set[str]:
-    # Detect renames before filtering paths, including moves into the snapshots tree.
+def added_files(root: Path, base: str) -> set[str]:
+    """Every .rs file added against the base; an exact rename is not an added file."""
     added = rst.git(root, "diff", "--find-renames=100%", "--diff-filter=A", "--name-only", "-z",
                     base, "HEAD", "--")
-    return {path for path in added.split("\0") if path.endswith(".rs") and not is_test_file(path)}
+    return {path for path in added.split("\0") if path.endswith(".rs")}
 
 
 def module_depth(path: str) -> int:
-    """Directories between snapshots/ and the file."""
-    return 0 if path == SCOPE_FILE else len(inside(path).split("/")) - 1
+    """Directories between the file's top-level module directory and the file."""
+    return max(0, len(inside(path).split("/")) - 2)
 
 
 def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits: dict[str, int] | None,
@@ -190,25 +202,27 @@ def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits
                                                f"up from {sum(base_limits.values())} at base"))
 
 
-def check_tree(root: Path, files: list[str], dirs: list[str], tree: rst.Tree, out: list[Finding]) -> None:
+def check_tree(root: Path, files: list[str], dirs: list[str], tree: rst.Tree, out: list[Finding],
+               added: set[str] = frozenset()) -> None:
     for path in files:
         if path.endswith(".rs"):
             if path not in tree.contexts:
                 out.append(Finding("tree", path, "not reachable by mod from the crate root"))
             if posixpath.basename(path) == "mod.rs":
-                out.append(Finding("tree", path, "mod.rs; name the module file after its directory"))
-        elif not is_fixture(path):
+                out.append(Finding("tree", path, "mod.rs; name the module file after its directory",
+                                   new_file=path in added))
+        elif not is_fixture(path) and not is_native_shim(path):
             out.append(Finding("tree", path, "not a .rs file outside tests/fixtures/ and "
                                              "state_v2/sqlite/migrations/*.sql"))
     for directory in dirs:
-        has_rs = any(name.endswith(".rs") for name in os.listdir(root / directory))
+        has_rs = directory != SCOPE_DIR and any(name.endswith(".rs") for name in os.listdir(root / directory))
         if has_rs and not (root / f"{directory}.rs").is_file():
             out.append(Finding("tree", directory, f"module directory without {posixpath.basename(directory)}.rs"))
 
 
 def check_budget(root: Path, files: list[str], dirs: list[str], out: list[Finding]) -> None:
     for directory in dirs:
-        if is_fixture(f"{directory}/x") or inside(directory).startswith("state_v2/sqlite/migrations"):
+        if is_fixture(f"{directory}/x") or inside(directory).startswith("snapshots/state_v2/sqlite/migrations"):
             continue
         entries = len(os.listdir(root / directory))
         if entries > MAX_ENTRIES:
@@ -257,7 +271,7 @@ def names_of(files: list[str], dirs: list[str]) -> list[tuple[str, str]]:
     named = [(path, posixpath.basename(path)[:-3]) for path in files if path.endswith(".rs")]
     named += [(directory, posixpath.basename(directory)) for directory in dirs
               if directory != SCOPE_DIR and not is_fixture(f"{directory}/x")
-              and not inside(directory).startswith("tests/fixtures")]
+              and "/tests/fixtures/" not in f"/{inside(directory)}/"]
     return named
 
 
@@ -271,7 +285,8 @@ def check_names(named: list[tuple[str, str]], out: list[Finding]) -> None:
             out.append(Finding("names", path, f"coded stem {', '.join(dict.fromkeys(coded))}"))
 
 
-def check_header(root: Path, files: list[str], source: rst.Source, out: list[Finding]) -> None:
+def check_header(root: Path, files: list[str], source: rst.Source, out: list[Finding],
+                 added: set[str] = frozenset()) -> None:
     for path in files:
         if not path.endswith(".rs") or is_test_file(path):
             continue
@@ -282,20 +297,23 @@ def check_header(root: Path, files: list[str], source: rst.Source, out: list[Fin
             continue
         first = next((item for item in items if item.kind != "comment"), None)
         if first is None or first.kind != "inner-doc":
-            out.append(Finding("header", path, "no //! module doc at the top"))
+            out.append(Finding("header", path, "no //! module doc at the top", new_file=path in added))
 
 
 def check_stutter(named: list[tuple[str, str]], out: list[Finding]) -> None:
     for path, stem in named:
         parent = posixpath.basename(posixpath.dirname(path))
-        if path != SCOPE_FILE and (stem == parent or stem.startswith(f"{parent}_")):
+        if stem == parent or stem.startswith(f"{parent}_"):
             out.append(Finding("stutter", path, f"name starts with its directory name {parent}"))
 
 
 def test_attrs(lexed: rst.Lexed) -> int:
-    """Outer test attributes (`#[test]`, `#[tokio::test]`, ...) anywhere in the file's code."""
+    """Outer test attributes (`#[test]`, `#[tokio::test]`, ...) in the file's code, outside its inline `mod tests`."""
     count = 0
+    own = [(item.start, item.end) for item in lexed.items if item.kind == "mod" and item.name == "tests"]
     for index, token in enumerate(lexed.tokens):
+        if any(start <= token.start < end for start, end in own):
+            continue
         if lexed.is_punct(index, "#"):
             bracket = lexed.next_code(index + 1)
             if lexed.is_punct(bracket, "[") and rst.is_test_attr(
@@ -315,15 +333,15 @@ def check_tests(files: list[str], source: rst.Source, out: list[Finding]) -> Non
             out.append(Finding("tests", path, f"cannot read: {error}"))
             continue
         if count:
-            out.append(Finding("tests", path, f"{count} #[test] outside tests.rs and tests/"))
+            out.append(Finding("tests", path, f"{count} #[test] outside tests.rs, tests/ and an inline mod tests"))
 
 
 def source_of(path: str) -> str | None:
     """The source (`claude`, `codex`, ...) whose subtree holds `path`, if any."""
     parts = inside(path).split("/")
-    if parts[0] != "sources" or len(parts) < 2 or (len(parts) == 2 and not parts[1].endswith(".rs")):
+    if parts[:2] != ["snapshots", "sources"] or len(parts) < 3 or (len(parts) == 3 and not parts[2].endswith(".rs")):
         return None
-    return parts[1].removesuffix(".rs")
+    return parts[2].removesuffix(".rs")
 
 
 def check_isolation(files: list[str], source: rst.Source, out: list[Finding]) -> None:
@@ -353,8 +371,29 @@ def check_isolation(files: list[str], source: rst.Source, out: list[Finding]) ->
 
 def check_test_stem(named: list[tuple[str, str]], out: list[Finding]) -> None:
     for path, stem in named:
-        if path.endswith(".rs") and stem.endswith("_tests"):
+        if path.endswith(".rs") and stem.endswith("_tests") and "tests" not in inside(path).split("/")[:-1]:
             out.append(Finding("test-stem", path, "stem ends in _tests; use tests.rs or tests/<topic>.rs"))
+
+
+def check_flat(root: Path, ceilings: dict[str, int], base_ceilings: dict[str, int] | None,
+               out: list[Finding]) -> None:
+    for directory, ceiling in sorted(ceilings.items()):
+        if not (root / directory).is_dir():
+            out.append(Finding("flat", directory, f"row in {FLAT} for a directory that does not exist"))
+            continue
+        count = sum(1 for name in os.listdir(root / directory)
+                    if name.endswith(".rs") and (root / directory / name).is_file())
+        if count > ceiling:
+            out.append(Finding("flat", directory, f"{count} .rs files directly in it, over its ceiling of {ceiling} "
+                                                  f"in {FLAT}; put a new file in the folder of its feature"))
+        elif count < ceiling:
+            out.append(Finding("flat", directory, f"{count} .rs files; its ceiling can fall from {ceiling}", note=True))
+    for directory, ceiling in sorted((base_ceilings or {}).items()):
+        if directory not in ceilings:
+            if (root / directory).is_dir():
+                out.append(Finding("flat", directory, f"its row is gone from {FLAT}"))
+        elif ceilings[directory] > ceiling:
+            out.append(Finding("flat", directory, f"ceiling rose from {ceiling} to {ceilings[directory]}"))
 
 
 def base_text(repo: Path, base: str, path: str) -> str | None:
@@ -371,7 +410,8 @@ def main(argv: list[str] | None = None) -> int:
                                        "skipped when there is none)")
     parser.add_argument("--enforce", default="", metavar="RULE,...", help=f"fail on these rules: {', '.join(RULES)}")
     parser.add_argument("--enforce-new", action="store_true",
-                        help="fail on added production .rs files over 3,000 lines; warn over 1,500")
+                        help="fail on added production .rs files over 3,000 lines (warn over 1,500), on an added "
+                             "mod.rs and on an added production file without a //! module doc")
     args = parser.parse_args(argv)
     root = Path(args.root)
     enforce = {rule for rule in args.enforce.split(",") if rule}
@@ -388,13 +428,17 @@ def main(argv: list[str] | None = None) -> int:
                 base = None
         if args.enforce_new and not base:
             raise rst.SourceError("--enforce-new needs --base or a merge-base with origin/main")
-        new_files = added_production_files(root, base) if args.enforce_new else set()
+        added = added_files(root, base) if args.enforce_new else set()
+        new_files = {path for path in added if not is_test_file(path)}
         source = rst.DirSource(root)
         limits = limits_table((root / LIMITS).read_text(encoding="utf-8"), LIMITS)
         allowed = read_table((root / INCLUDES).read_text(encoding="utf-8"), 3, INCLUDES)
-        base_limits = base_allowed = None
+        ceilings = limits_table((root / FLAT).read_text(encoding="utf-8"), FLAT)
+        base_limits = base_allowed = base_ceilings = None
         if base:
             limits_then, allowed_then = base_text(root, base, LIMITS), base_text(root, base, INCLUDES)
+            ceilings_then = base_text(root, base, FLAT)
+            base_ceilings = limits_table(ceilings_then, f"{base}:{FLAT}") if ceilings_then is not None else None
             base_limits = limits_table(limits_then, f"{base}:{LIMITS}") if limits_then is not None else None
             base_allowed = read_table(allowed_then, 3, f"{base}:{INCLUDES}") if allowed_then is not None else None
         files, dirs = scope_files(root), scope_dirs(root)
@@ -405,16 +449,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2 if enforce or args.enforce_new else 0
     findings: list[Finding] = []
     check_size(root, sorted(set(files) | new_files), limits, base_limits, findings, new_files)
-    check_tree(root, files, dirs, tree, findings)
+    check_tree(root, files, dirs, tree, findings, added)
     check_budget(root, files, dirs, findings)
     check_path_include(link_rows(tree, files), allowed, base_allowed, findings)
     named = names_of(files, dirs)
     check_names(named, findings)
-    check_header(root, files, source, findings)
+    check_header(root, files, source, findings, added)
     check_stutter(named, findings)
     check_tests(files, source, findings)
     check_isolation(files, source, findings)
     check_test_stem(named, findings)
+    check_flat(root, ceilings, base_ceilings, findings)
     for finding in findings:
         kind = ("warning" if finding.new_file else "note") if finding.note else finding.rule
         print(f"source-layout: {kind}: {finding.path}: {finding.message}")
@@ -426,13 +471,14 @@ def main(argv: list[str] | None = None) -> int:
           + ("" if base else "; ratchets not compared (no base)"))
     failing = {rule: counts[rule] for rule in sorted(enforce) if counts[rule]}
     if any(f.new_file and not f.note for f in findings):
-        print("source-layout: new production files exceed the line ceiling", file=sys.stderr)
+        print("source-layout: added files break the rules for new files (line ceiling, mod.rs, //! module doc)",
+              file=sys.stderr)
         return 1
     if failing:
         print(f"source-layout: enforced rules with findings: {', '.join(failing)}", file=sys.stderr)
         return 1
     mode = 'enforced: ' + ', '.join(sorted(enforce)) if enforce else 'report only'
-    print(f"source-layout: {mode}" + ("; new production file ceiling enforced" if args.enforce_new else ""))
+    print(f"source-layout: {mode}" + ("; rules for new files enforced" if args.enforce_new else ""))
     return 0
 
 

@@ -14,6 +14,14 @@
   account attribution. Preserve lock and side-effect ordering, credential/privacy
   protections, and checkpoint/receipt/retry/recovery semantics unless the task
   explicitly changes them. Keep manifests and lockfiles unchanged unless needed.
+- Daemon file layout (see "Module map: `src/`" and "Layout and naming rules" in its
+  ARCHITECTURE.md): put new code under the existing module it belongs to, never as a
+  new file directly in `src/`, `snapshots/` or `snapshot_sync/` (a genuinely new top-level
+  feature gets its own folder in its own commit; see rule 1). Name a file for what it does
+  now (no ticket or phase codes) and start a production file with a `//!` line. Use `foo.rs` + `foo/`; no
+  `mod.rs`, no new `#[path]` or `include!`. Tests go in `foo/tests.rs` or
+  `foo/tests/<topic>.rs` (a short inline `mod tests` is fine). No new glob imports outside test modules. A move is its own PR
+  (`Move-only:` or `File-move:`), never mixed with a logic change.
 - Before consolidating similar code, compare preconditions and failure handling.
   Repeated boundary checks and distinct settlement outcomes may be intentional.
 - Coordinate with existing owners before editing shared files. For authorized
