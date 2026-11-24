@@ -409,11 +409,49 @@ fn add_spawn_edge(home: &OracleHome, parent: &str, child: &str) {
         .unwrap();
 }
 
-/// complete -> a spawn edge binds a created thread whose rollout never
+/// Moves a thread's thread-history extent by `lag` bytes and ordinals behind
+/// what the fixture wrote (0 catches it up again). The rollout is untouched.
+fn set_extent_lag(home: &OracleHome, thread: &str, lag: i64) {
+    let history = roots(home)[0]
+        .parent()
+        .unwrap()
+        .join("thread_history_1.sqlite");
+    let rows = std::fs::read_to_string(roots(home)[0].join(format!("rollout-{thread}.jsonl")))
+        .unwrap()
+        .lines()
+        .count() as i64;
+    let length = std::fs::metadata(roots(home)[0].join(format!("rollout-{thread}.jsonl")))
+        .unwrap()
+        .len() as i64;
+    rusqlite::Connection::open(history)
+        .unwrap()
+        .execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1,next_rollout_ordinal=?2 WHERE thread_id=?3",
+            rusqlite::params![length - lag, rows - lag, thread],
+        )
+        .unwrap();
+}
+
+/// The side-only change a Codex row makes after its source settles.
+#[derive(Clone, Copy)]
+enum SideOnly {
+    /// A spawn edge binds a created thread.
+    SpawnEdge,
+    /// The thread is held (its spawn edge is in place, its extent lags the
+    /// rollout); thread history then catches up.
+    ExtentCatchUp,
+}
+
+/// complete -> a side-only change for a created thread whose rollout never
 /// changes -> passes to the backstop. With `gated` false every pass walks
 /// (today's back-to-back walks over the same timeline). Also returns, per
-/// pass after the edge, whether the rollout's index entry took the change.
-fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<bool>) {
+/// pass after the change, whether the rollout's index entry or the server's
+/// placement took it.
+fn codex_side_only_lifecycle(
+    row: &'static str,
+    gated: bool,
+    side: SideOnly,
+) -> (Lifecycle, Vec<bool>) {
     let source = SnapshotSource::Codex;
     let recording = Recording::start();
     let server = OracleServer::new(source, recording.handle());
@@ -421,6 +459,10 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
     home.row = row;
     install(&home);
     install_created_thread(&home, false, SECOND_CODEX_THREAD, false);
+    if let SideOnly::ExtentCatchUp = side {
+        add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+        set_extent_lag(&home, IDENTITY_PIPELINE_ROOT, 1);
+    }
     let watched = roots(&home);
     with_simulated_watch(&watched, || {
         walk_idle::restart_for_test();
@@ -435,9 +477,14 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
             (cycle.index.files.get(&key)).map(|entry| entry.source_file_fingerprint.clone())
         };
         let before = fingerprint(cycles.last().unwrap());
-        assert!(before.is_some(), "{row}: the rollout is indexed");
+        let placed = placement(&server);
         let rollout = std::fs::read(transcript(&home)).unwrap();
-        add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+        match side {
+            SideOnly::SpawnEdge => {
+                add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+            }
+            SideOnly::ExtentCatchUp => set_extent_lag(&home, IDENTITY_PIPELINE_ROOT, 0),
+        }
         let mut applied = Vec::new();
         let mut since_walk = 0;
         loop {
@@ -447,7 +494,7 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
             let walk = backstop || !gated;
             expect_pass(source, row, &cycle, walk, &server, &mut seen);
             walks += usize::from(walk);
-            applied.push(fingerprint(&cycle) != before);
+            applied.push(fingerprint(&cycle) != before || placement(&server) != placed);
             cycles.push(cycle);
             if backstop {
                 break;
@@ -462,27 +509,53 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
     })
 }
 
-/// A side-only Codex change on an unchanged rollout does not wake a settled
-/// source: the backstop walk applies it, with the money of back-to-back
-/// walks over the same timeline.
+/// Runs one side-only row gated and with back-to-back walks: the change
+/// wakes nothing, the backstop walk applies it, and the money matches.
+fn codex_side_only_waits_for_the_backstop(
+    side: SideOnly,
+    row: &'static str,
+    control: &'static str,
+) {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (gated, rested) = codex_side_only_lifecycle(row, true, side);
+    let (today, walked_each) = codex_side_only_lifecycle(control, false, side);
+    assert!(walked_each[0], "{row}: the next walk applies the change");
+    let (backstop, rests) = rested.split_last().unwrap();
+    assert!(
+        rests.iter().all(|applied| !applied),
+        "{row}: a rest applies nothing"
+    );
+    assert!(*backstop, "{row}: the backstop walk applies the change");
+    assert!(gated.walks < today.walks, "{row}: the change woke no walk");
+    gated.assert_matches(&today, row);
+}
+
+/// A spawn edge for a created thread on an unchanged rollout.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn codex_side_only_change_waits_for_the_backstop_walk() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (gated, rested) = codex_side_only_lifecycle("w20_codex_side", true);
-    let (today, walked_each) = codex_side_only_lifecycle("w20_codex_side_today", false);
-    assert!(walked_each[0], "the next walk applies the edge");
-    let (backstop, rests) = rested.split_last().unwrap();
-    assert!(
-        rests.iter().all(|applied| !applied),
-        "a rest applies nothing"
+    codex_side_only_waits_for_the_backstop(
+        SideOnly::SpawnEdge,
+        "w20_codex_side",
+        "w20_codex_side_today",
     );
-    assert!(*backstop, "the backstop walk applies the edge");
-    assert!(gated.walks < today.walks, "the edge woke no walk");
-    gated.assert_matches(&today, "w20_codex_side");
+}
+
+/// A created thread held while its thread-history extent lags: the extent
+/// catching up (no rollout change) misses the hold's memo, so the backstop
+/// walk re-reads it and binds the parent.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_held_thread_extent_catch_up_waits_for_the_backstop_walk() {
+    codex_side_only_waits_for_the_backstop(
+        SideOnly::ExtentCatchUp,
+        "w22_codex_extent",
+        "w22_codex_extent_today",
+    );
 }
 
 /// An unreadable Codex state store still walks an armed source: home side
