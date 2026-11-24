@@ -226,132 +226,8 @@ impl OwnedSourceScan {
             decision = logical;
             parse_reason = reason;
         }
-        // History-upgrade gate, whatever selected the file:
-        // unchanged Claude history that would carry a new body-witness
-        // revision passes the list, the no-list birth hold, the family
-        // skip, the stop latch and this page's budget (reserved once per
-        // file). A held file that only owes the upgrade is skipped with
-        // its old stamp, and so is one that also owes only its upload
-        // context. A held file selected for another reason (re-arm,
-        // family, audit, authority, a rebuilt or replayed index) still
-        // parses for its local work, but none of its bodies
-        // is emitted and its upload tuple stays (`veto_claude_history_emission`).
-        // A new Claude file held only by this page's budget is skipped too.
-        // A skipped Claude file held only by this page's budget is queued
-        // again as a re-read for the next page of the walk. Codex and Pi
-        // keep the adoption-only page budget.
-        let mut history_held = false;
-        if decision == CandidateDecision::Parse {
-            let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                && (self
-                    .index
-                    .candidate_requires_only_body_witness_adoption(&candidate, self.audit_now)
-                    || (self.source == SnapshotSource::ClaudeCode
-                        && claude_copy_prefix_reread::unchanged_requested(
-                            &self.index,
-                            &candidate,
-                            self.audit_now,
-                        )));
-            let history = if self.source == SnapshotSource::ClaudeCode {
-                self.index.claude_history_upgrade_decision(
-                    &candidate,
-                    opened_file
-                        .metadata()
-                        .and_then(|metadata| metadata.created())
-                        .ok()
-                        .and_then(unix_seconds),
-                    &mut self.history_upgrade,
-                )
-            } else if adoption_only
-                && !self.history_upgrade.reserve_admitting_first_file(
-                    &local_index_key(&candidate.path),
-                    candidate.size_bytes,
-                )
-            {
-                self.history_upgrade.note_denied(
-                    HistoryHold::Budget,
-                    self.index.claude_reemission_exclusions.state(),
-                );
-                HistoryDecision::Held(HistoryHold::Budget)
-            } else {
-                HistoryDecision::NotOwed
-            };
-            if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
-                // Held for a later walk: this walk cannot settle it.
-                if let Some(traversal) = self.index.traversal.as_mut() {
-                    traversal.rewalk_owed = true;
-                }
-            }
-            // A held, unchanged member owed only a proof correction is not
-            // re-read every traversal either: its bodies would be vetoed,
-            // and the correction waits for the gate (StateMissing).
-            let correction_only = parse_reason == Some(CandidateParseReason::AuthorityQuarantine)
-                && self.index.claude_authority_correction_only(&candidate);
-            // A new Claude file held only by this page's budget is not
-            // read now: a vetoed read would save it unoffered. It waits
-            // in the queue, keeping its census membership. A family root
-            // (a `<root>/subagents` directory) still takes the held read:
-            // its census record lets a fork read first drop its copy.
-            let budget_held_new = self.source == SnapshotSource::ClaudeCode
-                && parse_reason == Some(CandidateParseReason::NewFile)
-                && history == HistoryDecision::Held(HistoryHold::Budget)
-                && !candidate.path.with_extension("").join("subagents").is_dir();
-            // A listed genuine change is never held (it is literal-only
-            // denied), so a held correction-only member is unchanged.
-            match history {
-                HistoryDecision::Held(hold)
-                    if adoption_only || correction_only || budget_held_new =>
-                {
-                    if self.source == SnapshotSource::ClaudeCode {
-                        let carried = self
-                            .index
-                            .accepted_rebuild_incidence
-                            .get(&local_index_key(&candidate.path))
-                            .map_or(0, BTreeSet::len);
-                        self.index.claude_history_emission.skipped_carried_entries = self
-                            .index
-                            .claude_history_emission
-                            .skipped_carried_entries
-                            .saturating_add(carried);
-                        // A budget hold paces the upgrade page by page:
-                        // the file goes back to the walk's queue as a
-                        // re-read, so the next page of this walk continues
-                        // the upgrade (the switch-on
-                        // re-read). A re-read is not a census member
-                        // (G1): it never holds the census, and a walk
-                        // that ends first drops it for the next walk to
-                        // list again. Only once this page admitted
-                        // history: a file that cannot fit an empty page
-                        // waits for the next walk as before.
-                        if hold == HistoryHold::Budget && self.history_upgrade.admitted_any() {
-                            if let Some(traversal) = self.index.traversal.as_mut() {
-                                traversal.pending_candidates.push_back(ScanTraversalPath {
-                                    scan_root: candidate.scan_root.clone(),
-                                    path: candidate.path.clone(),
-                                    census_member: budget_held_new
-                                        && self
-                                            .selected_flags
-                                            .get(&local_index_key(&candidate.path))
-                                            .is_some_and(|&(member, _)| member),
-                                    watcher_hint: false,
-                                });
-                            }
-                        }
-                    }
-                    decision = CandidateDecision::Skip;
-                }
-                HistoryDecision::Held(hold) => {
-                    history_held = true;
-                    self.index
-                        .gate_claude_history_candidate(&candidate, Some(hold));
-                }
-                HistoryDecision::Owed => self.index.gate_claude_history_candidate(&candidate, None),
-                HistoryDecision::LiteralDenied => {
-                    self.index.deny_claude_history_literal(&candidate);
-                }
-                HistoryDecision::NotOwed => {}
-            }
-        }
+        let (mut decision, history_held) =
+            self.apply_history_upgrade_gate(&candidate, &opened_file, parse_reason, decision);
         // A file whose Tail failed alone is selected by its set-aside
         // marker before an ordinary Skip, even with equal stamps, and
         // re-reads from its committed head.
@@ -1520,5 +1396,145 @@ impl OwnedSourceScan {
             }
         }
         true
+    }
+
+    /// The history-upgrade gate. Returns the decision, unchanged or `Skip`,
+    /// and `history_held`: this gate held the file's history emission and
+    /// left its decision at `Parse`.
+    #[inline(never)]
+    fn apply_history_upgrade_gate(
+        &mut self,
+        candidate: &CandidateFile,
+        opened_file: &std::fs::File,
+        parse_reason: Option<CandidateParseReason>,
+        mut decision: CandidateDecision,
+    ) -> (CandidateDecision, bool) {
+        // History-upgrade gate, whatever selected the file:
+        // unchanged Claude history that would carry a new body-witness
+        // revision passes the list, the no-list birth hold, the family
+        // skip, the stop latch and this page's budget (reserved once per
+        // file). A held file that only owes the upgrade is skipped with
+        // its old stamp, and so is one that also owes only its upload
+        // context. A held file selected for another reason (re-arm,
+        // family, audit, authority, a rebuilt or replayed index) still
+        // parses for its local work, but none of its bodies
+        // is emitted and its upload tuple stays (`veto_claude_history_emission`).
+        // A new Claude file held only by this page's budget is skipped too.
+        // A skipped Claude file held only by this page's budget is queued
+        // again as a re-read for the next page of the walk. Codex and Pi
+        // keep the adoption-only page budget.
+        let mut history_held = false;
+        if decision == CandidateDecision::Parse {
+            let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
+                && (self
+                    .index
+                    .candidate_requires_only_body_witness_adoption(candidate, self.audit_now)
+                    || (self.source == SnapshotSource::ClaudeCode
+                        && claude_copy_prefix_reread::unchanged_requested(
+                            &self.index,
+                            candidate,
+                            self.audit_now,
+                        )));
+            let history = if self.source == SnapshotSource::ClaudeCode {
+                self.index.claude_history_upgrade_decision(
+                    candidate,
+                    opened_file
+                        .metadata()
+                        .and_then(|metadata| metadata.created())
+                        .ok()
+                        .and_then(unix_seconds),
+                    &mut self.history_upgrade,
+                )
+            } else if adoption_only
+                && !self.history_upgrade.reserve_admitting_first_file(
+                    &local_index_key(&candidate.path),
+                    candidate.size_bytes,
+                )
+            {
+                self.history_upgrade.note_denied(
+                    HistoryHold::Budget,
+                    self.index.claude_reemission_exclusions.state(),
+                );
+                HistoryDecision::Held(HistoryHold::Budget)
+            } else {
+                HistoryDecision::NotOwed
+            };
+            if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
+                // Held for a later walk: this walk cannot settle it.
+                if let Some(traversal) = self.index.traversal.as_mut() {
+                    traversal.rewalk_owed = true;
+                }
+            }
+            // A held, unchanged member owed only a proof correction is not
+            // re-read every traversal either: its bodies would be vetoed,
+            // and the correction waits for the gate (StateMissing).
+            let correction_only = parse_reason == Some(CandidateParseReason::AuthorityQuarantine)
+                && self.index.claude_authority_correction_only(candidate);
+            // A new Claude file held only by this page's budget is not
+            // read now: a vetoed read would save it unoffered. It waits
+            // in the queue, keeping its census membership. A family root
+            // (a `<root>/subagents` directory) still takes the held read:
+            // its census record lets a fork read first drop its copy.
+            let budget_held_new = self.source == SnapshotSource::ClaudeCode
+                && parse_reason == Some(CandidateParseReason::NewFile)
+                && history == HistoryDecision::Held(HistoryHold::Budget)
+                && !candidate.path.with_extension("").join("subagents").is_dir();
+            // A listed genuine change is never held (it is literal-only
+            // denied), so a held correction-only member is unchanged.
+            match history {
+                HistoryDecision::Held(hold)
+                    if adoption_only || correction_only || budget_held_new =>
+                {
+                    if self.source == SnapshotSource::ClaudeCode {
+                        let carried = self
+                            .index
+                            .accepted_rebuild_incidence
+                            .get(&local_index_key(&candidate.path))
+                            .map_or(0, BTreeSet::len);
+                        self.index.claude_history_emission.skipped_carried_entries = self
+                            .index
+                            .claude_history_emission
+                            .skipped_carried_entries
+                            .saturating_add(carried);
+                        // A budget hold paces the upgrade page by page:
+                        // the file goes back to the walk's queue as a
+                        // re-read, so the next page of this walk continues
+                        // the upgrade (the switch-on
+                        // re-read). A re-read is not a census member
+                        // (G1): it never holds the census, and a walk
+                        // that ends first drops it for the next walk to
+                        // list again. Only once this page admitted
+                        // history: a file that cannot fit an empty page
+                        // waits for the next walk as before.
+                        if hold == HistoryHold::Budget && self.history_upgrade.admitted_any() {
+                            if let Some(traversal) = self.index.traversal.as_mut() {
+                                traversal.pending_candidates.push_back(ScanTraversalPath {
+                                    scan_root: candidate.scan_root.clone(),
+                                    path: candidate.path.clone(),
+                                    census_member: budget_held_new
+                                        && self
+                                            .selected_flags
+                                            .get(&local_index_key(&candidate.path))
+                                            .is_some_and(|&(member, _)| member),
+                                    watcher_hint: false,
+                                });
+                            }
+                        }
+                    }
+                    decision = CandidateDecision::Skip;
+                }
+                HistoryDecision::Held(hold) => {
+                    history_held = true;
+                    self.index
+                        .gate_claude_history_candidate(candidate, Some(hold));
+                }
+                HistoryDecision::Owed => self.index.gate_claude_history_candidate(candidate, None),
+                HistoryDecision::LiteralDenied => {
+                    self.index.deny_claude_history_literal(candidate);
+                }
+                HistoryDecision::NotOwed => {}
+            }
+        }
+        (decision, history_held)
     }
 }
