@@ -583,15 +583,14 @@ rm -rf "$DMG_STAGING"
 CLI_ZIP="$OUTPUT_DIR/ottto-macos-$ARCH.zip"
 DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
 # Each zip holds its executable plus the license notices at the zip root. The
-# staging folders live outside the release output folder.
+# staging folders live outside the release output folder, so a failed run
+# cannot leave them where release files are collected.
 ZIP_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ottto-zip-stage.XXXXXX")"
-trap 'rm -rf "$ZIP_STAGE_ROOT"' EXIT
 ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto" "$ZIP_STAGE_ROOT/cli"
 ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto-service" "$ZIP_STAGE_ROOT/daemon"
 ditto -c -k "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
 ditto -c -k "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
 rm -rf "$ZIP_STAGE_ROOT"
-trap - EXIT
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
 # The SBOM describes the Apple Silicon build and the Sparkle version the app
 # source commit pins; the embedded framework must be that version.
