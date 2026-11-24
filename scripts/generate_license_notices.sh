@@ -79,7 +79,7 @@ from html.parser import HTMLParser
 REQUIRED = [
     ("ring", "Apache-2.0", "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"),
     ("ring", "ISC", "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"),
-    ("ring", "MIT", "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"),
+    ("ring", "Apache-2.0", "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"),
     ("ring", "Apache-2.0", "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"),
     ("ring", "MIT", "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"),
     ("webpki-roots", "CDLA-Permissive-2.0", "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8"),

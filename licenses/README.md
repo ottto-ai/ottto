@@ -57,8 +57,8 @@ identifier fails generation until it is reviewed and added to `accepted`.
 
 - `ring` 0.17.14: its `LICENSE` only points at other files. The clarification
   reproduces all five: `LICENSE-BoringSSL` (Apache-2.0), `LICENSE-other-bits`
-  (ISC), `third_party/fiat/LICENSE` (MIT) and the bundled `once_cell`
-  Apache-2.0 and MIT files.
+  (ISC), the fiat-crypto notice `third_party/fiat/LICENSE` (Apache-2.0) and the
+  bundled `once_cell` Apache-2.0 and MIT files.
 - `webpki-roots` 1.0.12: the root certificate data is under
   CDLA-Permissive-2.0, whose full text must accompany the data.
 - `objc2-core-foundation` and `objc2-core-services` 0.3.2 ship no license file
