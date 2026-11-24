@@ -1,5 +1,5 @@
 // CI controls for paced continuation. The cursor side and the
-// platform are fakes standing in for c22's hunks and the platform hunk; the
+// platform are fakes standing in for `CodexCursorPort` and `MacPlatformSignals`; the
 // clock is simulated, so nothing here sleeps, reads a transcript or opens a
 // socket.
 
@@ -32,7 +32,7 @@ const OTHER_AUTHORITY: [u8; 32] = [4; 32];
 /// How far a page reads past its deadline: to the end of the current record.
 const RECORD: Duration = Duration::from_secs(1);
 /// The fakes' ticket lifetime unless a control sets its own: long enough
-/// that only the K2/P-1 expiry controls reach it.
+/// that only the expiry controls reach it.
 const LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 struct World {
@@ -177,7 +177,7 @@ struct FakePort<'a> {
     authority_during_page: Option<Option<[u8; 32]>>,
     /// The deadline each page was given, and whether it was cut short there.
     deadlines: Vec<(Instant, bool)>,
-    /// The ordinary equivalent each page was given (K4).
+    /// The ordinary equivalent each page was given.
     equivalents: Vec<Option<Duration>>,
     calls: Calls,
 }
@@ -661,7 +661,7 @@ fn ordinary_cycles_keep_todays_cadence_and_order_with_continuation_pages() {
     }
 }
 
-/// K2/P-1: a ticket whose fixed lifetime ended before the page, or a clock
+/// A ticket whose fixed lifetime ended before the page, or a clock
 /// that reads earlier than its issue, never reaches the cursor side.
 #[test]
 fn an_expired_or_rolled_back_ticket_runs_no_page() {
@@ -700,7 +700,7 @@ fn an_expired_or_rolled_back_ticket_runs_no_page() {
     }
 }
 
-/// K2/P-1: nothing renews the lifetime: a re-paused page keeps the minting
+/// Nothing renews the lifetime: a re-paused page keeps the minting
 /// page's `issued`/`expires`, so a run of pages ends at the fixed expiry
 /// whatever its activity.
 #[test]
@@ -773,9 +773,9 @@ fn the_sync_lock_is_free_while_the_loop_waits() {
     assert!(host.waits.iter().all(|free| *free), "{:?}", host.waits);
 }
 
-// Option W (W1–W12): the worker, its join and the parent's mapping.
+// The worker, its join and the parent's mapping.
 
-/// W10: test hooks are thread-locals the worker does not inherit; a test
+/// Test hooks are thread-locals the worker does not inherit; a test
 /// must install them inside the worker.
 #[test]
 fn parent_test_hooks_are_not_seen_on_the_worker() {
@@ -802,7 +802,7 @@ fn test_latch() -> &'static AtomicBool {
     Box::leak(Box::new(AtomicBool::new(false)))
 }
 
-/// W8(a), W9: a worker that panics while holding the cache's cursor lock
+/// A worker that panics while holding the cache's cursor lock
 /// comes back as `Failed`; the latch then refuses every further ticket and
 /// readiness, and the poisoned lock fails closed.
 #[test]
@@ -863,7 +863,7 @@ fn ticket_with_inputs(
     (ticket, sentinel)
 }
 
-/// K2 (4): the moved context is dropped (its key zeroized by its own
+/// The moved context is dropped (its key zeroized by its own
 /// `Zeroizing` storage) on every end that clears the ticket: expiry, an
 /// authority or destination change, a ticket that is not ready, an ordinary
 /// failure or prepare, a replacement, a rotation discard, and a worker

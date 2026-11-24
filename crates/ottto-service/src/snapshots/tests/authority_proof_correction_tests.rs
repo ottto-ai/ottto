@@ -246,7 +246,7 @@ fn only_owed_or_changed_members_bypass_the_terminal_gate() {
     let mut changed = apc_candidate(&index, 0);
     changed.source_file_fingerprint = apc_hex('5');
     assert_eq!(apc_decision(&index, &changed), PARSE_FOR_AUTHORITY);
-    // The R3 failure shape the demotion path writes.
+    // The failure shape the demotion path writes.
     let record = index
         .claude_usage_authority_quarantine
         .get_mut(APC_ROOT)
@@ -280,7 +280,7 @@ fn apc_load_value(scratch: &Path, name: &str, value: &Value) -> (ScanIndex, bool
     (loaded, quarantined)
 }
 
-/// T5/R7 strict load: the proof, record digest and retained witness are one
+/// Strict load: the proof, record digest and retained witness are one
 /// binding; owed is non-empty and a subset of the recorded members; contract
 /// v2 exactly when a correction is present, on a terminal record. Every other
 /// shape drops only the authority record.
@@ -427,7 +427,7 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
     );
 }
 
-/// R7 against the actual pre-change decoder source. The pinned base has no
+/// Test against the actual pre-change decoder source. The pinned base has no
 /// `deny_unknown_fields` on the record, so a v2 record still decodes and the
 /// field is dropped; its record predicate then rejects the v2 contract, so the
 /// old loader takes its invalid-index branch: whole-index quarantine and a
@@ -903,7 +903,7 @@ fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
     }
 }
 
-/// A1 then A3 (Addendum 4 acceptance 1 and 5). A new empty revision parsed on
+/// A new empty revision parsed on
 /// an earlier partial page advances only the member's map revision, with the
 /// owed set, counter, deadline, proof and every acceptance and entity debt
 /// byte-identical; the three facts persist together through restart; the
@@ -960,7 +960,7 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
     apc_save_reload(&mut loaded, &scratch.join("advanced.json"));
 }
 
-/// A3 control (Addendum 4 acceptance 2 and 5). The committed state holds an
+/// Control. The committed state holds an
 /// older empty entry while the record holds a newer revision; this page
 /// parses that newer revision to a body a hold keeps from the upload. Neither
 /// the non-empty parse nor borrowed or consuming held restoration of the old
@@ -1144,9 +1144,9 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
     apc_save_reload(&mut loaded, &scratch.join("shed.json"));
 }
 
-/// A3 (Addendum 4 acceptance 4 and 5): a complete non-empty parse at a new
+/// A complete non-empty parse at a new
 /// revision never advances the map at any census; the changed revision takes
-/// the existing R4 path, and the member stays owed through restart.
+/// the existing `AuthorityQuarantine` path, and the member stays owed through restart.
 #[test]
 fn a3_a_non_empty_parse_never_advances_the_map() {
     let [root, agent] = apc_members();
