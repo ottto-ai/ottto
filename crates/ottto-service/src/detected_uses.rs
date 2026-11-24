@@ -783,7 +783,7 @@ mod tests {
         assert!(reset.is_empty());
         let unchanged =
             without_pre_account_cache(vec![unnamed.clone()], std::slice::from_ref(&unnamed));
-        assert_eq!(unchanged, [unnamed.clone()]);
+        assert_eq!(unchanged, std::slice::from_ref(&unnamed));
         let current = without_pre_account_cache(
             vec![unnamed.clone(), named.clone()],
             std::slice::from_ref(&named),
