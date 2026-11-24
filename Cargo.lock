@@ -737,7 +737,6 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.4.3",
- "libc",
  "ottto-core",
  "ottto-protocol",
  "serde",

@@ -21,7 +21,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 getrandom.workspace = true
-libc.workspace = true
 ottto-core = { path = "../ottto-core" }
 ottto-protocol = { path = "../ottto-protocol" }
 serde.workspace = true

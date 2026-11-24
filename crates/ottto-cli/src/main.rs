@@ -181,6 +181,10 @@ struct CloudConnectArgs {
     timeout: u64,
     #[arg(long, help = "Show AWS CLI error text on this terminal")]
     verbose: bool,
+    /// Set by the printed resume command: repeats the request that started an attempt, so a
+    /// rerun reads that attempt back instead of starting another.
+    #[arg(long, hide = true, value_name = "ID", value_parser = cloud_connect::valid_request_id)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1085,7 +1089,20 @@ fn request_with_autostart(
     invocation: &Invocation,
     request: &LocalControlRequest,
 ) -> Result<LocalControlResponse, CliError> {
-    let timeout = control_socket_timeout(&request.command);
+    request_with_autostart_timeout(
+        invocation,
+        request,
+        control_socket_timeout(&request.command),
+    )
+}
+
+/// [`request_with_autostart`] with a caller-chosen socket timeout, for commands that carry their
+/// own deadline.
+fn request_with_autostart_timeout(
+    invocation: &Invocation,
+    request: &LocalControlRequest,
+    timeout: Duration,
+) -> Result<LocalControlResponse, CliError> {
     match request_unix_socket_with_timeout(&invocation.socket, request, timeout) {
         Ok(response) => Ok(response),
         Err(error) => {
@@ -2212,9 +2229,9 @@ fn local_command(command: Command) -> LocalControlCommand {
                 attempt_id: Some(attempt_id),
                 timeout_ms: 30_000,
             },
-            CloudCommand::Connect(_) => LocalControlCommand::CloudConnectStatus {
-                attempt_id: None,
-                timeout_ms: 30_000,
+            // Connect starts with the feature check; `cloud_connect::run` builds the rest.
+            CloudCommand::Connect(_) => LocalControlCommand::CloudStatus {
+                source: Some("bedrock".to_string()),
             },
             CloudCommand::Cancel(args) => LocalControlCommand::CloudConnectCancel {
                 attempt_id: args.attempt,

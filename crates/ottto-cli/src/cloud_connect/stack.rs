@@ -1,9 +1,10 @@
 //! Typed CloudFormation plans, stack reconciliation and cleanup output.
 
 use super::aws::{access_denied, Aws, Session};
-use super::{best_effort_aws, invalid_server, sleep_until, Failure};
+use super::{invalid_server, sleep_until, Failure};
 use ottto_protocol::{
-    cloud_account_id, cloud_stack_id, cloud_stack_name, CloudTemplatePin, CLOUD_CONNECT_REGION,
+    cloud_account_id, cloud_stack_id, cloud_stack_name, CloudTemplatePin, TemplatePin,
+    TemplatePinId, CLOUD_CONNECT_REGION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -15,6 +16,8 @@ pub(super) struct Plan {
     pub(super) stack_name: String,
     region: String,
     template: CloudTemplatePin,
+    /// Built locally from the compiled pin once `check` accepts the server's template metadata.
+    #[serde(skip)]
     url: String,
     parameters: Parameters,
     capabilities: Vec<String>,
@@ -36,19 +39,25 @@ impl Plan {
         &self.parameters.ottto_workspace
     }
 
-    pub(super) fn check(&self, metrics: bool) -> Result<(), Failure> {
-        if !self.template.is_compiled_pin()
-            || self.url
-                != format!(
-            "https://ottto-cloud-connect-templates.s3.us-east-1.amazonaws.com/{}?versionId={}",
-            self.template.key, self.template.version_id
-        ) {
-            return Err(Failure::new(
-                "aws_template_unverified",
-                "Use Ottto on the web to connect with a verified template.",
-                "use_web",
-            ));
-        }
+    /// Checks every server value before any AWS write. The template must be the one this release
+    /// compiled in; its URL is built from that pin, never taken from the server.
+    pub(super) fn check(&mut self, metrics: bool) -> Result<(), Failure> {
+        let pin = TemplatePinId::BedrockCliReadRoleV1;
+        self.url = pin
+            .matches_metadata(
+                &self.template.key,
+                &self.template.version_id,
+                &self.template.sha256,
+            )
+            .then(|| pin.pin().and_then(TemplatePin::url))
+            .flatten()
+            .ok_or_else(|| {
+                Failure::new(
+                    "aws_template_unverified",
+                    "Use Ottto on the web to connect with a verified template.",
+                    "use_web",
+                )
+            })?;
         let (prefix, variant, metric_value) = if metrics {
             ("ottto-read-m-", "cli_metrics", "true")
         } else {
@@ -332,11 +341,8 @@ impl Reconcile<'_> {
                 ],
                 deadline,
             )
-            .and_then(|output| self.aws.json(output));
-        let events = match best_effort_aws(events) {
-            Ok(events) => events,
-            Err(interrupted) => return interrupted,
-        };
+            .and_then(|output| self.aws.json(output))
+            .ok();
         let denied = events.is_some_and(|value| {
             value["StackEvents"]
                 .as_array()
@@ -372,62 +378,41 @@ fn mismatch() -> Failure {
     )
 }
 
+/// The server's reference to a stack an attempt may have created.
 #[derive(Deserialize)]
 pub(super) struct CleanupReference {
+    pub(super) attempt_id: String,
     pub(super) stack_name: String,
     pub(super) account_id: String,
     pub(super) stack_id: Option<String>,
 }
 
 impl CleanupReference {
-    pub(super) fn resolve(
-        &self,
-        identity: Option<(&Aws, &Session, &str)>,
-        deadline: Instant,
-    ) -> Result<Option<Value>, Failure> {
-        if !self.is_valid() {
-            return Ok(None);
+    /// What to tell the user about the stack of an attempt the server ended without saving. The
+    /// delete command names the full ARN the server checked, so it fails safely under another
+    /// account's profile. Without an ARN the user gets the name, account and region only.
+    pub(super) fn output(&self, profile: Option<&str>) -> Option<Value> {
+        if !cloud_account_id(&self.account_id) || !cloud_stack_name(&self.stack_name) {
+            return None;
         }
-        if let Some((aws, session, account)) =
-            identity.filter(|(_, _, account)| *account == self.account_id)
-        {
-            let selector = self.stack_id.as_deref().unwrap_or(&self.stack_name);
-            if self.stack_id.is_none() || cloud_stack_id(selector, account, &self.stack_name) {
-                match best_effort_aws(describe(aws, session, selector, deadline))? {
-                    Some(Some(stack))
-                        if stack.stack_name == self.stack_name
-                            && stack.stack_status != "DELETE_COMPLETE"
-                            && self
-                                .stack_id
-                                .as_ref()
-                                .is_none_or(|expected| expected == &stack.stack_id)
-                            && cloud_stack_id(&stack.stack_id, account, &self.stack_name) =>
-                    {
-                        return Ok(Some(cleanup(account, &stack.stack_id, aws.profile())));
-                    }
-                    Some(None) => return Ok(None),
-                    _ => {}
-                }
-            }
-        }
-        Ok(self.unverified())
-    }
-
-    fn is_valid(&self) -> bool {
-        cloud_account_id(&self.account_id) && cloud_stack_name(&self.stack_name)
-    }
-
-    pub(super) fn unverified(&self) -> Option<Value> {
-        self.is_valid().then(|| {
-            json!({
+        let arn = self
+            .stack_id
+            .as_deref()
+            .filter(|arn| cloud_stack_id(arn, &self.account_id, &self.stack_name));
+        Some(match arn {
+            Some(arn) => cleanup(&self.account_id, arn, profile),
+            None => json!({
+                "stack_name": self.stack_name,
                 "account_id": self.account_id,
                 "region": CLOUD_CONNECT_REGION,
                 "verified": false,
                 "message": format!(
-                    "Sign in to AWS account {} to see the delete command.",
+                    "If stack {} exists in {} of AWS account {}, you can delete it.",
+                    self.stack_name,
+                    CLOUD_CONNECT_REGION,
                     super::display_account(&self.account_id),
                 ),
-            })
+            }),
         })
     }
 }
@@ -459,25 +444,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cleanup_names_only_a_full_arn_verified_for_the_observed_account() {
-        let reference = CleanupReference {
+    fn cleanup_names_the_server_arn_or_only_describes_the_stack() {
+        let arn = "arn:aws:cloudformation:us-east-1:000000000001:stack/ottto-read-b-abcde234/00000000-0000-0000-0000-000000000001";
+        let mut reference = CleanupReference {
+            attempt_id: "00000000-0000-4000-8000-000000000001".into(),
             stack_name: "ottto-read-b-abcde234".into(),
             account_id: "000000000001".into(),
-            stack_id: Some("arn:aws:cloudformation:us-east-1:000000000001:stack/ottto-read-b-abcde234/00000000-0000-0000-0000-000000000001".into()),
+            stack_id: Some(arn.into()),
         };
-        let arn = reference.stack_id.as_deref().unwrap();
-        assert!(cloud_stack_id(
-            arn,
-            &reference.account_id,
-            &reference.stack_name
-        ));
-        assert!(!cloud_stack_id(arn, "000000000002", &reference.stack_name));
-        let unverified = reference.resolve(None, Instant::now()).unwrap().unwrap();
-        assert_eq!(unverified["verified"], false);
-        assert!(unverified.get("argv").is_none());
-        let verified = cleanup(&reference.account_id, arn, Some("billing"));
-        assert_eq!(verified["verified"], true);
-        assert_eq!(verified["argv"][4], arn);
-        assert_eq!(verified["argv"][7], "--profile=billing");
+        let known = reference.output(Some("billing")).unwrap();
+        assert_eq!(known["verified"], true);
+        assert_eq!(known["argv"][4], arn);
+        assert_eq!(known["argv"][7], "--profile=billing");
+
+        reference.stack_id = None;
+        let unknown = reference.output(None).unwrap();
+        assert_eq!(unknown["verified"], false);
+        assert!(unknown.get("argv").is_none());
+        assert_eq!(unknown["stack_name"], "ottto-read-b-abcde234");
+
+        // An ARN in another account is never offered for deletion.
+        reference.stack_id = Some(arn.replace("000000000001:stack", "000000000002:stack"));
+        assert!(reference.output(None).unwrap().get("argv").is_none());
     }
 }
