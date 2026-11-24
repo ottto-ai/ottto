@@ -174,7 +174,7 @@ write_manifest() {
         ],
         slsa_build: {
           spec_version: "1.2",
-          level: "build_l2",
+          level: "build_l1",
           predicate_type: "https://slsa.dev/provenance/v1",
           repository: "ottto-ai/ottto",
           signer_workflow: ".github/workflows/macos-stable-release.yml",
@@ -337,15 +337,32 @@ if "$PREFLIGHT" --manifest "$bad_rollback_manifest" --dry-run >/dev/null 2>&1; t
   exit 1
 fi
 
+# [behaviour] Signing-Mac releases record SLSA Build L1 (the passing fixture
+# above); stable still requires verified provenance attestations.
 unverified_supply_chain_manifest="$TMP_DIR/unverified-supply-chain-manifest.json"
-jq '.supply_chain.slsa_build.level = "build_l1"
-    | .supply_chain.slsa_build.attested = false
+jq '.supply_chain.slsa_build.attested = false
     | .supply_chain.slsa_build.verified = false' \
   "$stable_manifest" > "$unverified_supply_chain_manifest"
-if "$PREFLIGHT" --manifest "$unverified_supply_chain_manifest" --dry-run >/dev/null 2>&1; then
+if "$PREFLIGHT" --manifest "$unverified_supply_chain_manifest" --dry-run >"$TMP_DIR/unverified-supply-chain.out" 2>&1; then
   echo "Expected unverified stable supply-chain metadata to fail" >&2
   exit 1
 fi
+grep -Fq "Stable manifest requires verified SLSA provenance attestations" \
+  "$TMP_DIR/unverified-supply-chain.out"
+
+# [behaviour] The level must be one of the schema's values.
+invalid_level_manifest="$TMP_DIR/invalid-level-manifest.json"
+jq '.supply_chain.slsa_build.level = "build_l9"' "$stable_manifest" > "$invalid_level_manifest"
+if "$PREFLIGHT" --manifest "$invalid_level_manifest" --dry-run >"$TMP_DIR/invalid-level.out" 2>&1; then
+  echo "Expected an invalid SLSA build level to fail stable preflight" >&2
+  exit 1
+fi
+grep -Fq "Stable manifest supply_chain.slsa_build.level is invalid: build_l9" "$TMP_DIR/invalid-level.out"
+
+# [behaviour] Historical Build L2 manifests stay verifiable for rollback.
+historical_l2_manifest="$TMP_DIR/historical-l2-manifest.json"
+jq '.supply_chain.slsa_build.level = "build_l2"' "$stable_manifest" > "$historical_l2_manifest"
+"$PREFLIGHT" --manifest "$historical_l2_manifest" --dry-run >/dev/null
 
 bad_sbom_sha_manifest="$TMP_DIR/bad-sbom-sha-manifest.json"
 jq '.supply_chain.sbom.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \

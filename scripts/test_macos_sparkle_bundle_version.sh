@@ -43,6 +43,7 @@ mkdir -p \
   "$app_root/.build/release/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" \
   "$app_root/.build/release/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" \
   "$app_root/.build/release/Sparkle.framework/Versions/B/Updater.app" \
+  "$app_root/.build/release/Sparkle.framework/Versions/B/Resources" \
   "$app_root/Sources/OtttoCompanion/Resources" \
   "$mock_bin"
 
@@ -56,6 +57,33 @@ RS
 cat > "$app_root/Package.swift" <<'SWIFT'
 // test fixture
 SWIFT
+sparkle_revision="6276ba2b404829d139c45ff98427cf90e2efc59b"
+# write_sparkle_pin <version>: the app lockfile's Sparkle pin.
+write_sparkle_pin() {
+  jq -n --arg version "$1" --arg revision "$sparkle_revision" '{
+    originHash: "fixture",
+    pins: [{
+      identity: "sparkle",
+      kind: "remoteSourceControl",
+      location: "https://github.com/sparkle-project/Sparkle",
+      state: {revision: $revision, version: $version}
+    }],
+    version: 3
+  }' > "$app_root/Package.resolved"
+}
+write_sparkle_pin "2.9.2"
+cat > "$app_root/.build/release/Sparkle.framework/Versions/B/Resources/Info.plist" <<'SPARKLE_PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>org.sparkle-project.Sparkle</string>
+  <key>CFBundleShortVersionString</key>
+  <string>2.9.2</string>
+</dict>
+</plist>
+SPARKLE_PLIST
 cat > "$app_root/Companion.entitlements.plist" <<'ENTITLEMENTS'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,18 +138,26 @@ jq -n \
 SMOKE
 chmod +x "$repo/scripts/macos_launch_smoke.sh"
 
+# Records the SBOM inputs the packager passes.
 cat > "$repo/scripts/cyclonedx_sbom.sh" <<'SBOM'
 #!/usr/bin/env bash
 set -euo pipefail
 output=""
+version=""
+sparkle_version=""
+sparkle_revision=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) output="$2"; shift 2 ;;
-    --version) shift 2 ;;
+    --version) version="$2"; shift 2 ;;
+    --sparkle-version) sparkle_version="$2"; shift 2 ;;
+    --sparkle-revision) sparkle_revision="$2"; shift 2 ;;
     *) exit 2 ;;
   esac
 done
-printf '{}\n' > "$output"
+jq -n --arg version "$version" --arg sparkle_version "$sparkle_version" \
+  --arg sparkle_revision "$sparkle_revision" \
+  '{version: $version, sparkle_version: $sparkle_version, sparkle_revision: $sparkle_revision}' > "$output"
 SBOM
 chmod +x "$repo/scripts/cyclonedx_sbom.sh"
 
@@ -340,6 +376,41 @@ if ! jq -e \
   echo "Release manifest did not bind the exact public and private app Git materials" >&2
   exit 1
 fi
+# [behaviour] The SBOM gets the release version and the app commit's Sparkle pin.
+if ! jq -e --arg revision "$sparkle_revision" '
+  . == {version: "0.1.92-rc2", sparkle_version: "2.9.2", sparkle_revision: $revision}
+' "$output_dir/ottto-local-platform-sbom.cdx.json" >/dev/null; then
+  echo "Packaged SBOM did not receive the release version and Sparkle pin" >&2
+  cat "$output_dir/ottto-local-platform-sbom.cdx.json" >&2
+  exit 1
+fi
+
+# commit_app_fixture <message>: commit the app fixture and print the commit.
+commit_app_fixture() {
+  git -C "$private_repo" add .
+  git -C "$private_repo" commit -qm "$1"
+  git -C "$private_repo" rev-parse HEAD
+}
+# [behaviour] Packaging refuses an embedded Sparkle that differs from the pin.
+write_sparkle_pin "2.9.3"
+mismatch_commit="$(commit_app_fixture "pin a different Sparkle")"
+package_expect_failure sparkle-mismatch "Embedded Sparkle framework version must match the app source pin (2.9.3)" \
+  --app-root "$app_root" --app-source-commit "$mismatch_commit"
+# [behaviour] A lockfile without exactly one upstream Sparkle pin is refused.
+jq '.pins = []' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
+mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
+no_pin_commit="$(commit_app_fixture "drop the Sparkle pin")"
+package_expect_failure sparkle-no-pin "Expected one upstream Sparkle pin in Package.resolved" \
+  --app-root "$app_root" --app-source-commit "$no_pin_commit"
+# [behaviour] A Sparkle pin without a revision is refused with a reason.
+write_sparkle_pin "2.9.2"
+jq 'del(.pins[0].state.revision)' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
+mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
+no_revision_commit="$(commit_app_fixture "drop the Sparkle revision")"
+package_expect_failure sparkle-no-revision "The Sparkle pin in Package.resolved needs a version and a revision" \
+  --app-root "$app_root" --app-source-commit "$no_revision_commit"
+git -C "$private_repo" reset -q --hard "$private_commit"
+
 printf '// dirty fixture\n' >> "$app_root/Package.swift"
 if PATH="$mock_bin:$PATH" \
   bash "$repo/scripts/macos_package.sh" \
