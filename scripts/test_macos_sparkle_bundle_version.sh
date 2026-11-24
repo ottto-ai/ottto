@@ -44,6 +44,7 @@ mkdir -p \
   "$app_root/.build/release/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" \
   "$app_root/.build/release/Sparkle.framework/Versions/B/Updater.app" \
   "$app_root/.build/release/Sparkle.framework/Versions/B/Resources" \
+  "$repo/licenses" \
   "$app_root/Sources/OtttoCompanion/Resources" \
   "$mock_bin"
 
@@ -51,6 +52,14 @@ cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
 cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_scheme.sh"
 cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
+cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+# shellcheck source=scripts/macos_license_notices.sh
+source "$ROOT/scripts/macos_license_notices.sh"
+sparkle_license="licenses/Sparkle-$OTTTO_SPARKLE_LICENSE_VERSION-LICENSE"
+cp "$ROOT/$sparkle_license" "$repo/$sparkle_license"
+printf 'Fixture license\n' > "$repo/LICENSE"
+printf 'Fixture notice\n' > "$repo/NOTICE"
+printf '<!doctype html>\n<title>Fixture notices</title>\n' > "$repo/LICENSE-THIRD-PARTY.html"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 15;
 RS
@@ -58,21 +67,22 @@ cat > "$app_root/Package.swift" <<'SWIFT'
 // test fixture
 SWIFT
 sparkle_revision="6276ba2b404829d139c45ff98427cf90e2efc59b"
-# write_sparkle_pin <version>: the app lockfile's Sparkle pin.
+# write_sparkle_pin <revision>: the app lockfile's Sparkle pin.
 write_sparkle_pin() {
-  jq -n --arg version "$1" --arg revision "$sparkle_revision" '{
+  jq -n --arg revision "$1" '{
     originHash: "fixture",
     pins: [{
       identity: "sparkle",
       kind: "remoteSourceControl",
       location: "https://github.com/sparkle-project/Sparkle",
-      state: {revision: $revision, version: $version}
+      state: {revision: $revision, version: "2.9.2"}
     }],
     version: 3
   }' > "$app_root/Package.resolved"
 }
-write_sparkle_pin "2.9.2"
-cat > "$app_root/.build/release/Sparkle.framework/Versions/B/Resources/Info.plist" <<'SPARKLE_PLIST'
+write_sparkle_pin "$sparkle_revision"
+sparkle_plist=".build/release/Sparkle.framework/Versions/B/Resources/Info.plist"
+cat > "$app_root/$sparkle_plist" <<'SPARKLE_PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -164,7 +174,12 @@ chmod +x "$repo/scripts/cyclonedx_sbom.sh"
 cat > "$mock_bin/ditto" <<'DITTO'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
+if [[ "${1:-}" == "-c" && "${2:-}" == "-k" && -d "$3" ]]; then
+  # A folder "zip" lists its entries with their hashes.
+  (cd "$3" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
+    printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
+  done) > "$4"
+elif [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
   cp "$3" "$4"
 else
   cp -R "$1" "$2"
@@ -231,6 +246,7 @@ git -C "$private_repo" config user.email "sparkle-version-test@example.invalid"
 git -C "$private_repo" config user.name "Sparkle Version Test"
 # No origin remote is needed: the caller supplies the repository identity.
 git -C "$private_repo" add .
+git -C "$private_repo" add -f "$app_root/$sparkle_plist"
 git -C "$private_repo" commit -qm "app fixture"
 private_commit="$(git -C "$private_repo" rev-parse HEAD)"
 private_tree="$(git -C "$private_repo" rev-parse HEAD:tools/ottto-macos-app)"
@@ -294,6 +310,42 @@ bash "$repo/scripts/macos_package.sh" \
 if [[ -e "$gh_calls" ]]; then
   echo "Packaging must not call gh:" >&2
   cat "$gh_calls" >&2
+  exit 1
+fi
+
+# [behaviour] The signed app carries the four license notices, and each binary
+# zip holds exactly its executable plus three notices at its root.
+sha256_of() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+resources="$output_dir/Ottto.app/Contents/Resources"
+while IFS= read -r name; do
+  case "$name" in
+    LICENSE-Sparkle.txt) source_file="$repo/$sparkle_license" ;;
+    *) source_file="$repo/$name" ;;
+  esac
+  if ! cmp -s "$source_file" "$resources/$name"; then
+    echo "Packaged app is missing license notice $name" >&2
+    exit 1
+  fi
+done < <(ottto_app_license_resource_names)
+for zip_binary in ottto-macos:ottto ottto-service-macos:ottto-service; do
+  binary_name="${zip_binary#*:}"
+  zip_listing="$(find "$output_dir" -maxdepth 1 -name "${zip_binary%%:*}-*.zip" -print -quit)"
+  expected_listing="$(
+    for name in LICENSE LICENSE-THIRD-PARTY.html NOTICE; do
+      printf '%s %s\n' "$(sha256_of "$repo/$name")" "$name"
+    done
+    printf '%s %s\n' "$(sha256_of "$output_dir/$binary_name")" "$binary_name"
+  )"
+  if [[ -z "$zip_listing" ]] ||
+    [[ "$(LC_ALL=C sort -k2 "$zip_listing")" != "$(LC_ALL=C sort -k2 <<<"$expected_listing")" ]]; then
+    echo "The $binary_name zip must hold $binary_name and the license notices at its root" >&2
+    exit 1
+  fi
+done
+if find "$output_dir" -maxdepth 1 -name '*stag*' | grep -q .; then
+  echo "Zip staging folders must not be left in the release output folder" >&2
   exit 1
 fi
 
@@ -392,10 +444,11 @@ commit_app_fixture() {
   git -C "$private_repo" rev-parse HEAD
 }
 # [behaviour] Packaging refuses an embedded Sparkle that differs from the pin.
-write_sparkle_pin "2.9.3"
-mismatch_commit="$(commit_app_fixture "pin a different Sparkle")"
-package_expect_failure sparkle-mismatch "Embedded Sparkle framework version must match the app source pin (2.9.3)" \
+plutil -replace CFBundleShortVersionString -string 2.9.3 "$app_root/$sparkle_plist"
+mismatch_commit="$(commit_app_fixture "change the embedded Sparkle version")"
+package_expect_failure sparkle-mismatch "Embedded Sparkle framework version must match the app source pin (2.9.2)" \
   --app-root "$app_root" --app-source-commit "$mismatch_commit"
+git -C "$private_repo" reset -q --hard "$private_commit"
 # [behaviour] A lockfile without exactly one upstream Sparkle pin is refused.
 jq '.pins = []' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
 mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
@@ -403,12 +456,17 @@ no_pin_commit="$(commit_app_fixture "drop the Sparkle pin")"
 package_expect_failure sparkle-no-pin "Expected one upstream Sparkle pin in Package.resolved" \
   --app-root "$app_root" --app-source-commit "$no_pin_commit"
 # [behaviour] A Sparkle pin without a revision is refused with a reason.
-write_sparkle_pin "2.9.2"
+write_sparkle_pin "$sparkle_revision"
 jq 'del(.pins[0].state.revision)' "$app_root/Package.resolved" > "$app_root/Package.resolved.next"
 mv "$app_root/Package.resolved.next" "$app_root/Package.resolved"
 no_revision_commit="$(commit_app_fixture "drop the Sparkle revision")"
 package_expect_failure sparkle-no-revision "The Sparkle pin in Package.resolved needs a version and a revision" \
   --app-root "$app_root" --app-source-commit "$no_revision_commit"
+# [behaviour] A different revision of the same Sparkle version is refused.
+write_sparkle_pin "1111111111111111111111111111111111111111"
+other_pin_commit="$(commit_app_fixture "change the Sparkle revision")"
+package_expect_failure other-sparkle-pin "the vendored Sparkle license is for" \
+  --app-root "$app_root" --app-source-commit "$other_pin_commit"
 git -C "$private_repo" reset -q --hard "$private_commit"
 
 printf '// dirty fixture\n' >> "$app_root/Package.swift"

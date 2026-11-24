@@ -1,0 +1,45 @@
+# cargo-about 0.9.2 configuration for LICENSE-THIRD-PARTY.html.
+# Regenerate with scripts/generate_license_notices.sh (see README.md here).
+#
+# This lists the licenses whose notices we reproduce. It is not a general
+# approval of future license changes: a new license fails generation until
+# someone reviews it and adds it here.
+accepted = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-3-Clause",
+  "BSD-2-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+]
+# The shipped binaries are Apple Silicon only.
+targets = ["aarch64-apple-darwin"]
+ignore-dev-dependencies = true
+# Build scripts and procedural macros can put third-party code or data into
+# the binaries, so their notices are included too.
+ignore-build-dependencies = false
+ignore-transitive-dependencies = false
+# The workspace crates are covered by the root LICENSE and NOTICE.
+private = { ignore = true }
+
+# ring ships its terms in several files, and its LICENSE only points at them.
+# Clarification keys are not versioned: the generator checks the locked ring
+# version so a bump makes someone re-check these hashes.
+[ring.clarify]
+license = "Apache-2.0 AND ISC AND MIT"
+files = [
+  { path = "LICENSE-BoringSSL", license = "Apache-2.0", checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d" },
+  { path = "LICENSE-other-bits", license = "ISC", checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f" },
+  { path = "third_party/fiat/LICENSE", license = "MIT", checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f" },
+  { path = "src/polyfill/once_cell/LICENSE-APACHE", license = "Apache-2.0", checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2" },
+  { path = "src/polyfill/once_cell/LICENSE-MIT", license = "MIT", checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc" },
+]
+
+# webpki-roots carries the CDLA-Permissive-2.0 data license; its full text
+# must accompany the data.
+[webpki-roots.clarify]
+license = "CDLA-Permissive-2.0"
+files = [{ path = "LICENSE", checksum = "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8" }]
