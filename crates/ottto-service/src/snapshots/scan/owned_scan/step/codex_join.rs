@@ -265,7 +265,7 @@ impl OwnedSourceScan {
                         self.residue_index_keys.extend(members);
                         continue;
                     }
-                    // G1: a group whose attempt already ended in this
+                    // A group whose attempt already ended in this
                     // generation is fenced at its pop (M-5 b) and reads
                     // nothing. Decide it here, so it takes no file
                     // allowance a waiting census member needs.
@@ -276,7 +276,7 @@ impl OwnedSourceScan {
                             fence.as_deref(),
                         )
                     });
-                    // G1: a group whose selected members are all re-reads
+                    // A group whose selected members are all re-reads
                     // never takes file allowance a waiting census-member
                     // singleton needs (own page or not). It waits for a
                     // page without one; its members stay pending as
@@ -352,7 +352,7 @@ impl OwnedSourceScan {
                                     traversal.pending_candidates.push_back(ScanTraversalPath {
                                         scan_root: member.scan_root.clone(),
                                         path: member.path.clone(),
-                                        // G1: a re-read is not re-enrolled.
+                                        // A re-read is not re-enrolled.
                                         census_member:
                                             sampled_scan::codex_cursor::selected_census_member(
                                                 &self.selected_flags,
@@ -435,7 +435,7 @@ impl OwnedSourceScan {
                 while !self.identified_candidates.is_empty()
                     && used + self.identified_candidates.len() > self.file_limit
                 {
-                    // G1: re-reads leave before any census member.
+                    // Re-reads leave before any census member.
                     let context_evict = self
                         .index
                         .file_upload_context_enabled()
@@ -475,7 +475,7 @@ impl OwnedSourceScan {
                         .unwrap_or(self.identified_candidates.len() - 1);
                     if let Some(candidate) = self.identified_candidates.remove(evict) {
                         if let Some(traversal) = self.index.traversal.as_mut() {
-                            // G1: a re-read is not re-enrolled.
+                            // A re-read is not re-enrolled.
                             let census_member = sampled_scan::codex_cursor::selected_census_member(
                                 &self.selected_flags,
                                 &candidate.path,
@@ -963,7 +963,7 @@ impl OwnedSourceScan {
                     sampled_scan::codex_cursor::Resumed::Idle => {}
                 }
             }
-            // Stage 1 hunk D: a continuation page only resumes. Without
+            // A continuation page only resumes. Without
             // an active job it plans and starts nothing: every path it
             // identified, and every group it prepared, goes back to the
             // queue untouched, and the page finishes.
@@ -994,7 +994,7 @@ impl OwnedSourceScan {
     /// fenced; each of those pauses the page too.
     #[inline(never)]
     fn start_next_codex_group(&mut self, active_file: &Option<Box<OwnedActiveFile>>) -> bool {
-        // G1 (fix 2): a group whose selected members are all re-reads
+        // A group whose selected members are all re-reads
         // waits until this page's census singletons are read, so its
         // replay cannot spend the singleton budget a first read needs.
         // Evaluated between files only, and the candidate scan only when

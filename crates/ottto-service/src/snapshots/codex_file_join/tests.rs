@@ -3433,7 +3433,7 @@ fn historical_replay_preserves_pending_and_applied_protection() {
 
 const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 /// Feed members in order through one `StreamProof`, with the parser's
-/// S10 tap after every UI usage record.
+/// `admitted_usage` tap after every UI usage record.
 pub(crate) fn stream(members: &[Vec<Value>]) -> Option<(JoinRefusal, usize)> {
     let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default(); members.len()]);
     for (position, rows) in members.iter().enumerate() {

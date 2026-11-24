@@ -1449,7 +1449,7 @@ fn erasure_deletes_debt_and_counts_unaccepted_files() {
     );
 }
 
-/// The session facts S2 stores, each seeded as `{literal}-{fact}`:
+/// The session facts Tail stores, each seeded as `{literal}-{fact}`:
 /// title, first prompt material and display title, workspace, opening
 /// instructions and an opening file path.
 pub(crate) const TAIL_FACT_LITERALS: [&str; 6] = [

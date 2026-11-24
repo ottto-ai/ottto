@@ -848,7 +848,7 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// StateMissing L1: a stored cutoff ahead of the clock is pulled back to
+/// A stored cutoff ahead of the clock is pulled back to
 /// now, and only prior history records one.
 #[test]
 fn history_cutoff_is_bounded_by_the_clock() {
@@ -881,7 +881,7 @@ fn history_cutoff_is_bounded_by_the_clock() {
     assert_eq!(gated.claude_history_cutoff_unix_seconds, None);
 }
 
-/// StateMissing N1: the first gated load of an intact index records the last
+/// The first gated load of an intact index records the last
 /// moment it shows this destination receiving history (the newest valid
 /// activity clock among its accepted entities), so sessions created after it
 /// are new. A fresh index, a replay drop, or an index with no accepted
@@ -1034,7 +1034,7 @@ fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
         let mut index = ScanIndex::default();
         index.activate_effective_upload_body_witness_revision(2);
         index.adopt_effective_upload_body_witness_revision_monotonically();
-        // Per-pass state a refused activation must still reset (R6).
+        // Per-pass state a refused activation must still reset.
         index
             .effective_upload_body_witness_revision_excluded_source_files
             .insert("held-source".into());
@@ -1107,7 +1107,7 @@ fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
     snapshots.extend(copies);
 }
 
-/// F5: a same-size file whose mtime alone moved is not a genuine change. A
+/// A same-size file whose mtime alone moved is not a genuine change. A
 /// listed root touched this way is held history under revision 3: nothing
 /// emits and its tuple and stamp stay.
 #[test]
@@ -1157,9 +1157,9 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
 /// either upload path and it never stamps revision 3, while an unlisted
 /// family keeps both. [money] A paused list holds adoption only: it stamps
 /// no file during the pause but filters literals by the digests it still has, so
-/// with them kept the listed family stays off `e2` (G4), and with none (a
+/// with them kept the listed family stays off `e2`, and with none (a
 /// list missing after install) every family takes `e2` until the list is
-/// back (G5, disclosed).
+/// back (disclosed).
 #[test]
 fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
     with_max_gated_claude_revision(3, || {
@@ -1275,14 +1275,14 @@ fn a_listed_root_outside_this_cycle_gets_no_literal_and_no_revision_three() {
             assert_eq!(index.files[&key].effective_upload_body_witness_revision, 2);
         };
 
-        // G4: paused with its digests kept (closure overflow).
+        // Paused with its digests kept (closure overflow).
         let installed = index.claude_reemission_exclusions.clone();
         index.claude_reemission_exclusions =
             installed.with_state_for_test(ListState::ClosureOverflow);
         only_unlisted_literals(&mut index);
         no_stamp(&mut index);
 
-        // G5: the list goes missing after install. No digest is left, so
+        // The list goes missing after install. No digest is left, so
         // every literal passes both paths and the listed family folds.
         fs::remove_file(ReemissionExclusions::path(&support)).unwrap();
         index.load_claude_reemission_exclusions(&support);

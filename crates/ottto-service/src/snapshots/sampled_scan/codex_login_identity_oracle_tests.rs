@@ -13,11 +13,11 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 };
 use serde_json::json;
 
-// NOT COVERED here: T4 drives the production save path with an injected read
+// NOT COVERED here: the login-switch case drives the production save path with an injected read
 // (the provider boundary is agent_status's
 // `codex_probe_confirms_no_identity_when_the_login_switches_during_the_read`);
-// T5's same-login reader sharing needs the quota scheduler, so it is checked
-// at the binding level only; T7's launch block is covered by the launch tests.
+// same-login reader sharing needs the quota scheduler, so it is checked
+// at the binding level only; a dead login's launch block is covered by the launch tests.
 // `Disk` has no durable-restore arm apart from a restarted owner over the
 // committed route, so `Mode::DiskRestore` is not driven separately here.
 
@@ -430,7 +430,7 @@ fn pinned_saved(home: &Path, tag: &str) -> serde_json::Value {
             "login":{"auth":auth},"refresh_held":true}})
 }
 
-/// T8's setup: id token expired, access live; the pinned bytes saved.
+/// Setup: id token expired, access live; the pinned bytes saved.
 fn pinned_failure(home: &Path, tag: &str) {
     login(home, tag, 'a', (EXPIRED, LIVE), "2026-10-27T06:00:00Z");
     status::write_saved(home, &pinned_saved(home, tag).to_string());
@@ -491,7 +491,7 @@ const ROWS: &[Row] = &[
         between: same,
         expect: [Some('a'), Some('a'), None],
     },
-    // T4: A -> B inside one read: nothing saved; the next read is B.
+    // A -> B inside one read: nothing saved; the next read is B.
     Row {
         tag: "t4",
         setup: |home, tag| {
@@ -515,7 +515,7 @@ const ROWS: &[Row] = &[
         between: same,
         expect: [Some('a'), Some('a'), None],
     },
-    // T7: dead login (account:null / auth_rejected): no new owner.
+    // Dead login (account:null / auth_rejected): no new owner.
     Row {
         tag: "t7",
         setup: live,
@@ -523,7 +523,7 @@ const ROWS: &[Row] = &[
         between: same,
         expect: [Some('a'), Some('a'), None],
     },
-    // T8: upgrade from pinned pre-change bytes: a newer failure saved with
+    // Upgrade from pinned pre-change bytes: a newer failure saved with
     // no binding (id expired then) is still served, not the older success.
     Row {
         tag: "t8",
@@ -606,9 +606,9 @@ fn codex_login_identity_rows_bind_through_the_status_lane() {
     }
 }
 
-/// [money] The positive control: two accounts, one user in two workspaces
-/// (T5), a read gap that recovers on the same file (T9), and a `codex login`
-/// switch in the middle of a session (T10). Its parent spawns side calls in
+/// [money] The positive control: two accounts, one user in two workspaces,
+/// a read gap that recovers on the same file, and a `codex login`
+/// switch in the middle of a session. Its parent spawns side calls in
 /// the same home before the switch (owned as the parent) and after it (owned
 /// by the new login), both through the home's binding. Every route equals
 /// cold Full; a restart after the switch reads nothing; swapped owners fail
@@ -643,7 +643,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
         side_call(switch, &s5, &s1, "2026-10-27T07:05:00Z"),
     ];
     let collected = status::collection(homes.as_slice());
-    // T5: one user, two workspaces, two homes: two bindings, never shared.
+    // One user, two workspaces, two homes: two bindings, never shared.
     let bindings = collected
         .codex_home_bindings
         .iter()
@@ -673,7 +673,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
         first, expected,
         "page 1: the gap leaves its session untagged"
     );
-    // T10: `codex login` rewrites the switch home mid-session; T9: the gap
+    // `codex login` rewrites the switch home mid-session; the gap
     // home's next read succeeds on the same file.
     sign_in(switch, "m-b", "m-wb", (LIVE, LIVE), "2026-10-27T07:30:00Z");
     read(switch, bound("m-b", "m-wb", 0));
@@ -715,7 +715,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
     quiet_restart(&c, &mut disk, &scanner, &roots, ram, &collected);
 }
 
-/// [money] T8, interrupted: over the pinned pre-change bytes (a success,
+/// [money] Interrupted save: over the pinned pre-change bytes (a success,
 /// then a newer failure with `refresh_held`), a save stops after writing its
 /// temp file (holding that older success alone) and before the rename; the
 /// process restarts. Before and after the next completed save (another

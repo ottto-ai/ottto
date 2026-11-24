@@ -726,8 +726,8 @@ pub(crate) fn configured_project_doc_max_bytes(raw: &str) -> Option<u64> {
 
 /// Whether Codex cut the project part of a loaded AGENTS.md text at its
 /// `project_doc_max_bytes` budget (the text Codex loaded, as in `world_state`).
-/// The shared truncation rule for the per-file items and the per-session flag
-/// (CROSS-LANE S5). The user-level part before the separator is not budgeted.
+/// The shared truncation rule for the per-file items and the per-session flag.
+/// The user-level part before the separator is not budgeted.
 pub(crate) fn agents_md_cut(text: &str, limit: u64) -> bool {
     let project = text
         .find(PROJECT_DOC_SEPARATOR)
@@ -891,7 +891,7 @@ fn sized_item(
         .then(|| measure_bytes(bytes, false, salt))
         .flatten()
         .unwrap_or(FileCounts {
-            // Never an uncapped size: admission bounds file_bytes at 1 MiB (BR4).
+            // Never an uncapped size: admission bounds file_bytes at 1 MiB.
             file_bytes: disk_size.filter(|size| *size <= MAX_FILE_BYTES as u64),
             ..FileCounts::default()
         });
@@ -1094,7 +1094,7 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         .unwrap_or_else(|| "unknown".to_string());
     let used_tokens = prelude.first_input_tokens.unwrap_or(0);
     // The source observation is the session start, not this upload (a
-    // replayed prelude is the same observation; BR3).
+    // replayed prelude is the same observation).
     let captured_at = OffsetDateTime::from_unix_timestamp(prelude.started_at?)
         .ok()?
         .format(&Rfc3339)
@@ -1152,7 +1152,7 @@ struct UploadCacheEntry {
     /// Watermark: start (unix seconds) of the newest session this workspace
     /// (the backend's snapshot series) has sent or matched. A start at or
     /// before it is never sent again, even when an older session resumes
-    /// later (BR3). Another directory of the same repository is its own
+    /// later. Another directory of the same repository is its own
     /// series, so its unsent start is a first observation, not a replay.
     #[serde(default)]
     started_at: Option<i64>,

@@ -601,7 +601,7 @@ impl OwnedJsonlParser {
         // The retained reduction's own count; a live body must equal it.
         let reduction_drop_count = recognized_usage_drop_count;
         // Present for a cursor job or Claude in-page read whose prefix
-        // certificate passed (S12/FE1)
+        // certificate passed
         // or whose lossy job holds the same-object identity proof.
         let sealed_prefix = bounded.sealed_prefix;
         // A cursor read withheld an unterminated final record (N2).
@@ -1288,7 +1288,7 @@ pub(in crate::snapshots) struct BoundedJsonlReader<R> {
     sealed_fragment: Option<()>,
     /// Set by `finish_job` or the in-page grown route: the identity `finish` may
     /// accept for a grown object. `Certified` after its prefix certificate
-    /// passed (S12); `LossySameObject` is not a sealed-prefix
+    /// passed; `LossySameObject` is not a sealed-prefix
     /// certificate and permits only an uncertified publication.
     pub(in crate::snapshots) sealed_prefix: Option<sampled_scan::codex_cursor::FinishGrant>,
 }
@@ -1457,7 +1457,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         };
         crate::local_resource_diagnostics::jsonl::line_buffer(buf.capacity());
         if reached_eof && self.extent_limit.is_some() && !buf.is_empty() && !line_complete {
-            // Sealed cursor completion (S5): a record without its newline at
+            // Sealed cursor completion: a record without its newline at
             // or before the frozen extent is unfinished for this read, even if
             // no byte beyond the extent is visible yet. It is never parsed,
             // counted or certified. Reads without an extent keep the normal

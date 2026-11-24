@@ -310,7 +310,7 @@ fn a_tail_only_failure_resumes_from_the_committed_head() {
     assert_eq!(acc.claude_responses.values().len(), 4);
 }
 
-/// [behaviour] A4d: a head neither observed, residue nor indexed retires;
+/// [behaviour] A head neither observed, residue nor indexed retires;
 /// the other three stay.
 #[test]
 fn absent_heads_retire() {
@@ -339,7 +339,7 @@ fn absent_heads_retire() {
     );
 }
 
-/// [behaviour] A4d classifies absent heads by custody, never by set
+/// [behaviour] `retire_absent` classifies absent heads by custody, never by set
 /// difference alone: a reduction retires and its revisions stay under a
 /// metadata-only head, which the next complete census keeps (absence never
 /// clears debt); a head that fails to load is set aside, not retired (F4).
@@ -349,7 +349,7 @@ fn absent_heads_retire() {
 fn absent_heads_are_classified_by_custody() {
     let mut route = route();
     let (path, owed) = committed(&mut route, "owed.jsonl", 3);
-    // F1: an observation restates the head's current summary.
+    // An observation restates the head's current summary.
     let common = route.head(&owed).unwrap().common;
     state_v2::observe_tail(
         &route.path,

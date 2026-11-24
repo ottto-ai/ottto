@@ -809,7 +809,7 @@ impl ScanIndex {
         self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
         self.admit_carried_ack_debt()?;
         self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
-        // P2: the durable exact-ACK stamps carry with the ledger they
+        // The durable exact-ACK stamps carry with the ledger they
         // copy. They prove a body only under their context, destination
         // and replay generation; file receipts are rebuilt by scan.
         self.upload_context_proof = carry.upload_context_proof;

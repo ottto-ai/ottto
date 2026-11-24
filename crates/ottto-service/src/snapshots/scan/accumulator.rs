@@ -535,7 +535,7 @@ pub(in crate::snapshots) struct SnapshotAccumulator {
     // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
     // turn duration is derivable this way, never TTFT.
     pub(in crate::snapshots) claude_last_user_ts: Option<String>,
-    // Desktop-lineage clocks (L04): the earliest and latest top-level
+    // Desktop-lineage clocks: the earliest and latest top-level
     // `timestamp` over every whole Claude line, copied history included, in
     // unix nanoseconds. Stored in the first head format so the lineage window
     // can come from the head; not read yet.

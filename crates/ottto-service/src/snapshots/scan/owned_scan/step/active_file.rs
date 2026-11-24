@@ -34,7 +34,7 @@ impl OwnedSourceScan {
             let mut group_end = None;
             let stepped = if active.group.is_some() {
                 // A group job: one record of the current member, or one
-                // member transition (P2).
+                // member transition.
                 let live_scope = |member: &CandidateFile| {
                     let context = self.sampling.as_ref()?;
                     let dependency = sampled_scan::reduction_dependencies(
@@ -118,7 +118,7 @@ impl OwnedSourceScan {
             }
             match stepped {
                 Ok(false) => {
-                    // Stage 1 (K6): or a continuation page past its
+                    // Or a continuation page past its
                     // deadline, which pauses without a ticket.
                     if active.cursor.is_some()
                         && self
@@ -126,7 +126,7 @@ impl OwnedSourceScan {
                             .cursor_stop(sampled_scan::codex_cursor::Limits::current())
                     {
                         if let Some(lease) = codex_cursor_lease.take() {
-                            // Stage 1 hunk A: minted before the pause
+                            // Minted before the pause
                             // consumes the job, kept only if it pauses.
                             let ticket = self.sampling.as_ref().and_then(|context| {
                                 context.cache.continuation_ticket(&active, &self.codex_page)
@@ -156,7 +156,7 @@ impl OwnedSourceScan {
                         }
                         // A job without its lease is dropped, never
                         // continued in-page past the budget; its pending
-                        // path restarts it (L2).
+                        // path restarts it.
                         if let Some(context) = self.sampling.as_ref() {
                             context.cache.cursor_note_lost();
                         }
@@ -175,7 +175,7 @@ impl OwnedSourceScan {
                         lease.release();
                     }
                     if let Some(group) = active.group.as_ref() {
-                        // A member read failure: strict, as before P2.
+                        // A member read failure: strict, as before.
                         codex_file_join::disclose_strict(&group.members, targets!(self));
                         sampled_scan::codex_cursor::dequeue_members(
                             &mut self.index,
@@ -309,7 +309,7 @@ impl OwnedSourceScan {
             // `finish_job` consumes the acquisition's start offset. An
             // exact-stamp memo below must not cover anything past them.
             let attempt_read_end = sampled_scan::codex_cursor::read_end(&active);
-            // S6: a cursor job commits only through its sealed-prefix
+            // A cursor job commits only through its sealed-prefix
             // certificate; an invalidated attempt publishes nothing.
             let mut cursor_certificate = None;
             let mut cursor_publication = None;
@@ -332,7 +332,7 @@ impl OwnedSourceScan {
                         .cursor
                         .as_ref()
                         .is_some_and(sampled_scan::codex_cursor::JobMeta::census_trusted);
-                // G1: growth past a job's frozen extent is next-generation
+                // Growth past a job's frozen extent is next-generation
                 // evidence when the job started in this census generation.
                 let job_in_generation = active
                     .cursor
@@ -367,7 +367,7 @@ impl OwnedSourceScan {
                         context
                             .cache
                             .cursor_note_next_generation(u64::from(next_generation));
-                        // N1: a cursor-only job (census incomplete at start
+                        // A cursor-only job (census incomplete at start
                         // or now) publishes like main's unsampled read: the
                         // certificate fenced the object, but no checkpoint,
                         // copy or verification is kept. A group job retains
@@ -427,7 +427,7 @@ impl OwnedSourceScan {
                     );
                 }
             }
-            // S12: the live member's certified grant reaches validation.
+            // The live member's certified grant reaches validation.
             let group_live = active
                 .group
                 .as_ref()
@@ -1779,7 +1779,7 @@ impl OwnedSourceScan {
         file_sampling: &mut Option<sampled_scan::Active>,
         cursor_certificate: Option<Option<crate::transcript_acquisition::Checkpoint>>,
     ) -> Option<(Option<sampled_jsonl::CompletedNativeAcquisition>, bool)> {
-        // N4 (fe-seam-ack §5): the file branch decides its H3c route
+        // The file branch decides its grown-prefix route
         // before its completion.
         let file_acquisition = file_sampling
             .as_ref()
@@ -1799,7 +1799,7 @@ impl OwnedSourceScan {
                 .map(|(dependency, context)| {
                     context.file_scope(self.source, candidate, &dependency)
                 });
-                // H3c: a passed certificate permits native finish of
+                // A passed certificate permits native finish of
                 // this prefix only. Discard its checkpoint: no cache copy,
                 // audit credit or source verification can follow it.
                 let prefix = current_scope

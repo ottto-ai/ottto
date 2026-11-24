@@ -88,7 +88,7 @@ pub(in crate::snapshots) fn fixture_birth() -> Option<u64> {
     FIXTURE_BIRTH.with(std::cell::Cell::get)
 }
 
-// Per-stage wall clock for the F3 perf receipt. Test builds only: the
+// Per-stage wall clock for the perf receipt. Test builds only: the
 // daemon build has no timer here, `timed` is just the call.
 #[cfg(test)]
 thread_local! {
@@ -177,7 +177,7 @@ impl ReadContext<'_> {
     }
 }
 
-/// Same member spelling as T4's twin index, including subagent stems.
+/// Same member spelling as the twin index, including subagent stems.
 fn session_member(path: &Path) -> Option<std::borrow::Cow<'_, str>> {
     let member = claude_index_path_member_ref(path)?;
     Some(match member.subagent_stem {
@@ -269,7 +269,7 @@ pub(crate) mod money_mark {
     pub(crate) const RETIRED_PERMIT: u8 = 64;
 }
 /// The money-rule epoch stamped on each stored Claude request at its first
-/// admission (`ClaudeResponseObservation.rule_epoch`; L12). A field only: no
+/// admission (`ClaudeResponseObservation.rule_epoch`). A field only: no
 /// reader, no gate and no stored contribution. Its meaning belongs to E2.
 /// A rule acting at parse time is forward under Tail by construction; one
 /// acting in the fold gates on the request's own provider timestamp
@@ -3058,7 +3058,7 @@ enum Evidence {
     None,
 }
 
-/// What `key`'s census record proves about the file now (owner rule P2:
+/// What `key`'s census record proves about the file now (owner rule:
 /// holding a session withholds its UPLOAD only; its scan state stays
 /// evidence). The record of the settled revision (its index entry, same
 /// fingerprint) proves it; so does the record of a scan whose upload is held
@@ -3492,7 +3492,7 @@ fn decide_holders(
                 .collect::<Vec<_>>();
             hashes.sort_unstable();
             hashes.dedup();
-            // Addendum 1: a stored removal stays removed after its holder's
+            // A stored removal stays removed after its holder's
             // id list retires. Only a holder whose census disproves it
             // invalidates that saved decision; a holder family on the
             // re-emission list keeps it (listing pauses new removals only).
@@ -4770,7 +4770,7 @@ fn trace_owners<'a>(
     owners
 }
 
-/// Whether this page's API sidecar read succeeded (T4 passes it).
+/// Whether this page's API sidecar read succeeded (the caller passes it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TelemetryRead {
     Loaded,
@@ -4780,7 +4780,7 @@ pub(crate) enum TelemetryRead {
 /// DARK comparison happens after today's authoritative body fold. Only the
 /// explicit gate permits mutation; one summed entity is emitted per session
 /// (path twins sum). A failed telemetry read never yields a "complete"
-/// body; T4 keeps that page's owed history files owed.
+/// body; `hold_claude_history_for_unread_telemetry` keeps that page's owed history files owed.
 ///
 /// Returns the sessions whose entity was withheld (held twin, uncertified,
 /// identity already tagged, overflow). Their items stay on the page

@@ -1,7 +1,7 @@
 //! [money] A held original and its dependent copy on the Tail path. A newer
 //! build's head holds the original (`Load::Held`): it is never read or sent,
 //! and its last accepted body stands, while the copy that gained a request is
-//! read in the same pass. Ported from the two M3 production rows deleted with
+//! read in the same pass. Ported from the two production rows deleted with
 //! the record store (a held original's census and the copy's proof, money and
 //! witness), with their grown-original and changed-entry arms.
 use super::super::claude::Claude;

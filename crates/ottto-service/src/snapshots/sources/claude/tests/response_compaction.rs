@@ -333,7 +333,7 @@ fn speed_record(timestamp: Option<&str>, top_level: bool) -> Value {
     row
 }
 
-/// M-review F6: records with equal selector context but different sources,
+/// Records with equal selector context but different sources,
 /// where a record equal to its physical predecessor sorts last by provider
 /// time. A "same as previous" dedupe would change the uploaded source.
 #[test]

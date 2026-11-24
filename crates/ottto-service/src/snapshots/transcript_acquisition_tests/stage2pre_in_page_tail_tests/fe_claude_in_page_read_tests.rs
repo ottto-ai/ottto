@@ -1,7 +1,7 @@
 //! FE red-first fixtures: Claude appends while an in-page sampled `Full` or
-//! `Tail` reads. FE is the Claude twin of Stage2-pre: a reader-relative extent
-//! limit (H1c), an in-page genuine-EOF apply for a quiescent unterminated row (H2c), and a
-//! grown-read route (H3c) that publishes the sealed prefix `[0, s)` as a
+//! `Tail` reads. The extension is the Claude twin of Codex in-page reads: a reader-relative extent
+//! limit, an in-page genuine-EOF apply for a quiescent unterminated row, and a
+//! grown-read route that publishes the sealed prefix `[0, s)` as a
 //! certificate only: no checkpoint, copy, cache insert or audit credit, the
 //! prepared debt re-staged, and the index left at the opened stamp.
 //!
@@ -15,7 +15,7 @@
 //! - publish only when `s` is at least the last committed size;
 //! - a prefix never backs proof, v1, a family witness, or a verified
 //!   request-census record;
-//! - FE2: the sample-preserving-rewrite residual is accepted (SP-5 residual).
+//! - The sample-preserving-rewrite residual is accepted.
 //!
 //! This suite leaves out the Codex parent side-record reads. The
 //! former `sp11_claude_in_page_tail_with_append_keeps_main_failure`
@@ -261,7 +261,7 @@ fn grown_full() -> Grown {
     }
 }
 
-/// SP-1c (RED): a Claude file with no copy and a prepared (not yet due)
+/// (RED): a Claude file with no copy and a prepared (not yet due)
 /// audit debt; complete rows are appended after the open step of its in-page
 /// `Full`. FE publishes `[0, s)` (here `s` = frozen) with no checkpoint or
 /// cache insert and no `complete_full_audit` (the debt stays staged at its
@@ -308,7 +308,7 @@ fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
     next_full("SP-1c", &base, index, STATE_MISSING);
 }
 
-/// SP-1c' (RED): the same during a Claude in-page `Tail` from `s` of a
+/// (RED): the same during a Claude in-page `Tail` from `s` of a
 /// committed head. FE publishes `[0, frozen)`, keeps no copy (no checkpoint
 /// or cache insert), and re-stages the Tail's prepared debt unchanged; the
 /// next page continues from the head as a Tail with body parity.
@@ -342,7 +342,7 @@ fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_de
     next_tail("SP-1c'", &base, index);
 }
 
-/// SP-2a-c (RED): half a row at open, completed (plus more rows) after the
+/// (RED): half a row at open, completed (plus more rows) after the
 /// open step of a Claude `Tail`. FE seals at the row's start `s'` < frozen:
 /// the row is absent now and present on the next read.
 ///
@@ -380,8 +380,8 @@ fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
     );
 }
 
-/// SP-2b-c (GREEN): a quiescent unterminated last row in a Claude `Tail`,
-/// not grown. Main's trailing-line rule applies it; H2c must keep this
+/// (GREEN): a quiescent unterminated last row in a Claude `Tail`,
+/// not grown. Main's trailing-line rule applies it; the in-page EOF handling must keep this
 /// byte-identical: body == Full parse, unsealed, no copy,
 /// nothing unreadable.
 #[test]
@@ -401,7 +401,7 @@ fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
     );
 }
 
-/// SP-2b-c, Full (GREEN): the same unterminated last row read by a Claude
+/// Full (GREEN): the same unterminated last row read by a Claude
 /// in-page `Full` keeps main's output: nothing unreadable, body == Full parse.
 #[test]
 fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
@@ -424,7 +424,7 @@ fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
     );
 }
 
-/// SP-2c-c (RED): setter units with `s` >= 64 KiB. The Claude `Tail` reader
+/// (RED): setter units with `s` >= 64 KiB. The Claude `Tail` reader
 /// stops at frozen with a reader-relative limit `frozen - start`.
 ///
 /// Red on main: no in-page limit is set; the reader passes frozen and fails
@@ -595,7 +595,7 @@ fn replaced_page(
     (index, result, seen, selected)
 }
 
-/// SP-3a-c: a new object renamed over the path during a `Tail`; the held FD
+/// A new object renamed over the path during a `Tail`; the held FD
 /// is not grown, so the strict reopen refuses. The first refusal keeps
 /// nothing and requeues the file with its selection flags, also across a
 /// restart. A re-read that did not hold the census is requeued as a census
@@ -813,7 +813,7 @@ fn changed_reopen_shares_growth_retry(source: SnapshotSource) {
     }
 }
 
-/// SP-4-c (GREEN): truncated below frozen during a Claude `Tail`, no regrow.
+/// (GREEN): truncated below frozen during a Claude `Tail`, no regrow.
 /// Not grown, so main's strict reopen refuses; nothing published, and the
 /// file takes its one same-walk retry.
 #[test]
@@ -834,8 +834,8 @@ fn fe_claude_sp4_truncate_during_tail_keeps_main_failure() {
     assert_retried(&index, &tail, &seen, &base, "SP-4-c");
 }
 
-/// SP-5a-c (GREEN): truncated at the open step (a short EOF), then regrown
-/// past frozen before completion. H3c's traversal check fails, so main's
+/// (GREEN): truncated at the open step (a short EOF), then regrown
+/// past frozen before completion. The grown-prefix traversal check fails, so main's
 /// strict reopen refuses and the file takes its one same-walk retry.
 #[test]
 fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
@@ -870,8 +870,8 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     assert_retried(&index, &tail, &seen, &base, "SP-5a-c");
 }
 
-/// SP-5b-c (GREEN): after the Claude reader passes frozen, the file is
-/// rewritten past frozen with a different head. Main's revalidation and H3c's
+/// (GREEN): after the Claude reader passes frozen, the file is
+/// rewritten past frozen with a different head. Main's revalidation and the grown-prefix
 /// head sample both refuse as `ScopeObject`; nothing published.
 #[test]
 fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
@@ -892,7 +892,7 @@ fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
     assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5b-c");
 }
 
-/// SP-5c-c (GREEN): after the Claude reader passes frozen, the file is
+/// (GREEN): after the Claude reader passes frozen, the file is
 /// rewritten to exactly frozen with a different head. Not grown, so main's
 /// strict reopen refuses and the file takes its one same-walk retry.
 #[test]
@@ -913,10 +913,10 @@ fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
     assert_retried(&index, &tail, &seen, &base, "SP-5c-c");
 }
 
-/// SP-5 residual, Claude (RED; EXPECTED RESIDUAL per FE2, not mutation
+/// Residual, Claude (RED; EXPECTED RESIDUAL, not mutation
 /// detection): after the reader passed them, already-read tail bytes outside
 /// both 4 KiB sample windows are truncated and regrown with a different row
-/// of the same length, plus growth. H3c accepts it as the cursor does: the
+/// of the same length, plus growth. The grown-prefix check accepts it as the cursor does: the
 /// page publishes the bytes it read; only a later Full (the quiet audit) sees
 /// the edit.
 ///
@@ -969,7 +969,7 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
     );
     // FE2: even a grown Full that had no previous debt must retain a
     // deadline. A Full audit sees the interior rewrite and counts it; only a
-    // file with no stored continuation reaches it (the SP-5 residual).
+    // file with no stored continuation reaches it.
     assert!(index.files[&base.key].unverified_deadline().is_some());
     crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(&base.cache, &index);
     index
@@ -1471,7 +1471,7 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
         assert!(read.is_some());
         assert_eq!(seen.unreadable, 0, "FE capacity: {:?}", seen.causes);
         assert!(result.snapshots.is_empty());
-        // H1c freezes the admitted extent independently of audit capacity.
+        // The read plan freezes the admitted extent independently of audit capacity.
         // With no audit slot, the committed body and census membership stay owed.
         assert_eq!(seen.causes, [0; 8], "capacity defers only this file");
         assert!(!index
@@ -1679,7 +1679,7 @@ fn fe_claude_finalizer_response_loss_keeps_valid_grown_prefix() {
     assert_eq!(index.files[&base.key].size_bytes, read.frozen);
 }
 
-/// An ineligible Full still has a ReadPlan, but H1c never froze its reader.
+/// An ineligible Full still has a ReadPlan, but the extent limit never froze its reader.
 /// Growth after its native EOF must not enter the optional prefix route.
 #[test]
 fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
@@ -1800,7 +1800,7 @@ fn fe_claude_prefix_then_grown_tail_does_not_clear_provenance() {
     assert!(!mints_v1(&mut index, &result, 0..10));
 }
 
-/// c22 G1 (control): FE marks its grown prefix after `record` in the same
+/// Control: the frozen-extent route marks its grown prefix after `record` in the same
 /// completion, so a prefix still ends `p` from a clean, replay-reset or
 /// legacy prior entry, and stays excluded.
 #[test]

@@ -300,7 +300,7 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
 }
 
 /// [money] A late-evidence re-fold whose body is not the ACKed one reads 0
-/// native bytes and is sent as an ordinary update (L02): its body is the
+/// native bytes and is sent as an ordinary update: its body is the
 /// cold Full's whole body, never a rescan claim or a challenge answer, and
 /// nothing is owed afterwards.
 #[test]

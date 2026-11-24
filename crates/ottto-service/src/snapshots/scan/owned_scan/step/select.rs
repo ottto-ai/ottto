@@ -770,7 +770,7 @@ impl OwnedSourceScan {
                         metadata.len() > sampled_scan::codex_cursor::Limits::current().singleton()
                     })
             {
-                // N1 (K9): the state or sidecar census is incomplete, so
+                // The state or sidecar census is incomplete, so
                 // main's trust rule refuses verification and retention,
                 // yet main still reads and publishes this file. A file
                 // larger than the singleton budget therefore pages as a
@@ -1351,7 +1351,7 @@ impl OwnedSourceScan {
                         }
                         // The slot frees when its job ends: wait in turn.
                         Err(sampled_scan::codex_cursor::StartRefusal::Busy) => true,
-                        // N1: no acquisition even cursor-only (no current
+                        // No acquisition even cursor-only (no current
                         // owning header or no reduction dependencies, where
                         // main holds the file too). Never requeued: the
                         // path is processed for this generation with a
@@ -1500,8 +1500,8 @@ impl OwnedSourceScan {
                         // the file goes back to the walk's queue as a
                         // re-read, so the next page of this walk continues
                         // the upgrade (the switch-on
-                        // re-read). A re-read is not a census member
-                        // (G1): it never holds the census, and a walk
+                        // re-read). A re-read is not a census member:
+                        // it never holds the census, and a walk
                         // that ends first drops it for the next walk to
                         // list again. Only once this page admitted
                         // history: a file that cannot fit an empty page

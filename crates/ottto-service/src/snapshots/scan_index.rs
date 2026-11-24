@@ -1186,7 +1186,7 @@ impl ScanIndex {
 
     /// The newest valid activity clock among this index's accepted entities,
     /// in unix seconds: the last moment the index records this destination
-    /// receiving history (StateMissing N1). `None` when it records none.
+    /// receiving history (`note_claude_history_cutoff`). `None` when it records none.
     pub(in crate::snapshots) fn last_received_activity_unix_seconds(&self) -> Option<u64> {
         self.accepted_snapshot_fingerprints
             .iter()

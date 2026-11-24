@@ -125,7 +125,7 @@ where
     ))
 }
 
-/// K4: a malformed move hold must not release history after bootstrap.
+/// A malformed move hold must not release history after bootstrap.
 /// Missing fields keep the legacy default; explicit booleans keep their value.
 pub(in crate::snapshots) fn deserialize_lenient_move_hold<'de, D>(
     deserializer: D,

@@ -511,7 +511,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     // Main reloads the index every pass (snapshot_sync's per-pass load) and
     // never serializes the RAM-only fragment custody, so each reloaded pass
     // re-reads the fragment only: a Tail from the committed prefix, bounded
-    // by the fragment's bytes, never a Full (pre-existing; disclosed in S2b).
+    // by the fragment's bytes, never a Full (pre-existing).
     // The existing repeat counter counts each such pass. These passes run
     // before the metadata-only change below, as production's re-read sees an
     // unchanged file: once reloaded, the entry has no fragment record to

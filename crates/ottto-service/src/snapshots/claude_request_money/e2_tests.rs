@@ -1470,7 +1470,7 @@ fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
     }
 }
 
-/// Exercise T4's actual index walk and one metadata probe per twin. Only physical
+/// Exercise the actual index walk and one metadata probe per twin. Only physical
 /// birth is injected, as in parse(); Linux has no portable set-creation-time API.
 fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
     let mut page = crate::snapshots::claude_history_upgrade::HistoryPage::default();
@@ -2365,7 +2365,7 @@ fn side_call_page(side: ClaudeLocalOtelEvidence) -> (SnapshotItem, Option<(Strin
     (item, side)
 }
 
-/// [money] [regress] MA1 B3: a telemetry-only side call (Desktop
+/// [money] [regress] A telemetry-only side call (Desktop
 /// `prompt_suggestion`/`compact`) with its own complete account was added
 /// under the session fallback instead (2,817 requests per cycle uploaded
 /// account-less). It now carries its own account; totals are unchanged.
@@ -3629,7 +3629,7 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
             &[marker.clone(), line("original", &at(2), 10)],
         );
         for fresh in [false, true] {
-            // The page's metadata probe witnesses the live original (F1c).
+            // The page's metadata probe witnesses the live original.
             stage_twins(
                 &mut index,
                 &[(&original, t0()), (&copy, t0() + 100_000_000_000)],
@@ -3951,7 +3951,7 @@ fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
     };
 }
 
-// ---- I4b ----
+// ---- Subagent twins and side calls ----
 
 fn sub_line(id: &str, seconds: i64, input: u64) -> Value {
     let mut value = line(id, &at(seconds), input);
@@ -4461,7 +4461,7 @@ fn e2_twin_index_spells_root_and_subagent_members_once() {
     remove_agent_scratch(&[&agent_a, &agent_b, &solo]);
 }
 
-/// The sidecar fingerprint rule before F3b: hash the blanked clone's JSON
+/// The sidecar fingerprint rule before streamed hashing: hash the blanked clone's JSON
 /// and compare the formatted string.
 fn reference_fingerprint_ok<T: serde::Serialize + Clone>(
     row: &T,

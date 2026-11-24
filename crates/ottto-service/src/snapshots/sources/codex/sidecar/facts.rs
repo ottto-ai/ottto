@@ -396,7 +396,7 @@ fn index_rows(path: &Path, rows: &mut CreatedRows) -> Result<()> {
 }
 
 /// Evaluate membership with SQLite itself, then stage/decode each sub-census
-/// independently. A bad Q1/Q2 row discards only its own complete-query effects.
+/// independently. A bad title or thread row discards only its own complete-query effects.
 fn thread_rows(
     db: &Connection,
 ) -> Result<(Result<TitleRows>, Result<ThreadRows>, Result<CreatedRows>)> {
