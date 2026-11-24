@@ -357,7 +357,8 @@ use crate::backfill::{
 };
 use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics};
 use crate::detected_uses::{
-    aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
+    aggregate_detected_uses, merge_detected_uses, without_pre_account_cache,
+    DETECTED_USE_RETENTION_DAYS,
 };
 use crate::local_resource_diagnostics::claude_contract;
 use crate::session_attribution::SessionAttributionContext;
