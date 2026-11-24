@@ -599,6 +599,33 @@ pub(super) fn backend_post_json_with_timeout<T: DeserializeOwned>(
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
 
+/// Sends `body` byte for byte (or no body) and decodes a JSON 2xx answer. A signed write's
+/// challenge hashes the exact body, so the HTTP client must not serialize it again.
+pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> Result<T, LocalApiError> {
+    let mut request = crate::retry_tls::credential_agent()
+        .request(method, url)
+        .set("Accept", "application/json")
+        .timeout(BACKEND_REQUEST_TIMEOUT);
+    for (key, value) in headers {
+        request = request.set(key, value);
+    }
+    let response = match body {
+        Some(body) => request
+            .set("Content-Type", "application/json")
+            .send_bytes(body),
+        None => request.call(),
+    }
+    .map_err(|error| backend_error_from_ureq(url, error))?;
+    backend_success(url, response)?
+        .into_json()
+        .map_err(|error| backend_response_unexpected(url, error.to_string()))
+}
+
 pub(super) fn backend_get_json<T: DeserializeOwned>(
     url: &str,
     headers: &[(&str, &str)],

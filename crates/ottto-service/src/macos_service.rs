@@ -14,6 +14,9 @@ mod status_probe;
 
 pub const LAUNCH_AGENT_LABEL: &str = MACOS_LAUNCH_AGENT_LABEL;
 pub const MACH_SERVICE_NAME: &str = "net.ottto.service.xpc";
+/// The Mach service of the Mac app's signer channel
+/// (`control::cloud_connect`). Only an app-installed service registers it.
+pub const SIGNER_MACH_SERVICE_NAME: &str = "net.ottto.service.signer";
 /// Env var read by the daemon (see `control::companion_code_requirement`) to
 /// override the baked-in Developer ID requirement for token-less Companion
 /// trust. Dev/QA only.
@@ -407,6 +410,15 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
     );
     let mut mach_services = Dictionary::new();
     mach_services.insert(config.mach_service_name.clone(), Value::Boolean(true));
+    // The signer channel exists only beside the signed app: a Homebrew,
+    // hosted or dev service never registers it, so the app finds no signer.
+    if install_owner_for_path(&config.executable_path) == InstallOwner::AppBundle {
+        if let Some(Value::Array(arguments)) = root.get_mut("ProgramArguments") {
+            arguments.push(Value::String("--signer-mach-service".to_string()));
+            arguments.push(Value::String(SIGNER_MACH_SERVICE_NAME.to_string()));
+        }
+        mach_services.insert(SIGNER_MACH_SERVICE_NAME.to_string(), Value::Boolean(true));
+    }
     root.insert("MachServices".to_string(), Value::Dictionary(mach_services));
     root.insert("RunAtLoad".to_string(), Value::Boolean(true));
     let mut keep_alive = Dictionary::new();
@@ -600,6 +612,57 @@ mod tests {
                 .and_then(Value::as_boolean),
             Some(true)
         );
+    }
+
+    /// [behaviour] Only an app-installed service registers the signer Mach
+    /// service and passes its name to `serve-xpc`.
+    #[test]
+    fn only_an_app_bundle_launch_agent_registers_the_signer() {
+        for (executable, registers) in [
+            (
+                "/Applications/Ottto.app/Contents/Helpers/ottto-service",
+                true,
+            ),
+            ("/opt/homebrew/Cellar/ottto/0.1.0/bin/ottto-service", false),
+            ("/Users/test/.ottto/bin/ottto-service", false),
+            ("/Users/test/src/ottto/target/debug/ottto-service", false),
+        ] {
+            let config = LaunchAgentConfig::local_user_default(
+                Path::new("/Users/test"),
+                PathBuf::from(executable),
+            );
+            let bytes = render_launch_agent_plist(&config).expect("plist should render");
+            let parsed = Value::from_reader_xml(bytes.as_slice()).expect("plist should parse");
+            let root = parsed.as_dictionary().expect("dictionary");
+            let services = root
+                .get("MachServices")
+                .and_then(Value::as_dictionary)
+                .expect("mach services");
+            let args = root
+                .get("ProgramArguments")
+                .and_then(Value::as_array)
+                .expect("program args")
+                .iter()
+                .filter_map(Value::as_string)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                services.get(MACH_SERVICE_NAME).and_then(Value::as_boolean),
+                Some(true),
+                "{executable}"
+            );
+            assert_eq!(
+                services.get(SIGNER_MACH_SERVICE_NAME).is_some(),
+                registers,
+                "{executable}"
+            );
+            let signer_args = args
+                .windows(2)
+                .filter(|pair| {
+                    pair[0] == "--signer-mach-service" && pair[1] == SIGNER_MACH_SERVICE_NAME
+                })
+                .count();
+            assert_eq!(signer_args, usize::from(registers), "{executable}");
+        }
     }
 
     fn plist_environment(config: &LaunchAgentConfig) -> Dictionary {

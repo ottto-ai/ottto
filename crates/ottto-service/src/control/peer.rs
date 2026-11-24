@@ -463,6 +463,34 @@ pub(super) fn companion_identity_code_requirement() -> String {
     format!("identifier \"{OTTTO_COMPANION_BUNDLE_IDENTIFIER}\"")
 }
 
+/// The signing identifier of `ottto-service`: the packager signs it without `--identifier`, so
+/// codesign takes its file name. The Mac app pins it, with the team, to trust the signer channel.
+#[cfg(target_os = "macos")]
+const OTTTO_SERVICE_SIGNING_IDENTIFIER: &str = "ottto-service";
+
+/// The release `ottto-service`: its identifier, signed by a Developer ID certificate Apple issued
+/// to `team_id`. The Mac app requires it of the signer channel, and this service requires it of
+/// itself before it opens that channel.
+#[cfg(target_os = "macos")]
+pub(super) fn service_team_code_requirement(team_id: &str) -> String {
+    format!(
+        "identifier \"{OTTTO_SERVICE_SIGNING_IDENTIFIER}\" and {}",
+        developer_id_requirement_fragment(team_id)
+    )
+}
+
+/// Whether this running process satisfies `requirement`.
+#[cfg(target_os = "macos")]
+pub(super) fn this_process_satisfies(requirement: &str) -> bool {
+    use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement};
+
+    let Ok(requirement) = requirement.parse::<SecRequirement>() else {
+        return false;
+    };
+    SecCode::for_self(Flags::NONE)
+        .is_ok_and(|code| code.check_validity(Flags::NONE, &requirement).is_ok())
+}
+
 /// The requirement this daemon's own code must satisfy for the install to count
 /// as a customer artifact: a Developer ID certificate Apple issued to the
 /// baked-in team. No `identifier` clause — the daemon ships under several

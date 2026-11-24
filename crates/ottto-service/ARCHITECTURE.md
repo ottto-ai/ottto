@@ -950,6 +950,45 @@ Public updates and backend-token commands use their own handler paths. Identity
 commands keep their handler-side authorization and invalidate pending launch
 handoffs before mutation.
 
+## Cloud connect signer channel
+
+`control/cloud_connect` is the service side of connecting a cloud account from this Mac. The
+Ottto app holds the Secure Enclave keys and signs; the service talks to the Ottto server and
+never sees a key.
+
+- **Channel.** A second Mach service, `net.ottto.service.signer`, separate from the control
+  listener. The service renders it into its LaunchAgent (`MachServices` and
+  `serve-xpc --signer-mach-service`) only when an app bundle installed it, and opens it only
+  when its own signature is the release `ottto-service` (identifier and Developer ID team) and
+  no `OTTTO_COMPANION_*` override is set. There is no dev, ad-hoc or socket mode. A listener
+  that cannot start is logged and leaves the signer unavailable; the control listener and socket
+  keep serving.
+- **Peers.** Each peer must run as this user and pass
+  `xpc_connection_set_peer_code_signing_requirement` with the release app's identifier and team;
+  libxpc then checks every message it delivers. The app pins the service the same way.
+- **Wire.** JSON `{"signer_protocol":1,"id","command","args"}` in, `{"signer_protocol":1,"id",
+  "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. Every connection sends
+  `signer_hello` first; the service refuses anything else on a connection without one. The
+  commands (`cloud_sign_poll`, `cloud_sign_result`, `cloud_keys_claim_start`,
+  `cloud_keys_claim_status`, `cloud_keys_enroll_prepare`, `cloud_keys_enroll`,
+  `cloud_keys_revoke`) exist only here, never on the control channel.
+- **Signed writes.** A prepare builds the body once, hashes
+  `method + "\n" + route template + "\n" + body` with the literal `{setup_run_id}`, gets a
+  device challenge for that hash, checks the challenge's signed facts, and freezes body and
+  challenge on the connection. The send uses those bytes and `{challenge_id}.{signature}` proofs,
+  at most once: key enrollment is never retried by the service. Revoke signs the empty `DELETE`
+  body the same way. A refused run token is refreshed and the identical request sent again.
+- **Sign queue.** In memory only: at most four live requests, a device proof until its
+  challenge expires and an approval until its `sign_by`; one request per approval id, and a new
+  approval supersedes the attempt's older one. A request goes to the first verified connection
+  that polls it, only that connection's answer counts, and a DER shape check guards signatures.
+  An ended connection drops its prepares and returns its requests to the queue.
+- **Wake.** A queued request with no hello in the last 3 s checks the app bundle around this
+  service against the app requirement and runs `open -g -a <app> ottto://cloud/sign`. The URL
+  carries no data.
+- **Template.** The CloudFormation template URL is built from a pinned object key and version,
+  never taken from the server, and the bytes served there must hash to the pinned sha256.
+
 ## Local health diagnostics
 
 Verification authorizes before source reads or result writes; setup authorizes

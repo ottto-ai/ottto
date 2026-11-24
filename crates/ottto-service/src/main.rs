@@ -85,6 +85,10 @@ enum Command {
         mach_service: String,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Also serve the Mac app's signer channel on this Mach service. Only the LaunchAgent of
+        /// an app-installed service passes it.
+        #[arg(long)]
+        signer_mach_service: Option<String>,
     },
     Service {
         #[command(subcommand)]
@@ -415,6 +419,7 @@ fn main() -> Result<()> {
         Command::ServeXpc {
             mach_service,
             socket,
+            signer_mach_service,
         } => {
             #[cfg(unix)]
             let _local_state = hold_local_state_or_exit();
@@ -477,12 +482,21 @@ fn main() -> Result<()> {
 
             #[cfg(target_os = "macos")]
             {
+                // Before the control listener's dispatch_main(), which serves both. A signer
+                // failure leaves the control listener and socket serving.
+                if let Some(signer_mach_service) = signer_mach_service.as_deref() {
+                    ottto_service::xpc_mach::start_signer_listener(
+                        signer_mach_service,
+                        daemon.clone(),
+                    );
+                }
                 ottto_service::xpc_mach::serve_xpc_mach_service(&mach_service, daemon)?;
             }
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = mach_service;
                 let _ = socket;
+                let _ = signer_mach_service;
                 anyhow::bail!("XPC transport is not supported on this platform");
             }
             #[cfg(not(any(unix, target_os = "macos")))]

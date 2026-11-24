@@ -24,6 +24,91 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn ottto_xpc_start_signer(
+        mach_service: *const c_char,
+        peer_requirement: *const c_char,
+        handler: extern "C" fn(*const c_char, u64, *mut c_void) -> *mut c_char,
+        closed: extern "C" fn(u64, *mut c_void),
+        context: *mut c_void,
+    ) -> c_int;
+}
+
+/// Opens the Mac app's signer channel on `mach_service`, beside the control listener, when this
+/// service may serve it (`control::cloud_connect::signer_peer_requirement`). Any failure is logged
+/// and leaves the signer unavailable; it never stops the service. Call it before
+/// [`serve_xpc_mach_service`], whose `dispatch_main()` also serves this listener.
+#[cfg(target_os = "macos")]
+pub fn start_signer_listener(mach_service: &str, daemon: LocalDaemon) {
+    use crate::control::cloud_connect;
+
+    let requirement = match cloud_connect::signer_peer_requirement() {
+        Ok(requirement) => requirement,
+        Err(off) => {
+            eprintln!("signer channel off: {}", off.reason());
+            return;
+        }
+    };
+    let (Ok(name), Ok(peer_requirement)) = (
+        CString::new(mach_service),
+        CString::new(requirement.as_str()),
+    ) else {
+        eprintln!("signer channel off: its name or requirement contains NUL");
+        return;
+    };
+    // Owned by the listener for the life of the process once it starts.
+    let context = Box::into_raw(Box::new(daemon)) as *mut c_void;
+    let rc = unsafe {
+        ottto_xpc_start_signer(
+            name.as_ptr(),
+            peer_requirement.as_ptr(),
+            handle_signer_request,
+            signer_connection_closed,
+            context,
+        )
+    };
+    if rc != 0 {
+        unsafe {
+            drop(Box::from_raw(context as *mut LocalDaemon));
+        }
+        eprintln!("signer channel off: its listener failed to start with status {rc}");
+        return;
+    }
+    cloud_connect::signer_listening(requirement);
+    eprintln!("serving the signer channel on {mach_service}");
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn handle_signer_request(
+    request_json: *const c_char,
+    connection_id: u64,
+    context: *mut c_void,
+) -> *mut c_char {
+    const SIGNER_INTERNAL: &str =
+        r#"{"signer_protocol":1,"id":"","ok":false,"error":{"code":"internal"}}"#;
+    if request_json.is_null() || context.is_null() {
+        return c_string_or_null(SIGNER_INTERNAL);
+    }
+    let daemon = unsafe { &*(context as *const LocalDaemon) }.clone();
+    let request = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .into_owned();
+    let response = join_worker("ottto-xpc-signer", move || {
+        crate::control::cloud_connect::handle_signer_request_json(&daemon, connection_id, &request)
+    })
+    .unwrap_or_else(|| SIGNER_INTERNAL.to_string());
+    c_string_or_null(&response)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn signer_connection_closed(connection_id: u64, _context: *mut c_void) {
+    // A panic must not unwind into libxpc.
+    let _ = std::panic::catch_unwind(|| {
+        crate::control::cloud_connect::signer_connection_closed(connection_id);
+    });
+}
+
+#[cfg(target_os = "macos")]
 pub fn serve_xpc_mach_service(mach_service: &str, daemon: LocalDaemon) -> Result<()> {
     let mach_service = CString::new(mach_service).context("Mach service name contains NUL")?;
     let context = Box::into_raw(Box::new(daemon)) as *mut c_void;
@@ -100,26 +185,34 @@ fn run_xpc_worker<F>(operation: F) -> String
 where
     F: FnOnce() -> String + Send + 'static,
 {
-    let worker = thread::Builder::new()
-        .name("ottto-xpc-control".to_string())
-        .stack_size(XPC_CONTROL_THREAD_STACK_BYTES)
-        .spawn(operation);
-
-    match worker {
-        Ok(handle) => match handle.join() {
-            Ok(response) => {
-                crate::control_plane_health::record_request_served();
-                response
-            }
-            Err(_) => {
-                crate::control_plane_health::record_request_error();
-                internal_error_response()
-            }
-        },
-        Err(error) => {
-            eprintln!("failed to spawn XPC control worker: {error}");
+    match join_worker("ottto-xpc-control", operation) {
+        Some(response) => {
+            crate::control_plane_health::record_request_served();
+            response
+        }
+        None => {
             crate::control_plane_health::record_request_error();
             internal_error_response()
+        }
+    }
+}
+
+/// Runs `operation` on its own thread with the control stack size and waits for it. `None` when
+/// the thread could not start or panicked.
+#[cfg(target_os = "macos")]
+fn join_worker<F>(name: &str, operation: F) -> Option<String>
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    let worker = thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(XPC_CONTROL_THREAD_STACK_BYTES)
+        .spawn(operation);
+    match worker {
+        Ok(handle) => handle.join().ok(),
+        Err(error) => {
+            eprintln!("failed to spawn {name} worker: {error}");
+            None
         }
     }
 }
