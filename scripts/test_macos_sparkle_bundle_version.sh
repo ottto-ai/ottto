@@ -49,6 +49,7 @@ mkdir -p \
 cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
 cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_scheme.sh"
 cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
+cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 15;
@@ -125,13 +126,22 @@ printf '{}\n' > "$output"
 SBOM
 chmod +x "$repo/scripts/cyclonedx_sbom.sh"
 
-cat > "$mock_bin/ditto" <<'DITTO'
+# Archive calls are logged with their time zone; the last two arguments are
+# always the input and the output.
+cat > "$mock_bin/ditto" <<DITTO
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
-  cp "$3" "$4"
+if [[ "\${1:-}" == "-c" && "\${2:-}" == "-k" ]]; then
+  printf 'TZ=%s %s\\n' "\${TZ:-}" "\$*" >> "$TMP_DIR/ditto-archive.log"
+  src=""
+  dst=""
+  for arg in "\$@"; do
+    src="\$dst"
+    dst="\$arg"
+  done
+  cp "\$src" "\$dst"
 else
-  cp -R "$1" "$2"
+  cp -R "\$1" "\$2"
 fi
 DITTO
 cat > "$mock_bin/hdiutil" <<'HDIUTIL'
@@ -260,6 +270,15 @@ if [[ -e "$gh_calls" ]]; then
   cat "$gh_calls" >&2
   exit 1
 fi
+# [behaviour] Both published zips are written in UTC without resource forks or
+# extended attributes.
+for zip_name in "ottto-macos-" "ottto-service-macos-"; do
+  if ! grep -Eq "^TZ=UTC -c -k --norsrc --noextattr .* $output_dir/${zip_name}[a-z0-9_]+\.zip\$" "$TMP_DIR/ditto-archive.log"; then
+    echo "Published zip ${zip_name}* must be archived with TZ=UTC --norsrc --noextattr" >&2
+    cat "$TMP_DIR/ditto-archive.log" >&2
+    exit 1
+  fi
+done
 
 # [behaviour] Only the daemon LaunchAgent carries the allocator setting.
 service_plist="$output_dir/Ottto.app/Contents/Library/LaunchAgents/net.ottto.service.plist"

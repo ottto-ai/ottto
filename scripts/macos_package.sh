@@ -8,6 +8,8 @@ source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
 source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 # shellcheck source=scripts/macos_companion_entitlements.sh
 source "$SCRIPT_DIR/macos_companion_entitlements.sh"
+# shellcheck source=scripts/macos_release_archive.sh
+source "$SCRIPT_DIR/macos_release_archive.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -573,8 +575,8 @@ sign_container "$APP_DMG"
 rm -rf "$DMG_STAGING"
 CLI_ZIP="$OUTPUT_DIR/ottto-macos-$ARCH.zip"
 DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
-ditto -c -k "$OUTPUT_DIR/ottto" "$CLI_ZIP"
-ditto -c -k "$OUTPUT_DIR/ottto-service" "$DAEMON_ZIP"
+ottto_release_zip "$OUTPUT_DIR/ottto" "$CLI_ZIP"
+ottto_release_zip "$OUTPUT_DIR/ottto-service" "$DAEMON_ZIP"
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
 "$ROOT/scripts/cyclonedx_sbom.sh" --output "$SBOM_PATH" --version "$VERSION" >/dev/null
 
