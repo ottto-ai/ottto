@@ -186,7 +186,7 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
     }
 }
 
-/// [behaviour] T4: a page partly acknowledged under B is checkpointed, then the
+/// [behaviour] A page partly acknowledged under B is checkpointed, then the
 /// pass fails and rolls back to that checkpoint. Back under A the file still
 /// holds A's receipt, and the entities ACKed under B leave it owing delivery,
 /// never a read; its next ordinary send resends exactly those.

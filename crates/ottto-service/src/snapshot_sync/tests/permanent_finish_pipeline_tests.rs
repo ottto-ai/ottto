@@ -638,7 +638,7 @@ fn mixed_conflict_and_validation_finish_still_defer() {
     permanent_finish_pipeline(FinishOutcome::ConflictValidation);
 }
 
-/// F1: body A is refused as dominated, then a newer body B of the same entity
+/// Body A is refused as dominated, then a newer body B of the same entity
 /// gets a retryable conflict. A conflict finish leaves exactly one durable
 /// fact for B: the index-owned `RetryPending(B)` quarantine beside the
 /// permanent refusal of A. This fixture cannot vary only witness-bound

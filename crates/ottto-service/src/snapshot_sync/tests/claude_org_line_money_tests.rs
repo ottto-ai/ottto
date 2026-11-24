@@ -13,10 +13,10 @@ use crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_equ
 /// an unexplained flip to org 2 and gap r1 before T; from T gap r2, complete
 /// telemetry r3 (login c, org d), login-only r4 (login a) and a side call
 /// (login a, org 1). Before T the flip stays refused (r0, r1: org 1); from T
-/// it places the gap r2 (org 2, B1/B2); own telemetry keeps r3 (B4/B7) and
-/// login-only r4 never borrows it (B11). Tokens and requests are conserved,
+/// it places the gap r2 (org 2, B1/B2); own telemetry keeps r3 and
+/// login-only r4 never borrows it. Tokens and requests are conserved,
 /// and a restarted Tail over the head before T equals the cold Full under the
-/// money oracle (B1c).
+/// money oracle.
 #[test]
 fn org_line_governs_from_t_and_a_restarted_tail_matches_cold() {
     with_e2(|| {

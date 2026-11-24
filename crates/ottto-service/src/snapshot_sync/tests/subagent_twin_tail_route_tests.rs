@@ -78,7 +78,7 @@ fn revisions(index: &ScanIndex) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// [money] T4/T7: from an accepted over-counted body, cold, retained and
+/// [money] From an accepted over-counted body, cold, retained and
 /// restarted owners emit the same corrected body (each shared request once).
 /// Rule 4 re-owes the pair once (not the root or the lone sibling); after a
 /// restart nothing is re-owed again. The receiver accepts the decrease, and
@@ -205,7 +205,7 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
     });
 }
 
-/// [money] T7: from version 2, rules 3 and 4 select the same pair: the jump
+/// [money] From version 2, rules 3 and 4 select the same pair: the jump
 /// to version 4 re-owes each key once. Without a pair, rule 4 re-owes nothing.
 #[cfg(unix)]
 #[test]

@@ -421,7 +421,7 @@ fn fresh_growing_file_has_numbers_on_its_first_upload() {
         posture(&items[0]),
         (Some(100), Some(100), Some(100), Some(0))
     );
-    // R9: no local proven family witness, so this contract-less body may
+    // No local proven family witness, so this contract-less body may
     // carry its scalars (once per change). Counted locally.
     let counts = &disposition.context_file_birth;
     assert_eq!(counts.contractless_scalars_witness_missing_session_count, 1);
@@ -665,7 +665,7 @@ fn restored_file_that_grows_counts_post_birth_only_unless_the_original_is_presen
     let _ = fs::remove_dir_all(dir);
 }
 
-/// F5: a reported birth at or before 2020-01-01T00:00:00Z (0, the epoch, a
+/// A reported birth at or before 2020-01-01T00:00:00Z (0, the epoch, a
 /// reset clock) is not evidence, so the file withholds as unknown birth.
 #[test]
 fn birth_at_or_before_2020_counts_as_unknown() {
@@ -897,7 +897,7 @@ fn admit_with_slice_cap(
     (admissions, counts)
 }
 
-/// review-678c R3: one root whose requests span slices, with the
+/// One root whose requests span slices, with the
 /// contradiction in a later slice than a confirmed request. The earlier
 /// slice's confirmation must not hide the later contradiction.
 #[test]
@@ -1096,7 +1096,7 @@ fn remembered_tripwire_fails_closed_when_full() {
     for item in [&first, &second, &third, &changed] {
         assert!(memory.holds(item), "full: fail closed");
     }
-    // N3: the full list shows on the local counts line.
+    // The full list shows on the local counts line.
     let reports = no_reports();
     let veto_rows = ClaudeVetoApiRows::new();
     let tripwire = sources::claude::context_file_birth::ClaudeTelemetryTripwire::build(

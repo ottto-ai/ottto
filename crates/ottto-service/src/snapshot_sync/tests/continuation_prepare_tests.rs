@@ -1,4 +1,4 @@
-// Stage 1 (K1 a″, K2/P-1, K5): the continuation-local prepare and the cached
+// The continuation-local prepare and the cached
 // same-cycle inputs, on synthetic fixtures. Nothing here opens a socket: the
 // receipt client names an offline address and is never called, and the
 // attribution key is a synthetic sentinel, never printed.
@@ -255,7 +255,7 @@ pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation
     preparation
 }
 
-/// K2: cached inputs for the continuation tests, with a drop sentinel (the
+/// Cached inputs for the continuation tests, with a drop sentinel (the
 /// prelude feed's `Arc`, whose count falls back to one when the inputs, and
 /// the context with them, are dropped).
 pub(super) fn continuation_inputs_for_test(
@@ -309,7 +309,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
     );
 }
 
-/// K1.3: on a quiescent destination the continuation prepare yields the
+/// On a quiescent destination the continuation prepare yields the
 /// preparation the ordinary prepare's tail yields, on every field
 /// `finish_sync_source` reads, except the documented SKIPs; and it saves
 /// nothing.
@@ -459,7 +459,7 @@ fn a_continuation_page_mirrors_an_open_head_conflict() {
         .head_conflict_owed(&cache_session_key("synthetic-other-session")));
 }
 
-/// K1.1: a destination with a historical replay pending refuses before any
+/// A destination with a historical replay pending refuses before any
 /// read, saves nothing and keeps the context in the cached inputs.
 #[test]
 fn a_pending_historical_replay_refuses_the_continuation_prepare() {
@@ -515,7 +515,7 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
     }
 }
 
-/// K2: no serialized output of a continuation preparation carries the
+/// No serialized output of a continuation preparation carries the
 /// context's key.
 #[test]
 fn no_continuation_output_serializes_the_attribution_key() {
@@ -557,7 +557,7 @@ fn no_continuation_output_serializes_the_attribution_key() {
     }
 }
 
-/// K1.1 (C-1 lease): a destination whose ordinary prepare armed an
+/// A destination whose ordinary prepare armed an
 /// admission re-offer refuses before any read.
 #[test]
 fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
@@ -592,7 +592,7 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
 }
 
-/// K1 (a″, C-1 lease): a due quarantine retry the ordinary selection would
+/// A due quarantine retry the ordinary selection would
 /// lease (and save) refuses at the pure probe.
 #[test]
 fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
@@ -616,7 +616,7 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
     fixture.assert_refused(ContinuationRefusal::UploadClaim);
 }
 
-/// K1 (a″, C-1 lease): a due, exactly bound reason re-offer. The ordinary
+/// A due, exactly bound reason re-offer. The ordinary
 /// selection that activates a re-offer always reports a claim, so the page
 /// refuses at the pure probe (UploadClaim); the post-claim
 /// ReasonReoffer arm stays the backstop and is not reachable from disk.

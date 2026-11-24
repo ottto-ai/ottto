@@ -638,7 +638,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         // req_3 is observed B inside the gap stream: carry cannot replace it.
         assert_eq!(e2_source_counts(on).get(&(b.clone(), None)), Some(&1));
         // Acknowledging the marked carry never strips the accepted account
-        // or invokes B31's starting-binding fallback on the next body.
+        // or invokes the starting-binding fallback on the next body.
         assert_eq!(on.request_identity_refusals, 0);
         assert_eq!(again.request_identity_refusals, 0);
         assert_eq!(e2_source_counts(again), e2_source_counts(on));
@@ -1433,7 +1433,7 @@ fn e2_bound_trace_case(
     let (recovered, _, stats) =
         e2_bound_trace_page(&dir, &support, &root, &mut index, false, accepted);
     if listed {
-        // Addendum 3: the accepted tags are kept, nothing is refused.
+        // The accepted tags are kept, nothing is refused.
         for item in &recovered {
             let logins = e2_login_counts(item);
             assert!(

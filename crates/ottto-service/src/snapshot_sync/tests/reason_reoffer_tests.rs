@@ -95,7 +95,7 @@ fn decode(reoffer: &str) -> Option<reason_reoffer::RefusalReoffer> {
     record.reoffer
 }
 
-/// R10: only an exact version-1 extension qualifies; everything else
+/// Only an exact version-1 extension qualifies; everything else
 /// disables this record's retry while the refusal itself survives.
 #[test]
 fn reoffer_decoder_is_bounded_and_isolating() {
@@ -172,7 +172,7 @@ fn reoffer_decoder_is_bounded_and_isolating() {
     }
 }
 
-/// R9: a frozen pre-change reader reads newly written records: the new
+/// A frozen pre-change reader reads newly written records: the new
 /// reason keeps the old enum value, the extension is ignored, siblings and
 /// the receipt reason survive. An old rewrite drops the extension, which
 /// leaves a refusal that is never re-offered.
@@ -257,7 +257,7 @@ fn old_daemon_reads_new_refusal_records_and_receipt_reason() {
     assert!(!receipt_reason.is_dominated());
 }
 
-/// R3: due re-offers and ordinary retries share one 50-slot budget, oldest
+/// Due re-offers and ordinary retries share one 50-slot budget, oldest
 /// deadline first; the remainder is deferred and counted, its deadline
 /// untouched. A selected re-offer reserves now + 24 h.
 #[test]
@@ -310,7 +310,7 @@ fn reoffers_share_the_ordinary_retry_budget_oldest_first() {
     assert!(!progress.active_reason_reoffers.contains_key(&fp(100)));
 }
 
-/// R4/R5/R11: only a due, current, unaccepted refusal bound to its exact
+/// Only a due, current, unaccepted refusal bound to its exact
 /// terminal record qualifies; other reasons, done markers, changed
 /// witnesses, superseded or out-of-window records never do.
 #[test]
@@ -407,7 +407,7 @@ fn reoffer_lease_is_bound_to_the_exact_refused_body() {
     assert!(!progress.contains_body(&fp(1), &body(1)));
 }
 
-/// R6: the reservation is durable before any lease is used. A failed save
+/// The reservation is durable before any lease is used. A failed save
 /// grants nothing; a crash after the claim cannot re-offer within the day.
 #[test]
 fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
@@ -485,7 +485,7 @@ fn clock_rollback_reclamps_and_skips_without_consuming_classification() {
     assert_eq!(reloaded.active_reason_reoffers.len(), 1);
 }
 
-/// F9: a re-offer cannot claim two slots for a fingerprint whose ordinary
+/// A re-offer cannot claim two slots for a fingerprint whose ordinary
 /// retry and refusal disagree after a crash.
 #[test]
 fn reoffer_and_stale_ordinary_retry_share_one_slot() {
@@ -535,7 +535,7 @@ fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
     );
 }
 
-/// F1: the cache-enriched upload and its stripped head probe have different
+/// The cache-enriched upload and its stripped head probe have different
 /// witnesses. Only the refusal's own recorded probe lease may pass its hold.
 #[test]
 fn materialized_cache_probe_matches_only_its_own_refusal_witness() {

@@ -301,7 +301,7 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
 }
 
 /// A fresh install may find the real progress lock, but never prior progress
-/// state: that refuses before any native publication. Once fresh G0 custody is
+/// state: that refuses before any native publication. Once fresh generation-zero custody is
 /// published, a later JSON ledger beside it does not revoke that custody.
 #[test]
 fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
@@ -548,7 +548,7 @@ fn recovery_emission_boundaries(
             index.claude_literal_guard(&items),
             claude_history_upgrade::LiteralGuard::Open
         ));
-        // Frozen reproduction of round 9's bad control setup: turning off
+        // Frozen reproduction of the bad control setup: turning off
         // the active revision rejects this same literal without any damage.
         let mut inactive = index.clone();
         inactive.active_effective_upload_body_witness_revision = 0;
@@ -973,6 +973,6 @@ fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     drop(session);
 }
 
-// F10: count surviving complete offers at the real post-policy finalizer.
+// Count surviving complete offers at the real post-policy finalizer.
 // Parser completion and an equal body suppressed as a semantic noop are not
 // publication. This runs portably; Pi has no production durable source registration.
