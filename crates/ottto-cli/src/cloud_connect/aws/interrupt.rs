@@ -31,24 +31,21 @@ impl InterruptGuard {
 
 pub(super) fn check() -> Result<(), Failure> {
     #[cfg(unix)]
-    match SIGNAL.load(Ordering::Relaxed) {
-        signal @ (libc::SIGINT | libc::SIGTERM) => {
-            let mut failure = Failure::new(
-                "interrupted",
-                "Cloud setup was interrupted. Run the command again to resume.",
-                "run_again",
-            );
-            failure.reason = Some(
-                if signal == libc::SIGTERM {
-                    "sigterm"
-                } else {
-                    "sigint"
-                }
-                .into(),
-            );
-            return Err(failure);
-        }
-        _ => {}
+    if let signal @ (libc::SIGINT | libc::SIGTERM) = SIGNAL.load(Ordering::Relaxed) {
+        let mut failure = Failure::new(
+            "interrupted",
+            "Cloud setup was interrupted. Run the command again to resume.",
+            "run_again",
+        );
+        failure.reason = Some(
+            if signal == libc::SIGTERM {
+                "sigterm"
+            } else {
+                "sigint"
+            }
+            .into(),
+        );
+        return Err(failure);
     }
     Ok(())
 }
