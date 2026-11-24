@@ -39,8 +39,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::heap_layout_bound::split_fields as money_heap_fields;
-
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
@@ -920,7 +918,7 @@ struct FoldTelemetry {
     /// lookups; collisions are checked against the existing request sets.
     membership: FamilyMembership,
 }
-money_heap_fields!(FoldTelemetry; inline: [read, complete, side_candidates, side_calls_done]; heap: [start_bucket, membership]);
+crate::heap_layout_bound::split_fields!(FoldTelemetry; inline: [read, complete, side_candidates, side_calls_done]; heap: [start_bucket, membership]);
 
 /// Elapsed work is diagnostic, never part of native scan identity or parity.
 /// Keep Debug deterministic while retaining the measured value for receipts.
@@ -1016,7 +1014,7 @@ pub(crate) struct FileFold {
     /// fold release takes them.
     own_tools: Option<Box<(Option<Vec<super::super::SnapshotToolUsage>>, bool)>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent, own_tools]);
+crate::heap_layout_bound::split_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent, own_tools]);
 
 impl FileFold {
     pub(in crate::snapshots) fn new(
@@ -1798,7 +1796,7 @@ struct FamilyMembership {
     entries: Vec<u64>,
     member_mask: u64,
 }
-money_heap_fields!(FamilyMembership; inline: [member_mask]; heap: [entries]);
+crate::heap_layout_bound::split_fields!(FamilyMembership; inline: [member_mask]; heap: [entries]);
 
 /// Attach and subtraction share this one view, consumed before candidate
 /// hashes and trace owners are allocated. Indices are into the unchanged page.
