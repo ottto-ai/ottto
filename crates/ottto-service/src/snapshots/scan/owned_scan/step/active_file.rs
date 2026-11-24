@@ -455,54 +455,8 @@ impl OwnedSourceScan {
                 self.codex_page
                     .charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
             }
-            let memo_candidate = memo_offset.and_then(|offset| {
-                let file = active.parser.reader.reader.get_ref();
-                let live = sampled_scan::codex_cursor::LiveWitness::read(
-                    &active.candidate.path,
-                    file,
-                    offset,
-                )?;
-                let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
-                // PR-1: every singleton entry is exact until a counted tail
-                // makes growth replayable, so the stamp must cover exactly
-                // the bytes read (captured after
-                // `finish_job`'s check).
-                if stamp.extent() != attempt_read_end {
-                    return None;
-                }
-                // L-6: a curable hold is stamped only at the length its bind saw.
-                if sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
-                    && active.parser.accumulator.codex_bind_seed_len != Some(attempt_read_end)
-                {
-                    return None;
-                }
-                let dependencies = sampled_scan::reduction_dependencies(
-                    self.source,
-                    &active.candidate,
-                    &self.codex_title_metadata,
-                    &self.claude_title_metadata,
-                    self.claude_effort_support_dir.as_deref(),
-                )?;
-                let digest = sampled_scan::codex_cursor::memo_digest(
-                    &self.index,
-                    &active.candidate,
-                    file,
-                    &dependencies,
-                    &self.codex_title_metadata,
-                    sampled_scan::codex_cursor::owner_members(
-                        self.codex_join_inventory.as_ref(),
-                        &active.candidate.path,
-                    ),
-                )?;
-                let sidecar = sampled_scan::codex_cursor::sidecar_wakes(&active.parser.accumulator)
-                    .then(|| {
-                        sampled_scan::codex_cursor::sidecar_fingerprint(
-                            &self.codex_title_metadata,
-                            &active.candidate.path,
-                        )
-                    });
-                Some((digest, live, stamp, sidecar))
-            });
+            let memo_candidate = memo_offset
+                .and_then(|offset| self.codex_memo_witness(&active, offset, attempt_read_end));
             let OwnedActiveFile {
                 first_read,
                 sampling: mut file_sampling,
@@ -750,39 +704,11 @@ impl OwnedSourceScan {
             // Retain the obligation until native finish and RAM admission.
             // Only due complete-c Unchanged acquisitions can retire it;
             // incidental telemetry refreshes keep the original obligation.
-            let quiet_audit_checked = if let (Some(completed), Some(active), Some(context)) = (
+            let quiet_audit_checked = self.check_quiet_audit(
                 completed_acquisition.as_ref(),
                 file_sampling.as_ref(),
-                self.sampling.as_mut(),
-            ) {
-                if active.mode == crate::transcript_acquisition::ReadMode::Unchanged
-                    // Withheld bodies retain their obligation until release.
-                    && !self.index.claude_account_deferred_holds.contains_key(&active.key)
-                    && self.index.files.get(&active.key).is_some_and(|entry| {
-                        entry.audit_requires_full(self.audit_now)
-                            && !entry.has_prefix_provenance()
-                    })
-                    && !self.index.claude_request_census.get(&active.key).is_some_and(
-                        claude_request_census::ClaudeRequestCensusRecord::identity_incomplete_hold,
-                    )
-                {
-                    let mut bytes = 0;
-                    let checked = completed
-                        .checkpoint
-                        .quiet_audit_matches(
-                            parser.reader.reader.get_mut(),
-                            &active.scope,
-                            &mut bytes,
-                        )
-                        .unwrap_or(false);
-                    context.sample_bytes = context.sample_bytes.saturating_add(bytes as u64);
-                    checked
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+                &mut parser,
+            );
             #[cfg(test)]
             sampled_scan::test_hooks::fire_for_key(
                 sampled_scan::test_hooks::Point::AfterRetain,
@@ -1907,5 +1833,106 @@ impl OwnedSourceScan {
             delivery.arm();
         }
         true
+    }
+
+    /// The live witness, stamp and digest that let a held Codex singleton
+    /// be memoized at `offset`; `None` when any of them cannot be proven.
+    #[inline(never)]
+    fn codex_memo_witness(
+        &self,
+        active: &OwnedActiveFile,
+        offset: u64,
+        attempt_read_end: u64,
+    ) -> Option<(
+        String,
+        sampled_scan::codex_cursor::LiveWitness,
+        sampled_scan::codex_cursor::OpenStamp,
+        Option<String>,
+    )> {
+        let file = active.parser.reader.reader.get_ref();
+        let live =
+            sampled_scan::codex_cursor::LiveWitness::read(&active.candidate.path, file, offset)?;
+        let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
+        // PR-1: every singleton entry is exact until a counted tail
+        // makes growth replayable, so the stamp must cover exactly
+        // the bytes read (captured here, after the caller's
+        // `finish_job` check).
+        if stamp.extent() != attempt_read_end {
+            return None;
+        }
+        // L-6: a curable hold is stamped only at the length its bind saw.
+        if sampled_scan::codex_cursor::growth_may_cure(&active.parser.accumulator)
+            && active.parser.accumulator.codex_bind_seed_len != Some(attempt_read_end)
+        {
+            return None;
+        }
+        let dependencies = sampled_scan::reduction_dependencies(
+            self.source,
+            &active.candidate,
+            &self.codex_title_metadata,
+            &self.claude_title_metadata,
+            self.claude_effort_support_dir.as_deref(),
+        )?;
+        let digest = sampled_scan::codex_cursor::memo_digest(
+            &self.index,
+            &active.candidate,
+            file,
+            &dependencies,
+            &self.codex_title_metadata,
+            sampled_scan::codex_cursor::owner_members(
+                self.codex_join_inventory.as_ref(),
+                &active.candidate.path,
+            ),
+        )?;
+        let sidecar =
+            sampled_scan::codex_cursor::sidecar_wakes(&active.parser.accumulator).then(|| {
+                sampled_scan::codex_cursor::sidecar_fingerprint(
+                    &self.codex_title_metadata,
+                    &active.candidate.path,
+                )
+            });
+        Some((digest, live, stamp, sidecar))
+    }
+
+    /// Whether a due audit of an unchanged file was checked against the
+    /// held descriptor, so the obligation can retire after native finish.
+    #[inline(never)]
+    fn check_quiet_audit(
+        &mut self,
+        completed_acquisition: Option<&sampled_jsonl::CompletedNativeAcquisition>,
+        file_sampling: Option<&sampled_scan::Active>,
+        parser: &mut OwnedJsonlParser,
+    ) -> bool {
+        if let (Some(completed), Some(file_sampling), Some(context)) =
+            (completed_acquisition, file_sampling, self.sampling.as_mut())
+        {
+            if file_sampling.mode == crate::transcript_acquisition::ReadMode::Unchanged
+                // Withheld bodies retain their obligation until release.
+                && !self.index.claude_account_deferred_holds.contains_key(&file_sampling.key)
+                && self.index.files.get(&file_sampling.key).is_some_and(|entry| {
+                    entry.audit_requires_full(self.audit_now)
+                        && !entry.has_prefix_provenance()
+                })
+                && !self.index.claude_request_census.get(&file_sampling.key).is_some_and(
+                    claude_request_census::ClaudeRequestCensusRecord::identity_incomplete_hold,
+                )
+            {
+                let mut bytes = 0;
+                let checked = completed
+                    .checkpoint
+                    .quiet_audit_matches(
+                        parser.reader.reader.get_mut(),
+                        &file_sampling.scope,
+                        &mut bytes,
+                    )
+                    .unwrap_or(false);
+                context.sample_bytes = context.sample_bytes.saturating_add(bytes as u64);
+                checked
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
