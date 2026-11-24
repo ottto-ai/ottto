@@ -1363,7 +1363,7 @@ fn codex_inside_window_due_retry_is_offered_by_the_narrow_scan() {
     });
 }
 
-#[path = "progress_rows_oracle_tests.rs"]
+#[path = "tests/progress_rows_oracle_tests.rs"]
 mod progress_rows_oracle_tests;
 
 fn owned_batch(items: &[&SnapshotItem]) -> Vec<SnapshotItem> {

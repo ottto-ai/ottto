@@ -4,7 +4,7 @@ use super::*;
 use crate::snapshots::privacy_flip_modes::{all, link, Flip, Mode, FLIPS};
 use serde_json::Value;
 
-#[path = "privacy_flip_tail_tests.rs"]
+#[path = "tests/privacy_flip_tail_tests.rs"]
 mod tail_rows;
 
 const SOURCES: [SnapshotSource; 3] = [

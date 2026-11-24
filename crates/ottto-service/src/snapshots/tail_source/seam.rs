@@ -454,7 +454,7 @@ pub(in crate::snapshots::tail_source) mod tests;
 mod transition_tests;
 
 #[cfg(test)]
-#[path = "../bad_record_tests.rs"]
+#[path = "../tests/bad_record_tests.rs"]
 mod bad_record_tests;
 
 #[cfg(test)]

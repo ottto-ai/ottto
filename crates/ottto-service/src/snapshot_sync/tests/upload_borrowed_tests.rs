@@ -15,7 +15,7 @@ fn upload_attempt_matches_cloned_batch_bytes() {
     let path = root.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
     std::fs::write(
         &path,
-        include_str!("../../../../fixtures/snapshot-audit/claude-request-owned-root.jsonl"),
+        include_str!("../../../../../fixtures/snapshot-audit/claude-request-owned-root.jsonl"),
     )
     .unwrap();
     let raw = e2::with_fixture_birth(1, || {
@@ -53,7 +53,7 @@ fn upload_attempt_matches_cloned_batch_bytes() {
     let cache = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     assert!(cache.cache_observations_state.is_some());
     let pi_path = root.join("pi.jsonl");
-    std::fs::write(&pi_path, include_str!("../../../../fixtures/snapshot-audit/pi-session.jsonl")).unwrap();
+    std::fs::write(&pi_path, include_str!("../../../../../fixtures/snapshot-audit/pi-session.jsonl")).unwrap();
     let pi = crate::snapshots::parse_pi_jsonl_file(&pi_path, "2026-07-22T08:01:00Z", "c".repeat(64)).unwrap();
     assert!(!pi.is_empty());
     for (source, items) in [

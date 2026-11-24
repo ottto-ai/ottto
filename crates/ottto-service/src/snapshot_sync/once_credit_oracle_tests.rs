@@ -4901,12 +4901,12 @@ mod money_equivalence_tests {
 
 // The walk gate on this runner: idle passes, wakes, the backstop and hint loss.
 mod walk_gate_oracle_tests {
-    include!("walk_gate_oracle_tests.rs");
+    include!("tests/walk_gate_oracle_tests.rs");
 }
 
 // Every way one finish can end, on the scripted and oracle fixtures above.
 mod finish_outcome_tests {
-    include!("finish_outcome_tests.rs");
+    include!("tests/finish_outcome_tests.rs");
 }
 
 /// One line for a tier row's failure: the backfill state, the saved queue

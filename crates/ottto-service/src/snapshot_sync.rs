@@ -568,31 +568,31 @@ pub(crate) use tests::codex_archive_tests::{
 mod tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/h357_ack_tests.rs"]
+#[path = "snapshot_sync/tests/h357_ack_tests.rs"]
 mod h357_ack_tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/tail_ack_ledger.rs"]
+#[path = "snapshot_sync/tests/tail_ack_ledger.rs"]
 pub(crate) mod tail_ack_ledger;
 
 #[cfg(test)]
-#[path = "snapshot_sync/usage_decrease_hold_tests.rs"]
+#[path = "snapshot_sync/tests/usage_decrease_hold_tests.rs"]
 mod usage_decrease_hold_tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/head_conflict_answer_tests.rs"]
+#[path = "snapshot_sync/tests/head_conflict_answer_tests.rs"]
 pub(crate) mod head_conflict_answer_tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/change_reason_tests.rs"]
+#[path = "snapshot_sync/tests/change_reason_tests.rs"]
 mod change_reason_tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/progress_unchanged_save_tests.rs"]
+#[path = "snapshot_sync/tests/progress_unchanged_save_tests.rs"]
 mod progress_unchanged_save_tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/head_conflict_released_progress_fixture.rs"]
+#[path = "snapshot_sync/tests/head_conflict_released_progress_fixture.rs"]
 mod head_conflict_released_progress_fixture;
 
 #[cfg(test)]

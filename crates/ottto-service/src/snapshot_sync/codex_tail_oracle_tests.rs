@@ -103,7 +103,7 @@ fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
 
 mod independent {
     use super::*;
-    include!("codex_sameid_oracle_tests.rs");
+    include!("tests/codex_sameid_oracle_tests.rs");
 }
 
 pub(in crate::snapshot_sync) use independent::{

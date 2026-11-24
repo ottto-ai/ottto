@@ -2979,12 +2979,12 @@ mod tests {
     }
 
     mod local_health_retention_tests {
-        include!("local_health_retention_tests.rs");
+        include!("lib_tests/local_health_retention_tests.rs");
     }
 
     mod scan_index_health_tests {
         use super::*;
-        include!("scan_index_health_tests.rs");
+        include!("lib_tests/scan_index_health_tests.rs");
     }
 
     fn daemon() -> LocalDaemon {

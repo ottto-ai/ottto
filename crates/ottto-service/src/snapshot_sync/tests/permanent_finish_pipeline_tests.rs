@@ -795,7 +795,7 @@ pub(crate) mod reason_reoffer_pipeline_tests {
 
 // Same real prepare/finish pipeline across a same-account re-login.
 pub(crate) mod relogin_pipeline_tests {
-    include!("relogin_pipeline_tests.rs");
+    include!("../relogin_pipeline_tests.rs");
 }
 
 // Same real prepare/finish pipeline; a late Task member's exact hint.
@@ -804,7 +804,7 @@ pub(crate) mod late_member_finish_pipeline_tests {
 }
 
 pub(crate) mod once_credit_oracle_tests {
-    include!("once_credit_oracle_tests.rs");
+    include!("../once_credit_oracle_tests.rs");
 }
 
 thread_local! {
@@ -1345,5 +1345,5 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
 }
 
 mod identity_503_tests {
-    include!("identity_503_tests.rs");
+    include!("../identity_503_tests.rs");
 }

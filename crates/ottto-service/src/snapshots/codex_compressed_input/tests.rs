@@ -1960,5 +1960,5 @@ fn archive_confirmed_empty_walk_owes_nothing() {
 }
 mod archive_transitions {
     use super::*;
-    include!("../codex_archive_transition_tests.rs");
+    include!("../tests/codex_archive_transition_tests.rs");
 }

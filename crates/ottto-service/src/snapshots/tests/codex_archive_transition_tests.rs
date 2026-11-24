@@ -3310,10 +3310,10 @@ fn first_import_page_total_rows() {
 
 mod sidecar_reuse_transition {
     use super::*;
-    include!("sources/codex/sidecar/reuse_transition.rs");
+    include!("../sources/codex/sidecar/reuse_transition.rs");
 }
 
 mod removed_root_transition {
     use super::*;
-    include!("discovery/removed_root_transition.rs");
+    include!("../discovery/removed_root_transition.rs");
 }
