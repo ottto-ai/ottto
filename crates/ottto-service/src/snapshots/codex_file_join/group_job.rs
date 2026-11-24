@@ -1,4 +1,4 @@
-//! A Codex file group as one job (P2). A pre-job boot identifies the members,
+//! A Codex file group as one job. A pre-job boot identifies the members,
 //! reads their headers (the parent's `read_header_bytes`, called as-is),
 //! plans the canonical order (§a.3) and, for legacy-shape groups, probes each
 //! member to its first native record. Continuous groups replay through one
@@ -207,7 +207,7 @@ pub(in crate::snapshots) fn disclose_members(
 }
 
 /// A genuine open/read failure, line loss, receipt, owner or creator
-/// conflict: strict, exactly as before P2.
+/// conflict: strict, exactly as before.
 pub(in crate::snapshots) fn disclose_strict(
     members: &[CandidateFile],
     targets: DisclosureTargets<'_>,
@@ -249,9 +249,9 @@ pub(in crate::snapshots) struct GroupBoot {
     admitted: bool,
     pub(in crate::snapshots) probe_bound: bool,
     /// A probe was cut by `PROBE_BYTES` itself, not by the allowance: the
-    /// fallback order is the same every generation (round 3).
+    /// fallback order is the same every generation.
     probe_limit_bound: bool,
-    /// This boot runs on a page of its own (round 3, `ProbeBudgetOrder`).
+    /// This boot runs on a page of its own (`ProbeBudgetOrder`).
     pub(in crate::snapshots) own_page: bool,
     /// Probe bytes this boot may still read (R2-N2): the page's remaining
     /// singleton budget, set by the scanner before each step.
@@ -892,7 +892,7 @@ pub(in crate::snapshots) struct GroupJob {
     probe_limit_bound: bool,
     own_page: bool,
     /// `GroupBoot::dependencies`: a parked `ProbeBudgetOrder` record's wake
-    /// inputs (round 3).
+    /// inputs.
     pub(in crate::snapshots) dependencies: Option<String>,
     pub(in crate::snapshots) memo_digest: Option<String>,
     /// `cursor::group_scope` at job start: every resume and the
@@ -936,7 +936,7 @@ pub(in crate::snapshots) enum GroupEnd {
     Strict,
     /// A member changed or vanished: a necessary invalidation.
     Changed,
-    /// The live member's acquisition evidence is unavailable this page (K9).
+    /// The live member's acquisition evidence is unavailable this page.
     Unavailable,
 }
 
@@ -1095,7 +1095,7 @@ fn member_eof(
         });
     }
     let receipt = replay.finish().map_err(|_| GroupEnd::Strict)?;
-    // The variable records this member leaves in the job (round 4, L3).
+    // The variable records this member leaves in the job.
     let retained = [
         crate::heap_layout_bound::completed_bound(&receipt, usize::MAX),
         crate::heap_layout_bound::completed_bound(&key, usize::MAX),
@@ -1257,7 +1257,7 @@ fn independent_member_eof(
 /// EOF only (`cursor::group_eof_record_due`): the withheld final record is
 /// applied from the buffered bytes through the same line sink, the proof
 /// before the member's proof ends. The job
-/// then gets no S12 grant (`finish_job`), so strict finish identity covers
+/// then gets no certified grant (`finish_job`), so strict finish identity covers
 /// the record. Without it, a quiescent live member ending in an
 /// unterminated record would stage hourly audit debt and re-read the whole
 /// group each time.
@@ -1433,7 +1433,7 @@ pub(in crate::snapshots) fn end_group(
         }
         // The chronological fallback order may itself break the
         // chain (a budget artifact, not a property of the files): strict,
-        // never settleable or memoized, named for S11. Per-member reasons
+        // never settleable or memoized, named for `ProbeBudgetOrder`. Per-member reasons
         // (UI balance, shape) do not depend on the order.
         GroupEnd::Refused {
             reason: reason @ (JoinRefusal::Gap | JoinRefusal::Overlap),

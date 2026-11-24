@@ -182,6 +182,7 @@ pub(in crate::snapshots) fn clear_claude_context_posture(item: &mut SnapshotItem
     item.peak_context_fill_tokens = None;
     item.first_turn_context_tokens = None;
     item.last_turn_context_tokens = None;
+    item.context_request_count = None;
     item.compaction_count = None;
     item.compaction_timestamps.clear();
     item.compaction_events.clear();
@@ -222,12 +223,25 @@ where
         claude_compaction_summary_paired(owned_observations, &paired);
     item.compaction_count = Some(count);
     item.compaction_timestamps = timestamps;
-    let (events, id_less) = compaction_events::claude_compaction_events(
+    let (events, id_less, counted) = compaction_events::claude_compaction_events(
         owned_observations,
         &paired,
         occurrences.clone().filter(|occurrence| is_own(occurrence)),
     );
     item.compaction_events = events;
+    // Only an item a transcript walk counted carries positions: absent,
+    // never 0, on any other item.
+    item.context_request_count = item.claude_counted_request_candidates.map(|_| counted);
+    if item.context_request_count.is_none() {
+        crate::snapshots::clear_counted_request_positions(item);
+    }
+    // Ownership and a repeated request id only remove counted requests, so
+    // an equal count means the finalize positions are these requests.
+    if item.claude_counted_request_candidates != Some(counted) {
+        if let Some(start) = item.session_start.as_deref_mut() {
+            compaction_events::clear_counted_start_sizes(start);
+        }
+    }
     item.compaction_total_pre_tokens =
         (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
     item.compaction_total_post_tokens =

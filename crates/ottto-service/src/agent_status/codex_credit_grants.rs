@@ -585,7 +585,7 @@ pub(super) fn model_diagnostics_suffix(diagnostics: &[CreditModelDiagnostic]) ->
     format!(" Credit model: {}.", parts.join(", "))
 }
 
-/// Design C2a: a counts-only view of `rateLimitsByLimitId` and two top-level
+/// A counts-only view of `rateLimitsByLimitId` and two top-level
 /// fields, so the next decision on emitting pools rests on evidence. Pool ids
 /// are provider codenames; ids outside `^[a-z0-9_.-]{1,64}$` are only counted.
 pub(super) fn rate_limit_pools_summary(rate_limits: &Value, read_at: u64) -> String {

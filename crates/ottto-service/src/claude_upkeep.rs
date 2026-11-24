@@ -98,8 +98,8 @@ pub(crate) fn observe_registered_slot_upkeep(
 }
 
 /// The decision always comes from the live read, never from the persisted
-/// `access_expires_at`: a stale persisted deadline latched slots in the past
-/// (H58), and a login the user restored must resume in the same pass.
+/// `access_expires_at`: a stale persisted deadline latched slots in the past,
+/// and a login the user restored must resume in the same pass.
 fn observe_registered_slot_upkeep_reading(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     consent: bool,
@@ -639,7 +639,7 @@ mod tests {
         );
     }
 
-    /// H58 latch regression: the decision never comes from the persisted
+    /// Latch regression: the decision never comes from the persisted
     /// deadline. A past persisted deadline with a valid live login resumes in
     /// the same pass.
     #[test]
@@ -730,7 +730,7 @@ mod tests {
         );
     }
 
-    /// T5: five expired, consented anchors pause in the foreground. Nothing is
+    /// Five expired, consented anchors pause in the foreground. Nothing is
     /// enqueued, no worker thread starts, and an old `Backoff` witness from a
     /// pre-upgrade worker is not resurrected.
     #[test]

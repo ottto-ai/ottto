@@ -27,7 +27,7 @@ pub(in crate::snapshots) fn codex_last_usage(value: &Value) -> Option<UsageTotal
 }
 
 /// The one `last_token_usage` root the parser admits (shared with the group
-/// proof, S10).
+/// proof).
 pub(in crate::snapshots) fn codex_last_usage_root(value: &Value) -> Option<&Value> {
     value
         .pointer("/token_count/info/last_token_usage")
@@ -336,9 +336,15 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if let Some(timestamp) = timestamp.clone() {
             // `before` is the session's current "last" value: the last owned
             // non-zero request before this marker, in the posture measure.
-            accumulator
-                .codex_compaction_sizes
-                .note_marker(&timestamp, accumulator.last_turn_context_tokens);
+            // Its counted position only when that size is the last counted one.
+            let request_index = accumulator
+                .counted_requests
+                .and_then(|counted| counted.marker_index());
+            accumulator.codex_compaction_sizes.note_marker(
+                &timestamp,
+                accumulator.last_turn_context_tokens,
+                request_index,
+            );
             accumulator.compaction_timestamps.push(timestamp);
         }
     }
@@ -359,7 +365,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // — the Claude-side `effective_input_context()` formula — would nearly
     // double a cache-heavy turn and report a long session as filling more than
     // its own context window.
-    if let Some(context_tokens) = codex_last_turn_input_context(value) {
+    let context_tokens = codex_last_turn_input_context(value);
+    let posture_before = accumulator.last_turn_context_tokens;
+    if let Some(context_tokens) = context_tokens {
         // The `token_count` event Codex emits at a compaction reports zero
         // usage; it observed no context, so it must not become the baseline.
         if context_tokens > 0 {
@@ -394,6 +402,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // Usage-counting V2 (configured parsers only): version decision on the
     // first owned record, turn lifecycle and native `token_usage_record`s.
     accumulator.observe_codex_counting_line(value, timestamp.as_deref(), &selector);
+    let mut counted = false;
     if let Some(usage) = codex_total_usage(value) {
         // Codex cumulative totals carry request_count as a session-wide count.
         // When the field is missing the parser defaults it to 1 so deltas
@@ -438,7 +447,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             let bucket = model
                 .as_deref()
                 .or(accumulator.latest_model.as_deref())
-                .zip(codex_last_turn_input_context(value))
+                .zip(context_tokens)
                 .and_then(|(model, prompt_tokens)| {
                     provider_context_bucket(model, prompt_tokens, timestamp.as_deref())
                 });
@@ -465,7 +474,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if admitted.is_some() {
             if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
                 replay.admitted(applied_tier);
-                // S10: the group proof sees only actually admitted usage.
+                // The group proof sees only actually admitted usage.
                 replay.admitted_usage(
                     value,
                     last_usage.is_some(),
@@ -481,11 +490,24 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         // duplicates and re-emissions are not admitted. Same measure as
         // `before` (the posture read of `last_token_usage`).
         if admitted.is_some() {
-            if let Some(context_tokens) = codex_last_turn_input_context(value) {
+            if let Some(context_tokens) = context_tokens {
                 accumulator
                     .codex_compaction_sizes
                     .note_counted_request(context_tokens);
+                CountedRequests::note(&mut accumulator.counted_requests, context_tokens);
+                counted = context_tokens > 0;
             }
+        }
+    }
+    // A positive size moved the posture's "last" above. Counted, it is the
+    // last counted request's; a different size the counter refused is not,
+    // so a marker's `before` loses its index until the next counted request.
+    // A refused repeat of the same size leaves `before` on the counted one.
+    if let Some(counted_requests) = accumulator.counted_requests.as_mut() {
+        if counted {
+            counted_requests.aligned = true;
+        } else if context_tokens.is_some_and(|size| size > 0 && Some(size) != posture_before) {
+            counted_requests.aligned = false;
         }
     }
     if string_eq_at(value, &["type"], "response_item") {

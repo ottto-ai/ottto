@@ -1202,7 +1202,7 @@ fn codex_case(legacy: bool, content: bool) {
     assert_eq!(modes, (0, 1, 0), "must continue from the Codex route head");
     let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior.clone());
     assert_eq!(modes, (1, 0, 0));
-    // S2b: a new owner continues from the same committed Codex heads.
+    // A new owner continues from the same committed Codex heads.
     let (_, restored, modes) = other_page(&c, &restart, source, prior);
     assert_eq!(
         modes,
@@ -3332,7 +3332,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
         );
         progress.save_fixture(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
-        // Reuse these outcomes with a B2 loss-bearing successor.
+        // Reuse these outcomes with a loss-bearing successor.
         append(&path, "{broken\n");
         grow(&path, "next", 20);
         let mut successor = c.raw(&warm, prior.clone(), 100, true, &[]);
@@ -4302,7 +4302,7 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
     });
 }
 
-/// [money] SOURCE Addendum 7 (Q2) GOLDEN, conflict then append. A head-CAS
+/// [money] GOLDEN, conflict then append. A head-CAS
 /// conflict with a challenge is recorded on a production-shaped Claude body.
 /// While the answer is owed (the ledger's challenge mirrored into the scan
 /// index, as each prepare does), no read continues from stored state: (a) a

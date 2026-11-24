@@ -11,7 +11,7 @@ const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
 const SECOND: &str = "b0000000-0000-4000-8000-00000000000b";
 const OTHER_ROOT: &str = "c0000000-0000-4000-8000-00000000000c";
 const COPIED: i64 = -2 * 24 * 60 * 60;
-const CONTEXT_KEYS: [&str; 11] = [
+const CONTEXT_KEYS: [&str; 12] = [
     "compaction_count",
     "compaction_events",
     "compaction_timestamps",
@@ -19,6 +19,7 @@ const CONTEXT_KEYS: [&str; 11] = [
     "compaction_total_duration_ms",
     "compaction_total_post_tokens",
     "compaction_total_pre_tokens",
+    "context_request_count",
     "first_own_request_at",
     "first_turn_context_tokens",
     "last_turn_context_tokens",
@@ -165,6 +166,7 @@ fn assert_cleared(item: &SnapshotItem) {
     assert!(item.compaction_events.is_empty());
     assert!(item.local_context_points.is_empty());
     assert_eq!(item.first_own_request_at, None);
+    assert_eq!(item.context_request_count, None);
 }
 
 /// Prompt sizes of the item's Mac-local points, oldest first.
@@ -269,9 +271,12 @@ fn rewind_copy_counts_only_own_records() {
             at: own_boundary.clone(),
             before: Some(300),
             after: Some(200),
+            request_index: Some(2),
             trigger: Some("auto".to_string()),
         }]
     );
+    // Counted positions cover own requests only: req_a1..req_a4.
+    assert_eq!(item.context_request_count, Some(4));
     // Local points: the same own requests as first/peak/last.
     let points = point_sizes(&item);
     assert_eq!(points.first(), Some(&100));
@@ -1875,8 +1880,10 @@ fn withheld_item_clears_sizes_and_points_with_the_tuple() {
         at: stamp(now, -29),
         before: Some(100),
         after: Some(200),
+        request_index: Some(1),
         trigger: None,
     }];
+    parsed.context_request_count = Some(2);
     parsed.local_context_points = vec![LocalContextPoint {
         at_unix_seconds: 1,
         prompt_tokens: 100,
@@ -1923,9 +1930,12 @@ fn id_less_neighbours_of_a_compaction_are_counted_locally() {
             at: stamp(now, -28),
             before: Some(100),
             after: Some(200),
+            request_index: Some(1),
             trigger: Some("auto".to_string()),
         }]
     );
+    // ID-less responses are never counted.
+    assert_eq!(items[0].context_request_count, Some(2));
     // Counted on the local basis-counts line only; the wire is unchanged.
     let counts = &disposition.context_file_birth;
     assert_eq!(
@@ -1963,6 +1973,7 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
     let mut bare = item.clone();
     bare.compaction_events.clear();
     bare.local_context_points.clear();
+    assert!(crate::snapshots::clear_counted_request_positions(&mut bare));
     let claude = SnapshotSource::ClaudeCode;
     let policy = valid_v6_batch_request().upload_policy;
     assert_eq!(
@@ -1989,9 +2000,201 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
     let wire = serde_json::to_value(&item).expect("serialize body");
     assert_eq!(
         wire["compaction_events"],
-        serde_json::json!([{"at": stamp(now, -28), "before": 300, "after": 200, "trigger": "auto"}])
+        serde_json::json!([{"at": stamp(now, -28), "before": 300, "after": 200, "request_index": 2, "trigger": "auto"}])
     );
+    assert_eq!(wire["context_request_count"], 3);
     assert!(wire.get("local_context_points").is_none());
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// `at` `millis` after 30 s before `now`, with fixed three-digit fractions so
+/// string order is time order.
+fn counted_at(now: OffsetDateTime, millis: i64) -> String {
+    let whole = stamp(now, -30 + millis.div_euclid(1000));
+    format!("{}.{:03}Z", &whole[..19], millis.rem_euclid(1000))
+}
+
+/// Fifty-five positive requests of `n` thousand tokens, a zero-size and an
+/// ID-less response among the first, and 66 boundaries: one after each
+/// request from the fifth, then fifteen after the last. `duplicate` adds a
+/// second response under request 3's ID.
+fn counted_lines(session: &str, now: OffsetDateTime, duplicate: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let boundary_at = |millis: i64, lines: &mut Vec<String>| {
+        lines.push(boundary(session, &counted_at(now, millis), 1, 1));
+    };
+    for n in 1..=55_i64 {
+        let request = assistant(
+            session,
+            &format!("req_{n:02}"),
+            &counted_at(now, n * 100),
+            n as u64 * 1_000,
+        );
+        lines.push(request.clone());
+        match n {
+            2 => lines.push(assistant(
+                session,
+                "req_zero",
+                &counted_at(now, n * 100 + 10),
+                0,
+            )),
+            3 => {
+                lines.push(id_less_assistant(
+                    session,
+                    &counted_at(now, n * 100 + 10),
+                    7_000,
+                ));
+                // A second response under the same request ID: finalize
+                // counts both, the occurrence map keeps one.
+                if duplicate {
+                    lines.push(request.replace("\"msg_req_03\"", "\"msg_req_03_again\""));
+                }
+            }
+            _ => {}
+        }
+        if n >= 5 {
+            boundary_at(n * 100 + 50, &mut lines);
+        }
+    }
+    for extra in 1..=15 {
+        boundary_at(5_550 + extra, &mut lines);
+    }
+    lines
+}
+
+/// [behaviour] Claude counts owned, ID-bearing responses with a positive size,
+/// once each: the total, each kept marker's index (older markers still count)
+/// and the 10/20/50 sizes. A repeated ID or a copied opening breaks the
+/// sizes' equality check or freshness, so they stay absent; a withheld item
+/// carries no key at all, never a 0.
+#[test]
+fn claude_counted_curve_uses_owned_resolved_responses() {
+    let dir = temp_dir("claude-file-birth-counted-curve");
+    let now = OffsetDateTime::now_utc();
+    let kept_indices = (7..=55).chain([55; 15]).map(Some).collect::<Vec<_>>();
+    let copied_opening = |session: &str| {
+        let mut lines = vec![assistant(session, "req_c0", &stamp(now, COPIED), 900_000)];
+        lines.extend(counted_lines(session, now, false));
+        lines
+    };
+    // (label, session, lines, withheld, sizes)
+    let none = [None; 3];
+    let cases = [
+        (
+            "fresh",
+            "c1000000-0000-4000-8000-000000000001",
+            counted_lines("c1000000-0000-4000-8000-000000000001", now, false),
+            false,
+            [Some(10_000), Some(20_000), Some(50_000)],
+        ),
+        (
+            "repeated id",
+            "c1000000-0000-4000-8000-000000000002",
+            counted_lines("c1000000-0000-4000-8000-000000000002", now, true),
+            false,
+            none,
+        ),
+        (
+            "copied opening",
+            "c1000000-0000-4000-8000-000000000003",
+            copied_opening("c1000000-0000-4000-8000-000000000003"),
+            false,
+            none,
+        ),
+        (
+            "withheld",
+            "c1000000-0000-4000-8000-000000000004",
+            counted_lines("c1000000-0000-4000-8000-000000000004", now, false),
+            true,
+            none,
+        ),
+    ];
+    for (label, session, lines, withheld, sizes) in cases {
+        let (path, mut parsed) = root_session(&dir, session, &lines);
+        if withheld {
+            parsed.claude_file_birth.forget_birth_for_test();
+        }
+        let mut items = vec![parsed];
+        let mut index = indexed(&[&path]);
+        fold(&mut items, &no_reports(), &mut index);
+        let item = &items[0];
+        let start = item.session_start.as_deref();
+        let start_sizes = start.map_or(none, |start| {
+            [
+                start.counted_request_10_context_tokens,
+                start.counted_request_20_context_tokens,
+                start.counted_request_50_context_tokens,
+            ]
+        });
+        assert_eq!(start_sizes, sizes, "{label}");
+        let wire = serde_json::to_string(item).unwrap();
+        if withheld {
+            assert_cleared(item);
+            for key in [
+                "context_request_count",
+                "request_index",
+                "counted_request_10_context_tokens",
+            ] {
+                assert!(!wire.contains(key), "{label}: {key}");
+            }
+            continue;
+        }
+        assert_eq!(item.context_request_count, Some(55), "{label}");
+        assert_eq!(
+            item.compaction_events
+                .iter()
+                .map(|event| event.request_index)
+                .collect::<Vec<_>>(),
+            kept_indices,
+            "{label}"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// [behaviour] Sizes at counted positions never create an opening block: a
+/// fresh transcript with no client version and a collapsed (multi-iteration)
+/// opening has no start to send, so it carries its count and no
+/// `session_start`.
+#[test]
+fn counted_sizes_never_create_a_start_block() {
+    let dir = temp_dir("claude-file-birth-counted-start");
+    let now = OffsetDateTime::now_utc();
+    let session = "c1000000-0000-4000-8000-000000000005";
+    let lines = (1..=11_i64)
+        .map(|n| {
+            let line = assistant(
+                session,
+                &format!("req_{n:02}"),
+                &counted_at(now, n * 100),
+                n as u64 * 1_000,
+            )
+            .replace("\"version\":\"2.1.226\",", "");
+            if n > 1 {
+                return line;
+            }
+            line.replace(
+                "\"output_tokens\":1}",
+                "\"output_tokens\":1,\"iterations\":[{\"input_tokens\":1},{\"input_tokens\":2}]}",
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(lines.iter().all(|line| !line.contains("\"version\"")));
+    assert!(lines[0].contains("\"iterations\""));
+    let (path, parsed) = root_session(&dir, session, &lines);
+    let mut items = vec![parsed];
+    let mut index = indexed(&[&path]);
+    fold(&mut items, &no_reports(), &mut index);
+    let item = &items[0];
+    assert!(
+        item.context_request_count.is_some_and(|count| count >= 10),
+        "{:?}",
+        item.context_request_count
+    );
+    assert!(item.session_start.is_none(), "{:?}", item.session_start);
+    let wire = serde_json::to_string(item).unwrap();
+    assert!(!wire.contains("session_start"));
+    assert!(!wire.contains("counted_request_10_context_tokens"));
     let _ = fs::remove_dir_all(dir);
 }
 

@@ -4,6 +4,12 @@
 //! connector below keeps ureq 2.12.1's built-in ring/TLS1.2+1.3/WebPKI client.
 //! No thread or socket clone: pinned ureq performs its normal handshake over
 //! the bounded deadline stream.
+//!
+//! Portions are adapted from ureq 2.12.1 src/rtls.rs and used under the Apache
+//! License, Version 2.0. Modified by the Ottto contributors: the TLS roots and
+//! client configuration moved into this connector, errors are constructed
+//! differently, and the shared connector and deadline wrappers were added.
+//! See NOTICE for the upstream attribution and LICENSE for the terms.
 use std::io::{self, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -163,10 +169,10 @@ impl TlsConnector for DeadlineTls {
 // The client config above, the connect step and the stream below are adapted
 // from ureq 2.12.1 src/rtls.rs
 // (https://github.com/algesten/ureq), Copyright (c) 2019 Martin Algesten,
-// licensed MIT OR Apache-2.0; see NOTICE. Only error construction differs:
-// ureq's `ErrorKind::msg` and `Error::src` are crate-private, so each failure
-// is an `io::Error` that keeps the underlying I/O kind and carries a typed
-// `TlsSetupError` naming the step.
+// licensed MIT OR Apache-2.0; see NOTICE. The main change is how errors are
+// built: ureq's `ErrorKind::msg` and `Error::src` are crate-private, so each
+// failure is an `io::Error` that keeps the underlying I/O kind and carries a
+// typed `TlsSetupError` naming the step.
 #[expect(clippy::result_large_err, reason = "ureq's TlsConnector::connect type")]
 fn rustls_connect(
     config: &Arc<rustls::ClientConfig>,

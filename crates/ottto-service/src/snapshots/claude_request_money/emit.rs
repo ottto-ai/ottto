@@ -88,7 +88,7 @@ pub(super) fn apply(
         return false;
     }
     // Identity belongs to its existing owners, which tag the final rows after
-    // emission (T4 order). Rows tagged BEFORE emission cannot be regrouped
+    // emission. Rows tagged BEFORE emission cannot be regrouped
     // without orphaning their evidence refs: refuse rather than wipe them.
     if !item.request_evidence.is_empty()
         || item

@@ -24,7 +24,7 @@ fn inputs(exclusions: &ReemissionExclusions, listed: bool, active: u64) -> Polic
     }
 }
 
-/// F5: a same-size file whose mtime alone moved (seconds or nanos) is
+/// A same-size file whose mtime alone moved (seconds or nanos) is
 /// not a genuine change; it is unchanged history, so it is gated.
 #[test]
 fn a_same_size_mtime_only_change_is_not_a_genuine_change() {
@@ -164,7 +164,7 @@ fn no_list_policy_paces_unless_unverified_or_a_move_not_full() {
     }
 }
 
-/// F4b: where the no-list policy holds, the birth hold reads the active
+/// Where the no-list policy holds, the birth hold reads the active
 /// revision's own cutoff.
 #[test]
 fn the_no_list_birth_hold_is_per_revision() {
@@ -266,7 +266,7 @@ const PAUSED: [ListState; 4] = [
     ListState::ClosureOverflow,
 ];
 
-/// [money] A paused list holds adoption only (G1, G2, G4): owed history
+/// [money] A paused list holds adoption only: owed history
 /// is held, while a genuine change or a new file decides exactly as under
 /// the installed list, listed or not.
 #[test]

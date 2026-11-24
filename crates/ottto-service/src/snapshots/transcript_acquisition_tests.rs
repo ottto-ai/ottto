@@ -1333,8 +1333,8 @@ fn an_unrouted_codec_source_keeps_no_ram_copy() {
 
 /// [regress] A codec source's route that cannot be read now (a poisoned
 /// session: `DbUnavailable`) is kept as an error, never read as "no route":
-/// the file is held for its next selection, unread, and RAM is no fallback
-/// (conformance B2). The page holds before it reaches the candidate.
+/// the file is held for its next selection, unread, and RAM is no fallback.
+/// The page holds before it reaches the candidate.
 #[test]
 fn a_codec_route_error_holds_the_file_without_ram() {
     use crate::snapshots::e2_pipeline_scan_fixture::route_for_test;
@@ -2222,20 +2222,22 @@ fn codex_compaction_events_take_last_before_and_first_counted_after() {
     }
     let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
     let item = &items[0];
-    let event = |at: &str, before: u64, after: u64| SnapshotCompactionEvent {
+    let event = |at: &str, before: u64, after: u64, index: u64| SnapshotCompactionEvent {
         at: at.to_string(),
         before: Some(before),
         after: Some(after),
+        request_index: Some(index),
         trigger: None,
     };
     assert_eq!(
         item.compaction_events,
         [
-            event("2026-10-07T11:10:00Z", 250_000, 59_000),
-            event("2026-10-07T11:45:00Z", 70_000, 30_000),
-            event("2026-10-07T11:46:00Z", 70_000, 30_000),
+            event("2026-10-07T11:10:00Z", 250_000, 59_000, 2),
+            event("2026-10-07T11:45:00Z", 70_000, 30_000, 4),
+            event("2026-10-07T11:46:00Z", 70_000, 30_000, 4),
         ]
     );
+    assert_eq!(item.context_request_count, Some(5));
     assert_eq!(
         item.compaction_events
             .iter()
@@ -2268,6 +2270,153 @@ fn codex_compaction_events_take_last_before_and_first_counted_after() {
         .unwrap();
     assert!(late[0].local_context_points.is_empty());
     assert_eq!(late[0].compaction_events, item.compaction_events);
+}
+
+/// [behaviour] Codex counts admitted positive token events. A marker takes
+/// the count as its index only while the posture's last size is the last
+/// counted one: an exact repeat, a zero ping or a refused record of the same
+/// size keep it; a refused record of another size drops it until the next
+/// counted request; before any counted request there is none.
+#[test]
+fn codex_counted_curve_uses_admitted_positive_events() {
+    let at = |minute: u64| format!("2026-10-07T11:{minute:02}:00Z");
+    let usage = |n: u64| json!({"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10});
+    let token = |minute: u64, total: u64, last: u64| {
+        json!({"type":"event_msg","timestamp":at(minute),"payload":{"type":"token_count",
+            "info":{"model":"gpt-5.6","total_token_usage":usage(total),"last_token_usage":usage(last)}}})
+    };
+    // No cumulative total: the counter refuses it, the posture still reads it.
+    let last_only = |minute: u64, last: u64| {
+        json!({"type":"event_msg","timestamp":at(minute),"payload":{"type":"token_count",
+            "info":{"model":"gpt-5.6","last_token_usage":usage(last)}}})
+    };
+    let marker = |minute: u64| json!({"timestamp":at(minute),"type":"compacted","payload":{"replacement_history":[]}});
+    let first = token(1, 100, 100);
+    let second = token(2, 300, 200);
+    // (label, lines, marker indices, count)
+    type Case = (&'static str, Vec<Value>, Vec<Option<u64>>, u64);
+    let cases: [Case; 6] = [
+        (
+            "before any counted request",
+            vec![marker(1), token(2, 100, 100)],
+            vec![None],
+            1,
+        ),
+        (
+            "exact repeat keeps it",
+            vec![first.clone(), second.clone(), second.clone(), marker(3)],
+            vec![Some(2)],
+            2,
+        ),
+        (
+            "zero ping keeps it",
+            vec![first.clone(), token(2, 100, 0), marker(3)],
+            vec![Some(1)],
+            1,
+        ),
+        (
+            "refused same size keeps it",
+            vec![first.clone(), last_only(2, 100), marker(3)],
+            vec![Some(1)],
+            1,
+        ),
+        (
+            "refused other size drops it",
+            vec![first.clone(), last_only(2, 500), marker(3)],
+            vec![None],
+            1,
+        ),
+        (
+            "the next counted request restores it",
+            vec![
+                first.clone(),
+                last_only(2, 500),
+                marker(3),
+                token(4, 400, 300),
+                marker(5),
+            ],
+            vec![None, Some(2)],
+            2,
+        ),
+    ];
+    for (label, lines, indices, count) in cases {
+        let fixture = Fixture::new(SnapshotSource::Codex);
+        for line in &lines {
+            fixture.append(line);
+        }
+        let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
+        let item = &items[0];
+        assert_eq!(
+            item.compaction_events
+                .iter()
+                .map(|event| event.request_index)
+                .collect::<Vec<_>>(),
+            indices,
+            "{label}"
+        );
+        assert_eq!(item.context_request_count, Some(count), "{label}");
+        let start = item.session_start.as_deref();
+        assert!(
+            start.is_none_or(|start| start.counted_request_10_context_tokens.is_none()),
+            "{label}"
+        );
+    }
+}
+/// [behaviour] A Codex root with more than fifty counted requests sends the
+/// sizes at counted positions 10, 20 and 50, counting admitted positive
+/// sizes only: an exact repeat and a zero ping before the tenth take no
+/// position. Its fork-child twin, same lines, sends a start without them.
+#[test]
+fn codex_counted_sizes_sit_at_counted_positions_and_skip_fork_children() {
+    let at = |n: u64| format!("2026-10-07T{:02}:{:02}:00Z", 10 + n / 60, n % 60);
+    let usage = |n: u64| json!({"input_tokens":n,"cached_input_tokens":n/2,"output_tokens":n/10});
+    let token = |n: u64, total: u64, last: u64| {
+        json!({"type":"event_msg","timestamp":at(n),"payload":{"type":"token_count",
+            "info":{"model":"gpt-5.6","total_token_usage":usage(total),"last_token_usage":usage(last)}}})
+    };
+    // Request N's size is 1000 + 10N.
+    let mut lines = Vec::new();
+    let (mut total, mut minute) = (0, 0);
+    for request in 1..=55 {
+        let last = 1_000 + 10 * request;
+        total += last;
+        minute += 1;
+        lines.push(token(minute, total, last));
+        if request == 5 {
+            lines.push(token(minute, total, last));
+            minute += 1;
+            lines.push(token(minute, total, 0));
+        }
+    }
+    for fork in [false, true] {
+        let mut meta = json!({"id":"019fa111-2222-7333-8444-0000000000e1","cli_version":"0.160.0"});
+        if fork {
+            meta["forked_from_id"] = json!("019fa111-2222-7333-8444-0000000000e2");
+            meta["thread_source"] = json!("user");
+        }
+        let path = crate::test_scratch::unique_path("ottto-counted-sizes").with_extension("jsonl");
+        let fixture = Fixture(path);
+        fixture.append(&json!({"timestamp":at(0),"type":"session_meta","payload":meta}));
+        for line in &lines {
+            fixture.append(line);
+        }
+        let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
+        let start = items[0]
+            .session_start
+            .as_deref()
+            .expect("a versioned start");
+        let sizes = [
+            start.counted_request_10_context_tokens,
+            start.counted_request_20_context_tokens,
+            start.counted_request_50_context_tokens,
+        ];
+        if fork {
+            assert_eq!(sizes, [None; 3], "a fork child's opening is not its own");
+        } else {
+            assert_eq!(items[0].context_request_count, Some(55));
+            assert_eq!(sizes, [Some(1_100), Some(1_200), Some(1_500)]);
+        }
+    }
 }
 #[test]
 fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {

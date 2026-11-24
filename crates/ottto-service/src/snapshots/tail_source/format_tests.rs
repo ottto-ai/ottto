@@ -1,4 +1,4 @@
-//! S2 c7 on real committed Tail state: a shorter file reads main's counted
+//! Tests on real committed Tail state: a shorter file reads main's counted
 //! Full, a key rotation is a counted explicit-action reconstruction
 //! while an attribution toggle scrubs and reuses, the legacy record directory
 //! is erased and counted before the first load, the first format round-trips
@@ -163,7 +163,7 @@ fn legacy_erasure_is_counted_before_the_first_load() {
     assert_eq!(counters::total("tail_db_loads", "hit"), 1);
 }
 
-/// [format] L04 + L12: the lineage clocks (copied history included) and each
+/// [format] The lineage clocks (copied history included) and each
 /// request's rule epoch round-trip through the first head and page format.
 #[test]
 fn lineage_clocks_and_rule_epoch_round_trip() {
@@ -194,7 +194,7 @@ fn lineage_clocks_and_rule_epoch_round_trip() {
         .all(|epoch| *epoch == claude_request_money::e2::RULE_EPOCH));
 }
 
-/// [behaviour] L01: every source's Tail lives on the route, whatever the
+/// [behaviour] Every source's Tail lives on the route, whatever the
 /// registry's `state_v2` flag says, and each source's counters stay on its
 /// own line.
 #[test]

@@ -1316,6 +1316,44 @@ pub(crate) fn snapshot_packing_json_length<T: Serialize + ?Sized>(
     Ok(length.bytes)
 }
 
+/// The item-size preflight before each POST, then `send`. Counted request
+/// positions are optional display leaves outside every digest: when the
+/// preflight refuses a request, each body it refuses that carries them is
+/// sent without them, so they never refuse a body that fit before they
+/// existed. Every other byte stays. Only a refused preflight measures
+/// again: a request that passes adds no serialization.
+pub(crate) fn preflight_snapshot_request<R>(
+    request: &SnapshotBatchRequest<&SnapshotItem>,
+    item_cap: usize,
+    send: impl FnOnce(&SnapshotBatchRequest<&SnapshotItem>, usize) -> Result<R>,
+) -> Result<R> {
+    use crate::snapshots::{has_counted_request_positions, snapshot_items_refused_at};
+    let preflight = |request: &SnapshotBatchRequest<&SnapshotItem>| {
+        crate::snapshots::validate_snapshot_batch_request_with_item_limit(request, item_cap)
+            .map_err(|reason| SnapshotBatchPreflightRejected { reason })
+    };
+    let Err(refused) = preflight(request) else {
+        return send(request, 0);
+    };
+    let omitted = snapshot_items_refused_at(request, item_cap, has_counted_request_positions)
+        .into_iter()
+        .map(|index| {
+            let mut item = request.snapshots[index].clone();
+            crate::snapshots::clear_counted_request_positions(&mut item);
+            (index, item)
+        })
+        .collect::<Vec<_>>();
+    if omitted.is_empty() {
+        return Err(refused.into());
+    }
+    let mut trimmed = request.clone();
+    for (index, item) in &omitted {
+        trimmed.snapshots[*index] = item;
+    }
+    preflight(&trimmed)?;
+    send(&trimmed, omitted.len())
+}
+
 /// Cut one request-owned family (root first) into consecutive groups that
 /// each fit one batch: at most `SNAPSHOT_BATCH_LIMIT` bodies and
 /// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
@@ -1485,8 +1523,8 @@ where
         }
     }
     let mut batches = VecDeque::new();
-    // Request-owned literal bodies travel with their Claude family (early-t7
-    // Q1). A family that fits one batch is packed whole; a larger one is cut
+    // Request-owned literal bodies travel with their Claude family.
+    // A family that fits one batch is packed whole; a larger one is cut
     // into consecutive batch-sized groups, root first, never refused. Each
     // group still settles by its own exact entity ACKs. Units are kept as one
     // ordered list plus end offsets; an ordinary body is a unit of one, so

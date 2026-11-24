@@ -222,7 +222,7 @@ crate::heap_layout_bound::no_heap!(true; ClaudeFileBirth {
     tagged_before_first_own, writer, all_response_writers, opened,
 });
 
-/// A reported birth at or before the floor is no evidence (F5).
+/// A reported birth at or before the floor is no evidence.
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
     created_unix_nanos
         .filter(|birth| *birth > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
@@ -1092,7 +1092,7 @@ pub struct ClaudeContextFileBirthCounts {
     #[serde(flatten)]
     pub total: ClaudeContextBasisCounts,
     pub by_claude_code_version: BTreeMap<String, ClaudeContextBasisCounts>,
-    /// Sessions the family demotion quarantine held back this fold (R7): the
+    /// Sessions the family demotion quarantine held back this fold: the
     /// hold is unchanged, so their scalars wait with the rest of the body.
     pub demotion_quarantined_session_count: usize,
     /// Claude bodies without the v1 contract that
@@ -1190,7 +1190,7 @@ impl ClaudeContextFileBirthCounts {
             .saturating_add(local_context_points_work_refused_session_count);
     }
 
-    /// Count one body the fold left without the v1 contract (R9).
+    /// Count one body the fold left without the v1 contract.
     pub(in crate::snapshots) fn record_contractless(
         &mut self,
         item: &SnapshotItem,

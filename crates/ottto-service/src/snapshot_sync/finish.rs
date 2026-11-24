@@ -1533,6 +1533,12 @@ pub(super) fn finish_sync_source(
         &mut scan_result.snapshots,
         &mut upload_progress,
     );
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::prepare_counted_cap_body_for_test(
+        source,
+        upload_policy,
+        &mut scan_result.snapshots,
+    );
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -1799,31 +1805,31 @@ pub(super) fn finish_sync_source(
     // stages and the main upload draw on it, so the page never waits more
     // than two resends and 10 s under the sync lock.
     let mut inplace_retry = InplaceRetryBudget::default();
-    // One page upload, probe or main: preflight at the identity item cap,
-    // authority around a fresh relay token, Codex joins, then the exact ACK.
+    // One page upload, probe or main: preflight at the identity item cap
+    // (counted request positions never refuse a body), authority around a
+    // fresh relay token, Codex joins, then the exact ACK.
     let upload_checked = |request: &SnapshotBatchRequest<&SnapshotItem>,
                           enforce_head_cas: bool|
      -> Result<crate::snapshot_client::SnapshotBatchResponse> {
-        if let Err(reason) = crate::snapshots::validate_snapshot_batch_request_with_item_limit(
+        super::upload::preflight_snapshot_request(
             request,
             identity_item_cap,
-        ) {
-            return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                reason,
-            }));
-        }
-        ensure_authority()?;
-        let token = client.issue_relay_token(device, device_secret, source)?;
-        ensure_authority()?;
-        validate_joined(&request.snapshots)?;
-        let response = client.upload_batch_with_item_cap(
-            &token,
-            request,
-            enforce_head_cas,
-            identity_item_cap,
-        )?;
-        response.validate_entity_ack_with_head_cas(request, enforce_head_cas)?;
-        Ok(response)
+            |request, trimmed_items| {
+                ensure_authority()?;
+                let token = client.issue_relay_token(device, device_secret, source)?;
+                ensure_authority()?;
+                validate_joined(&request.snapshots)?;
+                let response = client.upload_batch_with_item_cap(
+                    &token,
+                    request,
+                    enforce_head_cas,
+                    identity_item_cap,
+                    trimmed_items,
+                )?;
+                response.validate_entity_ack_with_head_cas(request, enforce_head_cas)?;
+                Ok(response)
+            },
+        )
     };
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only

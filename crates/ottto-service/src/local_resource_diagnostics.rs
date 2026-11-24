@@ -147,7 +147,7 @@ macro_rules! codex_cursor_events {
             /// budget even after releasing retained copies.
             jobs_state_bound,
             jobs_lost,
-            /// Evidence unavailable at start, resume or emission (K9): deferred as
+            /// Evidence unavailable at start, resume or emission: deferred as
             /// `InProgress`, never counted as a member change.
             jobs_deferred_inputs,
             /// Start refused because the held file's stamp could not be read.
@@ -157,7 +157,7 @@ macro_rules! codex_cursor_events {
             jobs_audit_restarted,
             /// Committed, then the native finish refused publication.
             jobs_finish_failed,
-            /// A dropped scan frame returned its intact job to the slot (K12).
+            /// A dropped scan frame returned its intact job to the slot.
             jobs_frame_returned,
             deferred,
             /// A large file waited because another is ahead in rotation (K7).
@@ -165,7 +165,7 @@ macro_rules! codex_cursor_events {
             /// A large read after this generation's completed attempt, left for the
             /// next generation (K7 fence).
             deferred_next_generation,
-            /// A resume found a live job of another namespace in the slot (K10).
+            /// A resume found a live job of another namespace in the slot.
             namespace_busy,
             cursor_disabled_unsupported_layout,
             /// Certified at or after its audit deadline: the debt stays staged.
@@ -670,7 +670,7 @@ impl CapCounts {
 
 crate::heap_layout_bound::fields!(CapCounts; bootstrap_overflow_events, price_trace_row_limit_hits);
 
-/// K10 (LD): one line observer's counts for a page; nonzero keys only.
+/// One line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
     #[serde(skip_serializing_if = "is_zero")]
@@ -681,7 +681,7 @@ pub(crate) struct LineDeliveryCounts {
     pub(crate) incomplete: u64,
 }
 
-/// K10 (LD): why a discovery gate left a file unselected.
+/// Why a discovery gate left a file unselected.
 pub(crate) enum UnselectedReason {
     Age,
     /// A never-read file past the first-read bound.
@@ -1474,7 +1474,7 @@ impl Probe {
             },
             counts,
         });
-        // Own records, so the page line stays under its size bound (§13).
+        // Own records, so the page line stays under its size bound.
         if let Some(change_reasons) = change_reason::drain(source) {
             #[derive(Serialize)]
             struct Counts {
@@ -1768,6 +1768,7 @@ pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedByte
 pub(crate) struct PassOutcomes {
     pub(crate) selected: u64,
     pub(crate) accepted: u64,
+    pub(crate) counted_positions_trimmed_items: u64,
     pub(crate) index_saved: u64,
     pub(crate) progress_committed: u64,
     pub(crate) progress_unchanged: u64,
@@ -3637,6 +3638,7 @@ mod tests {
                     pass_outcomes(|counts| {
                         counts.selected = 5;
                         counts.accepted = 3;
+                        counts.counted_positions_trimmed_items += 2;
                         counts.index_saved = 1;
                         counts.progress_committed += 2;
                         counts.progress_unchanged += 1;
@@ -3653,6 +3655,7 @@ mod tests {
             for (field, expected) in [
                 ("selected", 5_u64),
                 ("accepted", 3),
+                ("counted_positions_trimmed_items", 2),
                 ("index_saved", 1),
                 ("progress_committed", 2),
                 ("progress_unchanged", 2),

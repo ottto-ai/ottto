@@ -391,7 +391,7 @@ struct StreamedChecks {
     /// Enrichments whose terminal pass read more pairs than the whole fold.
     /// None: the terminal proof reread is gone.
     reread: usize,
-    /// Enrichments whose bodies, both ways, carry L2 and its org forward to
+    /// Enrichments whose bodies, both ways, carry the second login and its org forward to
     /// root A's own request that has no telemetry row.
     carried: usize,
     /// Enrichments whose page ran as two or more evidence chunks, and the
@@ -3514,7 +3514,7 @@ fn e2_pipeline_uncopied_guard_absent_complete() {
 
 #[test]
 fn e2_pipeline_uncopied_guard_carried_accounts() {
-    // Expected RED on main (22/4 vs 12/3); guards accepted residual B2 after dedup.
+    // Expected RED on main (22/4 vs 12/3); guards accepted residual account drift after dedup.
     // Equal native None markers can carry different accounts; the copy-order keeper wins.
     for a_first in [true, false] {
         with_e2(|| {
@@ -3858,7 +3858,7 @@ fn e2_pipeline_first_twin_group_above_byte_budget_preserves_complete_history() {
     });
 }
 
-// ---- I4b: gate-ON copy proofs, delays, side-call holds, conflict carrier ----
+// ---- gate-ON copy proofs, delays, side-call holds, conflict carrier ----
 
 const LATE: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
@@ -4242,7 +4242,7 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
     });
 }
 
-/// Owner rule (P2): holding a session withholds its upload only; its scan
+/// Owner rule: holding a session withholds its upload only; its scan
 /// state stays evidence. All-copied main files of four sessions share
 /// request ids (the Linux probe shape: every root a cross-session copy
 /// candidate), read one per page. Each file counts unproven requests or
@@ -5205,10 +5205,11 @@ fn e2_pipeline_audit_shaped_resume_reread_removes_exactly_its_copies() {
             copy.output_tokens, 20,
             "the two own turns keep their tokens"
         );
+        // The released body predates counted request positions.
+        let mut other = body(&on, OTHER).unwrap().clone();
+        crate::snapshots::clear_counted_request_positions(&mut other);
         assert_eq!(
-            canonical(&without_file_fingerprint_or_cache(
-                body(&on, OTHER).unwrap()
-            )),
+            canonical(&without_file_fingerprint_or_cache(&other)),
             canonical(&without_file_fingerprint_or_cache(&released("audit.other"))),
             "unrelated body unchanged"
         );

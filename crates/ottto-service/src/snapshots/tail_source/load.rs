@@ -8,7 +8,7 @@
 //!
 //! Each load counts once in `tail_db_loads{outcome}` on its source's line; a
 //! hit adds the bytes it read to `tail_db_load_bytes{head,page}`. Counters
-//! only: no point repeats them (§13). Stored state that cannot be
+//! only: no point repeats them. Stored state that cannot be
 //! reused is a counted reconstruction (`tail_reconstruct`) and the read starts
 //! at once as a Full; a file shorter than its head reads Full (`Shrunk`) and
 //! is counted in `tail_shorter_file_full`. A head whose session owes a
@@ -138,7 +138,7 @@ pub(in crate::snapshots) fn set_aside(index: &ScanIndex, key: &str) -> bool {
     matches!(state_v2::tail_set_aside(index, key), Ok(Some(_)))
 }
 
-/// A4d: after a complete census with no decode hold, a head whose file the
+/// After a complete census with no decode hold, a head whose file the
 /// census did not observe, that is no residue and has no index entry, is
 /// absent. Each absent head is classified by its custody, never deleted by
 /// set difference: a reduction retires at the next save (the store keeps its

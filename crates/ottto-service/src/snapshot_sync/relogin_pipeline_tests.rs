@@ -1,6 +1,6 @@
 use super::*;
 
-/// [money] R1 on the real prepare/finish: a confirmed same-account re-login
+/// [money] On the real prepare/finish: a confirmed same-account re-login
 /// installs device B with an alias to device A's namespace. The next cycle,
 /// in a restarted daemon, keeps A's index and ACK ledger: it offers no
 /// accepted body, reads no transcript byte and still sends B's terminal

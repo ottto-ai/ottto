@@ -274,7 +274,7 @@ fn sidecar_state_transitions_match_fresh() {
     }
     let cached = parity(&mut facts, &roots, std::slice::from_ref(&path));
     assert_eq!(cached.local_diagnostics.state_titles.reused_roots, 2);
-    // Removed winning home: the surviving Q2 row needs a new exact prefix.
+    // Removed winning home: the surviving title row needs a new exact prefix.
     roots = b.roots();
     let removed = parity(&mut facts, &roots, std::slice::from_ref(&path));
     assert_eq!(removed.local_diagnostics.state_titles.reloaded_roots, 1);

@@ -1591,7 +1591,7 @@ pub(crate) fn resolve_carrier_discovery_debt_for_test(
     path: &Path,
 ) -> (usize, usize) {
     fn revisions(index: &ScanIndex, key: &str) -> (usize, Vec<u8>) {
-        let head = state_v2::load_head(index, key, 1).unwrap().unwrap();
+        let head = state_v2::load_head(index, key, u32::MAX).unwrap().unwrap();
         let mut count = 0;
         state_v2::load_revisions(index, key, &head, |_, _| {
             count += 1;

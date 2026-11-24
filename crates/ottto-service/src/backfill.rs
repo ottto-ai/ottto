@@ -917,8 +917,8 @@ mod tests {
                 );
             }
             assert!(pending_backfill_sources_for_destination(&state, "new").contains(&source));
-            // A completed R1, B completed today's R2. B's global revision cannot
-            // pay A's replay; only settled A/R2 does so, exactly once.
+            // A completed an old revision, B completed today's revision. B's global revision cannot
+            // pay A's replay; only settled replay of today's revision for A does so, exactly once.
             let revision = current_historical_replay(source).revision;
             state
                 .completed_destination_replays
@@ -1431,6 +1431,8 @@ mod tests {
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: None,
             last_turn_context_tokens: None,
+            context_request_count: None,
+            claude_counted_request_candidates: None,
             first_turn_context_window_tokens: None,
             peak_context_fill_window_tokens: None,
             last_turn_context_window_tokens: None,

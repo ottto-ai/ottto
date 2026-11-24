@@ -2201,7 +2201,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
     }
 }
 
-/// K1–K4: every reader shares fail-closed scalar repairs. An intact cutoff
+/// Every reader shares fail-closed scalar repairs. An intact cutoff
 /// must not hide a damaged move hold after this destination bootstraps.
 #[test]
 fn history_gate_damage_is_local_through_load_and_both_cas_readers() {

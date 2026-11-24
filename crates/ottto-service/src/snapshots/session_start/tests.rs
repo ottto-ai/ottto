@@ -283,7 +283,7 @@ fn later_observations_of_a_file_wait_for_their_request() {
     state.note_claude_response(0, &UsageTotals::default(), 1, 1);
     state.note_claude_response(1, &UsageTotals::default(), 2, 1);
     let mut start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     start.apply_upload_policy(true, false);
     assert_eq!(start.opening_request_count, Some(2));
@@ -581,23 +581,37 @@ fn forks_and_copied_prefixes_keep_only_client_version() {
         ..SnapshotSessionStart::default()
     });
     let fresh = measured_codex_state("", 1)
-        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     assert_eq!(fresh.opening_request_count, Some(1));
     assert_eq!(
-        measured_codex_state("", 1).finish(false, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
+        measured_codex_state("", 1).finish(
+            false,
+            None,
+            CODEX_PARTS_METHOD,
+            None,
+            Some(&SALT),
+            None
+        ),
         only_version
     );
     let mut copied = measured_codex_state("", 1);
     copied.note_inherited_prefix();
     assert_eq!(
-        copied.finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
+        copied.finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT), None),
         only_version
     );
     assert_eq!(fresh.inherited(), only_version);
     // Nothing measured: the field is omitted.
     assert_eq!(
-        SessionStartState::default().finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT)),
+        SessionStartState::default().finish(
+            true,
+            None,
+            CODEX_PARTS_METHOD,
+            None,
+            Some(&SALT),
+            None
+        ),
         None
     );
     assert_eq!(SnapshotSessionStart::default().inherited(), None);
@@ -804,7 +818,7 @@ fn opening_files_cap_at_64_and_count_withheld_entries() {
     // Staged for request 3, which the session never reached.
     state.note_client_load("/w/repo/late.md", "nested_memory", 1, 3, Some(cwd));
     let mut start = state
-        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     assert!(start.opening_files.is_empty());
     assert_eq!(start.opening_file_overflow, Some(71));
@@ -847,7 +861,7 @@ fn instruction_cap_makes_file_facts_unknown() {
     state.note_claude_response(0, &UsageTotals::default(), 1, 1);
     state.note_claude_response(1, &UsageTotals::default(), 2, 0);
     let mut start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     start.apply_upload_policy(true, true);
     assert!(start.opening_files.is_empty());
@@ -963,7 +977,14 @@ fn plain_paths_and_tool_labels_follow_admission() {
     state.note_claude_response(0, &UsageTotals::default(), 1, 1);
     state.note_claude_response(1, &UsageTotals::default(), 2, 0);
     let start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, Some(&context), Some(&SALT))
+        .finish(
+            true,
+            None,
+            CLAUDE_PARTS_METHOD,
+            Some(&context),
+            Some(&SALT),
+            None,
+        )
         .expect("measured");
     let mut labels_only = start.clone();
     labels_only.apply_upload_policy(true, false);
@@ -1007,7 +1028,7 @@ fn relative_shell_paths_without_a_proven_base_stay_private() {
         state.note_claude_response(sequence, &UsageTotals::default(), 1, 1);
     }
     let mut start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     start.apply_upload_policy(true, false);
     let shown = start
@@ -1027,7 +1048,7 @@ fn relative_shell_paths_without_a_proven_base_stay_private() {
     state.note_claude_response(0, &UsageTotals::default(), 1, 1);
     state.note_claude_response(1, &UsageTotals::default(), 1, 0);
     let mut start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     start.apply_upload_policy(true, false);
     assert!(start.opening_files.is_empty());
@@ -1058,7 +1079,7 @@ fn relative_shell_paths_without_a_proven_base_stay_private() {
         codex.codex_parsed_command(id, &record, Some(cwd));
     }
     let mut start = codex
-        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CODEX_PARTS_METHOD, None, Some(&SALT), None)
         .expect("measured");
     start.apply_upload_policy(true, false);
     let shown = start
@@ -1089,7 +1110,7 @@ fn collapsed_claude_responses_drop_request_indexed_facts() {
         0,
     );
     let start = state
-        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT))
+        .finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), None)
         .expect("client version");
     assert_eq!(start.client_version.as_deref(), Some("2.1.300"));
     assert_eq!(start.opening_request_count, None);
@@ -1097,6 +1118,48 @@ fn collapsed_claude_responses_drop_request_indexed_facts() {
     // Every usage root the parser accepts is checked.
     assert!(claude_multi_request(&json!({"payload": {"usage": {
         "iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})));
+}
+
+/// [behaviour] Sizes at counted positions ride only on a start that is
+/// sent without them: a collapsed opening with nothing else measured gets
+/// no block, and clearing them leaves the start as it was.
+#[test]
+fn counted_sizes_never_create_a_start_block() {
+    let sizes = Some([Some(10_000), Some(20_000), None]);
+    let collapsed = |version: Option<&str>| {
+        let mut line = json!({"type": "assistant", "message": {"id": "m1", "usage": {
+            "input_tokens": 3, "iterations": [{"input_tokens": 5}, {"input_tokens": 3}]}}});
+        if let Some(version) = version {
+            line["version"] = json!(version);
+        }
+        let mut state = SessionStartState::default();
+        state.observe_claude_line(&line, 1, None);
+        let usage = UsageTotals {
+            input_tokens: 3,
+            ..UsageTotals::default()
+        };
+        state.note_claude_response(0, &usage, 3, 0);
+        state.finish(true, None, CLAUDE_PARTS_METHOD, None, Some(&SALT), sizes)
+    };
+    assert_eq!(collapsed(None), None);
+    let start = collapsed(Some("2.1.300")).expect("client version");
+    assert_eq!(
+        [
+            start.counted_request_10_context_tokens,
+            start.counted_request_20_context_tokens,
+            start.counted_request_50_context_tokens,
+        ],
+        [Some(10_000), Some(20_000), None]
+    );
+    let mut cleared = start;
+    crate::snapshots::compaction_events::clear_counted_start_sizes(&mut cleared);
+    assert_eq!(
+        cleared,
+        SnapshotSessionStart {
+            client_version: Some("2.1.300".to_string()),
+            ..SnapshotSessionStart::default()
+        }
+    );
 }
 
 /// Cost receipt over local transcripts listed in
@@ -1217,7 +1280,7 @@ fn session_start_cost_receipt() {
         };
         // Upper bound on the wire: the breakdown is kept whenever request 1 reconciles.
         let first_turn = shadow.requests[0].map(|request| request.context_tokens);
-        let finished = shadow.finish(true, first_turn, method, None, Some(&SALT));
+        let finished = shadow.finish(true, first_turn, method, None, Some(&SALT), None);
         total.shadow += started.elapsed();
         total.peak_held.push(peak);
         if let Some(mut start) = finished {
@@ -1313,7 +1376,7 @@ fn opening_call_ids_are_the_only_l_span_and_request_keys_are_digests() {
     assert!(!state.parts_unmeasurable);
 }
 
-/// F1: `ConfigDigest` is a reversible rolling digest of instruction text,
+/// `ConfigDigest` is a reversible rolling digest of instruction text,
 /// so it is content (`X`) on both sources: an encoded record carries none
 /// of its state (the body equals the body of the same state with every
 /// config digest cleared), a decoded record has none, and the Claude

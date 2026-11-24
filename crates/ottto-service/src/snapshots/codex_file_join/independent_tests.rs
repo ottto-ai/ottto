@@ -103,6 +103,11 @@ fn finish_independent(mut job: Box<OwnedActiveFile>) -> Vec<SnapshotItem> {
         )
         .unwrap();
     assert!(parsed.progress_complete());
+    // Each member finished with its own count of its own revert branch.
+    assert!(contributions
+        .iter()
+        .chain(&parsed.snapshots)
+        .all(|member| member.context_request_count.is_some()));
     fold_independent(&mut parsed.snapshots, contributions).unwrap();
     parsed.snapshots
 }
@@ -158,6 +163,8 @@ fn compressed_revert_sums_are_order_independent_and_read_each_member_once() {
             assert_eq!(items.len(), 1);
             let item = &items[0];
             assert_eq!(item.request_count, requests.iter().sum::<u64>());
+            // No single request axis runs through the folded body.
+            assert!(!crate::snapshots::has_counted_request_positions(item));
             assert_eq!(
                 item.input_tokens,
                 requests
@@ -879,6 +886,7 @@ fn independent_fold_composes_context_posture_across_branches() {
                     at: timestamp.clone(),
                     before: Some(started + 1),
                     after: None,
+                    request_index: None,
                     trigger: None,
                 })
                 .collect(),

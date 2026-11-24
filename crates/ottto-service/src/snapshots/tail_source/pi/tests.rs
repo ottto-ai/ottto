@@ -230,3 +230,39 @@ fn missing_or_inconsistent_pi_state_is_a_reconstruction() {
         Err(ReconstructCause::Incomplete)
     );
 }
+
+/// [behaviour] Pi sends no counted request position and stores no byte for
+/// one: its walk never counts, its items carry none of the keys, and a
+/// forced count leaves the Pi head and pages byte-identical.
+#[test]
+fn pi_counted_curve_is_absent() {
+    let (mut reduction, certificate) = parse(&lines(60, 3, None));
+    let (acc, _, _) = reduction.finish_view();
+    assert_eq!(acc.counted_requests, None);
+    let items = acc.clone().into_items(
+        Path::new("/home/projects/session.jsonl"),
+        "2026-10-27T08:00:00Z",
+        "pi-fp".to_string(),
+        None,
+    );
+    assert!(!items.is_empty());
+    for item in &items {
+        let wire = serde_json::to_string(item).unwrap();
+        for key in [
+            "context_request_count",
+            "request_index",
+            "counted_request_10_context_tokens",
+            "counted_request_20_context_tokens",
+            "counted_request_50_context_tokens",
+        ] {
+            assert!(!wire.contains(key), "{key}");
+        }
+    }
+    let staged = stage(&reduction, &certificate);
+    let forced = &mut reduction.accumulator_for_test().counted_requests;
+    *forced = Some(Default::default());
+    crate::snapshots::CountedRequests::note(forced, 100);
+    let again = stage(&reduction, &certificate);
+    assert!(again.head == staged.head, "the head stores no count");
+    assert!(again.pages == staged.pages);
+}

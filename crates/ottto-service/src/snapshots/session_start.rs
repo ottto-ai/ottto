@@ -522,7 +522,7 @@ crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest
 crate::durable_tail_codec::durable_struct!(ClaudeBlob {
     G parts: [u64; PARTS],
     N unmeasurable: bool,
-    // A reversible rolling digest of instruction text (F1): content, never
+    // A reversible rolling digest of instruction text: content, never
     // in a record body; stored with the opening-settings session fact.
     X config_digest: Option<ConfigDigest>,
 });
@@ -1515,6 +1515,7 @@ impl SessionStartState {
     /// Everything request-indexed is cut to the contiguous requests actually
     /// observed: a file, truncation or tool call staged for a request the
     /// transcript has not reached yet is not sent (nor counted as overflow).
+    /// `counted_sizes` are the sizes at counted positions 10, 20 and 50.
     pub(in crate::snapshots) fn finish(
         self,
         fresh_start: bool,
@@ -1522,6 +1523,7 @@ impl SessionStartState {
         method: &'static str,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         device_salt: Option<&[u8; 32]>,
+        counted_sizes: Option<[Option<u64>; 3]>,
     ) -> Option<SnapshotSessionStart> {
         let matching_incomplete = self.file_matching_incomplete();
         let parts = if method == CODEX_PARTS_METHOD {
@@ -1659,7 +1661,14 @@ impl SessionStartState {
             let hash = crate::context_file_counts::salted_content_hash(salt, &material);
             start.start_config_fingerprint = Some(hash[..CONFIG_FINGERPRINT_LEN].to_string());
         }
-        start.into_measured()
+        // Only beside a start that is sent without them: they never make one.
+        let mut start = start.into_measured()?;
+        [
+            start.counted_request_10_context_tokens,
+            start.counted_request_20_context_tokens,
+            start.counted_request_50_context_tokens,
+        ] = counted_sizes.unwrap_or_default();
+        Some(start)
     }
 
     /// Path matching saw only part of the injected instruction text (its
@@ -1774,6 +1783,13 @@ pub struct SnapshotSessionStart {
     pub request_2_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_3_context_tokens: Option<u64>,
+    /// Sizes at counted positions 10, 20 and 50 (`compaction_events.rs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counted_request_10_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counted_request_20_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counted_request_50_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opening_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1828,7 +1844,7 @@ pub struct SnapshotSessionStart {
 
 crate::heap_layout_bound::fields!(SnapshotOpeningFile; request, tool, repo_path, path_hash, ext, chars, reads, instruction_segments, client_loaded, truncated);
 crate::heap_layout_bound::fields!(OpeningFileCandidate; row, repo_path, path_hash, ext);
-crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard, policy_applied, opening_files_unknown);
+crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, counted_request_10_context_tokens, counted_request_20_context_tokens, counted_request_50_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard, policy_applied, opening_files_unknown);
 
 impl SnapshotSessionStart {
     /// Picks each entry's identity under the current consent: a plain path
@@ -1919,6 +1935,10 @@ pub(crate) fn session_start_verdict(item: &crate::snapshots::SnapshotItem) -> St
         files_over_guard: _,
         policy_applied: _,
         opening_files_unknown: _,
+        // Only ever beside the opening window's own values.
+        counted_request_10_context_tokens: _,
+        counted_request_20_context_tokens: _,
+        counted_request_50_context_tokens: _,
         user_turn_count,
         first_request_uncached_input_tokens,
         first_request_cache_read_tokens,
@@ -1994,7 +2014,12 @@ pub(crate) fn uploaded_start_verdict(item: &crate::snapshots::SnapshotItem) -> S
             start.iter().any(|(key, value)| {
                 !matches!(
                     key.as_str(),
-                    "client_version" | "start_config_fingerprint" | "opening_files"
+                    "client_version"
+                        | "start_config_fingerprint"
+                        | "opening_files"
+                        | "counted_request_10_context_tokens"
+                        | "counted_request_20_context_tokens"
+                        | "counted_request_50_context_tokens"
                 ) && !value.is_null()
             })
         });

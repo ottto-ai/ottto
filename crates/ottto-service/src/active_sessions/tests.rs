@@ -919,6 +919,7 @@ fn requires_advanced_recent_activity_and_preserves_compaction_times() {
         at: "2026-07-19T09:59:00Z".to_string(),
         before: Some(100),
         after: Some(59_000),
+        request_index: None,
         trigger: None,
     }];
     snapshot.local_context_points = vec![
@@ -2481,6 +2482,8 @@ fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {
         max_time_to_first_token_ms: None,
         peak_context_fill_tokens: Some(100),
         last_turn_context_tokens: None,
+        context_request_count: None,
+        claude_counted_request_candidates: None,
         first_turn_context_window_tokens: None,
         peak_context_fill_window_tokens: None,
         last_turn_context_window_tokens: None,

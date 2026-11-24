@@ -6718,6 +6718,8 @@ pub(super) fn sample_session_artifact_item() -> SnapshotItem {
         peak_context_fill_tokens: None,
         first_turn_context_tokens: None,
         last_turn_context_tokens: None,
+        context_request_count: None,
+        claude_counted_request_candidates: None,
         first_turn_context_window_tokens: None,
         peak_context_fill_window_tokens: None,
         last_turn_context_window_tokens: None,
@@ -10404,10 +10406,13 @@ fn claude_compaction_events_take_owned_sizes_and_trigger() {
 
     rebuild_all_owned(&mut item);
 
-    let event = |at: &str, before, after, trigger: Option<&str>| SnapshotCompactionEvent {
+    // The request index counts the positive requests at or before the
+    // marker: zero-size requests are never counted.
+    let event = |at: &str, before, after, index, trigger: Option<&str>| SnapshotCompactionEvent {
         at: at.to_string(),
         before,
         after,
+        request_index: Some(index),
         trigger: trigger.map(str::to_string),
     };
     assert_eq!(
@@ -10417,24 +10422,28 @@ fn claude_compaction_events_take_owned_sizes_and_trigger() {
                 "2026-10-20T10:02:00Z",
                 Some(100_000),
                 Some(30_000),
+                1,
                 Some("manual")
             ),
             event(
                 "2026-10-20T11:00:00Z",
                 Some(150_000),
                 Some(40_000),
+                3,
                 Some("idle")
             ),
             event(
                 "2026-10-20T11:01:00Z",
                 Some(40_000),
                 Some(45_000),
+                4,
                 Some("idle")
             ),
-            event("2026-10-20T11:03:00Z", Some(45_000), None, None),
-            event("2026-10-20T11:04:00Z", Some(45_000), None, Some("auto")),
+            event("2026-10-20T11:03:00Z", Some(45_000), None, 5, None),
+            event("2026-10-20T11:04:00Z", Some(45_000), None, 5, Some("auto")),
         ]
     );
+    assert_eq!(item.context_request_count, Some(5));
     assert_eq!(
         item.compaction_events
             .iter()
@@ -10445,13 +10454,14 @@ fn claude_compaction_events_take_owned_sizes_and_trigger() {
     assert_eq!(item.compaction_count, Some(5));
 
     // The helper reads the owned requests in any order.
-    let (reversed, id_less) = super::compaction_events::claude_compaction_events(
+    let (reversed, id_less, counted) = super::compaction_events::claude_compaction_events(
         &item.claude_context_curve_boundaries,
         &paired_claude_legacy_compactions(&item.claude_context_curve_boundaries),
         item.claude_usage_occurrences.values().rev(),
     );
     assert_eq!(reversed, item.compaction_events);
     assert_eq!(id_less, Default::default());
+    assert_eq!(counted, 5);
 
     // Local points: the same requests as first/peak/last, in order.
     let seconds = |at: &str| {
@@ -10752,6 +10762,7 @@ fn compaction_events_and_local_context_points_are_identity_neutral() {
         at: "2026-08-14T09:00:00Z".to_string(),
         before: Some(250_000),
         after: Some(59_000),
+        request_index: None,
         trigger: Some("manual".to_string()),
     }];
     with.local_context_points = vec![LocalContextPoint {
@@ -10915,6 +10926,7 @@ fn context_curve_is_hash_neutral_and_deterministically_bounded() {
                 at: at.clone(),
                 before: Some(u64::MAX),
                 after: Some(u64::MAX),
+                request_index: None,
                 trigger: Some("manual".to_string()),
             })
             .collect();
@@ -16630,6 +16642,7 @@ fn codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture() {
             at: "2026-08-02T06:01:03Z".to_string(),
             before: Some(100),
             after: None,
+            request_index: Some(1),
             trigger: None,
         }]
     );
@@ -19405,6 +19418,7 @@ fn v6_snapshot_batch_matches_backend_contract() {
         "peak_context_fill_tokens",
         "first_turn_context_tokens",
         "last_turn_context_tokens",
+        "context_request_count",
         "first_turn_context_window_tokens",
         "peak_context_fill_window_tokens",
         "last_turn_context_window_tokens",
@@ -19603,6 +19617,8 @@ fn v6_snapshot_batch_matches_backend_contract() {
         peak_context_fill_tokens: Some(115),
         first_turn_context_tokens: Some(105),
         last_turn_context_tokens: None,
+        context_request_count: Some(2),
+        claude_counted_request_candidates: None,
         first_turn_context_window_tokens: None,
         peak_context_fill_window_tokens: None,
         last_turn_context_window_tokens: None,
@@ -19612,6 +19628,7 @@ fn v6_snapshot_batch_matches_backend_contract() {
             at: "2026-07-20T11:30:00Z".to_string(),
             before: Some(115),
             after: Some(105),
+            request_index: Some(1),
             trigger: None,
         }],
         first_own_request_at: None,
@@ -19731,7 +19748,7 @@ fn v6_snapshot_batch_matches_backend_contract() {
     );
     assert_eq!(
         snapshot["compaction_events"],
-        json!([{"at": "2026-07-20T11:30:00Z", "before": 115, "after": 105}])
+        json!([{"at": "2026-07-20T11:30:00Z", "before": 115, "after": 105, "request_index": 1}])
     );
 
     // (2) every snapshot-item key is within the backend's allowed item set.
@@ -19843,6 +19860,7 @@ fn v6_snapshot_preflight_rejects_invalid_compaction() {
                         at: "2026-07-20T12:00:00Z".to_string(),
                         before: Some(1),
                         after: None,
+                        request_index: None,
                         trigger: None,
                     };
                     MAX_COMPACTION_TIMESTAMPS + 1
@@ -21397,6 +21415,8 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
             last_turn_context_tokens: None,
+            context_request_count: None,
+            claude_counted_request_candidates: None,
             first_turn_context_window_tokens: None,
             peak_context_fill_window_tokens: None,
             last_turn_context_window_tokens: None,
@@ -22326,7 +22346,7 @@ fn held_page_subset_applies_debt_and_audit_carries() {
     ));
 }
 
-/// R11/R12: an exact refusal re-offer lease re-reads an unchanged,
+/// An exact refusal re-offer lease re-reads an unchanged,
 /// already-passed file through the ordinary retry predicate, but a
 /// Claude family hold keeps its own earlier gate.
 #[test]

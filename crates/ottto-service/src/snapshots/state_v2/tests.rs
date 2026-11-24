@@ -1,5 +1,5 @@
 //! Synthetic store fixtures only. These are written for CI, never run by the
-//! build helper on the developer's Mac. Application F1–F9 remain to be implemented with routing.
+//! build helper on the developer's Mac. Application cases remain to be implemented with routing.
 use super::*;
 use std::fs;
 use std::path::PathBuf;

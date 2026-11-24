@@ -367,7 +367,7 @@ impl BirthStore {
             ),
         }
     }
-    /// Page-local probes are cleared with T4's page twin index. No per-response state.
+    /// Page-local probes are cleared with the page twin index. No per-response state.
     pub(in crate::snapshots) fn begin_page(&mut self) {
         self.1.clear();
     }

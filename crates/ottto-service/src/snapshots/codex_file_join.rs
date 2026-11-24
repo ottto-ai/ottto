@@ -787,7 +787,8 @@ impl HeaderInventory {
             let carried_hit = carried.is_some();
             let joined_archive = if !carried_hit && joined {
                 lookups += 1;
-                state_v2::load_head(index, &key, 1)?
+                // Common facts only: any stored reduction revision serves.
+                state_v2::load_head(index, &key, u32::MAX)?
                     .filter(|head| {
                         head.common
                             .inventory
@@ -1130,7 +1131,7 @@ pub(super) struct Group {
     pub(super) home: PathBuf,
     pub(super) members: Vec<CandidateFile>,
     /// A paged group's live member (index key) and the grant its sealed-prefix
-    /// certificate passed with (S12): validation then accepts that member's
+    /// certificate passed with: validation then accepts that member's
     /// growth past the frozen extent on the same object, like `finish`.
     pub(super) live: Option<(String, sampled_scan::codex_cursor::SealedPrefix)>,
 }
@@ -1219,7 +1220,8 @@ pub(super) fn stage_independent_inventory(
         let key = local_index_key(&member.path);
         let file = open_candidate_beneath_root(member)?;
         let stamp = sampled_scan::codex_cursor::OpenStamp::capture(&file)?.content_stamp();
-        let prior = state_v2::load_head(index, &key, 1)?;
+        // Common facts only: any stored reduction revision serves.
+        let prior = state_v2::load_head(index, &key, u32::MAX)?;
         let (representation, summary) = prior.map_or(
             (
                 state_v2::Representation::Archive,
@@ -1479,7 +1481,7 @@ impl TierReplay {
             self.tiers.insert(key, source);
         }
     }
-    /// S10: the parser admitted usage from `value` (after actual admission),
+    /// The parser admitted usage from `value` (after actual admission),
     /// under V2 turn binding.
     pub(super) fn admitted_usage(
         &mut self,
@@ -1578,7 +1580,7 @@ pub(super) struct MemberPlan {
     pub(super) watch: Vec<u64>,
     /// `(predecessor position, end_ordinal_exclusive, end_byte_offset)`.
     pub(super) binding: Option<(usize, u64, u64)>,
-    /// A duplicate origin that must end neutral (F1).
+    /// A duplicate origin that must end neutral.
     pub(super) stub: bool,
 }
 crate::heap_layout_bound::fields!(MemberPlan; first, watch, binding, stub);
@@ -1634,7 +1636,7 @@ fn independent_fork_references_prefix(value: &Value, meta: &Value, owner: &str) 
 }
 
 /// The group proof, fed inside the one native replay: the native side in
-/// `TierReplay::observe`, the UI side by the parser admission tap (S10)
+/// `TierReplay::observe`, the UI side by the parser admission tap
 /// after actual admission. It moves from member to member with the replay.
 /// Only compact identities, counters and per-member ordinal witnesses are kept.
 #[derive(Clone, Debug)]
@@ -1925,7 +1927,7 @@ impl StreamProof {
         Ok(())
     }
 
-    /// S10: the parser admitted UI usage from this record. `from_last` is
+    /// The parser admitted UI usage from this record. `from_last` is
     /// false when it used a cumulative delta; `identity` is the parser's own
     /// usage event identity and `turn` its running turn id.
     pub(super) fn admitted_usage(

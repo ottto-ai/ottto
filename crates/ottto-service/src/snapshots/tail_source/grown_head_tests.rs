@@ -276,6 +276,8 @@ fn claude_layout() -> String {
             "",
         )
         .replace("I codex_sidecar_binding: Option<String>;", "")
+        .replace("I counted_requests: Option<CountedRequests>;", "")
+        .replace("I request_index: Option<NonZeroU64>;", "")
         // A live Desktop marker, set per scan and never stored.
         .replace("I claude_desktop_scheduled_task: bool;", "")
 }
@@ -295,8 +297,9 @@ fn codex_layout() -> String {
         .replace("I claude_desktop_scheduled_task: bool;", "")
 }
 
+// Revision 2 appends the counted-requests trailer extension.
 const CODEX_LAYOUT_SHA256: &str =
-    "08d39e3197541363e20e5756c805bb2ab509180a3642911d517fc5de49f1dd5d";
+    "fdcf0c0a603f5a40854114a8eeda562e79d8c411d9e969171f9d3399712f54f2";
 
 /// [format] Codex's persisted head, pages and prelude fact have one layout pin.
 #[test]

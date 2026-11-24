@@ -5,7 +5,8 @@ use crate::snapshots::{
     cache_observations, claude_cache_request_slot, claude_request_identity, claude_request_money,
     claude_response_key, claude_response_tool_uses, provider_context_bucket, rfc3339_unix_nanos,
     rfc3339_unix_seconds, string_at, ClaudeResolveFailure, ClaudeResponseObservation,
-    ClaudeTranscriptUsageOccurrence, OwnedRequest, UsageTotals, CLAUDE_RECORDS_PER_FILE_ALARM,
+    ClaudeTranscriptUsageOccurrence, CountedRequests, OwnedRequest, UsageTotals,
+    CLAUDE_RECORDS_PER_FILE_ALARM,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -151,6 +152,8 @@ impl SnapshotAccumulator {
         // use); `None` after a tool use or an unresolved response. A response
         // whose prompt follows it starts a turn: the time between is idle.
         let mut turn_end: Option<String> = None;
+        // The whole retained book, in order: never a count from a Tail offset.
+        self.counted_requests = Some(CountedRequests::default());
         for response in responses {
             let mut response = match response {
                 Ok(response) => response,
@@ -316,6 +319,11 @@ impl SnapshotAccumulator {
                 effective_input_context,
                 response.tool_uses.len(),
             );
+            // Tentative: the ownership fold keeps the sizes only when its own
+            // count of these requests agrees.
+            if has_request_id {
+                CountedRequests::note(&mut self.counted_requests, effective_input_context);
+            }
             for name in response.tool_uses.into_values() {
                 self.note_tool_usage(name);
             }

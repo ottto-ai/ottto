@@ -2420,6 +2420,7 @@ impl SnapshotApiClient {
             request,
             enforce_head_cas,
             crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
+            0,
         )
     }
 
@@ -2430,6 +2431,7 @@ impl SnapshotApiClient {
         request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
         item_cap: usize,
+        trimmed_items: usize,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
@@ -2463,6 +2465,13 @@ impl SnapshotApiClient {
                 request.set("X-Ottto-Upload-Reason", &reasons)
             }
         };
+        // Count this batch offer once, before the first POST attempt: per
+        // offer; a re-offer counts again.
+        if trimmed_items != 0 {
+            crate::local_resource_diagnostics::pass_outcomes(|counts| {
+                counts.counted_positions_trimmed_items += trimmed_items as u64;
+            });
+        }
         // Sent inline rather than through a closure: a closure returning
         // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
         // the duplication here is two lines.

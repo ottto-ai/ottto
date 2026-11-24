@@ -8,6 +8,10 @@ source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
 source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 # shellcheck source=scripts/macos_companion_entitlements.sh
 source "$SCRIPT_DIR/macos_companion_entitlements.sh"
+# shellcheck source=scripts/macos_license_notices.sh
+source "$SCRIPT_DIR/macos_license_notices.sh"
+# shellcheck source=scripts/macos_app_binary.sh
+source "$SCRIPT_DIR/macos_app_binary.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -43,13 +47,17 @@ Options:
   --artifact-base-url <url>  Public URL prefix for generated artifacts.
   --release-notes <text>     User-facing "What's new" notes for release manifests.
   --notarized               Mark artifacts notarized after external notarization.
-  --skip-build              Reuse existing release build outputs.
+  --skip-build              Reuse existing release build outputs (dev and
+                             preview only).
   -h, --help                Show help.
 
 Environment:
   OTTTO_MACOS_APP_SOURCE_REPOSITORY
                              Required app source identity in owner/name form.
                              Recorded as given; the caller validates the source.
+  OTTTO_MACOS_DSYM_DIR       Private folder for the Companion dSYM and the
+                             build tool logs. Required for stable-candidate and
+                             stable; never printed or uploaded.
 USAGE
 }
 
@@ -238,7 +246,7 @@ if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_SOURCE_PIN" ]]; then
   echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not --app-source-commit $MAC_APP_SOURCE_PIN" >&2
   exit 2
 fi
-MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
+MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH")"
 COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"
 # Bind the signed plist to the verified private commit, not the index.
 COMPANION_ENTITLEMENTS_BLOB="$(git -C "$MAC_APP_GIT_ROOT" rev-parse --verify --quiet "HEAD:$MAC_APP_SOURCE_PATH/Companion.entitlements.plist" || true)"
@@ -257,61 +265,84 @@ if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
   exit 1
 fi
 
+if ! ottto_macos_check_binary_policy "$CHANNEL" "$SKIP_BUILD" "$ROOT" "$OUTPUT_DIR" "$MAC_APP_GIT_ROOT"; then
+  exit 2
+fi
+SWIFT_SCRATCH_PATH="$(ottto_macos_swift_scratch "$CHANNEL" "$MAC_APP_ROOT")"
+ottto_macos_package_cleanup() {
+  if ottto_macos_is_stable_channel "$CHANNEL"; then
+    rm -rf "$SWIFT_SCRATCH_PATH"
+  fi
+  if [[ -n "$OTTTO_MACOS_DSYM_INCOMING" ]]; then
+    rm -rf "$OTTTO_MACOS_DSYM_INCOMING"
+  fi
+}
+trap ottto_macos_package_cleanup EXIT
+# Debug-map object paths are recorded relative to this folder; dsymutil
+# prepends it again to find the objects.
+if ottto_macos_path_within "$SWIFT_SCRATCH_PATH" "$MAC_APP_GIT_ROOT"; then
+  SWIFT_OSO_PREFIX="$MAC_APP_GIT_ROOT"
+  SWIFT_SCRATCH_MAP=()
+else
+  SWIFT_OSO_PREFIX="$SWIFT_SCRATCH_PATH"
+  SWIFT_SCRATCH_MAP=(-Xswiftc -file-prefix-map -Xswiftc "$SWIFT_SCRATCH_PATH=.build")
+fi
+
 if [[ "$SKIP_BUILD" != "true" ]]; then
   # Compilers record source paths (panic locations, debug maps). Map the build
   # Mac's folders to neutral prefixes so shipped binaries do not carry them.
-  # rustc applies the last matching --remap-path-prefix, so the most specific
-  # folder comes last. --config arrays join any build.rustflags already set.
-  RUST_REMAP_FLAGS=()
-  for remap in "${HOME:-}=~" "${CARGO_HOME:-${HOME:-}/.cargo}=/cargo" "$ROOT=."; do
-    if [[ "$remap" == /* && "$remap" != *"'"* ]]; then
-      RUST_REMAP_FLAGS+=("'--remap-path-prefix=$remap'")
-    fi
-  done
-  RUST_REMAP_CONFIG="build.rustflags=[$(IFS=,; echo "${RUST_REMAP_FLAGS[*]}")]"
   (
     cd "$ROOT"
+    ottto_macos_release_build_env "$ROOT"
     OTTTO_RELEASE_VERSION="$VERSION" \
       OTTTO_RELEASE_CHANNEL="$CHANNEL" \
       GIT_COMMIT="$COMMIT" \
-      cargo build --locked --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
+      ottto_macos_run_logged "Rust release build" \
+      cargo build --locked --release -p ottto-cli -p ottto-service
   )
-  swift build -c release --package-path "$MAC_APP_ROOT" \
+  # --disable-automatic-resolution builds exactly the committed Package.resolved.
+  ottto_macos_run_logged "Swift release build" \
+    swift build -c release --package-path "$MAC_APP_ROOT" \
+    --scratch-path "$SWIFT_SCRATCH_PATH" \
+    --disable-automatic-resolution \
     -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \
-    -Xlinker -oso_prefix -Xlinker "$MAC_APP_GIT_ROOT/"
+    ${SWIFT_SCRATCH_MAP[@]+"${SWIFT_SCRATCH_MAP[@]}"} \
+    -Xlinker -oso_prefix -Xlinker "$SWIFT_OSO_PREFIX/"
 fi
 
-SWIFT_BUILD_DIR="$MAC_APP_ROOT/.build/release"
+SWIFT_BUILD_DIR="$SWIFT_SCRATCH_PATH/release"
 APP_EXECUTABLE="$SWIFT_BUILD_DIR/Ottto"
 CLI_BINARY="$ROOT/target/release/ottto"
 DAEMON_BINARY="$ROOT/target/release/ottto-service"
 
 for binary in "$APP_EXECUTABLE" "$CLI_BINARY" "$DAEMON_BINARY"; do
   if [[ ! -x "$binary" ]]; then
-    echo "Expected executable is missing: $binary" >&2
+    echo "Expected executable is missing: $(basename "$binary")" >&2
     exit 1
   fi
 done
 
 # Report (never fail on) build-Mac home paths left in the shipped executables.
-# SwiftPM's generated Bundle.module accessor keeps one build-folder string that
-# no compiler flag maps; the app only uses it outside an .app bundle.
+# The privacy gate enforces; this is an early hint in the job log.
 for binary in "$APP_EXECUTABLE" "$CLI_BINARY" "$DAEMON_BINARY"; do
   [[ -n "${HOME:-}" ]] || break
-  home_paths="$(strings -a "$binary" 2>/dev/null | grep -F "$HOME/" | grep -c -v -F "_OtttoCompanion.bundle" || true)"
+  home_paths="$(LC_ALL=C /usr/bin/grep -a -c -F "$HOME/" "$binary" || true)"
   if [[ "${home_paths:-0}" != "0" ]]; then
     echo "::warning::$(basename "$binary") still contains $home_paths build-Mac home path string(s)"
   fi
 done
+if [[ -d "$SWIFT_BUILD_DIR/OtttoCompanion_OtttoCompanion.bundle" ]]; then
+  echo "::warning::The app source still declares SwiftPM resources; its Bundle.module accessor stores the build folder in the binary"
+fi
 
 # Sparkle.framework powers the seamless in-app updater. SwiftPM copies it next
 # to the built executable; fall back to the extracted XCFramework slice.
 SPARKLE_FRAMEWORK="$SWIFT_BUILD_DIR/Sparkle.framework"
 if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
-  SPARKLE_FRAMEWORK="$(find "$MAC_APP_ROOT/.build" -type d -path '*macos-arm64*/Sparkle.framework' -print -quit 2>/dev/null || true)"
+  SPARKLE_FRAMEWORK="$(find "$SWIFT_SCRATCH_PATH" -type d -path '*macos-arm64*/Sparkle.framework' -print -quit 2>/dev/null || true)"
 fi
 if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
-  echo "Sparkle.framework not found under $MAC_APP_ROOT/.build (did 'swift build' resolve Sparkle?)" >&2
+  echo "Sparkle.framework not found in the Swift build folder (did 'swift build' resolve Sparkle?)" >&2
   exit 1
 fi
 
@@ -328,24 +359,27 @@ APP_LAUNCH_AGENTS="$APP_CONTENTS/Library/LaunchAgents"
 
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES" "$APP_FRAMEWORKS" "$APP_LAUNCH_AGENTS"
 cp "$APP_EXECUTABLE" "$APP_MACOS/Ottto"
+# The dSYM reads the unstripped build output while its objects still exist;
+# the bundle copy loses its debug map and local symbols before signing.
+if [[ "$SKIP_BUILD" != "true" ]]; then
+  ottto_macos_make_dsym "$APP_EXECUTABLE" "$SWIFT_OSO_PREFIX"
+fi
+ottto_macos_strip_companion "$APP_MACOS/Ottto"
 # Embed Sparkle.framework (ditto preserves the Versions/Current symlinks). The
 # app links Sparkle, so the bundle will not launch without this.
 ditto "$SPARKLE_FRAMEWORK" "$APP_FRAMEWORKS/Sparkle.framework"
 cp "$CLI_BINARY" "$APP_HELPERS/ottto"
 cp "$DAEMON_BINARY" "$APP_HELPERS/ottto-service"
-cp "$MAC_APP_ROOT/Sources/OtttoCompanion/Resources/OtttoCompanionIcon.icns" "$APP_RESOURCES/OtttoCompanionIcon.icns"
-# Mirror the SwiftPM resource bundle's payload into Contents/Resources/ so
-# OtttoResourceImage.resourceImage(name:) can resolve PNGs via Bundle.main
-# without touching Bundle.module (whose generated accessor crashes inside an
-# .app wrapper because it expects OtttoCompanion_OtttoCompanion.bundle next to
-# Bundle.main.bundleURL, which is the .app root).
-SWIFTPM_RESOURCE_BUNDLE="$SWIFT_BUILD_DIR/OtttoCompanion_OtttoCompanion.bundle"
-if [[ -d "$SWIFTPM_RESOURCE_BUNDLE/Resources" ]]; then
-  cp -R "$SWIFTPM_RESOURCE_BUNDLE/Resources/." "$APP_RESOURCES/"
-else
-  echo "Expected SwiftPM resource bundle is missing: $SWIFTPM_RESOURCE_BUNDLE" >&2
-  exit 1
-fi
+# Ship the listed Resources of the recorded app commit (never its README).
+# Inside Ottto.app the app finds them through Bundle.main.
+ottto_macos_copy_companion_resources "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH" "$APP_RESOURCES"
+# License notices go into Resources before the app is signed. The Sparkle pin
+# comes from the verified app commit and must match the vendored license.
+sparkle_pin="$(ottto_macos_sparkle_pin "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
+sparkle_version="$(jq -r '.version' <<< "$sparkle_pin")"
+sparkle_revision="$(jq -r '.revision' <<< "$sparkle_pin")"
+ottto_check_sparkle_license_pin "$sparkle_version" "$sparkle_revision" "$APP_FRAMEWORKS/Sparkle.framework" || exit 2
+ottto_copy_app_license_notices "$ROOT" "$APP_RESOURCES"
 cp "$CLI_BINARY" "$OUTPUT_DIR/ottto"
 cp "$DAEMON_BINARY" "$OUTPUT_DIR/ottto-service"
 
@@ -537,6 +571,9 @@ if ! otool -l "$APP_MACOS/Ottto" | grep -q "@executable_path/../Frameworks"; the
   install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_MACOS/Ottto"
 fi
 
+# Resources are final before signing: the listed Companion files and the
+# license files.
+ottto_macos_check_app_resources "$APP_RESOURCES"
 sign_code "$APP_HELPERS/ottto"
 sign_code "$APP_HELPERS/ottto-service"
 sign_companion "$APP_MACOS/Ottto"
@@ -555,6 +592,8 @@ for helper in "$APP_HELPERS/ottto" "$APP_HELPERS/ottto-service" "$OUTPUT_DIR/ott
     exit 1
   fi
 done
+ottto_macos_check_no_stabs "$APP_MACOS/Ottto"
+ottto_macos_keep_dsym "$APP_MACOS/Ottto" "$VERSION"
 
 LAUNCH_SMOKE_EVIDENCE="$OUTPUT_DIR/packaged-app-launch-smoke.json"
 "$ROOT/scripts/macos_launch_smoke.sh" \
@@ -573,35 +612,21 @@ sign_container "$APP_DMG"
 rm -rf "$DMG_STAGING"
 CLI_ZIP="$OUTPUT_DIR/ottto-macos-$ARCH.zip"
 DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
-ditto -c -k "$OUTPUT_DIR/ottto" "$CLI_ZIP"
-ditto -c -k "$OUTPUT_DIR/ottto-service" "$DAEMON_ZIP"
+# Each zip holds its executable plus the license notices at the zip root. The
+# staging folders live outside the release output folder, so a failed run
+# cannot leave them where release files are collected.
+(
+  ZIP_STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ottto-zip-stage.XXXXXX")"
+  trap 'rm -rf "$ZIP_STAGE_ROOT"' EXIT
+  ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto" "$ZIP_STAGE_ROOT/cli"
+  ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto-service" "$ZIP_STAGE_ROOT/daemon"
+  ditto -c -k "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
+  ditto -c -k "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
+)
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
-# The SBOM describes the Apple Silicon build and the Sparkle version the app
-# source commit pins; the embedded framework must be that version.
+# The SBOM describes the Apple Silicon build and the validated Sparkle pin.
 if [[ "$ARCH" != "arm64" ]]; then
   echo "The macOS release SBOM requires Apple Silicon artifacts" >&2
-  exit 2
-fi
-if ! sparkle_pin="$(
-  git -C "$MAC_APP_GIT_ROOT" show "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH/Package.resolved" 2>/dev/null |
-    jq -ce '
-      [.pins[]? | select(.identity == "sparkle"
-        and .kind == "remoteSourceControl"
-        and .location == "https://github.com/sparkle-project/Sparkle")]
-      | if length == 1 then .[0].state else error("Expected one upstream Sparkle pin in Package.resolved") end
-      | if (.version | type) == "string" and (.revision | type) == "string" then .
-        else error("The Sparkle pin in Package.resolved needs a version and a revision") end
-    '
-)"; then
-  echo "Could not read the Sparkle pin from the app source commit's Package.resolved" >&2
-  exit 2
-fi
-sparkle_version="$(jq -r '.version' <<<"$sparkle_pin")"
-sparkle_revision="$(jq -r '.revision' <<<"$sparkle_pin")"
-sparkle_plist="$APP_FRAMEWORKS/Sparkle.framework/Versions/B/Resources/Info.plist"
-if ! embedded_sparkle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$sparkle_plist" 2>/dev/null)" ||
-  [[ "$embedded_sparkle_version" != "$sparkle_version" ]]; then
-  echo "Embedded Sparkle framework version must match the app source pin ($sparkle_version)" >&2
   exit 2
 fi
 "$ROOT/scripts/cyclonedx_sbom.sh" --output "$SBOM_PATH" --version "$VERSION" \

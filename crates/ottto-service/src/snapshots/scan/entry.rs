@@ -266,7 +266,7 @@ pub(in crate::snapshots) fn with_codex_before_parse<T>(
 
 #[cfg(test)]
 thread_local! {
-    /// Stage2-pre seam: runs once the active file's reader reports EOF and
+    /// EOF seam: runs once the active file's reader reports EOF and
     /// before its completion (EOF record, tier gate, revalidation, commit), so a test
     /// can change the file inside the window that `OwnedSourceScan::step`
     /// boundaries do not expose.

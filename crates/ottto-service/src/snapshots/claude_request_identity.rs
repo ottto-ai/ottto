@@ -1997,16 +1997,19 @@ fn set_row(
     }
 }
 
-/// Money identity outranks display data: an over-cap tagged body
-/// first sheds cache observations from the end of the patch, and only then
-/// may the selector strip tags. Returns the pre-shed component bytes (counts
-/// only) and the bytes after shedding.
+/// Money identity outranks display data: an over-cap tagged body first
+/// drops its counted request positions, then sheds cache observations from
+/// the end of the patch, and only then may the selector strip tags. A body
+/// that fits without the positions keeps every other byte. Returns the
+/// pre-shed component bytes (counts only; the positions count with the
+/// curve) and the bytes after shedding.
 fn shed_display_leaves(
     item: &mut SnapshotItem,
     grouping: &Grouping,
     attempted: usize,
     max_item_bytes: usize,
 ) -> crate::local_resource_diagnostics::ClaudeIdentityOverCapBytes {
+    crate::snapshots::clear_counted_request_positions(item);
     let mut probe = item.clone();
     probe.context_curve = None;
     let without_curve = grouping.item_bytes(&probe);
@@ -3704,7 +3707,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             };
             accounts.fallback = accounts.starting.clone();
             if settled || accounts.reconciled {
-                // Own request logins survive; only missing shares inherit RD47.
+                // Own request logins survive; only missing shares inherit the fallback account.
                 fold.entity.inherit_missing(accounts.fallback.clone());
             } else {
                 fold.entity.repartition(accounts.fallback.clone());

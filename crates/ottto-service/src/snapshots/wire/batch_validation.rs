@@ -64,7 +64,7 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
         })
         .map_err(|error| format!("snapshot[{index}] wire encoding: {error}"))?
         .len();
-        if item_size > item_limit && item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES {
+        if item_size_refused(item_size, item_limit) {
             return Err(format!(
                 "snapshot[{index}] wire body is {item_size} bytes; maximum is {item_limit}"
             ));
@@ -79,6 +79,38 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
         ));
     }
     Ok(())
+}
+
+/// The item-size rule above: refused only over both the item limit and the
+/// default item cap.
+fn item_size_refused(item_size: usize, item_limit: usize) -> bool {
+    item_size > item_limit && item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES
+}
+
+/// Measure every item matching `select`, including its semantic envelope.
+/// Return the indices that the item-size rule refuses at `item_limit`.
+pub(crate) fn snapshot_items_refused_at(
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    item_limit: usize,
+    select: impl Fn(&SnapshotItem) -> bool,
+) -> Vec<usize> {
+    let Some(source) = snapshot_source_from_api_slug(&request.source) else {
+        return Vec::new();
+    };
+    request
+        .items()
+        .enumerate()
+        .filter(|&(_, item)| select(item))
+        .filter(|&(_, item)| {
+            let wire = SnapshotItemWire {
+                snapshot: item,
+                semantic_envelope: snapshot_semantic_envelope(source, item, request.upload_policy),
+            };
+            crate::snapshot_sync::snapshot_packing_json_length(&wire)
+                .is_ok_and(|bytes| item_size_refused(bytes, item_limit))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub(in crate::snapshots) fn validate_snapshot_item(

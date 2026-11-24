@@ -775,3 +775,104 @@ fn codex_content_loads_back_from_its_session_facts() {
         Some(ReconstructCause::INCOMPATIBLE)
     );
 }
+
+fn marker_line(minute: usize) -> serde_json::Value {
+    json!({"type":"compacted","timestamp":at(minute)})
+}
+
+fn indices(acc: &SnapshotAccumulator) -> Vec<Option<u64>> {
+    let indices = acc.codex_compaction_sizes.request_indices();
+    indices
+        .into_iter()
+        .map(|index| index.map(std::num::NonZeroU64::get))
+        .collect()
+}
+
+/// [behaviour] The counted requests, the alignment bit and every marker's
+/// index round-trip through the revision-2 head, and a marker noted after
+/// the restart takes the restored bit. An index list that does not match
+/// the entries is corrupt.
+#[test]
+fn codex_counted_alignment_round_trips_a_restart() {
+    for aligned in [true, false] {
+        let (mut reduction, certificate) = parse(&lines(12));
+        let acc = reduction.accumulator_for_test();
+        acc.counted_requests
+            .as_mut()
+            .expect("a byte-zero walk counts")
+            .aligned = aligned;
+        let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+        assert_eq!(staged.revision, 2);
+        let (acc, _, _) = reduction.finish_view();
+        assert_eq!(
+            acc.counted_requests.map(|counted| counted.count()),
+            Some(12)
+        );
+        assert_eq!(indices(acc), [Some(4), Some(8), Some(12)]);
+        let mut restored = loaded(&staged);
+        assert_eq!(
+            restored.counted_requests, acc.counted_requests,
+            "aligned={aligned}"
+        );
+        assert_eq!(indices(&restored), indices(acc));
+        apply_codex_line(&marker_line(30), &mut restored);
+        assert_eq!(
+            indices(&restored)[3],
+            aligned.then_some(12),
+            "aligned={aligned}"
+        );
+        assert_reencodes(&reduction, &certificate, &staged);
+        // A revision-1 read of these bytes leaves the extension over.
+        let mut into = SnapshotAccumulator::new(SnapshotSource::Codex);
+        assert!(Codex::decode_head(1, &staged.head, &mut into).is_err());
+    }
+    let (reduction, _) = parse(&lines(12));
+    let mut sizes = reduction.finish_view().0.codex_compaction_sizes.clone();
+    assert!(sizes.restore_request_indices(vec![None; 4]).is_err());
+    assert!(sizes.restore_request_indices(vec![None; 3]).is_ok());
+}
+
+/// [format] A known zero count is not unknown: `Some` with count 0 comes back
+/// from the revision-2 head as `Some`, never as `None`.
+#[test]
+fn codex_zero_counted_requests_round_trip_as_known() {
+    let (mut reduction, certificate) = parse(&lines(12));
+    reduction.accumulator_for_test().counted_requests = Some(Default::default());
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+    let restored = loaded(&staged).counted_requests;
+    assert_eq!(restored, Some(Default::default()));
+    assert_eq!(restored.map(|counted| counted.count()), Some(0));
+    assert_reencodes(&reduction, &certificate, &staged);
+}
+
+/// [behaviour] A released revision-1 head (real 0.1.261 writer bytes) holds
+/// no counted curve: it decodes to unknown, a Tail continuation does not
+/// invent one, and it round-trips through revision 2 still unknown. Only a
+/// byte-zero Full counts. A revision-1 reader holds the revision-2 head.
+#[test]
+fn codex_revision_one_tail_has_no_counted_curve() {
+    let (mut acc, frozen_lines, decoded) =
+        super::super::historical_codex::decode(super::super::historical_codex::Frozen::RevisionOne);
+    assert_eq!(frozen_lines, lines(12));
+    assert_eq!(acc.counted_requests, None);
+    assert_eq!(indices(&acc), [None; 3]);
+    let grown = lines(16);
+    for line in &grown[frozen_lines.len()..] {
+        apply_codex_line(&serde_json::from_str(line).unwrap(), &mut acc);
+    }
+    assert_eq!(acc.counted_requests, None);
+    assert_eq!(indices(&acc), [None; 4]);
+    let view = PreFinalization::new(&acc, &decoded.report, decoded.scalars);
+    let staged = stage_full::<Codex>(&view, &decoded.certificate, &identity());
+    assert!(staged.revision > 1, "a revision-1 reader holds this head");
+    let restored = loaded(&staged);
+    assert_eq!(restored.counted_requests, None);
+    assert_eq!(indices(&restored), [None; 4]);
+    let (full, _) = parse(&grown);
+    let (full, _, _) = full.finish_view();
+    assert_eq!(
+        full.counted_requests.map(|counted| counted.count()),
+        Some(16)
+    );
+    assert_eq!(indices(full), [Some(4), Some(8), Some(12), Some(16)]);
+}

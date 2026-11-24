@@ -259,7 +259,7 @@ pub(in crate::snapshots) struct CollectionSpec {
     /// empty collection from a missing one.
     pub(in crate::snapshots) required: bool,
     /// Its pages hold private strings: a rewrite or removal of a committed
-    /// page stages `Change::DropsPrivate`, so the old value is purged (F3).
+    /// page stages `Change::DropsPrivate`, so the old value is purged.
     pub(in crate::snapshots) private: bool,
 }
 
@@ -414,6 +414,9 @@ pub(in crate::snapshots) trait TailSource {
     const SOURCE: SnapshotSource;
     /// Bumped only when the meaning of the parse-time reduction changes.
     const REDUCTION_REVISION: u32;
+    /// The oldest revision `decode_head` still reads; a codec that accepts an
+    /// older one decodes its layout explicitly.
+    const OLDEST_DECODED_REVISION: u32 = Self::REDUCTION_REVISION;
     /// The head stores the accepted usage totals: usage is accepted while the
     /// file is read, not folded at finish.
     const USAGE_BEFORE_FINISH: bool = false;
@@ -548,7 +551,7 @@ fn encode_envelope(
     })
 }
 
-/// `S`'s envelope back, at its own revision only: the accumulator, the
+/// `S`'s envelope back, at a revision its codec decodes: the accumulator, the
 /// codec's `lead` and `trailer`, and the parts outside the accumulator.
 fn decode_envelope<S: TailSource, L, T>(
     revision: u32,
@@ -556,7 +559,7 @@ fn decode_envelope<S: TailSource, L, T>(
     lead: impl FnOnce(&mut Dec<'_>) -> Result<L, Corrupt>,
     trailer: impl FnOnce(&mut Dec<'_>) -> Result<T, Corrupt>,
 ) -> Result<(SnapshotAccumulator, L, T, DecodedHead), ReconstructCause> {
-    if revision != S::REDUCTION_REVISION {
+    if !(S::OLDEST_DECODED_REVISION..=S::REDUCTION_REVISION).contains(&revision) {
         return Err(ReconstructCause::INCOMPATIBLE);
     }
     let mut d = Dec::new(head);
@@ -1217,6 +1220,7 @@ head_fields! {
         N compaction_count: u64,
         I compaction_timestamps: crate::owned_heap::OwnedVec<String>,
         D codex_compaction_sizes: CodexCompactionSizes,
+        I counted_requests: Option<CountedRequests>,
         D local_context_points: LocalContextPoints,
         I claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
         L claude_compaction_link_tip: Option<(u64, String)>,
