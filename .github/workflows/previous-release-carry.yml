@@ -1,0 +1,83 @@
+name: Previous release carry
+
+# Rollback check for a release that raises the store's rollback floor: the
+# previous release, built from its own source, must refuse a store the target
+# commit wrote without changing a row, and the target must then read back what
+# it wrote. Dispatch it on the release candidate:
+#   gh workflow run previous-release-carry.yml -f target=<candidate sha>
+# `previous` defaults to the repository's first commit, the source of the last
+# release published before this repository's history began; pass the previous
+# release's commit once a release from this history exists.
+# A pull request that changes this workflow or its script runs it once on the
+# pull request's head. Linux hosted only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Full SHA of the commit whose store the previous release must refuse (empty = the dispatched ref)
+        required: false
+        default: ""
+      previous:
+        description: Full SHA of the previous release's source commit
+        required: false
+        default: 6aa2d047a7eaa3f9b199000f89d0bb00713f502d
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - .github/workflows/previous-release-carry.yml
+      - scripts/previous_release_carry.py
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  carry:
+    name: Previous release carry
+    if: ${{ !github.event.pull_request.draft }}
+    timeout-minutes: 150
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Line tables keep file:line in panic backtraces without the memory of
+      # full debuginfo (see linux-tests.yml).
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      PREVIOUS: ${{ inputs.previous || '6aa2d047a7eaa3f9b199000f89d0bb00713f502d' }}
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.target || github.sha }}
+          # Full history, so the previous release's commit is present.
+          fetch-depth: 0
+
+      - name: Checkout harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          persist-credentials: false
+          path: harness
+          sparse-checkout: scripts/previous_release_carry.py
+          sparse-checkout-cone-mode: false
+
+      # Two test builds (target and previous release) share the runner's disk.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
+        with:
+          linux-test-env: "true"
+
+      - name: Carry check
+        run: |
+          set -euo pipefail
+          echo "target: $(git rev-parse HEAD)"
+          echo "previous: $PREVIOUS"
+          python3 harness/scripts/previous_release_carry.py --previous "$PREVIOUS" --tree .

@@ -239,6 +239,20 @@ no promise that forcibly running an unsupported pre-N binary is intercepted by
 its installer. The intact original-path manifest remains an additional strict
 schema refusal for 0.1.201; it is not the supported downgrade path.
 
+A release that raises the writer capability or catalogue layout is checked
+against the previous release's real source before it is published. The
+dispatch-only `Previous release carry` workflow
+(`.github/workflows/previous-release-carry.yml`, script
+`scripts/previous_release_carry.py`) does the following:
+
+- The candidate writes a progress-row store and a telemetry-only store.
+- The previous release's source, with only two read probes appended, must
+  refuse each store as newer without changing a row.
+- The candidate then reads back exactly what it wrote.
+
+Dispatch it with `target=<candidate sha>` and `previous=<previous release's
+source sha>`.
+
 A metadata-only legacy copy is rejected as the primary protection. An absent or
 renamed original file becomes a fresh index in the old loader. Corrupt JSON can
 be quarantined and rebuilt. A valid legacy stub could discard large-map state
