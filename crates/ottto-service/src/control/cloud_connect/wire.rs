@@ -64,6 +64,18 @@ pub(super) fn is_reverse_code(code: &str) -> bool {
             .all(|byte| REVERSE_CODE_ALPHABET.contains(&byte))
 }
 
+/// The browser's forward key code is eight RFC 4648 Base32 characters in two groups.
+pub(super) fn is_key_code(code: &str) -> bool {
+    code.len() == 9
+        && code.bytes().enumerate().all(|(index, byte)| {
+            if index == 4 {
+                byte == b'-'
+            } else {
+                byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte)
+            }
+        })
+}
+
 /// An ASN.1 DER `ECDSA-Sig-Value` the size of a P-256 signature: a SEQUENCE of two positive,
 /// minimally encoded INTEGERs of at most 33 bytes each and nothing after them.
 pub(super) fn is_p256_der_signature(der: &[u8]) -> bool {

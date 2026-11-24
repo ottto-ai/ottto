@@ -184,6 +184,15 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    refresh_setup_run_token_checked(api_base_url, connection, |_| Ok(()))
+}
+
+/// Lets a caller refuse a refresh that would change its binding, before storing any update.
+pub(in crate::control) fn refresh_setup_run_token_checked(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    check: impl FnOnce(&SetupRunRefreshResponse) -> Result<(), LocalApiError>,
+) -> Result<RefreshedSetupRunToken, LocalApiError> {
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
@@ -215,6 +224,7 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
         "device_secret": device_secret,
     });
     let response: SetupRunRefreshResponse = backend_post_json(&url, &body, &[])?;
+    check(&response)?;
     let mut refreshed = connection.clone();
     if let Some(setup_run_id) = response
         .setup_run_id
@@ -322,6 +332,15 @@ pub(in crate::control) fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<SetupRunCredentials, LocalApiError> {
+    setup_run_token_for_connection_with_refresh(connection, || {
+        refresh_setup_run_token_via_device_secret(api_base_url, connection)
+    })
+}
+
+pub(in crate::control) fn setup_run_token_for_connection_with_refresh(
+    connection: &LocalConnectionBinding,
+    refresh: impl FnOnce() -> Result<RefreshedSetupRunToken, LocalApiError>,
+) -> Result<SetupRunCredentials, LocalApiError> {
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
@@ -329,14 +348,10 @@ pub(in crate::control) fn setup_run_token_for_connection(
             setup_run_token: token,
             connection: connection.clone(),
         }),
-        Err(_) => {
-            refresh_setup_run_token_via_device_secret(api_base_url, connection).map(|refreshed| {
-                SetupRunCredentials {
-                    setup_run_token: refreshed.setup_run_token,
-                    connection: refreshed.connection,
-                }
-            })
-        }
+        Err(_) => refresh().map(|refreshed| SetupRunCredentials {
+            setup_run_token: refreshed.setup_run_token,
+            connection: refreshed.connection,
+        }),
     }
 }
 

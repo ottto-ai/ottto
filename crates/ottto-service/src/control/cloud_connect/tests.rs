@@ -12,6 +12,7 @@ use super::server::DeviceChallenge;
 use super::server::Enrolled;
 use super::server::Revoked;
 use super::server::ServerError;
+use super::server::{check_refresh_binding, send_with_refresh};
 use super::signer;
 use super::template::template_bytes_match;
 use super::template::template_url;
@@ -21,16 +22,22 @@ use super::wake::app_bundle_of;
 use super::wire;
 use super::SignerOff;
 use super::SignerStartFacts;
+use super::{verified_template_url, TemplatePinId};
+use crate::control::SetupRunRefreshResponse;
+use crate::{BackendErrorDetails, BackendErrorKind, LocalApiError};
 use ottto_protocol::InstallOwner;
 use ottto_protocol::LocalControlRequest;
 use serde_json::json;
 use serde_json::Value;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::Path;
 use std::time::Duration;
 
 const CLAIM_ID: &str = "11111111-2222-4333-8444-555555555555";
 const CHALLENGE_ID: &str = "99999999-8888-4777-8666-555555555555";
+const CLAIM_URL: &str =
+    "https://app.ottto.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
 /// `30 06 02 01 01 02 01 01`: r = 1, s = 1.
 const DER_SIGNATURE_B64: &str = "MAYCAQECAQE";
 
@@ -40,6 +47,7 @@ type SentEnrollment = (Vec<u8>, String, Option<String>);
 /// Answers like the server's cloud-key routes and records what it was sent.
 #[derive(Default)]
 struct FakeServer {
+    claim_fields: Option<(&'static str, &'static str)>,
     /// Return a challenge whose signed hash differs from the one asked for.
     tamper_challenge: bool,
     challenges: RefCell<Vec<(String, String)>>,
@@ -48,11 +56,12 @@ struct FakeServer {
 }
 
 impl CloudKeyServer for FakeServer {
-    fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
+    fn start_claim(&self, _body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
+        let (claim_url, key_code) = self.claim_fields.unwrap_or((CLAIM_URL, "AB23-EFG7"));
         Ok(ClaimStarted {
             key_claim_id: CLAIM_ID.to_string(),
-            claim_url: format!("https://app.ottto.net/cloud-keys/{}", body.client_claim_id),
-            key_code: "ABCD-EFGH".to_string(),
+            claim_url: claim_url.to_string(),
+            key_code: key_code.to_string(),
             expires_at: "2026-11-24T12:00:00Z".to_string(),
         })
     }
@@ -321,6 +330,25 @@ fn enrollment_sends_the_frozen_body_once() {
         "device_signature_b64": DER_SIGNATURE_B64,
         "approval_signature_b64": DER_SIGNATURE_B64,
     });
+    for field in ["device_signature_b64", "approval_signature_b64"] {
+        let mut malformed = enroll.clone();
+        malformed[field] = json!("AAAA");
+        assert_eq!(
+            error_code(&channel.send(1, "cloud_keys_enroll", malformed)),
+            "signature_invalid"
+        );
+    }
+    let mut missing = enroll.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("approval_signature_b64");
+    assert_eq!(
+        error_code(&channel.send(1, "cloud_keys_enroll", missing)),
+        "signature_invalid"
+    );
+    assert!(channel.server.enrolls.borrow().is_empty());
+
     let enrolled = channel.send(1, "cloud_keys_enroll", enroll.clone());
     assert_eq!(
         enrolled["result"]["approval_key_id"], "approval-key",
@@ -359,16 +387,6 @@ fn enrollment_refuses_what_it_cannot_send_safely() {
         "prepare_not_found"
     );
 
-    // An approval key needs an approval signature, and signatures must be DER.
-    let prepared = channel.send(2, "cloud_keys_enroll_prepare", enroll_args());
-    let missing_approval = json!({
-        "prepare_id": prepared["result"]["prepare_id"],
-        "device_signature_b64": DER_SIGNATURE_B64,
-    });
-    assert_eq!(
-        error_code(&channel.send(2, "cloud_keys_enroll", missing_approval)),
-        "signature_invalid"
-    );
     assert!(channel.server.enrolls.borrow().is_empty());
 
     let calls_before = channel.server.challenges.borrow().len();
@@ -416,18 +434,26 @@ fn revoke_signs_the_empty_delete_body() {
             wire::request_sha256("DELETE", wire::KEYS_ROUTE_TEMPLATE, b"")
         )]
     );
-    let revoked = channel.send(
-        1,
-        "cloud_keys_revoke",
-        json!({
-            "prepare_id": prepared["result"]["prepare_id"],
-            "device_signature_b64": DER_SIGNATURE_B64,
-        }),
+    let revoke = json!({
+        "prepare_id": prepared["result"]["prepare_id"],
+        "device_signature_b64": DER_SIGNATURE_B64,
+    });
+    let mut malformed = revoke.clone();
+    malformed["device_signature_b64"] = json!("AAAA");
+    assert_eq!(
+        error_code(&channel.send(1, "cloud_keys_revoke", malformed)),
+        "signature_invalid"
     );
+    assert!(channel.server.revokes.borrow().is_empty());
+    let revoked = channel.send(1, "cloud_keys_revoke", revoke.clone());
     assert_eq!(revoked["result"]["reason"], "revoked", "{revoked}");
     assert_eq!(
         channel.server.revokes.borrow().as_slice(),
         &[format!("{CHALLENGE_ID}.{DER_SIGNATURE_B64}")]
+    );
+    assert_eq!(
+        error_code(&channel.send(1, "cloud_keys_revoke", revoke)),
+        "prepare_not_found"
     );
 }
 
@@ -445,7 +471,8 @@ fn claim_start_and_state_reach_the_server() {
             "approval_key_spki_b64": null,
         }),
     );
-    assert_eq!(started["result"]["key_code"], "ABCD-EFGH", "{started}");
+    assert_eq!(started["result"]["key_code"], "AB23-EFG7", "{started}");
+    assert_eq!(started["result"]["claim_url"], CLAIM_URL);
     let state = channel.send(
         1,
         "cloud_keys_claim_status",
@@ -460,6 +487,99 @@ fn claim_start_and_state_reach_the_server() {
         )),
         "invalid_argument"
     );
+}
+
+/// [behaviour] No browser link or forward code is returned until both pass the local checks.
+#[test]
+fn claim_start_refuses_untrusted_browser_fields() {
+    for (url, code) in [
+        ("http://app.ottto.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555", "ABCD-EFGH"),
+        ("https://app.ottto.net.example.com/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555", "ABCD-EFGH"),
+        ("https://app.ottto.net:8443/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555", "ABCD-EFGH"),
+        ("https://app.ottto.net/other?claim=11111111-2222-4333-8444-555555555555", "ABCD-EFGH"),
+        ("https://app.ottto.net/setup/cloud-keys?claim=bogus", "ABCD-EFGH"),
+        ("https://app.ottto.net/setup/cloud-keys?claim=99999999-8888-4777-8666-555555555555", "ABCD-EFGH"),
+        ("https://app.ottto.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555&claim=99999999-8888-4777-8666-555555555555", "ABCD-EFGH"),
+        (CLAIM_URL, "ABCD-EFG8"),
+        (CLAIM_URL, "ABCD-efgh"),
+        (CLAIM_URL, "ABCDEFGH"),
+    ] {
+        let channel = Channel::new(FakeServer {
+            claim_fields: Some((url, code)),
+            ..FakeServer::default()
+        });
+        channel.hello(1);
+        let reply = channel.send(
+            1,
+            "cloud_keys_claim_start",
+            json!({ "client_claim_id": CLAIM_ID, "device_key_spki_b64": "BBBB" }),
+        );
+        assert_eq!(error_code(&reply), "server_untrusted", "{url} {code}");
+        assert!(reply.get("result").is_none());
+    }
+}
+
+/// [behaviour] A refresh can resend on the original run and org only. Proof errors never refresh.
+#[test]
+fn refresh_resends_only_on_the_original_run_and_organization() {
+    let original = json!({
+        "setup_run_id": "run-original",
+        "setup_run_token": "refreshed",
+        "expires_at": "2026-11-24T12:00:00Z",
+        "run": { "id": "run-original", "organization_id": "org-original", "status": "completed" }
+    });
+    let reject = |reason: &str| {
+        LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/cloud/keys".to_string(),
+            status: Some(401),
+            body_excerpt: None,
+            reason_code: Some(reason.to_string()),
+        })
+    };
+    for (field, value) in [
+        ("", Value::Null),
+        ("/setup_run_id", json!("run-other")),
+        ("/run/id", json!("run-other")),
+        ("/run/organization_id", json!("org-other")),
+        ("/run/organization_id", Value::Null),
+        ("/run", Value::Null),
+    ] {
+        let mut body = original.clone();
+        if !field.is_empty() {
+            *body.pointer_mut(field).unwrap() = value;
+        }
+        let response: SetupRunRefreshResponse = serde_json::from_value(body).unwrap();
+        let sends = Cell::new(0);
+        let result = send_with_refresh(
+            "original",
+            |token| {
+                sends.set(sends.get() + 1);
+                match token {
+                    "original" => Err(reject("setup_run_token_invalid")),
+                    "refreshed" => Ok(()),
+                    _ => panic!("unexpected token"),
+                }
+            },
+            || {
+                check_refresh_binding(&response, "run-original", "org-original")?;
+                Ok(response.setup_run_token)
+            },
+        );
+        if field.is_empty() {
+            assert_eq!(result, Ok(()));
+            assert_eq!(sends.get(), 2);
+        } else {
+            assert_eq!(result.unwrap_err().code, "not_paired", "{field}");
+            assert_eq!(sends.get(), 1, "{field}");
+        }
+    }
+    let refused = send_with_refresh::<()>(
+        "original",
+        |_| Err(reject("device_proof_invalid")),
+        || panic!("proof refusals must not refresh credentials"),
+    );
+    assert_eq!(refused.unwrap_err().code, "device_proof_invalid");
 }
 
 /// [behaviour] A queued request goes to the first verified connection that polls it; only that
@@ -537,6 +657,7 @@ fn queue_supersedes_caps_and_expires() {
         .enqueue(approval("approval_2"), b"b".to_vec(), unix_now() + 60)
         .unwrap();
     assert_ne!(renewed.request_id, first.request_id);
+    assert!(!renewed.wake_app);
     assert_eq!(
         queue.wait(&first.request_id, Duration::ZERO),
         Some(SignOutcome::Superseded)
@@ -566,6 +687,47 @@ fn queue_supersedes_caps_and_expires() {
         queue.wait("sign_unknown", Duration::ZERO),
         Some(SignOutcome::Expired)
     );
+}
+
+/// [behaviour] A rejected renewal keeps the old approval. A valid renewal can reuse its slot.
+#[test]
+fn queue_replaces_an_approval_only_after_admission() {
+    let queue = SignQueue::default();
+    let approval = |attempt: &str, approval: &str| SignKind::Approval {
+        attempt_id: attempt.to_string(),
+        approval_id: approval.to_string(),
+    };
+    let old = queue
+        .enqueue(approval("attempt", "old"), vec![], unix_now() + 60)
+        .unwrap();
+    for _ in 1..super::MAX_LIVE_SIGN_REQUESTS {
+        queue
+            .enqueue(SignKind::DeviceProof, vec![], unix_now() + 60)
+            .unwrap();
+    }
+    assert_eq!(
+        queue.enqueue(approval("attempt", "expired"), vec![], unix_now()),
+        Err(SignQueueError::AlreadyExpired)
+    );
+    assert_eq!(
+        queue.enqueue(approval("other", "new"), vec![], unix_now() + 60),
+        Err(SignQueueError::Full)
+    );
+    assert_eq!(queue.wait(&old.request_id, Duration::ZERO), None);
+    assert_eq!(queue.poll(1)[0].request_id, old.request_id);
+
+    let replacement = queue
+        .enqueue(approval("attempt", "new"), vec![], unix_now() + 60)
+        .unwrap();
+    assert_eq!(
+        queue.wait(&old.request_id, Duration::ZERO),
+        Some(SignOutcome::Superseded)
+    );
+    let live = queue.poll(1);
+    assert_eq!(live.len(), super::MAX_LIVE_SIGN_REQUESTS);
+    assert!(live
+        .iter()
+        .any(|request| request.request_id == replacement.request_id));
 }
 
 /// [behaviour] The signer opens only in a release-signed service the app installed, with no
@@ -613,9 +775,9 @@ fn signer_starts_only_for_the_release_app_service() {
 #[test]
 fn template_url_comes_from_the_pin_and_bytes_must_match() {
     let pin = TemplatePin {
-        key: "aws/bedrock-cli-read-role/v1.yaml".to_string(),
-        version_id: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY".to_string(),
-        sha256: "5cde0f1298f41f7d1c8b907a36992a7a513225a2615bd6e307bf1a9149b06b40".to_string(),
+        key: "aws/bedrock-cli-read-role/v1.yaml",
+        version_id: "3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY",
+        sha256: "5cde0f1298f41f7d1c8b907a36992a7a513225a2615bd6e307bf1a9149b06b40",
     };
     assert_eq!(
         template_url(&pin).unwrap(),
@@ -634,15 +796,56 @@ fn template_url_comes_from_the_pin_and_bytes_must_match() {
         ("aws/role/v1.yaml", ""),
     ] {
         let bad = TemplatePin {
-            key: key.to_string(),
-            version_id: version_id.to_string(),
-            ..pin.clone()
+            key,
+            version_id,
+            ..pin
         };
         assert_eq!(
             template_url(&bad),
             Err(TemplateError::InvalidPin),
             "{key} {version_id}"
         );
+    }
+}
+
+/// [behaviour] A server cannot enable an unpublished template by supplying a complete pin.
+#[test]
+fn unpublished_template_has_no_server_fallback() {
+    let id = TemplatePinId::BedrockCliReadRoleV1;
+    assert!(!id.matches_metadata(
+        "aws/bedrock-cli-read-role/v1.yaml",
+        "object-version",
+        &crate::hex::sha256_lower(b"server-selected bytes")
+    ));
+    assert_eq!(verified_template_url(id), Err(TemplateError::InvalidPin));
+}
+
+/// [behaviour] Both XPC endpoints require the Apple Developer ID intermediate and the signed
+/// identifier. Parse the requirement with the same macOS framework the service uses.
+#[cfg(target_os = "macos")]
+#[test]
+fn signer_requirements_pin_the_developer_id_chain() {
+    use crate::control::peer::{companion_signer_code_requirement, service_team_code_requirement};
+    use security_framework::os::macos::code_signing::SecRequirement;
+
+    let team = "ABCDE12345";
+    for (requirement, identity) in [
+        (
+            companion_signer_code_requirement(team),
+            "net.ottto.Companion",
+        ),
+        (service_team_code_requirement(team), "ottto-service"),
+    ] {
+        assert_eq!(
+            requirement,
+            format!(
+                "identifier \"{identity}\" and anchor apple generic \
+                 and certificate leaf[field.1.2.840.113635.100.6.1.13] \
+                 and certificate leaf[subject.OU] = \"{team}\" \
+                 and certificate 1[field.1.2.840.113635.100.6.2.6]"
+            )
+        );
+        assert!(requirement.parse::<SecRequirement>().is_ok());
     }
 }
 

@@ -1,8 +1,8 @@
 //! Waking the Mac app's signer loop: when a request is queued and no app said hello recently, the
 //! app bundle this service runs from is checked against the release app requirement and opened in
-//! the background with a URL that carries no data.
+//! the background with an unauthenticated URL hint. Signer requests travel over verified XPC.
 
-/// Only starts the app's signer loop; the app then polls over the verified channel.
+/// An unauthenticated hint to start the app's signer loop. The app polls over verified XPC.
 #[cfg(target_os = "macos")]
 const SIGN_URL: &str = "ottto://cloud/sign";
 

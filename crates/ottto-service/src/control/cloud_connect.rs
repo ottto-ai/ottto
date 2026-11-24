@@ -22,7 +22,7 @@ pub use queue::SignQueueError;
 pub use queue::MAX_LIVE_SIGN_REQUESTS;
 pub use template::verified_template_url;
 pub use template::TemplateError;
-pub use template::TemplatePin;
+pub use template::TemplatePinId;
 
 use crate::LocalDaemon;
 use ottto_protocol::InstallOwner;
@@ -107,7 +107,7 @@ pub fn signer_peer_requirement() -> Result<String, SignerOff> {
                 team_id,
             )),
     })?;
-    Ok(super::peer::companion_team_code_requirement(team_id))
+    Ok(super::peer::companion_signer_code_requirement(team_id))
 }
 
 /// Off macOS there is no Mac app and no release signature.
@@ -140,8 +140,8 @@ fn connections() -> &'static signer::Connections {
     CONNECTIONS.get_or_init(signer::Connections::default)
 }
 
-/// Queues `payload` for the app to sign until `expires_at` (Unix seconds), and wakes the app when
-/// none said hello in the last few seconds. Returns the request id to wait on.
+/// Queues `payload` for the app to sign until `expires_at` (Unix seconds), with a throttled wake
+/// hint when no signer said hello recently. Returns the request id to wait on.
 pub fn queue_sign_request(
     kind: SignKind,
     payload: Vec<u8>,

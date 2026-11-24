@@ -1,6 +1,5 @@
-//! The CloudFormation template check: the template URL is built here from a pinned object key and
-//! version, never taken from the server, and the bytes served there must hash to the pinned sha256
-//! before any stack is created from it.
+//! CloudFormation template verification against a build-time table of published object versions
+//! and digests.
 
 use std::io::Read as _;
 use std::time::Duration;
@@ -14,17 +13,42 @@ const MAX_TEMPLATE_BYTES: u64 = 1024 * 1024;
 
 const TEMPLATE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// One published template object version and the sha256 of its bytes.
+/// A template chosen by the local cloud connect flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplatePinId {
+    BedrockCliReadRoleV1,
+}
+
+/// Add the immutable object version and its digest after the template is published.
+/// An absent pin keeps CLI setup disabled for that template.
+const TEMPLATE_PINS: &[(TemplatePinId, TemplatePin)] = &[];
+
+/// One published template object version and the SHA-256 of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplatePin {
-    pub key: String,
-    pub version_id: String,
-    pub sha256: String,
+pub(super) struct TemplatePin {
+    pub(super) key: &'static str,
+    pub(super) version_id: &'static str,
+    pub(super) sha256: &'static str,
+}
+
+impl TemplatePinId {
+    fn pin(self) -> Option<&'static TemplatePin> {
+        TEMPLATE_PINS
+            .iter()
+            .find_map(|(id, pin)| (*id == self).then_some(pin))
+    }
+
+    /// Checks server metadata against the locally selected pin.
+    pub fn matches_metadata(self, key: &str, version_id: &str, sha256: &str) -> bool {
+        self.pin().is_some_and(|pin| {
+            pin.key == key && pin.version_id == version_id && pin.sha256 == sha256
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateError {
-    /// The pin's key, version or digest has the wrong shape.
+    /// The pin is absent or its key, version or digest has the wrong shape.
     InvalidPin,
     /// The object could not be read.
     Unreachable,
@@ -32,8 +56,9 @@ pub enum TemplateError {
     DigestMismatch,
 }
 
-/// The template URL for `pin`, once the bytes served there hash to `pin.sha256`.
-pub fn verified_template_url(pin: &TemplatePin) -> Result<String, TemplateError> {
+/// The compiled template URL for `id`, once the served bytes hash to its compiled digest.
+pub fn verified_template_url(id: TemplatePinId) -> Result<String, TemplateError> {
+    let pin = id.pin().ok_or(TemplateError::InvalidPin)?;
     let url = template_url(pin)?;
     let response = crate::retry_tls::credential_agent()
         .get(&url)
@@ -70,7 +95,7 @@ pub(super) fn template_url(pin: &TemplatePin) -> Result<String, TemplateError> {
             .version_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
-    if !key_ok || !version_ok || !crate::hex::is_sha256_lower(&pin.sha256) {
+    if !key_ok || !version_ok || !crate::hex::is_sha256_lower(pin.sha256) {
         return Err(TemplateError::InvalidPin);
     }
     Ok(format!(

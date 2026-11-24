@@ -433,9 +433,6 @@ pub(super) fn resolve_companion_code_requirement(
 /// forces the chain back to Apple, and the leaf marker OID
 /// `1.2.840.113635.100.6.1.13` is what makes it Developer ID rather than a
 /// development or Mac App Store certificate from the same team.
-///
-/// This is exactly the shape of Apple's own generated designated requirement;
-/// `codesign -d -r- /Applications/Ottto.app` prints it.
 #[cfg(target_os = "macos")]
 fn developer_id_requirement_fragment(team_id: &str) -> String {
     format!(
@@ -468,15 +465,27 @@ pub(super) fn companion_identity_code_requirement() -> String {
 #[cfg(target_os = "macos")]
 const OTTTO_SERVICE_SIGNING_IDENTIFIER: &str = "ottto-service";
 
+/// Both signer endpoints also pin the Apple Developer ID intermediate CA.
+#[cfg(target_os = "macos")]
+fn signer_team_code_requirement(identifier: &str, team_id: &str) -> String {
+    format!(
+        "identifier \"{identifier}\" and {} and certificate 1[field.1.2.840.113635.100.6.2.6]",
+        developer_id_requirement_fragment(team_id)
+    )
+}
+
+/// Only the release Companion may connect to the signer listener.
+#[cfg(target_os = "macos")]
+pub(super) fn companion_signer_code_requirement(team_id: &str) -> String {
+    signer_team_code_requirement(OTTTO_COMPANION_BUNDLE_IDENTIFIER, team_id)
+}
+
 /// The release `ottto-service`: its identifier, signed by a Developer ID certificate Apple issued
 /// to `team_id`. The Mac app requires it of the signer channel, and this service requires it of
 /// itself before it opens that channel.
 #[cfg(target_os = "macos")]
 pub(super) fn service_team_code_requirement(team_id: &str) -> String {
-    format!(
-        "identifier \"{OTTTO_SERVICE_SIGNING_IDENTIFIER}\" and {}",
-        developer_id_requirement_fragment(team_id)
-    )
+    signer_team_code_requirement(OTTTO_SERVICE_SIGNING_IDENTIFIER, team_id)
 }
 
 /// Whether this running process satisfies `requirement`.
