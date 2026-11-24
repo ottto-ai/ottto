@@ -6,10 +6,11 @@ use crate::control::api_url_with_base;
 use crate::control::backend_get_json;
 use crate::control::backend_post_json;
 use crate::control::backend_send_raw_json;
-use crate::control::setup::claims::credentials::refresh_setup_run_token_checked;
+use crate::control::setup::claims::credentials::refresh_cloud_setup_run_token_checked;
 use crate::control::setup::claims::credentials::setup_run_token_for_connection_with_refresh;
 use crate::control::validated_api_base_url;
 use crate::control::SetupRunRefreshResponse;
+use crate::control::DEFAULT_API_BASE_URL;
 use crate::LocalApiError;
 use crate::LocalDaemon;
 use serde::Deserialize;
@@ -17,6 +18,32 @@ use serde::Serialize;
 
 /// The server's answer to a refused run token; any other 401 (a bad proof) is final.
 const SETUP_RUN_TOKEN_INVALID: &str = "setup_run_token_invalid";
+
+const CLAIM_ORIGIN_PAIRS: [(&str, &str); 2] = [
+    (DEFAULT_API_BASE_URL, "https://app.ottto.net"),
+    (
+        "https://staging.tail21f014.ts.net:8443",
+        "https://staging.tail21f014.ts.net",
+    ),
+];
+const CLAIM_WEB_ROUTE: &str = "/setup/cloud-keys?claim=";
+
+fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'static str)> {
+    let api_base_url = api_base_url.trim().trim_end_matches('/');
+    CLAIM_ORIGIN_PAIRS
+        .into_iter()
+        .find(|(api, _)| *api == api_base_url)
+}
+
+/// The configured staging API is trusted only for cloud setup-run requests and token refresh.
+pub(in crate::control) fn validated_cloud_api_base_url(
+    api_base_url: &str,
+) -> Result<String, LocalApiError> {
+    match claim_origin_pair(api_base_url) {
+        Some((api, _)) => Ok(api.to_string()),
+        None => validated_api_base_url(Some(api_base_url)),
+    }
+}
 
 #[derive(Serialize)]
 pub(super) struct ClaimStartBody<'a> {
@@ -32,6 +59,27 @@ pub(super) struct ClaimStarted {
     pub(super) claim_url: String,
     pub(super) key_code: String,
     pub(super) expires_at: String,
+}
+
+/// Validate against the API selected for this request, including any token retry.
+pub(super) fn checked_claim_start(
+    api_base_url: &str,
+    start: impl FnOnce() -> Result<ClaimStarted, ServerError>,
+) -> Result<ClaimStarted, ServerError> {
+    let untrusted = || ServerError::local("server_untrusted");
+    let (_, web_origin) = claim_origin_pair(api_base_url).ok_or_else(untrusted)?;
+    let started = start()?;
+    let browser_claim = started
+        .claim_url
+        .strip_prefix(web_origin)
+        .and_then(|route| route.strip_prefix(CLAIM_WEB_ROUTE));
+    if !crate::hex::is_uuid(&started.key_claim_id)
+        || browser_claim != Some(started.key_claim_id.as_str())
+        || !super::wire::is_key_code(&started.key_code)
+    {
+        return Err(untrusted());
+    }
+    Ok(started)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +166,7 @@ impl ServerError {
 
 /// The cloud-key routes the signer channel calls.
 pub(super) trait CloudKeyServer {
-    /// Starts (or replays) a key claim for these public keys.
+    /// Starts or replays a claim and verifies its browser link against the connected API.
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError>;
     fn claim_state(&self, key_claim_id: &str) -> Result<ClaimState, ServerError>;
     /// A challenge committing to `request_sha256` for `operation`.
@@ -187,10 +235,10 @@ impl SetupRunServer<'_> {
         }) {
             return Err(ServerError::local("not_paired"));
         }
-        let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))
+        let api_base_url = validated_cloud_api_base_url(&connection.api_base_url)
             .map_err(|error| ServerError::from_local(&error))?;
         let refresh = || {
-            refresh_setup_run_token_checked(&api_base_url, &connection, |response| {
+            refresh_cloud_setup_run_token_checked(&api_base_url, &connection, |response| {
                 check_refresh_binding(response, &connection.setup_run_id, &organization_id)
             })
         };
@@ -245,12 +293,15 @@ pub(super) fn send_with_refresh<T>(
 
 impl CloudKeyServer for SetupRunServer<'_> {
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
-        self.call(|prefix, token| {
-            backend_post_json(
-                &format!("{prefix}/key-claims"),
-                body,
-                &[("X-Ottto-Setup-Run-Token", token)],
-            )
+        let run = self.bound_run()?;
+        checked_claim_start(&run.api_base_url, || {
+            self.call_bound(Some(&run), |prefix, token| {
+                backend_post_json(
+                    &format!("{prefix}/key-claims"),
+                    body,
+                    &[("X-Ottto-Setup-Run-Token", token)],
+                )
+            })
         })
     }
 

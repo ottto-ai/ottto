@@ -11,7 +11,6 @@ use super::wire::checked_challenge;
 use super::wire::decode_base64url;
 use super::wire::encode_base64url;
 use super::wire::is_encoded_spki;
-use super::wire::is_key_code;
 use super::wire::is_p256_der_signature;
 use super::wire::is_reverse_code;
 use super::wire::proof_header;
@@ -376,23 +375,11 @@ fn claim_start(server: &dyn CloudKeyServer, args: ClaimStartArgs) -> Result<Valu
     {
         return Err(Refusal::new("invalid_argument"));
     }
-    let started = server.start_claim(&ClaimStartBody {
+    to_result(server.start_claim(&ClaimStartBody {
         client_claim_id: &args.client_claim_id,
         device_key_spki_b64: &args.device_key_spki_b64,
         approval_key_spki_b64: args.approval_key_spki_b64.as_deref(),
-    })?;
-    // The app can open this URL in a browser. Accept only the exact web route
-    // and a single claim parameter that names the returned claim.
-    let browser_claim = started
-        .claim_url
-        .strip_prefix("https://app.ottto.net/setup/cloud-keys?claim=");
-    if !crate::hex::is_uuid(&started.key_claim_id)
-        || browser_claim != Some(started.key_claim_id.as_str())
-        || !is_key_code(&started.key_code)
-    {
-        return Err(Refusal::new("server_untrusted"));
-    }
-    to_result(started)
+    })?)
 }
 
 /// Gets a challenge for `body` and freezes both on the connection.

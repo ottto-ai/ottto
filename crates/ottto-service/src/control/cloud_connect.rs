@@ -10,6 +10,7 @@ pub(super) use agent::dispatch as dispatch_agent;
 
 mod queue;
 mod server;
+pub(super) use server::validated_cloud_api_base_url;
 mod signer;
 mod template;
 mod wake;

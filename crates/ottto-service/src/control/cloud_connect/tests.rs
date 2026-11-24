@@ -13,7 +13,9 @@ use super::server::DeviceChallenge;
 use super::server::Enrolled;
 use super::server::Revoked;
 use super::server::ServerError;
-use super::server::{check_refresh_binding, send_with_refresh};
+use super::server::{
+    check_refresh_binding, checked_claim_start, send_with_refresh, validated_cloud_api_base_url,
+};
 use super::signer;
 use super::template::template_bytes_match;
 use super::template::template_url;
@@ -49,6 +51,7 @@ type SentEnrollment = (Vec<u8>, String, Option<String>);
 #[derive(Default)]
 struct FakeServer {
     claim_fields: Option<(&'static str, &'static str)>,
+    claim_api_base: Option<&'static str>,
     /// Return a challenge whose signed hash differs from the one asked for.
     tamper_challenge: bool,
     challenges: RefCell<Vec<(String, String)>>,
@@ -59,11 +62,14 @@ struct FakeServer {
 impl CloudKeyServer for FakeServer {
     fn start_claim(&self, _body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
         let (claim_url, key_code) = self.claim_fields.unwrap_or((CLAIM_URL, "AB23-EFG7"));
-        Ok(ClaimStarted {
-            key_claim_id: CLAIM_ID.to_string(),
-            claim_url: claim_url.to_string(),
-            key_code: key_code.to_string(),
-            expires_at: "2026-11-24T12:00:00Z".to_string(),
+        let api_base = self.claim_api_base.unwrap_or("https://api.ottto.net");
+        checked_claim_start(api_base, || {
+            Ok(ClaimStarted {
+                key_claim_id: CLAIM_ID.to_string(),
+                claim_url: claim_url.to_string(),
+                key_code: key_code.to_string(),
+                expires_at: "2026-11-24T12:00:00Z".to_string(),
+            })
         })
     }
 
@@ -493,6 +499,53 @@ fn claim_start_and_state_reach_the_server() {
         )),
         "invalid_argument"
     );
+}
+
+/// [behaviour] The signer opens claims only on the web origin for the connected API.
+#[test]
+fn claim_start_requires_the_connected_apis_compiled_web_origin() {
+    const PRODUCTION_API: &str = "https://api.ottto.net";
+    const STAGING_API: &str = "https://staging.tail21f014.ts.net:8443";
+    const STAGING_CLAIM: &str =
+        "https://staging.tail21f014.ts.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
+    const OTHER_CLAIM: &str =
+        "https://example.test/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
+
+    for (api, claim_url, accepted) in [
+        (PRODUCTION_API, CLAIM_URL, true),
+        (STAGING_API, STAGING_CLAIM, true),
+        (PRODUCTION_API, STAGING_CLAIM, false),
+        (STAGING_API, CLAIM_URL, false),
+        (PRODUCTION_API, OTHER_CLAIM, false),
+        (STAGING_API, OTHER_CLAIM, false),
+        ("https://example.test", CLAIM_URL, false),
+        ("https://staging.tail21f014.ts.net", STAGING_CLAIM, false),
+    ] {
+        let channel = Channel::new(FakeServer {
+            claim_api_base: Some(api),
+            claim_fields: Some((claim_url, "AB23-EFG7")),
+            ..FakeServer::default()
+        });
+        channel.hello(1);
+        let reply = channel.send(
+            1,
+            "cloud_keys_claim_start",
+            json!({ "client_claim_id": CLAIM_ID, "device_key_spki_b64": "BBBB" }),
+        );
+        if accepted {
+            assert_eq!(reply["result"]["claim_url"], claim_url, "{api}");
+        } else {
+            assert_eq!(error_code(&reply), "server_untrusted", "{api} {claim_url}");
+            assert!(reply.get("result").is_none());
+        }
+    }
+
+    assert_eq!(
+        validated_cloud_api_base_url(STAGING_API).unwrap(),
+        STAGING_API
+    );
+    assert!(crate::control::validated_api_base_url(Some(STAGING_API)).is_err());
+    assert!(validated_cloud_api_base_url("https://staging.tail21f014.ts.net:8444").is_err());
 }
 
 /// [behaviour] No browser link or forward code is returned until both pass the local checks.

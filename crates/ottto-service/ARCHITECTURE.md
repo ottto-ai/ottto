@@ -981,9 +981,10 @@ never sees a key.
   `DELETE` body the same way. When the server specifically refuses the run token, the service
   refreshes and resends the identical request only if the run and organization both match the
   original binding. An ambiguous enrollment response requires a claim-state readback.
-- **Browser claim.** The service returns the claim link only when it names the returned UUID on
-  `https://app.ottto.net/setup/cloud-keys?claim=…` and the forward key code has the expected
-  Base32 shape.
+- **Browser claim.** The service selects the web origin from a compiled production and staging
+  table using the API bound to the claim request. It returns a link only for that origin's
+  `/setup/cloud-keys?claim=…` route with the returned UUID and a valid forward key code.
+  The exact staging API is trusted for cloud setup-run requests and their token refresh.
 - **Sign queue.** In memory only: at most four live requests, a device proof until its
   challenge expires and an approval until its `sign_by`; one request per approval id, and a new
   approval supersedes the attempt's older one once the replacement passes expiry and capacity
