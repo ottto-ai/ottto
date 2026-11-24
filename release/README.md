@@ -188,7 +188,11 @@ present owner-aware instructions for Homebrew, hosted-installer, and
 app-bundled installs without self-overwriting files managed by another owner.
 The manifest also carries a `supply_chain` block for SLSA Build Track
 provenance and CycloneDX SBOM evidence. `macos_package.sh` generates
-`ottto-local-platform-sbom.cdx.json` and records it in the manifest; the release
+`ottto-local-platform-sbom.cdx.json` and records it in the manifest. The SBOM
+lists the Apple Silicon build graph of the CLI and daemon (normal and build
+dependencies, with each crate's declared license), the closed-source Companion
+app, the Sparkle version pinned by the app source commit (which must match the
+embedded framework) and the fonts bundled in the app. The release
 workflow writes `subject.checksums.txt`, calls `actions/attest@v4` for build
 provenance and SBOM attestations, verifies those attestations with
 `gh attestation verify`, and runs `macos_attestation_bind.sh` before any stable
@@ -403,10 +407,13 @@ to the release tag:
   --source-ref refs/tags/v<version>
 ```
 
-The binder updates only `supply_chain.slsa_build` and `supply_chain.sbom`, sets
-Build L2 verified metadata only after `gh attestation verify` succeeds for the
-release subjects, and leaves stable preflight red while those fields still
-describe only local Build L1 metadata.
+The binder updates only `supply_chain.slsa_build` and `supply_chain.sbom`. It
+sets both `attested`/`verified` pairs only after `gh attestation verify`
+succeeds for every release subject and both predicate types, and stable
+preflight stays red until it does. Releases are built on a self-hosted signing
+Mac, so the manifest records SLSA Build L1 (`build_l1`): the verified GitHub
+attestations add signed provenance and SBOM evidence for that build without
+raising its level. Historical L2 manifests remain valid inputs.
 
 After attestation binding, sign and verify the final manifest bytes:
 
@@ -489,9 +496,10 @@ AWS/CDN prerequisites before publish:
 8. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
    SHA-256, is uploaded under the immutable prefix, and is attested with
    predicate `https://cyclonedx.org/bom`.
-9. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
-   Build L2 or better, covers every artifact plus `release-manifest.json` and
-   the SBOM, and has verified GitHub attestation evidence. Bind that evidence
+9. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, records the
+   signing-Mac build as SLSA Build L1, covers every artifact plus
+   `release-manifest.json` and the SBOM, and has verified GitHub attestation
+   evidence for each subject (both `attested`/`verified` pairs true). Bind that evidence
    and sign the final manifest with `macos_manifest_signature.sh`.
 10. Run `macos_release_gate.sh` and
    `macos_stable_preflight.sh --require-installer-sha256` against the exact
