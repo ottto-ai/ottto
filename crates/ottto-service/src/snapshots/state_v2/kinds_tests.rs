@@ -47,6 +47,9 @@ impl Scratch {
         db.control("generation", &0_u64).unwrap();
         (Self(dir), db)
     }
+    /// `finish_import` releases the owner lock and the store reopens at once. A process another
+    /// test spawns meanwhile can still hold a copy of that lock, so every caller runs isolated
+    /// (`test_isolation::run_here`).
     fn live_store() -> (Self, sqlite::Sqlite) {
         let (scratch, db) = Self::store();
         db.finish_import().unwrap();
@@ -375,6 +378,9 @@ impl Value for Stored {
 /// [format] last shared literal release marks erasure in the deleting transaction and rollback keeps it.
 #[test]
 fn last_shared_literal_release_marks_erasure_in_the_deleting_transaction_and_rollback_keeps_it() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     let evidence = interning::RequestEvidence::Account {
         prefixes: "/synthetic/private-prefix",
@@ -541,6 +547,9 @@ fn is_census(key: &RowKey) -> bool {
 /// the baseline is still rewritten.
 #[test]
 fn seeded_census_baseline_commits_to_the_stored_row() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use crate::snapshots::claude_request_census::{
         ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
     };
@@ -675,6 +684,9 @@ fn growth_raw_hold_survives_composed_hydration_and_cas_cannot_release_it() {
 /// [format] committed saves publish their generation; page-cap failures keep the committed graph.
 #[test]
 fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &fixture());
     let (prev, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
@@ -728,6 +740,9 @@ fn committed_save_gcs_after_its_generation_and_failed_save_never_gcs() {
 /// reloads the complete committed graph. Either path can retry from hydration.
 #[test]
 fn refused_commit_refuses_reload_required_without_post_commit() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for after_commit in [false, true] {
         let (_scratch, mut db) = Scratch::live_store();
         commit_populate(&mut db, &fixture());
@@ -774,6 +789,9 @@ fn refused_commit_refuses_reload_required_without_post_commit() {
 /// [format] stale generation or future writer refuses before saving.
 #[test]
 fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for future_writer in [false, true] {
         let (_scratch, mut db) = Scratch::live_store();
         commit_populate(&mut db, &fixture());
@@ -797,6 +815,9 @@ fn stale_generation_or_future_writer_refuses_before_restart_side_effects() {
 /// [money] a refused COMMIT preserves unsettled custody through subsequent independent saves.
 #[test]
 fn refused_commit_preserves_owed_custody_through_independent_saves() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     let mut prev = fixture();
     prev.accepted_rebuild_incidence
@@ -1572,6 +1593,9 @@ fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
 /// second save brings none of them back.
 #[test]
 fn retired_purge_keeps_co_owned_request_set() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &with_co_owned_witness(fixture()));
     let keys = seed_retired_rows(&mut db, true);
@@ -1643,6 +1667,9 @@ fn retired_purge_keeps_co_owned_request_set() {
 /// good save removes them.
 #[test]
 fn interrupted_purge_save_keeps_rows() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &with_co_owned_witness(fixture()));
     let keys = seed_retired_rows(&mut db, true);
@@ -1672,6 +1699,9 @@ fn interrupted_purge_save_keeps_rows() {
 /// metadata without the fields.
 #[test]
 fn retired_raw_holds_load_and_are_purged_by_the_next_save() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     const FIELDS: [&str; 3] = [
         "claude_usage_family_pending",
         "claude_account_family_pending",
@@ -1724,6 +1754,9 @@ fn retired_raw_holds_load_and_are_purged_by_the_next_save() {
 /// re-read, and the next save removes every row.
 #[test]
 fn retired_family_tombstone_rows_load_and_are_purged_by_the_next_save() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     let index = fixture();
     commit_populate(&mut db, &index);
@@ -1779,6 +1812,9 @@ fn retired_family_tombstone_rows_load_and_are_purged_by_the_next_save() {
 /// can read does not fail the load, and the row is still named for removal.
 #[test]
 fn corrupt_retired_row_does_not_fail_load() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &fixture());
     let rows = [
@@ -1806,6 +1842,9 @@ fn corrupt_retired_row_does_not_fail_load() {
 /// restores the graph alone.
 #[test]
 fn graph_save_keeps_progress_rows_outside_the_graph() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (_scratch, mut db) = Scratch::live_store();
     commit_populate(&mut db, &fixture());
     let rows = [
