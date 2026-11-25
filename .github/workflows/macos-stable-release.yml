@@ -266,7 +266,7 @@ jobs:
             exit 1
           }
           test -f "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
-            echo "Stable-candidate RC evidence file does not exist: $OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" >&2
+            echo "Stable-candidate RC evidence file named by OTTTO_STABLE_CANDIDATE_RC_EVIDENCE does not exist." >&2
             exit 1
           }
           cp "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" dist/macos/stable-candidate-rc-qa.json
