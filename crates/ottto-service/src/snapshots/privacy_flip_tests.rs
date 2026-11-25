@@ -216,6 +216,10 @@ fn settled(source: SnapshotSource, mode: Mode) -> Fixture {
 /// unaffected file is already proven by its mode-free receipt.
 #[test]
 fn flip_reads_and_sends_nothing_on_unchanged_files() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for source in SOURCES {
         for bit in &FLIPS {
             for start in [false, true] {
@@ -245,6 +249,10 @@ fn flip_reads_and_sends_nothing_on_unchanged_files() {
 /// the delivery context.
 #[test]
 fn copy_prefix_reread_mode_flip_reads_nothing() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let mut f = settled(SnapshotSource::ClaudeCode, mode(false));
     f.flip_to(Mode {
         copy: true,
@@ -269,6 +277,10 @@ fn copy_prefix_reread_mode_flip_reads_nothing() {
 /// of the untouched file either: settings are forward-only.
 #[test]
 fn shared_entity_body_not_context_decides_the_untouched_alias() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let mut f = Fixture::new(SnapshotSource::Pi);
     f.flip(all(false));
     let a = f.index.active_upload_context_fingerprint.clone().unwrap();
@@ -387,6 +399,10 @@ fn shared_entity_body_not_context_decides_the_untouched_alias() {
 /// never compared, so neither reads nor holds. Nothing is read or sent.
 #[test]
 fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for source in SOURCES {
         let mut f = Fixture::new(source);
         f.flip(all(false));
@@ -462,6 +478,10 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
 /// decides the wire.
 #[test]
 fn links_are_scraped_with_links_off_and_absent_on_the_wire() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let off = all(false);
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.append(&material(f.source));
