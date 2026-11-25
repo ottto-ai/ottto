@@ -616,7 +616,8 @@ fn unproven(logs: &[Value]) -> Value {
 /// archive records exactly the length the head read and that read ended on a
 /// sealed line. Otherwise the archive is read once as a new file: turns
 /// appended before compression count, the session's emitted or carried body,
-/// placement and Codex evidence equal a cold Full's, the next pass is quiet,
+/// placement and Codex evidence equal a cold Full's, the next pass in the
+/// same process is quiet,
 /// and only the archive stays indexed. Two accounts, a side call and an
 /// evidence gap stay in the corpus.
 #[test]
@@ -662,7 +663,9 @@ fn compression_carries_only_a_proven_complete_read() {
         fs::remove_file(&original).unwrap();
         let (old_key, new_key) = (local_index_key(&original), local_index_key(&compressed));
         let before = index.clone();
-        let (working, scan, _, _, logs) = page(&c, index, Arc::default());
+        // One process-lifetime cache, as the daemon keeps across passes.
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (working, scan, _, _, logs) = page(&c, index, cache.clone());
         let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
         let Some(reason) = reason else {
             assert_eq!(full_decodes(&logs), 0, "{case}: carried without a decode");
@@ -689,7 +692,7 @@ fn compression_carries_only_a_proven_complete_read() {
         let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
         cold.snapshots.retain(|item| item.source_session_id == MAIN);
         money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
-        let (index, _) = assert_quiet(&c, index, &warm);
+        let (index, _) = assert_quiet_on(&c, index, &warm, cache);
         assert!(!index.files.contains_key(&old_key), "{case}: the predecessor retired");
         assert!(index.files.contains_key(&new_key), "{case}");
     }
