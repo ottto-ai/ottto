@@ -43,13 +43,13 @@ fi
 for zip_stage in 'CLI_ZIP cli' 'DAEMON_ZIP daemon'; do
   zip_var="${zip_stage% *}"
   stage="${zip_stage#* }"
-  if ! grep -Fxq "  ditto -c -k \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
+  if ! grep -Fxq "  ottto_release_zip \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
     echo "Package script must zip the $stage staging folder with its license notices." >&2
     exit 1
   fi
 done
 # shellcheck disable=SC2016
-if grep -Eq 'ditto -c -k "\$OUTPUT_DIR/ottto(-service)?"' "$package_script"; then
+if grep -Eq '(ditto -c -k|ottto_release_zip) "\$OUTPUT_DIR/ottto(-service)?"' "$package_script"; then
   echo "Package script must not zip a bare executable without its license notices." >&2
   exit 1
 fi
@@ -61,6 +61,7 @@ cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_sc
 cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
 cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 11;

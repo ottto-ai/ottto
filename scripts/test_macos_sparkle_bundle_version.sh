@@ -57,6 +57,7 @@ cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companio
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
 # shellcheck source=scripts/macos_license_notices.sh
 source "$ROOT/scripts/macos_license_notices.sh"
 sparkle_license="licenses/Sparkle-$OTTTO_SPARKLE_LICENSE_VERSION-LICENSE"
@@ -167,20 +168,32 @@ jq -n --arg version "$version" --arg sparkle_version "$sparkle_version" \
 SBOM
 chmod +x "$repo/scripts/cyclonedx_sbom.sh"
 
+# Archive calls are logged with their time zone; the last two arguments are
+# always the input and the output.
+export fixture_ditto_archive_log="$TMP_DIR/ditto-archive.log"
 cat > "$mock_bin/ditto" <<'DITTO'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "-c" && "${2:-}" == "-k" && -d "$3" ]]; then
-  if [[ "${fixture_fail_daemon_zip:-}" == "true" && "$3" == */daemon ]]; then
-    echo "Fixture daemon zip creation failed" >&2
-    exit 1
+if [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
+  printf 'TZ=%s %s\n' "${TZ:-}" "$*" >> "$fixture_ditto_archive_log"
+  src=""
+  dst=""
+  for arg in "$@"; do
+    src="$dst"
+    dst="$arg"
+  done
+  if [[ -d "$src" ]]; then
+    if [[ "${fixture_fail_daemon_zip:-}" == "true" && "$src" == */daemon ]]; then
+      echo "Fixture daemon zip creation failed" >&2
+      exit 1
+    fi
+    # A folder "zip" lists its entries with their hashes.
+    (cd "$src" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
+      printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
+    done) > "$dst"
+  else
+    cp "$src" "$dst"
   fi
-  # A folder "zip" lists its entries with their hashes.
-  (cd "$3" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
-    printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
-  done) > "$4"
-elif [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
-  cp "$3" "$4"
 else
   cp -R "$1" "$2"
 fi
@@ -453,6 +466,16 @@ if [[ -e "$gh_calls" ]]; then
   cat "$gh_calls" >&2
   exit 1
 fi
+
+# [behaviour] Both published zips are written in UTC without resource forks or
+# extended attributes.
+for zip_name in "ottto-macos-" "ottto-service-macos-"; do
+  if ! grep -Eq "^TZ=UTC -c -k --norsrc --noextattr .* $output_dir/${zip_name}[a-z0-9_]+\.zip\$" "$fixture_ditto_archive_log"; then
+    echo "Published zip ${zip_name}* must be archived with TZ=UTC --norsrc --noextattr" >&2
+    cat "$fixture_ditto_archive_log" >&2
+    exit 1
+  fi
+done
 
 # [behaviour] The signed app carries the four license notices, and each binary
 # zip holds exactly its executable plus three notices at its root.

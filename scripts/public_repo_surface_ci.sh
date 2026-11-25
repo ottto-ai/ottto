@@ -312,6 +312,7 @@ run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_com
 run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step B "test macOS license notices" bash scripts/test_macos_license_notices.sh
 run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
+run_step M "test macOS release archives" bash scripts/test_macos_release_archive.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
 run_step B "test macOS notarization artifact selection" bash scripts/test_macos_notarize_filter.sh
