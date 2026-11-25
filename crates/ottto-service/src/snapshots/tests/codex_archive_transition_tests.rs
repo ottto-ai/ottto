@@ -615,9 +615,10 @@ fn unproven(logs: &[Value]) -> Value {
 /// [money] A Codex compression carries its predecessor's head only when the
 /// archive records exactly the length the head read and that read ended on a
 /// sealed line. Otherwise the archive is read once as a new file: turns
-/// appended before compression count, the family's emitted and carried bodies
-/// and placement equal a cold Full's, the next pass is quiet, and only the
-/// archive stays indexed. Two accounts, a side call and an evidence gap.
+/// appended before compression count, the session's emitted or carried body,
+/// placement and Codex evidence equal a cold Full's, the next pass is quiet,
+/// and only the archive stays indexed. Two accounts, a side call and an
+/// evidence gap stay in the corpus.
 #[test]
 fn compression_carries_only_a_proven_complete_read() {
     let _lock = DECODER_TEST_LOCK
@@ -684,7 +685,9 @@ fn compression_carries_only_a_proven_complete_read() {
         let mut carried = first_route.accepted.clone();
         carried.extend(warm.accepted.clone());
         warm.accepted = carried;
-        let (_, cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+        // Only MAIN's file changed; the other sessions are not read again.
+        let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+        cold.snapshots.retain(|item| item.source_session_id == MAIN);
         money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
         let (index, _) = assert_quiet(&c, index, &warm);
         assert!(!index.files.contains_key(&old_key), "{case}: the predecessor retired");
