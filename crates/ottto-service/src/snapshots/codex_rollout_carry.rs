@@ -64,6 +64,16 @@ fn compression_unproven(
     }
 }
 
+pub(super) fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
+    // A header refresh must never make newly appended bytes look applied.
+    // Its inventory stamp is seeded only at the logical checkpoint or carry;
+    // a later ordinary checkpoint can supersede that older physical stamp.
+    head.common.inventory.as_ref().is_some_and(|facts| {
+        crate::transcript_acquisition::FileStamp::capture(metadata.clone())
+            .is_ok_and(|stamp| facts.stamp.matches_acquisition(&stamp))
+    }) || tail_source::certified_physical_matches(&head.body, metadata)
+}
+
 impl ScanIndex {
     /// One physical equality seam for listing, hints, selection and freshness.
     /// A legacy head uses its existing object certificate; no historical read.
@@ -426,7 +436,9 @@ impl ScanIndex {
 pub(in crate::snapshots) fn codex_archive_bytes(plain: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
-    encoder.set_pledged_src_size(Some(plain.len() as u64)).unwrap();
+    encoder
+        .set_pledged_src_size(Some(plain.len() as u64))
+        .unwrap();
     encoder.write_all(plain).unwrap();
     encoder.finish().unwrap()
 }
