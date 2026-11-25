@@ -375,9 +375,11 @@ fn heads(accepted: &BTreeMap<String, Accepted>) -> BTreeMap<String, (u64, u64)> 
 
 /// [money] One family, four exactly acknowledged entities. A main-only
 /// append changes only the main's ACK; an append to one child's later twin
-/// then changes only that child's ACK, its copied prefix counted once. Every
-/// other entity keeps its last body and witness, the new witness is saved,
-/// and the carried family matches cold, placement included.
+/// then changes only that child's ACK, its copied prefix counted once. Each
+/// append is a tool turn on that one copy, so the tool rows merge over the
+/// twins whichever copy is read first. Every other entity keeps its last body
+/// and witness, the new witness is saved, and the carried family matches cold,
+/// placement included.
 #[test]
 fn family_entities_keep_exact_heads_across_acks() {
     with_e2(|| {
@@ -403,16 +405,15 @@ fn family_entities_keep_exact_heads_across_acks() {
         assert_eq!(heads(&carried), expected, "seed");
         assert_eq!(family(&heads(&carried)), (70, 5));
         let mut prior = commit(&session, first);
-        for (step, relative, twin, entity, head, total) in [
+        for (step, relative, entity, head, total) in [
             (
                 0,
                 format!("z/{ROOT}.jsonl"),
-                format!("a/{ROOT}.jsonl"),
                 ROOT.to_string(),
                 (29, 3),
                 (78, 6),
             ),
-            (1, member("z", 0), member("a", 0), child(0), (28, 2), (86, 7)),
+            (1, member("z", 0), child(0), (28, 2), (86, 7)),
         ] {
             let path = c.root.join(relative);
             let request = format!("family-head-{step}");
@@ -425,15 +426,10 @@ fn family_entities_keep_exact_heads_across_acks() {
                 "name": "Read",
                 "input": {},
             }]);
-            // Both twins carry the tool turn because the first item's list is published.
+            // Only the grown copy holds the tool turn.
             append(&path, &(turn.to_string() + "\n"));
-            turn["requestId"] = json!(format!("{request}-tool"));
-            turn["message"]["id"] = json!(format!("msg-{request}-tool"));
-            turn["message"]["usage"] = json!({"input_tokens":0,"output_tokens":0});
-            let twin = c.root.join(twin);
-            append(&twin, &(turn.to_string() + "\n"));
 
-            let mut warm = hinted(&c, prior, 100, true, &[path, twin]);
+            let mut warm = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
             let mut actual = result(&warm, Mode::Ram);
             actual.accepted = carried.clone();
             money_oracle::assert_carried_equivalent(&cold(&c), &actual);
