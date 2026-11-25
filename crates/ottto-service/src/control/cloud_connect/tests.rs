@@ -227,6 +227,10 @@ fn enroll_args() -> Value {
 const ENROLL_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/enroll_wire_v1.json");
 /// The signer channel's wire, shared with the Mac app's tests.
 const SIGNER_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/signer_wire_v1.json");
+/// The server's Mac approval signing vector, vendored byte for byte: the server serves this
+/// payload in R2 and accepts this signature in R5.
+const APPROVAL_SIGNATURE: &str =
+    include_str!("../../../../../fixtures/cloud_connect/signatures_v4.json");
 
 fn fixture(text: &str) -> Value {
     serde_json::from_str(text).expect("fixture is JSON")
@@ -1433,4 +1437,43 @@ fn approval_payload_is_signed_unchanged_and_posted_as_the_r5_body() {
     ] {
         assert_eq!(check(&canonical(&payload)).unwrap_err().code, code);
     }
+}
+
+/// [behaviour] The server's approval signing vector passes the service's fact checks unchanged,
+/// and the R5 body carries its approval ID and signature exactly as the server accepts them.
+#[test]
+fn approval_signing_vector_reaches_r5_unchanged() {
+    use super::agent::{approval_body, checked_approval};
+    let vector = fixture(APPROVAL_SIGNATURE);
+    let payload_b64 = text(&vector, "payload_b64");
+    let payload = wire::decode_base64url(payload_b64).unwrap();
+    let facts: Value = serde_json::from_slice(&payload).unwrap();
+    let approval_id = text(&facts, "approval_id");
+    let attempt_id = text(&facts, "attempt_id");
+    let account = text(&facts["target"], "id");
+    // sign_by 1764000600 as the R2 approval object states it.
+    let approval = json!({
+        "approval_id": approval_id, "payload_b64": payload_b64,
+        "sign_by": "2025-11-24T16:10:00Z", "next_actions": ["approve_on_mac"],
+    });
+    let attempt = json!({"attempt_id": attempt_id, "account_id": account, "input_revision": 1});
+    let checked = checked_approval(
+        &approval,
+        &attempt,
+        text(&facts, "org_id"),
+        attempt_id,
+        account,
+    )
+    .unwrap();
+    assert_eq!(checked.payload, payload);
+    assert_eq!(checked.sign_by, 1_764_000_600);
+    let signature = text(&vector, "signature");
+    let body = approval_body(
+        &checked.approval_id,
+        &wire::decode_base64url(signature).unwrap(),
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        format!(r#"{{"approval_id":"{approval_id}","signature":"{signature}"}}"#)
+    );
 }
