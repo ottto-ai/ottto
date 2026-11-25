@@ -60,9 +60,12 @@ checked; adding, deleting or retyping one of them is checked as usual.
   - every added glob in an existing module or a module with moved items fails;
   - every added explicit binding beside an item-level macro call in a module
     with moved items fails (a macro can expand to `use` items this check cannot
-    see), except exact `thread_local!`, `crate::heap_layout_bound::fields!`,
-    `crate::heap_layout_bound::split_fields!` and `crate::heap_layout_bound::no_heap!`
-    calls, whose expansions cannot introduce module-level imports, and calls
+    see), except exact `thread_local!`, `std::thread_local!`,
+    `crate::heap_layout_bound::fields!`, `crate::heap_layout_bound::split_fields!`,
+    `crate::heap_layout_bound::no_heap!`,
+    `crate::local_resource_diagnostics::process_static!` and
+    `crate::durable_tail_codec::durable_struct!` calls, whose expansions cannot
+    introduce module-level imports, and calls
     inside an `impl` block, which expand only to associated items;
   - other added and removed bindings are glue; a `use` item this check cannot
     read fails.
@@ -101,8 +104,13 @@ GLUE = {"use", "mod-decl", "include", "inner-doc"}
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 # Exact lexer names at the audited call sites; aliases and other paths stay guarded.
 # The three heap_layout_bound macros expand only to `impl crate::heap_layout_bound::HeapLayoutBound for $t {..}`.
-IMPORT_FREE_MACROS = {"thread_local!", "crate::heap_layout_bound::fields!", "crate::heap_layout_bound::split_fields!",
-                      "crate::heap_layout_bound::no_heap!"}
+# `std::thread_local!` is the same std macro as `thread_local!`. `process_static!` expands to one
+# `$vis fn $with<T>(..) -> T {..}` holding its static inside the body. `durable_struct!` expands only to
+# `impl $crate::durable_tail_codec::{Durable, DurableKey} for $t {..}` and its own `$crate::`-qualified recursion.
+IMPORT_FREE_MACROS = {"thread_local!", "std::thread_local!", "crate::heap_layout_bound::fields!",
+                      "crate::heap_layout_bound::split_fields!", "crate::heap_layout_bound::no_heap!",
+                      "crate::local_resource_diagnostics::process_static!",
+                      "crate::durable_tail_codec::durable_struct!"}
 REPORT_LIMIT = 50
 # Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
 # by path or text, so their edits are listed as validator edits and never checked as moves.
