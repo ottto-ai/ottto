@@ -252,8 +252,10 @@ fi
 if [[ "$channel" != "stable" ]]; then
   fail "Stable closeout requires channel=stable, got: $channel"
 fi
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  fail "Stable closeout manifest version must be X.Y.Z"
+# Canonical numeric triple: no leading zeros, at most 9 digits per component.
+version_component='(0|[1-9][0-9]{0,8})'
+if [[ ! "$version" =~ ^${version_component}\.${version_component}\.${version_component}$ ]]; then
+  fail "Stable closeout manifest version must be X.Y.Z (canonical numbers, at most 9 digits each)"
 fi
 if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ ]]; then
   fail "Stable closeout manifest commit is not a git SHA prefix: $commit"
@@ -362,7 +364,8 @@ if ! jq -e \
         and (.value.result | name)
         and (.value.method | name)
         and (if (.value | has("from"))
-          then (.value.from | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+(-rc[0-9]+)?$"))
+          then (.value.from | type == "string"
+            and test("^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})(-rc[1-9][0-9]*)?$"))
           else true end)))
   ' "$evidence_path" >/dev/null 2>&1; then
   echo "Stable clean-machine QA evidence is not a schema 2 summary of this manifest (unexpected or missing fields, wrong value types, or another manifest): $evidence_name" >&2
@@ -459,7 +462,7 @@ for owner in "${supported_owners[@]}"; do
         def ver: split(".") | map(tonumber);
         keys == ["from", "method", "result"]
         and (.method == "live" or .method == "scripted")
-        and ((.from | sub("-rc[0-9]+$"; "") | ver) as $from
+        and ((.from | sub("-rc[1-9][0-9]*$"; "") | ver) as $from
           | ($version | ver) as $this
           | $from[0] == $this[0]
             and $from[1] == $this[1]

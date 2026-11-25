@@ -350,6 +350,20 @@ dir="$(new_case carried-static)"
 mutate "$dir" "$(carry homebrew logout_json 0.1.6 static)"
 expect_failure "$dir" "homebrew.logout_json $bad_carry"
 
+# [contract] Version grammar shared with the release API reader: canonical
+# numbers (no leading zero, at most 9 digits), RC suffix -rcN with N >= 1.
+for from in 0.1.06 0.01.6 0.1.1234567890 0.1.7-rc0 0.1.7-rc01; do
+  dir="$(new_case "carried-noncanonical-from-$from")"
+  mutate "$dir" "$(carry homebrew logout_json "$from")"
+  expect_failure "$dir" "is not a schema 2 summary of this manifest"
+done
+
+for target in 0.01.7 0.1.07 0.1.1234567890 0.1.7-rc1; do
+  dir="$(new_case "target-version-$target")"
+  jq --arg v "$target" '.version = $v' "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
+  expect_failure "$dir" "Stable closeout manifest version must be X.Y.Z"
+done
+
 dir="$(new_case carried-from-word)"
 mutate "$dir" "$(carry homebrew logout_json latest)"
 expect_failure "$dir" "is not a schema 2 summary of this manifest"
