@@ -614,7 +614,8 @@ fn unproven(logs: &[Value]) -> Value {
 
 /// [money] A Codex compression carries its predecessor's head only when the
 /// archive records exactly the length the head read and that read ended on a
-/// sealed line. Otherwise the archive is read once as a new file: turns
+/// sealed line. A read that stopped mid-line leaves no certified head, so the
+/// archive is held as before. Otherwise the archive is read once as a new file: turns
 /// appended before compression count, the session's emitted or carried body,
 /// placement and Codex evidence equal a cold Full's, the next pass in the
 /// same process is quiet,
@@ -631,7 +632,7 @@ fn compression_carries_only_a_proven_complete_read() {
         ("grown", true, true, false, Some("length")),
         ("no length", false, false, false, Some("no_length")),
         ("no length, grown", false, true, false, Some("no_length")),
-        ("unsealed", true, false, true, Some("unsealed")),
+        ("unsealed", true, false, true, None),
     ] {
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
@@ -673,6 +674,16 @@ fn compression_carries_only_a_proven_complete_read() {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let (working, scan, _, _, logs) = page(&c, index, cache.clone());
         let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        if unsealed {
+            // A read that stopped mid-line leaves no certified head to carry:
+            // the existing refused-carry path holds the archive and the old
+            // entry, with no read, upload or money change.
+            assert_eq!(full_decodes(&logs), 0, "{case}");
+            assert!(scan.snapshots.is_empty() && posts.is_empty(), "{case}");
+            assert!(index.files.contains_key(&old_key), "{case}");
+            assert!(!index.files.contains_key(&new_key), "{case}");
+            continue;
+        }
         let Some(reason) = reason else {
             assert_eq!(full_decodes(&logs), 0, "{case}: carried without a decode");
             assert!(scan.snapshots.is_empty(), "{case}");
