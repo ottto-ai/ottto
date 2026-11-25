@@ -2173,7 +2173,17 @@ fn persistent_unreadable_carrier_repairs_after_two_saves() {
         };
         assert!(item.request_count <= limit);
     }
-    assert_eq!(canonical(&recovered), canonical(&healthy));
+    // Separate corpora: the fingerprints name each run's physical file, not money.
+    let portable = |items: &[SnapshotItem]| {
+        let mut values = serde_json::to_value(items).unwrap();
+        for value in values.as_array_mut().unwrap() {
+            let object = value.as_object_mut().unwrap();
+            object.remove("snapshot_fingerprint");
+            object.remove("source_file_fingerprint");
+        }
+        canonical(&values)
+    };
+    assert_eq!(portable(&recovered), portable(&healthy));
 }
 
 /// A store error on every carrier read for two saves sets nothing aside and resolves once reads work.
