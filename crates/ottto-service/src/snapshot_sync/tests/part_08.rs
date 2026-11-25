@@ -1566,7 +1566,7 @@ fn same_source_ack_account_destination_stop_invalidation_after_ack_keeps_ledger_
     }
 }
 #[test]
-fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+fn claude_typed_mixed_uses_full_enrichment_order() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Legacy session-account wire shape; `e2` emits request-owned account partitions.
@@ -1733,7 +1733,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
 #[test]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
-fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+fn claude_mixed_503_lost_ack_restart_preserves_candidate() {
     // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
     let (root, mut prior, _, _) = crate::snapshots::claude_request_account_mixed_fixture(2, true);

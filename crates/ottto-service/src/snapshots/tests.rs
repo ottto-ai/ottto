@@ -8292,7 +8292,7 @@ fn d1_subagent_account_specimen(
 }
 
 #[test]
-fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
+fn claude_subagent_coverage_lifecycle_and_shapes() {
     // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
     let (dir, root, items) = claude_account_family_fixture(true);
@@ -8669,7 +8669,7 @@ fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
 }
 
 #[test]
-fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
+fn claude_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
     // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
     let (dir, root, items) = claude_account_family_fixture(true);

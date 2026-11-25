@@ -63,7 +63,7 @@ fn value(tx: &mut impl Transaction, h: &Header) -> Vec<u8> {
 
 /// [format] f8 owner replacement reclaims all superseded parts atomically.
 #[test]
-fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
+fn owner_replacement_reclaims_all_superseded_parts_atomically() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -99,7 +99,7 @@ fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
 
 /// [format] f8 64 mib admission checks before read allocation.
 #[test]
-fn f8_64_mib_admission_checks_before_read_allocation() {
+fn the_64_mib_admission_checks_before_read_allocation() {
     let key = raw_hold("large".into());
     let admitted = preflight(&RowInput {
         value_version: 1,
@@ -121,7 +121,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
 
 /// [format] f8 json raw spelling hashes and positional neighbours survive.
 #[test]
-fn f8_json_raw_spelling_hashes_and_positional_neighbours_survive() {
+fn json_raw_spelling_hashes_and_positional_neighbours_survive() {
     let raw = br#"{ "source_file_fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "raw": {"retry_after_unix_seconds":"mistyped"}, "positional":[7,null,8], "unicode":"\u0041" }"#;
     for chunk in [1, 3, 32, 32768] {
         let mut encoder = codec::Encoder::new(Vec::new());
@@ -211,7 +211,7 @@ fn damaged_row_checksum_or_value_digest_refuses_before_any_value_byte() {
 
 /// [format] f8 orphan and dangling parts are damage without silent gc.
 #[test]
-fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {
+fn orphan_and_dangling_parts_are_damage_without_silent_gc() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
     sqlite::orphan_part_for_test(&mut db);
@@ -253,7 +253,7 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
 
 /// [format] f6 import is journal off and has no import wal.
 #[test]
-fn f6_import_is_journal_off_and_has_no_import_wal() {
+fn import_is_journal_off_and_has_no_import_wal() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -360,7 +360,7 @@ fn owner_sidecar_rejects_symlinks_and_hardlinks_before_db_creation() {
 
 /// [format] f5 independent identity mismatch refuses before wal mutation.
 #[test]
-fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
+fn independent_identity_mismatch_refuses_before_wal_mutation() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -378,7 +378,7 @@ fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
 
 /// [format] f6 pl in values requires purge even with hash only keys.
 #[test]
-fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
+fn pl_in_values_requires_purge_even_with_hash_only_keys() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -438,7 +438,7 @@ fn over_budget_path_diff_commits_and_requires_erasure() {
 
 /// [format] f6 passive complete can leave allocated wal and allows next write.
 #[test]
-fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
+fn passive_complete_can_leave_allocated_wal_and_allows_next_write() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -471,7 +471,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
 
 /// [format] f9 unknown top nested array tail and reserved money pause.
 #[test]
-fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
+fn unknown_top_nested_array_tail_and_reserved_money_pause() {
     for (raw, expected) in [
         (
             r#"{"files":{},"future_custody":{"owed":true}}"#,
@@ -504,7 +504,7 @@ fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
 
 /// [format] f9 unknown plus malformed is a conversion refusal without writes.
 #[test]
-fn f9_unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
+fn unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
     let raw = br#"{"files":{},"future_custody": { definitely malformed"#;
     assert_eq!(
         codec::inventory(std::io::Cursor::new(raw)),
@@ -559,7 +559,7 @@ fn independent_identity_is_write_once() {
 
 /// [format] f6 deadline keeps writes live without resetting oldest purge.
 #[test]
-fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
+fn deadline_keeps_writes_live_without_resetting_oldest_purge() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -608,7 +608,7 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
 
 /// [format] f8 vacuum churn removes deleted keys and pl values.
 #[test]
-fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
+fn vacuum_churn_removes_deleted_keys_and_pl_values() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -833,7 +833,7 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
 
 /// [format] f8 set last reference reclaims parts without reusing ids.
 #[test]
-fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
+fn set_last_reference_reclaims_parts_without_reusing_ids() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -870,7 +870,7 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
 
 /// [format] f6 busy purge retains obligation paces retry and allows in deadline writes.
 #[test]
-fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
+fn busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -923,7 +923,7 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
 
 /// [format] f6 restart between vacuum and metadata clear keeps pending debt.
 #[test]
-fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
+fn restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -952,7 +952,7 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
 
 /// [format] f6 overdue recovery overrides a future attempt clock.
 #[test]
-fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
+fn overdue_recovery_overrides_a_future_attempt_clock() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1013,7 +1013,7 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
 }
 /// [format] c1 same key rewrites and path set diffs.
 #[test]
-fn c1_same_key_rewrites_and_path_set_diffs() {
+fn same_key_rewrites_and_path_set_diffs() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1772,7 +1772,7 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
 }
 /// [format] f8 damaged header refuses both lookup and scan before owned copy.
 #[test]
-fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
+fn damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
     if !crate::test_isolation::run_here() {
         return;
     }
@@ -1902,7 +1902,7 @@ fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
 }
 /// [format] f8 corrupted refcount cannot reclaim evidence or commit sibling changes.
 #[test]
-fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
+fn corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
     if !crate::test_isolation::run_here() {
         return;
     }

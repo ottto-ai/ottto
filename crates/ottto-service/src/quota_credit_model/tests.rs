@@ -141,7 +141,7 @@ fn overflow(count: usize) -> Vec<GrantInput> {
 }
 
 #[test]
-fn v21_case4_overflow_without_count_stays_partial() {
+fn v21_overflow_without_count_stays_partial() {
     let build = build_grants(read(Provider::OpenAi, None, overflow(25)));
     assert!(!build.sender_capped);
     let mut balance = saved_resets(None, READ_AT);
@@ -154,7 +154,7 @@ fn v21_case4_overflow_without_count_stays_partial() {
 }
 
 #[test]
-fn v21_case7_redeemed_and_past_expiry_have_no_expired_status() {
+fn v21_redeemed_and_past_expiry_have_no_expired_status() {
     let mut redeemed = openai_grant("r1", "2026-08-01T00:00:00Z", Some("2026-08-05T00:00:00Z"));
     redeemed.status = GrantStatusInput::Reported(Field::Value("redeemed".to_string()));
     let past = openai_grant("p1", "2026-08-02T00:00:00Z", Some("2026-08-10T00:00:00Z"));
@@ -178,7 +178,7 @@ fn v21_case7_redeemed_and_past_expiry_have_no_expired_status() {
 }
 
 #[test]
-fn v21_case11_invalid_id_drops_grant_and_makes_list_partial() {
+fn v21_invalid_id_drops_grant_and_makes_list_partial() {
     let mut missing = openai_grant("x", "2026-09-20T09:15:00Z", None);
     missing.id = Field::Absent;
     let mut wrong_type = openai_grant("x", "2026-09-20T09:15:00Z", None);
@@ -226,7 +226,7 @@ fn v21_case11_invalid_id_drops_grant_and_makes_list_partial() {
 }
 
 #[test]
-fn v21_case17_oversized_and_unknown_values() {
+fn v21_oversized_and_unknown_values() {
     let long_title = "Reset ".repeat(40);
     let mut grant = openai_grant("t1", "2026-09-20T09:15:00Z", None);
     grant.title = Field::Value(long_title.clone());

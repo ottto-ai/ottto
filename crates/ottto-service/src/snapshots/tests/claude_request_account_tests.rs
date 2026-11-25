@@ -26,7 +26,7 @@ pub(crate) fn output(name: &str, item: &SnapshotItem) {
 }
 
 #[test]
-fn claude_p92_clock_qualification_and_all_bucket_coverage() {
+fn claude_clock_qualification_and_all_bucket_coverage() {
     // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, root, items) = claude_account_family_fixture(true);
@@ -369,7 +369,7 @@ pub(crate) fn claude_request_account_mixed_fixture(
 }
 
 #[test]
-fn claude_p92_mixed_body_capability_and_restart_refusals() {
+fn claude_mixed_body_capability_and_restart_refusals() {
     // Session-account qualification and binding; `e2` keeps per-request account partitions.
 
     let (dir, mut mixed, api, trace) = claude_request_account_mixed_fixture(4, true);
@@ -698,7 +698,7 @@ fn h296_trace_refingerprint(row: &mut crate::claude_local_otel::ClaudeTraceOwner
 }
 
 #[test]
-fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
+fn claude_root_refuses_partial_no_otel_owners_and_collisions() {
     let (dir, original, api, trace) = h296_root_evidence();
     for case in [
         "no_otel",
@@ -795,7 +795,7 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 }
 
 #[test]
-fn claude_h296_root_production_enrichment_keeps_child_separate() {
+fn claude_root_production_enrichment_keeps_child_separate() {
     // [money] Production contract-5 placement keeps the root's own requests
     // separate from its child without manufacturing an original creator.
 
