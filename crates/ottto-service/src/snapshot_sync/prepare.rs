@@ -764,7 +764,7 @@ pub(super) fn prepare_sync_source_inner(
     if receipt_window_days == 0 {
         // The tombstone withdraws the server's census, which the armed
         // walk record stood for: the next pass at a real window walks.
-        crate::snapshots::walk_idle::clear(source);
+        crate::snapshots::walk_idle::clear(source, "window_zero");
         withdraw_and_report_policy_stop(
             client,
             device,

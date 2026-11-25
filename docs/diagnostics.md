@@ -1765,8 +1765,9 @@ the first pass after a start), `key:<input>` (the first gate input that moved:
 `owes:<kind>` (index debt: `persistence`, `unsettled_upload`, `decode_hold`,
 `account_hold`, `authority_quarantine`, `authority_correction`,
 `growth_claim`, `file_debt`), `cleared:<why>` (the record was dropped by a
-`hint`, a `listing` request, `disabled` collection, an `account_switch`,
-`walk_all`, a `failure`, a `resumed` source or an `idle_page_walked`) and
+`hint`, a `listing` request, `disabled` collection, a `window_zero` stop, an
+`account_switch`, `walk_all`, a `failure`, a `resumed` source or an
+`idle_page_walked`) and
 `no_record`. A rest the gate allowed but the scan's sidecar or census health
 check refused reports `health`. Passes inside a walk and resting passes emit
 nothing. A finish that retires a walk emits one `walk_gate` point with `arm`:
