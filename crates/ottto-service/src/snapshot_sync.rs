@@ -569,8 +569,8 @@ pub(crate) use tests::codex_archive_tests::{
 mod tests;
 
 #[cfg(test)]
-#[path = "snapshot_sync/tests/h357_ack_tests.rs"]
-mod h357_ack_tests;
+#[path = "snapshot_sync/tests/exact_body_ack_tests.rs"]
+mod exact_body_ack_tests;
 
 #[cfg(test)]
 #[path = "snapshot_sync/tests/tail_ack_ledger.rs"]

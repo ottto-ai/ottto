@@ -6,8 +6,8 @@ include!("tests/claude_request_account_tests.rs");
 mod claude_request_identity_tests {
     include!("tests/claude_request_identity_tests.rs");
 }
-mod census_p2_kept_tests {
-    include!("tests/census_p2_kept_tests.rs");
+mod census_held_key_tests {
+    include!("tests/census_held_key_tests.rs");
 }
 #[cfg(unix)]
 mod reread_trigger_content_tests {
