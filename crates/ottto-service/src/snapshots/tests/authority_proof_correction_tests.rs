@@ -7,7 +7,7 @@
 // content-free. The state-machine section is CONTROLLED: it seeds a granted
 // index, then runs the production seams in production order. The lifecycle
 // through real pages, uploads and reloads lives in
-// `snapshot_sync/authority_proof_correction_pipeline_tests.rs`.
+// `snapshot_sync/tests/authority_proof_correction_pipeline_tests.rs`.
 use super::*;
 
 const APC_ROOT: &str = "e1111111-1111-4111-8111-111111111111";
