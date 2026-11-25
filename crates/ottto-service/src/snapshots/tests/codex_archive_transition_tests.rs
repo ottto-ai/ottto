@@ -640,8 +640,10 @@ fn compression_carries_only_a_proven_complete_read() {
         c.write(GAP, None);
         let original = c.path(MAIN);
         if unsealed {
-            // Codex was mid-line at the read and never finished it.
-            append(&original, turn(3).trim_end());
+            // Codex stopped mid-line at the read and never finished it; a
+            // complete final line without its newline still seals.
+            let line = turn(3);
+            append(&original, &line[..line.len() / 2]);
         }
         let (_session, prior) = c.publish();
         let (working, first, _, _, _) = page(&c, prior.clone(), Arc::default());
