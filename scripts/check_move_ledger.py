@@ -60,8 +60,10 @@ checked; adding, deleting or retyping one of them is checked as usual.
   - every added glob in an existing module or a module with moved items fails;
   - every added explicit binding beside an item-level macro call in a module
     with moved items fails (a macro can expand to `use` items this check cannot
-    see), except exact `thread_local!` and `crate::heap_layout_bound::fields!`
-    calls, whose expansions cannot introduce module-level imports;
+    see), except exact `thread_local!`, `crate::heap_layout_bound::fields!`,
+    `crate::heap_layout_bound::split_fields!` and `crate::heap_layout_bound::no_heap!`
+    calls, whose expansions cannot introduce module-level imports, and calls
+    inside an `impl` block, which expand only to associated items;
   - other added and removed bindings are glue; a `use` item this check cannot
     read fails.
 
@@ -98,7 +100,9 @@ import rust_source_tree as rst
 GLUE = {"use", "mod-decl", "include", "inner-doc"}
 PATH_MACROS = {"include", "include_str", "include_bytes"}
 # Exact lexer names at the audited call sites; aliases and other paths stay guarded.
-IMPORT_FREE_MACROS = {"thread_local!", "crate::heap_layout_bound::fields!"}
+# The three heap_layout_bound macros expand only to `impl crate::heap_layout_bound::HeapLayoutBound for $t {..}`.
+IMPORT_FREE_MACROS = {"thread_local!", "crate::heap_layout_bound::fields!", "crate::heap_layout_bound::split_fields!",
+                      "crate::heap_layout_bound::no_heap!"}
 REPORT_LIMIT = 50
 # Design rule: validator anchors move in the PR that moves their anchor. These files check moved source
 # by path or text, so their edits are listed as validator edits and never checked as moves.
@@ -847,8 +851,9 @@ def check_uses(ledger: Ledger, base: Uses, head: Uses, base_modules: set[Module]
     for old, new in ledger.pairs:
         if old.module is not None and new.module is not None and old.module != new.module:
             touched |= {old.module, new.module}
+    # A call inside an impl block (a unit with a container) expands only to associated items, never a `use`.
     macros = {unit.module for unit in head_units
-              if unit.kind == "macro" and unit.name not in IMPORT_FREE_MACROS}
+              if unit.kind == "macro" and not unit.container and unit.name not in IMPORT_FREE_MACROS}
     removed: dict[str, list[tuple[Module, Binding]]] = {}
     for module, names in base.bound.items():
         for name, entries in names.items():
