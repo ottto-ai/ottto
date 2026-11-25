@@ -1321,7 +1321,7 @@ class StatusFixtureCatalogTests(unittest.TestCase):
         self.assertEqual(tuple(n for n in registered if not n.startswith("claude_status_")), (
             "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
             "resumed_prefix_sidecar_receipt", "root_twin_scoped_family",
-            "claude_copy_decision_rows"))
+            "claude_copy_decision_rows", "claude_mcp_session_start"))
         self.assertEqual(len(require_disjoint_head_only()), len(registered))
 
     def test_status_catalog_rejects_missing_duplicate_extra_and_unexecuted(self):
