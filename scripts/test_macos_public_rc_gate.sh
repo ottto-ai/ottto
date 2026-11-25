@@ -288,8 +288,8 @@ jq -e \
    and .update_lifecycle.launch_provenance == "TODO_launchservices_bundle"
    and .update_lifecycle.manual_process_termination == true
    and .update_lifecycle.manual_app_launch == true
-   and .checks.mixed_owner_app_version_truth == "not_run"
-   and .checks.mixed_owner_sparkle_autonomous_lifecycle == "not_run"' \
+   and .checks.app_owner_version_truth == "not_run"
+   and .checks.app_owner_sparkle_autonomous_lifecycle == "not_run"' \
   "$template_evidence" >/dev/null
 expect_failure "unfilled template evidence" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$template_evidence"
@@ -311,17 +311,18 @@ jq \
    | .update_lifecycle = {
        launch_provenance: "launchservices_bundle",
        user_update_actions: 1,
-       homebrew_service_reached_target: true,
-       lower_gui_remained_running_after_homebrew_update: true,
+       starting_service_owner: "app_bundle",
+       service_restarted_on_target_version: true,
        sparkle_terminated_old_process: true,
        sparkle_relaunched_target_bundle: true,
        process_id_changed: true,
+       final_service_owner: "app_bundle",
        manual_process_termination: false,
        manual_app_launch: false,
        account_continuity_verified: true,
        source_continuity_verified: true,
-       diagnostics_via_homebrew_socket: true,
-       verify_via_homebrew_socket: true,
+       diagnostics_via_app_service_socket: true,
+       verify_via_app_service_socket: true,
        owner_prefix_protocol_schema_version_converged: true
      }
    | .checks |= with_entries(.value = "passed")
@@ -447,10 +448,10 @@ expect_failure "private path evidence" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$private_path_evidence"
 
 missing_check_evidence="$TMP_DIR/missing-check-stable-candidate-rc-qa.json"
-jq 'del(.checks.mixed_owner_app_version_truth)' "$passed_evidence" > "$missing_check_evidence"
-expect_failure "missing mixed-owner app version truth check" \
+jq 'del(.checks.app_owner_version_truth)' "$passed_evidence" > "$missing_check_evidence"
+expect_failure "missing app-owner version truth check" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$missing_check_evidence"
-grep -q "mixed_owner_app_version_truth" /tmp/macos-public-rc-gate.out
+grep -q "app_owner_version_truth" /tmp/macos-public-rc-gate.out
 
 missing_lifecycle_evidence="$TMP_DIR/missing-lifecycle-stable-candidate-rc-qa.json"
 jq 'del(.update_lifecycle)' "$passed_evidence" > "$missing_lifecycle_evidence"
@@ -492,6 +493,20 @@ jq '.update_lifecycle.sparkle_relaunched_target_bundle = 1' \
 expect_failure "numeric boolean rejected" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$numeric_boolean_evidence"
 grep -q "update_lifecycle.sparkle_relaunched_target_bundle must be True" /tmp/macos-public-rc-gate.out
+
+homebrew_owner_evidence="$TMP_DIR/homebrew-owner-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.starting_service_owner = "homebrew"' \
+  "$passed_evidence" > "$homebrew_owner_evidence"
+expect_failure "update evidence from a Homebrew-owned service" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$homebrew_owner_evidence"
+grep -q "update_lifecycle.starting_service_owner must be 'app_bundle'" /tmp/macos-public-rc-gate.out
+
+final_owner_evidence="$TMP_DIR/final-owner-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.final_service_owner = "homebrew"' \
+  "$passed_evidence" > "$final_owner_evidence"
+expect_failure "update evidence that ends on a Homebrew-owned service" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$final_owner_evidence"
+grep -q "update_lifecycle.final_service_owner must be 'app_bundle'" /tmp/macos-public-rc-gate.out
 
 bad_stable_sha="$TMP_DIR/bad-stable-sha-manifest.json"
 write_stable_binding_manifest \

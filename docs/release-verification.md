@@ -197,23 +197,27 @@ version/channel, and the candidate release-manifest SHA-256. The evidence must
 not include private repo paths, local user paths, raw claim/setup tokens,
 account or machine identifiers, passwords, API keys, or bearer credentials.
 
-`mixed_owner_app_version_truth` must pass on a real lower-to-higher update when
-the signed GUI uses Sparkle and Homebrew owns the service. After Homebrew reaches
-the target but before Sparkle replaces the app, the UI must still show the lower
-bundle version and an update pending/in progress. A target-version or `up to
-date` claim while the lower bundle still runs fails the gate. Pass only after
-Sparkle installs the target bundle, relaunches a new app process, and GUI plus
-service versions converge without losing the account or sources.
+`app_owner_version_truth` must pass on a real lower-to-higher update when
+the lower app owns `net.ottto.service`. Until Sparkle replaces the app, the UI
+must show the lower bundle version and an update pending or in progress. A
+target-version or `up to date` claim while the lower bundle still runs fails the
+gate. Pass only after Sparkle installs the target bundle, relaunches a new app
+process, the app's service runs the target version, and GUI plus service
+versions converge without losing the account or sources.
 
-`mixed_owner_sparkle_autonomous_lifecycle` must also pass, backed by the
-structured `update_lifecycle` evidence object. Launch the lower app through
+`app_owner_sparkle_autonomous_lifecycle` must also pass, backed by the
+structured `update_lifecycle` evidence object. Start from a lower app that owns
+`net.ottto.service` (`starting_service_owner` is `app_bundle`). Launch it through
 LaunchServices from its canonical bundle, perform exactly one foreground update
 action, and require Sparkle to terminate the old process and relaunch the target
-bundle with a new process ID. Any manual process signal, force quit,
-executable-path launch, or manual reopen fails the gate. Diagnostics and Verify
-must pass through the Homebrew-owned service socket, account and source
-continuity must hold, and owner, prefix, protocol, schema, and version must
-converge before stable promotion.
+bundle with a new process ID. The service must restart on the target version and
+still be owned by the app (`final_service_owner` is `app_bundle`). Any manual
+process signal, force quit, executable-path launch, or manual reopen fails the
+gate. Diagnostics and Verify must pass through the app-owned service socket,
+account and source continuity must hold, and owner, install path, protocol,
+schema, and version must converge before stable promotion. A machine where the
+Homebrew formula owns the service is not valid evidence for this check: an
+installed app moves the service to itself before it updates.
 
 The packaged app does not declare `LSMultipleInstancesProhibited`, so several
 macOS users can run Ottto from one shared app bundle at the same time. The app
