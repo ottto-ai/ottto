@@ -3,6 +3,7 @@
 //! is independent: compression never certifies a replacement plaintext inode.
 use super::sampled_scan::codex_cursor::OpenStamp;
 use super::*;
+use crate::local_resource_diagnostics::CodexCompressionUnproven;
 use anyhow::{ensure, Context};
 
 fn absent(path: &Path) -> bool {
@@ -31,38 +32,36 @@ fn compressed_content_length(file: &File) -> Option<u64> {
         .flatten()
 }
 
-/// Whether a compressed successor may take its predecessor's head without a
-/// read: false when the archive records a plaintext length other than the one
-/// the head's certificate read (turns appended after this daemon's last read,
-/// then compressed), or when the predecessor still has retained growth. Such
-/// an archive is read as a new file instead. An archive that records no
-/// length, or a head without a readable certificate, keeps the existing path.
-fn compression_covers_head(
+/// Why a compressed successor may not take its predecessor's head without a
+/// read, or `None` when it may. Proof needs the archive to record exactly the
+/// plaintext length the head's certificate read, that read to end on a sealed
+/// line, and the predecessor to retain no growth; anything else (turns
+/// appended after the last read, an archive that records no length, a final
+/// line read unterminated) reads the archive as a new file. A metadata-only
+/// head or an unreadable certificate keeps the existing path.
+fn compression_unproven(
     index: &ScanIndex,
     from: &str,
     head: &state_v2::TailHead,
     archive: &File,
-) -> bool {
+) -> Option<CodexCompressionUnproven> {
+    if head.metadata_only {
+        return None;
+    }
     if index.v2().growth_retention.contains_key(from) {
-        return false;
+        return Some(CodexCompressionUnproven::Growth);
     }
     let Some(recorded) = compressed_content_length(archive) else {
-        return true;
+        return Some(CodexCompressionUnproven::NoLength);
     };
-    if head.metadata_only {
-        return true;
+    let certificate = tail_source::certified_certificate(&head.body).ok()?;
+    if certificate.length != recorded {
+        Some(CodexCompressionUnproven::Length)
+    } else if certificate.sealed_offset != certificate.length {
+        Some(CodexCompressionUnproven::Unsealed)
+    } else {
+        None
     }
-    tail_source::certified_certificate(&head.body)
-        .map_or(true, |certificate| certificate.length == recorded)
-}
-pub(super) fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
-    // A header refresh must never make newly appended bytes look applied.
-    // Its inventory stamp is seeded only at the logical checkpoint or carry;
-    // a later ordinary checkpoint can supersede that older physical stamp.
-    head.common.inventory.as_ref().is_some_and(|facts| {
-        crate::transcript_acquisition::FileStamp::capture(metadata.clone())
-            .is_ok_and(|stamp| facts.stamp.matches_acquisition(&stamp))
-    }) || tail_source::certified_physical_matches(&head.body, metadata)
 }
 
 impl ScanIndex {
@@ -286,8 +285,11 @@ impl ScanIndex {
             };
             // Not proven: the archive reads as a new file (a counted Full)
             // and the absent predecessor retires as any vanished rollout.
-            if compression && !compression_covers_head(self, &from, &head, &file) {
-                continue;
+            if compression {
+                if let Some(reason) = compression_unproven(self, &from, &head, &file) {
+                    crate::local_resource_diagnostics::codex_compression_carry_unproven(reason);
+                    continue;
+                }
             }
             let job = tail_source::job_for_carry(&head, &metadata, compression);
             // A settled metadata-only head can prove job custody by file
@@ -416,4 +418,15 @@ impl ScanIndex {
         }
         Ok(true)
     }
+}
+
+/// Codex's archive of `plain`: one zstd frame that records the plaintext
+/// length, as the provider writes it (`set_pledged_src_size`).
+#[cfg(test)]
+pub(in crate::snapshots) fn codex_archive_bytes(plain: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.set_pledged_src_size(Some(plain.len() as u64)).unwrap();
+    encoder.write_all(plain).unwrap();
+    encoder.finish().unwrap()
 }

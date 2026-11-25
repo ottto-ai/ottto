@@ -426,7 +426,7 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let compressed = original.with_extension("jsonl.zst");
         fs::write(
             &compressed,
-            zstd::stream::encode_all(&bytes[..], 1).unwrap(),
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&bytes),
         )
         .unwrap();
         let new_key = local_index_key(&compressed);
@@ -538,7 +538,7 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let current = fs::read(&original).unwrap();
         fs::write(
             &compressed,
-            zstd::stream::encode_all(&current[..], 1).unwrap(),
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&current),
         )
         .unwrap();
         fs::remove_file(&original).unwrap();
@@ -603,68 +603,92 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     }
 }
 
-/// Codex's archive: one zstd frame that records the plaintext length, as the
-/// provider writes it.
-fn codex_archive(bytes: &[u8]) -> Vec<u8> {
-    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
-    encoder
-        .set_pledged_src_size(Some(bytes.len() as u64))
-        .unwrap();
-    encoder.write_all(bytes).unwrap();
-    encoder.finish().unwrap()
+/// The reason counts on this pass's `codex_compression_carry_unproven` row.
+fn unproven(logs: &[Value]) -> Value {
+    logs.iter()
+        .find(|row| row["stage"] == "codex_compression_carry_unproven")
+        .map_or(Value::Null, |row| {
+            row["counts"]["codex_compression_carry_unproven"].clone()
+        })
 }
 
-/// [money] A rollout that grew after its last read and was then compressed
-/// is read from the archive: the turns appended before compression count, and
-/// the session's body and placement equal a cold Full's. The control (no
-/// growth, the recorded length equals the read length) carries with no
-/// decode or upload. The pass after the read is quiet. Two accounts, a side
-/// call and an evidence gap.
+/// [money] A Codex compression carries its predecessor's head only when the
+/// archive records exactly the length the head read and that read ended on a
+/// sealed line. Otherwise the archive is read once as a new file: turns
+/// appended before compression count, the family's emitted and carried bodies
+/// and placement equal a cold Full's, the next pass is quiet, and only the
+/// archive stays indexed. Two accounts, a side call and an evidence gap.
 #[test]
-fn compression_after_unread_growth_reads_the_archive() {
+fn compression_carries_only_a_proven_complete_read() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for grown in [false, true] {
+    // (case, records its length, grown after the read, read ends unterminated, reason)
+    for (case, recorded, grown, unsealed, reason) in [
+        ("unchanged", true, false, false, None),
+        ("grown", true, true, false, Some("length")),
+        ("no length", false, false, false, Some("no_length")),
+        ("no length, grown", false, true, false, Some("no_length")),
+        ("unsealed", true, false, true, Some("unsealed")),
+    ] {
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
         c.write(OTHER, Some("b"));
         c.write(SIDE, Some("b"));
         c.write(GAP, None);
+        let original = c.path(MAIN);
+        if unsealed {
+            // Codex was mid-line at the read and never finished it.
+            append(&original, turn(3).trim_end());
+        }
         let (_session, prior) = c.publish();
         let (working, first, _, _, _) = page(&c, prior.clone(), Arc::default());
         let (index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
-        assert_eq!(posts.len(), 1);
+        assert_eq!(posts.len(), 1, "{case}");
         let first_route = route(&index, &first, posts);
-        let original = c.path(MAIN);
         if grown {
             // Appended while this daemon did not read, then compressed.
             append(&original, &turn(3));
         }
+        let plain = fs::read(&original).unwrap();
+        let archive = if recorded {
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&plain)
+        } else {
+            zstd::stream::encode_all(&plain[..], 1).unwrap()
+        };
         let compressed = original.with_extension("jsonl.zst");
-        fs::write(&compressed, codex_archive(&fs::read(&original).unwrap())).unwrap();
+        fs::write(&compressed, archive).unwrap();
         fs::remove_file(&original).unwrap();
+        let (old_key, new_key) = (local_index_key(&original), local_index_key(&compressed));
         let before = index.clone();
         let (working, scan, _, _, logs) = page(&c, index, Arc::default());
         let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
-        if !grown {
-            assert_eq!(full_decodes(&logs), 0, "an unchanged archive carries");
-            assert!(scan.snapshots.is_empty());
-            assert!(posts.is_empty());
-            assert!(index.files.contains_key(&local_index_key(&compressed)));
+        let Some(reason) = reason else {
+            assert_eq!(full_decodes(&logs), 0, "{case}: carried without a decode");
+            assert!(scan.snapshots.is_empty(), "{case}");
+            assert!(posts.is_empty(), "{case}");
+            assert_eq!(unproven(&logs), Value::Null, "{case}");
+            assert!(!index.files.contains_key(&old_key), "{case}");
+            assert!(index.files.contains_key(&new_key), "{case}");
             continue;
+        };
+        assert_eq!(full_decodes(&logs), 1, "{case}: the archive is read once");
+        assert_eq!(unproven(&logs), json!({reason: 1}), "{case}");
+        let mut warm = route(&index, &scan, posts);
+        if grown {
+            assert_ne!(
+                warm.snapshots[MAIN], first_route.snapshots[MAIN],
+                "{case}: the appended turn changes the body"
+            );
         }
-        assert_eq!(full_decodes(&logs), 1, "the grown archive is read once");
-        assert_eq!(posts.len(), 1);
-        let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
-        cold.snapshots.retain(|item| item.source_session_id == MAIN);
-        let warm = route(&index, &scan, posts);
-        assert_ne!(
-            warm.snapshots[MAIN], first_route.snapshots[MAIN],
-            "the appended turn changes the body"
-        );
-        money_oracle::assert_equivalent(&emitted(&index, &cold), &warm);
-        assert_quiet(&c, index, &warm);
+        let mut carried = first_route.accepted.clone();
+        carried.extend(warm.accepted.clone());
+        warm.accepted = carried;
+        let (_, cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+        money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
+        let (index, _) = assert_quiet(&c, index, &warm);
+        assert!(!index.files.contains_key(&old_key), "{case}: the predecessor retired");
+        assert!(index.files.contains_key(&new_key), "{case}");
     }
 }
 
