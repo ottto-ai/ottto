@@ -1460,7 +1460,7 @@ mod application_cases {
 
     /// [format] f7 baseline failures remain unpublished and keep original authority.
     #[test]
-    fn f7_baseline_failures_remain_unpublished_and_keep_original_authority() {
+    fn baseline_failures_remain_unpublished_and_keep_original_authority() {
         for blocked in [".v1-readonly", ".v1-readonly.shards"] {
             let c = Corpus::new();
             c.sharded();
@@ -1530,7 +1530,7 @@ mod application_cases {
     }
     /// [format] f4 original unbound authority repair preserves freeze raw bytes and provenance.
     #[test]
-    fn f4_original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
+    fn original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
         let c = Corpus::new();
         let mut seed = ScanIndex::default();
         seed.insert_retry_pending_claude_authority_for_test("family");

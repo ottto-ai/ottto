@@ -2037,7 +2037,7 @@ fn w0_page(
 /// [money] W0_unchanged_cannot_clear_W1: a CAS-off unchanged W0 ACK carries
 /// no head, so W1's owed challenge survives it and a restart.
 #[test]
-fn w0_unchanged_cannot_clear_w1() {
+fn unchanged_cannot_clear() {
     let w1 = item();
     let key = cache_session_key(&w1.source_session_id);
     let mut progress = super::tests::class_split_tests::fresh_progress();
@@ -2054,7 +2054,7 @@ fn w0_unchanged_cannot_clear_w1() {
 /// never settles W1's debt. Post-save retirement drains only the exact W1
 /// witness with a head; a W0 witness or a missing head keeps it owed.
 #[test]
-fn headed_w0_is_not_patch_ack_and_only_exact_w1_with_head_retires() {
+fn headed_is_not_patch_ack_and_only_exact_with_head_retires() {
     let (index, w1) = super::tests::pending_head_index_item();
     let key = cache_session_key(&w1.source_session_id);
     let head = "e".repeat(64);

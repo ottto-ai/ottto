@@ -2987,8 +2987,8 @@ mod held_probe_listing_tests {
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn adopted_w0_head_first_w1() {
-    if !supported("adopted_w0_head_first_w1") {
+fn adopted_head_first() {
+    if !supported("adopted_head_first") {
         return;
     }
     struct Patched;

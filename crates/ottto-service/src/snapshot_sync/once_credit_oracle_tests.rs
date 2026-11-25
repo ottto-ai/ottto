@@ -1094,7 +1094,7 @@ impl OracleHome {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c00_real_runner_collects_finishes_and_reloads() {
+fn real_runner_collects_finishes_and_reloads() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -1180,7 +1180,7 @@ fn assert_durable(cycle: &Cycle) {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c02_durable_ack_suppresses_replay_of_the_prior_index() {
+fn durable_ack_suppresses_replay_of_the_prior_index() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -1212,7 +1212,7 @@ fn c02_durable_ack_suppresses_replay_of_the_prior_index() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c03_complete_same_body_reread_drops_at_the_finalizer() {
+fn complete_same_body_reread_drops_at_the_finalizer() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -1269,7 +1269,7 @@ fn pi_rows(conflict: bool) -> Vec<Value> {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c04_pi_positive_conflicted_result_cannot_publish() {
+fn pi_positive_conflicted_result_cannot_publish() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Pi, &server);
@@ -1337,7 +1337,7 @@ fn move_destination(home: &mut OracleHome) {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c05_fresh_destination_requires_its_own_exact_ack() {
+fn fresh_destination_requires_its_own_exact_ack() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -1616,7 +1616,7 @@ fn assert_terminal(cycle: &Cycle, fingerprint: &str, body: &str) {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
+fn head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     const SIX_HOURS: u64 = crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS;
     let claude = SnapshotSource::ClaudeCode;
     let recording = Recording::start();
@@ -1933,7 +1933,7 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert_eq!(receipt(&resumed, &sibling), receipt(&cold, &cold_sibling));
 }
 
-/// [money] `c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags`'s identity-positive
+/// [money] `claude_cold_control_preserves_accounts_side_call_gap_and_tags`'s identity-positive
 /// control (two accounts, a side call, an evidence gap, the effort tag) through the changed
 /// transition. At a moved destination, every head already holds its usage: each body is answered
 /// `usage_identical` and held, with the same body and the same account split
@@ -1943,7 +1943,7 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c13_identity_control_through_usage_identical_then_growth() {
+fn identity_control_through_usage_identical_then_growth() {
     let claude = SnapshotSource::ClaudeCode;
     let recording = Recording::start();
     let server = OracleServer::new(claude, recording.handle());
@@ -2051,7 +2051,7 @@ fn c13_identity_control_through_usage_identical_then_growth() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c06_crash_windows_preserve_placement_and_durable_suppression() {
+fn crash_windows_preserve_placement_and_durable_suppression() {
     for answer in [Answer::Dropped, Answer::LostAck, Answer::Accept] {
         let recording = Recording::start();
         let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
@@ -2342,7 +2342,7 @@ fn accounts_and_tags(items: &[SnapshotItem]) -> (BTreeMap<String, u64>, bool) {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
+fn claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -2680,7 +2680,7 @@ fn assert_redisclosed(first: &Cycle, quiet: &Cycle) {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c07_codex_group_memo_rediscloses_without_session_credit() {
+fn codex_group_memo_rediscloses_without_session_credit() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
@@ -2703,7 +2703,7 @@ fn c07_codex_group_memo_rediscloses_without_session_credit() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c08_codex_group_park_rediscloses_without_reading() {
+fn codex_group_park_rediscloses_without_reading() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
@@ -2804,7 +2804,7 @@ fn install_created_thread(home: &OracleHome, fork: bool, session: &str, priority
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c09_codex_singleton_memo_keeps_the_previous_body() {
+fn codex_singleton_memo_keeps_the_previous_body() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
@@ -2871,7 +2871,7 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c10_codex_singleton_park_keeps_the_previous_body() {
+fn codex_singleton_park_keeps_the_previous_body() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
@@ -2993,7 +2993,7 @@ fn finish_fragment(
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none() {
+fn fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none() {
     for outlive in [false, true] {
         let recording = Recording::start();
         let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
@@ -3035,7 +3035,7 @@ fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none(
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
+fn account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
@@ -4792,20 +4792,20 @@ mod money_equivalence_tests {
     // Calling them here makes the filtered money lane execute every gate row.
     #[test]
     fn once_credit_claude() {
-        c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags();
-        c02_durable_ack_suppresses_replay_of_the_prior_index();
-        c03_complete_same_body_reread_drops_at_the_finalizer();
-        c04_pi_positive_conflicted_result_cannot_publish();
-        c05_fresh_destination_requires_its_own_exact_ack();
-        c06_crash_windows_preserve_placement_and_durable_suppression();
-        c07_codex_group_memo_rediscloses_without_session_credit();
-        c08_codex_group_park_rediscloses_without_reading();
-        c09_codex_singleton_memo_keeps_the_previous_body();
-        c10_codex_singleton_park_keeps_the_previous_body();
-        c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
-        c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
-        c12_head_unstored_answers_hold_until_growth_earns_its_own_ack();
-        c13_identity_control_through_usage_identical_then_growth();
+        claude_cold_control_preserves_accounts_side_call_gap_and_tags();
+        durable_ack_suppresses_replay_of_the_prior_index();
+        complete_same_body_reread_drops_at_the_finalizer();
+        pi_positive_conflicted_result_cannot_publish();
+        fresh_destination_requires_its_own_exact_ack();
+        crash_windows_preserve_placement_and_durable_suppression();
+        codex_group_memo_rediscloses_without_session_credit();
+        codex_group_park_rediscloses_without_reading();
+        codex_singleton_memo_keeps_the_previous_body();
+        codex_singleton_park_keeps_the_previous_body();
+        fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
+        account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
+        head_unstored_answers_hold_until_growth_earns_its_own_ack();
+        identity_control_through_usage_identical_then_growth();
         scheduling_permutations_converge_to_the_same_bodies();
     }
 
@@ -4973,7 +4973,7 @@ fn pi_session(id: &str, tokens: u64) -> Vec<Value> {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
+fn tiers_advance_through_finish_and_pace_the_final_tier_gently() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Pi, &server);
@@ -5052,7 +5052,7 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
+fn a_terminal_answer_in_a_tier_lets_the_tier_advance() {
     for answer in [
         Answer::Refuse("invalid"),
         Answer::Unstored,
@@ -5103,7 +5103,7 @@ fn c31_a_terminal_answer_in_a_tier_lets_the_tier_advance() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c32_tier_participants_are_enabled_sources_anchored_or_not() {
+fn tier_participants_are_enabled_sources_anchored_or_not() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Pi, &server);
@@ -5162,7 +5162,7 @@ fn c32_tier_participants_are_enabled_sources_anchored_or_not() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
-fn c33_a_failed_prepare_never_holds_a_tier_and_a_return_earns_its_own_claim() {
+fn a_failed_prepare_never_holds_a_tier_and_a_return_earns_its_own_claim() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Pi, &server);

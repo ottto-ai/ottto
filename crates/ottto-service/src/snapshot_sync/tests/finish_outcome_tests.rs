@@ -83,7 +83,7 @@
 //     `network_error`; error "upload local snapshots".
 //     `failed_upload_receipt_names_each_failure_class` pins the receipt, the
 //     error and the partial checkpoint; custody, restart and replay:
-//     `c06_crash_windows_preserve_placement_and_durable_suppression`
+//     `crash_windows_preserve_placement_and_durable_suppression`
 //     (once_credit_oracle_tests.rs).
 // 20. Failed upload whose receipt cannot be sent: the upload's own error
 //     text, not the receipt's. `receipt_send_failure_at_each_exit`.
@@ -96,7 +96,7 @@
 //     two checks fires is not pinned.
 // 23. Failure right after the selected save. Index saved and manifest
 //     published; no receipt; error.
-//     `c02_durable_ack_suppresses_replay_of_the_prior_index`
+//     `durable_ack_suppresses_replay_of_the_prior_index`
 //     (once_credit_oracle_tests.rs), `hint_loss_failed_finish_walks_next`
 //     (walk_gate_oracle_tests.rs).
 // 24. The unverified-history marker clear fails. Index saved, success
