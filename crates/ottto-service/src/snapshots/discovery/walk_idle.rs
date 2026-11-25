@@ -3,7 +3,7 @@
 //! inputs match returns an empty page. A restart always walks.
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::*;
-use crate::transcript_acquisition::{Scope, SourceStamp};
+use crate::transcript_acquisition::Scope;
 use std::sync::Mutex;
 
 /// The backstop, start to start.
@@ -15,7 +15,6 @@ pub(crate) const PASS_GAP: u64 = 2 * crate::snapshot_sync::MAX_CYCLE_INTERVAL.as
 #[derive(Clone)]
 pub(crate) struct Pass {
     key: [u8; 32],
-    codex_homes: Vec<Option<SourceStamp>>,
     days: u64,
     covered: bool,
 }
@@ -64,6 +63,9 @@ pub(crate) fn clear(source: SnapshotSource) {
 
 impl Pass {
     /// Every input that decides a walk's reads and no hint announces.
+    /// Codex home side files (state, thread history, session index, config)
+    /// are not inputs: every walk reloads them and applies them to each
+    /// rollout it reaches, so a side-only change waits for the next walk.
     #[expect(clippy::too_many_arguments, reason = "the inputs prepare holds")]
     pub(crate) fn new(
         source: SnapshotSource,
@@ -109,42 +111,15 @@ impl Pass {
             add(format!("{:?}", modified.ok()).as_bytes());
         }
         add(&crate::snapshot_watcher::sidecar_epoch(source).to_be_bytes());
-        let codex_homes = if source == SnapshotSource::Codex {
-            let homes = roots
-                .iter()
-                .filter_map(|root| root.parent())
-                .collect::<BTreeSet<_>>();
-            homes
-                .into_iter()
-                .flat_map(|home| {
-                    let [state, history, titles] = sources::codex::sidecar::facts::capture(home);
-                    let config = SourceStamp::capture_file(&home.join("config.toml")).ok();
-                    [state, history, titles, config]
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         Self {
             key: digest.finalize().into(),
-            codex_homes,
             days,
             covered: crate::snapshot_watcher::covers(roots),
         }
     }
 
-    /// A stamp that could not be taken either time is stable.
     fn same(&self, other: &Self) -> bool {
         self.key == other.key
-            && self.codex_homes.len() == other.codex_homes.len()
-            && self
-                .codex_homes
-                .iter()
-                .zip(&other.codex_homes)
-                .all(|pair| match pair {
-                    (Some(a), Some(b)) => a.same(b),
-                    (a, b) => a.is_none() && b.is_none(),
-                })
     }
 }
 
@@ -316,7 +291,6 @@ pub(crate) fn armed_for_test(source: SnapshotSource) -> Option<(u64, u64)> {
 pub(crate) fn arm_for_test(source: SnapshotSource) {
     let pass = Pass {
         key: [0; 32],
-        codex_homes: Vec::new(),
         days: 0,
         covered: true,
     };
