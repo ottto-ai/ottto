@@ -1130,7 +1130,12 @@ pub(crate) mod test_support {
                 // redirections, so `<&0` alone still reads /dev/null under dash.
                 // Save the probe's stdin on fd 3 first so the descendant holds both pipes.
                 "hold-exit" => format!("exec 3<&0\n/bin/sleep 4 <&3 3<&- &\necho $! > {}\nexit 0\n", quote(&root.join("descendant"))),
-                "protected" => format!(": > {}\nexec /bin/sleep 4\n", quote(&root.join(super::REFRESH_LOCK_FILE))),
+                // Runs until the gate stops it or the fixture drops (`release`),
+                // bounded at 60 s, never on a timer a slow runner can outlast.
+                "protected" => format!(
+                    ": > {}\ni=0\nwhile [ ! -e {} ] && [ $i -lt 1200 ]; do /bin/sleep 0.05; i=$((i+1)); done\n",
+                    quote(&root.join(super::REFRESH_LOCK_FILE)), quote(&root.join("release")),
+                ),
                 "escaped" => format!(
                     ": > {}\nexport OTTTO_PROBE_FIXTURE_DIR={}\n{} --ignored --exact claude_spawn_gate::tests::probe_escape_fixture --nocapture --test-threads=1 &\nwhile [ ! -s {} ]; do /bin/sleep 0.01; done\nexit 0\n",
                     quote(&root.join(super::REFRESH_LOCK_FILE)), quote(root), quote(&std::env::current_exe().unwrap()), quote(&root.join("descendant")),
