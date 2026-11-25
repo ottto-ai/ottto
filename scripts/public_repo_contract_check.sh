@@ -970,6 +970,7 @@ def check_public_skeleton_contracts() -> None:
         "scripts/macos_public_rc_gate.sh",
         "scripts/macos_stable_preflight.sh",
         "scripts/macos_stable_qa_evidence_template.sh",
+        "scripts/macos_stable_qa_summary.sh",
         "scripts/public_repo_contract_check.sh",
         "scripts/public_repo_secret_scan.sh",
         "scripts/public_repo_surface_ci.sh",
@@ -982,6 +983,7 @@ def check_public_skeleton_contracts() -> None:
         "scripts/test_macos_manifest_signature.sh",
         "scripts/test_macos_stable_release_workflow.sh",
         "scripts/test_macos_stable_qa_evidence_template.sh",
+        "scripts/test_macos_stable_qa_summary.sh",
         "scripts/public_repo_manifest.sh",
     )
     for relative in required_executables:
@@ -2470,7 +2472,7 @@ def check_install_docs_contracts() -> None:
                 "release verification docs must gate Homebrew owner support on clean-machine evidence",
             ),
             (
-                "App-bundle\nevidence has to prove a second Homebrew install/start attempt is either a safe\nrefusal with instructions or an explicit migration, not silent owner takeover.",
+                "App-bundle\nevidence has to prove a second Homebrew install/start attempt is a safe\nrefusal with instructions, not a second serving job or silent owner takeover:",
                 "release verification docs must prohibit silent app/Homebrew owner takeover",
             ),
             (

@@ -1182,8 +1182,8 @@ release = release.replace(
 )
 release = release.replace(
     "App-bundle\n"
-    "evidence has to prove a second Homebrew install/start attempt is either a safe\n"
-    "refusal with instructions or an explicit migration, not silent owner takeover.",
+    "evidence has to prove a second Homebrew install/start attempt is a safe\n"
+    "refusal with instructions, not a second serving job or silent owner takeover:",
     "App-bundle evidence need not cover Homebrew takeover.",
 )
 release = release.replace(

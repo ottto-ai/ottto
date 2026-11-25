@@ -268,25 +268,41 @@ daemon reachability.
 
 Before a stable release is promoted as the public `latest` release, Ottto
 requires clean-machine evidence for every install owner advertised by the
-manifest. The release operator should attach the redacted
-`stable-clean-machine-qa.json` evidence file and run:
+manifest. The published `stable-clean-machine-qa.json` is a closed public
+summary (evidence `schema_version: 2`) of a private QA record that is never
+published. The release operator writes the record outside the release folder,
+fills it, writes the summary beside the manifest, and runs the gate:
 
 ```bash
 macos_stable_qa_evidence_template.sh \
   --manifest release-manifest.json \
-  --output stable-clean-machine-qa.json
+  --host-class signing_mac \
+  --output <private-folder>/stable-clean-machine-qa.record.json
+macos_stable_qa_summary.sh \
+  --record <private-folder>/stable-clean-machine-qa.record.json \
+  --manifest release-manifest.json
+macos_stable_closeout_gate.sh --manifest release-manifest.json
 ```
 
 The template binds the exact manifest SHA-256, adds each required owner, and
 records the expected local-runtime binding for `ottto-service`,
 `net.ottto.service`, protocol v15, stable version/channel, install owner, and
-release-manifest SHA-256. It leaves every owner check as `not_run`. Fill those
-values with real clean-machine pass/fail facts; do not paste raw terminal
-output or local identifiers into the evidence file. Then run:
+release-manifest SHA-256. It leaves every owner check as `not_run`. The summary
+copies only allowlisted fields, so the record's notes never reach the release
+folder. The gate refuses a private record anywhere in that folder and any
+symlink in it, and fails if it cannot read the whole folder; publishers that
+upload an explicit file list add defense in depth.
 
-```bash
-macos_stable_closeout_gate.sh --manifest release-manifest.json
-```
+To check a published summary, download it beside its manifest and run the
+gate. `environment.host_class` says where QA ran: `clean_vm` (a clean guest
+VM), `clean_macos` (a clean physical Mac), `qa_user_on_shared_mac`,
+`signing_mac` (the release signing host, for every user on it) or
+`developer_mac`. Each check is `passed` with a `method`: `live` (driven by
+hand), `scripted` (run by an automated script), or `static` (inspection only,
+allowed just for `artifact_checksum`, `formula_syntax`, `gatekeeper` and
+`native_gatekeeper`). `passed` means the check ran in this release against
+this manifest. The schema can also say `carried` with `from` (the release
+where the check last ran), but the gate does not accept a carried check yet.
 
 The gate checks that every advertised runtime owner passed the required
 owner-specific trust checks and the full lifecycle matrix. The verified native
@@ -298,18 +314,37 @@ browser setup claim, app detection, Codex verify, doctor, fix, diagnostics,
 logout, update check, upgrade, uninstall, reinstall, post-reinstall status, and
 re-onboard after a local Keychain wipe. The re-onboard check must start from a
 previously claimed Mac, remove local runtime state and all local telemetry
-device-secret Keychain rows, use dashboard Start fresh to remove the stale
-machine, reinstall, complete browser claim, and prove relay-device
+device-secret Keychain rows, remove that exact installation from the
+dashboard (a fresh install alone does not count), reinstall, complete browser
+claim, and prove relay-device
 provisioning, snapshot creation, and connected account state recover.
-Homebrew evidence also has to prove that launching `Ottto.app` before and after
-upgrade preserves the Homebrew-owned LaunchAgent, that doctor reports no owner
-drift, and that update JSON reports the Homebrew install owner. App-bundle
-evidence has to prove a second Homebrew install/start attempt is either a safe
-refusal with instructions or an explicit migration, not silent owner takeover. The
-release gate checks the mechanism on the packaged app: `macos_release_gate.sh`
-asks the app's bundled `ottto-service` to decide as a launchd-started Homebrew
-copy (`service step-aside-check`), and a stable release fails unless that copy
-hands over to the packaged app and serves when no app is there.
+The Homebrew owner is checked headless: `headless_no_app_process` proves the QA
+user has no Ottto app process for the whole Homebrew lane, including after a
+service restart, and `post_upgrade_service_restarts_owned` proves that after
+`brew upgrade ottto` and a service restart launchd runs a new process at the
+target version with `install_owner` still `homebrew`. Homebrew evidence also has
+to prove that doctor reports no owner drift and that update JSON reports the
+Homebrew install owner. App-bundle `upgrade` includes the target app relaunch
+and the app keeping ownership.
+
+App-bundle `move_service_to_app` is the one explicit migration. It starts from
+a serving Homebrew job. The QA user launches the installed target app in their
+own desktop session, the app must offer Move, and the operator clicks Move.
+Afterwards exactly one app-owned launchd job serves the target version and no
+Homebrew process remains. On the isolated QA VM, the operator also checks,
+after the app reports healthy, that the formula was removed.
+
+App-bundle `homebrew_second_install_safe_refusal` is a separate run, not a
+Move. App-bundle
+evidence has to prove a second Homebrew install/start attempt is a safe
+refusal with instructions, not a second serving job or silent owner takeover:
+a formula beside a running app never gets a second serving job and never
+silently takes ownership (the keg may exist). The release gate checks a
+related decision on the packaged app: `macos_release_gate.sh` asks the app's
+bundled `ottto-service` to decide as a launchd-started Homebrew copy
+(`service step-aside-check`), and a stable release fails unless that copy
+hands over to the packaged app and serves when no app is there. That packaged
+check is distinct from Move and is not live ownership evidence for this check.
 The evidence file must match the exact manifest version, commit, and SHA-256,
 prove the expected per-owner local-runtime binding, and it must not contain
 extra required install owners, unknown per-owner check names, local user paths,

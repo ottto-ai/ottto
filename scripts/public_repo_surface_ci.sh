@@ -323,6 +323,7 @@ run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gat
 run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
 run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
 run_step B "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh
+run_step B "test stable QA summary" bash scripts/test_macos_stable_qa_summary.sh
 run_step B "test Homebrew formula generator" bash scripts/test_homebrew_formula.sh
 run_step B "test hosted native installer generator" bash scripts/test_hosted_native_installer.sh
 run_step B "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
