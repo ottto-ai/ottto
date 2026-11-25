@@ -243,31 +243,40 @@ pub(super) fn cloud_status(
     source: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_status_source(source.as_deref())?;
-    let mut status = observe_setup_run_read(
+    let (mut status, web) = observe_setup_run_read(
         daemon,
         authorization,
         "ottto cloud",
         crate::control::cloud_connect::validated_cloud_api_base_url,
-        |api_base_url, connection, setup_run_token| match cloud_status_with_base(
-            api_base_url,
-            connection,
-            setup_run_token,
-            source.as_deref(),
-        ) {
-            Ok(value) => Ok(value),
-            Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-                let refreshed =
-                    refresh_cloud_setup_run_token_checked(api_base_url, connection, |_| Ok(()))?;
-                cloud_status_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    source.as_deref(),
-                )
+        |api_base_url, connection, setup_run_token| {
+            let web = crate::control::cloud_connect::paired_connect_url(api_base_url);
+            match cloud_status_with_base(
+                api_base_url,
+                connection,
+                setup_run_token,
+                source.as_deref(),
+            ) {
+                Ok(value) => Ok(value),
+                Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+                    let refreshed = refresh_cloud_setup_run_token_checked(
+                        api_base_url,
+                        connection,
+                        |_| Ok(()),
+                    )?;
+                    cloud_status_with_base(
+                        api_base_url,
+                        &refreshed.connection,
+                        &refreshed.setup_run_token,
+                        source.as_deref(),
+                    )
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
+            .map(|value| (value, web))
         },
     )?;
+    // The connections link names the web origin compiled for this API, never the server's own.
+    crate::control::cloud_connect::set_connect_url(&mut status, web);
     if let Some(status) = status.as_object_mut() {
         let signer = if crate::control::cloud_connect::signer_available() {
             "available"

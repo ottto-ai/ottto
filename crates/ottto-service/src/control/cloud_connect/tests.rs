@@ -1310,3 +1310,127 @@ fn approval_link_uses_the_runs_paired_web_origin() {
         );
     }
 }
+
+/// [behaviour] Cloud setup replies and refusals link only to the connections page on the web
+/// origin compiled for this Mac's API (staging on staging), never to the page the server named.
+#[test]
+fn cloud_replies_link_only_the_paired_web_origin() {
+    use super::agent::with_connect_url;
+    use super::server::paired_connect_url;
+    let staging = paired_connect_url("https://staging.tail21f014.ts.net:8443/");
+    assert_eq!(
+        staging.as_deref(),
+        Some("https://staging.tail21f014.ts.net/connections")
+    );
+    assert_eq!(
+        paired_connect_url("https://api.ottto.net").as_deref(),
+        Some("https://app.ottto.net/connections")
+    );
+    let server =
+        || json!({"state": "web_open", "connect_url": "https://app.ottto.net/connections"});
+    let reply = with_connect_url(Ok(server()), staging.clone());
+    assert_eq!(
+        reply["connect_url"],
+        "https://staging.tail21f014.ts.net/connections"
+    );
+    let refusal = ottto_protocol::CloudConnectFailure::new("use_web", "Use the web.", "use_web");
+    let reply = with_connect_url(Err(refusal.clone()), staging);
+    assert_eq!(
+        reply["cloud_error"]["connect_url"],
+        "https://staging.tail21f014.ts.net/connections"
+    );
+    // An API with no compiled web origin gets no link at all.
+    assert_eq!(paired_connect_url("http://127.0.0.1:8000"), None);
+    assert!(with_connect_url(Ok(server()), None)
+        .get("connect_url")
+        .is_none());
+    let mut linked = refusal;
+    linked.connect_url = Some("https://app.ottto.net/connections".into());
+    assert!(with_connect_url(Err(linked), None)["cloud_error"]["connect_url"].is_null());
+}
+
+/// [behaviour] A queued native approval in the server's approval.v4 shape: the service signs the
+/// server's exact payload bytes and posts R5 as `{approval_id, signature}` with an unpadded
+/// base64url signature, which is what the server's approval route verifies.
+#[test]
+fn approval_payload_is_signed_unchanged_and_posted_as_the_r5_body() {
+    use super::agent::{approval_body, checked_approval, CheckedApproval};
+    let attempt_id = "44444444-4444-4444-8444-444444444444";
+    let approval_id = "55555555-5555-4555-8555-555555555555";
+    let account = "000000000001";
+    let sign_by = 4_102_444_800_i64;
+    let facts = |operation: &str, replaces: Value, aud: &str, target: &str| {
+        json!({
+            "v": "ottto.cloud_connect.approval.v4", "aud": aud,
+            "approval_id": approval_id, "attempt_id": attempt_id,
+            "org_id": ORG_ID, "org_name": "Example", "source": "bedrock",
+            "operation": operation,
+            "target": {"kind": "aws_account", "id": target, "org_role": "management",
+                "payer_account_id": target},
+            "reach": "all_linked_accounts",
+            "grant": {"variant": "cli_billing",
+                "role_arn": format!("arn:aws:iam::{target}:role/ottto-read-b-abcde234"),
+                "installed_sha256": "d".repeat(64), "metrics": false},
+            "replaces": replaces, "input_revision": 1,
+            "device_id": "22222222-2222-4222-8222-222222222222", "device_generation": 12,
+            "control_generation": 3, "dialog_sha256": "e".repeat(64),
+            "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "iat": sign_by - 300,
+            "sign_by": sign_by,
+        })
+    };
+    // The server's canonical encoding: sorted keys, no spaces.
+    let canonical = |value: &Value| serde_json::to_vec(value).unwrap();
+    let approval = |payload: &[u8]| {
+        json!({
+            "approval_id": approval_id, "payload_b64": wire::encode_base64url(payload),
+            "sign_by": "2100-01-01T00:00:00Z", "next_actions": ["approve_on_mac"],
+        })
+    };
+    let attempt = json!({"attempt_id": attempt_id, "account_id": account, "input_revision": 1});
+    let check = |payload: &[u8]| {
+        checked_approval(&approval(payload), &attempt, ORG_ID, attempt_id, account)
+    };
+
+    let payload = canonical(&facts("connect", Value::Null, "app.ottto.net", account));
+    assert_eq!(
+        check(&payload).unwrap(),
+        CheckedApproval {
+            approval_id: approval_id.into(),
+            payload: payload.clone(),
+            sign_by,
+        }
+    );
+    let replaced = json!({"integration_config_id": "66666666-6666-4666-8666-666666666666",
+        "credential_revision": 2, "active": true,
+        "target": {"kind": "aws_account", "id": "000000000002"}, "connected_by_name": null});
+    assert!(check(&canonical(&facts(
+        "replace",
+        replaced,
+        "app.ottto.net",
+        account
+    )))
+    .is_ok());
+
+    let signature = wire::decode_base64url(DER_SIGNATURE_B64).unwrap();
+    assert_eq!(
+        String::from_utf8(approval_body(approval_id, &signature)).unwrap(),
+        format!(r#"{{"approval_id":"{approval_id}","signature":"{DER_SIGNATURE_B64}"}}"#)
+    );
+
+    for (payload, code) in [
+        (
+            facts("connect", Value::Null, "staging", account),
+            "invalid_server_field",
+        ),
+        (
+            facts("replace", Value::Null, "app.ottto.net", account),
+            "invalid_server_field",
+        ),
+        (
+            facts("connect", Value::Null, "app.ottto.net", "000000000002"),
+            "account_mismatch",
+        ),
+    ] {
+        assert_eq!(check(&canonical(&payload)).unwrap_err().code, code);
+    }
+}

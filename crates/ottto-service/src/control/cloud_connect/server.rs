@@ -38,6 +38,23 @@ pub(super) fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'s
         .find(|(api, _)| *api == api_base_url)
 }
 
+/// The connections page on the web origin compiled for `api_base_url`, the only web page cloud
+/// setup replies may send the user to. `None` for any other API.
+pub(in crate::control) fn paired_connect_url(api_base_url: &str) -> Option<String> {
+    claim_origin_pair(api_base_url).map(|(_, web)| format!("{web}/connections"))
+}
+
+/// Replaces a reply's `connect_url` with `web`, or drops it when the API has no compiled web
+/// origin.
+pub(in crate::control) fn set_connect_url(reply: &mut serde_json::Value, web: Option<String>) {
+    if let Some(object) = reply.as_object_mut() {
+        object.remove("connect_url");
+        if let Some(url) = web {
+            object.insert("connect_url".into(), url.into());
+        }
+    }
+}
+
 /// The configured staging API is trusted only for cloud setup-run requests and token refresh.
 pub(in crate::control) fn validated_cloud_api_base_url(
     api_base_url: &str,

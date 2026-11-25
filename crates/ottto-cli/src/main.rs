@@ -185,6 +185,10 @@ struct CloudConnectArgs {
     /// rerun reads that attempt back instead of starting another.
     #[arg(long, hide = true, value_name = "ID", value_parser = cloud_connect::valid_request_id)]
     request_id: Option<String>,
+    /// Set by the printed resume command with `--request-id`: the attempt that request reached,
+    /// read first so a rerun stops once it saved or ended.
+    #[arg(long, hide = true, value_name = "ID", requires = "request_id", value_parser = cloud_connect::valid_attempt)]
+    attempt: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]

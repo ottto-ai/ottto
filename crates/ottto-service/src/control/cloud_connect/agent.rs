@@ -1,6 +1,9 @@
 //! CLI requests use the setup-run token, but only the app can sign a write.
 use super::queue::unix_now;
-use super::server::{claim_origin_pair, BoundRun, DeviceChallenge, ServerError, SetupRunServer};
+use super::server::{
+    claim_origin_pair, paired_connect_url, set_connect_url, BoundRun, DeviceChallenge, ServerError,
+    SetupRunServer,
+};
 use super::wire::{
     checked_challenge, decode_base64url, encode_base64url, proof_header, request_sha256,
     ChallengeRequest,
@@ -30,9 +33,25 @@ const SIGN_WAIT: Duration = Duration::from_secs(20);
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(in crate::control) fn dispatch(daemon: &LocalDaemon, command: Command) -> Value {
-    match dispatch_inner(daemon, command) {
-        Ok(value) => value,
-        Err(error) => json!({"cloud_error": error}),
+    let reply = dispatch_inner(daemon, command);
+    // A web link only on the origin compiled for this Mac's API, never the server's own.
+    let web = SetupRunServer { daemon }
+        .bound_run()
+        .ok()
+        .and_then(|run| paired_connect_url(&run.api_base_url));
+    with_connect_url(reply, web)
+}
+
+pub(super) fn with_connect_url(reply: Result<Value, Failure>, web: Option<String>) -> Value {
+    match reply {
+        Ok(mut value) => {
+            set_connect_url(&mut value, web);
+            value
+        }
+        Err(mut error) => {
+            error.connect_url = web.map(Into::into);
+            json!({"cloud_error": error})
+        }
     }
 }
 
@@ -415,43 +434,12 @@ impl SetupRunServer<'_> {
         let Some(approval) = approval.filter(|approval| !approval.is_null()) else {
             return Ok(attempt);
         };
-        let approval_id = approval["approval_id"]
-            .as_str()
-            .filter(|id| cloud_uuid(id))
-            .ok_or_else(invalid_server)?;
-        let payload = approval["payload_b64"]
-            .as_str()
-            .and_then(decode_base64url)
-            .ok_or_else(invalid_server)?;
-        let facts: Value = serde_json::from_slice(&payload).map_err(|_| invalid_server())?;
-        if facts["target"]["id"] != account || attempt["account_id"] != account {
-            return Err(account_mismatch());
-        }
-        let sign_by = approval["sign_by"]
-            .as_str()
-            .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok())
-            .map(OffsetDateTime::unix_timestamp)
-            .ok_or_else(invalid_server)?;
-        let operation = facts["operation"].as_str().ok_or_else(invalid_server)?;
-        if facts["v"] != "ottto.cloud_connect.approval.v4"
-            || facts["aud"] != "app.ottto.net"
-            || facts["source"] != "bedrock"
-            || facts["org_id"] != run.organization_id
-            || facts["attempt_id"] != id
-            || facts["approval_id"] != approval_id
-            || facts["input_revision"] != attempt["input_revision"]
-            || facts["sign_by"] != sign_by
-            || !matches!(operation, "connect" | "reconnect" | "replace")
-            || !facts.get("replaces").is_some_and(|replaces| {
-                if operation == "replace" {
-                    replaces.is_object()
-                } else {
-                    replaces.is_null()
-                }
-            })
-        {
-            return Err(invalid_server());
-        }
+        let CheckedApproval {
+            approval_id,
+            payload,
+            sign_by,
+        } = checked_approval(&approval, &attempt, &run.organization_id, id, account)?;
+        let approval_id = approval_id.as_str();
         if sign_by <= unix_now() {
             return Ok(attempt);
         }
@@ -477,9 +465,7 @@ impl SetupRunServer<'_> {
             if let Ok(request) = queued {
                 match sign_queue().approval_outcome(&request) {
                     Some(SignOutcome::Signed(signature)) => {
-                        let body = bytes(
-                            &json!({"approval_id": approval_id, "signature": encode_base64url(&signature)}),
-                        );
+                        let body = approval_body(approval_id, &signature);
                         let response = self.agent_call(
                             Some(&run),
                             "POST",
@@ -517,6 +503,7 @@ impl SetupRunServer<'_> {
                     }
                     Some(SignOutcome::Declined) => {
                         let mut value = self.cancel(&run, id, deadline)?;
+                        // The CLI reads this marked cancel reply as settled, like its own cancel.
                         if value["state"] == "cancelled" {
                             value["code"] = json!("approval_declined");
                         }
@@ -542,6 +529,73 @@ impl SetupRunServer<'_> {
             "use_web",
         ))
     }
+}
+
+/// A queued approval whose signed facts name this attempt, account and organization.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CheckedApproval {
+    pub(super) approval_id: String,
+    /// The server's exact payload bytes, which the app signs unchanged.
+    pub(super) payload: Vec<u8>,
+    pub(super) sign_by: i64,
+}
+
+/// Checks the R2 `approval` object for attempt `id` before anything is queued for signing.
+pub(super) fn checked_approval(
+    approval: &Value,
+    attempt: &Value,
+    organization_id: &str,
+    id: &str,
+    account: &str,
+) -> Result<CheckedApproval, Failure> {
+    let approval_id = approval["approval_id"]
+        .as_str()
+        .filter(|id| cloud_uuid(id))
+        .ok_or_else(invalid_server)?;
+    let payload = approval["payload_b64"]
+        .as_str()
+        .and_then(decode_base64url)
+        .ok_or_else(invalid_server)?;
+    let facts: Value = serde_json::from_slice(&payload).map_err(|_| invalid_server())?;
+    if facts["target"]["id"] != account || attempt["account_id"] != account {
+        return Err(account_mismatch());
+    }
+    let sign_by = approval["sign_by"]
+        .as_str()
+        .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok())
+        .map(OffsetDateTime::unix_timestamp)
+        .ok_or_else(invalid_server)?;
+    let operation = facts["operation"].as_str().ok_or_else(invalid_server)?;
+    if facts["v"] != "ottto.cloud_connect.approval.v4"
+        || facts["aud"] != "app.ottto.net"
+        || facts["source"] != "bedrock"
+        || facts["org_id"] != organization_id
+        || facts["attempt_id"] != id
+        || facts["approval_id"] != approval_id
+        || facts["input_revision"] != attempt["input_revision"]
+        || facts["sign_by"] != sign_by
+        || !matches!(operation, "connect" | "reconnect" | "replace")
+        || !facts.get("replaces").is_some_and(|replaces| {
+            if operation == "replace" {
+                replaces.is_object()
+            } else {
+                replaces.is_null()
+            }
+        })
+    {
+        return Err(invalid_server());
+    }
+    Ok(CheckedApproval {
+        approval_id: approval_id.into(),
+        payload,
+        sign_by,
+    })
+}
+
+/// The R5 body: the approval ID and the app's signature over the payload bytes, unpadded
+/// base64url.
+pub(super) fn approval_body(approval_id: &str, signature: &[u8]) -> Vec<u8> {
+    bytes(&json!({"approval_id": approval_id, "signature": encode_base64url(signature)}))
 }
 
 /// The browser approval link for attempt `id`: the server's link only when it is the approval

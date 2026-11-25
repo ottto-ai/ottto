@@ -12,7 +12,7 @@ use crate::{
 use ottto_protocol::{
     cloud_uuid, expected_local_control_protocol_version, CliError, CliErrorCode,
     CloudConnectEnsure, CloudConnectFailure as Failure, CloudConnectSubmit,
-    LocalControlCommand as Command, CLOUD_CONNECT_WEB_URL,
+    LocalControlCommand as Command,
 };
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -42,7 +42,9 @@ pub(super) fn run(invocation: Invocation, command: CloudCommand) -> i32 {
                 Ok(value) => {
                     result.account_id = string(&value, "account_id").map(str::to_owned);
                     result.state = string(&value, "state").map(str::to_owned);
-                    result.cleanup = ended_cleanup(&value, None, false);
+                    result.web_url = web_url(&value);
+                    result.cleanup =
+                        ended_cleanup(&value, None, Reply::Read, invocation.output_mode);
                     result.finish(
                         &invocation,
                         None,
@@ -66,7 +68,8 @@ pub(super) fn run(invocation: Invocation, command: CloudCommand) -> i32 {
                     .request_id
                     .as_deref()
                     .filter(|_| !ends_attempt(error, result.state.as_deref()));
-                resume(&args, invocation.output_mode, error, request_id)
+                let attempt_id = request_id.and(result.attempt_id.as_deref());
+                resume(&args, invocation.output_mode, error, request_id, attempt_id)
             });
             result.finish(
                 &invocation,
@@ -91,7 +94,9 @@ pub(super) fn run(invocation: Invocation, command: CloudCommand) -> i32 {
             let settled = reply.map(|value| {
                 result.account_id = string(&value, "account_id").map(str::to_owned);
                 result.state = string(&value, "state").map(str::to_owned);
-                result.cleanup = ended_cleanup(&value, None, false);
+                result.web_url = web_url(&value);
+                result.cleanup =
+                    ended_cleanup(&value, None, Reply::Settled, invocation.output_mode);
             });
             match settled {
                 Ok(()) => {
@@ -129,9 +134,23 @@ struct ResultState {
     profile: Option<String>,
     /// The R1 `client_request_id` once sent: a rerun with it reads the same attempt back.
     request_id: Option<String>,
+    /// The connections page on the web origin the service paired with this Mac's Ottto API.
+    web_url: Option<String>,
 }
 
 impl ResultState {
+    /// Only a page on the web origin the service paired with this Mac's API; with no such origin
+    /// known (an old or unreachable service) the user gets the message alone.
+    fn connect_url<'a>(&'a self, action: &str, error: Option<&'a Failure>) -> Option<&'a str> {
+        match action {
+            "approve_in_browser" => self.browser_url.as_deref(),
+            "use_web" => error
+                .and_then(|error| error.connect_url.as_deref())
+                .or(self.web_url.as_deref()),
+            _ => None,
+        }
+    }
+
     fn finish(
         self,
         invocation: &Invocation,
@@ -157,13 +176,7 @@ impl ResultState {
             || message.unwrap_or_default(),
             |error| error.message.as_ref(),
         );
-        let connect_url = if action == "approve_in_browser" {
-            self.browser_url.as_deref()
-        } else if action == "use_web" {
-            Some(CLOUD_CONNECT_WEB_URL)
-        } else {
-            None
-        };
+        let connect_url = self.connect_url(action, error.as_ref());
         let payload = json!({
             "schema_version": SCHEMA,
             "status": self.state.as_deref().unwrap_or(if error.is_some() { "failed" } else { "connected" }),
@@ -201,8 +214,8 @@ impl ResultState {
                 {
                     println!("Status       {}", sanitize_for_terminal(state));
                 }
-                if let Some(id) = self.attempt_id {
-                    println!("Attempt      {}", sanitize_for_terminal(&id));
+                if let Some(id) = &self.attempt_id {
+                    println!("Attempt      {}", sanitize_for_terminal(id));
                 }
                 if let Some(url) = connect_url {
                     println!("{url}");
@@ -217,6 +230,9 @@ impl ResultState {
                     println!("Cleanup      {command}");
                 } else if let Some(message) = payload["cleanup"]["message"].as_str() {
                     println!("{}", sanitize_for_terminal(message));
+                }
+                if let Some(command) = argv_line(&payload["cleanup"]["settle_argv"]) {
+                    println!("Settle       {command}");
                 }
             }
         }
@@ -336,6 +352,7 @@ fn connect(
     let features = call(invocation, deadline, |_| Command::CloudStatus {
         source: Some("bedrock".into()),
     })?;
+    result.web_url = web_url(&features);
     check_features(&features)?;
 
     let verbose = args.verbose
@@ -347,6 +364,25 @@ fn connect(
     let account = aws.identity(&session, deadline)?;
     result.account_id = Some(account.clone());
     progress(invocation, "aws_identity", json!({"account_id": account}));
+
+    // A resumed request first reads the attempt it reached. Once that attempt saved or ended, the
+    // rerun reports it and never sends the request again: a server that did not record this
+    // request against the attempt it resumed would otherwise read it as new.
+    if let Some(id) = &args.attempt {
+        result.attempt_id = Some(id.clone());
+        let attempt = call(invocation, deadline, |timeout_ms| {
+            Command::CloudConnectStatus {
+                attempt_id: Some(id.clone()),
+                timeout_ms,
+            }
+        })?;
+        if matches!(
+            attempt["state"].as_str(),
+            Some("saved" | "expired" | "cancelled")
+        ) {
+            return poll(invocation, deadline, result, attempt, id, &account);
+        }
+    }
 
     let body = CloudConnectEnsure {
         source: args.source.slug().into(),
@@ -363,6 +399,20 @@ fn connect(
         }
     })?;
     result.state = string(&attempt, "state").map(str::to_owned);
+    result.web_url = web_url(&attempt).or(result.web_url.take());
+    if let Some(id) = string(&attempt, "attempt_id").filter(|id| cloud_uuid(id)) {
+        result.attempt_id = Some(id.to_owned());
+    }
+    // The predecessor this request ended on restart is over and never saved, whatever became of
+    // the attempt it opened: report it on every reply, a saved readback included.
+    if let Some(cleanup) = ended_cleanup(
+        &attempt,
+        args.profile.as_deref(),
+        Reply::Ensure,
+        invocation.output_mode,
+    ) {
+        result.cleanup = Some(cleanup);
+    }
     match attempt["state"].as_str() {
         Some("connected" | "saved") => return Ok(()),
         Some("web_open") => {
@@ -391,14 +441,12 @@ fn connect(
         "attempt_ready",
         json!({"attempt_id": id, "account_id": account}),
     );
-    // The predecessor this request ended on restart is over and never saved.
-    if let Some(cleanup) = ended_cleanup(&attempt, args.profile.as_deref(), true) {
-        result.cleanup = Some(cleanup);
-    }
+    // A failure only a restart fixes is reported before any AWS work.
     if matches!(
         attempt["state"].as_str(),
         Some("cli_pending" | "cli_failed")
-    ) {
+    ) && attempt["next_action"] != "restart"
+    {
         let methods = attempt["approval_methods"]
             .as_array()
             .filter(|methods| !methods.is_empty())
@@ -573,14 +621,28 @@ fn poll(
         let stage = match state {
             "saved" | "connected" => return Ok(()),
             "cli_failed" | "cancelled" | "expired" => {
-                // `cli_failed` stays resumable with its stack: no delete command for it.
-                if let Some(cleanup) = ended_cleanup(&attempt, result.profile.as_deref(), false) {
+                // The service's own cancel after a declined approval is a settling write; any
+                // other reply here is a read, which may race a save.
+                let reply = if state == "cancelled" && attempt["code"] == "approval_declined" {
+                    Reply::Settled
+                } else {
+                    Reply::Read
+                };
+                let profile = result.profile.as_deref();
+                if let Some(cleanup) =
+                    ended_cleanup(&attempt, profile, reply, invocation.output_mode)
+                {
                     result.cleanup = Some(cleanup);
                 }
                 let code = string(&attempt, "code").unwrap_or(state);
                 let message = string(&attempt, "message")
                     .unwrap_or("Cloud setup ended. Run the command again.");
-                return Err(normalize_error(Failure::new(code, message, "run_again")));
+                let action = if attempt["next_action"] == "restart" {
+                    "restart"
+                } else {
+                    "run_again"
+                };
+                return Err(normalize_error(Failure::new(code, message, action)));
             }
             "cli_pending" => {
                 return Err(Failure::new(
@@ -673,23 +735,57 @@ fn approval_timeout(result: &ResultState, error: Failure) -> Failure {
     error
 }
 
-/// A delete command or note for a stack only when the server says its attempt ended without
-/// saving: in an ensure reply, the predecessor it ended on restart (another attempt); in an
-/// attempt reply, the attempt itself once `expired` or `cancelled`. Anything else may still save.
-fn ended_cleanup(value: &Value, profile: Option<&str>, ensure: bool) -> Option<Value> {
+/// How a reply was produced, which decides whether its cleanup material is final.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    /// R1: may name the predecessor this request ended on restart.
+    Ensure,
+    /// A cancel write, which settles the attempt under the server's lock first.
+    Settled,
+    /// A plain read. It can report a lapsed attempt as `expired` while a save is still
+    /// committing, so it never yields a delete command.
+    Read,
+}
+
+/// A delete command or note for a stack only when a settling write says its attempt ended without
+/// saving: in an ensure reply, the predecessor it ended on restart (another attempt); in a cancel
+/// reply, the attempt itself once `expired` or `cancelled`. A read of an ended attempt points at
+/// `ottto cloud cancel`, which settles it and then names the stack if it never saved.
+fn ended_cleanup(
+    value: &Value,
+    profile: Option<&str>,
+    reply: Reply,
+    mode: OutputMode,
+) -> Option<Value> {
     let reference: CleanupReference =
         serde_json::from_value(value["ended_attempt_cleanup"].clone()).ok()?;
     let own = value["attempt_id"].as_str() == Some(reference.attempt_id.as_str());
-    let ended = if ensure {
-        !own
-    } else {
-        own && matches!(value["state"].as_str(), Some("expired" | "cancelled"))
-    };
-    if ended {
-        reference.output(profile)
-    } else {
-        None
+    let ended = matches!(value["state"].as_str(), Some("expired" | "cancelled"));
+    match reply {
+        Reply::Ensure if !own => reference.output(profile),
+        Reply::Settled if own && ended => reference.output(profile),
+        Reply::Read if own && ended && cloud_uuid(&reference.attempt_id) => {
+            let mut argv: Vec<String> = ["ottto", "cloud", "cancel", "--attempt"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            argv.push(reference.attempt_id);
+            add_output_flags(&mut argv, mode);
+            Some(json!({
+                "verified": false,
+                "message": "To delete this setup's AWS stack, first confirm it ended without saving.",
+                "settle_argv": argv,
+            }))
+        }
+        _ => None,
     }
+}
+
+/// The connections page the service built from the web origin paired with its Ottto API.
+fn web_url(value: &Value) -> Option<String> {
+    string(value, "connect_url")
+        .filter(|url| url.starts_with("https://"))
+        .map(str::to_owned)
 }
 
 /// Whether the outcome closed the attempt this request read, so a rerun must ask for a new one.
@@ -780,13 +876,14 @@ pub(super) fn valid_request_id(value: &str) -> Result<String, String> {
 }
 
 /// The rerun command. With `request_id` it repeats the original request exactly (including
-/// `--restart`), so the server reads the same attempt back. Without it, it asks for a new
-/// attempt, restarting when `next_action` says so.
+/// `--restart`) and names the attempt it reached, so the rerun settles on that attempt. Without
+/// it, it asks for a new attempt, restarting when `next_action` says so.
 fn resume(
     args: &CloudConnectArgs,
     mode: OutputMode,
     error: &Failure,
     request_id: Option<&str>,
+    attempt_id: Option<&str>,
 ) -> Vec<String> {
     let restart = error.next_action == "restart";
     let mut argv: Vec<String> = ["ottto", "cloud", "connect", "--source", args.source.slug()]
@@ -817,6 +914,10 @@ fn resume(
     }
     if let Some(id) = request_id.filter(|_| !restart) {
         argv.push(format!("--request-id={id}"));
+        // The rerun reads this attempt first and stops if it already saved or ended.
+        if let Some(attempt) = attempt_id.or(args.attempt.as_deref()) {
+            argv.push(format!("--attempt={attempt}"));
+        }
     }
     add_output_flags(&mut argv, mode);
     argv
@@ -904,8 +1005,15 @@ mod tests {
         // A lost reply or a wait: the same request and flags read the same attempt back.
         let waiting = timed_out();
         assert!(!ends_attempt(&waiting, Some("cli_approval")));
+        let attempt = "00000000-0000-4000-8000-000000000001";
         assert_eq!(
-            resume(&args, OutputMode::Ndjson, &waiting, Some("req.1")),
+            resume(
+                &args,
+                OutputMode::Ndjson,
+                &waiting,
+                Some("req.1"),
+                Some(attempt)
+            ),
             [
                 "ottto",
                 "cloud",
@@ -917,27 +1025,44 @@ mod tests {
                 "--restart",
                 "--profile=work",
                 "--request-id=req.1",
+                "--attempt=00000000-0000-4000-8000-000000000001",
                 "--json",
                 "--watch",
             ]
         );
+        // The rerun parses, and names the attempt again even before its reply arrives.
+        let flag = format!("--attempt={attempt}");
+        let rerun = connect_args(&["--request-id=req.1", flag.as_str()]);
+        assert_eq!(rerun.attempt.as_deref(), Some(attempt));
+        assert!(resume(&rerun, OutputMode::Human, &waiting, Some("req.1"), None).contains(&flag));
+        // An attempt without its request is refused.
+        let argv = [
+            "ottto",
+            "cloud",
+            "connect",
+            "--source",
+            "bedrock",
+            flag.as_str(),
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
         // Before any request was sent the flags stay as given.
-        assert!(resume(&args, OutputMode::Human, &waiting, None)
+        assert!(resume(&args, OutputMode::Human, &waiting, None, None)
             .iter()
-            .all(|arg| !arg.starts_with("--request-id")));
+            .all(|arg| !arg.starts_with("--request-id") && !arg.starts_with("--attempt")));
 
         // A restart asks for a new attempt.
         let restart = normalize_error(Failure::new("stack_failed", "Failed.", "restart"));
         assert!(ends_attempt(&restart, Some("cli_failed")));
-        let argv = resume(&args, OutputMode::Json, &restart, None);
+        let argv = resume(&args, OutputMode::Json, &restart, None, Some(attempt));
         assert!(argv.iter().any(|arg| arg == "--restart"));
+        assert!(argv.iter().all(|arg| !arg.starts_with("--attempt")));
         assert!(argv.iter().all(|arg| !arg.starts_with("--request-id")));
 
         // An ended attempt runs again as a new request without --restart.
         let ended = normalize_error(Failure::new("expired", "Expired.", "restart"));
         assert_eq!(ended.next_action, "run_again");
         assert!(ends_attempt(&ended, Some("expired")));
-        let argv = resume(&args, OutputMode::Json, &ended, None);
+        let argv = resume(&args, OutputMode::Json, &ended, None, None);
         assert!(argv.iter().all(|arg| arg != "--restart"));
 
         // A resumable failure keeps the request so the stack is reused.
@@ -962,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_commands_only_name_stacks_of_attempts_that_ended_unsaved() {
+    fn delete_commands_only_name_stacks_a_settling_write_ended_unsaved() {
         let id = "00000000-0000-4000-8000-000000000001";
         let arn = "arn:aws:cloudformation:us-east-1:000000000001:stack/ottto-read-b-abcde234/00000000-0000-0000-0000-000000000001";
         let reply = |state: &str, owner: &str, stack_id: Value| {
@@ -975,19 +1100,86 @@ mod tests {
                 },
             })
         };
+        let cleanup = |value: &Value, kind| ended_cleanup(value, None, kind, OutputMode::Json);
+        // A cancel reply settles the attempt first: only then does an ended state name the stack.
         for state in ["cancelled", "expired"] {
-            let cleanup = ended_cleanup(&reply(state, id, json!(arn)), None, false).unwrap();
-            assert_eq!(cleanup["argv"][4], arn);
+            let settled = cleanup(&reply(state, id, json!(arn)), Reply::Settled).unwrap();
+            assert_eq!(settled["argv"][4], arn);
         }
         // A failed attempt can still be resumed and saved with this stack.
-        assert!(ended_cleanup(&reply("cli_failed", id, json!(arn)), None, false).is_none());
+        assert!(cleanup(&reply("cli_failed", id, json!(arn)), Reply::Settled).is_none());
+        assert!(cleanup(&reply("saved", id, json!(arn)), Reply::Settled).is_none());
         // Without an ARN the user gets the stack, account and region only.
-        let unknown = ended_cleanup(&reply("expired", id, Value::Null), None, false).unwrap();
+        let unknown = cleanup(&reply("expired", id, Value::Null), Reply::Settled).unwrap();
         assert!(unknown.get("argv").is_none());
         // An ensure reply names a predecessor it ended; its own attempt is still open.
         let other = "00000000-0000-4000-8000-000000000002";
-        assert!(ended_cleanup(&reply("cli_pending", other, json!(arn)), None, true).is_some());
-        assert!(ended_cleanup(&reply("cli_failed", id, json!(arn)), None, true).is_none());
+        assert!(cleanup(&reply("cli_pending", other, json!(arn)), Reply::Ensure).is_some());
+        assert!(cleanup(&reply("saved", other, json!(arn)), Reply::Ensure).is_some());
+        assert!(cleanup(&reply("expired", id, json!(arn)), Reply::Ensure).is_none());
+        // A read never names a predecessor either.
+        assert!(cleanup(&reply("cli_pending", other, json!(arn)), Reply::Read).is_none());
+    }
+
+    /// [behaviour] The save that commits just after the attempt lapsed: a read in between reports
+    /// `expired` with the stack ARN. It points at the settling cancel, whose reply then reads
+    /// `saved`, so no delete command ever names the connected stack.
+    #[test]
+    fn a_save_racing_expiry_never_gets_a_delete_command() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let arn = "arn:aws:cloudformation:us-east-1:000000000001:stack/ottto-read-b-abcde234/00000000-0000-0000-0000-000000000001";
+        let material = json!({
+            "attempt_id": id, "stack_name": "ottto-read-b-abcde234",
+            "account_id": "000000000001", "stack_id": arn,
+        });
+        let lapsed = json!({"attempt_id": id, "state": "expired", "code": "expired",
+            "next_action": "restart", "ended_attempt_cleanup": material});
+        for mode in [OutputMode::Human, OutputMode::Ndjson] {
+            let read = ended_cleanup(&lapsed, Some("work"), Reply::Read, mode).unwrap();
+            assert!(read.get("argv").is_none(), "{read}");
+            assert_eq!(read["verified"], false);
+            let settle = argv_line(&read["settle_argv"]).unwrap();
+            assert!(settle.starts_with(&format!("ottto cloud cancel --attempt {id}")));
+            assert_eq!(
+                settle.ends_with("--json --watch"),
+                mode == OutputMode::Ndjson
+            );
+        }
+        // The worker's save committed before the cancel took the row: no cleanup.
+        let saved = json!({"attempt_id": id, "state": "saved", "ended_attempt_cleanup": null});
+        assert!(ended_cleanup(&saved, None, Reply::Settled, OutputMode::Human).is_none());
+        // Or the cancel persisted the expiry first, and the stack is safe to delete.
+        let ended =
+            ended_cleanup(&lapsed, Some("work"), Reply::Settled, OutputMode::Human).unwrap();
+        assert_eq!(ended["argv"][4], arn);
+        // A lapsed attempt asks for a fresh request, never a restart that would end another.
+        let error = normalize_error(Failure::new("expired", "Expired.", "restart"));
+        assert_eq!(error.next_action, "run_again");
+    }
+
+    #[test]
+    fn web_links_use_only_the_paired_origin_the_service_sent() {
+        let staging = "https://staging.tail21f014.ts.net/connections";
+        let mut result = ResultState {
+            web_url: web_url(&json!({"connect_url": staging})),
+            ..ResultState::default()
+        };
+        let fallback = Failure::new("signer_unavailable", "Use the web.", "use_web");
+        assert_eq!(
+            result.connect_url("use_web", Some(&fallback)),
+            Some(staging)
+        );
+        let mut sent = fallback.clone();
+        sent.connect_url = Some(staging.into());
+        result.web_url = None;
+        assert_eq!(result.connect_url("use_web", Some(&sent)), Some(staging));
+        // No paired origin known: the message alone, never a production link.
+        assert_eq!(result.connect_url("use_web", Some(&fallback)), None);
+        assert_eq!(
+            web_url(&json!({"connect_url": "http://app.ottto.net"})),
+            None
+        );
+        assert_eq!(result.connect_url("run_again", Some(&sent)), None);
     }
 
     #[test]
