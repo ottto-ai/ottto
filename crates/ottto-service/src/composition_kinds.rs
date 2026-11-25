@@ -348,6 +348,17 @@ impl Verdict {
     }
 }
 
+/// `mcp__<server>__<tool>` -> (server, tool), split at the first `__` after
+/// the prefix; a name with no second `__` is (rest, ""). Lexical only: each
+/// caller keeps its own acceptance rules.
+pub(crate) fn split_mcp_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("mcp__")?;
+    match rest.split_once("__") {
+        Some((server, tool)) => Some((server, tool)),
+        None => Some((rest, "")),
+    }
+}
+
 /// The tool a call used: the raw client tool name, `server/tool` for an
 /// add-on (MCP) call. Upload labels and consent are the reader's.
 #[derive(Debug, Clone, PartialEq, Eq)]

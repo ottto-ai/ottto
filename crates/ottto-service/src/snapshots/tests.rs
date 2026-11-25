@@ -21775,6 +21775,7 @@ fn content_hash_ignores_scan_state_parser_provenance_and_display_policy() {
         }],
         opening_file_overflow: Some(0),
         start_chars_tools: Some(16),
+        start_chars_mcp_schemas: Some(5),
         ..SnapshotSessionStart::default()
     }));
     assert_eq!(content_hash(&session_start), expected, "session start");
