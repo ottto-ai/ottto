@@ -644,6 +644,48 @@ fn codex_held_thread_extent_catch_up_is_cured_by_the_next_walk() {
     );
 }
 
+/// A window-0 policy stop withdraws the server's census, so it clears an
+/// armed record: back at the same window (identical hint bytes) the next
+/// pass walks and republishes the manifest instead of resting on it.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn window_zero_policy_stop_clears_the_armed_record() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Pi;
+    let row = "w23_window_zero";
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        assert!(walk_idle::armed_for_test(source).is_some(), "{row}");
+        let statuses = status_count(&server);
+        let window = std::sync::atomic::Ordering::SeqCst;
+        server.window_days.store(0, window);
+        walk_idle::age_for_test(source, STEP);
+        assert!(
+            prepare_once(&mut home).unwrap().is_none(),
+            "{row}: window 0 stops the pass"
+        );
+        assert!(status_count(&server) > statuses, "{row}: the tombstone");
+        assert_eq!(
+            walk_idle::armed_for_test(source),
+            None,
+            "{row}: the stop clears the record"
+        );
+        server.window_days.store(183, window);
+        let mut seen = Seen::now(source, &server);
+        let back = pass(&mut home, &server, &recording, STEP);
+        expect_pass(source, row, &back, true, &server, &mut seen);
+    });
+}
+
 /// An unreadable Codex state store still walks an armed source: home side
 /// files left the gate key, the scan's census health check did not.
 #[test]

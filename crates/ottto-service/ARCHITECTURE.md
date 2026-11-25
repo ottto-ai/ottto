@@ -36,9 +36,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
   it reads, uploads and saves nothing and sends no status receipt: the walk's receipt and manifest
   stand, and check-in beats (sent with no scan start while a record is armed) keep them fresh.
-  Anything else walks as before: any failure, an account switch, a restart or another writer's
-  save. A due sampled audit waits for the next walk, at the latest the backstop. A pass that took
-  a hint clears the record before any fallible step, so a failed pass is followed by a walk. An
+  Anything else walks as before: any failure, an account switch, a restart, another writer's
+  save, or a policy stop (collection disabled or a zero backfill window, which withdraws the
+  server's census). A due sampled audit waits for the next walk, at the latest the backstop. A
+  pass that took a hint clears the record before any fallible step, so a failed pass is
+  followed by a walk. An
   idle pass never emits a body. A watcher overflow, a dropped-event rescan (FSEvents
   MustScanSubDirs with its user or kernel drop flags) or a watcher re-create requests a listing,
   so that pass walks. Limit: a change the watcher misses silently, with no event and no drop
