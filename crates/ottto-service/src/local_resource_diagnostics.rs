@@ -387,9 +387,13 @@ pub(crate) enum CodexCompressionUnproven {
     NoLength = 2,
     /// The head read up to an unterminated final line.
     Unsealed = 3,
+    /// The predecessor has no certified head; the carry stays refused and
+    /// holds the archive, so this counts once per pass while it holds.
+    Uncertified = 4,
 }
-const CODEX_COMPRESSION_UNPROVEN_KEYS: [&str; 4] = ["length", "growth", "no_length", "unsealed"];
-process_static!(fn with_codex_compression_unproven: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4]);
+const CODEX_COMPRESSION_UNPROVEN_KEYS: [&str; 5] =
+    ["length", "growth", "no_length", "unsealed", "uncertified"];
+process_static!(fn with_codex_compression_unproven: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5]);
 
 pub(crate) fn codex_compression_carry_unproven(reason: CodexCompressionUnproven) {
     with_codex_compression_unproven(|counts| {

@@ -677,11 +677,27 @@ fn compression_carries_only_a_proven_complete_read() {
         if unsealed {
             // A read that stopped mid-line leaves no certified head to carry:
             // the existing refused-carry path holds the archive and the old
-            // entry, with no read, upload or money change.
-            assert_eq!(full_decodes(&logs), 0, "{case}");
+            // entry, with no read, upload or money change, counted each pass
+            // it holds and never a read storm.
+            let mut index = index;
+            for pass in [0, 1] {
+                let pass_logs = if pass == 0 {
+                    logs.clone()
+                } else {
+                    let before = index.clone();
+                    let (working, scan, _, _, logs) = page(&c, index, cache.clone());
+                    let (next, posts) =
+                        working.checkpoint_with_captured_posts(&scan, &before, "accept");
+                    assert!(scan.snapshots.is_empty() && posts.is_empty(), "{case} {pass}");
+                    index = next;
+                    logs
+                };
+                assert_eq!(full_decodes(&pass_logs), 0, "{case} {pass}");
+                assert_eq!(unproven(&pass_logs), json!({"uncertified": 1}), "{case} {pass}");
+                assert!(index.files.contains_key(&old_key), "{case} {pass}");
+                assert!(!index.files.contains_key(&new_key), "{case} {pass}");
+            }
             assert!(scan.snapshots.is_empty() && posts.is_empty(), "{case}");
-            assert!(index.files.contains_key(&old_key), "{case}");
-            assert!(!index.files.contains_key(&new_key), "{case}");
             continue;
         }
         let Some(reason) = reason else {

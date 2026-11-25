@@ -289,6 +289,16 @@ impl ScanIndex {
                 && candidate.path.as_os_str() == compressed_name.as_os_str()
                 && old_path.parent() == candidate.path.parent();
             let head = state_v2::load_head(self, &from, revision)?;
+            // A compression over an uncertified head stays refused below.
+            if compression
+                && head.as_ref().is_none_or(|head| {
+                    head.metadata_only || tail_source::certified_certificate(&head.body).is_err()
+                })
+            {
+                crate::local_resource_diagnostics::codex_compression_carry_unproven(
+                    CodexCompressionUnproven::Uncertified,
+                );
+            }
             ensure!(!compression || head.is_some(), "codex_carry_certificate");
             let Some(head) = head else {
                 continue;
