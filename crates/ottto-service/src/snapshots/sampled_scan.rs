@@ -251,8 +251,8 @@ pub(super) struct Context {
     /// (created thread, spawn family, identity conflict) moved since their
     /// last read, so this walk reads them again.
     pub(super) codex_side_only_reselect: usize,
-    /// The same, for a rollout whose head stored no binding at its last read
-    /// (the side facts it now has arrived after that read).
+    /// The same, for a head that stored no binding at all (for example one
+    /// written before bindings were stored). Both count selection decisions.
     pub(super) codex_side_only_first_binding: usize,
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,

@@ -48,14 +48,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   their titles, lineage and placement can show up to `WALK_GAP` late. Amounts are unaffected.
   Codex home side files (`state_5.sqlite`, `thread_history_1.sqlite`, `session_index.jsonl`,
   `config.toml`) are not gate inputs either: a change to them neither wakes a settled Codex
-  source nor keeps a walk from arming. Every walk reloads them and checks each rollout it
-  reaches, so a side-only change (a created-thread or spawn link, an identity conflict, a title)
-  on an unchanged rollout is applied by the next walk, at the latest the backstop plus the time
-  to reach the file. A side fact that changes and changes back before that walk is never
-  applied, and a rollout that leaves the backfill window or is deleted in the wait is not read
-  again. `codex_side_only_reselect` and `codex_side_only_first_binding` count unchanged
-  rollouts whose stored head binding no longer matches the side files. A held created thread
-  re-read because its hold memo's side facts moved is not counted there.
+  source nor keeps a walk from arming. A walk uses the side facts current at that pass (reused
+  from cache while the files are unchanged) for each rollout it reaches. A side-only change to an
+  unchanged rollout is applied when the next eligible walk reaches that file: during use the next
+  rollout change, otherwise the remaining backstop gap plus pass lag plus the time to reach the
+  file. A rollout with a held created thread is owed work, so its source keeps walking. The
+  existing shortcuts still apply: a certified unchanged head compares only its reduction binding
+  (created thread, spawn family, identity conflict), so a title-only or extent-only change on it
+  waits for the file's next read; an accepted legacy rollout and an unowed compressed archive with
+  no reduction head reuse their stored decision. A side fact that changes and changes back before
+  that walk is never applied, and a rollout that leaves the backfill window or is deleted in the
+  wait is not read again. The freshness alarm ages unread transcript content; it carries no age
+  for a side-only change. `codex_side_only_reselect` and `codex_side_only_first_binding` count
+  selection decisions on unchanged rollouts whose stored head binding no longer matches; a held
+  created thread re-read because its hold memo's side facts moved is not counted there.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted

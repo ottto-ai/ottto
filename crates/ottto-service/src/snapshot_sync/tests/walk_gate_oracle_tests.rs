@@ -432,12 +432,19 @@ fn set_extent_lag(home: &OracleHome, thread: &str, lag: i64) {
         .unwrap();
 }
 
+/// The exact accepted heads (normalized bodies after each exact ACK) and,
+/// per pass after the side change, whether the changed thread's own accepted
+/// body moved and that pass's side-only reselect counts.
+struct SideOnlyRun {
+    lifecycle: Lifecycle,
+    accepted: BTreeMap<String, Value>,
+    passes: Vec<(bool, [u64; 2])>,
+}
+
 /// complete -> a spawn edge binds a created thread whose rollout never
 /// changes -> passes to the backstop. With `gated` false every pass walks
-/// (today's back-to-back walks over the same timeline). Also returns, per
-/// pass after the edge, whether the rollout's index entry or the server's
-/// placement took it, and the pass's side-only reselect counts.
-fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<(bool, [u64; 2])>) {
+/// (today's back-to-back walks over the same timeline).
+fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> SideOnlyRun {
     let source = SnapshotSource::Codex;
     let recording = Recording::start();
     let server = OracleServer::new(source, recording.handle());
@@ -454,12 +461,12 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
         let mut cycles = settle(&mut home, &server, &recording);
         let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
         let mut seen = Seen::now(source, &server);
-        let key = transcript(&home).to_string_lossy().into_owned();
-        let fingerprint = |cycle: &Cycle| {
-            (cycle.index.files.get(&key)).map(|entry| entry.source_file_fingerprint.clone())
-        };
-        let before = fingerprint(cycles.last().unwrap());
-        let placed = placement(&server);
+        let mut accepted = BTreeMap::new();
+        for cycle in &cycles {
+            schedule_accepts(source, cycle, &mut accepted);
+        }
+        let before = accepted.get(IDENTITY_PIPELINE_ROOT).cloned();
+        assert!(before.is_some(), "{row}: the thread has an accepted body");
         let rollout = std::fs::read(transcript(&home)).unwrap();
         add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
         let mut applied = Vec::new();
@@ -471,7 +478,8 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
             let walk = backstop || !gated;
             expect_pass(source, row, &cycle, walk, &server, &mut seen);
             walks += usize::from(walk);
-            let took = fingerprint(&cycle) != before || placement(&server) != placed;
+            schedule_accepts(source, &cycle, &mut accepted);
+            let took = accepted.get(IDENTITY_PIPELINE_ROOT) != before.as_ref();
             applied.push((took, cycle.side_only));
             cycles.push(cycle);
             if backstop {
@@ -483,13 +491,17 @@ fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<
             rollout,
             "{row}: the rollout never changed"
         );
-        (Lifecycle::of(&server, &cycles, walks), applied)
+        SideOnlyRun {
+            lifecycle: Lifecycle::of(&server, &cycles, walks),
+            accepted,
+            passes: applied,
+        }
     })
 }
 
 /// A spawn edge for a created thread on an unchanged rollout wakes nothing:
-/// the backstop walk applies it, counted, with the money of back-to-back
-/// walks over the same timeline.
+/// the backstop walk applies it to that thread's accepted body, counted, and
+/// every exact accepted body equals back-to-back walks over the same timeline.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -498,8 +510,9 @@ fn codex_side_only_change_waits_for_the_backstop_walk() {
         return;
     }
     let row = "w20_codex_side";
-    let (gated, rested) = codex_side_only_lifecycle(row, true);
-    let (today, walked_each) = codex_side_only_lifecycle("w20_codex_side_today", false);
+    let gated = codex_side_only_lifecycle(row, true);
+    let today = codex_side_only_lifecycle("w20_codex_side_today", false);
+    let (rested, walked_each) = (&gated.passes, &today.passes);
     assert!(walked_each[0].0, "{row}: the next walk applies the edge");
     let ((backstop, counted), rests) = rested.split_last().unwrap();
     assert!(
@@ -515,15 +528,28 @@ fn codex_side_only_change_waits_for_the_backstop_walk() {
     );
     assert_eq!(counted[1], 0, "{row}: {counted:?}");
     assert_eq!(walked_each[0].1, *counted, "{row}: on either schedule");
-    assert!(gated.walks < today.walks, "{row}: the edge woke no walk");
-    gated.assert_matches(&today, row);
+    assert!(
+        gated.lifecycle.walks < today.lifecycle.walks,
+        "{row}: the edge woke no walk"
+    );
+    gated.lifecycle.assert_matches(&today.lifecycle, row);
+    assert_eq!(
+        gated.accepted, today.accepted,
+        "{row}: the same exact accepted bodies"
+    );
+}
+
+/// A pass that walked to completion or left a walk in progress (an idle
+/// pass does neither).
+fn walking(cycle: &Cycle) -> bool {
+    walked(cycle) || cycle.index.traversal.is_some()
 }
 
 /// A created thread held while its thread-history extent lags its rollout:
 /// passes before and after the extent catches up (no rollout change). Also
-/// returns, per pass after the catch-up, whether the index entry or the
-/// server's placement took it.
-fn codex_held_thread_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Vec<bool>) {
+/// returns, per pass after the catch-up, whether the thread's own accepted
+/// body moved and that pass's side-only reselect counts.
+fn codex_held_thread_lifecycle(row: &'static str, gated: bool) -> SideOnlyRun {
     let source = SnapshotSource::Codex;
     let recording = Recording::start();
     let server = OracleServer::new(source, recording.handle());
@@ -540,45 +566,60 @@ fn codex_held_thread_lifecycle(row: &'static str, gated: bool) -> (Lifecycle, Ve
             crate::snapshot_watcher::cover_paths_for_test(None);
         }
         let mut cycles = Vec::new();
+        let mut accepted = BTreeMap::new();
         for _ in 0..3 {
             let cycle = pass(&mut home, &server, &recording, STEP);
             assert!(cycle.finish.is_ok(), "{row}: {:?}", cycle.finish);
+            assert!(
+                walking(&cycle),
+                "{row}: a held source walks: {}",
+                cycle.gate
+            );
             assert_eq!(
                 walk_idle::armed_for_test(source),
                 None,
                 "{row}: a held thread is owed, so the source never rests"
             );
+            schedule_accepts(source, &cycle, &mut accepted);
             cycles.push(cycle);
         }
-        let key = transcript(&home).to_string_lossy().into_owned();
-        let fingerprint = |cycle: &Cycle| {
-            (cycle.index.files.get(&key)).map(|entry| entry.source_file_fingerprint.clone())
-        };
-        let before = fingerprint(cycles.last().unwrap());
-        let placed = placement(&server);
+        let before = accepted.get(IDENTITY_PIPELINE_ROOT).cloned();
         let rollout = std::fs::read(transcript(&home)).unwrap();
         set_extent_lag(&home, IDENTITY_PIPELINE_ROOT, 0);
         let mut applied = Vec::new();
         for _ in 0..2 {
             let cycle = pass(&mut home, &server, &recording, STEP);
             assert!(cycle.finish.is_ok(), "{row}: {:?}", cycle.finish);
-            applied.push(fingerprint(&cycle) != before || placement(&server) != placed);
+            schedule_accepts(source, &cycle, &mut accepted);
+            let took = accepted.get(IDENTITY_PIPELINE_ROOT) != before.as_ref();
+            applied.push((took, cycle.side_only));
             cycles.push(cycle);
         }
+        assert!(
+            walking(&cycles[3]),
+            "{row}: the pass after the catch-up walks: {}",
+            cycles[3].gate
+        );
         assert_eq!(
             std::fs::read(transcript(&home)).unwrap(),
             rollout,
             "{row}: the rollout never changed"
         );
-        let walks = cycles.len();
-        (Lifecycle::of(&server, &cycles, walks), applied)
+        let walks = cycles.iter().filter(|cycle| walking(cycle)).count();
+        SideOnlyRun {
+            lifecycle: Lifecycle::of(&server, &cycles, walks),
+            accepted,
+            passes: applied,
+        }
     })
 }
 
 /// A held created thread keeps its source walking, so its thread-history
-/// extent catching up (no rollout change) is cured by the next walk, with
-/// the money of back-to-back walks. Home side files are not gate inputs, but
-/// a hold never rests to wait for them.
+/// extent catching up (no rollout change) is cured by the next walk: the
+/// thread's own accepted body moves, the side-only counters stay zero (a
+/// hold-memo miss is an ordinary re-read), and every exact accepted body
+/// equals back-to-back walks. Home side files are not gate inputs, but a
+/// hold never rests to wait for them.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -587,11 +628,20 @@ fn codex_held_thread_extent_catch_up_is_cured_by_the_next_walk() {
         return;
     }
     let row = "w22_codex_extent";
-    let (gated, cured) = codex_held_thread_lifecycle(row, true);
-    let (today, today_cured) = codex_held_thread_lifecycle("w22_codex_extent_today", false);
-    assert!(cured[0], "{row}: the next walk cures the hold");
-    assert_eq!(cured, today_cured, "{row}");
-    gated.assert_matches(&today, row);
+    let gated = codex_held_thread_lifecycle(row, true);
+    let today = codex_held_thread_lifecycle("w22_codex_extent_today", false);
+    assert!(gated.passes[0].0, "{row}: the next walk cures the hold");
+    assert_eq!(gated.passes, today.passes, "{row}");
+    assert!(
+        gated.passes.iter().all(|(_, counts)| *counts == [0, 0]),
+        "{row}: {:?}",
+        gated.passes
+    );
+    gated.lifecycle.assert_matches(&today.lifecycle, row);
+    assert_eq!(
+        gated.accepted, today.accepted,
+        "{row}: the same exact accepted bodies"
+    );
 }
 
 /// An unreadable Codex state store still walks an armed source: home side
@@ -617,9 +667,10 @@ fn codex_unreadable_state_store_walks_an_armed_source() {
         std::fs::write(state, b"not a state store").unwrap();
         let cycle = pass(&mut home, &server, &recording, STEP);
         assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+        assert!(walking(&cycle), "the pass walked: {}", cycle.gate);
         assert!(
             walk_idle::armed_for_test(source).is_none(),
-            "the pass walked: {}",
+            "and did not re-arm: {}",
             cycle.gate
         );
     });

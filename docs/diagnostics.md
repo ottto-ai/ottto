@@ -259,16 +259,20 @@ emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
-A nonzero-only `codex_side_only_reselect` record counts physically unchanged
-Codex rollouts whose stored head binding (created thread, spawn family,
-identity conflict) no longer matches the current home side files, so the
-certified unchanged shortcut does not apply. A nonzero-only
-`codex_side_only_first_binding` record counts the same for a head that stored
-no binding at its last read: the side facts arrived after that read. A head
-written before bindings were stored also counts there, on each walk, until its
-file is read again. Both count decisions, not distinct files. A held created
-thread re-read because its hold memo's side facts moved is not counted. Side-file
-changes do not wake the walk gate, so these show up on the next walk.
+A nonzero-only `codex_side_only_reselect` record counts selection decisions on
+physically unchanged Codex rollouts whose stored head binding (created thread,
+spawn family, identity conflict) no longer matches the current home side files,
+so the certified unchanged shortcut does not apply. A head stores a binding
+whenever its rollout path is recognized, even with no side rows, so a state row
+or spawn edge that lands after the last read counts here. A nonzero-only
+`codex_side_only_first_binding` record counts the same decision for a head that
+stored no binding at all, such as one written before bindings were stored; it
+repeats on each walk until the file is read again. Both are counted before read
+admission, so a counted file can still be skipped, retried or held, and both
+count decisions, not distinct files. A held created thread re-read because its
+hold memo's side facts moved is not counted. Side-file changes do not wake the
+walk gate, so these show up on the next walk, and with the gate off on every
+walk.
 Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
 paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its

@@ -43,7 +43,7 @@ impl ScanIndex {
     /// audit, evidence, exact-body/context or sidecar dependency authority.
     /// `side_moved` is set when the rollout is physically unchanged but its
     /// stored reduction binding differs from the current side facts: true when
-    /// the head stored no binding (a first binding), false otherwise.
+    /// the head stored no binding at all, false otherwise.
     pub(super) fn codex_unchanged_decision(
         &self,
         candidate: &mut CandidateFile,
