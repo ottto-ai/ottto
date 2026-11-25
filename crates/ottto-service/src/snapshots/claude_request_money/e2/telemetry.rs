@@ -7,7 +7,8 @@ use super::{
     mark_copy_key, matching_members, page_families, record_counts, reported_key, timed,
     CertificateFailure, ClaudeApiEvidenceRead, ClaudeEntityBody, ClaudeLocalOtelLoadReport,
     ClaudeTraceOwnershipLoadReport, Counts, Duration, FamilyMembership, FileFold, FoldTelemetry,
-    GrainNearMiss, IdentityCaller, PageSpent, PathBuf, RefCell, ScanTraversalPath, HOUR_NANOS,
+    GrainNearMiss, Holders, IdentityCaller, PageSpent, PathBuf, RefCell, ScanTraversalPath,
+    HOUR_NANOS,
 };
 use crate::claude_local_otel::ClaudeLocalOtelEvidence;
 use crate::snapshots::claude_money_birth_store::{location_key, LocationKey};
@@ -23,7 +24,7 @@ use crate::snapshots::{
     local_index_key, rfc3339_unix_nanos, validate_claude_api_row, ClaudeTranscriptUsageOccurrence,
     ScanIndex, ScanTraversalCheckpoint, SelectorCapture, SnapshotItem,
 };
-use crate::telemetry_attach::{join, Attachment, DisclosureReason, Holders};
+use crate::telemetry_attach::{join, Attachment, DisclosureReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;

@@ -7,8 +7,8 @@
 use super::pipeline_test_observer;
 use super::telemetry::place_request_identity;
 use super::{
-    diag, hold_copies, money_mark, money_marks, record_counts, CertificateFailure, CopyProof,
-    Counts, FileFold, IdentityCaller, Located, PageSpent, PrefixTally, SLACK,
+    diag, hold_copies, money_mark, record_counts, CertificateFailure, CopyProof, Counts, FileFold,
+    IdentityCaller, Located, PageSpent, PrefixTally, SLACK,
 };
 use crate::snapshots::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
