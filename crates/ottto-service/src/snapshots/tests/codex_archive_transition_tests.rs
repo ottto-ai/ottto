@@ -682,21 +682,35 @@ fn compression_carries_only_a_proven_complete_read() {
         };
         assert_eq!(full_decodes(&logs), 1, "{case}: the archive is read once");
         assert_eq!(unproven(&logs), json!({reason: 1}), "{case}");
-        let mut warm = route(&index, &scan, posts);
-        if grown {
-            assert_ne!(
-                warm.snapshots[MAIN], first_route.snapshots[MAIN],
-                "{case}: the appended turn changes the body"
+        assert!(!grown || !posts.is_empty(), "{case}: the grown body is sent");
+        let expected = if !posts.is_empty() {
+            let mut warm = route(&index, &scan, posts);
+            if grown {
+                assert_ne!(
+                    warm.snapshots[MAIN], first_route.snapshots[MAIN],
+                    "{case}: the appended turn changes the body"
+                );
+            }
+            let mut carried = first_route.accepted.clone();
+            carried.extend(warm.accepted.clone());
+            warm.accepted = carried;
+            // Only MAIN's file changed; the other sessions are not read again.
+            let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+            cold.snapshots.retain(|item| item.source_session_id == MAIN);
+            money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
+            warm
+        } else {
+            // The re-read rebuilds exactly the accepted body: nothing to send.
+            let item = scan.snapshots.iter().find(|item| item.source_session_id == MAIN);
+            assert!(
+                item.is_some_and(|item| index
+                    .accepted_snapshot_fingerprints
+                    .contains(&item.snapshot_fingerprint)),
+                "{case}: the re-read body is the accepted one"
             );
-        }
-        let mut carried = first_route.accepted.clone();
-        carried.extend(warm.accepted.clone());
-        warm.accepted = carried;
-        // Only MAIN's file changed; the other sessions are not read again.
-        let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
-        cold.snapshots.retain(|item| item.source_session_id == MAIN);
-        money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
-        let (index, _) = assert_quiet_on(&c, index, &warm, cache);
+            first_route
+        };
+        let (index, _) = assert_quiet_on(&c, index, &expected, cache);
         assert!(!index.files.contains_key(&old_key), "{case}: the predecessor retired");
         assert!(index.files.contains_key(&new_key), "{case}");
     }
