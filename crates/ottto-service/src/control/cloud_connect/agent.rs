@@ -1,8 +1,8 @@
 //! CLI requests use the setup-run token, but only the app can sign a write.
 use super::queue::unix_now;
 use super::server::{
-    claim_origin_pair, paired_connect_url, set_connect_url, BoundRun, DeviceChallenge, ServerError,
-    SetupRunServer,
+    approval_audience, claim_origin_pair, paired_connect_url, set_connect_url, BoundRun,
+    DeviceChallenge, ServerError, SetupRunServer,
 };
 use super::wire::{
     checked_challenge, decode_base64url, encode_base64url, proof_header, request_sha256,
@@ -438,7 +438,16 @@ impl SetupRunServer<'_> {
             approval_id,
             payload,
             sign_by,
-        } = checked_approval(&approval, &attempt, &run.organization_id, id, account)?;
+        } = checked_approval(
+            &approval,
+            &attempt,
+            &ApprovalScope {
+                audience: approval_audience(&run.api_base_url),
+                organization_id: &run.organization_id,
+                attempt_id: id,
+                account,
+            },
+        )?;
         let approval_id = approval_id.as_str();
         if sign_by <= unix_now() {
             return Ok(attempt);
@@ -540,14 +549,27 @@ pub(super) struct CheckedApproval {
     pub(super) sign_by: i64,
 }
 
-/// Checks the R2 `approval` object for attempt `id` before anything is queued for signing.
+/// What an approval's signed facts must name.
+pub(super) struct ApprovalScope<'a> {
+    /// The paired web host of the run's API (`app.ottto.net` for production).
+    pub(super) audience: &'a str,
+    pub(super) organization_id: &'a str,
+    pub(super) attempt_id: &'a str,
+    pub(super) account: &'a str,
+}
+
+/// Checks the R2 `approval` object for the scope's attempt before anything is queued for signing.
 pub(super) fn checked_approval(
     approval: &Value,
     attempt: &Value,
-    organization_id: &str,
-    id: &str,
-    account: &str,
+    scope: &ApprovalScope<'_>,
 ) -> Result<CheckedApproval, Failure> {
+    let ApprovalScope {
+        audience,
+        organization_id,
+        attempt_id: id,
+        account,
+    } = *scope;
     let approval_id = approval["approval_id"]
         .as_str()
         .filter(|id| cloud_uuid(id))
@@ -567,7 +589,8 @@ pub(super) fn checked_approval(
         .ok_or_else(invalid_server)?;
     let operation = facts["operation"].as_str().ok_or_else(invalid_server)?;
     if facts["v"] != "ottto.cloud_connect.approval.v4"
-        || facts["aud"] != "app.ottto.net"
+        || facts["aud"] != audience
+        || facts["target"]["kind"] != "aws_account"
         || facts["source"] != "bedrock"
         || facts["org_id"] != organization_id
         || facts["attempt_id"] != id

@@ -7,8 +7,9 @@ use crate::control::api_url_with_base;
 use crate::control::backend_get_json;
 use crate::control::backend_post_json;
 use crate::control::backend_send_raw_json;
-use crate::control::setup::claims::credentials::refresh_cloud_setup_run_token_checked;
+use crate::control::setup::claims::credentials::refresh_setup_run_token_checked;
 use crate::control::setup::claims::credentials::setup_run_token_for_connection_with_refresh;
+use crate::control::staging_pair;
 use crate::control::validated_api_base_url;
 use crate::control::SetupRunRefreshResponse;
 use crate::control::DEFAULT_API_BASE_URL;
@@ -21,21 +22,25 @@ use serde::Serialize;
 /// The server's answer to a refused run token; any other 401 (a bad proof) is final.
 const SETUP_RUN_TOKEN_INVALID: &str = "setup_run_token_invalid";
 
-const CLAIM_ORIGIN_PAIRS: [(&str, &str); 2] = [
-    (DEFAULT_API_BASE_URL, "https://app.ottto.net"),
-    (
-        "https://staging.tail21f014.ts.net:8443",
-        "https://staging.tail21f014.ts.net",
-    ),
-];
+const PRODUCTION_PAIR: (&str, &str) = (DEFAULT_API_BASE_URL, "https://app.ottto.net");
 const CLAIM_WEB_ROUTE: &str = "/setup/cloud-keys?claim=";
 
-/// The compiled (API, web) origin pair for `api_base_url`, if it is a known Ottto deployment.
+/// The (API, web) origin pair for `api_base_url`: production, or the staging pair a non-stable
+/// candidate build compiled in. The pair only chooses web pages and the approval audience; which
+/// APIs this service sends credentials to is `validated_api_base_url`'s decision.
 pub(super) fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'static str)> {
     let api_base_url = api_base_url.trim().trim_end_matches('/');
-    CLAIM_ORIGIN_PAIRS
+    [Some(PRODUCTION_PAIR), staging_pair()]
         .into_iter()
+        .flatten()
         .find(|(api, _)| *api == api_base_url)
+}
+
+/// The `aud` a native approval must name for `api_base_url`: the host of its paired web origin
+/// (`app.ottto.net` for production). An API with no pair keeps the production audience.
+pub(super) fn approval_audience(api_base_url: &str) -> &'static str {
+    let (_, web) = claim_origin_pair(api_base_url).unwrap_or(PRODUCTION_PAIR);
+    web.strip_prefix("https://").unwrap_or(web)
 }
 
 /// The connections page on the web origin compiled for `api_base_url`, the only web page cloud
@@ -52,16 +57,6 @@ pub(in crate::control) fn set_connect_url(reply: &mut serde_json::Value, web: Op
         if let Some(url) = web {
             object.insert("connect_url".into(), url.into());
         }
-    }
-}
-
-/// The configured staging API is trusted only for cloud setup-run requests and token refresh.
-pub(in crate::control) fn validated_cloud_api_base_url(
-    api_base_url: &str,
-) -> Result<String, LocalApiError> {
-    match claim_origin_pair(api_base_url) {
-        Some((api, _)) => Ok(api.to_string()),
-        None => validated_api_base_url(Some(api_base_url)),
     }
 }
 
@@ -272,10 +267,10 @@ impl SetupRunServer<'_> {
         }) {
             return Err(ServerError::local("not_paired"));
         }
-        let api_base_url = validated_cloud_api_base_url(&connection.api_base_url)
+        let api_base_url = validated_api_base_url(Some(&connection.api_base_url))
             .map_err(|error| ServerError::from_local(&error))?;
         let refresh = || {
-            refresh_cloud_setup_run_token_checked(&api_base_url, &connection, |response| {
+            refresh_setup_run_token_checked(&api_base_url, &connection, |response| {
                 check_refresh_binding(response, &connection.setup_run_id, &organization_id)
             })
         };

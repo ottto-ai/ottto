@@ -52,9 +52,16 @@ ottto_macos_path_within() {
 # The dSYM folder must be absolute and outside the public checkout, the
 # release output, the app checkout and the runner's folders; it is never
 # printed. Its logs/ subfolder becomes the private log.
+# Stable channels trust only the production cloud deployment: a set
+# OTTTO_CLOUD_STAGING_PAIR (even empty) is refused, and its value is never
+# printed. Dev and preview candidates may compile a staging pair in.
 ottto_macos_check_binary_policy() {
   local channel="$1" skip_build="$2" root="$3" output_dir="$4" app_git_root="$5"
   local dir="${OTTTO_MACOS_DSYM_DIR:-}" physical folder log_dir
+  if ottto_macos_is_stable_channel "$channel" && [[ -n "${OTTTO_CLOUD_STAGING_PAIR+set}" ]]; then
+    echo "OTTTO_CLOUD_STAGING_PAIR is set: stable channels build with the production cloud deployment only" >&2
+    return 2
+  fi
   if ottto_macos_is_stable_channel "$channel" && [[ "$skip_build" == "true" ]]; then
     echo "Stable channels build from source: --skip-build is for dev and preview builds" >&2
     return 2

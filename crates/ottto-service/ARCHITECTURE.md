@@ -988,10 +988,15 @@ never sees a key.
   server answers it with an empty 204. When the server specifically refuses the run token, the
   service refreshes and resends the identical request only if the run and organization both
   match the original binding. An ambiguous enrollment response requires a claim-state readback.
-- **Browser claim.** The service selects the web origin from a compiled production and staging
-  table using the API bound to the claim request. It returns a link only for that origin's
+- **Browser claim.** The service selects the web origin from the (API, web) pair of the API
+  bound to the claim request. It returns a link only for that origin's
   `/setup/cloud-keys?claim=…` route with the returned UUID and a valid forward key code.
-  The exact staging API is trusted for cloud setup-run requests and their token refresh.
+  Source compiles only the production pair. A non-stable candidate build may add one staging
+  pair with `OTTTO_CLOUD_STAGING_PAIR="<api origin>|<web origin>"` at build time; the stable
+  packaging path refuses to build with it set. The pair chooses web links and the approval
+  `aud` (the paired web host) only. Which APIs receive credentials, including the device secret
+  on token refresh, stays `validated_api_base_url`'s decision, which trusts that staging API
+  only in such a build.
 - **Sign queue.** In memory only: a device proof lives until its challenge expires and an
   approval until its `sign_by`; one request per approval id, and a new approval supersedes the
   attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the

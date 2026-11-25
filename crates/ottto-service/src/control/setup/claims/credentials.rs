@@ -184,27 +184,28 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    refresh_setup_run_token_checked(api_base_url, connection, |_| Ok(()))
+}
+
+/// The only helper that sends the long-lived device secret. `check` refuses a refresh answer
+/// before it is used (cloud setup requires the same run and organization).
+pub(in crate::control) fn refresh_setup_run_token_checked(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    check: impl FnOnce(&SetupRunRefreshResponse) -> Result<(), LocalApiError>,
+) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    // SECURITY: this path POSTs the long-lived relay device_secret to the
+    // backend. `connection.api_base_url` is deserialized from on-disk
+    // connection.json (see `LocalConnectionBinding`) and is not trusted — a
+    // co-resident attacker who tampers that file could otherwise exfiltrate the
+    // secret to their own host. Gate the base through the same trusted-base
+    // validator every other secret-bearing egress in this file uses, BEFORE
+    // touching the device secret. Never trust a base because it appears in the
+    // cloud web-origin pairs: those choose web pages only. Fail closed: callers
+    // map an `Err` to a reconnect/backend error, so an untrusted base never
+    // releases the secret.
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
-    refresh_setup_run_token_at_validated_base(&api_base_url, connection, |_| Ok(()))
-}
-
-/// Cloud setup can use a compiled deployment origin and must keep the same run and organization.
-pub(in crate::control) fn refresh_cloud_setup_run_token_checked(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    check: impl FnOnce(&SetupRunRefreshResponse) -> Result<(), LocalApiError>,
-) -> Result<RefreshedSetupRunToken, LocalApiError> {
-    let api_base_url = crate::control::cloud_connect::validated_cloud_api_base_url(api_base_url)?;
-    refresh_setup_run_token_at_validated_base(&api_base_url, connection, check)
-}
-
-/// This is the only helper that sends the long-lived device secret for refresh. The entry
-/// points above validate the API destination before this function loads the secret.
-fn refresh_setup_run_token_at_validated_base(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    check: impl FnOnce(&SetupRunRefreshResponse) -> Result<(), LocalApiError>,
-) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    let api_base_url = api_base_url.as_str();
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()

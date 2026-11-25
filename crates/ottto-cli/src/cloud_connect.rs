@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn web_links_use_only_the_paired_origin_the_service_sent() {
-        let staging = "https://staging.tail21f014.ts.net/connections";
+        let staging = "https://staging.example.invalid/connections";
         let mut result = ResultState {
             web_url: web_url(&json!({"connect_url": staging})),
             ..ResultState::default()

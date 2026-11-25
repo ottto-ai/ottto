@@ -550,6 +550,61 @@ fn is_trusted_api_base_url(value: &str) -> bool {
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
         || value.starts_with("http://localhost")
         || value.starts_with("http://127.0.0.1")
+        || staging_pair().is_some_and(|(api, _)| value == api)
+}
+
+/// The one staging deployment a non-stable candidate build may trust, as `(API origin, web
+/// origin)`. It exists only when the build sets `OTTTO_CLOUD_STAGING_PAIR="<api>|<web>"`; the
+/// stable packaging path refuses to build with it set, so stable releases trust production only.
+/// Source code names no staging host.
+pub(super) fn staging_pair() -> Option<(&'static str, &'static str)> {
+    #[cfg(test)]
+    let test_pair = TEST_STAGING_PAIR.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let test_pair = None;
+    test_pair.or_else(|| option_env!("OTTTO_CLOUD_STAGING_PAIR").and_then(parse_staging_pair))
+}
+
+/// `<api>|<web>`: two distinct bare `https://` origins (host and optional port, no path, query,
+/// fragment or credentials), neither of them production. Anything else compiles in no pair.
+pub(super) fn parse_staging_pair(value: &str) -> Option<(&str, &str)> {
+    let (api, web) = value.split_once('|')?;
+    let origin = |origin: &str| {
+        origin.strip_prefix("https://").is_some_and(|authority| {
+            !authority.is_empty()
+                && !authority.starts_with([':', '.', '-'])
+                && authority
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-:".contains(&byte))
+        })
+    };
+    (origin(api)
+        && origin(web)
+        && api != web
+        && !is_production_api_base_url(api)
+        && web != "https://app.ottto.net")
+        .then_some((api, web))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STAGING_PAIR: std::cell::Cell<Option<(&'static str, &'static str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `test` on this thread as if the build had compiled in `pair`.
+#[cfg(test)]
+pub(super) fn with_test_staging_pair<T>(
+    pair: (&'static str, &'static str),
+    test: impl FnOnce() -> T,
+) -> T {
+    let pair = parse_staging_pair(&format!("{}|{}", pair.0, pair.1))
+        .map(|_| pair)
+        .expect("a well-formed test staging pair");
+    TEST_STAGING_PAIR.with(|cell| cell.set(Some(pair)));
+    let result = test();
+    TEST_STAGING_PAIR.with(|cell| cell.set(None));
+    result
 }
 
 pub(super) fn api_url_with_base(api_base_url: &str, path: &str) -> String {
