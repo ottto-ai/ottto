@@ -2472,7 +2472,7 @@ def check_install_docs_contracts() -> None:
                 "release verification docs must gate Homebrew owner support on clean-machine evidence",
             ),
             (
-                "App-bundle\nevidence has to prove a second Homebrew install/start attempt is either a safe\nrefusal with instructions or an explicit migration, not silent owner takeover.",
+                "App-bundle\nevidence has to prove a second Homebrew install/start attempt is a safe\nrefusal with instructions, not a second serving job or silent owner takeover:",
                 "release verification docs must prohibit silent app/Homebrew owner takeover",
             ),
             (

@@ -173,7 +173,9 @@ expect_summary_error() {
     cat "$tmp_dir/summary-error.out" >&2
     exit 1
   fi
-  if grep -qF -- "SYNTHETIC-PRIVATE-MARKER" "$tmp_dir/summary-error.out" || grep -qF -- "$tmp_dir" "$tmp_dir/summary-error.out"; then
+  if grep -qF -- "SYNTHETIC-PRIVATE-MARKER" "$tmp_dir/summary-error.out" \
+    || grep -qF -- "synthetic_private_marker" "$tmp_dir/summary-error.out" \
+    || grep -qF -- "$tmp_dir" "$tmp_dir/summary-error.out"; then
     echo "Summary diagnostics repeat a private marker or a path" >&2
     exit 1
   fi
@@ -266,7 +268,80 @@ mkdir -p "$path_dir"
 jq '.quality_gates.stable_clean_machine_qa.evidence_path = "../stable-clean-machine-qa.json"' "$manifest" > "$path_dir/release-manifest.json"
 jq --arg sha "$(shasum -a 256 "$path_dir/release-manifest.json" | awk '{print $1}')" '.manifest.sha256 = $sha' \
   "$record" > "$private_dir/path.record.json"
-expect_summary_error 1 "evidence_path must be a plain file name" \
+expect_summary_error 1 "evidence_path must be stable-clean-machine-qa.json" \
   --record "$private_dir/path.record.json" --manifest "$path_dir/release-manifest.json"
+
+sed 's/"protocol_version": 15,/"protocol_version": 15.0,/' "$record" > "$private_dir/float.record.json"
+grep -qF '"protocol_version": 15.0,' "$private_dir/float.record.json"
+expect_summary_error 1 "record local_platform.protocol_version must be an integer" \
+  --record "$private_dir/float.record.json" --manifest "$manifest" --force
+expect_summary_error 1 "record install owner name must be a short token" \
+  --record "$(mutated_record '.install_owners[0].owner = "homebrew\nsynthetic_private_marker"')" --manifest "$manifest" --force
+expect_summary_error 1 "release manifest is missing" \
+  --record "$record" --manifest "$tmp_dir/synthetic_private_marker/release-manifest.json"
+
+# --- the summary never replaces the manifest or another release file ---------
+
+# bind_record <manifest> <output record>: the filled record, bound to that manifest.
+bind_record() {
+  jq --arg sha "$(shasum -a 256 "$1" | awk '{print $1}')" '.manifest.sha256 = $sha' "$record" > "$2"
+}
+
+# [regression] A manifest that is itself named like the summary keeps its bytes
+# even with --force.
+named_dir="$tmp_dir/manifest-named-summary"
+mkdir -p "$named_dir"
+cp "$manifest" "$named_dir/stable-clean-machine-qa.json"
+named_sha="$(shasum -a 256 "$named_dir/stable-clean-machine-qa.json" | awk '{print $1}')"
+expect_summary_error 1 "would replace the manifest or another release file" \
+  --record "$record" --manifest "$named_dir/stable-clean-machine-qa.json" --force
+[[ "$(shasum -a 256 "$named_dir/stable-clean-machine-qa.json" | awk '{print $1}')" == "$named_sha" ]]
+
+# [regression] evidence_path naming the manifest is refused; the manifest survives.
+self_dir="$tmp_dir/evidence-names-manifest"
+mkdir -p "$self_dir"
+jq '.quality_gates.stable_clean_machine_qa.evidence_path = "release-manifest.json"' "$manifest" > "$self_dir/release-manifest.json"
+self_sha="$(shasum -a 256 "$self_dir/release-manifest.json" | awk '{print $1}')"
+bind_record "$self_dir/release-manifest.json" "$private_dir/self.record.json"
+expect_summary_error 1 "evidence_path must be stable-clean-machine-qa.json" \
+  --record "$private_dir/self.record.json" --manifest "$self_dir/release-manifest.json" --force
+[[ "$(shasum -a 256 "$self_dir/release-manifest.json" | awk '{print $1}')" == "$self_sha" ]]
+
+artifact_dir="$tmp_dir/artifact-collision"
+mkdir -p "$artifact_dir"
+jq '.artifacts[0].path = "stable-clean-machine-qa.json"' "$manifest" > "$artifact_dir/release-manifest.json"
+printf 'synthetic artifact bytes\n' > "$artifact_dir/stable-clean-machine-qa.json"
+bind_record "$artifact_dir/release-manifest.json" "$private_dir/artifact.record.json"
+expect_summary_error 1 "would replace the manifest or another release file" \
+  --record "$private_dir/artifact.record.json" --manifest "$artifact_dir/release-manifest.json" --force
+grep -qxF 'synthetic artifact bytes' "$artifact_dir/stable-clean-machine-qa.json"
+
+# --- aliased record and manifest paths ----------------------------------------
+
+alias_dir="$tmp_dir/alias-release"
+mkdir -p "$alias_dir" "$tmp_dir/alias-outside"
+cp "$manifest" "$alias_dir/release-manifest.json"
+cp "$record" "$tmp_dir/alias-outside/qa.json"
+
+# [regression] A link inside the release folder to a record outside it: the
+# publisher follows the link.
+ln -s "$tmp_dir/alias-outside/qa.json" "$alias_dir/qa-notes.json"
+expect_summary_error 2 "must not be or pass through a symlink" \
+  --record "$alias_dir/qa-notes.json" --manifest "$alias_dir/release-manifest.json"
+rm "$alias_dir/qa-notes.json"
+ln -s "$tmp_dir/alias-outside" "$alias_dir/notes"
+expect_summary_error 2 "must not be or pass through a symlink" \
+  --record "$alias_dir/notes/qa.json" --manifest "$alias_dir/release-manifest.json"
+rm "$alias_dir/notes"
+ln -s "$tmp_dir/alias-outside/qa.json" "$private_dir/linked.record.json"
+expect_summary_error 2 "must not be or pass through a symlink" \
+  --record "$private_dir/linked.record.json" --manifest "$alias_dir/release-manifest.json"
+ln -s "$alias_dir/release-manifest.json" "$private_dir/linked-manifest.json"
+expect_summary_error 2 "the release manifest must not be a symlink" \
+  --record "$record" --manifest "$private_dir/linked-manifest.json"
+if [[ -e "$alias_dir/stable-clean-machine-qa.json" ]]; then
+  echo "Summary was written from an aliased path" >&2
+  exit 1
+fi
 
 echo "macos_stable_qa_summary tests passed"

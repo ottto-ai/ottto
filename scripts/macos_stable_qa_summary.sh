@@ -12,12 +12,14 @@ Usage: macos_stable_qa_summary.sh --record <qa-record.json> --manifest <release-
 Writes the public stable clean-machine QA summary from the private QA record
 that macos_stable_qa_evidence_template.sh created. Only allowlisted fields are
 copied: operator notes, per-check notes and any other record field are dropped.
-The summary is written beside the manifest under the file name the manifest's
-stable_clean_machine_qa.evidence_path gives. Run macos_stable_closeout_gate.sh
+The summary is written beside the manifest as stable-clean-machine-qa.json, the
+name the manifest's stable_clean_machine_qa.evidence_path must give; it never
+replaces the manifest or another release file. Run macos_stable_closeout_gate.sh
 on the manifest afterwards.
 
 Options:
-  --record <path>      Private QA record. Must be outside the manifest's folder.
+  --record <path>      Private QA record. Must be outside the manifest's folder,
+                       and neither a symlink nor reached through one.
   --manifest <path>    Stable release manifest the record is bound to.
   --force              Replace an existing summary.
   -h, --help           Show help.
@@ -79,13 +81,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-record_path = Path(sys.argv[1]).resolve()
-manifest_path = Path(sys.argv[2]).resolve()
+record_arg = Path(sys.argv[1]).absolute()
+manifest_arg = Path(sys.argv[2]).absolute()
 force = sys.argv[3] == "1"
-manifest_dir = manifest_path.parent
 
-# Same rule as scripts/macos_release_paths.sh: a plain file name, no slash.
-RELEASE_FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+# The one public summary name (schema 2). Any other name could collide with the
+# manifest or another release file.
+SUMMARY_NAME = "stable-clean-machine-qa.json"
 # Every copied string is a short token: no spaces, slashes or free text.
 TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,128}")
 LOCAL_PLATFORM_KEYS = (
@@ -116,24 +118,60 @@ def token(value: Any, label: str) -> str:
     return value
 
 
-def load(path: Path, label: str) -> dict[str, Any]:
+def reject_constant(_value: str) -> None:
+    raise ValueError("non-finite number")
+
+
+def read(path: Path, label: str) -> bytes:
     try:
-        return obj(json.loads(path.read_text(encoding="utf-8")), label)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        return path.read_bytes()
+    except OSError:
+        die(f"{label} is not readable")
+
+
+def load(data: bytes, label: str) -> dict[str, Any]:
+    try:
+        return obj(json.loads(data.decode("utf-8"), parse_constant=reject_constant), label)
+    except (UnicodeDecodeError, ValueError):
         die(f"{label} is not valid JSON")
 
 
-if record_path == manifest_dir or manifest_dir in record_path.parents:
+def inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def aliased(path: Path, folder: Path) -> bool:
+    """The path is a symlink, or a link inside the folder leads to it."""
+    if path.is_symlink():
+        return True
+    for ancestor in path.parents:
+        if ancestor.is_symlink() and inside(ancestor.parent.resolve(), folder):
+            return True
+    return False
+
+
+# The release folder is the manifest's physical parent, as the closeout gate
+# sees it; the publisher uploads it and follows links.
+if manifest_arg.is_symlink():
+    die("the release manifest must not be a symlink", code=2)
+manifest_dir = manifest_arg.parent.resolve()
+manifest_path = manifest_dir / manifest_arg.name
+if aliased(record_arg, manifest_dir):
+    die("the private QA record path must not be or pass through a symlink", code=2)
+record_path = record_arg.resolve()
+if inside(record_path, manifest_dir):
     die("the private QA record must live outside the release folder", code=2)
 
-record = load(record_path, "QA record")
-manifest = load(manifest_path, "release manifest")
+record = load(read(record_path, "QA record"), "QA record")
+manifest_bytes = read(manifest_path, "release manifest")
+manifest = load(manifest_bytes, "release manifest")
 if record.get("evidence_kind") != "private_record":
     die("input is not a private QA record (evidence_kind must be private_record)")
-if record.get("schema_version") != 2 or record.get("gate") != "stable_clean_machine_qa":
+if type(record.get("schema_version")) is not int or record.get("schema_version") != 2 \
+        or record.get("gate") != "stable_clean_machine_qa":
     die("QA record must be schema_version 2 for gate stable_clean_machine_qa")
 
-manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
 record_manifest = obj(record.get("manifest"), "record manifest")
 if record_manifest.get("sha256") != manifest_sha:
     die("QA record is bound to a different manifest")
@@ -196,25 +234,55 @@ gate = obj(
     obj(manifest.get("quality_gates"), "manifest quality_gates").get("stable_clean_machine_qa"),
     "manifest quality_gates.stable_clean_machine_qa",
 )
-evidence_name = gate.get("evidence_path")
-if not isinstance(evidence_name, str) or not RELEASE_FILENAME.fullmatch(evidence_name):
-    die("manifest stable_clean_machine_qa.evidence_path must be a plain file name")
-output_path = manifest_dir / evidence_name
+if gate.get("evidence_path") != SUMMARY_NAME:
+    die(f"manifest stable_clean_machine_qa.evidence_path must be {SUMMARY_NAME}")
+
+
+def release_file_names(value: Any) -> set[str]:
+    """Every file name the manifest lists: artifact, SBOM, evidence and subject paths."""
+    names: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("path", "verification_path", "evidence_path") and isinstance(item, str):
+                names.add(Path(item).name)
+            elif key == "subjects" and isinstance(item, list):
+                names.update(Path(subject).name for subject in item if isinstance(subject, str))
+            else:
+                names.update(release_file_names(item))
+    elif isinstance(value, list):
+        for item in value:
+            names.update(release_file_names(item))
+    return names
+
+
+other_gates = {key: value for key, value in obj(manifest.get("quality_gates"), "manifest quality_gates").items()
+               if key != "stable_clean_machine_qa"}
+manifest_without_gate = {key: value for key, value in manifest.items() if key != "quality_gates"}
+if (
+    manifest_path.name == SUMMARY_NAME
+    or SUMMARY_NAME in release_file_names(manifest_without_gate)
+    or SUMMARY_NAME in release_file_names(other_gates)
+):
+    die(f"{SUMMARY_NAME} would replace the manifest or another release file")
+output_path = manifest_dir / SUMMARY_NAME
 if output_path.is_symlink():
     die("the summary path beside the manifest must not be a symlink")
 if output_path.exists() and not force:
-    die(f"{evidence_name} already exists, pass --force to replace it", code=2)
+    die(f"{SUMMARY_NAME} already exists, pass --force to replace it", code=2)
 
 text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
-handle, temp_name = tempfile.mkstemp(prefix=".stable-qa-summary.", dir=manifest_dir)
+temp_name = ""
 try:
+    handle, temp_name = tempfile.mkstemp(prefix=".stable-qa-summary.", dir=manifest_dir)
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         stream.write(text)
     os.chmod(temp_name, 0o644)
     os.replace(temp_name, output_path)
-except BaseException:
-    if os.path.exists(temp_name):
+except BaseException as error:
+    if temp_name and os.path.exists(temp_name):
         os.unlink(temp_name)
+    if isinstance(error, OSError):
+        die(f"could not write {SUMMARY_NAME} beside the manifest")
     raise
-print(f"stable-qa-summary: wrote {evidence_name}")
+print(f"stable-qa-summary: wrote {SUMMARY_NAME}")
 PY

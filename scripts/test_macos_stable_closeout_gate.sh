@@ -192,6 +192,145 @@ write_evidence() {
     ' > "$output"
 }
 
+# A schema 1 summary as the pre-v2 template and runbook produced it: the old
+# host_kind claim, string results and the pre-headless Homebrew checks.
+write_v1_evidence() {
+  local manifest="$1"
+  local output="$2"
+  local manifest_sha
+  manifest_sha="$(shasum -a 256 "$manifest" | awk '{print $1}')"
+  jq -n \
+    --arg manifest_sha "$manifest_sha" \
+    '{
+      schema_version: 1,
+      gate: "stable_clean_machine_qa",
+      status: "passed",
+      checked_at: "2026-05-21T19:00:00Z",
+      manifest: {
+        product: "ottto-local-platform",
+        channel: "stable",
+        version: "0.1.7",
+        commit: "244f7ea90a7a",
+        sha256: $manifest_sha
+      },
+      environment: {
+        host_kind: "clean_macos",
+        macos_version: "15.5",
+        arch: "arm64"
+      },
+      install_owners: [
+        {
+          owner: "homebrew",
+          status: "passed",
+          local_platform: {
+            runtime: "ottto-service",
+            service_label: "net.ottto.service",
+            version: "0.1.7",
+            release_channel: "stable",
+            install_owner: "homebrew",
+            protocol_version: 15,
+            release_manifest_sha256: $manifest_sha
+          },
+          checks: {
+            formula_syntax: "passed",
+            install: "passed",
+            service_start: "passed",
+            app_launch_preserves_owner: "passed",
+            status_json: "passed",
+            setup_browser_claim: "passed",
+            apps_detect_json: "passed",
+            verify_codex_json: "passed",
+            doctor_json: "passed",
+            doctor_owner_drift_json: "passed",
+            fix_codex_json: "passed",
+            diagnostics_collect_json: "passed",
+            logout_json: "passed",
+            update_check: "passed",
+            update_check_owner_json: "passed",
+            upgrade: "passed",
+            post_upgrade_app_relaunch_preserves_owner: "passed",
+            uninstall: "passed",
+            reinstall: "passed",
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
+          }
+        },
+        {
+          owner: "hosted_installer",
+          status: "passed",
+          local_platform: {
+            runtime: "ottto-service",
+            service_label: "net.ottto.service",
+            version: "0.1.7",
+            release_channel: "stable",
+            install_owner: "hosted_installer",
+            protocol_version: 15,
+            release_manifest_sha256: $manifest_sha
+          },
+          checks: {
+            wrapper_download: "passed",
+            wrapper_checksum: "passed",
+            native_gatekeeper: "passed",
+            install: "passed",
+            app_launch: "passed",
+            service_ready: "passed",
+            status_json: "passed",
+            setup_browser_claim: "passed",
+            apps_detect_json: "passed",
+            verify_codex_json: "passed",
+            doctor_json: "passed",
+            fix_codex_json: "passed",
+            diagnostics_collect_json: "passed",
+            logout_json: "passed",
+            update_check: "passed",
+            upgrade: "passed",
+            uninstall: "passed",
+            reinstall: "passed",
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
+          }
+        },
+        {
+          owner: "app_bundle",
+          status: "passed",
+          local_platform: {
+            runtime: "ottto-service",
+            service_label: "net.ottto.service",
+            version: "0.1.7",
+            release_channel: "stable",
+            install_owner: "app_bundle",
+            protocol_version: 15,
+            release_manifest_sha256: $manifest_sha
+          },
+          checks: {
+            artifact_checksum: "passed",
+            gatekeeper: "passed",
+            install: "passed",
+            app_launch: "passed",
+            service_ready: "passed",
+            homebrew_second_install_safe_refusal: "passed",
+            status_json: "passed",
+            setup_browser_claim: "passed",
+            apps_detect_json: "passed",
+            verify_codex_json: "passed",
+            doctor_json: "passed",
+            doctor_owner_drift_json: "passed",
+            fix_codex_json: "passed",
+            diagnostics_collect_json: "passed",
+            logout_json: "passed",
+            update_check: "passed",
+            update_check_owner_json: "passed",
+            upgrade: "passed",
+            uninstall: "passed",
+            reinstall: "passed",
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
+          }
+        }
+      ]
+    }' > "$output"
+}
+
 base_dir="$tmp_dir/base"
 mkdir -p "$base_dir" "$tmp_dir/cases"
 write_manifest "$base_dir/release-manifest.json"
@@ -249,12 +388,23 @@ expect_failure() {
     cat "$output" >&2
     exit 1
   fi
-  # Diagnostics never echo free text or paths from the release folder.
-  if grep -qF -- "SYNTHETIC-PRIVATE-MARKER" "$output" || grep -qF -- "$tmp_dir" "$output"; then
+  # Diagnostics never echo free text, identifier-shaped values or paths from
+  # the release folder.
+  if grep -qiF -- "SYNTHETIC-PRIVATE-MARKER" "$output" \
+    || grep -qF -- "synthetic_private_marker" "$output" \
+    || grep -qF -- "$tmp_dir" "$output"; then
     echo "Closeout gate diagnostics repeat a private marker or the folder path" >&2
     cat "$output" >&2
     exit 1
   fi
+}
+
+# Replace one literal in a case's summary text (for values jq would rewrite,
+# such as 2.0), and fail the test if the literal is not there.
+edit_text() {
+  local file="$1" from="$2" to="$3"
+  grep -qF -- "$from" "$file" || { echo "Fixture literal not found: $from" >&2; exit 1; }
+  FROM="$from" TO="$to" python3 -c 'import os, sys; p = sys.argv[1]; t = open(p).read(); open(p, "w").write(t.replace(os.environ["FROM"], os.environ["TO"]))' "$file"
 }
 
 # carry <owner> <check> <from> [method]
@@ -400,9 +550,55 @@ dir="$(new_case old-host-kind)"
 mutate "$dir" '.environment.host_kind = "clean_macos"'
 expect_failure "$dir" "is not a schema 2 summary of this manifest"
 
+# [regression] A genuinely filled v1 summary (the pre-v2 format) stops with a
+# clear v2 requirement.
 dir="$(new_case schema-v1)"
-mutate "$dir" '.schema_version = 1'
+write_v1_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
+jq -e '.schema_version == 1 and .environment.host_kind == "clean_macos" and (.install_owners[0].checks | all(.[]; . == "passed"))' \
+  "$dir/stable-clean-machine-qa.json" >/dev/null
 expect_failure "$dir" "must be schema_version 2 (v1 cannot record carried checks)"
+
+# --- whole values and JSON integers, as the release API reader checks them ----
+
+dir="$(new_case checked-at-multiline)"
+mutate "$dir" '.checked_at = "2026-05-21T19:00:00Z\nSYNTHETIC-PRIVATE-MARKER"'
+expect_failure "$dir" "is not a schema 2 summary of this manifest"
+
+dir="$(new_case macos-version-multiline)"
+mutate "$dir" '.environment.macos_version = "15.5\nsynthetic_private_marker"'
+expect_failure "$dir" "is not a schema 2 summary of this manifest"
+
+dir="$(new_case schema-version-float)"
+edit_text "$dir/stable-clean-machine-qa.json" '"schema_version": 2,' '"schema_version": 2.0,'
+expect_failure "$dir" "is not a schema 2 summary of this manifest"
+
+dir="$(new_case protocol-version-float)"
+edit_text "$dir/stable-clean-machine-qa.json" '"protocol_version": 15,' '"protocol_version": 15.0,'
+expect_failure "$dir" "is not a schema 2 summary of this manifest"
+
+dir="$(new_case manifest-protocol-float)"
+edit_text "$dir/release-manifest.json" '"min_protocol_version": 15,' '"min_protocol_version": 15.0,'
+write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
+expect_failure "$dir" "Stable closeout manifest min_protocol_version must be the integer 15"
+
+suffix_case=0
+for target in $'0.1.7\n' '0.1.7 ' $'0.1.7\nsynthetic_private_marker'; do
+  suffix_case=$((suffix_case + 1))
+  dir="$(new_case "target-version-suffix-$suffix_case")"
+  jq --arg v "$target" '.version = $v' "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
+  write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
+  expect_failure "$dir" "Stable closeout manifest version must be X.Y.Z"
+done
+
+for from in $'0.1.6\n' '0.1.6 ' $'0.1.6\nsynthetic_private_marker'; do
+  suffix_case=$((suffix_case + 1))
+  dir="$(new_case "carried-from-suffix-$suffix_case")"
+  jq --arg from "$from" \
+    '(.install_owners[] | select(.owner == "homebrew") | .checks.logout_json) = {result: "carried", method: "live", from: $from}' \
+    "$dir/stable-clean-machine-qa.json" > "$tmp_dir/mutated.json"
+  mv "$tmp_dir/mutated.json" "$dir/stable-clean-machine-qa.json"
+  expect_failure "$dir" "is not a schema 2 summary of this manifest"
+done
 
 dir="$(new_case operator-notes)"
 mutate "$dir" '.operator_notes = ["SYNTHETIC-PRIVATE-MARKER ran on the build host"]'
@@ -438,33 +634,121 @@ expect_failure "$dir" "private path or secret-like material"
 
 # --- the private record stays out of the release folder ----------------------
 
+record_error="A private QA record is inside the release folder"
+
 dir="$(new_case record-beside-manifest)"
 printf '{"evidence_kind": "private_record"}\n' > "$dir/stable-clean-machine-qa.record.json"
-expect_failure "$dir" "A private QA record is inside the release folder; move it out before publishing: stable-clean-machine-qa.record.json"
+expect_failure "$dir" "$record_error (1 file(s)); move it out before publishing"
 
 dir="$(new_case record-nested)"
 mkdir -p "$dir/homebrew"
 printf '{}\n' > "$dir/homebrew/qa.record.json"
-expect_failure "$dir" "A private QA record is inside the release folder; move it out before publishing: qa.record.json"
+expect_failure "$dir" "$record_error"
 
 dir="$(new_case record-renamed)"
 mkdir -p "$dir/notes"
 printf '{"evidence_kind": "private_record", "operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$dir/notes/qa-notes.json"
-expect_failure "$dir" "A private QA record is inside the release folder; move it out before publishing: qa-notes.json"
+expect_failure "$dir" "$record_error"
 
-# --- summary file resolution ---------------------------------------------------
+# --- the release folder holds plain files only ---------------------------------
 
-resolve_error="Stable clean-machine QA summary is missing beside the manifest, or evidence_path is not a plain file name"
+symlink_error="The release folder contains 1 symlink(s); replace them with plain files or move them out before publishing"
+private_dir="$tmp_dir/private"
+mkdir -p "$private_dir/notes"
+printf '{"evidence_kind": "private_record", "operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$private_dir/qa.json"
+printf '{"evidence_kind": "private_record"}\n' > "$private_dir/notes/qa.json"
+
+# [regression] A valid summary beside a renamed link to the private record: the
+# publisher follows file links, a recursive grep does not.
+dir="$(new_case record-file-link)"
+ln -s "$private_dir/qa.json" "$dir/qa-notes.json"
+expect_failure "$dir" "$symlink_error"
+
+dir="$(new_case record-dir-link)"
+ln -s "$private_dir/notes" "$dir/notes"
+expect_failure "$dir" "$symlink_error"
+
+dir="$(new_case harmless-link)"
+ln -s release-manifest.json "$dir/manifest-alias.json"
+expect_failure "$dir" "$symlink_error"
+
+dir="$(new_case dangling-link)"
+ln -s "$tmp_dir/does-not-exist.json" "$dir/missing.json"
+expect_failure "$dir" "$symlink_error"
 
 dir="$(new_case evidence-symlink)"
 mv "$dir/stable-clean-machine-qa.json" "$tmp_dir/outside-summary.json"
 ln -s "$tmp_dir/outside-summary.json" "$dir/stable-clean-machine-qa.json"
-expect_failure "$dir" "$resolve_error"
+expect_failure "$dir" "$symlink_error"
+
+# A folder the gate cannot read fails closed (skipped when running as root,
+# where permissions do not block the scan).
+dir="$(new_case unreadable-subfolder)"
+mkdir -p "$dir/locked"
+printf '{"evidence_kind": "private_record"}\n' > "$dir/locked/qa.json"
+chmod 000 "$dir/locked"
+if [[ ! -r "$dir/locked" ]]; then
+  expect_failure "$dir" "Could not scan the release folder"
+fi
+chmod 755 "$dir/locked"
+
+# --- summary file resolution ---------------------------------------------------
+
+dir="$(new_case evidence-missing)"
+rm "$dir/stable-clean-machine-qa.json"
+expect_failure "$dir" "Stable clean-machine QA summary stable-clean-machine-qa.json is missing beside the manifest"
+
+evidence_name_error="Stable clean-machine QA gate evidence_path must be stable-clean-machine-qa.json"
 
 dir="$(new_case evidence-absolute)"
 write_manifest "$dir/release-manifest.json" "passed" "$dir/stable-clean-machine-qa.json"
 write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
-expect_failure "$dir" "$resolve_error"
+expect_failure "$dir" "$evidence_name_error"
+
+dir="$(new_case evidence-other-name)"
+write_manifest "$dir/release-manifest.json" "passed" "qa-summary.json"
+write_evidence "$dir/release-manifest.json" "$dir/qa-summary.json"
+expect_failure "$dir" "$evidence_name_error"
+
+dir="$(new_case evidence-manifest-name)"
+write_manifest "$dir/release-manifest.json" "passed" "release-manifest.json"
+expect_failure "$dir" "$evidence_name_error"
+
+dir="$(new_case evidence-name-newline)"
+write_manifest "$dir/release-manifest.json" "passed" $'stable-clean-machine-qa.json\n'
+write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
+expect_failure "$dir" "$evidence_name_error"
+
+# --- diagnostics never repeat values from the files ---------------------------
+
+# [regression] Identifier-shaped values (they could be a user or host name) are
+# replaced by fixed labels.
+dir="$(new_case marker-owner)"
+mutate "$dir" '.install_owners += [(.install_owners[0] | .owner = "synthetic_private_marker")]'
+expect_failure "$dir" "Stable clean-machine QA evidence includes unsupported install owner: <unknown owner>"
+
+dir="$(new_case marker-check)"
+mutate "$dir" '(.install_owners[] | select(.owner == "homebrew") | .checks.synthetic_private_marker) = {result: "passed", method: "live"}'
+expect_failure "$dir" "Stable clean-machine QA evidence includes unknown check homebrew.<unknown check>"
+
+dir="$(new_case marker-manifest-owner)"
+jq '.supported_install_owners += ["synthetic_private_marker"] | .quality_gates.stable_clean_machine_qa.required_install_owners += ["synthetic_private_marker"]' \
+  "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
+write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
+expect_failure "$dir" "Stable closeout does not know how to validate install owner: <unknown owner>"
+
+dir="$(new_case marker-manifest-fields)"
+jq '.product = "synthetic_private_marker" | .commit = "synthetic_private_marker"' \
+  "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
+expect_failure "$dir" "Stable closeout requires product=ottto-local-platform"
+expect_failure "$dir" "Stable closeout manifest commit is not a git SHA prefix"
+
+dir="$(new_case marker-manifest-json)"
+printf '{"product": "synthetic_private_marker",\n' > "$dir/release-manifest.json"
+expect_failure "$dir" "Release manifest is not readable JSON"
+
+mkdir -p "$tmp_dir/cases/synthetic_private_marker"
+expect_failure "$tmp_dir/cases/synthetic_private_marker" "Release manifest is missing"
 
 # --- owners, runtime binding and manifest -------------------------------------
 
@@ -479,7 +763,7 @@ expect_failure "$dir" "Stable clean-machine QA evidence must include exactly one
 
 dir="$(new_case unsupported-owner)"
 mutate "$dir" '.install_owners += [(.install_owners[0] | .owner = "manual_override")]'
-expect_failure "$dir" "Stable clean-machine QA evidence includes unsupported install owner: manual_override"
+expect_failure "$dir" "Stable clean-machine QA evidence includes unsupported install owner: <unknown owner>"
 
 dir="$(new_case bad-runtime)"
 mutate "$dir" '(.install_owners[] | select(.owner == "homebrew") | .local_platform.runtime) = "ottto-cli"'
@@ -495,7 +779,7 @@ expect_failure "$dir" "Stable clean-machine QA evidence has invalid local-platfo
 
 dir="$(new_case extra-check)"
 mutate "$dir" '(.install_owners[] | select(.owner == "homebrew") | .checks.manual_override) = {result: "passed", method: "live"}'
-expect_failure "$dir" "Stable clean-machine QA evidence includes unknown check homebrew.manual_override"
+expect_failure "$dir" "Stable clean-machine QA evidence includes unknown check homebrew.<unknown check>"
 
 # [regression] The pre-headless Homebrew check is no longer in the owner matrix.
 dir="$(new_case old-homebrew-check)"
@@ -510,7 +794,7 @@ dir="$(new_case extra-required-owner)"
 jq '.quality_gates.stable_clean_machine_qa.required_install_owners += ["manual_override"]' \
   "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
 write_evidence "$dir/release-manifest.json" "$dir/stable-clean-machine-qa.json"
-expect_failure "$dir" "Stable clean-machine QA manifest gate includes unsupported required install owner: manual_override"
+expect_failure "$dir" "Stable clean-machine QA manifest gate includes unsupported required install owner: <unknown owner>"
 
 dir="$(new_case target-version-format)"
 jq '.version = "0.1.7-beta1"' "$base_dir/release-manifest.json" > "$dir/release-manifest.json"

@@ -513,9 +513,10 @@ AWS/CDN prerequisites before publish:
 7. Generate `install-macos.sh` from the exact manifest with
    `hosted_native_installer.sh --record-sha256` and run its dry-run/static QA
    before attestation generation, attestation binding, and manifest signing.
-8. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
-   SHA-256, is uploaded under the immutable prefix, and is attested with
-   predicate `https://cyclonedx.org/bom`.
+8. Confirm `ottto-local-platform-sbom.cdx.json` exists in the release folder,
+   matches the manifest SHA-256, and is attested with predicate
+   `https://cyclonedx.org/bom`. It is uploaded with the rest of the folder in
+   step 16, after the closeout gate.
 9. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, records the
    signing-Mac build as SLSA Build L1, covers every artifact plus
    `release-manifest.json` and the SBOM, and has verified GitHub attestation
@@ -524,13 +525,18 @@ AWS/CDN prerequisites before publish:
 10. Run `macos_release_gate.sh` and
    `macos_stable_preflight.sh --require-installer-sha256` against the exact
    manifest to publish.
-11. Generate the Homebrew tap formula from the exact manifest and run the tap QA
-   checklist.
-12. Upload the app, CLI, daemon archives, `release-manifest.json`, the
-    CycloneDX SBOM, the Homebrew formula output, and `install-macos.sh` to the
-    immutable versioned prefix.
-13. Generate the private clean-machine QA record from the exact manifest,
-    outside the release folder (the template refuses a path inside it):
+11. Generate the Homebrew tap formula from the exact manifest. Nothing is
+    uploaded to the immutable versioned prefix yet: the publisher runs the
+    closeout gate first, and an existing versioned prefix must already hold
+    the exact final file set and bytes, so an early upload leaves the version
+    unable to take its summary. To test the formula before publishing, use an
+    isolated QA tap that holds the unmodified generated formula, with a QA-only
+    `HOMEBREW_ARTIFACT_DOMAIN` serving the verified stable archives from this
+    release folder at the formula's URLs. For the upgrade check, install the
+    previous published formula first, then switch the QA tap to the target.
+12. Generate the private clean-machine QA record from the exact manifest,
+    outside the release folder (the template refuses a path inside it, a
+    symlink, or a path through a symlink in the folder):
 
     ```bash
     ./scripts/macos_stable_qa_evidence_template.sh \
@@ -539,14 +545,14 @@ AWS/CDN prerequisites before publish:
       --output <private-folder>/stable-clean-machine-qa.record.json
     ```
 
-14. Run clean-machine QA for every supported install owner in the stable
+13. Run clean-machine QA for every supported install owner in the stable
     manifest: Homebrew, hosted installer, and direct app bundle where
     advertised. Fill each check in the private record with what happened in
     this release; notes and raw terminal output stay in the private record.
-15. Never edit the signed manifest: it already names
-    `stable-clean-machine-qa.json` as its `evidence_path`. Write the public
-    summary beside the manifest from the record, then run the closeout gate
-    before the summary is uploaded anywhere:
+14. Never edit the signed manifest: it already names
+    `stable-clean-machine-qa.json` as its `evidence_path` (the only summary
+    name the tools accept). Write the public summary beside the manifest from
+    the record, then run the closeout gate before anything is uploaded:
 
     ```bash
     ./scripts/macos_stable_qa_summary.sh \
@@ -556,10 +562,19 @@ AWS/CDN prerequisites before publish:
       --manifest dist/macos/release-manifest.json
     ```
 
-16. Update the stable `latest/` pointer only after download, checksum, stapler,
+15. The release folder must hold plain files and directories only. The
+    closeout gate fails on any symlink in it, on a private QA record under any
+    name, and when it cannot read part of the folder.
+16. Only after the closeout gate passes, upload the app, CLI, daemon archives,
+    `release-manifest.json`, the CycloneDX SBOM, the Homebrew formula output,
+    `install-macos.sh` and `stable-clean-machine-qa.json` to the immutable
+    versioned prefix. Uploading an explicit list of these files, rather than
+    the whole folder, is good defense in depth; the gate's folder check does
+    not depend on it.
+17. Update the stable `latest/` pointer only after download, checksum, stapler,
     Gatekeeper, install, service, update, uninstall, rollback, and closeout-gate
     evidence are attached to the release record.
-17. The GitHub Release verification mirror is disabled for now: the
+18. The GitHub Release verification mirror is disabled for now: the
     `github_release_mirror` input has no effect until the step publishes the
     operator-checked release folder. When enabled, it publishes a public GitHub
     Release verification mirror for the stable channel only. The mirror is verification-only: it never writes to the CDN and never
@@ -576,8 +591,9 @@ AWS/CDN prerequisites before publish:
 
 `macos_stable_closeout_gate.sh` is the final stable release evidence gate. It
 does not replace signing, notarization, `macos_release_gate.sh`, or
-`macos_stable_preflight.sh`; it runs after the immutable stable prefix is
-available and before stable `latest` promotion.
+`macos_stable_preflight.sh`; it runs on the finished release folder before
+anything is uploaded to the immutable stable prefix and before stable `latest`
+promotion.
 
 The release manifest must carry:
 
@@ -599,19 +615,27 @@ QA evidence has two forms with one schema (`schema_version: 2`):
 - The **private record** (`evidence_kind: private_record`) is what the QA
   operator fills. It may hold `operator_notes`, a `note` per check and host
   details such as a VM image digest. It never sits in the release folder,
-  because the publisher uploads that whole folder. The closeout gate refuses
-  any private record anywhere in the folder, under any name.
+  because the publisher uploads that whole folder and follows links. The
+  closeout gate refuses any private record anywhere in the folder, under any
+  name, and any symlink in it; the template and the summary writer refuse a
+  record path that is a symlink or passes through one in the folder.
 - The **public summary** is `stable-clean-machine-qa.json`, written beside the
   manifest by `macos_stable_qa_summary.sh`. It copies only allowlisted fields,
   so notes and any other record field are dropped, and it writes atomically.
+  It refuses any other name, so it never replaces the manifest or another
+  release file, even with `--force`.
 
 The summary is a closed schema: exactly the keys `schema_version`, `gate`,
 `status`, `checked_at`, `manifest` (`product`, `channel`, `version`, `commit`,
 `sha256` of the exact manifest), `environment` (`host_class`, `macos_version`
 as a numeric product version, `arch`) and `install_owners`. Each owner entry has
 exactly `owner`, `status`, `local_platform` and `checks`. Any other key, a
-wrong value type or free text fails the gate, which reports fixed messages and
-file names only.
+wrong value type or free text fails the gate. String values must match as a
+whole (a value with an extra line fails), and `schema_version` and
+`protocol_version` must be JSON integers (`2.0` fails), the same rules the
+release API applies when it reads the summary. The gate reports fixed
+messages: a name from the files appears only when it is one the gate already
+knows.
 
 `environment.host_class` is the least clean class that fits the QA host:
 `clean_vm` (a clean guest VM), `clean_macos` (a clean physical Mac),

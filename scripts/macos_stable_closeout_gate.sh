@@ -26,6 +26,10 @@ ran in an earlier release of the same X.Y line, at most 5 patches back. The gate
 validates its shape but does not accept it until verified carry ships.
 --list-never-carry-checks prints the checks that can never be carried.
 
+The release folder must hold plain files and directories only: the gate fails
+on any symlink in it, on a private QA record under any name, and on a scan
+error.
+
 Host classes (environment.host_class), least clean that fits: clean_vm (clean
 guest VM), clean_macos (clean physical Mac), qa_user_on_shared_mac,
 signing_mac (the signing host, for every user on it), developer_mac.
@@ -39,15 +43,21 @@ Owner checks with specific meaning:
                                            restart, launchd runs a new process at
                                            the target version; install_owner stays
                                            homebrew
-  app_bundle.move_service_to_app           from a serving Homebrew job, the
-                                           installed app offers Move; after it, one
-                                           app-owned job serves the target and no
-                                           Homebrew process remains
+  app_bundle.move_service_to_app           start from a serving Homebrew job;
+                                           launch the installed target app in the
+                                           QA user's desktop session; it must offer
+                                           Move; click Move; then exactly one
+                                           app-owned launchd job serves the target
+                                           and no Homebrew process remains; on the
+                                           isolated VM, check after app health that
+                                           the formula is removed
   app_bundle.homebrew_second_install_safe_refusal
-                                           a formula beside a running app never
+                                           a separate run, not a Move: a formula
+                                           installed beside a running app never
                                            gets a second serving job and never
                                            silently takes ownership (the keg may
-                                           exist)
+                                           exist). The packaging gate's step-aside
+                                           check is not evidence for this live run
   app_bundle.upgrade                       includes the target app relaunch and
                                            the app keeping ownership
 USAGE
@@ -214,17 +224,32 @@ contains_value() {
   return 1
 }
 
-# Diagnostics repeat a name from the evidence only when it is a plain
-# identifier, so a failure message never echoes free text from the file.
-safe_label() {
-  if [[ "$1" =~ ^[a-z0-9_]{1,64}$ ]]; then
-    printf '%s' "$1"
-  else
-    printf '%s' "<invalid name>"
-  fi
+# Diagnostics never repeat a value from the files: a name is printed only when
+# it is one this gate already knows, otherwise a fixed label stands in for it.
+known_owner_label() {
+  case "$1" in
+    homebrew|hosted_installer|app_bundle) printf '%s' "$1" ;;
+    *) printf '%s' "<unknown owner>" ;;
+  esac
+}
+
+known_check_label() {
+  local owner
+  for owner in homebrew hosted_installer app_bundle; do
+    if required_checks_for_owner "$owner" | grep -qxF -- "$1"; then
+      printf '%s' "$1"
+      return 0
+    fi
+  done
+  case "$1" in
+    # Pre-headless Homebrew owner checks, named so an old summary gets a clear message.
+    app_launch_preserves_owner|post_upgrade_app_relaunch_preserves_owner) printf '%s' "$1" ;;
+    *) printf '%s' "<unknown check>" ;;
+  esac
 }
 
 require_command jq
+require_command python3
 require_command shasum
 require_command grep
 require_command find
@@ -234,78 +259,127 @@ if [[ -z "$MANIFEST" ]]; then
   exit 2
 fi
 if [[ ! -f "$MANIFEST" ]]; then
-  echo "Release manifest is missing: $MANIFEST" >&2
+  echo "Release manifest is missing" >&2
   exit 1
 fi
 
 manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
-
-product="$(jq -r '.product // empty' "$MANIFEST")"
-channel="$(jq -r '.channel // empty' "$MANIFEST")"
-version="$(jq -r '.version // empty' "$MANIFEST")"
-commit="$(jq -r '.commit // empty' "$MANIFEST")"
 manifest_sha="$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
 
-if [[ "$product" != "ottto-local-platform" ]]; then
-  fail "Stable closeout requires product=ottto-local-platform, got: $product"
-fi
-if [[ "$channel" != "stable" ]]; then
-  fail "Stable closeout requires channel=stable, got: $channel"
-fi
-# Canonical numeric triple: no leading zeros, at most 9 digits per component.
-version_component='(0|[1-9][0-9]{0,8})'
-if [[ ! "$version" =~ ^${version_component}\.${version_component}\.${version_component}$ ]]; then
-  fail "Stable closeout manifest version must be X.Y.Z (canonical numbers, at most 9 digits each)"
-fi
-if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ ]]; then
-  fail "Stable closeout manifest commit is not a git SHA prefix: $commit"
-fi
-if ! jq -e '.min_protocol_version == 15' "$MANIFEST" >/dev/null; then
-  fail "Stable closeout manifest min_protocol_version must be 15"
+# Strict manifest check, the same rules as the release API reader: whole-string
+# matches (no trailing newline survives), JSON integers (15.0 is not 15) and
+# exact owner names. It runs before any value reaches the shell.
+if ! python3 - "$MANIFEST" <<'PY'
+import json
+import re
+import sys
+
+NAME = re.compile(r"[a-z0-9_]{1,64}")
+VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
+COMMIT = re.compile(r"[0-9a-f]{7,40}")
+
+
+def reject_constant(_value):
+    raise ValueError("non-finite number")
+
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        manifest = json.loads(stream.read().decode("utf-8"), parse_constant=reject_constant)
+except (OSError, UnicodeDecodeError, ValueError):
+    print("Release manifest is not readable JSON", file=sys.stderr)
+    sys.exit(1)
+
+problems = []
+if not isinstance(manifest, dict):
+    print("Release manifest is not a JSON object", file=sys.stderr)
+    sys.exit(1)
+
+
+def string_is(value, pattern):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def owner_list(value):
+    return isinstance(value, list) and all(string_is(item, NAME) for item in value)
+
+
+if manifest.get("product") != "ottto-local-platform":
+    problems.append("Stable closeout requires product=ottto-local-platform")
+if manifest.get("channel") != "stable":
+    problems.append("Stable closeout requires channel=stable")
+if not string_is(manifest.get("version"), VERSION):
+    problems.append("Stable closeout manifest version must be X.Y.Z (canonical numbers, at most 9 digits each)")
+if not string_is(manifest.get("commit"), COMMIT):
+    problems.append("Stable closeout manifest commit is not a git SHA prefix")
+min_protocol_version = manifest.get("min_protocol_version")
+if type(min_protocol_version) is not int or min_protocol_version != 15:
+    problems.append("Stable closeout manifest min_protocol_version must be the integer 15")
+if not owner_list(manifest.get("supported_install_owners")):
+    problems.append("Stable manifest supported_install_owners must be a list of owner names")
+
+quality_gates = manifest.get("quality_gates")
+gate = quality_gates.get("stable_clean_machine_qa") if isinstance(quality_gates, dict) else None
+if not isinstance(gate, dict):
+    problems.append("Stable manifest is missing quality_gates.stable_clean_machine_qa")
+else:
+    if gate.get("status") not in ("passed", "not_run"):
+        problems.append("Stable clean-machine QA manifest gate status must be passed or not_run")
+    # One canonical summary name, so it never collides with the manifest or
+    # another release file.
+    if gate.get("evidence_path") != "stable-clean-machine-qa.json":
+        problems.append("Stable clean-machine QA gate evidence_path must be stable-clean-machine-qa.json")
+    if "required_install_owners" in gate and not owner_list(gate.get("required_install_owners")):
+        problems.append("Stable clean-machine QA manifest gate required_install_owners must be a list of owner names")
+
+for problem in problems:
+    print(problem, file=sys.stderr)
+if problems:
+    print(f"Stable closeout gate failed with {len(problems)} issue(s).", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+  exit 1
 fi
 
-gate="$(jq -c '.quality_gates.stable_clean_machine_qa // empty' "$MANIFEST")"
-if [[ -z "$gate" ]]; then
-  fail "Stable manifest is missing quality_gates.stable_clean_machine_qa"
-fi
+version="$(jq -r '.version' "$MANIFEST")"
+commit="$(jq -r '.commit' "$MANIFEST")"
+channel="stable"
 
-gate_status="$(jq -r '.quality_gates.stable_clean_machine_qa.status // empty' "$MANIFEST")"
-gate_evidence_path="$(jq -r '.quality_gates.stable_clean_machine_qa.evidence_path // empty' "$MANIFEST")"
-if [[ "$gate_status" != "passed" && "$gate_status" != "not_run" ]]; then
-  fail "Stable clean-machine QA manifest gate status must be passed or not_run"
+# The publisher uploads the whole release folder and follows links, so the
+# folder holds plain files and directories only. A scan error fails closed.
+if ! symlinks="$(find "$manifest_dir" -type l -print 2>/dev/null)"; then
+  echo "Could not scan the release folder for symlinks" >&2
+  exit 1
 fi
-if [[ -z "$gate_evidence_path" ]]; then
-  fail "Stable clean-machine QA gate is missing evidence_path"
-fi
-
-if [[ "$failures" -gt 0 ]]; then
-  echo "Stable closeout gate failed with $failures issue(s)." >&2
+if [[ -n "$symlinks" ]]; then
+  symlink_count="$(printf '%s\n' "$symlinks" | wc -l | tr -d ' ')"
+  echo "The release folder contains $symlink_count symlink(s); replace them with plain files or move them out before publishing" >&2
   exit 1
 fi
 
 # The summary is a plain file name beside the manifest, never a path or a symlink.
-if ! evidence_path="$(macos_release_path "$manifest_dir" "$gate_evidence_path")" || [[ ! -f "$evidence_path" ]]; then
-  echo "Stable clean-machine QA summary is missing beside the manifest, or evidence_path is not a plain file name" >&2
+if ! evidence_path="$(macos_release_path "$manifest_dir" "stable-clean-machine-qa.json")" || [[ ! -f "$evidence_path" ]]; then
+  echo "Stable clean-machine QA summary stable-clean-machine-qa.json is missing beside the manifest" >&2
   exit 1
 fi
-evidence_name="$(basename "$evidence_path")"
+evidence_name="stable-clean-machine-qa.json"
 
-# The full QA record is private. The publisher uploads the release folder, so
-# refuse a record anywhere in it, under any name.
-private_records=0
-while IFS= read -r record; do
-  [[ -n "$record" ]] || continue
-  record_name="$(basename "$record")"
-  macos_release_filename "$record_name" || record_name="<invalid name>"
-  echo "A private QA record is inside the release folder; move it out before publishing: $record_name" >&2
-  private_records=$((private_records + 1))
-done < <(
-  {
-    find "$manifest_dir" -name '*.record.json' -print
-    grep -rlaF '"private_record"' "$manifest_dir" || true
-  } | sort -u
-)
+# The full QA record is private. Refuse a record anywhere in the folder, under
+# any name. grep exits 1 when nothing matches and 2 on a read error.
+if ! named_records="$(find "$manifest_dir" -name '*.record.json' -print 2>/dev/null)"; then
+  echo "Could not scan the release folder for private QA records" >&2
+  exit 1
+fi
+grep_status=0
+content_records="$(grep -rlaF '"private_record"' "$manifest_dir" 2>/dev/null)" || grep_status=$?
+if [[ "$grep_status" -gt 1 ]]; then
+  echo "Could not scan the release folder for private QA records" >&2
+  exit 1
+fi
+private_records="$(printf '%s\n%s\n' "$named_records" "$content_records" | sort -u | grep -c . || true)"
 if [[ "$private_records" -gt 0 ]]; then
+  echo "A private QA record is inside the release folder ($private_records file(s)); move it out before publishing" >&2
   exit 1
 fi
 
@@ -313,7 +387,7 @@ if grep -Eiq "/Users/|docs/dev|\\.agents|\\.claude|Bearer[[:space:]]+|claim_code
   echo "Stable clean-machine QA evidence contains private path or secret-like material: $evidence_name" >&2
   exit 1
 fi
-if jq -e '.. | strings | select(. == "not_run" or test("^TODO"))' "$evidence_path" >/dev/null; then
+if jq -e '.. | strings | select(. == "not_run" or test("^TODO"))' "$evidence_path" >/dev/null 2>&1; then
   echo "Stable clean-machine QA evidence still contains template placeholders: $evidence_name" >&2
   exit 1
 fi
@@ -322,52 +396,116 @@ if jq -e '.schema_version == 1' "$evidence_path" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Closed public schema: every object has exactly these keys and every leaf has
-# a fixed shape, so neither free text nor a private record can pass.
-if ! jq -e \
-  --arg product "$product" \
-  --arg channel "$channel" \
-  --arg version "$version" \
-  --arg commit "$commit" \
-  --arg manifest_sha "$manifest_sha" \
-  '
-    def name: type == "string" and test("^[a-z0-9_]{1,64}$");
-    type == "object"
-    and keys == ["checked_at", "environment", "gate", "install_owners", "manifest", "schema_version", "status"]
-    and .schema_version == 2
-    and .gate == "stable_clean_machine_qa"
-    and .status == "passed"
-    and (.checked_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-    and (.manifest | type == "object" and keys == ["channel", "commit", "product", "sha256", "version"])
-    and .manifest.product == $product
-    and .manifest.channel == $channel
-    and .manifest.version == $version
-    and .manifest.commit == $commit
-    and .manifest.sha256 == $manifest_sha
-    and (.environment | type == "object" and keys == ["arch", "host_class", "macos_version"])
-    and (.environment.host_class | IN("clean_vm", "clean_macos", "qa_user_on_shared_mac", "signing_mac", "developer_mac"))
-    and (.environment.macos_version | type == "string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){0,2}$"))
-    and (.environment.arch | IN("arm64", "x86_64", "universal"))
-    and (.install_owners | type == "array" and length > 0)
-    and all(.install_owners[];
-      type == "object"
-      and keys == ["checks", "local_platform", "owner", "status"]
-      and (.owner | name)
-      and .status == "passed"
-      and (.local_platform | type == "object"
-        and keys == ["install_owner", "protocol_version", "release_channel", "release_manifest_sha256", "runtime", "service_label", "version"])
-      and (.checks | type == "object" and length > 0)
-      and all(.checks | to_entries[];
-        (.key | name)
-        and (.value | type == "object")
-        and ((.value | keys) == ["method", "result"] or (.value | keys) == ["from", "method", "result"])
-        and (.value.result | name)
-        and (.value.method | name)
-        and (if (.value | has("from"))
-          then (.value.from | type == "string"
-            and test("^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})(-rc[1-9][0-9]*)?$"))
-          else true end)))
-  ' "$evidence_path" >/dev/null 2>&1; then
+# Closed public schema, the same rules as the release API reader: exact keys
+# at every level, whole-string matches, JSON integers and the binding to this
+# manifest. Neither free text nor a private record can pass.
+if ! python3 - "$evidence_path" "$MANIFEST" "$manifest_sha" <<'PY'
+import json
+import re
+import sys
+
+NAME = re.compile(r"[a-z0-9_]{1,64}")
+CHECKED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+MACOS_VERSION = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){0,2}")
+CARRY_FROM = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(-rc[1-9][0-9]*)?")
+HOST_CLASSES = {"clean_vm", "clean_macos", "qa_user_on_shared_mac", "signing_mac", "developer_mac"}
+ARCHES = {"arm64", "x86_64", "universal"}
+LOCAL_PLATFORM_KEYS = {
+    "install_owner",
+    "protocol_version",
+    "release_channel",
+    "release_manifest_sha256",
+    "runtime",
+    "service_label",
+    "version",
+}
+
+
+def reject_constant(_value):
+    raise ValueError("non-finite number")
+
+
+def load(path):
+    with open(path, "rb") as stream:
+        return json.loads(stream.read().decode("utf-8"), parse_constant=reject_constant)
+
+
+def string_is(value, pattern):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def check_entry_ok(entry):
+    if not isinstance(entry, dict) or set(entry) not in ({"result", "method"}, {"result", "method", "from"}):
+        return False
+    if not (string_is(entry["result"], NAME) and string_is(entry["method"], NAME)):
+        return False
+    return "from" not in entry or string_is(entry["from"], CARRY_FROM)
+
+
+def owner_entry_ok(entry):
+    if not isinstance(entry, dict) or set(entry) != {"checks", "local_platform", "owner", "status"}:
+        return False
+    local_platform = entry["local_platform"]
+    checks = entry["checks"]
+    return (
+        string_is(entry["owner"], NAME)
+        and entry["status"] == "passed"
+        and isinstance(local_platform, dict)
+        and set(local_platform) == LOCAL_PLATFORM_KEYS
+        and type(local_platform["protocol_version"]) is int
+        and all(isinstance(local_platform[key], str) for key in LOCAL_PLATFORM_KEYS - {"protocol_version"})
+        and isinstance(checks, dict)
+        and len(checks) > 0
+        and all(string_is(name, NAME) and check_entry_ok(value) for name, value in checks.items())
+    )
+
+
+try:
+    summary = load(sys.argv[1])
+    manifest = load(sys.argv[2])
+except (OSError, UnicodeDecodeError, ValueError):
+    sys.exit(1)
+manifest_sha = sys.argv[3]
+
+
+def summary_ok():
+    return (
+        isinstance(summary, dict)
+        and set(summary) == {"checked_at", "environment", "gate", "install_owners", "manifest", "schema_version", "status"}
+        and type(summary["schema_version"]) is int
+        and summary["schema_version"] == 2
+        and summary["gate"] == "stable_clean_machine_qa"
+        and summary["status"] == "passed"
+        and string_is(summary["checked_at"], CHECKED_AT)
+        and isinstance(summary["manifest"], dict)
+        and summary["manifest"] == {
+            "product": manifest.get("product"),
+            "channel": manifest.get("channel"),
+            "version": manifest.get("version"),
+            "commit": manifest.get("commit"),
+            "sha256": manifest_sha,
+        }
+        and isinstance(summary["environment"], dict)
+        and set(summary["environment"]) == {"arch", "host_class", "macos_version"}
+        and isinstance(summary["environment"]["host_class"], str)
+        and summary["environment"]["host_class"] in HOST_CLASSES
+        and string_is(summary["environment"]["macos_version"], MACOS_VERSION)
+        and isinstance(summary["environment"]["arch"], str)
+        and summary["environment"]["arch"] in ARCHES
+        and isinstance(summary["install_owners"], list)
+        and len(summary["install_owners"]) > 0
+        and all(owner_entry_ok(entry) for entry in summary["install_owners"])
+    )
+
+
+# A shape this check did not foresee fails closed, without a traceback.
+try:
+    ok = summary_ok()
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+then
   echo "Stable clean-machine QA evidence is not a schema 2 summary of this manifest (unexpected or missing fields, wrong value types, or another manifest): $evidence_name" >&2
   exit 1
 fi
@@ -388,7 +526,7 @@ done < <(jq -r '.quality_gates.stable_clean_machine_qa.required_install_owners[]
 
 for owner in "${required_gate_owners[@]}"; do
   if ! contains_value "$owner" "${supported_owners[@]}"; then
-    fail "Stable clean-machine QA manifest gate includes unsupported required install owner: $owner"
+    fail "Stable clean-machine QA manifest gate includes unsupported required install owner: $(known_owner_label "$owner")"
   fi
 done
 
@@ -399,7 +537,7 @@ done < <(never_carry_checks)
 
 for owner in "${supported_owners[@]}"; do
   if ! required_checks_for_owner "$owner" >/dev/null; then
-    fail "Stable closeout does not know how to validate install owner: $owner"
+    fail "Stable closeout does not know how to validate install owner: $(known_owner_label "$owner")"
     continue
   fi
   if ! contains_value "$owner" "${required_gate_owners[@]}"; then
@@ -476,14 +614,14 @@ for owner in "${supported_owners[@]}"; do
   done < <(required_checks_for_owner "$owner")
   while IFS= read -r check_name; do
     if ! contains_value "$check_name" "${required_owner_checks[@]}"; then
-      fail "Stable clean-machine QA evidence includes unknown check $owner.$(safe_label "$check_name")"
+      fail "Stable clean-machine QA evidence includes unknown check $owner.$(known_check_label "$check_name")"
     fi
   done < <(jq -r --arg owner "$owner" '.install_owners[] | select(.owner == $owner) | .checks | keys[]' "$evidence_path" | sort -u)
 done
 
 while IFS= read -r owner; do
   if ! contains_value "$owner" "${supported_owners[@]}"; then
-    fail "Stable clean-machine QA evidence includes unsupported install owner: $(safe_label "$owner")"
+    fail "Stable clean-machine QA evidence includes unsupported install owner: $(known_owner_label "$owner")"
   fi
 done < <(jq -r '.install_owners[].owner' "$evidence_path" | sort -u)
 

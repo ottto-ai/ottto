@@ -82,7 +82,7 @@ if [[ -z "$MANIFEST" || -z "$OUTPUT" || -z "$HOST_CLASS" ]]; then
   exit 2
 fi
 if [[ ! -f "$MANIFEST" ]]; then
-  echo "Release manifest is missing: $MANIFEST" >&2
+  echo "Release manifest is missing" >&2
   exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -101,7 +101,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-manifest_path = Path(sys.argv[1]).resolve()
+manifest_arg = Path(sys.argv[1]).absolute()
 output_arg = sys.argv[2]
 checked_at = sys.argv[3]
 macos_version = sys.argv[4] or "TODO_FILL_MACOS_PRODUCT_VERSION"
@@ -213,10 +213,22 @@ def require_string_list(value: Any, label: str) -> list[str]:
     return strings
 
 
+def reject_constant(_value: str) -> None:
+    raise ValueError("non-finite number")
+
+
+# The release folder is the manifest's physical parent, as the closeout gate
+# sees it. A linked manifest would point the checks at another folder.
+if manifest_arg.is_symlink():
+    die("the release manifest must not be a symlink", code=2)
+manifest_dir = manifest_arg.parent.resolve()
+manifest_path = manifest_dir / manifest_arg.name
+
 try:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-except json.JSONDecodeError as error:
-    die(f"invalid manifest JSON: {error}")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"), parse_constant=reject_constant)
+except (OSError, UnicodeDecodeError, ValueError):
+    die("the release manifest is not readable JSON")
 
 manifest = require_object(manifest, "manifest")
 product = require_string(manifest.get("product"), "manifest.product")
@@ -225,21 +237,23 @@ version = require_string(manifest.get("version"), "manifest.version")
 commit = require_string(manifest.get("commit"), "manifest.commit")
 min_protocol_version = manifest.get("min_protocol_version")
 if product != "ottto-local-platform":
-    die(f"expected product=ottto-local-platform, got {product}")
+    die("expected product=ottto-local-platform")
 if channel != "stable":
-    die(f"expected stable manifest, got channel={channel}")
-if min_protocol_version != 15:
-    die("manifest.min_protocol_version must be 15")
+    die("expected stable manifest (channel=stable)")
+if not re.fullmatch(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", version):
+    die("manifest.version must be X.Y.Z (canonical numbers, at most 9 digits each)")
+if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+    die("manifest.commit must be a git SHA prefix")
+if type(min_protocol_version) is not int or min_protocol_version != 15:
+    die("manifest.min_protocol_version must be the integer 15")
 
 quality_gates = require_object(manifest.get("quality_gates"), "manifest.quality_gates")
 gate = require_object(
     quality_gates.get("stable_clean_machine_qa"),
     "manifest.quality_gates.stable_clean_machine_qa",
 )
-evidence_path = require_string(
-    gate.get("evidence_path"),
-    "manifest.quality_gates.stable_clean_machine_qa.evidence_path",
-)
+if gate.get("evidence_path") != "stable-clean-machine-qa.json":
+    die("manifest stable_clean_machine_qa.evidence_path must be stable-clean-machine-qa.json")
 supported_owners = sorted(set(require_string_list(
     manifest.get("supported_install_owners"), "manifest.supported_install_owners"
 )))
@@ -248,9 +262,8 @@ required_owners = sorted(set(require_string_list(
     "manifest.quality_gates.stable_clean_machine_qa.required_install_owners",
 )))
 
-unknown_owners = sorted(set(supported_owners).difference(CHECKS_BY_OWNER))
-if unknown_owners:
-    die(f"unsupported install owner(s): {', '.join(unknown_owners)}")
+if set(supported_owners).difference(CHECKS_BY_OWNER) or set(required_owners).difference(CHECKS_BY_OWNER):
+    die("the manifest names an unsupported install owner")
 missing_required = sorted(set(supported_owners).difference(required_owners))
 if missing_required:
     die(
@@ -265,13 +278,31 @@ if host_class not in HOST_CLASSES:
 if sys.argv[4] and not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){0,2}", macos_version):
     die("--macos-version must be a macOS product version such as 15.5", code=2)
 
-# The record holds private notes; the publisher uploads the release folder.
-manifest_dir = manifest_path.parent
+
+def inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def aliased(path: Path, folder: Path) -> bool:
+    """The path is a symlink, or a link inside the folder leads to it."""
+    if path.is_symlink():
+        return True
+    for ancestor in path.parents:
+        if ancestor.is_symlink() and inside(ancestor.parent.resolve(), folder):
+            return True
+    return False
+
+
+# The record holds private notes; the publisher uploads the release folder and
+# follows links, so the record may be neither in it nor reached through it.
 if output_arg == "-":
     output_path = None
 else:
-    output_path = Path(output_arg).resolve()
-    if output_path == manifest_dir or manifest_dir in output_path.parents:
+    output_arg_path = Path(output_arg).absolute()
+    if aliased(output_arg_path, manifest_dir):
+        die("the private QA record path must not be or pass through a symlink", code=2)
+    output_path = output_arg_path.resolve()
+    if inside(output_path, manifest_dir):
         die(
             "the private QA record must live outside the release folder "
             "(the publisher uploads that folder); publish only the summary",
@@ -286,7 +317,7 @@ if not checked_at:
         .replace("+00:00", "Z")
     )
 
-manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
 evidence = {
     "schema_version": 2,
     "evidence_kind": "private_record",
@@ -365,8 +396,11 @@ if output_path is None:
     print(text, end="")
 else:
     if output_path.exists() and not force:
-        die(f"output already exists, pass --force to overwrite: {output_path.name}", code=2)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(text, encoding="utf-8")
-    print(f"stable-qa-template: wrote private record {output_path.name}")
+        die("output already exists, pass --force to overwrite it", code=2)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text, encoding="utf-8")
+    except OSError:
+        die("could not write the private QA record")
+    print("stable-qa-template: wrote the private QA record")
 PY

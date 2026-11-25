@@ -289,7 +289,9 @@ records the expected local-runtime binding for `ottto-service`,
 `net.ottto.service`, protocol v15, stable version/channel, install owner, and
 release-manifest SHA-256. It leaves every owner check as `not_run`. The summary
 copies only allowlisted fields, so the record's notes never reach the release
-folder; the gate refuses a private record anywhere in that folder.
+folder. The gate refuses a private record anywhere in that folder and any
+symlink in it, and fails if it cannot read the whole folder; publishers that
+upload an explicit file list add defense in depth.
 
 To check a published summary, download it beside its manifest and run the
 gate. `environment.host_class` says where QA ran: `clean_vm` (a clean guest
@@ -322,18 +324,26 @@ service restart, and `post_upgrade_service_restarts_owned` proves that after
 target version with `install_owner` still `homebrew`. Homebrew evidence also has
 to prove that doctor reports no owner drift and that update JSON reports the
 Homebrew install owner. App-bundle `upgrade` includes the target app relaunch
-and the app keeping ownership. App-bundle `move_service_to_app` starts from a
-serving Homebrew job, requires the installed app to offer Move, and ends with
-one app-owned job serving the target and no Homebrew process. App-bundle
-evidence has to prove a second Homebrew install/start attempt is either a safe
-refusal with instructions or an explicit migration, not silent owner takeover.
-Its check, `homebrew_second_install_safe_refusal`, means a formula beside a
-running app never gets a second serving job and never silently takes ownership
-(the keg may exist). The
-release gate checks the mechanism on the packaged app: `macos_release_gate.sh`
-asks the app's bundled `ottto-service` to decide as a launchd-started Homebrew
-copy (`service step-aside-check`), and a stable release fails unless that copy
-hands over to the packaged app and serves when no app is there.
+and the app keeping ownership.
+
+App-bundle `move_service_to_app` is the one explicit migration. It starts from
+a serving Homebrew job. The QA user launches the installed target app in their
+own desktop session, the app must offer Move, and the operator clicks Move.
+Afterwards exactly one app-owned launchd job serves the target version and no
+Homebrew process remains. On the isolated QA VM, the operator also checks,
+after the app reports healthy, that the formula was removed.
+
+App-bundle `homebrew_second_install_safe_refusal` is a separate run, not a
+Move. App-bundle
+evidence has to prove a second Homebrew install/start attempt is a safe
+refusal with instructions, not a second serving job or silent owner takeover:
+a formula beside a running app never gets a second serving job and never
+silently takes ownership (the keg may exist). The release gate checks a
+related decision on the packaged app: `macos_release_gate.sh` asks the app's
+bundled `ottto-service` to decide as a launchd-started Homebrew copy
+(`service step-aside-check`), and a stable release fails unless that copy
+hands over to the packaged app and serves when no app is there. That packaged
+check is distinct from Move and is not live ownership evidence for this check.
 The evidence file must match the exact manifest version, commit, and SHA-256,
 prove the expected per-owner local-runtime binding, and it must not contain
 extra required install owners, unknown per-owner check names, local user paths,
