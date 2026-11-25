@@ -297,6 +297,25 @@ expect_summary_error 1 "would replace the manifest or another release file" \
   --record "$record" --manifest "$named_dir/stable-clean-machine-qa.json" --force
 [[ "$(shasum -a 256 "$named_dir/stable-clean-machine-qa.json" | awk '{print $1}')" == "$named_sha" ]]
 
+# [regression] A case variant names the same file on a case-insensitive volume.
+case_dir="$tmp_dir/manifest-case-variant"
+mkdir -p "$case_dir"
+cp "$manifest" "$case_dir/Stable-Clean-Machine-QA.json"
+case_sha="$(shasum -a 256 "$case_dir/Stable-Clean-Machine-QA.json" | awk '{print $1}')"
+expect_summary_error 1 "would replace the manifest or another release file" \
+  --record "$record" --manifest "$case_dir/Stable-Clean-Machine-QA.json" --force
+[[ "$(shasum -a 256 "$case_dir/Stable-Clean-Machine-QA.json" | awk '{print $1}')" == "$case_sha" ]]
+
+# [regression] A hard link to the manifest under the summary name.
+hardlink_dir="$tmp_dir/manifest-hard-link"
+mkdir -p "$hardlink_dir"
+cp "$manifest" "$hardlink_dir/release-manifest.json"
+ln "$hardlink_dir/release-manifest.json" "$hardlink_dir/stable-clean-machine-qa.json"
+hardlink_sha="$(shasum -a 256 "$hardlink_dir/release-manifest.json" | awk '{print $1}')"
+expect_summary_error 1 "would replace the manifest or another release file" \
+  --record "$record" --manifest "$hardlink_dir/release-manifest.json" --force
+[[ "$(shasum -a 256 "$hardlink_dir/release-manifest.json" | awk '{print $1}')" == "$hardlink_sha" ]]
+
 # [regression] evidence_path naming the manifest is refused; the manifest survives.
 self_dir="$tmp_dir/evidence-names-manifest"
 mkdir -p "$self_dir"

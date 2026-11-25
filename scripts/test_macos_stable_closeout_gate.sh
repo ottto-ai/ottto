@@ -750,6 +750,15 @@ expect_failure "$dir" "Release manifest is not readable JSON"
 mkdir -p "$tmp_dir/cases/synthetic_private_marker"
 expect_failure "$tmp_dir/cases/synthetic_private_marker" "Release manifest is missing"
 
+# An unreadable manifest gets a fixed message, not the tool's error with the
+# path (skipped when running as root).
+dir="$(new_case unreadable-manifest)"
+chmod 000 "$dir/release-manifest.json"
+if [[ ! -r "$dir/release-manifest.json" ]]; then
+  expect_failure "$dir" "Release manifest is not readable"
+fi
+chmod 644 "$dir/release-manifest.json"
+
 # --- owners, runtime binding and manifest -------------------------------------
 
 dir="$(new_case failed-gate)"

@@ -258,13 +258,28 @@ def release_file_names(value: Any) -> set[str]:
 other_gates = {key: value for key, value in obj(manifest.get("quality_gates"), "manifest quality_gates").items()
                if key != "stable_clean_machine_qa"}
 manifest_without_gate = {key: value for key, value in manifest.items() if key != "quality_gates"}
-if (
-    manifest_path.name == SUMMARY_NAME
-    or SUMMARY_NAME in release_file_names(manifest_without_gate)
-    or SUMMARY_NAME in release_file_names(other_gates)
+release_names = (
+    {manifest_path.name}
+    | release_file_names(manifest_without_gate)
+    | release_file_names(other_gates)
+)
+output_path = manifest_dir / SUMMARY_NAME
+
+
+def same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.exists() and right.exists() and os.path.samefile(left, right)
+    except OSError:
+        return True
+
+
+# Names compare case-insensitively (macOS volumes usually are), and an existing
+# summary path must not be the manifest or a listed file under another name or
+# a hard link.
+if SUMMARY_NAME.casefold() in {name.casefold() for name in release_names} or any(
+    same_file(output_path, manifest_dir / name) for name in release_names if name not in ("", ".", "..")
 ):
     die(f"{SUMMARY_NAME} would replace the manifest or another release file")
-output_path = manifest_dir / SUMMARY_NAME
 if output_path.is_symlink():
     die("the summary path beside the manifest must not be a symlink")
 if output_path.exists() and not force:

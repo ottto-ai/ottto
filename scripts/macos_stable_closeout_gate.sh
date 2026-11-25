@@ -263,8 +263,15 @@ if [[ ! -f "$MANIFEST" ]]; then
   exit 1
 fi
 
-manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
-manifest_sha="$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
+# I/O errors get fixed messages: a tool's own error would print the path.
+if ! manifest_dir="$(macos_release_manifest_dir "$MANIFEST" 2>/dev/null)" || [[ -z "$manifest_dir" ]]; then
+  echo "Release manifest folder is not readable" >&2
+  exit 1
+fi
+if ! manifest_sha="$(shasum -a 256 "$MANIFEST" 2>/dev/null | awk '{print $1}')" || [[ ! "$manifest_sha" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Release manifest is not readable" >&2
+  exit 1
+fi
 
 # Strict manifest check, the same rules as the release API reader: whole-string
 # matches (no trailing newline survives), JSON integers (15.0 is not 15) and
@@ -383,7 +390,7 @@ if [[ "$private_records" -gt 0 ]]; then
   exit 1
 fi
 
-if grep -Eiq "/Users/|docs/dev|\\.agents|\\.claude|Bearer[[:space:]]+|claim_code|setup_run_token|account_id|machine_id|api[_-]?key|password" "$evidence_path"; then
+if grep -Eiq "/Users/|docs/dev|\\.agents|\\.claude|Bearer[[:space:]]+|claim_code|setup_run_token|account_id|machine_id|api[_-]?key|password" "$evidence_path" 2>/dev/null; then
   echo "Stable clean-machine QA evidence contains private path or secret-like material: $evidence_name" >&2
   exit 1
 fi
