@@ -762,6 +762,9 @@ pub(super) fn prepare_sync_source_inner(
         )
         .map_err(|_| anyhow!("tracking state unavailable"))?;
     if receipt_window_days == 0 {
+        // The tombstone withdraws the server's census, which the armed
+        // walk record stood for: the next pass at a real window walks.
+        crate::snapshots::walk_idle::clear(source);
         withdraw_and_report_policy_stop(
             client,
             device,
