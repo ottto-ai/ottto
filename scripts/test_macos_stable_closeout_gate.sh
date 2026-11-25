@@ -600,9 +600,10 @@ for from in $'0.1.6\n' '0.1.6 ' $'0.1.6\nsynthetic_private_marker'; do
   expect_failure "$dir" "is not a schema 2 summary of this manifest"
 done
 
+record_error="A private QA record is inside the release folder"
 dir="$(new_case operator-notes)"
 mutate "$dir" '.operator_notes = ["SYNTHETIC-PRIVATE-MARKER ran on the build host"]'
-expect_failure "$dir" "is not a schema 2 summary of this manifest"
+expect_failure "$dir" "$record_error"
 
 dir="$(new_case check-note)"
 mutate "$dir" '(.install_owners[] | select(.owner == "homebrew") | .checks.logout_json.note) = "SYNTHETIC-PRIVATE-MARKER"'
@@ -645,8 +646,6 @@ edit_text "$dir/stable-clean-machine-qa.json" \
 expect_failure "$dir" "$duplicate_key_error"
 
 # --- the private record stays out of the release folder ----------------------
-
-record_error="A private QA record is inside the release folder"
 
 dir="$(new_case record-beside-manifest)"
 printf '{"evidence_kind": "private_record"}\n' > "$dir/stable-clean-machine-qa.record.json"
