@@ -147,6 +147,11 @@ make_artifact() {
   printf 'artifact:%s\n' "$(basename "$path")" > "$path"
 }
 
+# Manifests name artifacts by filename beside the manifest. The script runs
+# from an unrelated directory and must still resolve them there.
+ELSEWHERE="$TMP_DIR/elsewhere"
+mkdir -p "$ELSEWHERE"
+cd "$ELSEWHERE"
 APP_DMG="$TMP_DIR/Ottto-macos-arm64.dmg"
 APP_BUNDLE="$TMP_DIR/Ottto.app"
 CLI_ZIP="$TMP_DIR/ottto-macos-arm64.zip"
@@ -168,14 +173,14 @@ sha256_file() {
 write_manifest() {
   local manifest="$1"
   jq -n \
-    --arg app_dmg "$APP_DMG" \
-    --arg app_bundle "$APP_BUNDLE" \
+    --arg app_dmg "$(basename "$APP_DMG")" \
+    --arg app_bundle "$(basename "$APP_BUNDLE")" \
     --arg app_sha "$(sha256_file "$APP_DMG")" \
-    --arg cli_zip "$CLI_ZIP" \
-    --arg cli_bin "$CLI_BIN" \
+    --arg cli_zip "$(basename "$CLI_ZIP")" \
+    --arg cli_bin "$(basename "$CLI_BIN")" \
     --arg cli_sha "$(sha256_file "$CLI_ZIP")" \
-    --arg daemon_zip "$DAEMON_ZIP" \
-    --arg daemon_bin "$DAEMON_BIN" \
+    --arg daemon_zip "$(basename "$DAEMON_ZIP")" \
+    --arg daemon_bin "$(basename "$DAEMON_BIN")" \
     --arg daemon_sha "$(sha256_file "$DAEMON_ZIP")" \
     '{
       schema_version: 1,
@@ -272,6 +277,35 @@ if ! grep -q "spctl --assess --type install .*ottto-service$" "$LOG"; then
   echo "Expected daemon Gatekeeper assessment to use install policy" >&2
   exit 1
 fi
+RELEASE_DIR="$(cd "$TMP_DIR" && pwd -P)"
+if ! grep -Fq "notarytool submit $RELEASE_DIR/ottto-macos-arm64.zip " "$LOG" ||
+  ! grep -Fq "codesign --verify --strict --verbose=2 $RELEASE_DIR/ottto-service" "$LOG"; then
+  echo "Expected artifacts to resolve beside the manifest, not in the working directory" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[1].sha256' "$MANIFEST")" != "$(sha256_file "$CLI_ZIP")" ]]; then
+  echo "Expected the CLI hash to be recorded from the file beside the manifest" >&2
+  exit 1
+fi
+
+# A manifest that names a host path, a traversal or a symlink is refused.
+for bad_ref in "$CLI_ZIP" "../$(basename "$TMP_DIR")/ottto-macos-arm64.zip" "linked-cli.zip"; do
+  ln -sf ottto-macos-arm64.zip "$TMP_DIR/linked-cli.zip"
+  jq --arg ref "$bad_ref" '.artifacts[1].path = $ref' "$MANIFEST" > "$TMP_DIR/bad-ref-manifest.json"
+  if OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/bad-ref.log" \
+    PATH="$FAKE_BIN:$PATH" \
+    "$NOTARIZE" \
+      --manifest "$TMP_DIR/bad-ref-manifest.json" \
+      --keychain-profile TEST_PROFILE \
+      --artifact-kind cli >"$TMP_DIR/bad-ref.out" 2>&1; then
+    echo "Expected notarize to refuse artifact path $bad_ref" >&2
+    exit 1
+  fi
+  grep -Fq "must be a release filename beside the manifest" "$TMP_DIR/bad-ref.out" || {
+    echo "Notarize did not explain the refused artifact path: $(cat "$TMP_DIR/bad-ref.out")" >&2
+    exit 1
+  }
+done
 
 APP_MANIFEST="$TMP_DIR/app-manifest.json"
 APP_LOG="$TMP_DIR/app.log"
@@ -310,15 +344,13 @@ fi
 
 LAUNCHED_DIR="$TMP_DIR/launched"
 LAUNCHED_BUNDLE="$LAUNCHED_DIR/Ottto.app"
-LAUNCHED_MANIFEST="$TMP_DIR/launched-manifest.json"
+LAUNCHED_MANIFEST="$LAUNCHED_DIR/release-manifest.json"
 LAUNCHED_LOG="$TMP_DIR/launched.log"
 mkdir -p "$LAUNCHED_BUNDLE/Contents"
 make_artifact "$LAUNCHED_BUNDLE/Ottto"
 make_artifact "$LAUNCHED_DIR/Ottto-macos-arm64.dmg"
 : > "$LAUNCHED_BUNDLE/.test-launched"
-jq --arg dir "$LAUNCHED_DIR" \
-  '.artifacts |= map(if .name == "Ottto.app" then .path = ($dir + "/Ottto-macos-arm64.dmg") | .verification_path = ($dir + "/Ottto.app") else . end)' \
-  "$APP_MANIFEST" > "$LAUNCHED_MANIFEST"
+cp "$APP_MANIFEST" "$LAUNCHED_MANIFEST"
 OTTTO_NOTARIZE_TEST_TOUCH_LAUNCHED_FAIL=1 \
   OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$TMP_DIR/launched-hdiutil-state" \
   OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \

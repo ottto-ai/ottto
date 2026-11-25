@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/macos_release_paths.sh
+source "$SCRIPT_DIR/macos_release_paths.sh"
+
 MANIFEST=""
-APP_SOURCE_REPOSITORY="${OTTTO_MACOS_APP_SOURCE_REPOSITORY:-}"
 
 usage() {
   cat <<'USAGE'
@@ -11,10 +14,10 @@ Usage: macos_release_gate.sh --manifest <release-manifest.json>
 Validates artifact presence, SHA-256 integrity, and stable-channel signing /
 notarization requirements for the clean-slate Ottto local platform.
 
-Environment:
-  OTTTO_MACOS_APP_SOURCE_REPOSITORY
-    Required expected app source identity in owner/name form. Supply it from
-    trusted release configuration, independently of the manifest being checked.
+Local files named by the manifest (artifacts, verification targets, SBOM and
+launch evidence) are plain filenames resolved in the manifest's directory,
+whatever the working directory. Check an older release record with the
+scripts from its own release tag.
 USAGE
 }
 
@@ -38,11 +41,6 @@ done
 
 if [[ -z "$MANIFEST" ]]; then
   usage >&2
-  exit 2
-fi
-
-if [[ ! "$APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" >&2
   exit 2
 fi
 
@@ -159,26 +157,13 @@ gatekeeper_assessment_type() {
   fi
 }
 
-manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
+manifest_dir="$(macos_release_manifest_dir "$MANIFEST")"
+# Resolve a release filename beside the manifest to an existing regular file.
 resolve_manifest_file() {
-  local manifest_path="$1"
-  if [[ "$manifest_path" == /* && -f "$manifest_path" ]]; then
-    echo "$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_path" ]]; then
-    echo "$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_dir/$manifest_path" ]]; then
-    echo "$manifest_dir/$manifest_path"
-    return
-  fi
-  if [[ -f "$manifest_dir/$(basename "$manifest_path")" ]]; then
-    echo "$manifest_dir/$(basename "$manifest_path")"
-    return
-  fi
-  return 1
+  local resolved
+  resolved="$(macos_release_path "$manifest_dir" "$1")" || return 1
+  [[ -f "$resolved" ]] || return 1
+  printf '%s\n' "$resolved"
 }
 
 slsa_spec_version="$(jq -r '.supply_chain.slsa_build.spec_version // empty' "$MANIFEST")"
@@ -202,12 +187,6 @@ material_count="$(jq '.supply_chain.materials // [] | length' "$MANIFEST")"
 public_material_kind="$(jq -r '.supply_chain.materials[0].kind // empty' "$MANIFEST")"
 public_material_repository="$(jq -r '.supply_chain.materials[0].repository // empty' "$MANIFEST")"
 public_material_commit="$(jq -r '.supply_chain.materials[0].commit // empty' "$MANIFEST")"
-app_material_kind="$(jq -r '.supply_chain.materials[1].kind // empty' "$MANIFEST")"
-app_material_repository="$(jq -r '.supply_chain.materials[1].repository // empty' "$MANIFEST")"
-app_material_commit="$(jq -r '.supply_chain.materials[1].commit // empty' "$MANIFEST")"
-app_material_path="$(jq -r '.supply_chain.materials[1].path // empty' "$MANIFEST")"
-app_material_tree="$(jq -r '.supply_chain.materials[1].tree // empty' "$MANIFEST")"
-app_material_clean="$(jq -r '.supply_chain.materials[1].clean // false' "$MANIFEST")"
 
 if [[ "$material_count" != "2" ]]; then
   echo "Release manifest supply_chain.materials must bind exactly the public repository and private app subtree" >&2
@@ -221,12 +200,20 @@ if [[ ! "$public_material_commit" =~ ^[0-9a-f]{40}$ || "${public_material_commit
   echo "Release manifest public source material commit does not match manifest commit" >&2
   exit 1
 fi
-if [[ "$app_material_kind" != "git_subtree" || "$app_material_repository" != "$APP_SOURCE_REPOSITORY" ]]; then
+# The app source is private: the record binds its commit and tree only, with
+# no repository name or path.
+if ! jq -e '
+  .supply_chain.materials[1]
+  | type == "object"
+    and (keys == ["clean", "commit", "kind", "name", "tree", "visibility"])
+    and .kind == "private_source"
+    and .name == "ottto-macos-app"
+    and .visibility == "private"
+    and (.commit | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.tree | type == "string" and test("^[0-9a-f]{40}$"))
+    and .clean == true
+' "$MANIFEST" >/dev/null; then
   echo "Release manifest private app source material is invalid" >&2
-  exit 1
-fi
-if [[ ! "$app_material_commit" =~ ^[0-9a-f]{40}$ || "$app_material_path" != "tools/ottto-macos-app" || ! "$app_material_tree" =~ ^[0-9a-f]{40}$ || "$app_material_clean" != "true" ]]; then
-  echo "Release manifest private app source material binding is incomplete" >&2
   exit 1
 fi
 if [[ "$slsa_spec_version" != "1.2" ]]; then
@@ -248,6 +235,16 @@ if [[ -z "$slsa_repository" || -z "$slsa_signer_workflow" || -z "$slsa_verificat
   echo "Release manifest SLSA verification metadata is incomplete" >&2
   exit 1
 fi
+# The recorded commands are examples run from the release folder. They are
+# never evaluated here; they must name one subject relative to that folder.
+verification_command_pattern='^gh attestation verify \./([A-Za-z0-9_][A-Za-z0-9_.+-]*) '
+for verification_command in "$slsa_verification_command" "$sbom_verification_command"; do
+  if [[ ! "$verification_command" =~ $verification_command_pattern ]] || \
+    ! jq -e --arg subject "${BASH_REMATCH[1]}" '.supply_chain.slsa_build.subjects | index($subject) != null' "$MANIFEST" >/dev/null; then
+    echo "Release manifest verification commands must name a release subject as ./<filename>" >&2
+    exit 1
+  fi
+done
 if [[ "$sbom_format" != "cyclonedx-json" || "$sbom_spec_version" != "1.7" ]]; then
   echo "Release manifest SBOM metadata must be CycloneDX JSON 1.7" >&2
   exit 1
@@ -273,7 +270,7 @@ if [[ ! "$sbom_expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 if ! sbom_resolved_path="$(resolve_manifest_file "$sbom_path")"; then
-  echo "Release manifest SBOM file is missing: $sbom_path" >&2
+  echo "Release manifest SBOM path must name a release file beside the manifest" >&2
   exit 1
 fi
 sbom_actual_sha="$(sha256_file "$sbom_resolved_path")"
@@ -282,7 +279,7 @@ if [[ "$sbom_actual_sha" != "$sbom_expected_sha" ]]; then
   exit 1
 fi
 if ! jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.7"' "$sbom_resolved_path" >/dev/null; then
-  echo "SBOM file is not CycloneDX JSON 1.7: $sbom_resolved_path" >&2
+  echo "SBOM file is not CycloneDX JSON 1.7" >&2
   exit 1
 fi
 
@@ -320,11 +317,8 @@ if [[ -z "$launch_evidence_path" ]]; then
   echo "Packaged app launch quality gate is missing evidence_path" >&2
   exit 1
 fi
-if [[ ! -f "$launch_evidence_path" ]]; then
-  launch_evidence_path="$manifest_dir/$(basename "$launch_evidence_path")"
-fi
-if [[ ! -f "$launch_evidence_path" ]]; then
-  echo "Packaged app launch evidence file is missing: $launch_evidence_path" >&2
+if ! launch_evidence_path="$(resolve_manifest_file "$launch_evidence_path")"; then
+  echo "Packaged app launch evidence_path must name a release file beside the manifest" >&2
   exit 1
 fi
 if [[ "$(jq -r '.schema_version // empty' "$launch_evidence_path")" != "1" ]]; then
@@ -347,6 +341,16 @@ if [[ "$(jq '.crash_reports // [] | length' "$launch_evidence_path")" != "$launc
   echo "Packaged app launch evidence crash reports do not match manifest gate" >&2
   exit 1
 fi
+launch_app_path="$(jq -r '.app_path // empty' "$launch_evidence_path")"
+if ! macos_release_filename "$launch_app_path"; then
+  echo "Packaged app launch evidence must name the app by its release filename" >&2
+  exit 1
+fi
+launch_app_target="$(jq -r 'first(.artifacts[] | select(.kind == "macos_app" and .platform == "macos") | .verification_path // "") // ""' "$MANIFEST")"
+if [[ -n "$launch_app_target" && "$launch_app_path" != "$launch_app_target" ]]; then
+  echo "Packaged app launch evidence names a different app than the manifest's app verification path" >&2
+  exit 1
+fi
 
 artifact_count="$(jq '.artifacts | length' "$MANIFEST")"
 if [[ "$artifact_count" -lt 1 ]]; then
@@ -359,8 +363,8 @@ while IFS= read -r subject; do
   required_subjects+=("$subject")
 done < <(
   {
-    jq -r '.artifacts[] | .path | split("/")[-1]' "$MANIFEST"
-    printf '%s\n' "release-manifest.json" "$(basename "$sbom_path")"
+    jq -r '.artifacts[] | .path' "$MANIFEST"
+    printf '%s\n' "release-manifest.json" "$sbom_path"
   } | sort -u
 )
 for subject in "${required_subjects[@]}"; do
@@ -385,13 +389,26 @@ while IFS= read -r artifact; do
   name="$(jq -r '.name' <<<"$artifact")"
   kind="$(jq -r '.kind' <<<"$artifact")"
   platform="$(jq -r '.platform' <<<"$artifact")"
-  path="$(jq -r '.path' <<<"$artifact")"
+  path_ref="$(jq -r '.path' <<<"$artifact")"
   url="$(jq -r '.url // empty' <<<"$artifact")"
-  verification_path="$(jq -r '.verification_path // empty' <<<"$artifact")"
+  verification_ref="$(jq -r '.verification_path // empty' <<<"$artifact")"
   expected_sha="$(jq -r '.sha256' <<<"$artifact")"
   signed="$(jq -r '.signed' <<<"$artifact")"
   notarized="$(jq -r '.notarized' <<<"$artifact")"
   gatekeeper_assessed="$(jq -r '.gatekeeper_assessed' <<<"$artifact")"
+
+  if ! path="$(resolve_manifest_file "$path_ref")"; then
+    echo "Missing artifact: $name (path must name a release file beside the manifest)" >&2
+    failures=$((failures + 1))
+    continue
+  fi
+  verification_path=""
+  if [[ -n "$verification_ref" ]] && \
+    ! verification_path="$(macos_release_path "$manifest_dir" "$verification_ref")"; then
+    echo "Verification path must be a release filename beside the manifest: $name" >&2
+    failures=$((failures + 1))
+    continue
+  fi
 
   if [[ -z "$url" ]]; then
     echo "Missing artifact URL: $name" >&2
@@ -402,12 +419,6 @@ while IFS= read -r artifact; do
   elif [[ "$url" != "$rollback_immutable_prefix/"* ]]; then
     echo "Artifact URL is outside rollback immutable_prefix: $name ($url)" >&2
     failures=$((failures + 1))
-  fi
-
-  if [[ ! -f "$path" ]]; then
-    echo "Missing artifact: $name ($path)" >&2
-    failures=$((failures + 1))
-    continue
   fi
 
   actual_sha="$(sha256_file "$path")"
@@ -421,7 +432,7 @@ while IFS= read -r artifact; do
       echo "Missing macOS app verification path: $name" >&2
       failures=$((failures + 1))
     elif [[ ! -d "$verification_path" ]]; then
-      echo "macOS app verification path is not a bundle directory: $name ($verification_path)" >&2
+      echo "macOS app verification path is not a bundle directory: $name" >&2
       failures=$((failures + 1))
     else
       info_plist="$verification_path/Contents/Info.plist"
@@ -496,7 +507,7 @@ while IFS= read -r artifact; do
 
   if [[ "$signed" == "true" && -n "$verification_path" ]]; then
     if [[ ! -e "$verification_path" ]]; then
-      echo "Verification path does not exist for $name: $verification_path" >&2
+      echo "Verification path does not exist for $name" >&2
       failures=$((failures + 1))
       continue
     fi

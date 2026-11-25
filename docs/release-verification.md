@@ -153,6 +153,10 @@ CDN. Because the mirror is opt-in per run, the newest GitHub Release (and its
 determine the current version; read the channel release manifest instead (see
 [Current Release Version](#current-release-version)).
 
+The mirror step is disabled for now and the input has no effect: the step would
+publish the runner's build before the release folder's privacy check. It comes
+back only together with a gate on the exact files it publishes.
+
 A stable verification mirror is expected to carry exactly these assets:
 
 - `Ottto-macos-*.dmg`
@@ -185,6 +189,24 @@ macos_public_rc_gate.sh \
   --candidate-manifest release-manifest.json \
   --evidence stable-candidate-rc-qa.json
 ```
+
+The gate needs the app bundle and the two binaries the manifest names as
+verification targets beside the manifest. A downloaded candidate holds only the
+archives, so first stage a disposable verification folder outside the download
+and run the gate on its byte-identical manifest:
+
+```bash
+macos_release_verification_folder.sh \
+  --manifest <download>/release-manifest.json \
+  --output <new folder outside the download>
+macos_public_rc_gate.sh \
+  --candidate-manifest <new folder>/release-manifest.json \
+  --evidence stable-candidate-rc-qa.json
+```
+
+The script checks each archive against its manifest SHA-256 before it mounts
+the DMG read-only or unpacks a ZIP. Never publish or upload the verification
+folder.
 
 Stable preflight requires `quality_gates.stable_candidate_rc.status: passed`,
 the candidate manifest SHA-256, and an evidence file whose candidate version

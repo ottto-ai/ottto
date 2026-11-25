@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/macos_stable_closeout_gate.sh"
 
@@ -50,10 +48,10 @@ write_manifest() {
             commit: "abcdef123456abcdef123456abcdef123456abcd"
           },
           {
-            kind: "git_subtree",
-            repository: "example-org/example-app",
+            kind: "private_source",
+            name: "ottto-macos-app",
+            visibility: "private",
             commit: "123456abcdef123456abcdef123456abcdef1234",
-            path: "tools/ottto-macos-app",
             tree: "fedcba654321fedcba654321fedcba654321fedc",
             clean: true
           }
@@ -73,7 +71,7 @@ write_manifest() {
           ],
           attested: true,
           verified: true,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto"
+          verification_command: "gh attestation verify ./Ottto-macos-arm64.dmg -R ottto-ai/ottto"
         },
         sbom: {
           format: "cyclonedx-json",
@@ -84,7 +82,7 @@ write_manifest() {
           sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           attested: true,
           verified: true,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
+          verification_command: "gh attestation verify ./Ottto-macos-arm64.dmg -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
         }
       },
       quality_gates: {

@@ -314,6 +314,7 @@ run_step B "test macOS license notices" bash scripts/test_macos_license_notices.
 run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
+run_step B "test macOS notarization artifact selection" bash scripts/test_macos_notarize_filter.sh
 run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
 run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
 run_step P "test release evidence placeholders" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_evidence_placeholders.py
