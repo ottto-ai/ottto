@@ -58,7 +58,7 @@ impl Fixture {
     }
 
     fn gate(&self, index: &ScanIndex, now: u64) -> bool {
-        gate(self.source, &self.pass(index, "a"), index, true, now)
+        gate(self.source, &self.pass(index, "a"), index, None, now)
     }
 
     /// One walking pass at `now` that retires a clean walk started then.
@@ -147,7 +147,7 @@ fn armed_follows_the_record() {
     assert!(!armed(SnapshotSource::Pi), "per source");
     assert!(fixture.gate(&index, START + 1800), "an idle pass");
     assert!(armed(source), "an idle pass keeps it");
-    clear(source);
+    clear(source, "lane");
     assert!(!armed(source), "cleared");
     fixture.walk(&index, START + 3600);
     assert!(armed(source), "re-armed");
@@ -203,7 +203,7 @@ fn changed_input_walks_and_changing_back_still_walks() {
         SnapshotSource::ClaudeCode,
         &changed,
         &index,
-        true,
+        None,
         START + 60
     ));
     assert!(
@@ -222,7 +222,7 @@ fn backfill_window_flip_walks_and_flipping_back_still_walks() {
         SnapshotSource::ClaudeCode,
         &narrow,
         &index,
-        true,
+        None,
         START + 60
     ));
     assert_eq!(armed_for_test(SnapshotSource::ClaudeCode), None);
@@ -252,7 +252,7 @@ fn owed_upload_work_walks_and_clears_the_record() {
         SnapshotSource::Codex,
         &pass,
         &index,
-        false,
+        Some("ack_capacity"),
         START + 60
     ));
     assert!(!fixture.gate(&index, START + 120), "the record is gone");
@@ -498,7 +498,7 @@ fn projection_owes_iff_walk_selects() {
         }
         assert!(!projected || walk_selects, "mask {mask:#08b}");
         selected += usize::from(projected);
-        let owed = !owes_nothing(&index, DAYS, START);
+        let owed = !owes(&index, DAYS, START).is_none();
         assert_eq!(owed, projected || mask & 0b1000 != 0, "mask {mask:#08b}");
     }
     assert!(selected > 0 && selected < 64);
@@ -506,7 +506,7 @@ fn projection_owes_iff_walk_selects() {
     let mut index = ScanIndex::default();
     settled_entry(&mut index, START - (DAYS + 1) * 86_400);
     index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = None;
-    assert!(owes_nothing(&index, DAYS, START));
+    assert!(owes(&index, DAYS, START).is_none());
 }
 
 /// Wakes no transcript hint names, each idle -> event -> walk: a watched
@@ -541,5 +541,156 @@ fn sidecar_and_launch_inbox_events_walk_an_idle_source() {
         );
         wake();
         assert!(!fixture.gate(&index, at + 120), "{name}: the event walks");
+    }
+}
+
+/// The counts-only `walk_gate` points: a pass that starts a walk names its
+/// first failing condition, a resting pass reports nothing, and a finish that
+/// retires a walk names whether it armed.
+#[test]
+fn walk_gate_points_name_the_veto_and_the_arm() {
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    let index = ScanIndex::default();
+    let points = |run: &dyn Fn()| -> Vec<serde_json::Value> {
+        let ((), rows) = crate::local_resource_diagnostics::capture(run);
+        rows.into_iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .map(|row| row["counts"].clone())
+            .collect()
+    };
+    let veto = |why: &str| vec![serde_json::json!({ "rest_veto": why })];
+    let arm = |outcome: &str| vec![serde_json::json!({ "arm": outcome })];
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START))),
+        veto("gap"),
+        "no earlier pass"
+    );
+    assert_eq!(points(&|| fixture.arm(&index, START)), arm("armed"));
+    assert!(points(&|| assert!(fixture.gate(&index, START + 60))).is_empty());
+    let [pending, _] = crate::launch_events::inbox_dirs(&fixture.scratch);
+    std::fs::create_dir_all(&pending).unwrap();
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 120))),
+        veto("key:launch_inbox")
+    );
+    fixture.arm(&index, START + 120);
+    clear(source, "hint");
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 180))),
+        veto("cleared:hint")
+    );
+    fixture.arm(&index, START + 180);
+    let owed = |now| {
+        let pass = fixture.pass(&index, "a");
+        assert!(!gate(source, &pass, &index, Some("ack_capacity"), now));
+    };
+    assert_eq!(points(&|| owed(START + 240)), veto("upload:ack_capacity"));
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 300))),
+        veto("no_record")
+    );
+    let mut scan = SourceScanResult::empty(source);
+    scan.census_complete = true;
+    let path = fixture.scratch.join("index");
+    assert_eq!(
+        points(&|| arm_after_finish(fixture.pass(&index, "a"), &index, &path, &scan, true)),
+        arm("not:unsettled")
+    );
+    fixture.walk(&index, START + 360);
+    for gap in (1800..WALK_GAP).step_by(1800) {
+        assert!(fixture.gate(&index, START + 360 + gap));
+    }
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 360 + WALK_GAP))),
+        veto("backstop")
+    );
+}
+
+/// With no walk in progress, the gate's rest decision equals the
+/// pre-diagnostic boolean chain for every combination of these eight
+/// predicates (the upload and index debt bits stand in for every owed kind),
+/// and exactly the non-resting passes emit one `walk_gate` point.
+#[test]
+fn gate_decision_matches_the_boolean_chain() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    let now = START + 2 * WALK_GAP;
+    for bits in 0..(1_u32 << 8) {
+        let bit = |n: u32| bits & (1 << n) != 0;
+        let [covered, outside, gap_ok, has_record, same, fresh, in_window, owes] =
+            [0, 1, 2, 3, 4, 5, 6, 7].map(bit);
+        restart_for_test();
+        crate::snapshot_watcher::cover_paths_for_test(covered.then(|| fixture.roots.clone()));
+        let index = ScanIndex {
+            bounded_sweep_had_unsettled_upload: owes,
+            ..ScanIndex::default()
+        };
+        let pass = fixture.pass(&index, "a");
+        let other = fixture.pass(&index, "b");
+        with_slot(source, |slot| {
+            slot.last_pass_at = Some(if gap_ok { now - 60 } else { now - PASS_GAP - 1 });
+            slot.record = has_record.then(|| Record {
+                pass: if same { pass.clone() } else { other.clone() },
+                generation: index.generation + u64::from(!fresh),
+                started_at: if in_window { now - 60 } else { now - WALK_GAP },
+            });
+        });
+        let chain =
+            covered && !outside && gap_ok && has_record && same && fresh && in_window && !owes;
+        let (rested, rows) = crate::local_resource_diagnostics::capture(|| {
+            gate(
+                source,
+                &pass,
+                &index,
+                outside.then_some("ack_capacity"),
+                now,
+            )
+        });
+        assert_eq!(rested, chain, "{bits:08b}");
+        assert_eq!(armed_for_test(source).is_some(), chain, "{bits:08b}");
+        let points = rows
+            .iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .count();
+        assert_eq!(points, usize::from(!chain), "{bits:08b}");
+    }
+}
+
+/// For a retiring, non-idle finish with a confirmed generation and no
+/// telemetry-unread hold, the arm decision equals the pre-diagnostic chain for
+/// every combination of these five predicates, and the finish reports exactly
+/// that outcome.
+#[test]
+fn arm_decision_matches_the_boolean_chain() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    let path = fixture.scratch.join("index");
+    for bits in 0..(1_u32 << 5) {
+        let bit = |n: u32| bits & (1 << n) != 0;
+        let [settled, outside_nothing, owes, has_start, same] = [0, 1, 2, 3, 4].map(bit);
+        restart_for_test();
+        let index = ScanIndex {
+            bounded_sweep_had_unsettled_upload: owes,
+            ..ScanIndex::default()
+        };
+        let pass = fixture.pass(&index, "a");
+        let other = fixture.pass(&index, "b");
+        with_slot(source, |slot| {
+            slot.walk_start = has_start.then(|| (if same { pass.clone() } else { other }, START));
+        });
+        let mut scan = SourceScanResult::empty(source);
+        scan.settled_walk = settled;
+        let chain = settled && outside_nothing && !owes && has_start && same;
+        let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+            arm_after_finish(pass, &index, &path, &scan, outside_nothing);
+        });
+        assert_eq!(armed_for_test(source).is_some(), chain, "{bits:05b}");
+        let arms = rows
+            .iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .map(|row| row["counts"]["arm"].as_str().unwrap().starts_with("armed"))
+            .collect::<Vec<_>>();
+        assert_eq!(arms, [chain], "{bits:05b}");
     }
 }

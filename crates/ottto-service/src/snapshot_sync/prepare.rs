@@ -764,7 +764,7 @@ pub(super) fn prepare_sync_source_inner(
     if receipt_window_days == 0 {
         // The tombstone withdraws the server's census, which the armed
         // walk record stood for: the next pass at a real window walks.
-        crate::snapshots::walk_idle::clear(source);
+        crate::snapshots::walk_idle::clear(source, "window_zero");
         withdraw_and_report_policy_stop(
             client,
             device,
@@ -814,7 +814,7 @@ pub(super) fn prepare_sync_source_inner(
     // `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
-        crate::snapshots::walk_idle::clear(source);
+        crate::snapshots::walk_idle::clear(source, "disabled");
         withdraw_and_report_policy_stop(
             client,
             device,
@@ -1174,11 +1174,10 @@ pub(super) fn prepare_sync_source_inner(
         request_identity_capture,
     );
     // A hint or listing request is a change: this pass walks.
-    if !watcher_hints.paths.is_empty()
-        || watcher_hints.overflowed
-        || watcher_hints.list_all.requested()
-    {
-        crate::snapshots::walk_idle::clear(source);
+    if !watcher_hints.paths.is_empty() {
+        crate::snapshots::walk_idle::clear(source, "hint");
+    } else if watcher_hints.overflowed || watcher_hints.list_all.requested() {
+        crate::snapshots::walk_idle::clear(source, "listing");
     }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("after_hint_take")?;
@@ -1194,24 +1193,33 @@ pub(super) fn prepare_sync_source_inner(
         &policy_bytes,
         &index,
     );
-    let cycle_owes_nothing = !backfill_pending
-        && !admission_reoffer_pending
-        && !claude_index_loaded_fresh
-        && copy_prefix_scope.is_empty();
+    let cycle_owes = if backfill_pending {
+        Some("backfill")
+    } else if admission_reoffer_pending {
+        Some("reoffer")
+    } else if claude_index_loaded_fresh {
+        Some("fresh_index")
+    } else if !copy_prefix_scope.is_empty() {
+        Some("copy_prefix")
+    } else {
+        None
+    };
+    let cycle_owes_nothing = cycle_owes.is_none();
     let now = crate::scan_clock::utc_seconds();
     let walk_idle = crate::snapshots::walk_idle::gate(
         source,
         &walk_idle_pass,
         &index,
-        cycle_owes_nothing
-            && upload_owes_nothing(
+        cycle_owes.or_else(|| {
+            upload_owes(
                 source,
                 &upload_progress,
                 support_dir,
                 &activity_hint,
                 &index,
                 now,
-            ),
+            )
+        }),
         now,
     );
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_recovery_priority(
@@ -1274,26 +1282,54 @@ pub(super) fn upload_owes_nothing(
     index: &ScanIndex,
     now: u64,
 ) -> bool {
-    progress.accepted_fingerprints.len() < progress.ack_capacity
-        && progress.pending_cache_heads.is_empty()
-        && !progress.context_resend.has_pending_ordinary()
-        && !progress
-            .head_conflict_challenges
-            .keys()
-            .any(|key| progress.accepted_cache_heads.contains_key(key))
-        && progress
-            .identity_503_pending
-            .as_ref()
-            .is_none_or(BTreeSet::is_empty)
-        && progress.active_quarantine_retries.is_empty()
-        && progress.active_reason_reoffers.is_empty()
-        && !progress.quarantined_fingerprints.values().any(|record| {
-            record.disposition == SnapshotQuarantineDisposition::RetryPending
-                && (1..=now).contains(&record.retry_after_unix_seconds)
-        })
-        && with_source_cadence_state(source, |cadence| cadence.continuation_work().is_none())
-            .unwrap_or(false)
-        && !progress.telemetry_owes_walk(support, hint, index)
+    upload_owes(source, progress, support, hint, index, now).is_none()
+}
+
+/// The first kind of upload work that needs a walk, if any.
+fn upload_owes(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    support: &Path,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+    index: &ScanIndex,
+    now: u64,
+) -> Option<&'static str> {
+    if progress.accepted_fingerprints.len() >= progress.ack_capacity {
+        Some("ack_capacity")
+    } else if !progress.pending_cache_heads.is_empty() {
+        Some("cache_heads")
+    } else if progress.context_resend.has_pending_ordinary() {
+        Some("context_resend")
+    } else if progress
+        .head_conflict_challenges
+        .keys()
+        .any(|key| progress.accepted_cache_heads.contains_key(key))
+    {
+        Some("head_conflict")
+    } else if !progress
+        .identity_503_pending
+        .as_ref()
+        .is_none_or(BTreeSet::is_empty)
+    {
+        Some("identity_503")
+    } else if !progress.active_quarantine_retries.is_empty() {
+        Some("quarantine_retry")
+    } else if !progress.active_reason_reoffers.is_empty() {
+        Some("reason_reoffer")
+    } else if progress.quarantined_fingerprints.values().any(|record| {
+        record.disposition == SnapshotQuarantineDisposition::RetryPending
+            && (1..=now).contains(&record.retry_after_unix_seconds)
+    }) {
+        Some("quarantine_due")
+    } else if !with_source_cadence_state(source, |cadence| cadence.continuation_work().is_none())
+        .unwrap_or(false)
+    {
+        Some("continuation")
+    } else if progress.telemetry_owes_walk(support, hint, index) {
+        Some("telemetry")
+    } else {
+        None
+    }
 }
 
 pub(super) fn capture_codex_recovery_evidence(

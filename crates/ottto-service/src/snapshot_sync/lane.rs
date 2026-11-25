@@ -234,7 +234,7 @@ pub(super) fn collect_file_activity_for(
             crate::agent_status::claude_default_account_fingerprint,
         ) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
-            crate::snapshots::walk_idle::clear(SnapshotSource::ClaudeCode);
+            crate::snapshots::walk_idle::clear(SnapshotSource::ClaudeCode, "account_switch");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_account_switch(crate::scan_clock::now())
             });
@@ -449,7 +449,7 @@ pub(super) fn sync_once(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for source in SNAPSHOT_SOURCES.into_iter().filter(|_| walk_all) {
-        crate::snapshots::walk_idle::clear(source);
+        crate::snapshots::walk_idle::clear(source, "walk_all");
     }
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
@@ -735,7 +735,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         crate::local_resource_diagnostics::pass_ended(source.api_slug());
         if result.is_err() {
             continuation::after_ordinary_source_failure(source);
-            crate::snapshots::walk_idle::clear(source);
+            crate::snapshots::walk_idle::clear(source, "failure");
         }
         match result {
             Ok(()) => self.transport_cycle.note_success(),
@@ -993,7 +993,7 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
                 // The source is eligible now, even if the later directory sync fails.
                 // A prepare hint in flight at pause may have re-armed its pulse.
                 reset_collection_health(source);
-                crate::snapshots::walk_idle::clear(source);
+                crate::snapshots::walk_idle::clear(source, "resumed");
                 sync_progress_parent(&marker)
             });
         let failures = turn.entry(marker).or_default();
