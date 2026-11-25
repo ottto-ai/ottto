@@ -61,7 +61,7 @@ use crate::agent_status::Path;
 use crate::agent_status::PathBuf;
 use crate::agent_status::Sha256;
 use crate::agent_status::SourceKind;
-use crate::agent_status::CODEX_NO_ACCOUNT_FAILURE_PREFIX;
+use crate::agent_status::{CODEX_LOGIN_REJECTED_FAILURE_PREFIX, CODEX_NO_ACCOUNT_FAILURE_PREFIX};
 
 /// Read-only launch projection: only saved provider-verified evidence and
 /// current local claims. No CLI detection/probes, provider reads, or wakeups.
@@ -104,7 +104,7 @@ pub(in crate::agent_status) fn session_launch_codex_candidate(
         snapshot.status = AgentStatusState::AuthRequired;
     } else {
         // A dead login reads as it does in status: needs a new sign-in.
-        let account_absent = match codex_saved_quota::serve_saved_for_launch(
+        let (account_absent, login_rejected) = match codex_saved_quota::serve_saved_for_launch(
             &slot.home,
             trust,
             current_unix_seconds(),
@@ -124,11 +124,22 @@ pub(in crate::agent_status) fn session_launch_codex_candidate(
                         snapshot.status = AgentStatusState::Available;
                     }
                 }
-                account_absent
+                (account_absent, false)
             }
-            Err(failure) => failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+            Err(failure) => (
+                failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+                failure
+                    .message
+                    .starts_with(CODEX_LOGIN_REJECTED_FAILURE_PREFIX),
+            ),
         };
-        apply_codex_dead_login(&mut snapshot, &slot.home, trust, account_absent);
+        apply_codex_dead_login(
+            &mut snapshot,
+            &slot.home,
+            trust,
+            account_absent,
+            login_rejected,
+        );
     }
     let mut collection = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);

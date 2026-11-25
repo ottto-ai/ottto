@@ -183,7 +183,11 @@ Canonicalization follows these rules:
 Codex owns OAuth token persistence and refresh. Ottto does not refresh tokens
 directly and does not promise that a provider-revoked login will remain valid.
 When Codex reports that a durable home needs login, the app should offer the
-same provider-owned reconnect flow for that exact home.
+same provider-owned reconnect flow for that exact home. The user's own default
+home shows as needing a sign-in only when Codex itself rejects its login (the
+account read refuses it, or a refresh is refused with "sign in again"); a read
+that merely names no account leaves it as it was. The user signs in with
+`codex login`.
 
 A durable connection belongs to the Mac that signed it in; a copied support
 folder (Migration Assistant, restore, manual copy) leaves two holders of one

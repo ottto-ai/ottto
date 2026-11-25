@@ -5106,7 +5106,9 @@ fn codex_dead_login_survives_a_failed_quota_read() {
 /// [regress] With refresh never forced, a dead refresh token shows as an
 /// account-stage error, not `account: null`. Codex 0.163's workspace
 /// discovery 401 and 0.167's "sign in again" read as a dead login in the
-/// provider and saved reads; a discovery timeout is a plain failure.
+/// provider and saved reads, on a durable slot and on the user's own default
+/// home (whose launch then asks for a sign-in too); a discovery timeout is a
+/// plain failure.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -5127,22 +5129,41 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
             .expect("managed home mode");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let slot = |registered_binding: Option<(String, String)>| CodexHomeSlot {
+            slot_id: if registered_binding.is_some() {
+                "codex_slot_auth_rejected".to_string()
+            } else {
+                "default".to_string()
+            },
+            ownership: if registered_binding.is_some() {
+                CodexAccountSlotOwnershipV1::Managed
+            } else {
+                CodexAccountSlotOwnershipV1::Default
+            },
+            home: home.clone(),
+            registered_binding,
+        };
         let collect = |registered_binding: Option<(String, String)>, quota_read: CodexQuotaRead| {
             collect_codex_home_candidate(
-                CodexHomeSlot {
-                    slot_id: "codex_slot_auth_rejected".to_string(),
-                    ownership: CodexAccountSlotOwnershipV1::Managed,
-                    home: home.clone(),
-                    registered_binding,
-                },
+                slot(registered_binding),
                 "2026-08-26T00:05:00Z",
                 "2026-08-26T00:20:00Z",
                 quota_read,
             )
         };
-        let registered = collect(None, CodexQuotaRead::Provider)
-            .binding
-            .expect("validated binding");
+        let registered = collect_codex_home_candidate(
+            CodexHomeSlot {
+                slot_id: "codex_slot_auth_rejected".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Managed,
+                home: home.clone(),
+                registered_binding: None,
+            },
+            "2026-08-26T00:05:00Z",
+            "2026-08-26T00:20:00Z",
+            CodexQuotaRead::Provider,
+        )
+        .binding
+        .expect("validated binding");
 
         let executable = root.join("codex");
         let script = std::fs::read_to_string(&executable).expect("fake Codex");
@@ -5167,7 +5188,28 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
                 "{label}"
             );
             assert!(read.binding.is_none(), "{label}");
+            let default = collect(None, quota_read);
+            assert_eq!(
+                default.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
+                dead,
+                "{label}: default home"
+            );
+            assert_eq!(
+                default
+                    .snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "codex_account_needs_login"),
+                dead,
+                "{label}: default home"
+            );
         }
+        let launched = session_launch_codex_candidate(slot(None), "2026-08-26T00:05:00Z");
+        assert_eq!(
+            launched.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
+            dead,
+            "{label}: default launch"
+        );
         if label == "v0163" {
             // Codex 0.163 gives the same text for a transient refresh
             // failure: it reads as a dead login only until the next good read.
@@ -5180,6 +5222,11 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
                     "{label}: recovered"
                 );
                 assert_eq!(read.binding.as_ref(), Some(&registered), "{label}: recovered");
+                assert_ne!(
+                    collect(None, quota_read).status.state,
+                    CodexAccountSlotCollectionStateV1::NeedsLogin,
+                    "{label}: default home recovered"
+                );
             }
         }
 
@@ -5193,8 +5240,9 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
 
 /// [regress] `account/read` answers from the local login without a refresh,
 /// so a refresh token another holder already used is first rejected on the
-/// rate-limits read. That refresh rejection reads as a dead login too; a 401
-/// or any other rate-limits failure stays a plain failure.
+/// rate-limits read. That refresh rejection reads as a dead login too, on a
+/// durable slot and on the default home; a 401 or any other rate-limits
+/// failure stays a plain failure.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -5217,10 +5265,19 @@ fn codex_quota_stage_auth_rejection_is_a_dead_login() {
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
         let collect = |registered_binding: Option<(String, String)>, quota_read: CodexQuotaRead| {
+            let managed = registered_binding.is_some();
             collect_codex_home_candidate(
                 CodexHomeSlot {
-                    slot_id: "codex_slot_quota_rejected".to_string(),
-                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    slot_id: if managed {
+                        "codex_slot_quota_rejected".to_string()
+                    } else {
+                        "default".to_string()
+                    },
+                    ownership: if managed {
+                        CodexAccountSlotOwnershipV1::Managed
+                    } else {
+                        CodexAccountSlotOwnershipV1::Default
+                    },
                     home: home.clone(),
                     registered_binding,
                 },
@@ -5229,9 +5286,19 @@ fn codex_quota_stage_auth_rejection_is_a_dead_login() {
                 quota_read,
             )
         };
-        let registered = collect(None, CodexQuotaRead::Provider)
-            .binding
-            .expect("validated binding");
+        let registered = collect_codex_home_candidate(
+            CodexHomeSlot {
+                slot_id: "codex_slot_quota_rejected".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Managed,
+                home: home.clone(),
+                registered_binding: None,
+            },
+            "2026-08-26T00:05:00Z",
+            "2026-08-26T00:20:00Z",
+            CodexQuotaRead::Provider,
+        )
+        .binding
+        .expect("validated binding");
 
         // The account read still answers; only the rate-limits read fails.
         let executable = root.join("codex");
@@ -5253,6 +5320,12 @@ fn codex_quota_stage_auth_rejection_is_a_dead_login() {
                 read.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
                 dead,
                 "{label}"
+            );
+            assert_eq!(
+                collect(None, quota_read).status.state
+                    == CodexAccountSlotCollectionStateV1::NeedsLogin,
+                dead,
+                "{label}: default home"
             );
         }
 

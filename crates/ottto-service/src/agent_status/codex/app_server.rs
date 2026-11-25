@@ -53,7 +53,7 @@ use crate::agent_status::CODEX_APP_SERVER_RUNS;
 #[cfg(test)]
 use crate::agent_status::CODEX_APP_SERVER_TEST_TIMEOUTS;
 use crate::agent_status::CODEX_APP_SERVER_TIMEOUT;
-use crate::agent_status::CODEX_NO_ACCOUNT_FAILURE_PREFIX;
+use crate::agent_status::{CODEX_LOGIN_REJECTED_FAILURE_PREFIX, CODEX_NO_ACCOUNT_FAILURE_PREFIX};
 
 pub(in crate::agent_status) fn collect_codex_app_server_usage_for_home(
     codex_home: &Path,
@@ -386,6 +386,9 @@ pub(in crate::agent_status) struct CodexAppServerRun {
     /// ([`codex_app_server_refresh_rejected`]), whatever the rest of the
     /// session did.
     pub(in crate::agent_status) account_absent: bool,
+    /// The provider rejected the login itself ([`codex_app_server_auth_rejected`]
+    /// or [`codex_app_server_refresh_rejected`]), not merely named no account.
+    pub(in crate::agent_status) login_rejected: bool,
     /// The binary whose bundled model list was passed to Codex
     /// ([`codex_probe_catalog`]), so it sent no models request.
     pub(in crate::agent_status) model_list: Option<crate::transcript_acquisition::SourceStamp>,
@@ -533,6 +536,9 @@ pub(in crate::agent_status) fn call_codex_app_server_rate_limits_for_home(
             codex_home_log_label(codex_home),
             started.elapsed().as_millis()
         );
+    }
+    if run.login_rejected {
+        return result.map_err(|message| format!("{CODEX_LOGIN_REJECTED_FAILURE_PREFIX}{message}"));
     }
     if run.account_absent {
         return result.map_err(|message| format!("{CODEX_NO_ACCOUNT_FAILURE_PREFIX}{message}"));
@@ -717,7 +723,8 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
         let mut send_details = false;
         match (response_id, error) {
             (Some("ottto_account"), Some(error)) => {
-                run.account_absent = codex_app_server_auth_rejected(error);
+                run.login_rejected = codex_app_server_auth_rejected(error);
+                run.account_absent = run.login_rejected;
                 break Err(rpc_failure("account", error));
             }
             (Some("ottto_account"), None) => {
@@ -735,7 +742,8 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
                 run.routine_read_rejected = true;
             }
             (Some("ottto_rate_limits"), Some(error)) => {
-                run.account_absent |= codex_app_server_refresh_rejected(error);
+                run.login_rejected |= codex_app_server_refresh_rejected(error);
+                run.account_absent |= run.login_rejected;
                 break Err(rpc_failure("quota", error));
             }
             (Some("ottto_rate_limits"), None) if rate_limits_result.is_none() => {
@@ -746,7 +754,8 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), Some(error)) => {
                 if rate_limits_result.is_none() {
-                    run.account_absent |= codex_app_server_refresh_rejected(error);
+                    run.login_rejected |= codex_app_server_refresh_rejected(error);
+                    run.account_absent |= run.login_rejected;
                     break Err(rpc_failure("quota", error));
                 }
                 detail_failed = true;
