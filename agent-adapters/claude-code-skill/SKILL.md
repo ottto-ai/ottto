@@ -185,8 +185,9 @@ Follow the final `next_action`:
 - For other actions, relay `message`.
 
 Show `cleanup.argv` when present; it appears only for a stack whose attempt
-Ottto ended without saving. Run it only if the user asks. If the outcome is
-unclear, run `status_argv` before suggesting any cleanup.
+Ottto ended without saving. Run it only if the user asks. When `cleanup` has
+`settle_argv` instead, the attempt may still be saving: run that cancel command
+before suggesting any cleanup. If the outcome is unclear, run `status_argv`.
 Use `ottto cloud status --source bedrock --json` to find an attempt,
 `ottto cloud status --attempt ID --json` to read it, and
 `ottto cloud cancel --attempt ID --json` if the user asks to cancel.

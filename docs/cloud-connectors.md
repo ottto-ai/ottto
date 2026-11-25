@@ -25,16 +25,18 @@ Approve saving the connection with Touch ID in the Ottto app or a passkey in
 your browser. Ottto checks access before saving, then emails workspace admins
 when a connection is saved from the Mac. If you leave or the wait times out,
 run the printed resume command with the same AWS account. It repeats the
-request that started the attempt, so Ottto picks up that attempt, or reports
-it saved, instead of creating another stack. Include `--restart` only when you
-want to replace an open attempt.
+request that started the attempt and names that attempt, so Ottto picks it
+up, or reports it saved or ended, instead of creating another stack. Include
+`--restart` only when you want to replace an open attempt.
 
 `--json` prints the final result. Add `--watch` for NDJSON progress and a final
 event. The final result includes the attempt ID, a next action, resume
 arguments and a status command for the attempt. A delete command for a stack
-appears only after Ottto reports its attempt cancelled or expired, never while
-the attempt could still save. If command-line setup is unavailable, follow the
-URL to complete it in the browser.
+appears only after `ottto cloud cancel` (or a restart) has ended its attempt
+without saving. When status shows an attempt cancelled or expired, the CLI
+prints that cancel command first, because a save may still be finishing. If
+command-line setup is unavailable, follow the URL, which opens the Ottto
+website this Mac is connected to, to complete it in the browser.
 
 ## Read status or cancel setup
 
@@ -46,10 +48,11 @@ ottto cloud status --attempt <id> --json
 ottto cloud cancel --attempt <id> --json
 ```
 
-Status is read-only. Cancel ends the selected setup from this Mac. Any AWS
-stack remains in your account. When the CLI can verify the stack ARN using
-your AWS sign-in, it prints a separate command you can run to delete the
-stack. Use the full ARN in that command.
+Status is read-only. Cancel ends the selected setup from this Mac, or confirms
+that it already ended or saved. Any AWS stack remains in your account. When
+Ottto confirms the setup ended without saving and knows the stack ARN, the CLI
+prints a separate command you can run to delete the stack. Use the full ARN in
+that command.
 
 ## Retired commands
 
