@@ -8206,6 +8206,102 @@ fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
     assert!(!payload_json.contains(canary));
 }
 
+/// docs/diagnostics.md: machine, installation, device, account, user and
+/// organization ids appear only as placeholders, in the local bundle and in
+/// the uploaded body alike.
+#[test]
+#[serial]
+fn diagnostics_bundle_holds_no_raw_identifier() {
+    let _env_lock = lock_backend_test_env();
+    let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-ids");
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+    let _keys = EnvVarGuard::set_path(
+        TELEMETRY_KEY_FILE_STORE_ENV,
+        &support.join("telemetry-keys"),
+    );
+    let machine = test_machine();
+    let device_id = "device-diagnostics-ids";
+    FileAccountStore::default()
+        .save(&connected_account())
+        .unwrap();
+    FileDeviceStore::default()
+        .save(&LocalDeviceBinding {
+            device_id: device_id.to_string(),
+            machine_id: Some(machine.machine_id.clone()),
+            sources: vec!["codex".to_string()],
+        })
+        .unwrap();
+    let captured = Arc::new(Mutex::new(None));
+    let api_base_url = diagnostics_upload_server(captured.clone());
+    let response = handle_request(
+        &daemon(),
+        LocalControlRequest {
+            request_id: "req_diagnostics_ids".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command: LocalControlCommand::DiagnosticsCollect {
+                upload: true,
+                upload_approval: Some(DiagnosticsUploadApproval {
+                    approved: true,
+                    retention_disclosure_accepted: true,
+                    support_claim: Some("support_ids".to_string()),
+                }),
+                api_base_url: Some(api_base_url),
+            },
+        },
+    );
+
+    assert!(response.ok, "{response:?}");
+    let payload = response.payload.expect("payload");
+    assert_eq!(payload["machine_id"], "[machine_id]");
+    let redaction = &payload["redaction"];
+    for field in [
+        "account_id",
+        "device_id",
+        "installation_id",
+        "machine_id",
+        "org_id",
+        "user_id",
+    ] {
+        assert!(
+            redaction["redacted_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(field)),
+            "{field} must be declared redacted"
+        );
+        assert!(
+            !redaction["preserved_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(field)),
+            "{field} must not be declared preserved"
+        );
+    }
+    let request = captured
+        .lock()
+        .expect("captured request lock")
+        .clone()
+        .expect("request captured");
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    assert!(body.contains("[machine_id]"));
+    let payload_json = serde_json::to_string(&payload).expect("payload serializes");
+    for raw in [
+        machine.machine_id.as_str(),
+        machine.installation_id.as_str(),
+        TEST_ACCOUNT_SCOPE,
+        device_id,
+        "user_test",
+        "org_test",
+    ] {
+        assert!(!payload_json.contains(raw), "bundle leaked {raw}");
+        assert!(!body.contains(raw), "upload leaked {raw}");
+    }
+}
+
 #[test]
 fn diagnostics_upload_no_backend_returns_retryable_backend_error() {
     let response = handle_request(
