@@ -391,6 +391,15 @@ def read_object(stream):
         encoding = "utf-32"
     elif bom.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         encoding = "utf-16"
+    elif len(bom) == 4 and bom[0] == 0 and bom[1] == 0:
+        # BOM-less encodings by the NUL pattern of the first characters.
+        encoding = "utf-32-be"
+    elif len(bom) == 4 and bom[1] == 0 and bom[2] == 0:
+        encoding = "utf-32-le"
+    elif len(bom) == 4 and bom[0] == 0:
+        encoding = "utf-16-be"
+    elif len(bom) == 4 and bom[1] == 0:
+        encoding = "utf-16-le"
     else:
         encoding = "utf-8-sig"
 
@@ -419,7 +428,8 @@ def read_object(stream):
         raise ValueError("JSON object exceeds scan limit")
     try:
         # Keep all members, including repeated keys, for the privacy check.
-        return json.loads(raw.decode(encoding), object_pairs_hook=tuple)
+        # json.loads on bytes detects UTF-8/16/32 with or without a BOM.
+        return json.loads(raw, object_pairs_hook=tuple)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
 
@@ -437,13 +447,14 @@ try:
                 continue
             with open(path, "rb") as stream:
                 members = read_object(stream)
-            if name.endswith(".record.json") or (
-                isinstance(members, tuple)
-                and any(
-                    key == "operator_notes" or (key == "evidence_kind" and value == "private_record")
-                    for key, value in members
-                )
-            ):
+            # The RC evidence beside the manifest also has operator_notes, so
+            # notes count only together with the stable QA gate marker.
+            pairs = members if isinstance(members, tuple) else ()
+            private_kind = any(k == "evidence_kind" and v == "private_record" for k, v in pairs)
+            stable_notes = any(k == "operator_notes" for k, _ in pairs) and any(
+                k == "gate" and v == "stable_clean_machine_qa" for k, v in pairs
+            )
+            if name.endswith(".record.json") or private_kind or stable_notes:
                 private_records += 1
 except (OSError, ValueError, RecursionError):
     print("Could not scan the release folder for private QA records", file=sys.stderr)

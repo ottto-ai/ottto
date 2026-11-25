@@ -663,7 +663,7 @@ expect_failure "$dir" "$record_error"
 
 # Renamed records use a JSON escape in the kind value and no distinctive suffix.
 # The public summary beside each one is valid.
-for encoding in utf-8 utf-8-sig utf-16 utf-32; do
+for encoding in utf-8 utf-8-sig utf-16 utf-32 utf-16-le utf-16-be utf-32-le; do
   dir="$(new_case "record-renamed-$encoding")"
   python3 - "$dir/qa-notes.txt" "$encoding" <<'PY'
 import pathlib
@@ -676,8 +676,15 @@ PY
 done
 
 dir="$(new_case record-operator-notes-only)"
-printf '{"operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$dir/qa-notes.txt"
+printf '{"gate": "stable_clean_machine_qa", "operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$dir/qa-notes.txt"
 expect_failure "$dir" "$record_error"
+
+# Public RC and launch evidence beside the manifest carry their own
+# operator_notes; they are not private records.
+dir="$(new_case rc-evidence-with-notes)"
+printf '{"schema_version": 1, "gate": "stable_candidate_rc_qa", "status": "passed", "operator_notes": ["redacted stable-candidate RC evidence"]}\n' > "$dir/stable-candidate-rc-qa.json"
+printf '{"schema_version": 1, "status": "passed", "operator_notes": ["redacted launch smoke"]}\n' > "$dir/packaged-app-launch-smoke.json"
+expect_pass "$dir"
 
 # Large binary artifacts are skipped after the prefix probe. A possible JSON
 # object that exceeds the same scanner's size limit fails closed.
