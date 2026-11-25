@@ -8,6 +8,53 @@ use anyhow::{ensure, Context};
 fn absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
+
+/// The plaintext length a compressed rollout's zstd frame header records
+/// (`Frame_Content_Size`), from its first bytes only. Codex compresses an
+/// unchanged cold rollout and records its length; `None` when the header
+/// records none or cannot be read.
+fn compressed_content_length(file: &File) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    // ZSTD_FRAMEHEADERSIZE_MAX: the longest frame header.
+    let mut header = [0u8; 18];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read_at(&mut header[filled..], filled as u64) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    zstd::zstd_safe::get_frame_content_size(&header[..filled])
+        .ok()
+        .flatten()
+}
+
+/// Whether a compressed successor may take its predecessor's head without a
+/// read: false when the archive records a plaintext length other than the one
+/// the head's certificate read (turns appended after this daemon's last read,
+/// then compressed), or when the predecessor still has retained growth. Such
+/// an archive is read as a new file instead. An archive that records no
+/// length, or a head without a readable certificate, keeps the existing path.
+fn compression_covers_head(
+    index: &ScanIndex,
+    from: &str,
+    head: &state_v2::TailHead,
+    archive: &File,
+) -> bool {
+    if index.v2().growth_retention.contains_key(from) {
+        return false;
+    }
+    let Some(recorded) = compressed_content_length(archive) else {
+        return true;
+    };
+    if head.metadata_only {
+        return true;
+    }
+    tail_source::certified_certificate(&head.body)
+        .map_or(true, |certificate| certificate.length == recorded)
+}
 pub(super) fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
     // A header refresh must never make newly appended bytes look applied.
     // Its inventory stamp is seeded only at the logical checkpoint or carry;
@@ -237,6 +284,11 @@ impl ScanIndex {
             let Some(head) = head else {
                 continue;
             };
+            // Not proven: the archive reads as a new file (a counted Full)
+            // and the absent predecessor retires as any vanished rollout.
+            if compression && !compression_covers_head(self, &from, &head, &file) {
+                continue;
+            }
             let job = tail_source::job_for_carry(&head, &metadata, compression);
             // A settled metadata-only head can prove job custody by file
             // identity. Outstanding revisions keep the existing owner hold.

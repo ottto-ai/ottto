@@ -603,6 +603,71 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
     }
 }
 
+/// Codex's archive: one zstd frame that records the plaintext length, as the
+/// provider writes it.
+fn codex_archive(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder
+        .set_pledged_src_size(Some(bytes.len() as u64))
+        .unwrap();
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// [money] A rollout that grew after its last read and was then compressed
+/// is read from the archive: the turns appended before compression count, and
+/// the session's body and placement equal a cold Full's. The control (no
+/// growth, the recorded length equals the read length) carries with no
+/// decode or upload. The pass after the read is quiet. Two accounts, a side
+/// call and an evidence gap.
+#[test]
+fn compression_after_unread_growth_reads_the_archive() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for grown in [false, true] {
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let (_session, prior) = c.publish();
+        let (working, first, _, _, _) = page(&c, prior.clone(), Arc::default());
+        let (index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+        assert_eq!(posts.len(), 1);
+        let first_route = route(&index, &first, posts);
+        let original = c.path(MAIN);
+        if grown {
+            // Appended while this daemon did not read, then compressed.
+            append(&original, &turn(3));
+        }
+        let compressed = original.with_extension("jsonl.zst");
+        fs::write(&compressed, codex_archive(&fs::read(&original).unwrap())).unwrap();
+        fs::remove_file(&original).unwrap();
+        let before = index.clone();
+        let (working, scan, _, _, logs) = page(&c, index, Arc::default());
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        if !grown {
+            assert_eq!(full_decodes(&logs), 0, "an unchanged archive carries");
+            assert!(scan.snapshots.is_empty());
+            assert!(posts.is_empty());
+            assert!(index.files.contains_key(&local_index_key(&compressed)));
+            continue;
+        }
+        assert_eq!(full_decodes(&logs), 1, "the grown archive is read once");
+        assert_eq!(posts.len(), 1);
+        let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+        cold.snapshots.retain(|item| item.source_session_id == MAIN);
+        let warm = route(&index, &scan, posts);
+        assert_ne!(
+            warm.snapshots[MAIN], first_route.snapshots[MAIN],
+            "the appended turn changes the body"
+        );
+        money_oracle::assert_equivalent(&emitted(&index, &cold), &warm);
+        assert_quiet(&c, index, &warm);
+    }
+}
+
 /// [regress] Header facts a warm process cache carries from earlier durable
 /// lookups keep each page's money: every appended page's bodies and placement
 /// equal a cold Full's, on one warm cache and with a restart (empty cache,
