@@ -20,10 +20,13 @@ pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
-pub(in crate::snapshots) fn claude_head_session(revision: u32, head: &[u8]) -> Option<String> {
+pub(in crate::snapshots) fn claude_head_session(
+    revision: u32,
+    head: &[u8],
+) -> Result<Option<String>, ReconstructCause> {
     let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    claude::Claude::decode_head(revision, head, &mut acc).ok()?;
-    acc.source_session_id
+    claude::Claude::decode_head(revision, head, &mut acc)?;
+    Ok(acc.source_session_id)
 }
 /// Every source's Tail codec: `$s` names the source's codec type inside
 /// `$arm`. A source joins by adding its arm here, never through its

@@ -284,7 +284,11 @@ impl CopyRemovalUpdates {
 /// The committed ownership facts retained with the save baseline. Census clones
 /// share their hash buffers; no upload, account-window or usage graph is copied.
 #[derive(Default)]
-pub(in crate::snapshots) struct CopyOwnership(Owners, pub(in crate::snapshots) Links, AcceptedRows);
+pub(in crate::snapshots) struct CopyOwnership(
+    Owners,
+    pub(in crate::snapshots) Carriers,
+    AcceptedRows,
+);
 type Owners = BTreeMap<String, CopyOwner>;
 struct CopyOwner {
     owned: bool,
@@ -295,10 +299,49 @@ struct CopyOwner {
     groups: Vec<(LocationKey, Box<[u64]>)>,
 }
 pub(in crate::snapshots) type Links = BTreeMap<String, String>;
-type HeadReader<'a> = dyn FnMut(&[&str]) -> Links + 'a;
+#[derive(Default)]
+pub(in crate::snapshots) struct Carriers {
+    pub(in crate::snapshots) links: Links,
+    pub(in crate::snapshots) unknown: BTreeSet<String>,
+    pub(in crate::snapshots) unreadable: BTreeSet<String>,
+    pub(in crate::snapshots) unreadable_streak: BTreeSet<String>,
+    // Baseline only. These roots still need a definitive loss comparison.
+    pending_loss: BTreeSet<String>,
+}
+impl Carriers {
+    pub(in crate::snapshots) fn remember(&mut self, before: &Self) {
+        self.unreadable_streak.clone_from(&before.unreadable_streak);
+        let unknown = !self.unknown.is_empty();
+        if !unknown && before.pending_loss.is_empty() {
+            return;
+        }
+        let lost = before
+            .pending_loss
+            .iter()
+            .chain(before.links.values().filter(|_| unknown));
+        let carried = self.links.values().collect::<BTreeSet<_>>();
+        self.pending_loss
+            .extend(lost.filter(|root| !carried.contains(root)).cloned());
+    }
+
+    pub(in crate::snapshots) fn due_repairs(&mut self) -> Vec<&str> {
+        // The streak counts saves, not passes.
+        let prior = std::mem::take(&mut self.unreadable_streak);
+        let mut due = Vec::new();
+        for key in &self.unreadable {
+            if prior.contains(key) {
+                due.push(key.as_str());
+            } else {
+                self.unreadable_streak.insert(key.clone());
+            }
+        }
+        due
+    }
+}
+type HeadReader<'a> = dyn FnMut(&[&str]) -> Carriers + 'a;
 impl CopyOwnership {
     pub(in crate::snapshots) fn capture(index: &ScanIndex) -> Self {
-        let live = main_files_with(index, |_| BTreeMap::new(), None);
+        let live = main_files_with(index, |_| Carriers::default(), None);
         Self(
             index
                 .files
@@ -310,7 +353,7 @@ impl CopyOwnership {
                         key.clone(),
                         CopyOwner {
                             owned: local_owned(index, &[], key, true),
-                            group_owned: index_group_owned(index, &live, key),
+                            group_owned: index_group_owned(index, &live, key) == Some(true),
                             carrier: committed_twin_carrier(index, key),
                             order: committed_holder_order(
                                 &index.claude_money_birth_store,
@@ -323,7 +366,7 @@ impl CopyOwnership {
                     ))
                 })
                 .collect(),
-            BTreeMap::new(),
+            Carriers::default(),
             live.accepted,
         )
     }
@@ -336,14 +379,24 @@ impl CopyOwnership {
             .collect::<Vec<_>>();
         self.1 = read(&keys);
     }
-    pub(in crate::snapshots) fn sessions(&self, index: &ScanIndex, keys: &[&str]) -> Links {
-        keys.iter()
-            .filter_map(|&key| {
-                let old = self.0.get(key)?.census.as_ref()?;
-                old.current_twin_for(&index.files.get(key)?.source_file_fingerprint)
-                    .then(|| self.1.get(key).map(|s| (key.to_owned(), s.clone())))?
-            })
-            .collect()
+    pub(in crate::snapshots) fn sessions(&self, index: &ScanIndex, keys: &[&str]) -> Carriers {
+        let mut sessions = Carriers::default();
+        for &key in keys {
+            if self.1.unknown.contains(key) {
+                sessions.unknown.insert(key.to_owned());
+            } else if let Some(session) = self.1.links.get(key).filter(|_| {
+                self.0
+                    .get(key)
+                    .and_then(|old| old.census.as_ref())
+                    .zip(index.files.get(key))
+                    .is_some_and(|(old, entry)| {
+                        old.current_twin_for(&entry.source_file_fingerprint)
+                    })
+            }) {
+                sessions.links.insert(key.to_owned(), session.clone());
+            }
+        }
+        sessions
     }
     /// Publish marks with the facts that invalidate them. Progress may already
     /// be ahead after a crash; only the two committed index images matter here.
@@ -351,18 +404,24 @@ impl CopyOwnership {
         &self,
         next: &mut ScanIndex,
         read: &mut HeadReader,
-    ) -> Links {
+    ) -> Carriers {
         let before = &self.0;
-        let old_carried = self.1.values().cloned().collect::<BTreeSet<_>>();
+        let old_carried = self
+            .1
+            .links
+            .values()
+            .chain(&self.1.pending_loss)
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         let mut live = main_files_with(next, &mut *read, None);
+        record_counts(Counts::one(23, live.sessions.unknown.len() as u64));
         let mut invalid = next
             .claude_copy_removals
             .relied_on
             .iter()
             .filter(|holder| {
-                !live
-                    .get(holder)
-                    .is_some_and(|key| index_group_owned(next, &live, key))
+                live.get(holder)
+                    .is_none_or(|key| index_group_owned(next, &live, key) == Some(false))
             })
             .copied()
             .collect::<BTreeSet<_>>();
@@ -374,21 +433,24 @@ impl CopyOwnership {
         let mut keep = next.claude_copy_removals.referenced_hashes();
         keep.retain(|loc, _| invalid.contains(loc));
         for (loc, hashes) in &mut keep {
-            hashes.retain(|&hash| holder_proof(next, &live, *loc, hash, HolderUse::Stored));
+            hashes.retain(|&hash| {
+                holder_proof(next, &live, *loc, hash, HolderUse::Stored) != Some(false)
+            });
         }
         let accepted = std::mem::take(&mut live.accepted);
+        let sessions = std::mem::take(&mut live.sessions);
         drop(live);
         let mut marks = next.claude_copy_removals.drop_holder_hashes(&keep);
         let invalidated = marks.iter().copied().collect::<BTreeSet<_>>();
-        let live = main_files_with(next, &mut *read, Some(accepted));
+        let live = main_files_with(next, |_| sessions, Some(accepted));
         marks.extend(live.iter().filter_map(|(&location, &key)| {
             let member = claude_index_path_member_ref(Path::new(key))?;
-            (old_carried.contains(member.root) && !live.carried.contains(member.root))
+            (old_carried.contains(member.root) && live.carrier(member.root) == Some(false))
                 .then_some(location)
         }));
         let mut carrier_lost = marks[invalidated.len()..].to_vec();
         // A carrier transfer leaves dependents settled if the main still owns its group.
-        carrier_lost.retain(|h| !index_group_owned(next, &live, live[h]));
+        carrier_lost.retain(|h| index_group_owned(next, &live, live[h]) == Some(false));
         let keys = before
             .keys()
             .map(String::as_str)
@@ -406,10 +468,12 @@ impl CopyOwnership {
                 .collect::<BTreeSet<_>>();
             let changed = !accepted_delta.is_empty()
                 || old.is_some_and(|o| o.owned) != local_owned(next, &[], key, true)
-                || (old.is_some_and(|o| o.group_owned)
-                    || claude_index_path_member_ref(Path::new(key))
-                        .is_some_and(|m| old_carried.contains(m.root)))
-                    != index_group_owned(next, &live, key)
+                || index_group_owned(next, &live, key).is_some_and(|owned| {
+                    owned
+                        != (old.is_some_and(|o| o.group_owned)
+                            || claude_index_path_member_ref(Path::new(key))
+                                .is_some_and(|m| old_carried.contains(m.root)))
+                })
                 || old.map_or(&[][..], |o| o.groups.as_slice()) != groups
                 || old
                     .and_then(|o| o.census.as_ref())
@@ -521,7 +585,11 @@ impl CopyOwnership {
             })
             .collect::<Vec<_>>();
         marks.retain(|file| live.get(file).is_some_and(|key| !copy_held(next, key)));
-        let sessions = live.sessions;
+        let mut sessions = live.sessions;
+        // Compare a deferred loss again after the unreadable heads recover.
+        if !sessions.unknown.is_empty() {
+            sessions.remember(&self.1);
+        }
         for (key, money_marks) in lost_copy_marks {
             next.claude_money_birth_store
                 .set_money_marks(&key, money_marks);
@@ -557,13 +625,18 @@ fn changed_copy_decisions(
             };
             let owned = local_owned(index, &[], key, true);
             for &hash in hits {
-                let removed = saved_removal_applies(index, live, key, hash);
-                let proven =
-                    holder_proof(index, live, location_key(key), hash, HolderUse::New(owned));
-                if !proven || !record.proves_scan() || removed {
+                let removed = saved_removal_proof(index, live, key, hash);
+                let proven = holder_proof(
+                    index,
+                    live,
+                    location_key(key),
+                    hash,
+                    HolderUse::New(Some(owned)),
+                );
+                if proven == Some(false) || !record.proves_scan() || removed == Some(true) {
                     holder_sessions.entry(root).or_default().insert(hash);
                 }
-                if proven {
+                if proven == Some(true) {
                     holders
                         .entry(hash)
                         .and_modify(|earliest| *earliest = (*earliest).min(order))
@@ -609,7 +682,7 @@ fn changed_copy_decisions(
             let removed = groups
                 .iter()
                 .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
-            let keep = saved_removal_applies(index, live, key, hash)
+            let keep = saved_removal_proof(index, live, key, hash) != Some(false)
                 && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
             let twin_counted = twin && live.accepts(location, hash);
             // Skip a family duplicate already removed inside this accepted sum.
@@ -707,7 +780,7 @@ pub(super) fn mark_settled_counted_copies(index: &mut ScanIndex) {
 
 #[cfg(test)]
 pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
-    CopyOwnership::capture(previous).reconcile(next, &mut |_| BTreeMap::new());
+    CopyOwnership::capture(previous).reconcile(next, &mut |_| Carriers::default());
 }
 
 fn committed_holder_order(
@@ -720,37 +793,64 @@ fn committed_holder_order(
         .map(|birth| (birth, location_key(key)))
 }
 
-fn index_group_owned(index: &ScanIndex, live: &Live<'_>, key: &str) -> bool {
-    index.claude_family_listed(key)
-        || local_owned(index, &[], key, true)
+/// An unknown carrier keeps the group's ownership undecided.
+fn index_group_owned(index: &ScanIndex, live: &Live<'_>, key: &str) -> Option<bool> {
+    index
+        .claude_family_listed(key)
+        .then_some(true)
+        .or_else(|| local_owned(index, &[], key, true).then_some(true))
         // A summed session body can be carried by another physical location.
         // Its earlier counting location still owns the stored removal.
-        || claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
-            index
+        .or_else(|| {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                return Some(false);
+            };
+            if index
                 .claude_money_birth_store
                 .observations(member.root)
                 .any(|(location, _)| {
                     live.get(&location)
                         .is_some_and(|other| local_owned(index, &[], other, true))
                 })
-                || live.carried.contains(member.root)
+            {
+                return Some(true);
+            }
+            live.carrier(member.root)
         })
 }
 
+fn saved_removal_proof(index: &ScanIndex, live: &Live<'_>, key: &str, hash: u64) -> Option<bool> {
+    any_proof(
+        index
+            .claude_copy_removals
+            .get(location_key(key))
+            .iter()
+            .filter(|(_, hashes)| hashes.binary_search(&hash).is_ok())
+            .map(|(holder, _)| holder_proof(index, live, *holder, hash, HolderUse::Stored)),
+    )
+}
+
+#[cfg(test)]
 pub(super) fn saved_removal_applies(
     index: &ScanIndex,
     live: &Live<'_>,
     key: &str,
     hash: u64,
 ) -> bool {
-    index
-        .claude_copy_removals
-        .get(location_key(key))
-        .iter()
-        .any(|(holder, hashes)| {
-            hashes.binary_search(&hash).is_ok()
-                && holder_proof(index, live, *holder, hash, HolderUse::Stored)
-        })
+    saved_removal_proof(index, live, key, hash) == Some(true)
+}
+
+/// Any positive proof settles the question, otherwise an unknown proof keeps it open.
+fn any_proof(proofs: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut answer = Some(false);
+    for proof in proofs {
+        match proof {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => answer = None,
+        }
+    }
+    answer
 }
 
 type AcceptedRows = BTreeMap<LocationKey, Vec<Arc<[u64]>>>;
@@ -771,7 +871,7 @@ fn accepted_hashes(view: &AcceptedRows, loc: LocationKey) -> BTreeSet<u64> {
         .collect()
 }
 enum HolderUse {
-    New(bool),
+    New(Option<bool>),
     Stored,
 }
 fn holder_proof(
@@ -780,25 +880,30 @@ fn holder_proof(
     loc: LocationKey,
     hash: u64,
     usage: HolderUse,
-) -> bool {
+) -> Option<bool> {
     if live.accepts(loc, hash) {
-        return true;
+        return Some(true);
     }
     let Some(&key) = live.get(&loc) else {
-        return false;
+        return Some(false);
     };
     match usage {
-        HolderUse::Stored => {
-            index_group_owned(index, live, key)
-                && stored_holder_answer(index, Some(key), hash) != Some(false)
-        }
+        HolderUse::Stored => index_group_owned(index, live, key)
+            .map(|owned| owned && stored_holder_answer(index, Some(key), hash) != Some(false)),
         HolderUse::New(local) => {
-            local
-                && index
+            if local == Some(false)
+                || !index
                     .claude_request_census
                     .get(key)
                     .is_some_and(|r| r.proves_scan() && r.holds_hash(hash))
-                && !saved_removal_applies(index, live, key, hash)
+            {
+                return Some(false);
+            }
+            match saved_removal_proof(index, live, key, hash) {
+                Some(true) => Some(false),
+                Some(false) => local,
+                None => None,
+            }
         }
     }
 }
@@ -807,9 +912,19 @@ pub(super) struct Live<'a> {
     files: BTreeMap<LocationKey, &'a str>,
     accepted: AcceptedRows,
     carried: BTreeSet<String>,
-    sessions: Links,
+    sessions: Carriers,
 }
 impl Live<'_> {
+    fn carrier(&self, root: &str) -> Option<bool> {
+        if self.carried.contains(root) {
+            Some(true)
+        } else {
+            // An unreadable head does not identify its session. The path name
+            // can differ from the session carried by the head.
+            self.sessions.unknown.is_empty().then_some(false)
+        }
+    }
+
     fn accepts(&self, loc: LocationKey, hash: u64) -> bool {
         self.accepted
             .get(&loc)
@@ -824,7 +939,7 @@ impl<'a> std::ops::Deref for Live<'a> {
 }
 fn main_files_with(
     index: &ScanIndex,
-    mut read: impl FnMut(&[&str]) -> Links,
+    read: impl FnOnce(&[&str]) -> Carriers,
     accepted: Option<AcceptedRows>,
 ) -> Live<'_> {
     let files = index
@@ -845,14 +960,22 @@ fn main_files_with(
     Live {
         accepted: accepted.unwrap_or_else(|| accepted_rows(index)),
         files,
-        carried: sessions.values().cloned().collect(),
+        carried: sessions.links.values().cloned().collect(),
         sessions,
     }
 }
 pub(super) fn indexed_main_files(index: &ScanIndex) -> Live<'_> {
     main_files_with(
         index,
-        |keys| crate::snapshots::state_v2::carried_sessions(index, keys).unwrap_or_default(),
+        |keys| {
+            if keys.is_empty() {
+                return Carriers::default();
+            }
+            crate::snapshots::state_v2::carried_sessions(index, keys).unwrap_or_else(|| Carriers {
+                unknown: keys.iter().map(|&key| key.to_owned()).collect(),
+                ..Default::default()
+            })
+        },
         None,
     )
 }
@@ -867,8 +990,10 @@ fn earliest_accepted_holder<'a>(
     candidates: impl Iterator<Item = (&'a str, &'a str, bool)>,
 ) -> Option<(i128, LocationKey)> {
     candidates
-        .filter_map(|(key, root, local)| census_holder(index, live, key, root, hash, local))
-        .filter(|&holder| holder < before)
+        .filter_map(|(key, root, local)| {
+            let (holder, proven) = census_holder(index, live, key, root, hash, Some(local))?;
+            (holder < before && proven == Some(true)).then_some(holder)
+        })
         .min()
 }
 
@@ -880,14 +1005,17 @@ fn census_holder(
     key: &str,
     root: &str,
     hash: u64,
-    local: bool,
-) -> Option<(i128, LocationKey)> {
+    local: Option<bool>,
+) -> Option<((i128, LocationKey), Option<bool>)> {
     let record = index.claude_request_census.get(key)?;
     if !record.proves_scan() || !record.holds_hash(hash) {
         return None;
     }
     let holder = holder_order(&index.claude_money_birth_store, root, key)?;
-    holder_proof(index, live, holder.1, hash, HolderUse::New(local)).then_some(holder)
+    Some((
+        holder,
+        holder_proof(index, live, holder.1, hash, HolderUse::New(local)),
+    ))
 }
 
 #[cfg(test)]
@@ -1597,6 +1725,7 @@ fn decide_holders(
         /// (`twin_page_held`): removed, never stored.
         twin_held: BTreeSet<u64>,
         holder_sessions: BTreeSet<String>,
+        carrier_unknown: bool,
     }
     // One accepted-row view for the whole acquisition page, before evidence chunks.
     let live = std::cell::OnceCell::<Live<'_>>::new();
@@ -1618,7 +1747,7 @@ fn decide_holders(
     // twin's ACK accepted that body, which counts this main's requests, so
     // the main holds them off the page as well.
     let carried = |key: &str| {
-        index.file_upload_context_enabled()
+        if !(index.file_upload_context_enabled()
             && index.confirmed_empty_files.contains(key)
             && !index.file_upload_context_requires_adoption(key)
             && !copy_held(index, key)
@@ -1628,16 +1757,24 @@ fn decide_holders(
                     .claude_request_census
                     .get(key)
                     .is_some_and(|record| record.current_for(&entry.source_file_fingerprint))
-            })
-            && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
-                live.get_or_init(|| indexed_main_files(index))
-                    .carried
-                    .contains(member.root)
-            })
+            }))
+        {
+            return Some(false);
+        }
+        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+            return Some(false);
+        };
+        live.get_or_init(|| indexed_main_files(index))
+            .carrier(member.root)
     };
     let owned = |key: &str| {
-        (local_owned(index, page, key, true) || carried(key))
-            && !held_here.contains(&location_key(key))
+        if held_here.contains(&location_key(key)) {
+            Some(false)
+        } else if local_owned(index, page, key, true) {
+            Some(true)
+        } else {
+            carried(key)
+        }
     };
     let mut page_folds = BTreeMap::<&str, Vec<usize>>::new();
     for (at, item) in page.iter().enumerate() {
@@ -1672,26 +1809,19 @@ fn decide_holders(
             // for hashes its accepted request rows still prove.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
+            let mut carrier_unknown = false;
             for (holder, held) in index.claude_copy_removals.get(order.1) {
-                let key = live
-                    .get_or_init(|| indexed_main_files(index))
-                    .get(holder)
-                    .copied();
+                let live = live.get_or_init(|| indexed_main_files(index));
                 for &hash in held.iter() {
-                    if hashes.binary_search(&hash).is_err()
-                        || !holder_proof(
-                            index,
-                            live.get_or_init(|| indexed_main_files(index)),
-                            *holder,
-                            hash,
-                            HolderUse::Stored,
-                        )
-                    {
-                        continue;
-                    }
-                    stored.insert(hash);
-                    if key.is_none() {
-                        absent.insert(hash);
+                    match holder_proof(index, live, *holder, hash, HolderUse::Stored) {
+                        Some(true) if hashes.binary_search(&hash).is_ok() => {
+                            stored.insert(hash);
+                            if !live.contains_key(holder) {
+                                absent.insert(hash);
+                            }
+                        }
+                        None => carrier_unknown = true,
+                        Some(_) => {}
                     }
                 }
             }
@@ -1709,6 +1839,7 @@ fn decide_holders(
                 parent,
                 folder,
                 holder_sessions: BTreeSet::new(),
+                carrier_unknown,
             })
         })
         .collect::<Vec<_>>();
@@ -1754,23 +1885,16 @@ fn decide_holders(
                         if file.session == root {
                             continue;
                         }
-                        if !proven || evidence == Evidence::None {
+                        if proven.is_none() {
+                            file.carrier_unknown = true;
+                        }
+                        if proven == Some(false) || evidence == Evidence::None {
+                            // Another location of this session may count the request.
                             file.holder_sessions.insert(root.to_owned());
                         }
-                        if !proven
-                            && saved_removal_applies(
-                                index,
-                                live.get_or_init(|| indexed_main_files(index)),
-                                key,
-                                hash,
-                            )
+                        if let Some(holder) =
+                            holder.filter(|h| proven == Some(true) && *h < file.order)
                         {
-                            // This location removed the id, but its session's
-                            // earlier location may still count it (Rule B).
-                            file.holder_sessions.insert(root.to_owned());
-                            continue;
-                        }
-                        if let Some(holder) = holder.filter(|h| proven && *h < file.order) {
                             let earliest = file.covered.entry(hash).or_insert(holder);
                             *earliest = (*earliest).min(holder);
                         }
@@ -1788,11 +1912,13 @@ fn decide_holders(
     for file in &mut wanted {
         // The first discovered path carries a summed session's ACK. Rule A
         // uses that session acceptance regardless of the carrier's location.
-        let session_accepted = store.observations(&file.session).any(|(location, _)| {
-            live.get_or_init(|| indexed_main_files(index))
-                .get(&location)
-                .is_some_and(|key| owned(key))
-        });
+        let session_accepted = any_proof(store.observations(&file.session).filter_map(
+            |(location, _)| {
+                live.get_or_init(|| indexed_main_files(index))
+                    .get(&location)
+                    .map(|key| owned(key))
+            },
+        ));
         for session in std::iter::once(&file.session).chain(file.holder_sessions.iter()) {
             for (location, _) in store.observations(session) {
                 let Some(&key) = live
@@ -1810,17 +1936,83 @@ fn decide_holders(
                     } else {
                         owned(key)
                     };
-                    if let Some(holder) = earliest_accepted_holder(
+                    if let Some((holder, proven)) = census_holder(
                         index,
                         live.get_or_init(|| indexed_main_files(index)),
+                        key,
+                        session,
                         hash,
-                        file.order,
-                        std::iter::once((key, session.as_str(), accepted)),
+                        accepted,
                     )
-                    .filter(|h| session != &file.session || !file.resumed || on_page.contains(&h.1))
-                    {
-                        let earliest = file.covered.entry(hash).or_insert(holder);
-                        *earliest = (*earliest).min(holder);
+                    .filter(|(h, _)| {
+                        *h < file.order
+                            && (session != &file.session || !file.resumed || on_page.contains(&h.1))
+                    }) {
+                        match proven {
+                            Some(true) => {
+                                let earliest = file.covered.entry(hash).or_insert(holder);
+                                *earliest = (*earliest).min(holder);
+                            }
+                            None => file.carrier_unknown = true,
+                            Some(false) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut held_sessions = wanted
+        .iter()
+        .filter(|file| file.carrier_unknown)
+        .map(|file| file.session.clone())
+        .collect::<BTreeSet<_>>();
+    if !held_sessions.is_empty()
+        && let Some(live) = live.get()
+    {
+        // A withheld page body cannot supply Local proof to another session.
+        let page_sessions = page
+            .iter()
+            .filter_map(|item| {
+                let location = item.claude_money.as_deref()?.location_key()?;
+                Some((location, item.source_session_id.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut dependents = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for file in &wanted {
+            for (&hash, &(_, location)) in &file.covered {
+                let Some(&session) = page_sessions.get(&location) else {
+                    continue;
+                };
+                if session == file.session.as_str()
+                    || file.stored.contains(&hash)
+                    || live.accepts(location, hash)
+                {
+                    continue;
+                }
+                let independent = live.get(&location).is_some_and(|key| {
+                    local_owned(index, &[], key, true) || carried(key) == Some(true)
+                });
+                if holder_proof(
+                    index,
+                    live,
+                    location,
+                    hash,
+                    HolderUse::New(Some(independent)),
+                ) != Some(true)
+                {
+                    dependents
+                        .entry(session)
+                        .or_default()
+                        .insert(file.session.as_str());
+                }
+            }
+        }
+        let mut pending = held_sessions.iter().cloned().collect::<Vec<_>>();
+        while let Some(session) = pending.pop() {
+            if let Some(copies) = dependents.remove(session.as_str()) {
+                for copy in copies {
+                    if held_sessions.insert(copy.to_owned()) {
+                        pending.push(copy.to_owned());
                     }
                 }
             }
@@ -1834,6 +2026,10 @@ fn decide_holders(
     };
 
     for wanted in wanted {
+        if held_sessions.contains(&wanted.session) {
+            hold_copies(&mut items[wanted.at], "request_owned_held");
+            continue;
+        }
         #[cfg(test)]
         pipeline_test_observer::record_holder(wanted.order.1, wanted.covered.values().min());
         let decided =
@@ -1916,6 +2112,9 @@ fn decide_holders(
             .collect::<Vec<_>>();
         restore_uncovered(&mut items[wanted.at], &ids);
     }
+    if let Some(live) = live.get() {
+        record_counts(Counts::one(23, live.sessions.unknown.len() as u64));
+    }
     updates
 }
 
@@ -1939,7 +2138,7 @@ fn stored_groups<'a>(
                 *holder,
                 hash,
                 HolderUse::Stored,
-            )
+            ) == Some(true)
         });
         let into = groups.entry(*holder).or_default();
         for &hash in kept {
@@ -2259,7 +2458,7 @@ pub(in crate::snapshots) fn selected_twin_roots<'a>(
 
 #[cfg(test)]
 pub(crate) fn carrier_group_owned_for_test(index: &ScanIndex, key: &str) -> bool {
-    index_group_owned(index, &indexed_main_files(index), key)
+    index_group_owned(index, &indexed_main_files(index), key) == Some(true)
 }
 
 #[cfg(test)]
@@ -2269,6 +2468,12 @@ pub(crate) fn reconcile_carrier_images_for_test(
     mut heads: impl FnMut(&[&str], bool) -> BTreeMap<String, String>,
 ) {
     let mut previous = CopyOwnership::capture(previous);
-    previous.seed(&mut |keys| heads(keys, true));
-    previous.reconcile(next, &mut |keys| heads(keys, false));
+    previous.seed(&mut |keys| Carriers {
+        links: heads(keys, true),
+        ..Default::default()
+    });
+    previous.reconcile(next, &mut |keys| Carriers {
+        links: heads(keys, false),
+        ..Default::default()
+    });
 }
