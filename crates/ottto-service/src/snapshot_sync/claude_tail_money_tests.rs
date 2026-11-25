@@ -652,11 +652,68 @@ fn claude_case(name: &str) {
         if mode.1 > 0 {
             input_clock(&path);
         }
-        receipt(
-            name,
-            &[compare_claude(&c, &scanner, &mut disk, prior, mode)],
-        );
+        let body = compare_claude(&c, &scanner, &mut disk, prior, mode);
+        if name == MCP_START {
+            assert_mcp_start_measured(&body.items);
+        }
+        receipt(name, &[body]);
     });
+}
+
+/// `claude_mcp_session_start`: request 1 sends one MCP tool in full and
+/// defers another, with deferred tool deltas before and after response 1.
+const MCP_START: &str = "claude_mcp_session_start";
+
+/// Request 1's records for `MCP_START`: a deferred tool delta, the request
+/// shape (a built-in tool, an MCP tool in full, a deferred MCP tool and a
+/// deferred built-in tool), its system blob and the request record.
+fn mcp_request_one() -> String {
+    let record = |mut value: Value| {
+        value["sessionId"] = json!(ROOT);
+        value["timestamp"] = json!(AT);
+        value["version"] = json!("2.1.309");
+        value.to_string() + "\n"
+    };
+    [
+        json!({"type": "attachment", "attachment": {"type": "deferred_tools_delta",
+            "addedNames": ["mcp__docs__fetch", "ToolSearch"], "removedNames": []}}),
+        json!({"type": "api-request-shape", "shapeHash": "mcp-shape", "shape": {
+            "system": [{"type": "text", "text": "You are Claude."}],
+            "tools": [
+                {"name": "Read"},
+                {"name": "mcp__docs__search", "description": "Search the docs.",
+                    "input_schema": {"type": "object"}},
+                {"name": "mcp__docs__fetch", "defer_loading": true},
+                {"name": "ToolSearch", "defer_loading": true}]}}),
+        json!({"type": "api-request-blob", "hash": "mcp-blob", "message": {"role": "system",
+            "content": [{"type": "text", "text": "intro\n# Environment"}]}}),
+        json!({"type": "api-request", "shapeHash": "mcp-shape", "tail": ["mcp-blob"]}),
+    ]
+    .into_iter()
+    .map(record)
+    .collect()
+}
+
+/// A deferred tool delta after response 1: a server that arrives late.
+fn mcp_late_delta(names: &[&str]) -> String {
+    json!({"type": "attachment", "sessionId": ROOT, "timestamp": AT, "version": "2.1.309",
+        "attachment": {"type": "deferred_tools_delta", "addedNames": names,
+            "removedNames": []}})
+    .to_string()
+        + "\n"
+}
+
+/// The positive control: every arm measured request 1, MCP tool sent in full
+/// included, so the receipt pins a body that carries the MCP start facts.
+fn assert_mcp_start_measured(items: &[SnapshotItem]) {
+    let root = items
+        .iter()
+        .find(|item| item.source_session_id == ROOT)
+        .expect("the root session is emitted");
+    let start = root.session_start.as_deref().expect("session_start");
+    let mcp = start.start_chars_mcp_schemas.expect("MCP schemas measured");
+    assert!(mcp > 0, "request 1 sent an MCP tool in full");
+    assert!(start.start_chars_tools.is_some_and(|tools| tools > mcp));
 }
 
 /// A row's corpus before its warm page: the root transcript (returned) and
@@ -677,7 +734,13 @@ pub(super) fn claude_corpus(name: &str) -> (Corpus, PathBuf) {
         c.root = c.root.join("listed");
         std::fs::create_dir_all(&c.root).unwrap();
     }
-    let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+    let path = if name == MCP_START {
+        let contents =
+            mcp_request_one() + &line(ROOT, "r1", AT, 10) + &mcp_late_delta(&["mcp__notes__list"]);
+        c.root(ROOT, &contents)
+    } else {
+        c.root(ROOT, &line(ROOT, "r1", AT, 10))
+    };
     if name == "side_owner" {
         let agent = c.agent(0, &line(ROOT, "agent", AT, 20));
         input_clock(&agent);
@@ -691,6 +754,11 @@ pub(super) fn claude_corpus(name: &str) -> (Corpus, PathBuf) {
 pub(super) fn claude_change(c: &Corpus, path: &Path, name: &str) -> (usize, usize, usize) {
     match name {
         "progressive_response" => append(path, &line(ROOT, "r1", AT, 30)),
+        // Another late server, then response 2, both read by the Tail.
+        MCP_START => append(
+            path,
+            &(mcp_late_delta(&["mcp__notes__get"]) + &line(ROOT, "r2", AT, 20)),
+        ),
         "duplicate_request_ids" => append(
             path,
             &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", AT, 20)),
@@ -735,7 +803,8 @@ claude_tests!(
     side_owner,
     side_without_owner,
     side_owner_directory_unlisted,
-    failed_then_healthy_telemetry
+    failed_then_healthy_telemetry,
+    claude_mcp_session_start
 );
 
 /// A production resumed-mode page: receipts use the base, stamps the exact
