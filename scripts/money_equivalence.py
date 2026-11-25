@@ -42,6 +42,7 @@ HEAD_ONLY_FIXTURES = (
     "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
     "resumed_prefix_sidecar_receipt", "root_twin_scoped_family",
     "claude_copy_decision_rows",
+    "claude_mcp_tools_start",
     "claude_status_s01_default_only",
     "claude_status_s02_lexical_tie",
     "claude_status_s03_health_first",

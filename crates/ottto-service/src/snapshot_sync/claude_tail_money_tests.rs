@@ -1699,6 +1699,103 @@ fn claude_paused_suffix() {
     claude_bad_record_case("claude_paused_suffix");
 }
 
+/// Money equivalence receipt: request 1 logs its shape with built-in and MCP
+/// tools, some deferred. Money is that of the plain rows (r1 and r2); the
+/// session start carries the characters of the MCP tools sent in full.
+#[test]
+fn claude_mcp_tools_start() {
+    let name = "claude_mcp_tools_start";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let tool = |name: &str, text: &str, fields: &[&str]| {
+            let properties: serde_json::Map<String, Value> = fields
+                .iter()
+                .map(|field| ((*field).to_owned(), json!({"type": "string"})))
+                .collect();
+            json!({"name": name, "description": text,
+                "input_schema": {"type": "object", "properties": properties}})
+        };
+        let deferred = |name: &str| json!({"name": name, "defer_loading": true});
+        // Python separators: 138 + 168 + 46 built-in, 163 + 154 + 160 MCP in
+        // full, 60 deferred MCP.
+        let tools = [
+            tool("LocalRead", "Read a local file.", &["path"]),
+            tool("LocalWrite", "Write a local file.", &["path", "text"]),
+            deferred("LocalSearch"),
+            tool(
+                "mcp__notes_demo__list_notes",
+                "List notes in a folder.",
+                &["folder"],
+            ),
+            tool("mcp__notes_demo__read_note", "Read one note.", &["note_id"]),
+            tool(
+                "mcp__weather_demo__forecast",
+                "Forecast for a place.",
+                &["place"],
+            ),
+            deferred("mcp__weather_demo__alerts"),
+        ];
+        let opening = [
+            json!({"type": "user", "message": {"role": "user", "content": "Summarize my notes."}}),
+            json!({"type": "api-request-shape", "shapeHash": "shape-1", "shape": {
+                "system": [{"type": "text", "text": "You are a demo assistant."}],
+                "tools": tools}}),
+            json!({"type": "api-request-blob", "hash": "blob-1", "message": {"role": "user",
+                "content": [{"type": "text", "text": "Summarize my notes."}]}}),
+            json!({"type": "api-request", "shapeHash": "shape-1", "tail": ["blob-1"]}),
+        ]
+        .into_iter()
+        .map(|mut record| {
+            record["sessionId"] = json!(ROOT);
+            record["version"] = json!("2.1.309");
+            record["timestamp"] = json!(AT);
+            record.to_string() + "\n"
+        })
+        .collect::<String>();
+        let mut c = corpus(name);
+        let path = c.root(ROOT, &(opening + &line(ROOT, "r1", AT, 10)));
+        input_clock(&path);
+        let mut disk = Disk::new(&c);
+        let (scanner, prior) = warm_claude(&c, &disk);
+        append(&path, &line(ROOT, "r2", AT, 20));
+        input_clock(&path);
+        let restart = disk.owner(SnapshotSource::ClaudeCode);
+        let mut pages = claude_pages(
+            &c,
+            &scanner,
+            &restart,
+            [prior.clone(), prior.clone(), prior],
+            (0, 1, 0),
+        );
+        finish_claude_pages(&c, &mut pages);
+        for page in &pages {
+            literal(page);
+            assert_eq!(page.scan.malformed_json_line_count, 0);
+            let [item] = page.scan.snapshots.as_slice() else {
+                panic!("one root session");
+            };
+            // r1 and r2 as `line` writes them; the logged request adds nothing.
+            assert_eq!(
+                [
+                    item.request_count,
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.cache_creation_5m_tokens,
+                    item.cache_creation_1h_tokens,
+                ],
+                [2, 30, 30, 6, 10, 4]
+            );
+            let start = item.session_start.as_deref().expect("session start");
+            assert_eq!(start.start_chars_tools, Some(889));
+            assert_eq!(start.start_chars_mcp_schemas, Some(163 + 154 + 160));
+        }
+        receipt(name, &[compare_claude_uploads(&pages)]);
+    });
+}
+
 /// Money equivalence receipt: an invalid native usage record between valid Codex
 /// turns never counts; its siblings count exactly as in a rollout without it.
 #[test]
