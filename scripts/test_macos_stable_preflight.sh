@@ -67,17 +67,18 @@ jq -n \
     update_lifecycle: {
       launch_provenance: "launchservices_bundle",
       user_update_actions: 1,
-      homebrew_service_reached_target: true,
-      lower_gui_remained_running_after_homebrew_update: true,
+      starting_service_owner: "app_bundle",
+      service_restarted_on_target_version: true,
       sparkle_terminated_old_process: true,
       sparkle_relaunched_target_bundle: true,
       process_id_changed: true,
+      final_service_owner: "app_bundle",
       manual_process_termination: false,
       manual_app_launch: false,
       account_continuity_verified: true,
       source_continuity_verified: true,
-      diagnostics_via_homebrew_socket: true,
-      verify_via_homebrew_socket: true,
+      diagnostics_via_app_service_socket: true,
+      verify_via_app_service_socket: true,
       owner_prefix_protocol_schema_version_converged: true
     },
     checks: {
@@ -96,8 +97,8 @@ jq -n \
       verify_codex: "passed",
       diagnostics_redaction: "passed",
       update_check: "passed",
-      mixed_owner_app_version_truth: "passed",
-      mixed_owner_sparkle_autonomous_lifecycle: "passed",
+      app_owner_version_truth: "passed",
+      app_owner_sparkle_autonomous_lifecycle: "passed",
       rollback_notes: "passed",
       stable_formula_static: "passed",
       stable_hosted_installer_static: "passed"
@@ -421,6 +422,19 @@ jq \
   "$stable_manifest" > "$wrong_type_candidate_rc_lifecycle_manifest"
 if "$PREFLIGHT" --manifest "$wrong_type_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
   echo "Expected boolean update-action count to fail stable preflight" >&2
+  exit 1
+fi
+
+homebrew_owner_candidate_rc_lifecycle="$TMP_DIR/stable-candidate-rc-homebrew-owner-lifecycle-qa.json"
+jq '.update_lifecycle.starting_service_owner = "homebrew"' \
+  "$candidate_rc_evidence" > "$homebrew_owner_candidate_rc_lifecycle"
+homebrew_owner_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-homebrew-owner-lifecycle-manifest.json"
+jq \
+  --arg evidence "$homebrew_owner_candidate_rc_lifecycle" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$homebrew_owner_candidate_rc_lifecycle_manifest"
+if "$PREFLIGHT" --manifest "$homebrew_owner_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected update evidence from a Homebrew-owned service to fail stable preflight" >&2
   exit 1
 fi
 

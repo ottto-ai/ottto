@@ -113,8 +113,8 @@ CHECKS = [
     "verify_codex",
     "diagnostics_redaction",
     "update_check",
-    "mixed_owner_app_version_truth",
-    "mixed_owner_sparkle_autonomous_lifecycle",
+    "app_owner_version_truth",
+    "app_owner_sparkle_autonomous_lifecycle",
     "rollback_notes",
     "stable_formula_static",
     "stable_hosted_installer_static",
@@ -206,17 +206,18 @@ evidence = {
     "update_lifecycle": {
         "launch_provenance": "TODO_launchservices_bundle",
         "user_update_actions": 0,
-        "homebrew_service_reached_target": False,
-        "lower_gui_remained_running_after_homebrew_update": False,
+        "starting_service_owner": "TODO_app_bundle",
+        "service_restarted_on_target_version": False,
         "sparkle_terminated_old_process": False,
         "sparkle_relaunched_target_bundle": False,
         "process_id_changed": False,
+        "final_service_owner": "TODO_app_bundle",
         "manual_process_termination": True,
         "manual_app_launch": True,
         "account_continuity_verified": False,
         "source_continuity_verified": False,
-        "diagnostics_via_homebrew_socket": False,
-        "verify_via_homebrew_socket": False,
+        "diagnostics_via_app_service_socket": False,
+        "verify_via_app_service_socket": False,
         "owner_prefix_protocol_schema_version_converged": False,
     },
     "resource_scorecard": {"schema_version": 1, "policy": "resource-stage1-v1", "status": "not_run"},
@@ -234,8 +235,10 @@ evidence = {
         ),
         (
             "The update_lifecycle object must describe one foreground update action "
-            "from a canonical LaunchServices bundle launch. Any manual signal, force "
-            "quit, executable-path launch, or manual reopen fails the gate."
+            "from a canonical LaunchServices bundle launch of a lower app that owns "
+            "net.ottto.service, ending with the app-owned service on the target "
+            "version. Any manual signal, force quit, executable-path launch, or "
+            "manual reopen fails the gate."
         ),
     ],
 }
