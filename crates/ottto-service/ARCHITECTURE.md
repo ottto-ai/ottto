@@ -988,9 +988,15 @@ never sees a key.
   server answers it with an empty 204. When the server specifically refuses the run token, the
   service refreshes and resends the identical request only if the run and organization both
   match the original binding. An ambiguous enrollment response requires a claim-state readback.
-- **Browser claim.** The service returns the claim link only when it names the returned UUID on
-  `https://app.ottto.net/setup/cloud-keys?claim=…` and the forward key code has the expected
-  Base32 shape.
+- **Browser claim.** The service selects the web origin from the (API, web) pair of the API
+  bound to the claim request. It returns a link only for that origin's
+  `/setup/cloud-keys?claim=…` route with the returned UUID and a valid forward key code.
+  Source compiles only the production pair. A non-stable candidate build may add one staging
+  pair with `OTTTO_CLOUD_STAGING_PAIR="<api origin>|<web origin>"` at build time; the stable
+  packaging path refuses to build with it set. The pair chooses web links and the approval
+  `aud` (the paired web host) only. Which APIs receive credentials, including the device secret
+  on token refresh, stays `validated_api_base_url`'s decision, which trusts that staging API
+  only in such a build.
 - **Sign queue.** In memory only: a device proof lives until its challenge expires and an
   approval until its `sign_by`; one request per approval id, and a new approval supersedes the
   attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the
@@ -1000,9 +1006,26 @@ never sees a key.
 - **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
   three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
   This unauthenticated hint carries no data. The app obtains requests over verified XPC.
+- **Template.** The CLI selects the template ID, compares the server's template metadata with
+  the compiled pin table in `ottto-protocol`, and builds the template URL from the pin. A missing
+  or different pin stops before any AWS write. The service does not fetch templates.
 - **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
   its LaunchAgent. Swapping only the service binary is unsupported because the installed job
   retains the signer Mach service and passes a flag the older binary cannot parse.
+
+- **CLI.** Command-scoped local-control requests require the CLI token. Passive attempt
+  status never presents an approval. Ensure, submit and cancel obtain a fresh app device
+  signature over the frozen HTTP request, with the literal attempt placeholder in the
+  digest for attempt-specific routes. One lost reply or invalid proof can retry with
+  a fresh challenge and the same request body. The native approval queue offers at most
+  four new approvals per minute, and a retained answer allows an identical approval
+  retry after readback. The daemon checks the approval's attempt, revision and AWS
+  account before it reaches the app.
+- **AWS.** The CLI checks the same compiled template pin as the daemon and uses a
+  single exported AWS credential session for identity and CloudFormation. Setup
+  state lives on the server. A resume re-reads the attempt and reconciles the verified
+  stack ARN before submission. Cancellation can return a separate delete command for
+  an ARN verified in the relevant account.
 
 ## Local health diagnostics
 

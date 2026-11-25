@@ -11,7 +11,6 @@ use super::wire::checked_challenge;
 use super::wire::decode_base64url;
 use super::wire::encode_base64url;
 use super::wire::is_encoded_spki;
-use super::wire::is_key_code;
 use super::wire::is_p256_der_signature;
 use super::wire::is_reverse_code;
 use super::wire::proof_header;
@@ -320,7 +319,7 @@ fn dispatch(
         "cloud_keys_claim_start" => claim_start(server, parse_args(args)?),
         "cloud_keys_claim_status" => {
             let args = parse_args::<ClaimStatusArgs>(args)?;
-            if !crate::hex::is_uuid(&args.key_claim_id) {
+            if !ottto_protocol::cloud_uuid(&args.key_claim_id) {
                 return Err(Refusal::new("invalid_argument"));
             }
             to_result(server.claim_state(&args.key_claim_id)?)
@@ -371,7 +370,7 @@ fn valid_keys(device: &str, approval: Option<&str>) -> bool {
 }
 
 fn claim_start(server: &dyn CloudKeyServer, args: ClaimStartArgs) -> Result<Value, Refusal> {
-    if !crate::hex::is_uuid(&args.client_claim_id)
+    if !ottto_protocol::cloud_uuid(&args.client_claim_id)
         || !valid_keys(
             &args.device_key_spki_b64,
             args.approval_key_spki_b64.as_deref(),
@@ -379,23 +378,11 @@ fn claim_start(server: &dyn CloudKeyServer, args: ClaimStartArgs) -> Result<Valu
     {
         return Err(Refusal::new("invalid_argument"));
     }
-    let started = server.start_claim(&ClaimStartBody {
+    to_result(server.start_claim(&ClaimStartBody {
         client_claim_id: &args.client_claim_id,
         device_key_spki_b64: &args.device_key_spki_b64,
         approval_key_spki_b64: args.approval_key_spki_b64.as_deref(),
-    })?;
-    // The app can open this URL in a browser. Accept only the exact web route
-    // and a single claim parameter that names the returned claim.
-    let browser_claim = started
-        .claim_url
-        .strip_prefix("https://app.ottto.net/setup/cloud-keys?claim=");
-    if !crate::hex::is_uuid(&started.key_claim_id)
-        || browser_claim != Some(started.key_claim_id.as_str())
-        || !is_key_code(&started.key_code)
-    {
-        return Err(Refusal::new("server_untrusted"));
-    }
-    to_result(started)
+    })?)
 }
 
 /// Gets a challenge for `body` and freezes both on the connection.
@@ -422,8 +409,8 @@ fn prepare_write(
         &challenge.challenge_id,
         &challenge.payload_bytes,
         &request,
-        &scope.run_id,
-        &scope.org_id,
+        &scope.id,
+        &scope.organization_id,
         server.now(),
     )
     .ok_or_else(|| Refusal::new("challenge_mismatch"))?;
@@ -455,7 +442,7 @@ fn enroll_prepare(
     connection: u64,
     args: EnrollPrepareArgs,
 ) -> Result<Value, Refusal> {
-    if !crate::hex::is_uuid(&args.key_claim_id)
+    if !ottto_protocol::cloud_uuid(&args.key_claim_id)
         || !valid_keys(
             &args.device_key_spki_b64,
             args.approval_key_spki_b64.as_deref(),

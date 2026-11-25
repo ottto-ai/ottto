@@ -3,6 +3,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use zeroize::Zeroize;
 
+mod cloud_connect;
+pub use cloud_connect::{
+    cloud_account_id, cloud_stack_id, cloud_stack_name, cloud_stack_name_from_id, cloud_uuid,
+    CloudConnectEnsure, CloudConnectFailure, CloudConnectSubmit, CloudTemplatePin, TemplatePin,
+    TemplatePinId, CLOUD_CONNECT_ATTEMPT_SCHEMA, CLOUD_CONNECT_CONTROL_PROTOCOL_VERSION,
+    CLOUD_CONNECT_REGION, CLOUD_CONNECT_WEB_URL, TEMPLATE_ORIGIN,
+};
+
 mod credit_amount;
 mod session_launch;
 pub use credit_amount::{scale_decimal, scale_minor, CreditAmount};
@@ -3100,6 +3108,11 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::SessionLaunchRecentFolders { .. }
         | LocalControlCommand::AccountNicknames
         | LocalControlCommand::AccountNicknameSet { .. } => SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::CloudConnectStatus { .. }
+        | LocalControlCommand::CloudConnectEnsure { .. }
+        | LocalControlCommand::CloudConnectSubmit { .. }
+        | LocalControlCommand::CloudConnectPoll { .. }
+        | LocalControlCommand::CloudConnectCancel { .. } => CLOUD_CONNECT_CONTROL_PROTOCOL_VERSION,
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
         }
@@ -4284,6 +4297,28 @@ pub enum LocalControlCommand {
     CloudStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+    },
+    CloudConnectStatus {
+        attempt_id: Option<String>,
+        timeout_ms: u64,
+    },
+    CloudConnectEnsure {
+        body: CloudConnectEnsure,
+        timeout_ms: u64,
+    },
+    CloudConnectSubmit {
+        attempt_id: String,
+        body: CloudConnectSubmit,
+        timeout_ms: u64,
+    },
+    CloudConnectPoll {
+        attempt_id: String,
+        observed_aws_account_id: String,
+        timeout_ms: u64,
+    },
+    CloudConnectCancel {
+        attempt_id: String,
+        timeout_ms: u64,
     },
     AuthStart,
     AuthComplete {

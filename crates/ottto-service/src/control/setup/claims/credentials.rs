@@ -187,7 +187,8 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
     refresh_setup_run_token_checked(api_base_url, connection, |_| Ok(()))
 }
 
-/// Lets a caller refuse a refresh that would change its binding, before storing any update.
+/// The only helper that sends the long-lived device secret. `check` refuses a refresh answer
+/// before it is used (cloud setup requires the same run and organization).
 pub(in crate::control) fn refresh_setup_run_token_checked(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
@@ -199,9 +200,12 @@ pub(in crate::control) fn refresh_setup_run_token_checked(
     // co-resident attacker who tampers that file could otherwise exfiltrate the
     // secret to their own host. Gate the base through the same trusted-base
     // validator every other secret-bearing egress in this file uses, BEFORE
-    // touching the device secret. Fail closed: both callers map an `Err` to a
-    // reconnect/backend error, so an untrusted base never releases the secret.
+    // touching the device secret. Never trust a base because it appears in the
+    // cloud web-origin pairs: those choose web pages only. Fail closed: callers
+    // map an `Err` to a reconnect/backend error, so an untrusted base never
+    // releases the secret.
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
+    let api_base_url = api_base_url.as_str();
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()
@@ -213,7 +217,7 @@ pub(in crate::control) fn refresh_setup_run_token_checked(
         .map_err(|_| LocalApiError::SetupRunConnectionMissing)?;
 
     let url = api_url_with_base(
-        &api_base_url,
+        api_base_url,
         &format!(
             "/api/v1/setup-runs/{}/local-client/refresh",
             connection.setup_run_id

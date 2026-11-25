@@ -96,6 +96,17 @@ for channel in stable stable-candidate; do
   expect_status 2 "$channel without a dSYM folder" policy "$channel" false
   expect_output "OTTTO_MACOS_DSYM_DIR is required for stable channels" "$channel without a dSYM folder"
 done
+# Stable channels refuse any staging cloud pair, set or empty, and never print it.
+staging_pair="https://staging.example.invalid:8443|https://staging.example.invalid"
+for channel in stable stable-candidate; do
+  for pair in "$staging_pair" ""; do
+    expect_status 2 "$channel with a staging pair" \
+      with_env OTTTO_CLOUD_STAGING_PAIR="$pair" policy "$channel" false "$policy_root/private/dsym"
+    expect_output "stable channels build with the production cloud deployment only" "$channel with a staging pair"
+    expect_no_output "staging.example.invalid" "$channel with a staging pair"
+  done
+done
+expect_status 0 "preview with a staging pair" with_env OTTTO_CLOUD_STAGING_PAIR="$staging_pair" policy preview true
 expect_status 0 "dev without a dSYM folder" policy dev false
 expect_output "::warning::Companion dSYM not kept" "dev without a dSYM folder"
 expect_status 0 "preview reuse without a dSYM folder" policy preview true
