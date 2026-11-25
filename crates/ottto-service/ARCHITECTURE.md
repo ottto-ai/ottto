@@ -137,6 +137,12 @@ file-system hint / periodic listing → select file → read new bytes from save
   A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
+  A compression is proven only when the archive's zstd frame header records the
+  plaintext length the predecessor's head read, that read ended on a sealed line,
+  and the predecessor retains no growth. Any other archive (another length, which
+  holds turns appended after the last read, or no recorded length) is read once
+  as a new file, the absent predecessor retires, and the local
+  `codex_compression_carry_unproven` row counts the reason.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.
   A rollout moved while a reader owns it waits for a later pass.
 - **Codex revert groups.** Same-home revert files with one native session id can
