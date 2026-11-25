@@ -2,7 +2,7 @@
 // page through the post-scan stages and the settlement helpers that
 // `finish_sync_source` uses, with an in-process upload in place of the network
 // and a save/reload between pages. Other pipeline suites share this fixture.
-// The cases below cover the hold, refusal and partial-ACK mechanisms census P2
+// The cases below cover the hold, refusal and partial-ACK mechanisms the census
 // keeps: money totals, exact ACKs, refusals and account holds are not relaxed.
 // Fixtures are synthetic.
 use super::*;

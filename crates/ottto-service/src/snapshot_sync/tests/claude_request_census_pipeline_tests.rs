@@ -11,7 +11,7 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
         .expect("unix seconds")
 }
 
-/// TD1g and TD1h. An account-deferred key's entry reverts to its accepted
+/// An account-deferred key's entry reverts to its accepted
 /// revision, but its record stays the revision this window parsed (records
 /// follow `self`, never `previous`). At the complete terminal of the same
 /// census window that record covers the key by `window`, so the hold is not a
@@ -39,7 +39,7 @@ fn census_records_keep_the_held_revision_and_cover_it_in_window() {
         "the changed owner-unproven body is held"
     );
     assert_eq!(first.index.claude_account_deferred_hold_count(), 1);
-    // TD1g: the reverted entry, the NEW record.
+    // The reverted entry, the NEW record.
     let record = first
         .index
         .claude_request_census_for_test()
@@ -59,7 +59,7 @@ fn census_records_keep_the_held_revision_and_cover_it_in_window() {
         census_pipeline_window(&first.scan.census_window_end)
     );
 
-    // TD1h: covered in-window at the terminal of the same census window.
+    // Covered in-window at the terminal of the same census window.
     assert!(last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.index.claude_account_deferred_hold_count() <= 1);

@@ -541,7 +541,7 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     );
 }
 
-/// [behaviour] L05: child metadata and a Desktop title re-select the file
+/// [behaviour] Child metadata and a Desktop title re-select the file
 /// (its sidecar fingerprint) and never void its reduction.
 #[test]
 fn child_metadata_and_desktop_identity_reselect_without_invalidating_reduction() {
@@ -677,7 +677,7 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     let held = settle(cached);
     f.evidence(2);
     // The quarantine's re-read re-folds the unchanged transcript from stored
-    // state (L02); its body is the cold Full's.
+    // state; its body is the cold Full's.
     let recovered = enriched(&f, raw_scan(&f, held.clone(), Some(cache), |_| {}));
     assert_layout_mode(recovered.modes, (0, 0, 1));
     assert_oracle(&f, &recovered, held);

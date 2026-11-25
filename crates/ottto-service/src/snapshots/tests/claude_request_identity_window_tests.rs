@@ -2538,7 +2538,7 @@ fn sticky_frozen_row_moved_to_a_new_row_key_counts_vanished_without_changing_the
 
 #[test]
 fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
-    // C9: with share protection off (no key), without hints and with
+    // With share protection off (no key), without hints and with
     // hints, no top rollup or bucket row may carry a part lacking a cost its
     // row carries. Presence is absent, reported zero or positive per field.
     let mut seed = 0x9e37_79b9_7f4a_7c15_u64;

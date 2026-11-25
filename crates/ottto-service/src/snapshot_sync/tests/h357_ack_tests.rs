@@ -444,7 +444,7 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
     assert_eq!(clean.last_success_at, clean.last_scan_finished_at);
 }
 
-/// [regress] H359 server-permanent exact bodies cannot resend after restart,
+/// [regress] Server-permanent exact bodies cannot resend after restart,
 /// even when version-only witness normalization needs a diagnostic save.
 #[test]
 #[serial_test::serial(client_report)]
@@ -2024,7 +2024,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
     );
 }
 
-/// T5: a retryable deferral stays `server_error`, whatever the ledger holds.
+/// A retryable deferral stays `server_error`, whatever the ledger holds.
 #[test]
 fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
     let mut ledger = progress();
@@ -2038,7 +2038,7 @@ fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
     }
 }
 
-/// F1: a newer body of a refused entity with a retryable conflict owes its own
+/// A newer body of a refused entity with a retryable conflict owes its own
 /// outcome. The older dominated refusal is no longer the entity's terminal
 /// record, so it cannot make the cycle a settled success.
 #[test]
