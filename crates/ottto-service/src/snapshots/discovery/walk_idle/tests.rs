@@ -622,8 +622,10 @@ fn gate_decision_matches_the_boolean_chain() {
             [0, 1, 2, 3, 4, 5, 6, 7].map(bit);
         restart_for_test();
         crate::snapshot_watcher::cover_paths_for_test(covered.then(|| fixture.roots.clone()));
-        let mut index = ScanIndex::default();
-        index.bounded_sweep_had_unsettled_upload = owes;
+        let index = ScanIndex {
+            bounded_sweep_had_unsettled_upload: owes,
+            ..ScanIndex::default()
+        };
         let pass = fixture.pass(&index, "a");
         let other = fixture.pass(&index, "b");
         with_slot(source, |slot| {
@@ -668,8 +670,10 @@ fn arm_decision_matches_the_boolean_chain() {
         let bit = |n: u32| bits & (1 << n) != 0;
         let [settled, outside_nothing, owes, has_start, same] = [0, 1, 2, 3, 4].map(bit);
         restart_for_test();
-        let mut index = ScanIndex::default();
-        index.bounded_sweep_had_unsettled_upload = owes;
+        let index = ScanIndex {
+            bounded_sweep_had_unsettled_upload: owes,
+            ..ScanIndex::default()
+        };
         let pass = fixture.pass(&index, "a");
         let other = fixture.pass(&index, "b");
         with_slot(source, |slot| {
