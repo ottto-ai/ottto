@@ -14,12 +14,13 @@ use crate::control::install_owner_for_path;
 use crate::control::local_lifecycle_home_dir;
 use crate::control::local_relay_base_url_for_daemon;
 use crate::control::lock_managed_claude_settings;
+use crate::control::refresh_setup_run_token_via_device_secret;
 use crate::control::release_channel_from_str;
 use crate::control::repair_claude_statusline_for_refresh_at;
 use crate::control::repair_registered_managed_claude_relay_settings_locked;
 use crate::control::require_authorized_local_client;
 use crate::control::setup::claims::credentials::refresh_cloud_setup_run_token_checked;
-use crate::control::setup_run_token_for_connection;
+use crate::control::setup::claims::credentials::setup_run_token_for_connection_with_refresh;
 use crate::control::source_patch_disabled;
 use crate::control::terminal_refresh_rejection;
 use crate::control::thread;
@@ -39,6 +40,7 @@ use crate::control::LocalApiError;
 use crate::control::LocalConnectionBinding;
 use crate::control::LocalDaemon;
 use crate::control::PathBuf;
+use crate::control::RefreshedSetupRunToken;
 use crate::control::ReleaseChannel;
 use crate::control::ReleaseManifest;
 use crate::control::RequestAuthorization;
@@ -169,6 +171,7 @@ fn observe_agent_read(
         authorization,
         command,
         |api_base_url| validated_api_base_url(Some(api_base_url)),
+        refresh_setup_run_token_via_device_secret,
         |api_base_url, connection, setup_run_token| {
             agent_read_with_refresh(api_base_url, connection, setup_run_token, &read_url)
         },
@@ -203,23 +206,28 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
 /// that binding has since been replaced. Reads of one binding also run
 /// concurrently with each other, so a success clears only the rejection that
 /// was already recorded when this read started, never a newer one.
+/// `validate_api` and `refresh` accept the same APIs, so a missing token is refreshed against
+/// the API the read itself trusts.
 fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
     validate_api: fn(&str) -> Result<String, LocalApiError>,
+    refresh: fn(&str, &LocalConnectionBinding) -> Result<RefreshedSetupRunToken, LocalApiError>,
     read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
     let (api_base_url, start) =
         setup_run_agent_read_binding(daemon, authorization, command, validate_api)?;
-    let result =
-        setup_run_token_for_connection(&api_base_url, &start.binding).and_then(|credentials| {
-            read(
-                &api_base_url,
-                &credentials.connection,
-                &credentials.setup_run_token,
-            )
-        });
+    let result = setup_run_token_for_connection_with_refresh(&start.binding, || {
+        refresh(&api_base_url, &start.binding)
+    })
+    .and_then(|credentials| {
+        read(
+            &api_base_url,
+            &credentials.connection,
+            &credentials.setup_run_token,
+        )
+    });
     match &result {
         Ok(_) => {
             let _ = daemon.record_setup_run_read_accepted(&start);
@@ -248,6 +256,9 @@ pub(super) fn cloud_status(
         authorization,
         "ottto cloud",
         crate::control::cloud_connect::validated_cloud_api_base_url,
+        |api_base_url, connection| {
+            refresh_cloud_setup_run_token_checked(api_base_url, connection, |_| Ok(()))
+        },
         |api_base_url, connection, setup_run_token| {
             let web = crate::control::cloud_connect::paired_connect_url(api_base_url);
             match cloud_status_with_base(
