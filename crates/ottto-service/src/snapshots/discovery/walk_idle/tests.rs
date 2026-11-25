@@ -58,7 +58,7 @@ impl Fixture {
     }
 
     fn gate(&self, index: &ScanIndex, now: u64) -> bool {
-        gate(self.source, &self.pass(index, "a"), index, true, now)
+        gate(self.source, &self.pass(index, "a"), index, None, now)
     }
 
     /// One walking pass at `now` that retires a clean walk started then.
@@ -147,7 +147,7 @@ fn armed_follows_the_record() {
     assert!(!armed(SnapshotSource::Pi), "per source");
     assert!(fixture.gate(&index, START + 1800), "an idle pass");
     assert!(armed(source), "an idle pass keeps it");
-    clear(source);
+    clear(source, "lane");
     assert!(!armed(source), "cleared");
     fixture.walk(&index, START + 3600);
     assert!(armed(source), "re-armed");
@@ -542,4 +542,67 @@ fn sidecar_and_launch_inbox_events_walk_an_idle_source() {
         wake();
         assert!(!fixture.gate(&index, at + 120), "{name}: the event walks");
     }
+}
+
+/// The counts-only `walk_gate` points: a pass that starts a walk names its
+/// first failing condition, a resting pass reports nothing, and a finish that
+/// retires a walk names whether it armed.
+#[test]
+fn walk_gate_points_name_the_veto_and_the_arm() {
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    let index = ScanIndex::default();
+    let points = |run: &dyn Fn()| -> Vec<serde_json::Value> {
+        let ((), rows) = crate::local_resource_diagnostics::capture(run);
+        rows.into_iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .map(|row| row["counts"].clone())
+            .collect()
+    };
+    let veto = |why: &str| vec![serde_json::json!({ "rest_veto": why })];
+    let arm = |outcome: &str| vec![serde_json::json!({ "arm": outcome })];
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START))),
+        veto("gap"),
+        "no earlier pass"
+    );
+    assert_eq!(points(&|| fixture.arm(&index, START)), arm("armed"));
+    assert!(points(&|| assert!(fixture.gate(&index, START + 60))).is_empty());
+    let [pending, _] = crate::launch_events::inbox_dirs(&fixture.scratch);
+    std::fs::create_dir_all(&pending).unwrap();
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 120))),
+        veto("key:launch_inbox")
+    );
+    fixture.arm(&index, START + 120);
+    clear(source, "hint");
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 180))),
+        veto("cleared:hint")
+    );
+    fixture.arm(&index, START + 180);
+    let owed = |now| {
+        let pass = fixture.pass(&index, "a");
+        assert!(!gate(source, &pass, &index, Some("ack_capacity"), now));
+    };
+    assert_eq!(points(&|| owed(START + 240)), veto("upload:ack_capacity"));
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 300))),
+        veto("no_record")
+    );
+    let mut scan = SourceScanResult::empty(source);
+    scan.census_complete = true;
+    let path = fixture.scratch.join("index");
+    assert_eq!(
+        points(&|| arm_after_finish(fixture.pass(&index, "a"), &index, &path, &scan, true)),
+        arm("not:unsettled")
+    );
+    fixture.walk(&index, START + 360);
+    for gap in (1800..WALK_GAP).step_by(1800) {
+        assert!(fixture.gate(&index, START + 360 + gap));
+    }
+    assert_eq!(
+        points(&|| assert!(!fixture.gate(&index, START + 360 + WALK_GAP))),
+        veto("backstop")
+    );
 }

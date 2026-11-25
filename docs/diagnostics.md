@@ -1751,6 +1751,29 @@ or a restart makes the next pass walk, and a settled source still walks at
 least once every listing interval (three hours). Codex home side files are not
 inputs: a change to them waits for the next walk.
 
+Each pass that starts a walk instead of resting
+emits one `local_resources` point with stage `walk_gate` and a fixed-enum
+`rest_veto`: the first condition that failed, in the gate's order. The values
+are `uncovered` (no live watcher over every root), `upload:<kind>` (owed
+upload or cycle work: `backfill`, `reoffer`, `fresh_index`, `copy_prefix`,
+`ack_capacity`, `cache_heads`, `context_resend`, `head_conflict`,
+`identity_503`, `quarantine_retry`, `reason_reoffer`, `quarantine_due`,
+`continuation`, `telemetry`), `gap` (no pass within the pass gap, including
+the first pass after a start), `key:<input>` (the first gate input that moved:
+`scope`, `index_path`, `context`, `replay`, `hint`, `policy`, `upload_context`,
+`telemetry`, `launch_inbox`, `sidecar_epoch`), `generation`, `backstop`,
+`owes:<kind>` (index debt: `persistence`, `unsettled_upload`, `decode_hold`,
+`account_hold`, `authority_quarantine`, `authority_correction`,
+`growth_claim`, `file_debt`), `cleared:<why>` (the record was dropped by a
+`hint`, a `listing` request, `disabled` collection, an `account_switch`,
+`walk_all`, a `failure`, a `resumed` source or an `idle_page_walked`) and
+`no_record`. A rest the gate allowed but the scan's sidecar or census health
+check refused reports `health`. Passes inside a walk and resting passes emit
+nothing. A finish that retires a walk emits one `walk_gate` point with `arm`:
+`armed`, or `not:<why>` (`unsettled`, `upload`, `telemetry_unread`,
+`owes:<kind>`, `no_start`, `key:<input>` for an input that moved during the
+walk, or `generation`). Counts and enum names only.
+
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher
 hint announced. `listing_changes_by_class` splits that total into six rows of

@@ -1272,7 +1272,7 @@ pub(super) fn finish_sync_source(
     }
     // A pass that started a walk while finishing is an ordinary page.
     if std::mem::take(&mut scan_result.walk_idle) {
-        crate::snapshots::walk_idle::clear(source);
+        crate::snapshots::walk_idle::clear(source, "idle_page_walked");
     }
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
