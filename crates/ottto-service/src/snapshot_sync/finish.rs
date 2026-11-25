@@ -2644,8 +2644,10 @@ pub(super) fn finish_sync_source(
                 source.api_slug()
             );
         } else if !resolved_permanent_rejections {
+            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "entity_deferred");
             return Err(snapshot_entity_deferred(count));
         }
+        crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "entity_refused");
         // Permanent refusals remain disclosed after the durable save; a
         // reporting failure does not change the resolved transport outcome.
         return Ok(());
@@ -2672,7 +2674,10 @@ pub(super) fn finish_sync_source(
                 counts,
                 state: CollectorState::Success,
             },
-        )?;
+        )
+        .inspect_err(|_| {
+            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "receipt_failed");
+        })?;
         if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
             let now = crate::scan_clock::utc_seconds();
             let outside = cycle_owed_nothing

@@ -101,6 +101,14 @@ pub(crate) fn report_health_veto(source: SnapshotSource) {
     report(source, "rest_veto", "health");
 }
 
+/// A finish that retires a walk but exits before arming (`why`) still
+/// reports `arm`.
+pub(crate) fn report_retired_unarmed(source: SnapshotSource, index: &ScanIndex, why: &str) {
+    if index.traversal.is_none() {
+        report(source, "arm", &format!("not:{why}"));
+    }
+}
+
 impl Pass {
     /// Every input that decides a walk's reads and no hint announces.
     /// Codex home side files (state, thread history, session index, config)
@@ -121,7 +129,7 @@ impl Pass {
     ) -> Self {
         let window = effective_backfill_window_days(days);
         let mut digest = Sha256::new();
-        let mut parts = [0; KEY_PARTS.len()];
+        let mut parts = [0_u64; KEY_PARTS.len()];
         let mut add = |part: usize, bytes: &[u8]| {
             update_length_prefixed(&mut digest, bytes);
             let mut fold = Sha256::new();
@@ -203,11 +211,11 @@ pub(crate) fn gate(
     outside_owes: Option<&'static str>,
     now: u64,
 ) -> bool {
-    with_slot(source, |slot| {
+    let veto = with_slot(source, |slot| {
         let previous = slot.last_pass_at.replace(now);
         if index.traversal.is_some() {
             slot.record = None;
-            return false;
+            return None;
         }
         slot.walk_start = Some((pass.clone(), now));
         let veto = if !pass.covered {
@@ -234,14 +242,20 @@ pub(crate) fn gate(
                     .map_or("no_record".to_owned(), |why| format!("cleared:{why}")),
             )
         };
-        let Some(veto) = veto else {
-            return true;
-        };
-        slot.record = None;
-        slot.cleared = None;
-        report(source, "rest_veto", &veto);
-        false
-    })
+        if veto.is_some() {
+            slot.record = None;
+            slot.cleared = None;
+        }
+        Some(veto)
+    });
+    match veto {
+        Some(Some(veto)) => {
+            report(source, "rest_veto", &veto);
+            false
+        }
+        Some(None) => true,
+        None => false,
+    }
 }
 
 /// After a successful finish: arm on a clean walk whose inputs held still.
@@ -270,7 +284,7 @@ pub(crate) fn arm_after_finish(
     } else {
         owes(index, pass.days, crate::scan_clock::utc_seconds()).map(|owed| format!("owes:{owed}"))
     };
-    with_slot(scan.source, |slot| {
+    let reported = with_slot(scan.source, |slot| {
         if scan.walk_idle {
             let record = slot
                 .record
@@ -279,7 +293,7 @@ pub(crate) fn arm_after_finish(
             if let Some((record, generation)) = record.zip(generation) {
                 record.generation = generation;
             }
-            return;
+            return None;
         }
         // The backstop runs from the walk's first pass, on the gate's clock.
         let outcome = match (unsettled, slot.walk_start.as_ref(), generation) {
@@ -291,12 +305,9 @@ pub(crate) fn arm_after_finish(
             (None, Some(_), None) => Err("generation".to_owned()),
             (None, Some(&(_, started_at)), Some(generation)) => Ok((started_at, generation)),
         };
-        if index.traversal.is_none() {
-            let value = outcome
-                .as_ref()
-                .map_or_else(|why| format!("not:{why}"), |_| "armed".to_owned());
-            report(scan.source, "arm", &value);
-        }
+        let value = outcome
+            .as_ref()
+            .map_or_else(|why| format!("not:{why}"), |_| "armed".to_owned());
         slot.record = outcome.ok().map(|(started_at, generation)| Record {
             pass,
             generation,
@@ -305,7 +316,11 @@ pub(crate) fn arm_after_finish(
         if slot.record.is_some() {
             slot.cleared = None;
         }
+        index.traversal.is_none().then_some(value)
     });
+    if let Some(value) = reported {
+        report(scan.source, "arm", &value);
+    }
 }
 
 /// The generation the next prepare loads, after this pass's last commit (the
@@ -324,12 +339,8 @@ pub(crate) fn idle_finish(index: &ScanIndex) -> bool {
     index.traversal.is_none()
 }
 
-/// Nothing in the index needs a walk (a due audit waits for the backstop).
-pub(in crate::snapshots) fn owes_nothing(index: &ScanIndex, days: u64, now: u64) -> bool {
-    owes(index, days, now).is_none()
-}
-
-/// The first kind of index debt that needs a walk, if any.
+/// The first kind of index debt that needs a walk, if any (a due audit waits
+/// for the backstop).
 fn owes(index: &ScanIndex, days: u64, now: u64) -> Option<&'static str> {
     if !index.persistence_available() {
         Some("persistence")

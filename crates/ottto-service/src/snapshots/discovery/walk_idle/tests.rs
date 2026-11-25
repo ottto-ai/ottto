@@ -203,7 +203,7 @@ fn changed_input_walks_and_changing_back_still_walks() {
         SnapshotSource::ClaudeCode,
         &changed,
         &index,
-        true,
+        None,
         START + 60
     ));
     assert!(
@@ -222,7 +222,7 @@ fn backfill_window_flip_walks_and_flipping_back_still_walks() {
         SnapshotSource::ClaudeCode,
         &narrow,
         &index,
-        true,
+        None,
         START + 60
     ));
     assert_eq!(armed_for_test(SnapshotSource::ClaudeCode), None);
@@ -252,7 +252,7 @@ fn owed_upload_work_walks_and_clears_the_record() {
         SnapshotSource::Codex,
         &pass,
         &index,
-        false,
+        Some("ack_capacity"),
         START + 60
     ));
     assert!(!fixture.gate(&index, START + 120), "the record is gone");
@@ -498,7 +498,7 @@ fn projection_owes_iff_walk_selects() {
         }
         assert!(!projected || walk_selects, "mask {mask:#08b}");
         selected += usize::from(projected);
-        let owed = !owes_nothing(&index, DAYS, START);
+        let owed = !owes(&index, DAYS, START).is_none();
         assert_eq!(owed, projected || mask & 0b1000 != 0, "mask {mask:#08b}");
     }
     assert!(selected > 0 && selected < 64);
@@ -506,7 +506,7 @@ fn projection_owes_iff_walk_selects() {
     let mut index = ScanIndex::default();
     settled_entry(&mut index, START - (DAYS + 1) * 86_400);
     index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = None;
-    assert!(owes_nothing(&index, DAYS, START));
+    assert!(owes(&index, DAYS, START).is_none());
 }
 
 /// Wakes no transcript hint names, each idle -> event -> walk: a watched
@@ -607,9 +607,10 @@ fn walk_gate_points_name_the_veto_and_the_arm() {
     );
 }
 
-/// The gate's rest decision equals the pre-diagnostic boolean chain for every
-/// combination of its predicates (a walk in progress returns before any of
-/// them), and exactly the non-resting passes emit one `walk_gate` point.
+/// With no walk in progress, the gate's rest decision equals the
+/// pre-diagnostic boolean chain for every combination of these eight
+/// predicates (the upload and index debt bits stand in for every owed kind),
+/// and exactly the non-resting passes emit one `walk_gate` point.
 #[test]
 fn gate_decision_matches_the_boolean_chain() {
     let source = SnapshotSource::Pi;
@@ -654,8 +655,10 @@ fn gate_decision_matches_the_boolean_chain() {
     }
 }
 
-/// The arm decision equals the pre-diagnostic chain for every combination of
-/// its predicates, and the retiring finish reports exactly that outcome.
+/// For a retiring, non-idle finish with a confirmed generation and no
+/// telemetry-unread hold, the arm decision equals the pre-diagnostic chain for
+/// every combination of these five predicates, and the finish reports exactly
+/// that outcome.
 #[test]
 fn arm_decision_matches_the_boolean_chain() {
     let source = SnapshotSource::Pi;
