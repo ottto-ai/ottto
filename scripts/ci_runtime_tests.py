@@ -74,6 +74,10 @@ DOCTEST_FAILED = re.compile(r"error: doctest failed")
 NOT_EXECUTED = re.compile(r"could not execute process")
 RERUN = re.compile(r"error: test failed, to rerun pass ")
 TARGETS_FAILED = re.compile(r"error: (\d+) targets? failed")
+# libtest's closing list: a "failures:" header, then one indented name per
+# line. Unlike "test NAME ... FAILED", other output never splits it.
+FAILURES_HEADER = re.compile(r"^failures:$")
+FAILURE_NAME = re.compile(r"^    (\S+)$")
 SERVICE_LIB = ["-p", "ottto-service", "--lib"]
 # Money suites must fail on the first red; a retry never hides one. Every
 # module whose file calls the money oracle is added at startup (oracle_modules).
@@ -257,7 +261,9 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
     a binary that never started also gets `process didn't exit successfully` or
     `could not execute process`. A binary is retriable only with exactly one
     rerun line, neither of those, FAILED names, and a last summary that counts
-    exactly those names. Everything else blocks the retry: a binary without a
+    exactly those names. A name comes from its `test NAME ... FAILED` line or
+    from libtest's closing `failures:` list; with --nocapture another test's
+    output can land between NAME and FAILED, and then only the list names it. Everything else blocks the retry: a binary without a
     summary, a failed doc-test, a crash (a child probe's clean summary is not
     the binary's own), cargo error lines outside any binary, or a closing
     `error: N targets failed` that is missing or does not count the rerun lines.
@@ -266,6 +272,8 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
     summary_failed: dict[str, int] = {}
     reruns: dict[str, int] = {}
     abnormal: set[str] = set()
+    listed: dict[str, set[str]] = {}  # names in the closing list before each binary's last summary
+    pending: set[str] | None = None   # names after the latest "failures:" header
     stray: list[str] = []
     targets_failed = None
     current = None
@@ -290,8 +298,16 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
         if running or doc:
             current = Path(running.group(1)).name if running else f"doc-tests {doc.group(1)}"
             failed.setdefault(current, set())
+            pending = None
             continue
         if current is None:
+            continue
+        if FAILURES_HEADER.match(line):
+            pending = set()  # libtest may print two headers (output, then names); the last one lists the names
+            continue
+        listed_name = FAILURE_NAME.match(line)
+        if listed_name and pending is not None:
+            pending.add(listed_name.group(1))
             continue
         for match in libtest_log.RESULT.finditer(line):
             if match.group(2) == "FAILED":
@@ -300,6 +316,10 @@ def failures_by_binary(lines: list[str]) -> tuple[dict[str, list[str]], list[str
         if summary:
             # Tests that re-run their binary print a summary first; the last one wins.
             summary_failed[current] = int(summary.group(2))
+            listed[current] = pending or set()
+            pending = None
+    for binary, names in listed.items():
+        failed[binary] |= names
     unretriable = {binary for binary in failed if binary not in summary_failed}
     for binary, names in failed.items():
         if not (names or reruns.get(binary) or binary in abnormal or summary_failed.get(binary)):
