@@ -970,6 +970,7 @@ def check_public_skeleton_contracts() -> None:
         "scripts/macos_public_rc_gate.sh",
         "scripts/macos_stable_preflight.sh",
         "scripts/macos_stable_qa_evidence_template.sh",
+        "scripts/macos_stable_qa_summary.sh",
         "scripts/public_repo_contract_check.sh",
         "scripts/public_repo_secret_scan.sh",
         "scripts/public_repo_surface_ci.sh",
@@ -982,6 +983,7 @@ def check_public_skeleton_contracts() -> None:
         "scripts/test_macos_manifest_signature.sh",
         "scripts/test_macos_stable_release_workflow.sh",
         "scripts/test_macos_stable_qa_evidence_template.sh",
+        "scripts/test_macos_stable_qa_summary.sh",
         "scripts/public_repo_manifest.sh",
     )
     for relative in required_executables:

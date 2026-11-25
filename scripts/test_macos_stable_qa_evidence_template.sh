@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$ROOT/scripts/macos_stable_qa_evidence_template.sh"
 CLOSEOUT_GATE="$ROOT/scripts/macos_stable_closeout_gate.sh"
+SUMMARY="$ROOT/scripts/macos_stable_qa_summary.sh"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -129,110 +130,146 @@ write_manifest() {
   }' > "$output"
 }
 
-manifest="$tmp_dir/release-manifest.json"
-evidence="$tmp_dir/stable-clean-machine-qa.json"
+release_dir="$tmp_dir/release"
+private_dir="$tmp_dir/private"
+mkdir -p "$release_dir" "$private_dir"
+manifest="$release_dir/release-manifest.json"
+record="$private_dir/stable-clean-machine-qa.record.json"
+summary="$release_dir/stable-clean-machine-qa.json"
 write_manifest "$manifest"
+
+expect_template_error() {
+  local expected_code="$1"
+  local message="$2"
+  shift 2
+  local code=0
+  "$TEMPLATE" "$@" >"$tmp_dir/template-error.out" 2>&1 || code=$?
+  if [[ "$code" != "$expected_code" ]]; then
+    echo "Expected template exit $expected_code ($message), got $code" >&2
+    cat "$tmp_dir/template-error.out" >&2
+    exit 1
+  fi
+  if [[ -n "$message" ]] && ! grep -qF -- "$message" "$tmp_dir/template-error.out"; then
+    echo "Template error is missing: $message" >&2
+    cat "$tmp_dir/template-error.out" >&2
+    exit 1
+  fi
+}
 
 "$TEMPLATE" \
   --manifest "$manifest" \
-  --output "$evidence" \
+  --output "$record" \
+  --host-class signing_mac \
   --checked-at "2026-05-21T19:05:00Z" \
   --macos-version "15.5" \
   --arch "arm64" \
-  >/tmp/stable-qa-template.out
+  >"$tmp_dir/template.out"
 
-test -f "$evidence"
-grep -q "stable-qa-template: wrote" /tmp/stable-qa-template.out
+test -f "$record"
+grep -qF "stable-qa-template: wrote private record stable-clean-machine-qa.record.json" "$tmp_dir/template.out"
 jq -e \
   --arg manifest_sha "$(shasum -a 256 "$manifest" | awk '{print $1}')" \
   '
-    .schema_version == 1
+    def not_run: . == {result: "not_run", method: "TODO_live_scripted_or_static"};
+    .schema_version == 2
+    and .evidence_kind == "private_record"
     and .gate == "stable_clean_machine_qa"
     and .status == "not_run"
     and .checked_at == "2026-05-21T19:05:00Z"
-    and .manifest.product == "ottto-local-platform"
-    and .manifest.channel == "stable"
-    and .manifest.version == "0.1.0"
-    and .manifest.commit == "244f7ea90a7a"
-    and .manifest.sha256 == $manifest_sha
-    and .environment.host_kind == "clean_macos"
-    and .environment.macos_version == "15.5"
-    and .environment.arch == "arm64"
+    and .manifest == {product: "ottto-local-platform", channel: "stable", version: "0.1.0", commit: "244f7ea90a7a", sha256: $manifest_sha}
+    and .environment == {host_class: "signing_mac", macos_version: "15.5", arch: "arm64"}
+    and (.operator_notes | type == "array" and length > 0)
     and ([.install_owners[].owner] | sort == ["app_bundle", "homebrew", "hosted_installer"])
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.formula_syntax == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.app_launch_preserves_owner == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.runtime == "ottto-service")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.service_label == "net.ottto.service")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.version == "0.1.0")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.release_channel == "stable")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.install_owner == "homebrew")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.protocol_version == 15)
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.release_manifest_sha256 == $manifest_sha)
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.setup_browser_claim == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.verify_codex_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.doctor_owner_drift_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.fix_codex_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.diagnostics_collect_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.logout_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.update_check_owner_json == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.post_upgrade_app_relaunch_preserves_owner == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.reinstall == "not_run")
-    and (.install_owners[] | select(.owner == "homebrew") | .checks.reonboard_after_keychain_wipe == "not_run")
-    and (.install_owners[] | select(.owner == "hosted_installer") | .checks.native_gatekeeper == "not_run")
-    and (.install_owners[] | select(.owner == "hosted_installer") | .checks.upgrade == "not_run")
-    and (.install_owners[] | select(.owner == "hosted_installer") | .checks.post_reinstall_status_json == "not_run")
-    and (.install_owners[] | select(.owner == "hosted_installer") | .checks.reonboard_after_keychain_wipe == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.artifact_checksum == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.homebrew_second_install_safe_refusal == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.doctor_owner_drift_json == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.update_check_owner_json == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.apps_detect_json == "not_run")
-    and (.install_owners[] | select(.owner == "app_bundle") | .checks.reonboard_after_keychain_wipe == "not_run")
-  ' "$evidence" >/dev/null
+    and all(.install_owners[]; .status == "not_run" and all(.checks[]; not_run))
+    and (.install_owners[] | select(.owner == "homebrew") | .local_platform == {
+      runtime: "ottto-service",
+      service_label: "net.ottto.service",
+      version: "0.1.0",
+      release_channel: "stable",
+      install_owner: "homebrew",
+      protocol_version: 15,
+      release_manifest_sha256: $manifest_sha
+    })
+    and (.install_owners[] | select(.owner == "homebrew") | .checks | keys == ([
+      "formula_syntax", "install", "service_start", "headless_no_app_process", "status_json",
+      "setup_browser_claim", "apps_detect_json", "verify_codex_json", "doctor_json",
+      "doctor_owner_drift_json", "fix_codex_json", "diagnostics_collect_json", "logout_json",
+      "update_check", "update_check_owner_json", "upgrade", "post_upgrade_service_restarts_owned",
+      "uninstall", "reinstall", "post_reinstall_status_json", "reonboard_after_keychain_wipe"
+    ] | sort))
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks | has("move_service_to_app"))
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks | has("homebrew_second_install_safe_refusal"))
+    and (.install_owners[] | select(.owner == "hosted_installer") | .checks | has("native_gatekeeper"))
+  ' "$record" >/dev/null
 
-if "$CLOSEOUT_GATE" --manifest "$manifest" >/tmp/stable-qa-template-closeout.out 2>&1; then
-  echo "Expected closeout gate to reject an unfilled evidence template" >&2
+# The unfilled record cannot become a summary that passes the gate.
+"$SUMMARY" --record "$record" --manifest "$manifest" >/dev/null
+if "$CLOSEOUT_GATE" --manifest "$manifest" >"$tmp_dir/closeout-unfilled.out" 2>&1; then
+  echo "Expected closeout gate to reject an unfilled record's summary" >&2
   exit 1
 fi
-grep -q "template placeholders" /tmp/stable-qa-template-closeout.out
+grep -q "template placeholders" "$tmp_dir/closeout-unfilled.out"
 
+# Fill the record honestly: artifact checks by inspection, the rest live, and
+# private notes that the summary must drop.
 jq '
   .status = "passed"
-  | .install_owners |= map(.status = "passed" | .checks |= with_entries(.value = "passed"))
-' "$evidence" > "$tmp_dir/passed.json"
-mv "$tmp_dir/passed.json" "$evidence"
-"$CLOSEOUT_GATE" --manifest "$manifest" >/tmp/stable-qa-template-passed.out
-grep -q "Stable closeout gate passed" /tmp/stable-qa-template-passed.out
+  | .operator_notes += ["QA ran as the dedicated QA user; details stay in this record."]
+  | .install_owners |= map(
+      .status = "passed"
+      | .checks |= with_entries(
+          .value = (if (.key | IN("artifact_checksum", "formula_syntax", "gatekeeper", "native_gatekeeper"))
+            then {result: "passed", method: "static"}
+            else {result: "passed", method: "live", note: "ran on the target build"} end)))
+' "$record" > "$tmp_dir/filled.json"
+mv "$tmp_dir/filled.json" "$record"
 
-if "$TEMPLATE" --manifest "$manifest" --output "$evidence" >/tmp/stable-qa-template-existing.out 2>&1; then
-  echo "Expected template generation to refuse overwriting existing evidence" >&2
+# [regression] A raw record copied into the release folder never passes.
+cp "$record" "$summary"
+if "$CLOSEOUT_GATE" --manifest "$manifest" >"$tmp_dir/closeout-record.out" 2>&1; then
+  echo "Expected closeout gate to reject a raw private record as public evidence" >&2
   exit 1
 fi
-grep -q "output already exists" /tmp/stable-qa-template-existing.out
+grep -q "A private QA record is inside the release folder" "$tmp_dir/closeout-record.out"
+
+"$SUMMARY" --record "$record" --manifest "$manifest" --force >/dev/null
+"$CLOSEOUT_GATE" --manifest "$manifest" >"$tmp_dir/closeout-passed.out"
+grep -qF "Stable closeout gate passed for 0.1.0 (244f7ea90a7a): stable-clean-machine-qa.json (host class signing_mac;" "$tmp_dir/closeout-passed.out"
+
+# --- record placement and inputs --------------------------------------------
+
+expect_template_error 2 "" --manifest "$manifest" --host-class signing_mac
+expect_template_error 2 "" --manifest "$manifest" --output "$private_dir/no-host.record.json"
+expect_template_error 2 "--host-class must be one of" \
+  --manifest "$manifest" --output "$private_dir/bogus.record.json" --host-class trusted_internal_macos
+expect_template_error 2 "--macos-version must be a macOS product version" \
+  --manifest "$manifest" --output "$private_dir/version.record.json" --host-class signing_mac --macos-version "Sonoma 15"
+expect_template_error 2 "must live outside the release folder" \
+  --manifest "$manifest" --output "$release_dir/qa.record.json" --host-class signing_mac
+mkdir -p "$release_dir/homebrew"
+expect_template_error 2 "must live outside the release folder" \
+  --manifest "$manifest" --output "$release_dir/homebrew/qa.record.json" --host-class signing_mac
+expect_template_error 2 "output already exists" \
+  --manifest "$manifest" --output "$record" --host-class signing_mac
+
+for host_class in clean_vm clean_macos qa_user_on_shared_mac developer_mac; do
+  "$TEMPLATE" --manifest "$manifest" --output - --host-class "$host_class" >"$tmp_dir/host.json"
+  jq -e --arg host_class "$host_class" '.environment.host_class == $host_class' "$tmp_dir/host.json" >/dev/null
+done
 
 bad_required="$tmp_dir/bad-required.json"
 jq 'del(.quality_gates.stable_clean_machine_qa.required_install_owners[] | select(. == "homebrew"))' \
   "$manifest" > "$bad_required"
-if "$TEMPLATE" --manifest "$bad_required" --output "$tmp_dir/bad-required-evidence.json" >/tmp/stable-qa-template-bad-required.out 2>&1; then
-  echo "Expected template generation to reject missing required install owners" >&2
-  exit 1
-fi
-grep -q "required_install_owners is missing supported owner(s): homebrew" /tmp/stable-qa-template-bad-required.out
+expect_template_error 1 "required_install_owners is missing supported owner(s): homebrew" \
+  --manifest "$bad_required" --output "$private_dir/bad-required.record.json" --host-class signing_mac
 
 dev_manifest="$tmp_dir/dev-manifest.json"
 jq '.channel = "dev"' "$manifest" > "$dev_manifest"
-if "$TEMPLATE" --manifest "$dev_manifest" --output - >/tmp/stable-qa-template-dev.out 2>&1; then
-  echo "Expected template generation to reject non-stable manifests" >&2
-  exit 1
-fi
-grep -q "expected stable manifest" /tmp/stable-qa-template-dev.out
+expect_template_error 1 "expected stable manifest" --manifest "$dev_manifest" --output - --host-class signing_mac
 
 stale_protocol_manifest="$tmp_dir/stale-protocol-manifest.json"
 jq '.min_protocol_version = 11' "$manifest" > "$stale_protocol_manifest"
-if "$TEMPLATE" --manifest "$stale_protocol_manifest" --output - >/tmp/stable-qa-template-stale-protocol.out 2>&1; then
-  echo "Expected template generation to reject stale protocol manifests" >&2
-  exit 1
-fi
-grep -q "min_protocol_version must be 15" /tmp/stable-qa-template-stale-protocol.out
+expect_template_error 1 "min_protocol_version must be 15" \
+  --manifest "$stale_protocol_manifest" --output - --host-class signing_mac
 
 echo "macos_stable_qa_evidence_template tests passed"
