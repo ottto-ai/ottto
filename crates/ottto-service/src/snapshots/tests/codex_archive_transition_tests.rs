@@ -656,7 +656,11 @@ fn compression_carries_only_a_proven_complete_read() {
         let archive = if recorded {
             crate::snapshots::codex_rollout_carry::codex_archive_bytes(&plain)
         } else {
-            zstd::stream::encode_all(&plain[..], 1).unwrap()
+            // An archive whose frame header records no plaintext length.
+            let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+            encoder.include_contentsize(false).unwrap();
+            encoder.write_all(&plain).unwrap();
+            encoder.finish().unwrap()
         };
         let compressed = original.with_extension("jsonl.zst");
         fs::write(&compressed, archive).unwrap();
