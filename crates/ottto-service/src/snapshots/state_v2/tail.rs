@@ -465,6 +465,17 @@ impl TailStage {
             .checkpoint = Some(Err(cause));
         self.report();
     }
+    pub(super) fn clear_set_aside(&mut self, key: &str) {
+        let bytes = key.as_bytes();
+        if let Some(entry) = self.files.get_mut(bytes)
+            && matches!(entry.checkpoint, Some(Err(_)))
+        {
+            entry.checkpoint = None;
+            if entry.job.is_none() {
+                self.files.remove(bytes);
+            }
+        }
+    }
     /// `keys` must be authoritative: the files are absent, or their stored
     /// state is void. Anything staged for them is stale and goes.
     pub(super) fn retire(&mut self, keys: impl IntoIterator<Item = String>) {

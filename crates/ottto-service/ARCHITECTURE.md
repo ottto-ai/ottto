@@ -1012,6 +1012,9 @@ Only an exact body ACK replaces a slot's counted, nonzero request hashes, includ
 Copy removals consult those hashes before local ownership and census evidence.
 An unreadable Claude Tail carrier leaves its saved removal groups in place.
 A page that needs that carrier's proof withholds the copy through the request-owned hold.
+A committed carrier head that stays unreadable for two saves is set aside for one counted
+re-read. A newer-format head stays held. `claude_carrier_unknown` is recorded at reconcile
+and again per page, so it can count a key more than once per pass.
 Once the head can be read, a confirmed loss runs the ordinary copy correction.
 Rows survive refusal, temporary census loss, historical replay and bounded rebuilds.
 A destination change clears them; positive deletion prunes only hashes no stored copy names.

@@ -303,11 +303,14 @@ pub(in crate::snapshots) type Links = BTreeMap<String, String>;
 pub(in crate::snapshots) struct Carriers {
     pub(in crate::snapshots) links: Links,
     pub(in crate::snapshots) unknown: BTreeSet<String>,
+    pub(in crate::snapshots) unreadable: BTreeSet<String>,
+    pub(in crate::snapshots) unreadable_streak: BTreeSet<String>,
     // Baseline only. These roots still need a definitive loss comparison.
     pending_loss: BTreeSet<String>,
 }
 impl Carriers {
     pub(in crate::snapshots) fn remember(&mut self, before: &Self) {
+        self.unreadable_streak.clone_from(&before.unreadable_streak);
         let unknown = !self.unknown.is_empty();
         if !unknown && before.pending_loss.is_empty() {
             return;
@@ -319,6 +322,20 @@ impl Carriers {
         let carried = self.links.values().collect::<BTreeSet<_>>();
         self.pending_loss
             .extend(lost.filter(|root| !carried.contains(root)).cloned());
+    }
+
+    pub(in crate::snapshots) fn due_repairs(&mut self) -> Vec<&str> {
+        // The streak counts saves, not passes.
+        let prior = std::mem::take(&mut self.unreadable_streak);
+        let mut due = Vec::new();
+        for key in &self.unreadable {
+            if prior.contains(key) {
+                due.push(key.as_str());
+            } else {
+                self.unreadable_streak.insert(key.clone());
+            }
+        }
+        due
     }
 }
 type HeadReader<'a> = dyn FnMut(&[&str]) -> Carriers + 'a;

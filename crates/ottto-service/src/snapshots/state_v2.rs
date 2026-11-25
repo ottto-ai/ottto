@@ -655,19 +655,35 @@ pub(crate) fn fail_next_carrier_save_for_test(index: &ScanIndex) {
 }
 
 #[cfg(test)]
-pub(crate) use import::with_carrier_head_error_for_test;
+pub(crate) use import::{with_carrier_head_error_for_test, with_carrier_store_error_for_test};
 
 #[cfg(test)]
-pub(in crate::snapshots) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+pub(crate) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+    seed_tail_head_for_test(index, |tx| {
+        tail::put_head_for_test(tx, key.as_bytes(), &[0])
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn seed_future_carrier_head_for_test(index: &ScanIndex, key: &str) {
+    seed_tail_head_for_test(index, |tx| tail::future_head_for_test(tx, key.as_bytes()));
+}
+
+#[cfg(test)]
+pub(crate) fn tail_set_aside_attempts_for_test(index: &ScanIndex, key: &str) -> Option<u32> {
+    tail_set_aside(index, key)
+        .unwrap()
+        .map(|marker| marker.attempts)
+}
+
+#[cfg(test)]
+fn seed_tail_head_for_test(
+    index: &ScanIndex,
+    write: impl FnOnce(&mut dyn Transaction) -> Result<()>,
+) {
     runtime::with_session_db(index, |db| {
         let mut tx = db.begin(TxnMode::Write).unwrap();
-        tx.put(RowInput {
-            key: &mapper::key("tail.head", key, 0).unwrap(),
-            fixed: &Fixed::None,
-            value_version: 1,
-            value: &[0],
-        })
-        .unwrap();
+        write(&mut tx).unwrap();
         let next = index.generation + 1;
         assert_eq!(
             tx.commit(index.generation, next),

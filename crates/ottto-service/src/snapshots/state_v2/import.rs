@@ -145,7 +145,8 @@ pub(super) fn save(
     next: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<kinds::Baseline> {
-    let carried = {
+    use super::super::claude_request_money::e2::record_carrier_repairs;
+    let mut carried = {
         let mut tx = db.begin(TxnMode::Read)?;
         kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
         kinds_files::merge_growth_cas(&mut tx, next)?;
@@ -165,7 +166,25 @@ pub(super) fn save(
         super::super::sampled_scan::now_seconds(),
     );
     next.prune_request_contributions();
-    let mut saved = kinds::save_graph(db, identity, previous, next, cx)?;
+    let due = carried.due_repairs();
+    for key in &due {
+        cx.tail
+            .get_or_insert_with(Default::default)
+            .set_aside(key, tail::SetAsideCause::Row);
+    }
+    let mut saved = match kinds::save_graph(db, identity, previous, next, cx) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // A retry must still see the committed head as unknown.
+            if let Some(stage) = &mut cx.tail {
+                for key in due {
+                    stage.clear_set_aside(key);
+                }
+            }
+            return Err(error);
+        }
+    };
+    record_carrier_repairs(due.len());
     next.deleted_holders.clear();
     saved.copy_ownership.1 = carried;
     Ok(saved)
@@ -196,6 +215,21 @@ pub(crate) fn with_carrier_head_error_for_test<T>(key: &str, run: impl FnOnce() 
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_CARRIER_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every committed carrier read inside `run` fails as the store would, not as
+/// one head would.
+#[cfg(test)]
+pub(crate) fn with_carrier_store_error_for_test<T>(run: impl FnOnce() -> T) -> T {
+    FAIL_CARRIER_STORE.with(|fault| assert!(!fault.replace(true)));
+    let result = run();
+    FAIL_CARRIER_STORE.with(|fault| fault.set(false));
+    result
+}
+
 pub(super) fn session_links(
     tx: &mut dyn Transaction,
     keys: &[&str],
@@ -204,6 +238,14 @@ pub(super) fn session_links(
 ) -> Carriers {
     use super::super::tail_source::{self, claude::Claude, TailSource};
     use tail::EffectiveHead;
+    // Only `Unreadable`, a failure of this one committed head, may lead to a
+    // repair read. A store error is not about the head and never does.
+    enum Unknown {
+        Future,
+        Staged,
+        Store,
+        Unreadable,
+    }
     let mut carriers = Carriers::default();
     let mut load = |key: &str| {
         #[cfg(test)]
@@ -215,18 +257,36 @@ pub(super) fn session_links(
             fault.take();
             true
         }) {
-            return Err(());
+            return Err(Unknown::Unreadable);
         }
-        tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation).map_err(|_| ())
+        #[cfg(test)]
+        if FAIL_CARRIER_STORE.with(std::cell::Cell::get) {
+            return Err(Unknown::Store);
+        }
+        // load_head also reports a higher reduction revision as Hold::Future.
+        tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation).map_err(
+            |error| {
+                if error.downcast_ref::<Hold>() == Some(&Hold::Future) {
+                    Unknown::Future
+                } else if error.is::<tail::UnreadableHead>() {
+                    Unknown::Unreadable
+                } else {
+                    Unknown::Store
+                }
+            },
+        )
     };
-    let decode =
-        |revision, body: &[u8]| tail_source::claude_head_session(revision, body).map_err(|_| ());
     for &key in keys {
         let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
             EffectiveHead::Removed => Ok(None),
-            EffectiveHead::Staged(revision, head) => decode(revision, &head),
+            EffectiveHead::Staged(revision, head) => {
+                tail_source::claude_head_session(revision, &head).map_err(|_| Unknown::Staged)
+            }
             EffectiveHead::Committed => load(key).and_then(|head| match head {
-                Some(head) if !head.metadata_only => decode(head.revision, &head.body),
+                Some(head) if !head.metadata_only => {
+                    tail_source::claude_head_session(head.revision, &head.body)
+                        .map_err(|_| Unknown::Unreadable)
+                }
                 _ => Ok(None),
             }),
         };
@@ -235,8 +295,11 @@ pub(super) fn session_links(
                 carriers.links.insert(key.to_owned(), session);
             }
             Ok(None) => {}
-            Err(()) => {
+            Err(reason) => {
                 carriers.unknown.insert(key.to_owned());
+                if matches!(reason, Unknown::Unreadable) {
+                    carriers.unreadable.insert(key.to_owned());
+                }
             }
         }
     }

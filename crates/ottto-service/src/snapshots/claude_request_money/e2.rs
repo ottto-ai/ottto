@@ -2398,7 +2398,7 @@ pub(crate) fn visit_entity_identity_rows(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 24] = [
+const COUNT_NAMES: [&str; 25] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -2423,6 +2423,7 @@ const COUNT_NAMES: [&str; 24] = [
     "copy_prefix_twin_page_removed",
     "side_call_member_hints",
     "claude_carrier_unknown",
+    "claude_carrier_repair",
 ];
 const COUNT_LEN: usize = COUNT_NAMES.len();
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];
@@ -2461,6 +2462,9 @@ fn record_counts(counts: Counts) {
             counter.fetch_add(value, Ordering::Relaxed);
         }
     }
+}
+pub(in crate::snapshots) fn record_carrier_repairs(count: usize) {
+    record_counts(Counts::one(24, count as u64));
 }
 pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))

@@ -326,6 +326,23 @@ pub(in super::super) struct Session {
     path: PathBuf,
     reload: bool,
     stamp: (u64, u64),
+    // Keep just the streak when a pass releases its graph baseline.
+    carrier_unreadable_streak: BTreeSet<String>,
+}
+impl Session {
+    fn save_graph(
+        &mut self,
+        identity: &Identity,
+        mut previous: kinds::Baseline,
+        next: &mut ScanIndex,
+    ) -> Result<kinds::Baseline> {
+        previous.copy_ownership.1.unreadable_streak =
+            std::mem::take(&mut self.carrier_unreadable_streak);
+        let mut saved = import::save(&mut self.db, identity, previous, next, &mut self.cx)?;
+        self.carrier_unreadable_streak =
+            std::mem::take(&mut saved.copy_ownership.1.unreadable_streak);
+        Ok(saved)
+    }
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -350,6 +367,7 @@ fn active(
             path: path.to_owned(),
             reload: false,
             stamp,
+            carrier_unreadable_streak: BTreeSet::new(),
         })),
     })
 }
@@ -740,19 +758,19 @@ pub(in super::super) fn save_locked(
         }
         typed_write(session, |session| {
             session.cx.tail = (!claim_only).then(|| std::mem::take(&mut state.tail));
-            let saved = import::save(&mut session.db, &id, previous, index, &mut session.cx);
+            let saved = session.save_graph(&id, previous, index);
             note_head_writes(state, std::mem::take(&mut session.cx.head_writes));
             // A commit published the stage; otherwise it waits for the next
             // save or the exit commit.
-            if let (Err(_), Some(stage)) = (&saved, session.cx.tail.take()) {
+            if let (false, Err(_), Some(stage)) = (claim_only, &saved, session.cx.tail.take()) {
                 state.tail = stage;
             }
             let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
             // A claim-only save keeps its carrier links for decide; row
-            // diffs re-read the committed rows (it writes no tail stage, so
-            // committed heads still match those links).
+            // diffs re-read the committed rows. The pass's Tail stage stays
+            // pending, so committed heads still match those links.
             if !session.reload {
                 state.save_digests = Some(if claim_only {
                     digests.links_only()

@@ -37,8 +37,7 @@ pub(in crate::snapshots) fn carry_tail(
             typed_write(session, |session| {
                 session.cx.carry = Some((to.to_owned(), carry));
                 session.cx.tail = Some(moved);
-                let saved =
-                    import::save(&mut session.db, &id, previous, &mut next, &mut session.cx);
+                let saved = session.save_graph(&id, previous, &mut next);
                 note_head_writes(state, std::mem::take(&mut session.cx.head_writes));
                 let digests = saved?;
                 session.stamp = session.db.stamp()?;

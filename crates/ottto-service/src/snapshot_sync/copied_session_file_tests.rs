@@ -2069,6 +2069,141 @@ fn carrier_absence_after_unknown_runs_held_correction() {
     assert_eq!(run(true), run(false));
 }
 
+/// Two unreadable saves cause one carrier recovery read, while a newer-format head stays held.
+#[test]
+fn persistent_unreadable_carrier_repairs_after_two_saves() {
+    use crate::snapshots::{
+        e2_pipeline_scan_fixture::{route_of, tail_counter_for_test},
+        state_v2, state_v2_baseline_release,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Head {
+        Healthy,
+        Unreadable,
+        Future,
+    }
+    let run = |head| {
+        with_e2(|| {
+            let (mut c, mut index, [holder, _, carrier]) = local_only_carrier();
+            let key = carrier.to_string_lossy();
+            let holder_key = holder.to_string_lossy();
+            let route = route_of(&index).unwrap();
+            match head {
+                Head::Healthy => {}
+                Head::Unreadable => state_v2::seed_unreadable_tail_head_for_test(&index, &key),
+                Head::Future => state_v2::seed_future_carrier_head_for_test(&index, &key),
+            }
+            index = ScanIndex::load(&route).unwrap();
+            for save in 1..=2 {
+                index.activate_upload_context("e2-synthetic-destination".into());
+                assert_eq!(
+                    e2::carrier_group_owned_for_test(&index, &holder_key),
+                    head == Head::Healthy
+                );
+                index.save_fixture(&route).unwrap();
+                assert_eq!(
+                    state_v2::tail_set_aside_attempts_for_test(&index, &key),
+                    (head == Head::Unreadable && save == 2).then_some(1)
+                );
+                drop(state_v2_baseline_release(&route, &index));
+                index = ScanIndex::load(&route).unwrap();
+            }
+
+            let scanner = carrier_scanner(&index);
+            let before = tail_counter_for_test("tail_reconstruct", "unreadable");
+            let recovery = ready(&c, &scanner, index.clone(), 100, true);
+            assert_eq!(
+                scanner
+                    .paths()
+                    .iter()
+                    .filter(|path| *path == &carrier)
+                    .count(),
+                usize::from(head == Head::Unreadable)
+            );
+            assert_eq!(
+                tail_counter_for_test("tail_reconstruct", "unreadable") - before,
+                u64::from(head == Head::Unreadable)
+            );
+            let mut sent = twin(&recovery);
+            sent.finish();
+            index = settle(&c, &index, recovery, &mut e2_progress());
+            assert!(state_v2::tail_set_aside_attempts_for_test(&index, &key).is_none());
+            index.activate_upload_context("e2-synthetic-destination".into());
+            assert_eq!(
+                e2::carrier_group_owned_for_test(&index, &holder_key),
+                head != Head::Future
+            );
+
+            c.write_at(
+                &file(THIRD),
+                &resumed(
+                    THIRD,
+                    &[A, ("own-branch", "2026-08-02T07:03:20Z", RESUME_WRITER)],
+                ),
+                BORN,
+            );
+            let scanner = carrier_scanner(&index);
+            let mut final_page = c.raw(&scanner, index, 100, true, &[]);
+            final_page.enrich(&c);
+            assert!(!scanner.paths().contains(&carrier));
+            if head == Head::Future {
+                assert_withheld(&final_page, THIRD, "the newer carrier stays held");
+            }
+            final_page.finish();
+            (sent.scan.snapshots, final_page.scan.snapshots)
+        })
+    };
+    let (healthy_recovery, healthy) = run(Head::Healthy);
+    let (recovery_offers, recovered) = run(Head::Unreadable);
+    let (future_offers, future) = run(Head::Future);
+    assert!(healthy_recovery.is_empty());
+    assert!(future_offers.is_empty() && future.is_empty());
+    assert_eq!(healthy.len(), 1);
+    assert_eq!(healthy[0].source_session_id, THIRD);
+    assert_eq!(healthy[0].request_count, 1);
+    for item in recovery_offers.iter().chain(&recovered) {
+        let limit = match item.source_session_id.as_str() {
+            ROOT => 3,
+            COPY => 1,
+            THIRD => healthy[0].request_count,
+            _ => panic!("an unexpected session was offered during carrier recovery"),
+        };
+        assert!(item.request_count <= limit);
+    }
+    assert_eq!(canonical(&recovered), canonical(&healthy));
+}
+
+/// A store error on every carrier read for two saves sets nothing aside and resolves once reads work.
+#[test]
+fn store_wide_carrier_error_never_sets_aside() {
+    use crate::snapshots::{
+        e2_pipeline_scan_fixture::route_of, state_v2, state_v2_baseline_release,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (_c, mut index, [holder, _, carrier]) = local_only_carrier();
+        let key = carrier.to_string_lossy();
+        let holder_key = holder.to_string_lossy();
+        let route = route_of(&index).unwrap();
+        for _ in 1..=2 {
+            index.activate_upload_context("e2-synthetic-destination".into());
+            state_v2::with_carrier_store_error_for_test(|| index.save_fixture(&route)).unwrap();
+            assert!(state_v2::tail_set_aside_attempts_for_test(&index, &key).is_none());
+            drop(state_v2_baseline_release(&route, &index));
+            index = ScanIndex::load(&route).unwrap();
+        }
+        index.activate_upload_context("e2-synthetic-destination".into());
+        index.save_fixture(&route).unwrap();
+        assert!(state_v2::tail_set_aside_attempts_for_test(&index, &key).is_none());
+        assert!(e2::carrier_group_owned_for_test(&index, &holder_key));
+    });
+}
+
 /// Scan decisions reuse the hydrated carrier even when claim-only work has
 /// advanced the store beyond the scan image's generation.
 #[test]
