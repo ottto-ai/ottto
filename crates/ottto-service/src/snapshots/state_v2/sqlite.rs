@@ -55,6 +55,10 @@ fn sample_pager_writes(conn: &Connection, counter: Event) {
 const MMAP_BYTES: i64 = 2_147_418_112;
 const CACHE_KIB: i64 = -8192;
 const BUSY: Duration = Duration::from_millis(100);
+/// How long a just-released owner lock may still look held. A process spawned while the
+/// lock's descriptor is open keeps a copy until its exec, and a loaded machine can take
+/// well over `BUSY` to get there. A real second owner still fails after this wait.
+const OWNER_RELEASE_WAIT: Duration = Duration::from_secs(2);
 const PAGE_HEADERS: usize = 128;
 const JOURNAL_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
 const _: () = assert!(
@@ -426,12 +430,12 @@ fn lock_owner(path: &Path) -> Result<File> {
     private_file(&path)?;
     // A flock belongs to the open file description, which a concurrent fork
     // shares until the child execs. A just-released owner can therefore look
-    // busy for a moment; keep retrying for about BUSY before reporting it.
+    // busy for a moment; keep retrying for up to OWNER_RELEASE_WAIT before reporting it.
     let started = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         ensure!(
             io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
-                && started.elapsed() < BUSY,
+                && started.elapsed() < OWNER_RELEASE_WAIT,
             "state_v2_exclusive_owner_busy"
         );
         std::thread::sleep(Duration::from_millis(2));
