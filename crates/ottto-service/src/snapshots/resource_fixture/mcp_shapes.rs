@@ -52,9 +52,9 @@ const SKILLS: &str = concat!(
 /// MCP names from 31 servers; the nine 64KiB files are Desktop sessions with
 /// 635 names from 26 servers; six of these ten get some names after the first
 /// response. Ten 4KiB files are headless sessions with 58 connector names
-/// from 5 servers. Codex: twenty per hundred carry 19 deferred namespaces at
-/// start; 16 per thousand re-send the block after the first response, 11 of
-/// them with a new namespace. Pi has no MCP lines.
+/// from 5 servers. Codex: 997 per thousand carry 19 deferred namespaces at
+/// start, and three carry none; 16 per thousand re-send the block after the
+/// first response, 11 of them with a new namespace. Pi has no MCP lines.
 pub(super) fn lines(source: SnapshotSource, n: usize, bucket: usize) -> Lines {
     let id = session(n);
     let late = if bucket % 5 < 3 { 1 + bucket % 2 } else { 0 };
@@ -62,10 +62,15 @@ pub(super) fn lines(source: SnapshotSource, n: usize, bucket: usize) -> Lines {
         (SnapshotSource::ClaudeCode, 0) => claude_desktop(&id, 31, 739, 1, 480),
         (SnapshotSource::ClaudeCode, 1..=9) => claude_desktop(&id, 26, 635, late, 300),
         (SnapshotSource::ClaudeCode, 10..=19) => claude_headless(&id, bucket % 4 == 3),
-        (SnapshotSource::Codex, 0..=19) => {
-            // Each thousand files has 200 with the block, ranked 0 to 199.
-            let rank = n / 100 % 10 * 20 + bucket;
-            codex(&id, rank < 16, rank < 11)
+        (SnapshotSource::Codex, _) => {
+            // Each thousand files is ranked 0 to 999; the last three have
+            // no block, as in older Codex versions.
+            let rank = n / 100 % 10 * 100 + bucket;
+            if rank < 997 {
+                codex(&id, rank < 16, rank < 11)
+            } else {
+                Default::default()
+            }
         }
         _ => Default::default(),
     }

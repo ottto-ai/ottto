@@ -17,9 +17,9 @@ hundred Claude files: nine 64KiB Desktop-shaped sessions with 635 MCP names from
 26 servers (32 tools in full in request 1, the rest deferred, instructions
 deltas before and after response 1) and one 1MiB one with 739 names from 31
 servers; six of these ten get some names after response 1. Ten 4KiB headless
-sessions carry 58 connector names from 5 servers. Per hundred Codex files,
-twenty list 19 deferred namespaces at start; per thousand, sixteen re-send the
-block, eleven of them with a new namespace. Native acquisition, policy, exact ACK,
+sessions carry 58 connector names from 5 servers. Per thousand Codex files, 997
+list 19 deferred namespaces at start and three have no block; sixteen re-send
+the block, eleven of them with a new namespace. Native acquisition, policy, exact ACK,
 accepted fingerprint, state save and reload helpers seed the corpus. No live
 provider input, auth material or generated transcript is checked in.
 

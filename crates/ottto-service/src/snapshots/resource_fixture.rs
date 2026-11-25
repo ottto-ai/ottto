@@ -608,8 +608,8 @@ fn resource_corpus_mcp_shares() {
         ("claude/plain/late0", 80),
         ("codex/[19, 1]", 5),
         ("codex/[19, 2]", 11),
-        ("codex/[19]", 184),
-        ("codex/[]", 800),
+        ("codex/[19]", 981),
+        ("codex/[]", 3),
     ];
     let expected = expected.map(|(shape, files)| (shape.to_owned(), files));
     assert_eq!(shapes, BTreeMap::from(expected));
