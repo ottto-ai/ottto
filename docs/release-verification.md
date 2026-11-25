@@ -314,8 +314,9 @@ browser setup claim, app detection, Codex verify, doctor, fix, diagnostics,
 logout, update check, upgrade, uninstall, reinstall, post-reinstall status, and
 re-onboard after a local Keychain wipe. The re-onboard check must start from a
 previously claimed Mac, remove local runtime state and all local telemetry
-device-secret Keychain rows, use dashboard Start fresh to remove the stale
-machine, reinstall, complete browser claim, and prove relay-device
+device-secret Keychain rows, remove that exact installation from the
+dashboard (a fresh install alone does not count), reinstall, complete browser
+claim, and prove relay-device
 provisioning, snapshot creation, and connected account state recover.
 The Homebrew owner is checked headless: `headless_no_app_process` proves the QA
 user has no Ottto app process for the whole Homebrew lane, including after a

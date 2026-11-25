@@ -530,10 +530,13 @@ AWS/CDN prerequisites before publish:
     closeout gate first, and an existing versioned prefix must already hold
     the exact final file set and bytes, so an early upload leaves the version
     unable to take its summary. To test the formula before publishing, use an
-    isolated QA tap that holds the unmodified generated formula, with a QA-only
-    `HOMEBREW_ARTIFACT_DOMAIN` serving the verified stable archives from this
-    release folder at the formula's URLs. For the upgrade check, install the
-    previous published formula first, then switch the QA tap to the target.
+    isolated QA tap that holds the unmodified generated formula, and seed a
+    disposable `HOMEBREW_CACHE` with the verified stable archives from this
+    release folder under the cache file names Homebrew derives from the
+    formula's URLs. Homebrew still checks each archive's SHA-256 against the
+    formula. (`HOMEBREW_ARTIFACT_DOMAIN` does not help here: it rewrites only
+    GitHub Packages URLs.) For the upgrade check, install the previous published
+    formula first, then switch the QA tap to the target.
 12. Generate the private clean-machine QA record from the exact manifest,
     outside the release folder (the template refuses a path inside it, a
     symlink, or a path through a symlink in the folder):
