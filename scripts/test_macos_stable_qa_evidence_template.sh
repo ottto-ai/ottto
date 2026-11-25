@@ -342,6 +342,16 @@ ln -s "$alias_release/release-manifest.json" "$private_dir/linked-manifest.json"
 expect_template_error 2 "the release manifest must not be a symlink" \
   --manifest "$private_dir/linked-manifest.json" --output "$private_dir/via-link.record.json" --host-class signing_mac
 
+# An outside hard link passes the path checks. A forced write must replace
+# that entry while leaving the signed manifest's original bytes intact.
+hard_link_manifest="$alias_release/release-manifest.json"
+hard_link_output="$private_dir/hard-linked.record.json"
+cp "$hard_link_manifest" "$tmp_dir/manifest-before-template.json"
+ln "$hard_link_manifest" "$hard_link_output"
+"$TEMPLATE" --manifest "$hard_link_manifest" --output "$hard_link_output" --host-class signing_mac --force >/dev/null
+cmp "$hard_link_manifest" "$tmp_dir/manifest-before-template.json"
+jq -e '.evidence_kind == "private_record"' "$hard_link_output" >/dev/null
+
 # --- the pre-v2 runbook call stops before writing ----------------------------
 
 # [regression] The old call wrote the evidence straight into the release folder

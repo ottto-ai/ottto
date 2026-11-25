@@ -632,6 +632,18 @@ dir="$(new_case private-path)"
 mutate "$dir" '.environment.arch = "/Users/example/Ottto"'
 expect_failure "$dir" "private path or secret-like material"
 
+# Raw edits preserve the two members that jq would collapse to the last one.
+duplicate_key_error="Stable clean-machine QA evidence contains duplicate JSON keys"
+dir="$(new_case duplicate-environment-leaf)"
+edit_text "$dir/stable-clean-machine-qa.json" '"arch": "arm64"' '"arch": "SYNTHETIC-PRIVATE-MARKER", "arch": "arm64"'
+expect_failure "$dir" "$duplicate_key_error"
+
+dir="$(new_case duplicate-check-result)"
+edit_text "$dir/stable-clean-machine-qa.json" \
+  $'"formula_syntax": {\n          "result": "passed"' \
+  $'"formula_syntax": {\n          "result": "failed", "result": "passed"'
+expect_failure "$dir" "$duplicate_key_error"
+
 # --- the private record stays out of the release folder ----------------------
 
 record_error="A private QA record is inside the release folder"
@@ -649,6 +661,54 @@ dir="$(new_case record-renamed)"
 mkdir -p "$dir/notes"
 printf '{"evidence_kind": "private_record", "operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$dir/notes/qa-notes.json"
 expect_failure "$dir" "$record_error"
+
+# Renamed records use a JSON escape in the kind value and no distinctive suffix.
+# The public summary beside each one is valid.
+for encoding in utf-8 utf-8-sig utf-16 utf-32; do
+  dir="$(new_case "record-renamed-$encoding")"
+  python3 - "$dir/qa-notes.txt" "$encoding" <<'PY'
+import pathlib
+import sys
+
+record = ' \r\n{"evidence_kind": "private\\u005frecord"}\n'
+pathlib.Path(sys.argv[1]).write_bytes(record.encode(sys.argv[2]))
+PY
+  expect_failure "$dir" "$record_error"
+done
+
+dir="$(new_case record-operator-notes-only)"
+printf '{"operator_notes": ["SYNTHETIC-PRIVATE-MARKER"]}\n' > "$dir/qa-notes.txt"
+expect_failure "$dir" "$record_error"
+
+# Large binary artifacts are skipped after the prefix probe. A possible JSON
+# object that exceeds the same scanner's size limit fails closed.
+dir="$(new_case large-binary-artifact)"
+python3 - "$dir/artifact.zip" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as stream:
+    stream.write(b"PK\x03\x04")
+    stream.truncate(20 * 1024 * 1024)
+PY
+expect_pass "$dir"
+
+dir="$(new_case oversized-json-object)"
+python3 - "$dir/large.json" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as stream:
+    stream.write(b"{")
+    stream.truncate(20 * 1024 * 1024)
+PY
+expect_failure "$dir" "Could not scan the release folder for private QA records"
+
+dir="$(new_case unreadable-regular-file)"
+touch "$dir/locked.dat"
+chmod 000 "$dir/locked.dat"
+if [[ ! -r "$dir/locked.dat" ]]; then
+  expect_failure "$dir" "Could not scan the release folder for private QA records"
+fi
+chmod 600 "$dir/locked.dat"
 
 # --- the release folder holds plain files only ---------------------------------
 

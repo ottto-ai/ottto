@@ -96,8 +96,10 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -397,9 +399,31 @@ if output_path is None:
 else:
     if output_path.exists() and not force:
         die("output already exists, pass --force to overwrite it", code=2)
+    temp_path = None
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text, encoding="utf-8")
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=".stable-qa-record.",
+                dir=output_path.parent,
+                delete=False,
+            ) as stream:
+                temp_path = Path(stream.name)
+                stream.write(text)
+            if force:
+                # Replace the directory entry without touching the old inode.
+                os.replace(temp_path, output_path)
+            else:
+                # Atomically create the output only if it is still absent.
+                try:
+                    os.link(temp_path, output_path)
+                except FileExistsError:
+                    die("output already exists, pass --force to overwrite it", code=2)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
     except OSError:
         die("could not write the private QA record")
     print("stable-qa-template: wrote the private QA record")

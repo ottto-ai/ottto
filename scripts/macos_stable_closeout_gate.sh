@@ -372,21 +372,91 @@ if ! evidence_path="$(macos_release_path "$manifest_dir" "stable-clean-machine-q
 fi
 evidence_name="stable-clean-machine-qa.json"
 
-# The full QA record is private. Refuse a record anywhere in the folder, under
-# any name. grep exits 1 when nothing matches and 2 on a read error.
-if ! named_records="$(find "$manifest_dir" -name '*.record.json' -print 2>/dev/null)"; then
-  echo "Could not scan the release folder for private QA records" >&2
-  exit 1
-fi
-grep_status=0
-content_records="$(grep -rlaF '"private_record"' "$manifest_dir" 2>/dev/null)" || grep_status=$?
-if [[ "$grep_status" -gt 1 ]]; then
-  echo "Could not scan the release folder for private QA records" >&2
-  exit 1
-fi
-private_records="$(printf '%s\n%s\n' "$named_records" "$content_records" | sort -u | grep -c . || true)"
-if [[ "$private_records" -gt 0 ]]; then
-  echo "A private QA record is inside the release folder ($private_records file(s)); move it out before publishing" >&2
+# The publisher copies the original file bytes. Identify private records by
+# their decoded top-level members, even when renamed or reserialized.
+if ! python3 - "$manifest_dir" <<'PY'
+import codecs
+import json
+import os
+import stat
+import sys
+
+MAX_JSON_BYTES = 16 * 1024 * 1024
+JSON_WHITESPACE = " \t\r\n"
+
+
+def read_object(stream):
+    bom = stream.peek(4)[:4]
+    if bom.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif bom.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-8-sig"
+
+    # Archives and other binary files need only a prefix probe. Decode again
+    # strictly if the file starts like a JSON object.
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    remaining = MAX_JSON_BYTES
+    while remaining:
+        chunk = stream.read(min(8192, remaining))
+        if not chunk:
+            return None
+        remaining -= len(chunk)
+        prefix = decoder.decode(chunk).lstrip(JSON_WHITESPACE)
+        if prefix:
+            if prefix[0] != "{":
+                return None
+            break
+    else:
+        if stream.read(1):
+            raise ValueError("JSON prefix exceeds scan limit")
+        return None
+
+    stream.seek(0)
+    raw = stream.read(MAX_JSON_BYTES + 1)
+    if len(raw) > MAX_JSON_BYTES:
+        raise ValueError("JSON object exceeds scan limit")
+    try:
+        # Keep all members, including repeated keys, for the privacy check.
+        return json.loads(raw.decode(encoding), object_pairs_hook=tuple)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def raise_scan_error(error):
+    raise error
+
+
+private_records = 0
+try:
+    for folder, _, names in os.walk(sys.argv[1], onerror=raise_scan_error):
+        for name in names:
+            path = os.path.join(folder, name)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            with open(path, "rb") as stream:
+                members = read_object(stream)
+            if name.endswith(".record.json") or (
+                isinstance(members, tuple)
+                and any(
+                    key == "operator_notes" or (key == "evidence_kind" and value == "private_record")
+                    for key, value in members
+                )
+            ):
+                private_records += 1
+except (OSError, ValueError, RecursionError):
+    print("Could not scan the release folder for private QA records", file=sys.stderr)
+    sys.exit(1)
+
+if private_records:
+    print(
+        f"A private QA record is inside the release folder ({private_records} file(s)); move it out before publishing",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+then
   exit 1
 fi
 
@@ -406,7 +476,8 @@ fi
 # Closed public schema, the same rules as the release API reader: exact keys
 # at every level, whole-string matches, JSON integers and the binding to this
 # manifest. Neither free text nor a private record can pass.
-if ! python3 - "$evidence_path" "$MANIFEST" "$manifest_sha" <<'PY'
+summary_status=0
+python3 - "$evidence_path" "$MANIFEST" "$manifest_sha" <<'PY' || summary_status=$?
 import json
 import re
 import sys
@@ -432,9 +503,26 @@ def reject_constant(_value):
     raise ValueError("non-finite number")
 
 
-def load(path):
+class DuplicateKeyError(ValueError):
+    pass
+
+
+def unique_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise DuplicateKeyError
+        obj[key] = value
+    return obj
+
+
+def load(path, *, object_pairs_hook=None):
     with open(path, "rb") as stream:
-        return json.loads(stream.read().decode("utf-8"), parse_constant=reject_constant)
+        return json.loads(
+            stream.read().decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=object_pairs_hook,
+        )
 
 
 def string_is(value, pattern):
@@ -468,8 +556,10 @@ def owner_entry_ok(entry):
 
 
 try:
-    summary = load(sys.argv[1])
+    summary = load(sys.argv[1], object_pairs_hook=unique_object)
     manifest = load(sys.argv[2])
+except DuplicateKeyError:
+    sys.exit(2)
 except (OSError, UnicodeDecodeError, ValueError):
     sys.exit(1)
 manifest_sha = sys.argv[3]
@@ -512,7 +602,10 @@ except Exception:
     ok = False
 sys.exit(0 if ok else 1)
 PY
-then
+if [[ "$summary_status" -eq 2 ]]; then
+  echo "Stable clean-machine QA evidence contains duplicate JSON keys" >&2
+  exit 1
+elif [[ "$summary_status" -ne 0 ]]; then
   echo "Stable clean-machine QA evidence is not a schema 2 summary of this manifest (unexpected or missing fields, wrong value types, or another manifest): $evidence_name" >&2
   exit 1
 fi

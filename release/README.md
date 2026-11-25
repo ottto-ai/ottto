@@ -555,7 +555,7 @@ AWS/CDN prerequisites before publish:
 14. Never edit the signed manifest: it already names
     `stable-clean-machine-qa.json` as its `evidence_path` (the only summary
     name the tools accept). Write the public summary beside the manifest from
-    the record, then run the closeout gate before anything is uploaded:
+    the record, then run the closeout gate before the immutable CDN upload:
 
     ```bash
     ./scripts/macos_stable_qa_summary.sh \
@@ -568,12 +568,10 @@ AWS/CDN prerequisites before publish:
 15. The release folder must hold plain files and directories only. The
     closeout gate fails on any symlink in it, on a private QA record under any
     name, and when it cannot read part of the folder.
-16. Only after the closeout gate passes, upload the app, CLI, daemon archives,
-    `release-manifest.json`, the CycloneDX SBOM, the Homebrew formula output,
-    `install-macos.sh` and `stable-clean-machine-qa.json` to the immutable
-    versioned prefix. Uploading an explicit list of these files, rather than
-    the whole folder, is good defense in depth; the gate's folder check does
-    not depend on it.
+16. After closeout passes, give the complete gated release folder to the
+    standard release publisher. It verifies the signed manifest and the
+    required release inventory, generates the appcast, and uploads the
+    complete set to the immutable versioned prefix.
 17. Update the stable `latest/` pointer only after download, checksum, stapler,
     Gatekeeper, install, service, update, uninstall, rollback, and closeout-gate
     evidence are attached to the release record.
