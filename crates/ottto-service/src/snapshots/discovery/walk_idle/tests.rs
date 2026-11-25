@@ -606,3 +606,84 @@ fn walk_gate_points_name_the_veto_and_the_arm() {
         veto("backstop")
     );
 }
+
+/// The gate's rest decision equals the pre-diagnostic boolean chain for every
+/// combination of its predicates (a walk in progress returns before any of
+/// them), and exactly the non-resting passes emit one `walk_gate` point.
+#[test]
+fn gate_decision_matches_the_boolean_chain() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    let now = START + 2 * WALK_GAP;
+    for bits in 0..(1_u32 << 8) {
+        let bit = |n: u32| bits & (1 << n) != 0;
+        let [covered, outside, gap_ok, has_record, same, fresh, in_window, owes] =
+            [0, 1, 2, 3, 4, 5, 6, 7].map(bit);
+        restart_for_test();
+        crate::snapshot_watcher::cover_paths_for_test(covered.then(|| fixture.roots.clone()));
+        let mut index = ScanIndex::default();
+        index.bounded_sweep_had_unsettled_upload = owes;
+        let pass = fixture.pass(&index, "a");
+        let other = fixture.pass(&index, "b");
+        with_slot(source, |slot| {
+            slot.last_pass_at = Some(if gap_ok { now - 60 } else { now - PASS_GAP - 1 });
+            slot.record = has_record.then(|| Record {
+                pass: if same { pass.clone() } else { other.clone() },
+                generation: index.generation + u64::from(!fresh),
+                started_at: if in_window { now - 60 } else { now - WALK_GAP },
+            });
+        });
+        let chain =
+            covered && !outside && gap_ok && has_record && same && fresh && in_window && !owes;
+        let (rested, rows) = crate::local_resource_diagnostics::capture(|| {
+            gate(
+                source,
+                &pass,
+                &index,
+                outside.then_some("ack_capacity"),
+                now,
+            )
+        });
+        assert_eq!(rested, chain, "{bits:08b}");
+        assert_eq!(armed_for_test(source).is_some(), chain, "{bits:08b}");
+        let points = rows
+            .iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .count();
+        assert_eq!(points, usize::from(!chain), "{bits:08b}");
+    }
+}
+
+/// The arm decision equals the pre-diagnostic chain for every combination of
+/// its predicates, and the retiring finish reports exactly that outcome.
+#[test]
+fn arm_decision_matches_the_boolean_chain() {
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    let path = fixture.scratch.join("index");
+    for bits in 0..(1_u32 << 5) {
+        let bit = |n: u32| bits & (1 << n) != 0;
+        let [settled, outside_nothing, owes, has_start, same] = [0, 1, 2, 3, 4].map(bit);
+        restart_for_test();
+        let mut index = ScanIndex::default();
+        index.bounded_sweep_had_unsettled_upload = owes;
+        let pass = fixture.pass(&index, "a");
+        let other = fixture.pass(&index, "b");
+        with_slot(source, |slot| {
+            slot.walk_start = has_start.then(|| (if same { pass.clone() } else { other }, START));
+        });
+        let mut scan = SourceScanResult::empty(source);
+        scan.settled_walk = settled;
+        let chain = settled && outside_nothing && !owes && has_start && same;
+        let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+            arm_after_finish(pass, &index, &path, &scan, outside_nothing);
+        });
+        assert_eq!(armed_for_test(source).is_some(), chain, "{bits:05b}");
+        let arms = rows
+            .iter()
+            .filter(|row| row["stage"] == "walk_gate")
+            .map(|row| row["counts"]["arm"].as_str().unwrap().starts_with("armed"))
+            .collect::<Vec<_>>();
+        assert_eq!(arms, [chain], "{bits:05b}");
+    }
+}
