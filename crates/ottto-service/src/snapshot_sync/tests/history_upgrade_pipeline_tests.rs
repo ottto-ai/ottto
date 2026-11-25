@@ -559,11 +559,11 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
     });
 }
 
-/// Addendum 3: a historical replay drops the Claude entries without resetting
+/// A historical replay drops the Claude entries without resetting
 /// the generation, so every file is new again. On a verified Mac with no
 /// list the dropped history is owed (born before the cutoff the drop
 /// records) and paced through the budget, one file per page here, never
-/// re-sent at once (StateMissing N1).
+/// re-sent at once (see `history_cutoff_is_the_last_received_activity`).
 #[test]
 fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     let fixture = HistoryFixture::new("history-upgrade-replay");
@@ -594,7 +594,7 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
     assert_eq!(sent, vec![1, 1, 1, 0], "paced, one history file per page");
 }
 
-/// Addendum 1 item 1 (secondary): existing revision-1 entries, an
+/// Secondary: existing revision-1 entries, an
 /// independent second reason on every file (a changed upload context), no
 /// list. Nothing is emitted, the old upload tuple stays, and nothing is read:
 /// the gate would veto every body, so a read could not earn a per-file
@@ -612,7 +612,7 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
 
     let fixture = HistoryFixture::new("history-upgrade-upload-context");
     let baseline = fixture.baseline();
-    // Held where no list is intended only on an unverified Mac (N1).
+    // Held where no list is intended only on an unverified Mac.
     fixture.corrupt_backfill_state();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let changed = fixture.cycle(
@@ -661,7 +661,7 @@ fn upload_context_change_does_not_carry_history_past_the_gate() {
     });
 }
 
-/// Addendum 1 items 1 and 5: a re-armed entry (fingerprint cleared, size and
+/// A re-armed entry (fingerprint cleared, size and
 /// mtime equal) is unchanged history: held, never emitted, and settled.
 #[test]
 fn rearmed_unchanged_history_is_held_and_settles() {
@@ -720,7 +720,7 @@ fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
     });
 }
 
-/// Addendum 2 item 13: after a held rebuild, only files that grew emit, by
+/// After a held rebuild, only files that grew emit, by
 /// ordinary sync, and they settle at the active revision.
 #[test]
 fn only_files_that_grew_after_a_rebuild_emit() {
@@ -1247,7 +1247,7 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
     assert_eq!(fresh.uploaded, BTreeSet::from([newcomer.to_string()]));
 }
 
-/// Addendum 1 item 6 group 6: a held file beside an accepted, changed sibling
+/// A held file beside an accepted, changed sibling
 /// on a deferred page never enters accepted-body progress or its new
 /// revision; the next completed page holds it again.
 #[test]
@@ -1835,7 +1835,7 @@ fn another_destinations_claude_state_is_prior_history() {
     assert_eq!(prior(), crate::snapshots::PriorHistory::Moved);
 }
 
-/// StateMissing N1 (a), the upgrade after downtime: a pre-gate `Loaded`
+/// The upgrade after downtime: a pre-gate `Loaded`
 /// index of this destination (its own bootstrap) and a session created
 /// after its last receipt, no list. The new session is uploaded at once,
 /// even with no history budget; the indexed history is paced, not held.
@@ -2543,7 +2543,7 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
             changed.index.files[&unlisted].effective_upload_body_witness_revision,
             3
         );
-        // A21 (was `e2_pipeline_dark_matches_fold_absent_publication_and_selection`):
+        // Comparison (was `e2_pipeline_dark_matches_fold_absent_publication_and_selection`):
         // the listed family's ordinary body takes the same batching, ACK
         // progress, index and next-selection route as the unlisted literal.
         // `cycle` already asserts the upload completed (batching and entity ACK).
@@ -2600,7 +2600,7 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// A list seen once and now missing keeps today's pause and alarm with the
 /// gate on: no owed file is re-read or stamped 3. [money] The pause holds
 /// adoption only: a genuine change of an unlisted family uploads the `e2`
-/// literal, as under the installed list, never withheld (G1), and its file
+/// literal, as under the installed list, never withheld, and its file
 /// is not stamped 3 while the list is missing.
 #[test]
 fn e2_missing_list_pauses_history_and_uploads_changes_as_e2() {

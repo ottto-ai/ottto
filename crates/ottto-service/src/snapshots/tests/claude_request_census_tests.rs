@@ -695,7 +695,7 @@ fn census_continuation_rejects_unproven_native_bases() {
     }
 }
 
-/// TD1a: every finished Claude parse writes a record bound to the candidate
+/// Every finished Claude parse writes a record bound to the candidate
 /// fingerprint and the census window, shaped by Context rows G-J and loss.
 #[test]
 fn census_records_bind_each_parse_to_its_revision_and_shape() {
@@ -746,7 +746,7 @@ fn census_records_bind_each_parse_to_its_revision_and_shape() {
         .twin_for_test());
 }
 
-/// TD1d: the derivation canary. The fixed corpus must yield exactly the
+/// The derivation canary. The fixed corpus must yield exactly the
 /// pinned table under `CLAUDE_REQUEST_CENSUS_DERIVATION`.
 #[test]
 fn census_derivation_canary_pins_ids_and_shapes() {
@@ -763,7 +763,7 @@ fn census_derivation_canary_pins_ids_and_shapes() {
     );
 }
 
-/// TD1f: a re-parse of a previously complete key
+/// A re-parse of a previously complete key
 /// that ends as residue, with copied ids, replaces the old record. The key is
 /// never covered by the old revision, and the copied ids join the census.
 #[test]
@@ -859,7 +859,7 @@ fn census_residue_reparse_never_keeps_the_old_record() {
     );
 }
 
-/// TD1b: census state follows the working index on a partial commit, never
+/// Census state follows the working index on a partial commit, never
 /// `previous`: an unsettled key reverts its entry but keeps the record this
 /// window parsed, and a never-committed key keeps its record until pruned.
 #[test]
@@ -1083,7 +1083,7 @@ fn legacy_hex_hashes(hashes: &[u64]) -> String {
     hashes.iter().map(|hash| format!("{hash:016x}")).collect()
 }
 
-/// TD1c: the decoder is per entry, tolerant and bounded. An old index has no
+/// The decoder is per entry, tolerant and bounded. An old index has no
 /// field; a wrong-type field is empty; malformed entries are dropped one by
 /// one; nothing ever quarantines the index. Records round-trip exactly.
 #[test]

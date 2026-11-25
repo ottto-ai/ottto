@@ -57,6 +57,10 @@ fn growth(source: SnapshotSource) -> Vec<Value> {
 /// changes nothing.
 #[test]
 fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
         for bit in &FLIPS {
             for start in [false, true] {
@@ -123,6 +127,10 @@ fn codex_pi_tail_under_flipped_mode_equals_full_for_every_bit() {
 /// under it: money, placement, what the scan retains and the POSTed bodies.
 #[test]
 fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
         for bit in &FLIPS {
             let before = mode(false);
@@ -186,12 +194,16 @@ fn codex_pi_flip_reads_no_unproven_delivered_file_then_tail_equals_full() {
     }
 }
 
-/// [behaviour] T4: a page partly acknowledged under B is checkpointed, then the
+/// [behaviour] A page partly acknowledged under B is checkpointed, then the
 /// pass fails and rolls back to that checkpoint. Back under A the file still
 /// holds A's receipt, and the entities ACKed under B leave it owing delivery,
 /// never a read; its next ordinary send resends exactly those.
 #[test]
 fn partial_ack_under_flip_checkpoint_rollback_owes_delivery_not_a_read() {
+    // Reopens a store it just published; see `test_isolation`.
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);
     f.flip(all(false));
     let a = f.index.active_upload_context_fingerprint.clone().unwrap();

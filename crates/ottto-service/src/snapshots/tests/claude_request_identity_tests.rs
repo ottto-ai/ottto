@@ -21,7 +21,7 @@ fn w0_index() -> Value {
     serde_json::from_slice(&fs::read(w0_path("index.json")).unwrap()).unwrap()
 }
 
-/// Every W0 body (old/new/rejected batches and bare P1 items) by name.
+/// Every fixture body (old/new/rejected batches and bare historical receiver items) by name.
 fn w0_bodies() -> Vec<(String, Value, Value)> {
     let index = w0_index();
     let mut out = Vec::new();

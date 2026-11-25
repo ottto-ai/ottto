@@ -220,7 +220,7 @@ fn regression<S: SourceFixture>() {
     );
     let items = parsed.snapshots.clone();
     commit::<S>(&mut route, &path, tail, parsed);
-    // O7: stored-body acceptance is independent of source progress. Retry an
+    // Stored-body acceptance is independent of source progress. Retry an
     // ACKed exact body once; the actual upload loop suppresses another POST.
     let mut ack = AckLedger::new(S::SOURCE);
     ack.deliver(&items);
@@ -255,7 +255,7 @@ fn regression<S: SourceFixture>() {
     quiet.io.anchor_reads = Some(sample_bytes);
     quiet.io.other_reads = Some(0);
     money_oracle::assert_quiet_restart_zero_bytes(&quiet);
-    // O9: the new decoder reads legacy JSON with the retired cap leaf and
+    // The new decoder reads legacy JSON with the retired cap leaf and
     // defaulted diagnostics. This proves legacy-to-new decoding only; it
     // does not exercise an older daemon reading newly written rows.
     let old = json!({"source_file_fingerprint":"a".repeat(64),
@@ -714,7 +714,7 @@ fn pi_bad_record_keeps_valid_occurrences() {
     assert!(tail.publish(&Ok(parsed)));
 }
 
-// O8 uses the real listing gate: an aged never-read file is skipped, an
+// This uses the real listing gate: an aged never-read file is skipped, an
 // eligible first admission adds valid siblings, and its accepted body stays quiet.
 fn admission<S: SourceFixture>() {
     let route = route_for(S::INDEX);
