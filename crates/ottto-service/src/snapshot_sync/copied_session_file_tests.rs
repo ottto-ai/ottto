@@ -1912,6 +1912,163 @@ fn quiet_carrier_pass(c: &Corpus, index: ScanIndex, paths: &[PathBuf; 3]) -> Sca
     next
 }
 
+fn local_only_carrier() -> (Corpus, ScanIndex, [PathBuf; 3]) {
+    let (c, mut index, paths) = settled_content_carrier(true);
+    index.upload_context_proof.request_contributions.clear();
+    index = c.reload(&mut index);
+    index.activate_upload_context("e2-synthetic-destination".into());
+    assert!(e2::carrier_group_owned_for_test(
+        &index,
+        &paths[0].to_string_lossy()
+    ));
+    (c, index, paths)
+}
+
+/// A failed save withholds the copy and recovery offers the same bodies without a request-count increase.
+#[test]
+fn failed_save_holds_twin_carried_copy_until_baseline_recovers() {
+    use crate::snapshots::{e2_pipeline_scan_fixture::route_of, state_v2};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (mut c, index, _) = local_only_carrier();
+        let copy = c.write_at(
+            &file(THIRD),
+            &resumed(
+                THIRD,
+                &[A, ("own-branch", "2026-08-02T07:03:20Z", RESUME_WRITER)],
+            ),
+            BORN,
+        );
+        c.write_at(&file(LATE), &line(LATE, "independent", AT, 10), BORN);
+        let scanner = carrier_scanner(&index);
+        let mut held = c.raw(&scanner, index, 100, true, &[]);
+        let mut expected = twin(&held);
+        expected.enrich(&c);
+        expected.finish();
+        assert_eq!(body(&expected, THIRD).unwrap().request_count, 1);
+        assert!(body(&expected, LATE).is_some());
+
+        let route = route_of(&held.index).unwrap();
+        state_v2::fail_next_carrier_save_for_test(&held.index);
+        assert!(held.index.clone().save_fixture(&route).is_err());
+        held.enrich(&c);
+        assert_withheld(&held, THIRD, "carrier baseline missing after failed save");
+        held.finish();
+        assert!(body(&held, THIRD).is_none());
+        assert_eq!(
+            canonical(body(&held, LATE).unwrap()),
+            canonical(body(&expected, LATE).unwrap())
+        );
+        for item in &held.scan.snapshots {
+            let oracle = body(&expected, &item.source_session_id).unwrap();
+            assert!(item.request_count <= oracle.request_count);
+        }
+
+        let recovered = ScanIndex::load(&route).unwrap();
+        let scanner = carrier_scanner(&recovered);
+        let mut retried = ready(&c, &scanner, recovered, 100, true);
+        assert!(scanner.paths().contains(&copy));
+        retried.finish();
+        assert_eq!(
+            canonical(&retried.scan.snapshots),
+            canonical(&expected.scan.snapshots)
+        );
+    });
+}
+
+/// A one-shot carrier read error during reconcile preserves the saved groups and produces no corrective offers.
+#[test]
+fn carrier_read_error_preserves_saved_removals_through_reconcile() {
+    use crate::snapshots::state_v2::with_carrier_head_error_for_test;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let run = |fault| {
+        with_e2(|| {
+            let (c, mut index, paths) = local_only_carrier();
+            let copy = location_key(&paths[1].to_string_lossy());
+            let groups = index.claude_copy_removals.get(copy).to_vec();
+            assert!(!groups.is_empty());
+            index.claude_copy_removals.mark(copy);
+            let scanner = carrier_scanner(&index);
+            let page = ready(&c, &scanner, index.clone(), 100, true);
+            assert!(scanner.paths().contains(&paths[1]));
+            assert!(!scanner.paths().contains(&paths[0]) && !scanner.paths().contains(&paths[2]));
+            assert_eq!(body(&page, COPY).unwrap().request_count, 1);
+            let mut sent = twin(&page);
+            sent.finish();
+            let save = || settle(&c, &index, page, &mut e2_progress());
+            let mut next = if fault {
+                with_carrier_head_error_for_test(&paths[2].to_string_lossy(), save)
+            } else {
+                save()
+            };
+            assert_eq!(next.claude_copy_removals.get(copy), groups.as_slice());
+            next.activate_upload_context("e2-synthetic-destination".into());
+            assert!(e2::carrier_group_owned_for_test(
+                &next,
+                &paths[0].to_string_lossy()
+            ));
+            quiet_carrier_pass(&c, next, &paths);
+            canonical(&sent.scan.snapshots)
+        })
+    };
+    assert_eq!(run(true), run(false));
+}
+
+/// Once an unknown carrier is confirmed absent, correction matches the same removal with healthy reads.
+#[test]
+fn carrier_absence_after_unknown_runs_held_correction() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        non_tail_carrier_observation_for_test, route_of,
+    };
+    use crate::snapshots::state_v2::with_carrier_head_error_for_test;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let run = |fault| {
+        with_e2(|| {
+            let (c, mut index, [holder, copy, carrier]) = local_only_carrier();
+            let copy_location = location_key(&copy.to_string_lossy());
+            let holder_key = holder.to_string_lossy();
+            let holder_location = location_key(&holder_key);
+            let groups = index.claude_copy_removals.get(copy_location).to_vec();
+            assert!(!groups.is_empty());
+            let route = route_of(&index).unwrap();
+            let mut save = || index.save_fixture(&route).unwrap();
+            if fault {
+                with_carrier_head_error_for_test(&carrier.to_string_lossy(), save);
+            } else {
+                save();
+            }
+            assert_eq!(
+                e2::carrier_group_owned_for_test(&index, &holder_key),
+                !fault
+            );
+            assert_eq!(
+                index.claude_copy_removals.get(copy_location),
+                groups.as_slice()
+            );
+            assert!(!index.claude_copy_removals.pending(holder_location));
+            assert!(!index.claude_copy_removals.pending(copy_location));
+
+            non_tail_carrier_observation_for_test(&index, &carrier);
+            index.save_fixture(&route).unwrap();
+            assert!(!e2::carrier_group_owned_for_test(&index, &holder_key));
+            assert!(index.claude_copy_removals.pending(holder_location));
+            assert!(index.claude_copy_removals.pending(copy_location));
+            let scanner = carrier_scanner(&index);
+            let mut correction = ready(&c, &scanner, index, 100, true);
+            assert!(scanner.paths().contains(&copy));
+            correction.finish();
+            canonical(&correction.scan.snapshots)
+        })
+    };
+    assert_eq!(run(true), run(false));
+}
+
 /// Scan decisions reuse the hydrated carrier even when claim-only work has
 /// advanced the store beyond the scan image's generation.
 #[test]

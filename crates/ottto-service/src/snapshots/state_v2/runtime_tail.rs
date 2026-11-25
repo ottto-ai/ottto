@@ -23,9 +23,12 @@ pub(in crate::snapshots) fn carry_tail(
         |state, session, id| {
             let previous = match state.save_digests.take() {
                 Some(previous) if !previous.links_only => previous,
-                _ => {
+                prior => {
                     let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
-                    let previous = import::baseline(&mut session.db, &committed, &mut cx)?;
+                    let mut previous = import::baseline(&mut session.db, &committed, &mut cx)?;
+                    if let Some(prior) = prior {
+                        previous.copy_ownership.1.remember(&prior.copy_ownership.1);
+                    }
                     session.cx = cx;
                     previous
                 }
@@ -192,9 +195,16 @@ pub(in crate::snapshots) fn load_job_head(
         Ok((head, kinds::job_template_since(tx)?))
     })
 }
-pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {
+pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Carriers> {
     let path = runtime_path(index).ok()??;
+    let runtime = index.v2().persistence_v2.as_ref()?;
     with_state(&path, |s| {
+        let session = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
+        let session = session.as_ref().ok_or(Hold::ReloadRequired)?;
+        ensure!(
+            !session.reload && !session.db.reload_required(),
+            Hold::ReloadRequired
+        );
         let baseline = s.save_digests.as_ref();
         Ok(baseline.map(|b| b.copy_ownership.sessions(index, keys)))
     })

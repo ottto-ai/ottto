@@ -157,7 +157,7 @@ pub(super) fn save(
                 session_links(&mut tx, keys, previous.generation, cx.tail.as_ref())
             })
         } else {
-            BTreeMap::new()
+            Carriers::default()
         }
     };
     super::super::sampled_audit::prune_growth_retention(
@@ -182,31 +182,65 @@ pub(super) fn baseline(
         .seed(&mut |keys| session_links(&mut tx, keys, index.generation, None));
     Ok(baseline)
 }
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CARRIER_HEAD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_carrier_head_error_for_test<T>(key: &str, run: impl FnOnce() -> T) -> T {
+    FAIL_CARRIER_HEAD.with(|fault| assert!(fault.replace(Some(key.to_owned())).is_none()));
+    let result = run();
+    FAIL_CARRIER_HEAD.with(|fault| assert!(fault.take().is_none(), "carrier was not read"));
+    result
+}
+
 pub(super) fn session_links(
     tx: &mut dyn Transaction,
     keys: &[&str],
     generation: u64,
     stage: Option<&tail::TailStage>,
-) -> Links {
+) -> Carriers {
     use super::super::tail_source::{self, claude::Claude, TailSource};
     use tail::EffectiveHead;
-    keys.iter()
-        .filter_map(|&key| {
-            let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
-                EffectiveHead::Removed => None,
-                EffectiveHead::Staged(revision, head) => {
-                    tail_source::claude_head_session(revision, &head)
-                }
-                EffectiveHead::Committed => {
-                    tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation)
-                        .ok()
-                        .flatten()
-                        .and_then(|h| tail_source::claude_head_session(h.revision, &h.body))
-                }
-            }?;
-            Some((key.to_owned(), session))
-        })
-        .collect()
+    let mut carriers = Carriers::default();
+    let mut load = |key: &str| {
+        #[cfg(test)]
+        if FAIL_CARRIER_HEAD.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            if fault.as_deref() != Some(key) {
+                return false;
+            }
+            fault.take();
+            true
+        }) {
+            return Err(());
+        }
+        tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation).map_err(|_| ())
+    };
+    let decode =
+        |revision, body: &[u8]| tail_source::claude_head_session(revision, body).map_err(|_| ());
+    for &key in keys {
+        let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
+            EffectiveHead::Removed => Ok(None),
+            EffectiveHead::Staged(revision, head) => decode(revision, &head),
+            EffectiveHead::Committed => load(key).and_then(|head| match head {
+                Some(head) if !head.metadata_only => decode(head.revision, &head.body),
+                _ => Ok(None),
+            }),
+        };
+        match session {
+            Ok(Some(session)) => {
+                carriers.links.insert(key.to_owned(), session);
+            }
+            Ok(None) => {}
+            Err(()) => {
+                carriers.unknown.insert(key.to_owned());
+            }
+        }
+    }
+    carriers
 }
 
 fn identity(tx: &mut dyn Transaction) -> Result<Identity> {

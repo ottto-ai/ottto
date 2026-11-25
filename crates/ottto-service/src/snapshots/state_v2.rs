@@ -70,7 +70,7 @@ pub(crate) use sqlite::history as upload_history;
 #[cfg(test)]
 pub(crate) use sqlite::sidecar as sqlite_sidecar;
 mod tail;
-use super::claude_request_money::e2::Links;
+use super::claude_request_money::e2::Carriers;
 use kinds::KindCx;
 #[allow(
     unused_imports,
@@ -648,6 +648,14 @@ pub(crate) fn seed_job_fixture_cutoff(index: &ScanIndex) {
         db.control("job_template_since", &1_u64).unwrap();
     });
 }
+
+#[cfg(test)]
+pub(crate) fn fail_next_carrier_save_for_test(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| sqlite::fence_commit_writing(db, "generation"));
+}
+
+#[cfg(test)]
+pub(crate) use import::with_carrier_head_error_for_test;
 
 #[cfg(test)]
 pub(in crate::snapshots) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {

@@ -1010,6 +1010,9 @@ advances the observed transition high-water marks even across a long polling gap
 Accepted Claude request holders are recorded per source/session slot and contributor location.
 Only an exact body ACK replaces a slot's counted, nonzero request hashes, including an empty set.
 Copy removals consult those hashes before local ownership and census evidence.
+An unreadable Claude Tail carrier leaves its saved removal groups in place.
+A page that needs that carrier's proof withholds the copy through the request-owned hold.
+Once the head can be read, a confirmed loss runs the ordinary copy correction.
 Rows survive refusal, temporary census loss, historical replay and bounded rebuilds.
 A destination change clears them; positive deletion prunes only hashes no stored copy names.
 The rows confer no upload receipt authority. State layout 8 stores each slot separately;

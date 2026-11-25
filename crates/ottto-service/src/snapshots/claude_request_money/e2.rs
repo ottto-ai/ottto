@@ -44,8 +44,8 @@ pub(crate) use self::copies::{
     reconcile_carrier_images_for_test,
 };
 pub(in crate::snapshots) use self::copies::{
-    copied_file_holders, earlier_holders, first_own_turn_at, selected_twin_roots, CopyOwnership,
-    Links,
+    copied_file_holders, earlier_holders, first_own_turn_at, selected_twin_roots, Carriers,
+    CopyOwnership,
 };
 pub(crate) use self::copies::{decide_page_copies_planned, page_content_holds};
 #[cfg(test)]
@@ -2398,7 +2398,7 @@ pub(crate) fn visit_entity_identity_rows(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 23] = [
+const COUNT_NAMES: [&str; 24] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -2422,6 +2422,7 @@ const COUNT_NAMES: [&str; 23] = [
     "family_copy_deferred",
     "copy_prefix_twin_page_removed",
     "side_call_member_hints",
+    "claude_carrier_unknown",
 ];
 const COUNT_LEN: usize = COUNT_NAMES.len();
 static COUNTS: [AtomicU64; COUNT_LEN] = [const { AtomicU64::new(0) }; COUNT_LEN];

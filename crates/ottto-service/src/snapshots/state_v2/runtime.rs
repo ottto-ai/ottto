@@ -720,13 +720,16 @@ pub(in super::super) fn save_locked(
     let result = with_save_session(path, runtime, expected, |state, session, id| {
         let previous = match state.save_digests.take() {
             Some(previous) if !previous.links_only => previous,
-            _ => {
+            prior => {
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let digests = import::baseline(&mut session.db, &previous, &mut cx)?;
+                let mut digests = import::baseline(&mut session.db, &previous, &mut cx)?;
+                if let Some(prior) = prior {
+                    digests.copy_ownership.1.remember(&prior.copy_ownership.1);
+                }
                 session.cx = cx;
                 digests
             }
