@@ -682,8 +682,18 @@ fn compression_carries_only_a_proven_complete_read() {
             assert!(index.files.contains_key(&new_key), "{case}");
             continue;
         };
+        let state = (
+            index.files.contains_key(&old_key),
+            index.files.contains_key(&new_key),
+            scan.snapshots.len(),
+            posts.len(),
+        );
+        assert_eq!(
+            unproven(&logs),
+            json!({reason: 1}),
+            "{case}: (old indexed, new indexed, items, posts) = {state:?}"
+        );
         assert_eq!(full_decodes(&logs), 1, "{case}: the archive is read once");
-        assert_eq!(unproven(&logs), json!({reason: 1}), "{case}");
         assert!(!grown || !posts.is_empty(), "{case}: the grown body is sent");
         let expected = if !posts.is_empty() {
             let mut warm = route(&index, &scan, posts);
