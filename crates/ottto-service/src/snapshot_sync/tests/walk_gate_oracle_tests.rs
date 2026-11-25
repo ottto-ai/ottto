@@ -542,7 +542,7 @@ fn codex_side_only_change_waits_for_the_backstop_walk() {
 /// A pass that walked to completion or left a walk in progress (an idle
 /// pass does neither).
 fn walking(cycle: &Cycle) -> bool {
-    walked(cycle) || cycle.index.traversal.is_some()
+    walked(cycle) || !walk_idle::idle_finish(&cycle.index)
 }
 
 /// A created thread held while its thread-history extent lags its rollout:
