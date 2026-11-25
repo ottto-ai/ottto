@@ -5106,8 +5106,9 @@ fn codex_dead_login_survives_a_failed_quota_read() {
 /// [regress] With refresh never forced, a dead refresh token shows as an
 /// account-stage error, not `account: null`. Codex 0.163's workspace
 /// discovery 401 and 0.167's "sign in again" read as a dead login in the
-/// provider and saved reads, on a durable slot and on the user's own default
-/// home (whose launch then asks for a sign-in too); a discovery timeout is a
+/// provider and saved reads of a durable slot. On the user's own default home
+/// (and its launch) only "sign in again" does: Codex also answers the 401
+/// when a refresh failed for a transient reason. A discovery timeout is a
 /// plain failure.
 #[cfg(unix)]
 #[test]
@@ -5115,14 +5116,16 @@ fn codex_dead_login_survives_a_failed_quota_read() {
 fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
     use std::os::unix::fs::PermissionsExt;
 
-    for (label, text, dead) in [
-        ("v0163", "workspace routing discovery unauthorized (401)", true),
+    // (label, account-read error, dead on a slot, dead on the default home)
+    for (label, text, dead, default_dead) in [
+        ("v0163", "workspace routing discovery unauthorized (401)", true, false),
         (
             "v0167",
             "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.",
             true,
+            true,
         ),
-        ("timeout", "workspace routing discovery timed out", false),
+        ("timeout", "workspace routing discovery timed out", false, false),
     ] {
         let (root, home) = synthetic_codex_collector_home(&format!("auth-rejected-{label}"), 0o600);
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
@@ -5191,7 +5194,7 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
             let default = collect(None, quota_read);
             assert_eq!(
                 default.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
-                dead,
+                default_dead,
                 "{label}: default home"
             );
             assert_eq!(
@@ -5200,14 +5203,14 @@ fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
                     .diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.code == "codex_account_needs_login"),
-                dead,
+                default_dead,
                 "{label}: default home"
             );
         }
         let launched = session_launch_codex_candidate(slot(None), "2026-08-26T00:05:00Z");
         assert_eq!(
             launched.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
-            dead,
+            default_dead,
             "{label}: default launch"
         );
         if label == "v0163" {

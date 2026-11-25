@@ -386,8 +386,9 @@ pub(in crate::agent_status) struct CodexAppServerRun {
     /// ([`codex_app_server_refresh_rejected`]), whatever the rest of the
     /// session did.
     pub(in crate::agent_status) account_absent: bool,
-    /// The provider rejected the login itself ([`codex_app_server_auth_rejected`]
-    /// or [`codex_app_server_refresh_rejected`]), not merely named no account.
+    /// Codex refused the login's refresh with "sign in again"
+    /// ([`codex_app_server_refresh_rejected`]) on either read: a dead login
+    /// even for the user's own default home, unlike a 401 or no account.
     pub(in crate::agent_status) login_rejected: bool,
     /// The binary whose bundled model list was passed to Codex
     /// ([`codex_probe_catalog`]), so it sent no models request.
@@ -723,8 +724,10 @@ pub(in crate::agent_status) fn run_codex_app_server_rate_limits_for_home(
         let mut send_details = false;
         match (response_id, error) {
             (Some("ottto_account"), Some(error)) => {
-                run.login_rejected = codex_app_server_auth_rejected(error);
-                run.account_absent = run.login_rejected;
+                run.account_absent = codex_app_server_auth_rejected(error);
+                // Only the refresh rejection: Codex also answers a 401 here
+                // when a refresh failed for a transient reason.
+                run.login_rejected = codex_app_server_refresh_rejected(error);
                 break Err(rpc_failure("account", error));
             }
             (Some("ottto_account"), None) => {

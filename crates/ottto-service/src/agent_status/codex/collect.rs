@@ -1204,9 +1204,10 @@ pub(in crate::agent_status) fn collect_codex_status_for_home(
 /// merely unconfirmed. For an Ottto slot's home, which the probe reads
 /// regularly (each read lets Codex refresh its login when due), a provider
 /// read that named no account (`account: null`) or rejected the login is
-/// dead. For the user's own default home only a rejected login is
-/// (`login_rejected`: `auth_rejected`, or a refresh refused with "sign in
-/// again"); `account: null` there stays a lapsed login, not a dead one.
+/// dead. For the user's own default home only a refused refresh is
+/// (`login_rejected`: "sign in again" on either read). A 401, which Codex
+/// also answers when a refresh failed for a transient reason, and
+/// `account: null` leave it as it was.
 /// Changes the status cause only.
 pub(in crate::agent_status) fn apply_codex_dead_login(
     snapshot: &mut AgentStatusSnapshot,
