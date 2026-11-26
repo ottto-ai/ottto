@@ -2,8 +2,9 @@
 """Workflow runner policy: the release signing runners never serve pull request or merge
 queue events.
 
-Every workflow under .github/workflows is parsed as YAML (PyYAML when installed, else Ruby's
-standard YAML library) and checked:
+Every workflow under .github/workflows is parsed as YAML and checked, once with each parser
+present: PyYAML and Ruby's standard YAML library (the fallback where PyYAML is absent; anchors
+and aliases enabled, as the workflows use them). At least one must be present:
 
 - No job in a workflow triggered by pull_request, pull_request_target or merge_group may run
   on the release labels (ottto-signing-mac, ottto-release-bootstrap) or read the stable
@@ -42,21 +43,36 @@ class PolicyError(Exception):
     pass
 
 
-def load_yaml(text):
+def pyyaml_loader():
     try:
         import yaml
     except ImportError:
-        yaml = None
-    if yaml is not None:
-        return yaml.safe_load(text)
+        return None
+    return yaml.safe_load
+
+
+def ruby_loader():
     ruby = shutil.which("ruby")
     if ruby is None:
+        return None
+
+    def load(text):
+        # Psych's safe_load refuses aliases unless asked (keyword since Psych 3.1, Ruby 2.6).
+        script = "print JSON.generate(YAML.safe_load(STDIN.read, aliases: true))"
+        result = subprocess.run([ruby, "-ryaml", "-rjson", "-e", script],
+                                input=text.encode("utf-8"), capture_output=True, check=False)
+        if result.returncode != 0:
+            raise PolicyError("YAML parse failed: " + result.stderr.decode("utf-8", "replace").strip())
+        return json.loads(result.stdout)
+    return load
+
+
+def loaders():
+    """[(name, load)] for each YAML parser present."""
+    found = [(name, load) for name, load in (("PyYAML", pyyaml_loader()), ("Ruby YAML", ruby_loader())) if load]
+    if not found:
         raise PolicyError("no YAML parser: install PyYAML or Ruby")
-    result = subprocess.run([ruby, "-ryaml", "-rjson", "-e", "print JSON.generate(YAML.safe_load(STDIN.read))"],
-                            input=text.encode("utf-8"), capture_output=True, check=False)
-    if result.returncode != 0:
-        raise PolicyError("YAML parse failed: " + result.stderr.decode("utf-8", "replace").strip())
-    return json.loads(result.stdout)
+    return found
 
 
 def triggers(doc):
@@ -144,7 +160,7 @@ def policy_problems(docs):
     return problems
 
 
-def repository_docs(root):
+def repository_docs(root, load_yaml):
     docs = {}
     folder = os.path.join(root, WORKFLOWS)
     for name in sorted(os.listdir(folder)):
@@ -164,6 +180,26 @@ on:
 jobs:
   build:
     runs-on: ${{ fromJSON(vars.OTTTO_MACOS_STABLE_RUNNER_LABELS || '["self-hosted","ottto-signing-mac","ottto-release-bootstrap"]') }}
+    steps:
+      - run: echo ok
+"""
+
+
+ANCHOR_FIXTURE = """
+on: pull_request
+jobs:
+  first:
+    runs-on: ubuntu-24.04
+    env: &shared
+      RUNNERS: &runners [ubuntu-24.04, macos-15]
+    steps:
+      - run: echo ok
+  second:
+    env: *shared
+    strategy:
+      matrix:
+        os: *runners
+    runs-on: ${{ matrix.os }}
     steps:
       - run: echo ok
 """
@@ -248,20 +284,29 @@ def fixture_cases():
         ("stable workflow on pull requests",
          {STABLE: STABLE_FIXTURE.replace("on:\n", "on:\n  pull_request:\n", 1)},
          "workflow_dispatch only"),
+        # Anchors and aliases (the workflows share env blocks this way) parse with every parser.
+        ("anchor and alias", {other: ANCHOR_FIXTURE}, None),
+        ("label reaching runs-on through an alias",
+         {other: ANCHOR_FIXTURE.replace("[ubuntu-24.04, macos-15]", "[ubuntu-24.04, ottto-signing-mac]")},
+         "strategy names the release label ottto-signing-mac"),
     ]
 
 
-def main():
+def check(load_yaml):
     failures = []
     for name, texts, expected in fixture_cases():
-        docs = {path: load_yaml(text) for path, text in texts.items()}
-        docs.setdefault(STABLE, load_yaml(STABLE_FIXTURE))
+        try:
+            docs = {path: load_yaml(text) for path, text in texts.items()}
+            docs.setdefault(STABLE, load_yaml(STABLE_FIXTURE))
+        except PolicyError as error:
+            failures.append("fixture %r: %s" % (name, error))
+            continue
         problems = policy_problems(docs)
         if expected is None and problems:
             failures.append("fixture %r: unexpected problems %s" % (name, problems))
         elif expected is not None and not any(expected in problem for problem in problems):
             failures.append("fixture %r: expected %r, got %s" % (name, expected, problems))
-    docs = repository_docs(ROOT)
+    docs = repository_docs(ROOT, load_yaml)
     problems = policy_problems(docs)
     failures += problems
     # The policy has something to protect: the stable workflow names the release labels.
@@ -269,11 +314,23 @@ def main():
                                       .get("runs-on"))).lower()
     if not all(label in stable_runs_on for label in RELEASE_LABELS):
         failures.append("%s: the signing job no longer names the release labels; update this check" % STABLE)
+    return failures, len(docs)
+
+
+def main():
+    try:
+        parsers = loaders()
+        results = [(name,) + check(load) for name, load in parsers]
+    except PolicyError as error:
+        print("workflow runner policy: " + str(error), file=sys.stderr)
+        return 1
+    failures = ["%s: %s" % (name, failure) for name, problems, _count in results for failure in problems]
     if failures:
         for failure in failures:
             print("workflow runner policy: " + failure, file=sys.stderr)
         return 1
-    print("workflow runner policy tests passed (%d workflows)" % len(docs))
+    print("workflow runner policy tests passed (%d workflows; parsers: %s)"
+          % (results[0][2], ", ".join(name for name, _p, _c in results)))
     return 0
 
 

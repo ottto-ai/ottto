@@ -10,6 +10,7 @@ classes, error codes and counts; never a marker, an excerpt or a raw path.
 import argparse
 import ctypes
 import ctypes.util
+import datetime
 import decimal
 import hashlib
 import html
@@ -2299,11 +2300,35 @@ def read_machine_name(args, policy):
 
 JOB_RECORD_MAX = 1 << 20
 STEP_LOG = re.compile(r"(?P<number>[1-9][0-9]{0,3})_(?P<name>[^/\0]+)\.txt")
+# The run attempt's log archive holds, per job, "<index>_<job name>.txt" (the whole job's log)
+# at its top and a "<job name>/" folder with system.txt and, in one of its two layouts, one
+# file per run step.
+JOB_LOG = re.compile(r"[0-9]{1,4}_(?P<name>[^/\0]+)\.txt")
+JOB_NAME = re.compile(r"[^/\0\r\n]{1,255}")
+API_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+LOG_TIME = re.compile(r"﻿?(?P<time>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z) ")
+JOB_NAME_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Complete job name: (?P<value>[^\r\n]*?)\r?")
+RUNNER_NAME_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Runner name: '(?P<value>[^'\r\n]*)'\r?")
+SYSTEM_RUNNER_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Job is about to start running on the (?:hosted )?runner: "
+                                r"(?P<value>[^\r\n]*?)\r?")
+# Runner clock against the API's whole-second times.
+LOG_CLOCK_SLACK = 60
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def utc_seconds(text):
+    match = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]+)?Z", text)
+    try:
+        when = datetime.datetime(*[int(part) for part in match.groups()[:6]], tzinfo=datetime.timezone.utc)
+    except (AttributeError, ValueError):
+        raise Incomplete("log_attempt")
+    return (when - EPOCH).total_seconds() + float(match.group(7) or 0)
 
 
 def load_job_record(path, run_id, run_attempt):
     """The job's API record (GET /repos/{owner}/{repo}/actions/jobs/{job_id}) for the selected
-    run and attempt: a completed job whose steps run from "Set up job" to "Complete job"."""
+    run and attempt: a completed job whose steps run from "Set up job" to "Complete job", with
+    its name, runner name and times."""
     try:
         with open(path, "rb") as handle:
             data = handle.read(JOB_RECORD_MAX + 1)
@@ -2316,7 +2341,10 @@ def load_job_record(path, run_id, run_attempt):
             or type(record.get("run_attempt")) is not int or record["run_attempt"] != int(run_attempt):
         raise Incomplete("log_run")
     steps = record.get("steps")
-    if record.get("status") != "completed" or not isinstance(steps, list) or len(steps) < 2:
+    if record.get("status") != "completed" or not isinstance(steps, list) or len(steps) < 2 \
+            or type(record.get("id")) is not int or not JOB_NAME.fullmatch(str(record.get("name"))) \
+            or not isinstance(record.get("runner_name"), str) or not record["runner_name"] \
+            or not all(API_TIME.fullmatch(str(record.get(key))) for key in ("created_at", "started_at", "completed_at")):
         raise Incomplete("log_record")
     previous = 0
     for step in steps:
@@ -2327,70 +2355,140 @@ def load_job_record(path, run_id, run_attempt):
         previous = step["number"]
     first, last = steps[0], steps[-1]
     if (first["number"], first["name"]) != (1, "Set up job") or last["name"] != "Complete job" \
-            or "skipped" in (first["conclusion"], last["conclusion"]):
+            or "skipped" in (first["conclusion"], last["conclusion"]) \
+            or not API_TIME.fullmatch(str(last.get("started_at"))):
         raise Incomplete("log_record")
-    return steps
+    return record
 
 
-def scan_logs(gate, root, policy, expected_name, run_id, run_attempt, job_record):
-    """One job's complete logs from the selected run attempt, bound to the job's API record: the
-    folder holds exactly the runner's step files (<number>_<step name>.txt) for every step the
-    record lists as run, from "Set up job" to "Complete job", plus the optional system.txt; a
-    missing, extra or renamed file is incomplete. Every text is searched. The one Machine name
-    field in the "Set up job" file is checked on its own (check_machine_name); a second field
-    anywhere is a finding; a job whose "Complete job" file does not end with the runner's last
-    line is incomplete. "/_work/" inside that run's release-host work folder is not a path
-    finding."""
-    steps = load_job_record(job_record, run_id, run_attempt)
-    expected = {"%d_%s.txt" % (step["number"], step["name"]): step["number"]
-                for step in steps if step["conclusion"] != "skipped"}
+def job_log_files(root, job, expected):
+    """(whole-job log, [step files in step order], system.txt) of one job in an extracted run
+    attempt archive. Both layouts GitHub serves are accepted: the job folder holds system.txt
+    and either exactly one file per run step or no step file. Other jobs' entries are not read."""
     files = list_files(root)
     if not files:
         raise Incomplete("log_empty")
-    if files - {"system.txt"} != set(expected) or not all(STEP_LOG.fullmatch(name) for name in expected):
+    whole = sorted(rel for rel in files if "/" not in rel and JOB_LOG.fullmatch(rel)
+                   and JOB_LOG.fullmatch(rel).group("name") == job)
+    inside = {rel[len(job) + 1:] for rel in files if rel.startswith(job + "/")}
+    if len(whole) != 1 or "system.txt" not in inside:
         raise Incomplete("log_partial")
+    step_files = inside - {"system.txt"}
+    if step_files and (step_files != set(expected) or not all(STEP_LOG.fullmatch(name) for name in expected)):
+        raise Incomplete("log_partial")
+    ordered = sorted(step_files, key=lambda name: expected[name])
+    return whole[0], [job + "/" + name for name in ordered], job + "/system.txt"
+
+
+def read_log(root, rel):
+    path = os.path.join(root, rel)
+    if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_FILE:
+        raise Incomplete("log_type")
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if not data:
+        raise Incomplete("log_empty")
+    try:
+        return data.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Incomplete("log_encoding")
+
+
+def ends_job(lines):
+    body = lines[:-1] if lines[-1] == "" else lines
+    return bool(body) and JOB_END_LINE.fullmatch(body[-1]) is not None
+
+
+def check_log_attempt(record, whole, setup_end, step_logs, system):
+    """The logs belong to the record's run attempt: every timestamped line lies between the
+    job's creation and completion, the whole-job log starts after the job started and ends
+    after its "Complete job" step started (an earlier attempt's logs end before this attempt
+    was created), it names the record's job, and every runner name the logs state is the
+    record's runner."""
+    times = [record["created_at"], record["started_at"], record["completed_at"], record["steps"][-1]["started_at"]]
+    created, started, completed, last_step = [utc_seconds(value) for value in times]
+    low, high = created - LOG_CLOCK_SLACK, completed + 1 + LOG_CLOCK_SLACK
+
+    def stamp(line):
+        match = LOG_TIME.match(line)
+        return utc_seconds(match.group("time")) if match else None
+
+    for lines in [whole] + step_logs + [system]:
+        for line in lines:
+            when = stamp(line)
+            if when is not None and not low <= when <= high:
+                raise Incomplete("log_attempt")
+    body = whole[:-1] if whole[-1] == "" else whole
+    first, end = stamp(body[0]), stamp(body[-1])
+    if first is None or end is None or first < started - LOG_CLOCK_SLACK or end < last_step - LOG_CLOCK_SLACK:
+        raise Incomplete("log_attempt")
+    if JOB_NAME_LINE.fullmatch(whole[setup_end]).group("value") != record["name"]:
+        raise Incomplete("log_attempt")
+    runners = [m.group("value") for m in (RUNNER_NAME_LINE.fullmatch(line) for line in whole[:setup_end]) if m]
+    runners += [m.group("value") for m in (SYSTEM_RUNNER_LINE.fullmatch(line) for line in system) if m]
+    if not runners or any(name != record["runner_name"] for name in runners):
+        raise Incomplete("log_attempt")
+
+
+def scan_logs(gate, root, policy, expected_name, run_id, run_attempt, job_record):
+    """One job's complete logs from the selected run attempt, bound to the job's API record.
+    --root is the extracted run attempt archive; the job's whole log, its system.txt and its
+    step files when the archive has them are read (job_log_files), and a missing, extra or
+    renamed step file is incomplete. Every text is searched. The one Machine name field in the
+    whole log's "Set up job" part (and its copy in the "Set up job" step file) is checked on
+    its own (check_machine_name); a further field anywhere is a finding. A log that does not
+    end with the runner's last line, or that does not belong to the record's attempt
+    (check_log_attempt), is incomplete. "/_work/" inside that run's release-host work folder
+    is not a path finding."""
+    record = load_job_record(job_record, run_id, run_attempt)
+    steps = record["steps"]
+    expected = {"%d_%s.txt" % (step["number"], step["name"]): step["number"]
+                for step in steps if step["conclusion"] != "skipped"}
+    whole_rel, step_rels, system_rel = job_log_files(root, record["name"], expected)
+    setup_step, end_step = record["name"] + "/1_Set up job.txt", "%s/%d_Complete job.txt" % (
+        record["name"], steps[-1]["number"])
     gate.work_prefix = RELEASE_WORK_PREFIX % run_id
-    order = sorted(files, key=lambda name: expected.get(name, 0))
-    setup_file, end_file = "1_Set up job.txt", "%d_Complete job.txt" % steps[-1]["number"]
-    logs, fields, job_end = [], [], False
-    for index, rel in enumerate(order):
-        path = os.path.join(root, rel)
-        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_FILE:
-            raise Incomplete("log_type")
-        with open(path, "rb") as handle:
-            data = handle.read()
-        if not data:
-            raise Incomplete("log_empty")
-        try:
-            text = data.decode("utf-8", "strict")
-        except UnicodeDecodeError:
-            raise Incomplete("log_encoding")
+    logs = []
+    for index, rel in enumerate([whole_rel] + step_rels + [system_rel]):
+        lines = read_log(root, rel).split("\n")
         label = "log%d" % index
         gate.scan_name(rel, Representation(label, (label, "name")), 0)
-        lines = text.split("\n")
+        logs.append((rel, label, lines))
+    whole = logs[0][2]
+    setup_end = next((number for number, line in enumerate(whole) if JOB_NAME_LINE.fullmatch(line)), None)
+    expected_fields = {"whole": 1, "step": 1 if step_rels else 0}
+    fields = {"whole": [], "step": [], "other": []}
+    for index, (rel, label, lines) in enumerate(logs):
         for number, line in enumerate(lines):
             match = MACHINE_NAME_LINE.fullmatch(line)
-            if match:
-                fields.append((rel == setup_file and match.group("step") is None, label, len(logs), number, match))
-        if rel == end_file:
-            body = lines[:-1] if lines[-1] == "" else lines
-            job_end = bool(body) and JOB_END_LINE.fullmatch(body[-1]) is not None
-        logs.append((label, lines))
-    if not job_end or not any(field[0] for field in fields):
+            if not match:
+                continue
+            if index == 0 and setup_end is not None and number < setup_end and match.group("step") is None:
+                kind = "whole"
+            elif rel == setup_step and match.group("step") is None:
+                kind = "step"
+            else:
+                kind = "other"
+            fields[kind].append((label, index, number, match))
+    ends = [ends_job(whole)] + [ends_job(lines) for rel, _label, lines in logs if rel == end_step]
+    if not all(ends) or not fields["whole"] or (step_rels and not fields["step"]):
         raise Incomplete("log_partial")
-    if len(fields) > 1:
+    check_log_attempt(record, whole, setup_end, [lines for _r, _l, lines in logs[1:-1]], logs[-1][2])
+    values = {match.group("value") for kind in ("whole", "step") for _l, _i, _n, match in fields[kind]}
+    if any(len(fields[kind]) != count for kind, count in expected_fields.items()) or fields["other"] \
+            or len(values) != 1:
         # Every copy stays in the text and is searched like any other line.
         gate.finding("logs", "host_runner_line", "duplicate")
     else:
-        _setup, label, index, number, match = fields[0]  # the setup file's own field
-        lines = logs[index][1]
-        start, end = match.span("value")
-        check_machine_name(gate, policy, label, lines[number], (start, end), expected_name)
-        # Matches that touch the value were all handled on the intact line.
-        lines[number] = lines[number][:start] + "\0" + lines[number][end:]
-    for label, lines in logs:
+        for label, index, number, match in fields["whole"] + fields["step"]:
+            lines = logs[index][2]
+            start, end = match.span("value")
+            check_machine_name(gate, policy, label, lines[number], (start, end), expected_name)
+            # Matches that touch the value were all handled on the intact line.
+            lines[number] = lines[number][:start] + "\0" + lines[number][end:]
+    for _rel, label, lines in logs:
         gate.scan_plain_text("\n".join(lines).encode("utf-8"), Representation(label, (label, "rest")))
-    return [label for label, _lines in logs]
+    return [label for _rel, label, _lines in logs]
 
 
 def check_machine_name(gate, policy, label, line, span, expected_name):

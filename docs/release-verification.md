@@ -506,22 +506,41 @@ The `logs` profile checks one job of one run attempt and needs all of:
 - `--job-record <file>`: the job's record from the GitHub API
   (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`). Its `run_id` and
   `run_attempt` must be the given ones (else `incomplete`, `log_run`), its
-  `status` `completed`, and its steps numbered in increasing order from
-  step 1, `Set up job`, to `Complete job`, every step `completed`
-  (else `log_record`).
-- `--root <folder>`: that job's folder from the run attempt's log archive
-  (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{n}/logs`). It
-  must hold exactly one `<number>_<step name>.txt` file for every step the
-  record lists with a conclusion other than `skipped`, and nothing else but
-  the optional `system.txt`. A missing step (also one in the middle), a file
-  for a skipped or unlisted step, a renamed file or a subfolder is
-  `incomplete` (`log_partial`), and so is a set whose `Set up job` file has
-  no `Machine name` field or whose `Complete job` file does not end with the
-  runner's last line, `Cleaning up orphan processes`. An empty folder or file
-  is `incomplete` too.
+  `status` `completed`, and it must carry the job's `id`, `name` (no `/`),
+  `runner_name`, `created_at`, `started_at` and `completed_at`; its steps are
+  numbered in increasing order from step 1, `Set up job`, to `Complete job`
+  (which carries `started_at`), every step `completed` (else `log_record`).
+- `--root <folder>`: the run attempt's log archive
+  (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{n}/logs`),
+  extracted. For the record's job it must hold exactly one whole-job log,
+  `<index>_<job name>.txt`, at its top and a `<job name>/` folder with
+  `system.txt`. GitHub serves the folder in two layouts, and both are
+  accepted: with exactly one `<number>_<step name>.txt` file for every step
+  the record lists with a conclusion other than `skipped`, or with no step
+  file at all. Other jobs' entries are not read. A missing whole-job log or
+  `system.txt`, a second whole-job log for the job, a step set that is
+  neither complete nor empty (a missing middle step, a file for a skipped or
+  unlisted step, a renamed file, a subfolder) is `incomplete` (`log_partial`),
+  and so is a whole-job log with no `Machine name` field before its
+  `Complete job name` line, or a whole-job log or `Complete job` file that
+  does not end with the runner's last line, `Cleaning up orphan processes`.
+  An empty archive or file is `incomplete` too.
+- The logs must belong to the record's attempt (else `incomplete`,
+  `log_attempt`): every timestamped line lies between the job's `created_at`
+  and `completed_at` (60 seconds of clock slack), the whole-job log starts no
+  earlier than `started_at` and ends no earlier than the `Complete job` step's
+  `started_at` (both less the slack), its `Complete job name` line names the
+  record's job, and every runner name the logs state (`Runner name` in the
+  setup lines, the runner `system.txt` names) is the record's `runner_name`,
+  at least one of them present. An earlier attempt's archive, even with the
+  same file names, ends before the later attempt was created. The job record
+  carries no identifier that appears in the logs, so the times, the job name
+  and the runner name are the binding.
 
-Every file is searched. A second `Machine name` field anywhere in the set is
-a finding. The admitted runner name, when the policy accepts the
+Every file is searched. The whole-job log's setup field and, in the step
+layout, its copy in the `Set up job` file are each checked on their own and
+must state the same name; a further `Machine name` field anywhere is a
+finding. The admitted runner name, when the policy accepts the
 machine-name field, comes from `--machine-name-fd <n>`, never argv. `/_work/`
 inside the run's release-host work folder is not a path finding (Matching).
 
@@ -549,7 +568,9 @@ The signing job runs only on the release host's per-run runner:
   labels: no job of a workflow triggered by `pull_request`,
   `pull_request_target` or `merge_group` runs on `ottto-signing-mac` or
   `ottto-release-bootstrap` or reads `vars.OTTTO_MACOS_STABLE_RUNNER_LABELS`
-  (`scripts/test_workflow_runner_policy.py`, in the public surface checks).
+  (`scripts/test_workflow_runner_policy.py`, in the public surface checks;
+  it parses the workflows with PyYAML and with Ruby's YAML library, aliases
+  enabled, whichever are present).
 
 ## Verify Stable Candidate RC
 

@@ -2,6 +2,7 @@
 """Tests for scripts/macos_privacy_gate.py. Synthetic markers and fixtures only."""
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib.util
 import io
@@ -846,36 +847,67 @@ class ReceiptAndContract(unittest.TestCase):
             g._legal_cache.update(saved_cache)
 
 
-SETUP_LOG = ("\ufeff2026-01-01T00:00:00.1000000Z Current runner version: '2.300.0'\n"
+JOB = "Release job"
+SETUP_LOG = ("﻿2026-01-01T00:00:00.1000000Z Current runner version: '2.300.0'\n"
+             "2026-01-01T00:00:00.1500000Z Runner name: 'runner-1'\n"
              "2026-01-01T00:00:00.2000000Z Machine name: '%s'\n"
-             "2026-01-01T00:00:00.3000000Z Complete job name: Build\n")
-END_LOG = "\ufeff2026-01-01T00:00:09.1000000Z Cleaning up orphan processes\n"
+             "2026-01-01T00:00:00.3000000Z Complete job name: Release job\n")
+END_LOG = "﻿2026-01-01T00:00:09.1000000Z Cleaning up orphan processes\n"
 BUILD_LOG = "2026-01-01T00:00:02.0000000Z ##[group]Run make\n2026-01-01T00:00:03.0000000Z done\n"
+SYSTEM_LOG = ("2025-12-31T23:59:58.5000000Z Requested labels: self-hosted\n"
+              "2025-12-31T23:59:59.5000000Z Job is about to start running on the runner: runner-1\n")
+RECORD_TIMES = {"created_at": "2025-12-31T23:59:58Z", "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:10Z"}
 
 
-def job_logs(tmp, name, setup=None, build=BUILD_LOG, end=END_LOG, omit=(), extra=(), system=None, record=None):
-    """A job's step folder as the runner's log archive holds it (skipped steps have no file; step
-    numbers have gaps) and the job's API record. Returns the logs-profile scan argv."""
+def shifted(seconds):
+    """A record whose times are `seconds` later: the logs on disk are from an earlier attempt."""
+    def later(value):
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") + dt.timedelta(seconds=seconds)
+
+    def change(record):
+        record = dict(record, **{key: later(record[key]).strftime("%Y-%m-%dT%H:%M:%SZ") for key in RECORD_TIMES})
+        record["steps"] = [dict(step, started_at=later(step["started_at"]).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                           for step in record["steps"]]
+        return record
+    return change
+
+
+def job_logs(tmp, name, setup=None, build=BUILD_LOG, end=END_LOG, omit=(), extra=(), system=SYSTEM_LOG,
+             record=None, layout="steps", whole=None, attempt=1, top=()):
+    """An extracted run attempt log archive (GET .../runs/<id>/attempts/<n>/logs) and the job's
+    API record. The archive holds "<index>_<job>.txt" (the whole job's log) at its top and a
+    "<job>/" folder with system.txt and, in the "steps" layout, one file per run step (skipped
+    steps have no file; step numbers have gaps); the "whole" layout has no step file. `extra`
+    adds files inside the job folder, `top` at the archive's top. Returns the logs-profile scan
+    argv."""
     folder = tempfile.mkdtemp(prefix="logs.", dir=tmp)
-    steps = [(1, "Set up job", "success", SETUP_LOG % name if setup is None else setup),
-             (2, "Checkout", "success", "2026-01-01T00:00:01.0000000Z ##[group]Run actions/checkout\n"),
-             (3, "Optional step", "skipped", None),
-             (4, "Build", "success", build),
-             (7, "Complete job", "success", end)]
-    files = [("%d_%s.txt" % (n, step), text) for n, step, _c, text in steps if text is not None and n not in omit]
-    files += list(extra) + ([("system.txt", system)] if system is not None else [])
+    steps = [(1, "Set up job", "success", SETUP_LOG % name if setup is None else setup, "00:00:00"),
+             (2, "Checkout", "success", "2026-01-01T00:00:01.0000000Z ##[group]Run actions/checkout\n", "00:00:01"),
+             (3, "Optional step", "skipped", None, "00:00:02"),
+             (4, "Build", "success", build, "00:00:02"),
+             (7, "Complete job", "success", end, "00:00:09")]
+    if whole is None:
+        whole = "﻿" + "".join(text.lstrip("﻿") for _n, _s, _c, text, _t in steps if text)
+    files = [("1_" + JOB + ".txt", whole)] + [(rel, text) for rel, text in top]
+    inside = list(extra) + ([("system.txt", system)] if system is not None else [])
+    if layout == "steps":
+        inside += [("%d_%s.txt" % (n, step), text) for n, step, _c, text, _t in steps
+                   if text is not None and n not in omit]
+    files += [(JOB + "/" + rel, text) for rel, text in inside]
     for rel, text in files:
         os.makedirs(os.path.dirname(os.path.join(folder, rel)), exist_ok=True)
         with open(os.path.join(folder, rel), "w", encoding="utf-8") as handle:
             handle.write(text)
-    value = {"id": 1, "run_id": 4242, "run_attempt": 1, "status": "completed", "conclusion": "success",
-             "steps": [{"number": n, "name": step, "status": "completed", "conclusion": c}
-                       for n, step, c, _text in steps]}
+    value = dict(RECORD_TIMES, id=1, name=JOB, run_id=4242, run_attempt=attempt, status="completed",
+                 conclusion="success", runner_name="runner-1",
+                 steps=[{"number": n, "name": step, "status": "completed", "conclusion": c,
+                         "started_at": "2026-01-01T%sZ" % at} for n, step, c, _text, at in steps])
     text = json.dumps(record(value) if record else value)
     path = os.path.join(tmp, "job-%s.json" % os.path.basename(folder))
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
-    return ["scan", "--profile", "logs", "--root", folder, "--run-id", "4242", "--run-attempt", "1",
+    return ["scan", "--profile", "logs", "--root", folder, "--run-id", "4242", "--run-attempt", str(attempt),
             "--job-record", path]
 
 
@@ -911,8 +943,23 @@ class LogScan(unittest.TestCase):
             (job_logs(tmp, host, build=BUILD_LOG + "2026-01-01T00:00:04Z Machine name: '%s'\n" % host),
              host, True, (), "blocked"),                                # a second field in another step
             (job_logs(tmp, host, build=BUILD_LOG + "later " + host + "\n"), host, True, (), "blocked"),
-            (job_logs(tmp, host, system="2026-01-01T00:00:00Z queued " + PRIVATE + "\n"), host, True, (),
-             "blocked"),                                                # system.txt is searched
+            (job_logs(tmp, host, system=SYSTEM_LOG + "2026-01-01T00:00:00Z queued " + PRIVATE + "\n"), host, True,
+             (), "blocked"),                                            # system.txt is searched
+            # The archive layout with the whole job's log and no step file.
+            (job_logs(tmp, host, layout="whole"), host, True, (), "clean"),
+            (job_logs(tmp, host, layout="whole"), None, False, (), "blocked"),
+            (job_logs(tmp, host, layout="whole", build=BUILD_LOG + "later " + host + "\n"), host, True, (),
+             "blocked"),
+            (job_logs(tmp, host, layout="whole", setup=(SETUP_LOG % host) * 2), host, True, (), "blocked"),
+            (job_logs(tmp, host, layout="whole",
+                      build=BUILD_LOG + "2026-01-01T00:00:04Z Machine name: '%s'\n" % host), host, True, (),
+             "blocked"),
+            # The step file's copy of the field must be the whole log's.
+            (job_logs(tmp, host, whole=SETUP_LOG % "other-host" + BUILD_LOG + END_LOG), host, True,
+             (), "blocked"),
+            # Other jobs' entries in the archive are not this job's logs and are not read.
+            (job_logs(tmp, host, top=(("2_Other job.txt", PRIVATE + "\n"), ("Other job/system.txt", "x\n"))),
+             host, True, (), "clean"),
             # Inside the admitted value only the host-name literal equal to the whole name passes.
             (job_logs(tmp, host), host, True, (g.Marker("thetic-ho", "private"),), "blocked"),
             (job_logs(tmp, host), host, True, (g.Marker(": 'synth", "private"),), "blocked"),
@@ -924,10 +971,11 @@ class LogScan(unittest.TestCase):
         # An independent literal equal to the admitted value blocks with its own class.
         for marker in (g.Marker(host, "private"), g.Marker(host, "signer", signer=True),
                        g.Marker(host, "owner", owner=True), g.Marker(host, "user"), g.Marker(host, "runner")):
-            gate = self.scan(job_logs(tmp, host), extra=(marker,))
-            self.assertEqual(gate.verdict(), "blocked", marker.cls)
-            self.assertEqual(set(gate.findings), {marker.cls}, gate.diagnostics)
-            self.assertIn(("log0", "host_runner_line", "accepted"), gate.diagnostics)
+            for layout in ("steps", "whole"):
+                gate = self.scan(job_logs(tmp, host, layout=layout), extra=(marker,))
+                self.assertEqual(gate.verdict(), "blocked", (marker.cls, layout))
+                self.assertEqual(set(gate.findings), {marker.cls}, gate.diagnostics)
+                self.assertIn(("log0", "host_runner_line", "accepted"), gate.diagnostics)
 
     def test_complete_job_only(self):
         host, tmp = self.HOST, self.tmp
@@ -962,6 +1010,41 @@ class LogScan(unittest.TestCase):
             (job_logs(tmp, host, record=steps(lambda s: s[:4] + [
                 {"number": 5, "name": "Upload", "status": "completed", "conclusion": "success"}] + s[4:])),
              "log_partial"),
+            (job_logs(tmp, host, record=lambda r: {k: v for k, v in r.items() if k != "runner_name"}), "log_record"),
+            (job_logs(tmp, host, record=lambda r: dict(r, completed_at="2026-01-01 00:00:10")), "log_record"),
+            (job_logs(tmp, host, record=lambda r: dict(r, name="Release/job")), "log_record"),
+            (job_logs(tmp, host, record=steps(lambda s: s[:-1] + [{k: v for k, v in s[-1].items()
+                                                                  if k != "started_at"}])), "log_record"),
+            # Both layouts need the whole job's log and system.txt.
+            (job_logs(tmp, host, system=None), "log_partial"),
+            (job_logs(tmp, host, system=None, layout="whole"), "log_partial"),
+            (job_logs(tmp, host, top=(("3_" + JOB + ".txt", "x\n"),)), "log_partial"),  # two whole logs
+            (job_logs(tmp, host, layout="whole", end="2026-01-01T00:00:08Z Cleaning\n"), "log_partial"),
+            (job_logs(tmp, host, layout="whole", setup=SETUP_LOG.replace("Machine name", "Machine") % host),
+             "log_partial"),
+            (job_logs(tmp, host, layout="whole", extra=(("4_Build.txt", BUILD_LOG),)), "log_partial"),  # some steps
+            # The logs belong to another attempt: an earlier attempt's archive with the same names.
+            (job_logs(tmp, host, attempt=2, record=shifted(1800)), "log_attempt"),
+            (job_logs(tmp, host, attempt=2, record=shifted(1800), layout="whole"), "log_attempt"),
+            (job_logs(tmp, host, attempt=2, record=shifted(-1800)), "log_attempt"),
+            # A record whose job ended before the "Complete job" step's line, or a log that starts
+            # long before the job started.
+            (job_logs(tmp, host, record=lambda r: dict(r, completed_at="2025-12-31T23:59:00Z")), "log_attempt"),
+            (job_logs(tmp, host, record=steps(lambda s: s[:-1] + [dict(s[-1], started_at="2026-01-01T00:05:00Z")])),
+             "log_attempt"),
+            (job_logs(tmp, host, record=lambda r: dict(r, started_at="2026-01-01T00:03:00Z")), "log_attempt"),
+            # A step file from another attempt beside this attempt's whole log.
+            (job_logs(tmp, host, build="2025-12-31T23:00:02.0000000Z ##[group]Run make\n"), "log_attempt"),
+            # Another job's name or another runner.
+            (job_logs(tmp, host, record=lambda r: dict(r, name="Other job")), "log_partial"),
+            (job_logs(tmp, host, whole=(SETUP_LOG % host).replace("name: Release job", "name: Other")
+                      + BUILD_LOG + END_LOG), "log_attempt"),
+            (job_logs(tmp, host, record=lambda r: dict(r, runner_name="runner-2")), "log_attempt"),
+            (job_logs(tmp, host, layout="whole", system=SYSTEM_LOG.replace("runner: runner-1", "runner: runner-2")),
+             "log_attempt"),
+            (job_logs(tmp, host, layout="whole", system="2025-12-31T23:59:58.5000000Z Requested labels: x\n",
+                      setup=SETUP_LOG.replace("Runner name: 'runner-1'", "Runner group: 'x'") % host),
+             "log_attempt"),                                            # no runner named at all
         ]
         for args, code in cases:
             with self.assertRaisesRegex(g.Incomplete, "^%s$" % code, msg=args):
@@ -972,8 +1055,8 @@ class LogScan(unittest.TestCase):
         with self.assertRaisesRegex(g.Incomplete, "^log_record$"):
             self.scan(args)
         empty = job_logs(tmp, host)
-        for name in os.listdir(empty[4]):
-            os.remove(os.path.join(empty[4], name))
+        shutil.rmtree(empty[4])
+        os.mkdir(empty[4])
         with self.assertRaisesRegex(g.Incomplete, "^log_empty$"):
             self.scan(empty)
 
@@ -1062,6 +1145,15 @@ class CommandLine(unittest.TestCase):
         result = self.run_gate(job_logs(self.tmp, "neutral-name", omit=(2,)), machine_name="neutral-name")
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn(b"code=log_partial", result.stderr)
+        # Both archive layouts scan clean; an earlier attempt's archive under a later record is
+        # incomplete.
+        for layout in ("steps", "whole"):
+            result = self.run_gate(job_logs(self.tmp, "neutral-name", layout=layout), machine_name="neutral-name")
+            self.assertEqual(result.returncode, 0, (layout, result.stderr))
+            result = self.run_gate(job_logs(self.tmp, "neutral-name", layout=layout, attempt=2, record=shifted(1800)),
+                                   machine_name="neutral-name")
+            self.assertEqual(result.returncode, 3, (layout, result.stderr))
+            self.assertIn(b"code=log_attempt", result.stderr)
         # The logs profile needs the run, the attempt and the job record; no other profile takes them.
         args = job_logs(self.tmp, "neutral-name")
         for drop in ("--run-id", "--run-attempt", "--job-record"):
