@@ -193,6 +193,7 @@ use toml_edit::Item;
 mod accounts;
 mod auth;
 mod backend_http;
+pub mod cloud_connect;
 mod diagnostics;
 mod managed_config;
 mod peer;
@@ -271,6 +272,7 @@ use backend_http::backend_post_json_with_timeout;
 #[cfg(test)]
 use backend_http::backend_reason_code;
 use backend_http::backend_response_unexpected;
+use backend_http::backend_send_raw_json;
 use backend_http::backend_success;
 use backend_http::bounded_display_text;
 use backend_http::cli_error;

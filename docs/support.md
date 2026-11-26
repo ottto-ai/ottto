@@ -86,7 +86,10 @@ Use the detected install owner from JSON status and the release manifest:
 - Homebrew: `brew update && brew upgrade ottto`
 - Hosted native installer: download and verify the signed native artifact
   advertised by the stable manifest.
-- App bundle: update through the signed app path.
+- App bundle: update through the signed app path. To downgrade, reinstall and
+  open the older signed Ottto app so it re-renders the LaunchAgent. A
+  service-binary-only swap is unsupported because the installed job can still
+  pass arguments the older service does not accept.
 
 Do not self-overwrite owner-managed files. For rollback, follow the release
 manifest rollback notes and verify checksums, signing/notarization state,

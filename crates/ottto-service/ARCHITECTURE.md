@@ -977,6 +977,60 @@ Public updates and backend-token commands use their own handler paths. Identity
 commands keep their handler-side authorization and invalidate pending launch
 handoffs before mutation.
 
+## Cloud connect signer channel
+
+`control/cloud_connect` is the service side of connecting a cloud account from this Mac. The
+Ottto app holds the Secure Enclave keys and signs; the service talks to the Ottto server and
+never sees a key.
+
+- **Channel.** A second Mach service, `net.ottto.service.signer`, separate from the control
+  listener. The service renders it into its LaunchAgent (`MachServices` and
+  `serve-xpc --signer-mach-service`) only when an app bundle installed it, and opens it only
+  when its own signature is the release `ottto-service` (identifier and Developer ID team) and
+  no `OTTTO_COMPANION_*` override is set. There is no dev, ad-hoc or socket mode. A listener
+  that cannot start is logged and leaves the signer unavailable; the control listener and socket
+  keep serving.
+- **Peers.** Each peer must run as this user and pass
+  `xpc_connection_set_peer_code_signing_requirement`; libxpc then checks every message it delivers.
+  The app and service requirements pin their respective identifiers, the team, and the Apple
+  Developer ID leaf and intermediate CA.
+- **Wire.** JSON `{"signer_protocol":1,"id","command","args"}` in, `{"signer_protocol":1,"id",
+  "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. The shared fixture
+  `fixtures/cloud_connect/signer_wire_v1.json` holds every command and result byte for byte; the
+  service tests and the Mac app's tests both read it. Every connection sends `signer_hello`
+  first; its result names this Mac's `binding` (device, generation, organization) and the
+  server's `agent_connect` status, each null when unknown. The service refuses anything else on
+  a connection without a hello. The
+  commands (`cloud_sign_poll`, `cloud_sign_result`, `cloud_keys_claim_start`,
+  `cloud_keys_claim_status`, `cloud_keys_enroll_prepare`, `cloud_keys_enroll`,
+  `cloud_keys_revoke`) exist only here, never on the control channel.
+- **Signed writes.** A prepare builds the body once, hashes
+  `method + "\n" + route template + "\n" + body` with the literal `{setup_run_id}`, gets a
+  device challenge for that hash, checks the challenge's signed facts (version, challenge id,
+  run, organization, operation, attempt, hash, and an expiry within the operation's lifetime),
+  and freezes body and challenge on the connection. The body and hashes match the server's
+  enrollment vector, vendored unchanged as `fixtures/cloud_connect/enroll_wire_v1.json`. The
+  send uses those bytes and `{challenge_id}.{signature}` proofs, after the signature shape and
+  required proofs are checked locally. Revoke signs the empty `DELETE` body the same way; the
+  server answers it with an empty 204. When the server specifically refuses the run token, the
+  service refreshes and resends the identical request only if the run and organization both
+  match the original binding. An ambiguous enrollment response requires a claim-state readback.
+- **Browser claim.** The service returns the claim link only when it names the returned UUID on
+  `https://app.ottto.net/setup/cloud-keys?claim=…` and the forward key code has the expected
+  Base32 shape.
+- **Sign queue.** In memory only: a device proof lives until its challenge expires and an
+  approval until its `sign_by`; one request per approval id, and a new approval supersedes the
+  attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the
+  server's attempt limits bound how many requests arrive. A request goes to the first verified
+  connection that polls it, only that connection's answer counts, and a DER shape check guards signatures.
+  An ended connection drops its prepares and returns its requests to the queue.
+- **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
+  three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
+  This unauthenticated hint carries no data. The app obtains requests over verified XPC.
+- **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
+  its LaunchAgent. Swapping only the service binary is unsupported because the installed job
+  retains the signer Mach service and passes a flag the older binary cannot parse.
+
 ## Local health diagnostics
 
 Verification authorizes before source reads or result writes; setup authorizes
