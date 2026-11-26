@@ -562,6 +562,8 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
     let mut first_pass = Vec::new();
     let mut first_scan = None;
+    // The index right after the first re-read, while the entry still exists.
+    let mut known = None;
     for pass in 0..2 {
         let (next, scan, reads, rows) = f.page(source, index);
         let modes = reads.0.lock().unwrap().0.clone();
@@ -624,6 +626,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         }
         if pass == 0 {
             assert!(!next.files[&key].has_sampled_tag());
+            known = Some(next.clone());
         } else {
             // Unchanged and past the window, the file owes nothing: the walk
             // does not observe it, and the clean generation's reconciliation
@@ -635,6 +638,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         }
         index = next;
     }
+    // The growth below is measured against the entry the first re-read left,
+    // as if the file had stayed inside the window.
+    let index = known.expect("the first re-read kept the entry");
     // Metadata-only change: the certified prefix still names the observed EOF,
     // so ctime adoption must use that extent, not just the committed prefix.
     use std::os::unix::fs::PermissionsExt;
