@@ -1312,9 +1312,30 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
                 .lock()
                 .unwrap()
                 .push_back(AckScriptedPost::Disabled);
+            // A paced first import the disabled batch must not leave behind.
+            with_source_cadence(source, |cadence| {
+                let now = crate::scan_clock::now();
+                cadence.record_scan_success(now, 1);
+                assert!(cadence.request_paced_scan(
+                    now,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(30),
+                        idle_per_work: 0,
+                    },
+                    true,
+                ));
+            });
         }
         let offered_before = server.offered.lock().unwrap().len();
         let result = home.finish(preparation, index, scan);
+        if !with_debt {
+            assert_eq!(
+                with_source_cadence(source, |cadence| cadence.paced_first_import()),
+                Some(false),
+                "cycle {cycle}: a disabled batch drops the paced request"
+            );
+        }
         if with_debt {
             let error = result.unwrap_err();
             assert!(

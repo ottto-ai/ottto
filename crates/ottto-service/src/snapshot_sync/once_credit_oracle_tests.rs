@@ -159,6 +159,8 @@ struct OracleServer {
     status_fails: Arc<std::sync::atomic::AtomicBool>,
     /// The activity hint's `backfill_window_days` (183 unless a row sets it).
     window_days: Arc<std::sync::atomic::AtomicU64>,
+    /// Windows for the next hints, in order, before `window_days` answers.
+    window_script: Arc<Mutex<VecDeque<u64>>>,
 }
 impl OracleServer {
     fn new(source: SnapshotSource, handle: Handle) -> Self {
@@ -186,6 +188,8 @@ impl OracleServer {
         let failing = status_fails.clone();
         let window_days = Arc::new(std::sync::atomic::AtomicU64::new(183));
         let window = window_days.clone();
+        let window_script = Arc::new(Mutex::new(VecDeque::<u64>::new()));
+        let scripted_window = window_script.clone();
         let worker = std::thread::spawn(move || {
             let _entered = handle.enter();
             while !done.load(Ordering::Relaxed) {
@@ -212,10 +216,15 @@ impl OracleServer {
                 let response = if request.contains("/relay-token") {
                     json!({"token":"synthetic-oracle-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
+                    let window_days = scripted_window
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| window.load(Ordering::SeqCst));
                     let mut hint = json!({"source":source.api_slug(),"server_time":AT,
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,
-                        "backfill_window_days":window.load(Ordering::SeqCst),
+                        "backfill_window_days":window_days,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"});
                     // Production still advertises this key to Claude Code
                     // only; the daemon no longer reads it (decode tolerates it).
@@ -392,6 +401,7 @@ impl OracleServer {
             statuses,
             status_fails,
             window_days,
+            window_script,
         }
     }
 }

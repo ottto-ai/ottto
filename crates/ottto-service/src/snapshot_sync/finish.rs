@@ -2234,6 +2234,8 @@ pub(super) fn finish_sync_source(
             return Ok(());
         }
         Ok(ResumableUploadResult::Disabled(disabled_reason)) => {
+            // No scan success follows to retire a paced request.
+            continuation::drop_paced_request(source);
             report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -2656,7 +2658,7 @@ pub(super) fn finish_sync_source(
         let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
             .with_snapshot_terminal_counts(&index);
         let loss_free = !counts.has_walk_loss(&index);
-        report_status_with_fresh_relay_token(
+        let terminal_window_days = report_status_with_fresh_relay_token(
             client,
             device,
             device_secret,
@@ -2678,7 +2680,12 @@ pub(super) fn finish_sync_source(
         .inspect_err(|_| {
             crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "receipt_failed");
         })?;
-        if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
+        if terminal_window_days == 0 {
+            // The receipt went out as a tombstone: the server holds no census
+            // for a record to stand for, so the next pass at a real window walks.
+            crate::snapshots::walk_idle::clear(source, "window_zero");
+            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "window_zero");
+        } else if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
             let now = crate::scan_clock::utc_seconds();
             let outside = cycle_owed_nothing
                 && loss_free

@@ -102,6 +102,11 @@ fn settle(home: &mut OracleHome, server: &OracleServer, recording: &Recording) -
 
 fn prepare_once(home: &mut OracleHome) -> Result<Option<SourcePreparation>> {
     home.cadence.due();
+    prepare_now(home)
+}
+
+/// One preparation on the cadence as it stands.
+fn prepare_now(home: &mut OracleHome) -> Result<Option<SourcePreparation>> {
     let collection = home.collection();
     with_scan_clock(home.now, || {
         crate::agent_status_refresh::with_test_collection(collection, || {
@@ -669,9 +674,33 @@ fn window_zero_policy_stop_clears_the_armed_record() {
         let window = std::sync::atomic::Ordering::SeqCst;
         server.window_days.store(0, window);
         walk_idle::age_for_test(source, STEP);
+        // A paced request (a first import mid-way) no pass would retire.
+        home.cadence.due();
+        with_scan_clock(home.now, || {
+            let now = crate::scan_clock::now();
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(now, 1);
+                assert!(cadence.request_paced_scan(
+                    now,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(30),
+                        idle_per_work: 0,
+                    },
+                    true,
+                ));
+            });
+        });
         assert!(
-            prepare_once(&mut home).unwrap().is_none(),
+            prepare_now(&mut home).unwrap().is_none(),
             "{row}: window 0 stops the pass"
+        );
+        // The request itself, not its deadline: the hint's scan directive
+        // can hide the deadline while the request stands.
+        assert_eq!(
+            with_source_cadence(source, |cadence| cadence.paced_first_import()),
+            Some(false),
+            "{row}: the stop drops the paced request"
         );
         assert!(status_count(&server) > statuses, "{row}: the tombstone");
         assert_eq!(
@@ -683,6 +712,53 @@ fn window_zero_policy_stop_clears_the_armed_record() {
         let mut seen = Seen::now(source, &server);
         let back = pass(&mut home, &server, &recording, STEP);
         expect_pass(source, row, &back, true, &server, &mut seen);
+    });
+}
+
+/// A window that reads 0 only at the terminal receipt turns it into a
+/// tombstone, so the walk that sent it does not arm: the server holds no
+/// census for the record to stand for, and the next pass walks again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn terminal_window_zero_receipt_does_not_arm() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Pi;
+    let row = "w24_terminal_window_zero";
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        assert!(walk_idle::armed_for_test(source).is_some(), "{row}");
+        // A hinted change walks; preparation reads 183, every later hint 0.
+        change(&home);
+        hint(&home);
+        let window = std::sync::atomic::Ordering::SeqCst;
+        server.window_script.lock().unwrap().push_back(183);
+        server.window_days.store(0, window);
+        let tombstoned = pass(&mut home, &server, &recording, STEP);
+        assert!(tombstoned.finish.is_ok(), "{row}: {:?}", tombstoned.finish);
+        let receipt = last_status(&server);
+        assert_eq!(receipt["report_kind"], "scan_status", "{row}");
+        assert_eq!(
+            receipt["last_backfill_window_days"], 0,
+            "{row}: the terminal receipt is a tombstone"
+        );
+        assert_eq!(receipt["last_census_complete"], false, "{row}");
+        assert_eq!(
+            walk_idle::armed_for_test(source),
+            None,
+            "{row}: a tombstoned receipt does not arm"
+        );
+        server.window_days.store(183, window);
+        let back = pass(&mut home, &server, &recording, STEP);
+        assert!(walking(&back), "{row}: the next pass walks: {}", back.gate);
     });
 }
 
