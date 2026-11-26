@@ -1153,6 +1153,10 @@ struct FinishEnv<'a> {
     index_path: &'a Path,
     activity_hint: &'a crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
+    backfill_pending: bool,
+    backfill_state: &'a crate::backfill::BackfillState,
+    upload_destination_namespace: &'a str,
+    scan_started_at: &'a str,
 }
 
 /// The pass's settled facts at the end of a finish, read by each step there.
@@ -1165,6 +1169,9 @@ struct PassEnd<'a> {
     isolated_only: bool,
     accepted: u64,
     terminal_scan_started_at: &'a str,
+    fresh_offer: bool,
+    upload_completed: bool,
+    backfill_succeeded: bool,
 }
 
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
@@ -2470,6 +2477,10 @@ pub(super) fn finish_sync_source(
         index_path: &index_path,
         activity_hint: &activity_hint,
         receipt_window_days,
+        backfill_pending,
+        backfill_state: &backfill_state,
+        upload_destination_namespace: &upload_destination_namespace,
+        scan_started_at: &scan_started_at,
     };
     let end = PassEnd {
         deferred_entity_count,
@@ -2479,118 +2490,18 @@ pub(super) fn finish_sync_source(
         isolated_only,
         accepted,
         terminal_scan_started_at,
+        fresh_offer,
+        upload_completed,
+        backfill_succeeded,
     };
-    // A completed cycle is what moves the tier: uploads keep a source warm, a
-    // quiet cycle lets it fall to idle and then cold. A conflict pass durably
-    // committed its accepted siblings and each held entity waits on its own
-    // quarantine clock, so it is not a source failure; the failure ladder is
-    // for upload errors. The sweep marker is stamped only for settled scans,
-    // and the status below still reports the held entities.
-    with_source_cadence(source, |cadence| {
-        cadence.record_scan_success(Instant::now(), accepted)
-    });
-    let first_read_bootstrap = backfill_pending
-        && crate::backfill::bootstrap_pending_for_destination(
-            &backfill_state,
-            source,
-            &upload_destination_namespace,
-        );
-    let power = continuation::MacPlatformSignals::default().power();
-    if let Some(first_import) = continuation::resident_scan_request_after_settlement(
+    settle_pass_and_markers(
+        &env,
         &scan_result,
-        first_read_bootstrap,
-        power,
-        index.runnable_walk_or_followup(
-            &scan_result,
-            &local_holds.held_fingerprints,
-            local_holds.progress_blocking,
-            fresh_offer,
-            &current_rfc3339(),
-        ),
-    ) {
-        // The final tier runs gentler: background QoS at the same bootstrap pace.
-        let first_import =
-            first_import && !backfill_state.first_read_tier_final(&upload_destination_namespace);
-        let existing = continuation::resident_scan_requested(&scan_result, first_read_bootstrap);
-        pass_outcomes(|counts| {
-            counts.paced_request_existing = u64::from(existing);
-            counts.paced_request_bootstrap_runnable = u64::from(!existing);
-            counts.paced_first_import = u64::from(first_import);
-            counts.paced_power_allowed = u64::from(power == continuation::PlatformState::Allowed);
-            counts.paced_power_battery = u64::from(power == continuation::PlatformState::Battery);
-        });
-        continuation::request_resident_scan_on_power(source, first_import, power);
-    }
-
-    // Refresh the per-source detected-uses cache the daemon health assembly
-    // reads for the Companion's "Detected Uses" panel. The scan is incremental,
-    // so this cycle's snapshots are a delta; the cache merge preserves
-    // historical destinations. A failure here must never fail the sync, and the
-    // error is not logged verbatim because it can embed a local filesystem path.
-    if update_detected_uses_cache(support_dir, source, &scan_result.snapshots).is_err() {
-        eprintln!(
-            "local detected-uses cache update skipped for {}",
-            source.api_slug()
-        );
-    }
-
-    // A Claude census completed and settled under the history gate clears the
-    // unverified marker. A fresh index recorded its cutoff this cycle and an
-    // intact one keeps its entries, so the rebuilt history stays gated;
-    // Claude's bootstrap and replays may then run.
-    #[cfg(test)]
-    tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
-    if claude_replay_suppressed(source, &backfill_state)
-        && scan_result.census_complete
-        && upload_fully_settled
-    {
-        clear_unverified_marker(source, support_dir)?;
-    }
-
-    // A tier waits only for work in flight inside the import; refusals and
-    // account holds stay owed. Order only: a failed save retries later.
-    let tier_finished = tier_settled(
-        upload_fully_settled,
-        upload_completed || resolved_permanent_rejections,
+        &index,
+        &upload_progress,
         &local_holds,
-    ) && index.first_read_tier_finished(source, |fingerprint| {
-        upload_progress
-            .permanent_rejections
-            .get(fingerprint)
-            .map(|rejection| rejection.body_witness.clone())
-    });
-    if tier_finished {
-        match crate::backfill::record_first_read_tier_pass(
-            support_dir,
-            source,
-            &upload_destination_namespace,
-            &super::enabled_snapshot_sources_in(device, support_dir),
-        ) {
-            // Every participant reads the next tier now; the final at background QoS.
-            Ok(Some((wake, first_import))) => {
-                for participant in wake {
-                    continuation::request_resident_scan_on_power(participant, first_import, power);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!(
-                "local snapshot backfill tier save deferred for {}: {}",
-                source.api_slug(),
-                safe_error(&error)
-            ),
-        }
-    }
-
-    #[cfg(test)]
-    tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
-    if backfill_succeeded {
-        record_backfill_completion(
-            source,
-            support_dir,
-            &upload_destination_namespace,
-            &scan_started_at,
-        )?;
-    }
+        end,
+    )?;
 
     // Final scan/backfill markers are durable before page progress is retired.
     // Accepted cache evidence and head tokens remain in this same ACK-owned
@@ -2649,6 +2560,151 @@ pub(super) fn finish_sync_source(
         walk_idle_pass,
         end,
     )
+}
+
+/// After the pass's saves: the source's cadence, the next resident scan and the
+/// detected-uses cache, then the two backfill markers in order, each under its
+/// own condition, with a best-effort first-read tier save between them. A
+/// marker write failure fails the pass before upload progress is retired.
+fn settle_pass_and_markers(
+    env: &FinishEnv<'_>,
+    scan_result: &SourceScanResult,
+    index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    local_holds: &LocalHoldSettlement,
+    end: PassEnd<'_>,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        device,
+        support_dir,
+        backfill_pending,
+        backfill_state,
+        upload_destination_namespace,
+        scan_started_at,
+        ..
+    } = *env;
+    let PassEnd {
+        upload_fully_settled,
+        resolved_permanent_rejections,
+        accepted,
+        fresh_offer,
+        upload_completed,
+        backfill_succeeded,
+        ..
+    } = end;
+    // A completed cycle is what moves the tier: uploads keep a source warm, a
+    // quiet cycle lets it fall to idle and then cold. A conflict pass durably
+    // committed its accepted siblings and each held entity waits on its own
+    // quarantine clock, so it is not a source failure; the failure ladder is
+    // for upload errors. The sweep marker is stamped only for settled scans,
+    // and the status below still reports the held entities.
+    with_source_cadence(source, |cadence| {
+        cadence.record_scan_success(Instant::now(), accepted)
+    });
+    let first_read_bootstrap = backfill_pending
+        && crate::backfill::bootstrap_pending_for_destination(
+            backfill_state,
+            source,
+            upload_destination_namespace,
+        );
+    let power = continuation::MacPlatformSignals::default().power();
+    if let Some(first_import) = continuation::resident_scan_request_after_settlement(
+        scan_result,
+        first_read_bootstrap,
+        power,
+        index.runnable_walk_or_followup(
+            scan_result,
+            &local_holds.held_fingerprints,
+            local_holds.progress_blocking,
+            fresh_offer,
+            &current_rfc3339(),
+        ),
+    ) {
+        // The final tier runs gentler: background QoS at the same bootstrap pace.
+        let first_import =
+            first_import && !backfill_state.first_read_tier_final(upload_destination_namespace);
+        let existing = continuation::resident_scan_requested(scan_result, first_read_bootstrap);
+        pass_outcomes(|counts| {
+            counts.paced_request_existing = u64::from(existing);
+            counts.paced_request_bootstrap_runnable = u64::from(!existing);
+            counts.paced_first_import = u64::from(first_import);
+            counts.paced_power_allowed = u64::from(power == continuation::PlatformState::Allowed);
+            counts.paced_power_battery = u64::from(power == continuation::PlatformState::Battery);
+        });
+        continuation::request_resident_scan_on_power(source, first_import, power);
+    }
+
+    // Refresh the per-source detected-uses cache the daemon health assembly
+    // reads for the Companion's "Detected Uses" panel. The scan is incremental,
+    // so this cycle's snapshots are a delta; the cache merge preserves
+    // historical destinations. A failure here must never fail the sync, and the
+    // error is not logged verbatim because it can embed a local filesystem path.
+    if update_detected_uses_cache(support_dir, source, &scan_result.snapshots).is_err() {
+        eprintln!(
+            "local detected-uses cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
+    // A Claude census completed and settled under the history gate clears the
+    // unverified marker. A fresh index recorded its cutoff this cycle and an
+    // intact one keeps its entries, so the rebuilt history stays gated;
+    // Claude's bootstrap and replays may then run.
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
+    if claude_replay_suppressed(source, backfill_state)
+        && scan_result.census_complete
+        && upload_fully_settled
+    {
+        clear_unverified_marker(source, support_dir)?;
+    }
+
+    // A tier waits only for work in flight inside the import; refusals and
+    // account holds stay owed. Order only: a failed save retries later.
+    let tier_finished = tier_settled(
+        upload_fully_settled,
+        upload_completed || resolved_permanent_rejections,
+        local_holds,
+    ) && index.first_read_tier_finished(source, |fingerprint| {
+        upload_progress
+            .permanent_rejections
+            .get(fingerprint)
+            .map(|rejection| rejection.body_witness.clone())
+    });
+    if tier_finished {
+        match crate::backfill::record_first_read_tier_pass(
+            support_dir,
+            source,
+            upload_destination_namespace,
+            &super::enabled_snapshot_sources_in(device, support_dir),
+        ) {
+            // Every participant reads the next tier now; the final at background QoS.
+            Ok(Some((wake, first_import))) => {
+                for participant in wake {
+                    continuation::request_resident_scan_on_power(participant, first_import, power);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "local snapshot backfill tier save deferred for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
+    if backfill_succeeded {
+        record_backfill_completion(
+            source,
+            support_dir,
+            upload_destination_namespace,
+            scan_started_at,
+        )?;
+    }
+    Ok(())
 }
 
 /// The terminal receipt and what follows it. Attempts the refusal receipt
