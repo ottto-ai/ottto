@@ -165,7 +165,7 @@ fn lease_touch_requires_the_certificates_own_known_birth_and_read() {
         Load::Cold(Some(FullReason::SameSizeEdit)) => {}
         Load::Cold(reason) => panic!("clamped birth returned Cold({reason:?})"),
         Load::Reused(..) => panic!("clamped birth returned Reused"),
-        Load::Held => panic!("clamped birth returned Held"),
+        Load::Held(_) => panic!("clamped birth returned Held"),
     }
 }
 

@@ -264,7 +264,10 @@ fn lower_and_future_revisions_keep_their_distinct_contracts() {
             .body;
         let (load, records) = loaded(&route, &path, &key);
         if future {
-            assert!(matches!(load, Load::Held));
+            assert!(matches!(
+                load,
+                Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
+            ));
             assert_eq!(counted(&records), ("held".into(), vec![]));
             let mut held = RouteResult::emitted(Mode::Restart, SOURCE, vec![], &[]);
             held.accepted = prior.accepted.clone();

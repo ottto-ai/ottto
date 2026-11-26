@@ -157,7 +157,10 @@ fn an_unknown_fact_version_holds_the_file() {
     route.save(false);
     let head = route.head(&key).unwrap().body;
     let (load, records) = loaded(&route, &route.dir.join("a.jsonl"), &key);
-    assert!(matches!(load, Load::Held));
+    assert!(matches!(
+        load,
+        Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
+    ));
     assert_eq!(counted(&records), ("held".into(), vec![]));
     assert_eq!(route.head(&key).unwrap().body, head);
 }
