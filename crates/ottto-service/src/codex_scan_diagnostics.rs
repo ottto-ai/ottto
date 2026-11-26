@@ -168,6 +168,26 @@ impl UnreadableCauses {
                 .insert(cause as usize, UnreadableSample::new(line, file));
         }
     }
+    /// `record_sampled` for a failed open or read: the sample also keeps the
+    /// error's kind.
+    #[track_caller]
+    pub(crate) fn record_io_sampled(
+        &mut self,
+        cause: UnreadableCause,
+        count: u64,
+        file: Option<(&std::path::Path, &str)>,
+        error: &std::io::Error,
+    ) {
+        self.record(cause, count);
+        if count > 0 {
+            let line = std::panic::Location::caller().line();
+            let sample = UnreadableSample {
+                io: Some(error.kind().into()),
+                ..UnreadableSample::new(line, file)
+            };
+            self.samples.insert(cause as usize, sample);
+        }
+    }
     pub(crate) fn merge(&mut self, other: Self) {
         for (slot, incoming) in self.counts.iter_mut().zip(other.counts) {
             *slot = slot.saturating_add(incoming);
@@ -251,11 +271,13 @@ impl crate::heap_layout_bound::HeapLayoutBound for UnreadableSamples {
 /// One unreadable event: the recording call's line in the producing build
 /// (with the cause it names one call site) and, when the site names a file,
 /// that file's root class, kind and the first 8 bytes of `digest(index key)`
-/// (lineage's `file_key_digest`) as a big-endian `u64`. Never path text. One
-/// flat record.
+/// (lineage's `file_key_digest`) as a big-endian `u64`, and for a failed open
+/// or read the error's kind. Never path or error text. One flat record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct UnreadableSample {
     line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    io: Option<UnreadableIo>,
     #[serde(flatten)]
     file: Option<UnreadableFile>,
 }
@@ -264,6 +286,30 @@ struct UnreadableFile {
     root: UnreadableRoot,
     kind: UnreadableFileKind,
     key: u64,
+}
+/// The kind of a failed open or read, from a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UnreadableIo {
+    NotFound,
+    PermissionDenied,
+    UnexpectedEof,
+    InvalidData,
+    /// A refused decoder admission: transient, retried, never a gone file.
+    WouldBlock,
+    Other,
+}
+impl From<std::io::ErrorKind> for UnreadableIo {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            std::io::ErrorKind::InvalidData => Self::InvalidData,
+            std::io::ErrorKind::WouldBlock => Self::WouldBlock,
+            _ => Self::Other,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -301,7 +347,11 @@ impl UnreadableSample {
                 key: u64::from_be_bytes(std::array::from_fn(|byte| key[byte])),
             }
         });
-        Self { line, file }
+        Self {
+            line,
+            io: None,
+            file,
+        }
     }
 }
 
@@ -1159,6 +1209,36 @@ mod tests {
         assert_eq!(merged.samples.0, causes.samples.0, "merge stays bounded");
         assert_eq!(merged.counts[UnreadableCause::OpenRead as usize], 12);
     }
+    /// [format] A failed open or read keeps its kind in the sample as a
+    /// closed enum name, never the error or path text; a kind outside the set
+    /// reads `other`. It survives the persisted round trip.
+    #[test]
+    fn unreadable_io_sample_keeps_only_the_error_kind() {
+        let path = std::path::Path::new("/Users/private credential/.codex/sessions/a.jsonl");
+        let key = path.to_string_lossy().into_owned();
+        let mut causes = UnreadableCauses::default();
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "private credential");
+        causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &gone);
+        let slow = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &slow);
+        let refused = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &refused);
+        assert_eq!(causes.counts[UnreadableCause::OpenRead as usize], 3);
+        let kept = causes.samples.0[UnreadableCause::OpenRead as usize];
+        assert_eq!(kept[0].unwrap().io, Some(UnreadableIo::NotFound));
+        assert_eq!(kept[1].unwrap().io, Some(UnreadableIo::Other));
+        assert_eq!(kept[2].unwrap().io, Some(UnreadableIo::WouldBlock));
+        assert_eq!(kept[0].unwrap().file, kept[1].unwrap().file);
+        let text = serde_json::to_string(&causes).unwrap();
+        assert!(text.contains(r#""io":"not_found""#), "{text}");
+        assert!(text.contains(r#""io":"other""#), "{text}");
+        assert!(text.contains(r#""io":"would_block""#), "{text}");
+        for forbidden in ["/Users", "private", "credential", ".codex", "sessions"] {
+            assert!(!text.contains(forbidden), "{forbidden}");
+        }
+        let back: UnreadableCauses = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.samples.0, causes.samples.0);
+    }
     #[test]
     fn reason_classification_never_uses_error_text() {
         let mut evidence = LoaderEvidence::default();
@@ -1250,6 +1330,7 @@ mod tests {
         diagnostics.unreadable_causes.samples = UnreadableSamples(
             [[Some(UnreadableSample {
                 line: u32::MAX,
+                io: Some(UnreadableIo::PermissionDenied),
                 file: Some(UnreadableFile {
                     root: UnreadableRoot::OtherHome,
                     kind: UnreadableFileKind::JsonlZst,

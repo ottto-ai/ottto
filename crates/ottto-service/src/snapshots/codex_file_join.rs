@@ -946,13 +946,21 @@ impl HeaderInventory {
                     return false;
                 }
                 self.mark_incomplete(Incomplete::HeaderError, 1);
-                let cause = if error.downcast_ref::<std::io::Error>().is_some() {
-                    UnreadableCause::OpenRead
-                } else {
-                    UnreadableCause::AliasParser
-                };
-                self.unreadable_causes
-                    .record_sampled(cause, 1, Some((Path::new(&key), &key)));
+                let file = Some((Path::new(&key), key.as_str()));
+                // An open or read failure keeps its kind, so a one-off is
+                // attributable (a file deleted mid-walk reads `not_found`).
+                match error.downcast_ref::<std::io::Error>() {
+                    Some(io) => self.unreadable_causes.record_io_sampled(
+                        UnreadableCause::OpenRead,
+                        1,
+                        file,
+                        io,
+                    ),
+                    None => {
+                        self.unreadable_causes
+                            .record_sampled(UnreadableCause::AliasParser, 1, file)
+                    }
+                }
                 let witness = path_witness(Path::new(&key));
                 self.refused.insert(key, witness);
             }
