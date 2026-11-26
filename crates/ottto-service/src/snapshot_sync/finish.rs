@@ -1157,6 +1157,8 @@ struct FinishEnv<'a> {
     backfill_state: &'a crate::backfill::BackfillState,
     upload_destination_namespace: &'a str,
     scan_started_at: &'a str,
+    upload_progress_path: &'a Path,
+    daemon: &'a LocalDaemon,
 }
 
 /// The pass's settled facts at the end of a finish, read by each step there.
@@ -1172,6 +1174,16 @@ struct PassEnd<'a> {
     fresh_offer: bool,
     upload_completed: bool,
     backfill_succeeded: bool,
+}
+
+/// What retiring this pass's upload progress consumes from the pass.
+struct ProgressRetirement<'a> {
+    locally_held_fingerprints: &'a BTreeSet<String>,
+    projected_pending_head_file_witnesses: &'a BTreeMap<String, Option<String>>,
+    current_entities: &'a BTreeSet<String>,
+    retired_upload_acks: &'a mut ack_retention::AckRetirementPlan,
+    walk_retired: bool,
+    identity_503_this_pass: Option<BTreeSet<String>>,
 }
 
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
@@ -2481,6 +2493,8 @@ pub(super) fn finish_sync_source(
         backfill_state: &backfill_state,
         upload_destination_namespace: &upload_destination_namespace,
         scan_started_at: &scan_started_at,
+        upload_progress_path: &upload_progress_path,
+        daemon,
     };
     let end = PassEnd {
         deferred_entity_count,
@@ -2503,54 +2517,21 @@ pub(super) fn finish_sync_source(
         end,
     )?;
 
-    // Final scan/backfill markers are durable before page progress is retired.
-    // Accepted cache evidence and head tokens remain in this same ACK-owned
-    // ledger across successful cycles so later corrections can retract safely.
-    let exhausted_cache_heads = upload_progress.retire_pending_cache_heads(
+    retire_upload_progress(
+        &env,
+        &mut upload_progress,
         &index,
-        &scan_result.snapshots,
-        locally_held_fingerprints,
-        scan_result.census_complete,
-        &projected_pending_head_file_witnesses,
-    );
-    if exhausted_cache_heads > 0 {
-        eprintln!(
-            "local snapshot cache heads settled for {}: pending_cache_heads_retired_exhausted={exhausted_cache_heads}",
-            source.api_slug()
-        );
-    }
-    upload_progress
-        .permanent_rejections
-        .retain(|fingerprint, refusal| {
-            refusal.has_stale_debt() || current_entities.contains(fingerprint)
-        });
-    // Before `finish_cycle` retires this cycle's quarantine records.
-    let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
-    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
-    log_retained_permanent_refusals(
-        source,
-        retained_refusals,
-        retained_downgrades,
-        upload_fully_settled,
-    );
-    upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, &index);
-    upload_progress.retire_planned_acks_after_index_save(
-        &index,
-        &retired_upload_acks,
-        locally_held_fingerprints,
-    );
-    if walk_retired {
-        upload_progress.retire_identity_503_custody(
-            identity_503_this_pass.unwrap_or_default(),
-            index.owes_isolated_503(),
-        );
-    }
-    #[cfg(test)]
-    tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
-    upload_progress.finish_cycle(&upload_progress_path)?;
-    crate::local_resource_diagnostics::pass_retained(source.api_slug(), || {
-        daemon.transcript_cache.retained_heap_bytes(&index)
-    });
+        &scan_result,
+        end,
+        ProgressRetirement {
+            locally_held_fingerprints,
+            projected_pending_head_file_witnesses: &projected_pending_head_file_witnesses,
+            current_entities: &current_entities,
+            retired_upload_acks: &mut retired_upload_acks,
+            walk_retired,
+            identity_503_this_pass,
+        },
+    )?;
 
     report_and_arm(
         &env,
@@ -2704,6 +2685,86 @@ fn settle_pass_and_markers(
             scan_started_at,
         )?;
     }
+    Ok(())
+}
+
+/// Retires this pass's upload progress after the index save and any marker
+/// writes that were due: pending cache heads, stale refusals, the planned ACKs
+/// and identity custody, then the durable ledger save, which can fail the pass.
+fn retire_upload_progress(
+    env: &FinishEnv<'_>,
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    scan_result: &SourceScanResult,
+    end: PassEnd<'_>,
+    retirement: ProgressRetirement<'_>,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        upload_progress_path,
+        daemon,
+        ..
+    } = *env;
+    let PassEnd {
+        upload_fully_settled,
+        ..
+    } = end;
+    let ProgressRetirement {
+        locally_held_fingerprints,
+        projected_pending_head_file_witnesses,
+        current_entities,
+        retired_upload_acks,
+        walk_retired,
+        identity_503_this_pass,
+    } = retirement;
+    // Final scan/backfill markers are durable before page progress is retired.
+    // Accepted cache evidence and head tokens remain in this same ACK-owned
+    // ledger across successful cycles so later corrections can retract safely.
+    let exhausted_cache_heads = upload_progress.retire_pending_cache_heads(
+        index,
+        &scan_result.snapshots,
+        locally_held_fingerprints,
+        scan_result.census_complete,
+        projected_pending_head_file_witnesses,
+    );
+    if exhausted_cache_heads > 0 {
+        eprintln!(
+            "local snapshot cache heads settled for {}: pending_cache_heads_retired_exhausted={exhausted_cache_heads}",
+            source.api_slug()
+        );
+    }
+    upload_progress
+        .permanent_rejections
+        .retain(|fingerprint, refusal| {
+            refusal.has_stale_debt() || current_entities.contains(fingerprint)
+        });
+    // Before `finish_cycle` retires this cycle's quarantine records.
+    let retained_refusals = PermanentRefusalCounts::of(upload_progress);
+    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(upload_progress);
+    log_retained_permanent_refusals(
+        source,
+        retained_refusals,
+        retained_downgrades,
+        upload_fully_settled,
+    );
+    upload_progress.add_saved_handoff_retirements(retired_upload_acks, index);
+    upload_progress.retire_planned_acks_after_index_save(
+        index,
+        retired_upload_acks,
+        locally_held_fingerprints,
+    );
+    if walk_retired {
+        upload_progress.retire_identity_503_custody(
+            identity_503_this_pass.unwrap_or_default(),
+            index.owes_isolated_503(),
+        );
+    }
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
+    upload_progress.finish_cycle(upload_progress_path)?;
+    crate::local_resource_diagnostics::pass_retained(source.api_slug(), || {
+        daemon.transcript_cache.retained_heap_bytes(index)
+    });
     Ok(())
 }
 
