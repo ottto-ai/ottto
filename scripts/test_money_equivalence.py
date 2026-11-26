@@ -1128,6 +1128,14 @@ class DistinctCommitTests(unittest.TestCase):
             money_equivalence.require_distinct_commits("a" * 40, "a" * 40)
 
 
+class BaseLineTests(unittest.TestCase):
+    def test_the_log_names_the_resolved_base_and_how_it_was_chosen(self):
+        self.assertEqual(money_equivalence.base_line("origin/main", "a" * 40, False),
+                         f"MONEY_EQUIVALENCE_BASE {'a' * 40} (fork point of origin/main)")
+        self.assertEqual(money_equivalence.base_line("v0.1.264", "b" * 40, True),
+                         f"MONEY_EQUIVALENCE_BASE {'b' * 40} (explicit)")
+
+
 class HeadOnlyFixtureTests(unittest.TestCase):
     """A new native fixture is required on the head, optional and UNCOMPARED on the base."""
 
