@@ -687,6 +687,24 @@ pub(crate) fn tail_head_bytes_for_test(index: &ScanIndex, key: &str) -> Vec<u8> 
     bytes
 }
 
+/// The committed head's reduction, revision and reduction membership, without
+/// the freshness debt (`Revisions`), which a held file's debt bookkeeping may
+/// change.
+#[cfg(test)]
+pub(crate) fn tail_head_reduction_for_test(
+    index: &ScanIndex,
+    key: &str,
+) -> (u32, Vec<u8>, Vec<(Collection, u64)>) {
+    let head = load_head(index, key, u32::MAX).unwrap().unwrap();
+    let table = head
+        .table
+        .iter()
+        .filter(|(collection, _)| **collection != Collection::Revisions)
+        .map(|(collection, entry)| (*collection, entry.pages))
+        .collect();
+    (head.revision, head.body, table)
+}
+
 #[cfg(test)]
 pub(crate) fn tail_set_aside_attempts_for_test(index: &ScanIndex, key: &str) -> Option<u32> {
     tail_set_aside(index, key)

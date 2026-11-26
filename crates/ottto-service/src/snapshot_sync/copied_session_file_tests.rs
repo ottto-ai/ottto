@@ -1962,7 +1962,7 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
         forced_needs_native_for_test, set_future_tail_fact_for_test, tail_counter_for_test,
     };
     use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
-    use crate::snapshots::state_v2::tail_head_bytes_for_test;
+    use crate::snapshots::state_v2::tail_head_reduction_for_test;
 
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1985,7 +1985,7 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
             &index,
             &holder.to_string_lossy()
         ));
-        let head = tail_head_bytes_for_test(&index, &key);
+        let head = tail_head_reduction_for_test(&index, &key);
         let held_count = tail_counter_for_test("tail_held_newer_build", "forced_twin");
         let scanner = carrier_scanner(&index);
         e2::take_diag();
@@ -2013,7 +2013,9 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
             assert!(item.request_count <= oracle.request_count);
         }
         index = settle(&c, &index, held, &mut e2_progress());
-        assert_eq!(tail_head_bytes_for_test(&index, &key), head);
+        // The newer reduction and facts stay as written; only the freshness
+        // debt the page's ACK drained may change.
+        assert_eq!(tail_head_reduction_for_test(&index, &key), head);
 
         index.activate_upload_context("e2-synthetic-destination".into());
         set_future_tail_fact_for_test(&mut index, &key, false);
