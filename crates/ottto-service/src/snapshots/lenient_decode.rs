@@ -1003,7 +1003,7 @@ fn read_persistence_mode<R: BufRead + Seek>(
     Ok(index)
 }
 
-// The common tail of full, bounded CAS, partial and v2 reads. The raw-dependent
+// The common tail of full, partial and v2 reads. The raw-dependent
 // repair/freeze pass must finish before these semantic drops and scope rebuilds.
 fn finish_decode(
     index: &mut ScanIndex,
@@ -1014,7 +1014,7 @@ fn finish_decode(
     map_only: bool,
 ) -> std::result::Result<(), Error> {
     view_controls(index, source, map_only)?;
-    // Normalize on every successful read, including both CAS readers. A bad
+    // Normalize on every successful read, including CAS. A bad
     // cutoff clears the loaded marker so prior-history signals re-derive it.
     index.drop_malformed_claude_history_cutoff();
     index.decode_holds = holds;
@@ -2474,81 +2474,6 @@ impl ScanIndex {
 // asserts their agreement. Never default a failed ledger read, quarantine its
 // file, or borrow census/parser-copy credit for it.
 
-pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
-    // Preserve the caller byte bound and the existing census normalization and
-    // node/depth admission before constructing native state. Original syntax is
-    // checked before the optional census normalizer can replace damaged input.
-    validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
-        note_refusal(error, "cas", "unattributed");
-    })?;
-    let (normalized, duplicate_census, duplicate_shadow) =
-        claude_request_census::normalized_bounded_bytes(bytes)?;
-    bounded_shape(&normalized).inspect_err(|_| {
-        note_refusal(
-            &Error::Refused("nesting resource cap"),
-            "cas",
-            "unattributed",
-        );
-    })?;
-    let mut index = read(std::io::Cursor::new(normalized), "cas", "unattributed")?;
-    if duplicate_census {
-        index.claude_request_census = ClaudeRequestCensus::default();
-    }
-    if duplicate_shadow {
-        index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
-    }
-    Ok(index)
-}
-
-fn bounded_shape(bytes: &[u8]) -> anyhow::Result<()> {
-    // An 8,192-node/depth-64 gate. The lexical pass already proved grammar;
-    // count tokens without converting 1e400 to f64.
-    let mut nodes = 0;
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut scalar = false;
-    for &byte in bytes {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-            continue;
-        }
-        if byte.is_ascii_whitespace() || matches!(byte, b',' | b':') {
-            scalar = false;
-            continue;
-        }
-        if matches!(byte, b'}' | b']') {
-            scalar = false;
-            depth = depth.saturating_sub(1);
-            continue;
-        }
-        let container = matches!(byte, b'{' | b'[');
-        if byte == b'"' || container || !scalar {
-            nodes += 1;
-            anyhow::ensure!(
-                nodes <= crate::snapshot_retry::STATE_NODES && depth <= 64,
-                "optional snapshot state shape cap"
-            );
-        }
-        if byte == b'"' {
-            quoted = true;
-            scalar = false;
-        } else if container {
-            depth += 1;
-            scalar = false;
-        } else {
-            scalar = true;
-        }
-    }
-    Ok(())
-}
-
 // Raw scalars borrow the admitted one-record capture. A malformed-present null
 // must stay distinguishable from a missing legacy count.
 fn present_raw<'de, D: serde::Deserializer<'de>>(
@@ -2728,16 +2653,8 @@ pub(super) fn read_partial_persistence(
     partial: scan_index_persistence::PartialIndex,
     stage: &str,
     source: &'static str,
-    cap: Option<usize>,
 ) -> anyhow::Result<ScanIndex> {
-    let (mut reader, unavailable) = partial.into_reader()?;
-    if let Some(cap) = cap {
-        anyhow::ensure!(
-            reader.seek(SeekFrom::End(0))? <= cap as u64,
-            "scan_index_read_limit"
-        );
-        reader.seek(SeekFrom::Start(0))?;
-    }
+    let (reader, unavailable) = partial.into_reader()?;
     let mut index = read_persistence_mode(
         BufReader::new(reader),
         stage,

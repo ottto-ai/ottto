@@ -717,7 +717,7 @@ or sit beside it, and not all of them say what the code does:
 | `snapshots/` | The local read path: discovery, file readers, reduction to usage, the scan index, the state database and the wire model. No network. |
 | `snapshot_sync/` | The upload cycle per source. Usage flows one way, to the server; the cycle also handles the server's answers and check-in. |
 | `snapshot_client.rs` | The main HTTP client for the Ottto server: snapshot uploads and most other relay calls. A few calls are made elsewhere (`control/backend_http.rs`). |
-| `snapshot_retry.rs` | Response size limits and bounded JSON reads. It holds no retry logic; that is in `snapshot_sync/retry.rs` and `net_resilience.rs`. |
+| `snapshot_retry.rs` | Response size limits. It holds no retry logic; that is in `snapshot_sync/retry.rs` and `net_resilience.rs`. |
 | `retry_tls.rs` | The TLS connector behind the daemon's HTTP agents. |
 | `snapshot_audit.rs` | The `snapshot-audit` command: a privacy-safe local report. |
 | `snapshot_watcher.rs`, `snapshot_roots.rs` | The file-system watcher, and the folders each source is scanned and watched in. |
