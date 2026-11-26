@@ -838,9 +838,10 @@ fn read_shared_page(
 /// as future state. Workspace accepts path-only v1 and v2 with a Git or non-Git
 /// binding independently of the other v1 facts, and opening settings accepts
 /// v1 and v2, which appends the request-1 MCP schema count. The Codex prelude
-/// accepts v1 and v2, which is v1 followed by one length-prefixed extension;
-/// this build reads the v1 part and skips the extension, and still writes v1.
-/// The head reduction revision stays unchanged. Kinds are shared by every codec; a kind
+/// accepts v1 and v2, which is v1 followed by one length-prefixed extension a
+/// later build writes for a start it counted: this build keeps a sealed
+/// start's extension and writes it back unchanged as v2, and writes v1
+/// otherwise. The head reduction revision stays unchanged. Kinds are shared by every codec; a kind
 /// its source never sets is never stored (the Codex agent label and prelude on
 /// Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -865,9 +866,10 @@ const FACTS: [Fact; 6] = [
 const FACT_VERSION: u64 = 1;
 const WORKSPACE_BINDING_VERSION: u64 = 2;
 const OPENING_MCP_SCHEMAS_VERSION: u64 = 2;
-/// A Codex prelude fact with an extension after the v1 fields. Read, never
-/// written yet: a build that writes it can roll back to this one, which keeps
-/// the v1 part and holds nothing.
+/// A Codex prelude fact with an extension after the v1 fields: a sealed
+/// start a later build counted. This build writes it back only as it read it,
+/// so that build can roll back to this one with nothing held, re-read or
+/// changed in what the start sends.
 const CODEX_PRELUDE_EXTENSION_VERSION: u64 = 2;
 
 crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
@@ -899,6 +901,9 @@ impl Fact {
             Self::OpeningSettings if acc.session_start.has_mcp_schemas() => {
                 OPENING_MCP_SCHEMAS_VERSION
             }
+            Self::CodexPrelude if acc.session_start.has_sealed_codex_start() => {
+                CODEX_PRELUDE_EXTENSION_VERSION
+            }
             _ => FACT_VERSION,
         })?;
         match self {
@@ -926,7 +931,10 @@ impl Fact {
             }
             Self::OpeningSettings => acc.session_start.put_opening_fact(e),
             Self::AgentLabel => acc.codex_agent_label.put(e),
-            Self::CodexPrelude => acc.session_start.put_codex_prelude_fact(e),
+            Self::CodexPrelude => {
+                acc.session_start.put_codex_prelude_fact(e)?;
+                acc.session_start.put_sealed_codex_start(e)
+            }
         }
     }
 
@@ -979,7 +987,8 @@ impl Fact {
             Self::CodexPrelude => {
                 into.session_start.take_codex_prelude_fact(&mut d)?;
                 if version == CODEX_PRELUDE_EXTENSION_VERSION {
-                    d.len_prefixed()?;
+                    let extension = d.len_prefixed()?;
+                    into.session_start.take_codex_prelude_extension(extension)?;
                 }
             }
         }
@@ -1004,6 +1013,11 @@ fn fact_pages(acc: &SnapshotAccumulator) -> Result<Vec<(u64, Vec<u8>)>, Refuse> 
         .into_iter()
         .filter(|fact| fact.present(acc))
         .map(|fact| {
+            if fact == Fact::CodexPrelude {
+                crate::local_resource_diagnostics::codex_start_fact(
+                    acc.session_start.has_sealed_codex_start(),
+                );
+            }
             Ok((
                 fact as u64,
                 Enc::count_write(usize::MAX, |e| fact.put(acc, e))?,

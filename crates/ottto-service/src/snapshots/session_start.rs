@@ -420,6 +420,34 @@ fn attachment_units(line: &Value, attachment: &Value) -> u64 {
     tool_output_units(attachment.get("content"))
 }
 
+/// A sealed Codex start a later build counted, kept from the extension of a
+/// version 2 prelude fact: the extension's bytes, written back unchanged on
+/// every save, and the request-1 breakdown that build proved (`None` when
+/// it proved none). This build counts no start itself; it only keeps the
+/// sealed one and sends the same breakdown, so a rollback changes nothing a
+/// sealed start sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::snapshots) struct SealedCodexStart {
+    extension: Vec<u8>,
+    first_request: Option<FirstRequestParts>,
+}
+crate::heap_layout_bound::fields!(SealedCodexStart; extension, first_request);
+
+/// The four request-1 buckets of a session start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirstRequestParts {
+    uncached_input: u64,
+    cache_read: u64,
+    cache_write_5m: Option<u64>,
+    cache_write_1h: Option<u64>,
+}
+crate::heap_layout_bound::fields!(FirstRequestParts; uncached_input, cache_read, cache_write_5m, cache_write_1h);
+
+/// The one extension layout this build reads: `varint 1 | bool sealed |
+/// Option<FirstRequestParts> | length-prefixed token state`. Another layout
+/// version is a later build's and is not kept.
+const CODEX_START_EXTENSION_LAYOUT: u64 = 1;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct OpeningRequest {
     context_tokens: u64,
@@ -506,6 +534,8 @@ pub(in crate::snapshots) struct SessionStartState {
     /// Codex: the one prelude parser, which also holds the AGENTS.md text
     /// for path matching.
     codex_prelude: Option<Box<CodexPreludeParser>>,
+    /// Codex: a sealed start a later build counted, from the prelude fact.
+    codex_sealed_start: Option<SealedCodexStart>,
     calls: BTreeMap<OpeningCallId, OpeningCall>,
     last_codex_call: Option<String>,
     files: BTreeMap<String, OpeningFileState>,
@@ -569,7 +599,7 @@ crate::durable_tail_codec::durable_struct!(OpeningFileState {
     N client_loaded: [bool; 2],
     N truncated: [bool; 2],
 });
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, mcp_schemas, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, mcp_schemas, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, codex_sealed_start, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 crate::durable_tail_codec::durable_struct!(SessionStartState {
     U client_version: Option<String>,
     N user_turns: u8,
@@ -593,6 +623,8 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     X instructions: Option<String>,
     N instructions_capped: bool,
     X codex_prelude: Option<Box<CodexPreludeParser>>,
+    // Stored in the Codex prelude fact (v2), so no head byte changes.
+    I codex_sealed_start: Option<SealedCodexStart>,
     D calls: BTreeMap<OpeningCallId, OpeningCall>,
     L last_codex_call: Option<String>,
     X files: BTreeMap<String, OpeningFileState>,
@@ -804,6 +836,81 @@ impl SessionStartState {
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
         self.codex_prelude = Some(Box::new(CodexPreludeParser::take_fact(d)?));
         Ok(())
+    }
+
+    /// Whether the Codex prelude fact carries a sealed start's extension,
+    /// stored as the fact's version 2.
+    pub(in crate::snapshots) fn has_sealed_codex_start(&self) -> bool {
+        self.codex_sealed_start.is_some()
+    }
+
+    /// The sealed start's extension, byte for byte, after the prelude fact's
+    /// version 1 fields.
+    pub(in crate::snapshots) fn put_sealed_codex_start(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        match &self.codex_sealed_start {
+            Some(sealed) => e.len_prefixed(&sealed.extension),
+            None => Ok(()),
+        }
+    }
+
+    /// Restores a version 2 prelude fact's extension. A sealed start is kept
+    /// with its bytes; a provisional one, or another layout, is dropped, so
+    /// the fact is written back as version 1 and this build's own reading of
+    /// the prelude stands. A malformed sealed or provisional extension is
+    /// corrupt.
+    pub(in crate::snapshots) fn take_codex_prelude_extension(
+        &mut self,
+        extension: &[u8],
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        use crate::durable_tail_codec::{Dec, Durable};
+        let mut d = Dec::new(extension);
+        if d.varint()? != CODEX_START_EXTENSION_LAYOUT {
+            return Ok(());
+        }
+        let sealed = bool::take(&mut d)?;
+        let first_request = if bool::take(&mut d)? {
+            Some(FirstRequestParts {
+                uncached_input: Durable::take(&mut d)?,
+                cache_read: Durable::take(&mut d)?,
+                cache_write_5m: Durable::take(&mut d)?,
+                cache_write_1h: Durable::take(&mut d)?,
+            })
+        } else {
+            None
+        };
+        d.len_prefixed()?;
+        d.finish()?;
+        self.codex_sealed_start = sealed.then(|| SealedCodexStart {
+            extension: extension.to_vec(),
+            first_request,
+        });
+        Ok(())
+    }
+
+    /// A version 2 prelude fact's extension as a later build writes it.
+    #[cfg(test)]
+    pub(in crate::snapshots) fn codex_start_extension_for_test(
+        sealed: bool,
+        first_request: Option<(u64, u64, Option<u64>, Option<u64>)>,
+        token_state: &[u8],
+    ) -> Vec<u8> {
+        use crate::durable_tail_codec::{Durable, Enc};
+        Enc::count_write(usize::MAX, |e| {
+            e.varint(CODEX_START_EXTENSION_LAYOUT)?;
+            sealed.put(e)?;
+            first_request.is_some().put(e)?;
+            if let Some((uncached, read, write_5m, write_1h)) = first_request {
+                uncached.put(e)?;
+                read.put(e)?;
+                write_5m.put(e)?;
+                write_1h.put(e)?;
+            }
+            e.len_prefixed(token_state)
+        })
+        .unwrap()
     }
 
     /// Restores the opening-settings fact into a decoded body: its blob and
@@ -1611,7 +1718,16 @@ impl SessionStartState {
         // The first-request breakdown only when its parts add up to the item's
         // first-turn context: the first request must reconcile exactly and be that turn. Codex takes
         // the first turn from a response the request count may not admit.
-        if let Some(first) = requests[0].filter(|r| {
+        // A sealed Codex start sends the breakdown the build that counted it
+        // proved, or none when it proved none.
+        if let Some(sealed) = &self.codex_sealed_start {
+            if let Some(first) = sealed.first_request {
+                start.first_request_uncached_input_tokens = Some(first.uncached_input);
+                start.first_request_cache_read_tokens = Some(first.cache_read);
+                start.first_request_cache_write_5m_tokens = first.cache_write_5m;
+                start.first_request_cache_write_1h_tokens = first.cache_write_1h;
+            }
+        } else if let Some(first) = requests[0].filter(|r| {
             r.parts_reconcile
                 && r.context_tokens > 0
                 && Some(r.context_tokens) == first_turn_context_tokens

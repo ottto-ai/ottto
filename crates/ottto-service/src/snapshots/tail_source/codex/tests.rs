@@ -776,25 +776,22 @@ fn codex_content_loads_back_from_its_session_facts() {
     );
 }
 
-/// [format] The Codex prelude fact is written as v1, and this build also
-/// reads v2: the v1 fields followed by one length-prefixed extension, which
-/// it skips. A v2 fact restores the same prelude as its v1 part, empty or
-/// not, so a later build that writes v2 can roll back to this one with
-/// nothing held and nothing read again. A v2 fact without its extension, or
-/// with bytes after it, is corrupt; a newer version is incompatible.
+/// [money] The Codex prelude fact is written as v1 unless it carries a
+/// sealed start a later build counted (v2: the v1 fields, then one
+/// length-prefixed extension). A sealed extension loads with no hold and no
+/// Full, is written back byte for byte, and the start sends the breakdown
+/// that build sealed, or none when it proved none. A provisional extension,
+/// or a later layout, is dropped: the fact is written back as its v1 bytes
+/// and the start sends what it sends today. A malformed extension is corrupt;
+/// a newer fact version holds.
 #[test]
-fn a_codex_prelude_fact_v2_restores_its_v1_part() {
+fn a_sealed_codex_start_survives_a_rollback_unchanged() {
+    use crate::snapshots::session_start::{SessionStartState, CODEX_PARTS_METHOD};
     let (reduction, certificate) = parse(&lines(3));
-    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
     let page = (Collection::SessionFacts, 5);
-    let v1 = staged.pages[&page].clone();
+    let v1 = stage_reduction::<Codex>(&reduction, &certificate, &identity()).pages[&page].clone();
     assert_eq!(v1[..2], [5, 1], "kind 5, written as version 1");
-    let prelude = |acc: &SnapshotAccumulator| {
-        Enc::count_write(usize::MAX, |e| acc.session_start.put_codex_prelude_fact(e)).unwrap()
-    };
-    let stored = prelude(&loaded(&staged));
-    assert_eq!(stored, v1[2..], "v1 loads back to its own bytes");
-    let with = |version: u8, tail: &[u8]| {
+    let staged = |version: u8, tail: &[u8]| {
         let mut staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
         let mut bytes = vec![5, version];
         bytes.extend_from_slice(&v1[2..]);
@@ -802,23 +799,103 @@ fn a_codex_prelude_fact_v2_restores_its_v1_part() {
         staged.pages.insert(page, bytes);
         staged
     };
-    for (label, extension) in [("empty", &[0][..]), ("filled", &[3, 9, 8, 7][..])] {
-        let v2 = with(2, extension);
-        assert_eq!(cause(&v2), None, "{label}: a v2 fact loads");
-        assert_eq!(prelude(&loaded(&v2)), stored, "{label}: the v1 part");
+    let len_prefixed =
+        |extension: &[u8]| Enc::count_write(usize::MAX, |e| e.len_prefixed(extension)).unwrap();
+    // The fact page a save writes, and the request-1 breakdown the start sends.
+    let saved = |acc: &SnapshotAccumulator| {
+        super::super::fact_pages(acc)
+            .unwrap()
+            .into_iter()
+            .find(|(kind, _)| *kind == 5)
+            .unwrap()
+            .1
+    };
+    let first_request = |acc: &SnapshotAccumulator| {
+        SessionStartState::clone(&acc.session_start)
+            .finish(true, Some(100), CODEX_PARTS_METHOD, None, None, None)
+            .map(|start| {
+                (
+                    start.first_request_uncached_input_tokens,
+                    start.first_request_cache_read_tokens,
+                    start.first_request_cache_write_5m_tokens,
+                    start.first_request_cache_write_1h_tokens,
+                )
+            })
+    };
+    let today = loaded(&staged(1, &[]));
+    assert_eq!(
+        saved(&today),
+        v1,
+        "v1 loads and saves back to its own bytes"
+    );
+    let sent_today = first_request(&today);
+    assert!(
+        sent_today.is_some_and(|parts| parts.0.is_some()),
+        "today's build sends a breakdown for this start: {sent_today:?}"
+    );
+    let extension = |sealed: bool, proven: Option<(u64, u64, Option<u64>, Option<u64>)>| {
+        SessionStartState::codex_start_extension_for_test(sealed, proven, b"token state")
+    };
+    let proven = (7, 3, Some(2), None);
+    for (label, sealed, first, sends) in [
+        (
+            "sealed proven",
+            true,
+            Some(proven),
+            Some((Some(7), Some(3), Some(2), None)),
+        ),
+        ("sealed unproven", true, None, None),
+    ] {
+        let tail = len_prefixed(&extension(sealed, first));
+        let file = staged(2, &tail);
+        assert_eq!(cause(&file), None, "{label}: loads, no hold, no Full");
+        let back = loaded(&file);
+        assert_eq!(
+            saved(&back),
+            file.pages[&page],
+            "{label}: saved byte for byte"
+        );
+        let sent = first_request(&back).map(|parts| parts.0.map(|_| parts));
+        assert_eq!(sent.flatten(), sends, "{label}: the sealed breakdown");
     }
+    let mut later = vec![2];
+    later.extend_from_slice(b"a later layout");
     for (label, tail) in [
-        ("no extension", &[][..]),
-        ("short", &[4, 1][..]),
-        ("trailing", &[1, 1, 0][..]),
+        ("provisional", len_prefixed(&extension(false, Some(proven)))),
+        ("later layout", len_prefixed(&later)),
+    ] {
+        let back = loaded(&staged(2, &tail));
+        assert_eq!(saved(&back), v1, "{label}: written back as v1");
+        assert_eq!(
+            first_request(&back),
+            sent_today,
+            "{label}: today's breakdown"
+        );
+    }
+    let mut bad_header = extension(true, Some(proven));
+    bad_header[1] = 9;
+    let mut trailing_inside = extension(true, None);
+    trailing_inside.push(0);
+    for (label, tail) in [
+        ("no extension", Vec::new()),
+        ("short", vec![4, 1]),
+        (
+            "after the extension",
+            [len_prefixed(&extension(true, None)), vec![0]].concat(),
+        ),
+        ("bad header", len_prefixed(&bad_header)),
+        ("inside the extension", len_prefixed(&trailing_inside)),
     ] {
         assert_eq!(
-            cause(&with(2, tail)),
+            cause(&staged(2, &tail)),
             Some(ReconstructCause::Corrupt),
             "{label}"
         );
     }
-    assert_eq!(cause(&with(3, &[0])), Some(ReconstructCause::INCOMPATIBLE));
+    assert_eq!(
+        cause(&staged(3, &[0])),
+        Some(ReconstructCause::INCOMPATIBLE)
+    );
 }
 
 fn marker_line(minute: usize) -> serde_json::Value {
