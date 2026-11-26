@@ -14359,7 +14359,7 @@ fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
         "2026-07-10T10:04:00Z",
     );
     assert!(first.original_identity_census_incomplete);
-    // Exercise the actual bounded production serializer and decoder.
+    // Round-trip the partial desktop inventory through save and load.
     let index_path = home.join("scan-index.json");
     index.save_fixture(&index_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
