@@ -131,6 +131,8 @@ fn a_held_original_conserves_its_dependent_copy_money() {
         ],
     );
     let mut cold = None;
+    // (ownership_incomplete, terminal_ownership_incomplete, census_complete) of the cold arm.
+    let mut cold_census = None;
     for arm in ["cold", "held", "held_grown", "entry_changed"] {
         // Reparse debt: the unchanged original is selected; the copy changed.
         let mut prior = seeded.clone();
@@ -174,6 +176,7 @@ fn a_held_original_conserves_its_dependent_copy_money() {
                 .unwrap();
         }
         let held_before = counters::total("tail_db_loads", "held");
+        let newer_before = counters::total("tail_held", "newer_build");
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
@@ -196,6 +199,12 @@ fn a_held_original_conserves_its_dependent_copy_money() {
             }
         };
         let held = counters::total("tail_db_loads", "held") - held_before;
+        let newer = counters::total("tail_held", "newer_build") - newer_before;
+        let census = (
+            result.ownership_incomplete_file_count,
+            result.terminal_ownership_incomplete_file_count,
+            result.census_complete,
+        );
         let emitted = accept(&mut index, &result);
         let copy_status =
             claude_census_member_status(&index, &copy, &result.census_window_end, true);
@@ -212,10 +221,20 @@ fn a_held_original_conserves_its_dependent_copy_money() {
             assert_eq!(accepted(&index, &original), last_accepted);
             assert!(bodies(&emitted, ORIGINAL).is_empty());
             assert!(!copy_sent.0.is_empty());
+            assert_eq!(newer, 0);
             cold = Some(copy_sent);
+            cold_census = Some(census);
             continue;
         }
         assert_eq!(held, 1, "{arm}: the newer head holds the original");
+        // The held original is ownership-incomplete residue that this walk,
+        // having finished discovery, settles to terminal: disclosed, and the
+        // census ends as complete as the cold arm's.
+        assert_eq!(newer, 1, "{arm}: named as a newer build's hold");
+        let (incomplete, terminal, complete) = cold_census.unwrap();
+        assert_eq!(census.0, incomplete + 1, "{arm}: counted once");
+        assert_eq!(census.1, terminal + 1, "{arm}: settled to terminal");
+        assert_eq!(census.2, complete, "{arm}: completeness as today");
         assert!(bodies(&emitted, ORIGINAL).is_empty(), "{arm}: no POST");
         assert_eq!(
             accepted(&index, &original),
