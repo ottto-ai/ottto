@@ -600,7 +600,7 @@ impl OwnedSourceScan {
                                     });
                                     match hold {
                                         tail_source::load::HoldKind::NewerBuild => {
-                                            self.hold_newer_tail(key, forced_twin);
+                                            self.hold_newer_tail(key, forced_family);
                                             return;
                                         }
                                         tail_source::load::HoldKind::LiveUnavailable => {
@@ -885,7 +885,7 @@ impl OwnedSourceScan {
         ) {
             tail_source::counters::bump(self.source, "tail_db_loads", "held");
             if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::Future) {
-                self.hold_newer_tail(key, forced_twin);
+                self.hold_newer_tail(key, forced_family);
             } else {
                 self.residue_index_keys.insert(key);
             }
@@ -991,11 +991,23 @@ impl OwnedSourceScan {
         *active_file = Some(active);
     }
 
-    fn hold_newer_tail(&mut self, key: String, forced_twin: bool) {
+    /// A file held for a newer build. Any forced family member, twin or
+    /// native, is unknown for copy ownership on this page: its stored state
+    /// is never a holder or carrier here.
+    fn hold_newer_tail(&mut self, key: String, forced_family: bool) {
         tail_source::counters::bump(self.source, "tail_held", "newer_build");
         self.census.ownership_incomplete_file_count += 1;
-        if forced_twin {
-            tail_source::counters::bump(self.source, "tail_held_newer_build", "forced_twin");
+        if forced_family {
+            let twin = self
+                .index
+                .claude_request_census
+                .get(&key)
+                .is_some_and(|record| record.is_twin());
+            tail_source::counters::bump(
+                self.source,
+                "tail_held_newer_build",
+                if twin { "forced_twin" } else { "forced_native" },
+            );
             self.newer_build_held.insert(key.clone());
         }
         self.residue_index_keys.insert(key);

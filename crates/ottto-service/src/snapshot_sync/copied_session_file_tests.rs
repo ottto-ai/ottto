@@ -2017,6 +2017,30 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
         // debt the page's ACK drained may change.
         assert_eq!(tail_head_reduction_for_test(&index, &key), head);
 
+        // A later page, the carrier still newer: it is held again, never a
+        // positive carrier from stored state, and the copy stays withheld.
+        index.activate_upload_context("e2-synthetic-destination".into());
+        let scanner = carrier_scanner(&index);
+        let mut later = c.raw(
+            &scanner,
+            index.clone(),
+            100,
+            true,
+            std::slice::from_ref(&holder),
+        );
+        assert!(!scanner.paths().contains(&carrier));
+        later.enrich(&c);
+        assert_withheld(
+            &later,
+            THIRD,
+            "the newer carrier stays unknown on a later page",
+        );
+        let mut later_sent = twin(&later);
+        later_sent.finish();
+        assert!(body(&later_sent, THIRD).is_none());
+        index = settle(&c, &index, later, &mut e2_progress());
+        assert_eq!(tail_head_reduction_for_test(&index, &key), head);
+
         index.activate_upload_context("e2-synthetic-destination".into());
         set_future_tail_fact_for_test(&mut index, &key, false);
         let scanner = carrier_scanner(&index);

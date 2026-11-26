@@ -527,8 +527,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   count, written only when that count is present (a measured zero included); without it the
   fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact it
   cannot read. The per-file hold keeps the checkpoint and changes no money. Even if the file
-  changed or was pulled as a forced twin, it never reads Full. It withholds copies that depend
-  on the held twin for that pass. Builds released before this protection could read such a
+  changed or was pulled as a forced family member (twin or native), it never reads Full. Such
+  a member is unknown for copy ownership, so copies that depend on it are withheld for that
+  pass. Builds released before this protection could read such a
   file once in full and keep only the facts they knew. No historical sessions are selected just
   to enrich metadata.
 - Claude Desktop store discovery reads ordinary directories at any depth, retaining
