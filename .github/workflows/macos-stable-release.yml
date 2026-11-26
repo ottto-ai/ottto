@@ -347,7 +347,11 @@ jobs:
             echo "Stable-candidate RC evidence file named by OTTTO_STABLE_CANDIDATE_RC_EVIDENCE does not exist." >&2
             exit 1
           }
-          cat < "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" > dist/macos/stable-candidate-rc-qa.json
+          # The group's stderr is redirected first, so a failed open names no path.
+          { cat < "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" > dist/macos/stable-candidate-rc-qa.json; } 2>/dev/null || {
+            echo "Stable-candidate RC evidence could not be read." >&2
+            exit 1
+          }
           candidate_sha="$(jq -r '.candidate_manifest.sha256 // empty' dist/macos/stable-candidate-rc-qa.json)"
           if [[ ! "$candidate_sha" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Stable-candidate RC evidence is missing candidate_manifest.sha256." >&2
@@ -520,8 +524,13 @@ jobs:
             exit 2
           }
           keychain="$OTTTO_PRIVACY_WORK/manual-signing.keychain-db"
+          # A failed link prints one fixed line; Python's own error would name both paths.
           OTTTO_KEYCHAIN_LINK="$keychain" python3 -I -c \
-            'import os; os.symlink(os.environ["OTTTO_MANUAL_SIGNING_KEYCHAIN"], os.environ["OTTTO_KEYCHAIN_LINK"])'
+            'import os; os.symlink(os.environ["OTTTO_MANUAL_SIGNING_KEYCHAIN"], os.environ["OTTTO_KEYCHAIN_LINK"])' \
+            2>/dev/null || {
+            echo "The manual signing keychain link could not be made." >&2
+            exit 2
+          }
           scripts/macos_quiet_step.sh "manifest sign" scripts/macos_manifest_signature.sh sign \
             --manifest dist/macos/release-manifest.json \
             --identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \

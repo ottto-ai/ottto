@@ -212,7 +212,7 @@ The `macos-stable-release` environment holds one variable,
 | `advisory_xattrs` | A subset of `macl` and `provenance`. A listed attribute's presence on a shipped file is counted but does not stop the release. Any marker in any attribute name or value still blocks. |
 | `leaf_sha256` | One or two distinct SHA-256 digests of the Developer ID leaf certificate (DER). Every signature the gate trusts must chain to Apple's Developer ID root and end in one of these leaves. Two entries cover a certificate rotation; both release lanes use the same list. |
 | `markers_sha256` | The marker list digest (below). |
-| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the job's one `Machine name: '…'` field (in the "Set up job" section) passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); only a literal match spanning exactly that value is counted as `host_runner_line` `accepted`. Any other literal or path inside or across the value, the rest of that line and the name anywhere else still block. |
+| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the job's one `Machine name: '…'` field (in the "Set up job" step) passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); only this machine's host-name literal spanning exactly that value is counted as `host_runner_line` `accepted`. Any other literal equal to the value (a listed private, `owner:` or `signer:` literal, a user or runner string) blocks with its own class, and so do any other literal or path inside or across the value, the rest of that line and the name anywhere else. |
 
 Duplicate keys, unknown keys, wrong types and missing required keys are
 refused. The canonical form is the object with every key (including the
@@ -261,8 +261,8 @@ digest and counts, never a literal.
 - A home folder (`/Users/<name>` other than `/Users/Shared`, `/home/<name>`),
   a per-user temp folder (`/var/folders/…`) or a runner work folder
   (`/_work/`, `actions-runner`) blocks wherever it appears. The one exception
-  is the `logs` profile with `--run-id <id>`: there `/_work/` inside the
-  release host's work folder for that run,
+  is the `logs` profile: there `/_work/` inside the release host's work
+  folder for the run given on `--run-id <id>`,
   `/opt/ottto-release/runners/<id>/_work/`, is not a finding.
 - File and folder names, symbolic link targets and extended attribute names
   and values are searched too. `com.apple.provenance` and `com.apple.macl` on
@@ -337,20 +337,16 @@ python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder
   [--lane candidate|stable|manual] [--appcast present|absent] \
   [--seal-from <folder>] [--markers-fd <n> | --markers-store <file>] \
   [--response-fd <n>] [--state <folder>] [--stage attest-1|attest-2] \
-  [--machine-name-fd <n>] [--run-id <id>]
+  [--machine-name-fd <n>] \
+  [--run-id <id> --run-attempt <n> --job-record <file>]   # logs profile only, all three
 ```
 
 Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
 `attest` (the attestation subjects, SBOM and checksums; `--stage attest-1`
 or `--stage attest-2` is required), `upload`, `publish`, `dispatch` and
-`logs` (one job's complete logs, every text file under `--root`; an empty
-folder or file is `incomplete`, and so is a set without the job's
-"Set up job" `Machine name` field or without its last line,
-`Cleaning up orphan processes`; a second `Machine name` field anywhere in the
-set is a finding; the admitted runner name, when the policy accepts the
-machine-name field, comes from `--machine-name-fd <n>`, never argv;
-`--run-id` admits that run's release-host work folder, see Matching). `dispatch` reads the
+`logs` (one job's complete logs from one run attempt, see Job logs below).
+`dispatch` reads the
 workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
 `OTTTO_DISPATCH_ARTIFACT_BASE_URL`, `OTTTO_DISPATCH_RELEASE_NOTES`,
 `OTTTO_DISPATCH_RELEASE_MODE`, `OTTTO_DISPATCH_OPERATOR_APPROVAL` and
@@ -486,7 +482,12 @@ design and is scanned again at each later stage.
   signing reads a copy of the committed entitlements from a temporary folder,
   so no child tool gets the checkout path as an operand. The one exception is
   the compiler's prefix map, which must name the checkout to remove it from
-  the binaries (SwiftPM passes the compiler absolute source paths itself).
+  the binaries (SwiftPM passes the compiler absolute source paths itself). In
+  the release workflow (`OTTTO_RELEASE_LANE` set) the app root and its
+  checkout must be inside the release host's app staging folder for the run,
+  `/opt/ottto-release/app-src/<run id>/` (checked as given and as a physical
+  path), so the prefix map names only that folder; otherwise the packager
+  stops with one fixed line before any tool runs.
 - The final attestation check runs `macos_attestation_bind.sh --verify-only`
   on the sealed final set; nothing is rewritten after the final seal.
 - Not covered here: the checkout and runner setup run before the mask step
@@ -496,6 +497,33 @@ design and is scanned again at each later stage.
   step output and a runner file (inside the same neutral work folder). That
   the Actions runner registers each mask and omits the `::add-mask::` command
   echo is proven only by a real release candidate's log scan.
+
+### Job logs
+
+The `logs` profile checks one job of one run attempt and needs all of:
+
+- `--run-id <id>` and `--run-attempt <n>`: the run and attempt.
+- `--job-record <file>`: the job's record from the GitHub API
+  (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`). Its `run_id` and
+  `run_attempt` must be the given ones (else `incomplete`, `log_run`), its
+  `status` `completed`, and its steps numbered in increasing order from
+  step 1, `Set up job`, to `Complete job`, every step `completed`
+  (else `log_record`).
+- `--root <folder>`: that job's folder from the run attempt's log archive
+  (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{n}/logs`). It
+  must hold exactly one `<number>_<step name>.txt` file for every step the
+  record lists with a conclusion other than `skipped`, and nothing else but
+  the optional `system.txt`. A missing step (also one in the middle), a file
+  for a skipped or unlisted step, a renamed file or a subfolder is
+  `incomplete` (`log_partial`), and so is a set whose `Set up job` file has
+  no `Machine name` field or whose `Complete job` file does not end with the
+  runner's last line, `Cleaning up orphan processes`. An empty folder or file
+  is `incomplete` too.
+
+Every file is searched. A second `Machine name` field anywhere in the set is
+a finding. The admitted runner name, when the policy accepts the
+machine-name field, comes from `--machine-name-fd <n>`, never argv. `/_work/`
+inside the run's release-host work folder is not a path finding (Matching).
 
 ### Release host runner
 
@@ -512,7 +540,16 @@ The signing job runs only on the release host's per-run runner:
   source), `OTTTO_STABLE_CANDIDATE_RC_EVIDENCE` (the redacted RC evidence file,
   stable releases) and `OTTTO_MANUAL_SIGNING_KEYCHAIN` (the manual lane's
   keychain). The workflow reads the evidence by shell redirection and links
-  the keychain from the environment, so neither path reaches an argv.
+  the keychain from the environment, so neither path reaches an argv; a
+  failed read or link prints one fixed line, never the path.
+- The app source is staged per run at `/opt/ottto-release/app-src/<run id>/`
+  (`OTTTO_MACOS_APP_ROOT` points inside it); the packager refuses any other
+  app root in the release workflow.
+- Only the dispatch-only stable release workflow may use the release runner
+  labels: no job of a workflow triggered by `pull_request`,
+  `pull_request_target` or `merge_group` runs on `ottto-signing-mac` or
+  `ottto-release-bootstrap` or reads `vars.OTTTO_MACOS_STABLE_RUNNER_LABELS`
+  (`scripts/test_workflow_runner_policy.py`, in the public surface checks).
 
 ## Verify Stable Candidate RC
 

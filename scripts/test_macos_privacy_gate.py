@@ -829,6 +829,138 @@ class ReceiptAndContract(unittest.TestCase):
             g._legal_cache.update(saved_cache)
 
 
+SETUP_LOG = ("\ufeff2026-01-01T00:00:00.1000000Z Current runner version: '2.300.0'\n"
+             "2026-01-01T00:00:00.2000000Z Machine name: '%s'\n"
+             "2026-01-01T00:00:00.3000000Z Complete job name: Build\n")
+END_LOG = "\ufeff2026-01-01T00:00:09.1000000Z Cleaning up orphan processes\n"
+BUILD_LOG = "2026-01-01T00:00:02.0000000Z ##[group]Run make\n2026-01-01T00:00:03.0000000Z done\n"
+
+
+def job_logs(tmp, name, setup=None, build=BUILD_LOG, end=END_LOG, omit=(), extra=(), system=None, record=None):
+    """A job's step folder as the runner's log archive holds it (skipped steps have no file; step
+    numbers have gaps) and the job's API record. Returns the logs-profile scan argv."""
+    folder = tempfile.mkdtemp(prefix="logs.", dir=tmp)
+    steps = [(1, "Set up job", "success", SETUP_LOG % name if setup is None else setup),
+             (2, "Checkout", "success", "2026-01-01T00:00:01.0000000Z ##[group]Run actions/checkout\n"),
+             (3, "Optional step", "skipped", None),
+             (4, "Build", "success", build),
+             (7, "Complete job", "success", end)]
+    files = [("%d_%s.txt" % (n, step), text) for n, step, _c, text in steps if text is not None and n not in omit]
+    files += list(extra) + ([("system.txt", system)] if system is not None else [])
+    for rel, text in files:
+        os.makedirs(os.path.dirname(os.path.join(folder, rel)), exist_ok=True)
+        with open(os.path.join(folder, rel), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    value = {"id": 1, "run_id": 4242, "run_attempt": 1, "status": "completed", "conclusion": "success",
+             "steps": [{"number": n, "name": step, "status": "completed", "conclusion": c}
+                       for n, step, c, _text in steps]}
+    text = json.dumps(record(value) if record else value)
+    path = os.path.join(tmp, "job-%s.json" % os.path.basename(folder))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return ["scan", "--profile", "logs", "--root", folder, "--run-id", "4242", "--run-attempt", "1",
+            "--job-record", path]
+
+
+class LogScan(unittest.TestCase):
+    """The logs profile in process, with a host-name class marker (host literals are this
+    machine's own strings, so the subprocess tests turn them off)."""
+    HOST = "synthetic-host"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
+
+    def tearDown(self):
+        g.remove_tree(self.tmp)
+
+    def scan(self, args, expected_name=HOST, accept=True, extra=()):
+        markers = [g.Marker(PRIVATE, "private"), g.Marker(self.HOST, "host")] + list(extra)
+        gate = g.Gate(g.Policy(policy_text("b" * 64, accept_runner_machine_name_line=accept)), markers, "logs")
+        value = dict(zip(args[1::2], args[2::2]))
+        g.scan_logs(gate, value["--root"], gate.policy, expected_name, value["--run-id"],
+                    value["--run-attempt"], value["--job-record"])
+        return gate
+
+    def test_machine_name_field(self):
+        host, tmp = self.HOST, self.tmp
+        cases = [
+            # (scan argv, admitted name, accept switch, extra markers, verdict)
+            (job_logs(tmp, host), None, False, (), "blocked"),       # the name blocks by default
+            (job_logs(tmp, host), host, True, (), "clean"),          # host name class, switch, admitted
+            (job_logs(tmp, host), "other-host", True, (), "blocked"),  # not the admitted name
+            (job_logs(tmp, "neutral-name"), "other-host", False, (), "blocked"),  # unexpected name
+            (job_logs(tmp, "neutral-name"), "neutral-name", False, (), "clean"),
+            (job_logs(tmp, host, setup=(SETUP_LOG % host) * 2), host, True, (), "blocked"),  # second field
+            (job_logs(tmp, host, build=BUILD_LOG + "2026-01-01T00:00:04Z Machine name: '%s'\n" % host),
+             host, True, (), "blocked"),                                # a second field in another step
+            (job_logs(tmp, host, build=BUILD_LOG + "later " + host + "\n"), host, True, (), "blocked"),
+            (job_logs(tmp, host, system="2026-01-01T00:00:00Z queued " + PRIVATE + "\n"), host, True, (),
+             "blocked"),                                                # system.txt is searched
+            # Inside the admitted value only the host-name literal equal to the whole name passes.
+            (job_logs(tmp, host), host, True, (g.Marker("thetic-ho", "private"),), "blocked"),
+            (job_logs(tmp, host), host, True, (g.Marker(": 'synth", "private"),), "blocked"),
+            (job_logs(tmp, host), host, True, (g.Marker("ic-host'", "private"),), "blocked"),
+        ]
+        for args, name, accept, extra, verdict in cases:
+            gate = self.scan(args, name, accept, extra)
+            self.assertEqual(gate.verdict(), verdict, (args, name, accept, gate.diagnostics))
+        # An independent literal equal to the admitted value blocks with its own class.
+        for marker in (g.Marker(host, "private"), g.Marker(host, "signer", signer=True),
+                       g.Marker(host, "owner", owner=True), g.Marker(host, "user"), g.Marker(host, "runner")):
+            gate = self.scan(job_logs(tmp, host), extra=(marker,))
+            self.assertEqual(gate.verdict(), "blocked", marker.cls)
+            self.assertEqual(set(gate.findings), {marker.cls}, gate.diagnostics)
+            self.assertIn(("log0", "host_runner_line", "accepted"), gate.diagnostics)
+
+    def test_complete_job_only(self):
+        host, tmp = self.HOST, self.tmp
+
+        def steps(change):
+            return lambda record: dict(record, steps=change(record["steps"]))
+
+        cases = [
+            (job_logs(tmp, host, omit=(2,)), "log_partial"),          # a missing middle step
+            (job_logs(tmp, host, omit=(4,)), "log_partial"),
+            (job_logs(tmp, host, omit=(7,)), "log_partial"),          # no job end
+            (job_logs(tmp, host, extra=(("3_Optional step.txt", "x\n"),)), "log_partial"),  # a skipped step's file
+            (job_logs(tmp, host, extra=(("5_Other.txt", "x\n"),)), "log_partial"),           # not in the record
+            (job_logs(tmp, host, extra=(("Build/4_Build.txt", "x\n"),)), "log_partial"),
+            (job_logs(tmp, host, omit=(2,), extra=(("2_checkout.txt", "x\n"),)), "log_partial"),  # renamed
+            (job_logs(tmp, host, setup=SETUP_LOG.replace("Machine name", "Machine") % host), "log_partial"),
+            (job_logs(tmp, host, setup="x\n", build=BUILD_LOG + "2026-01-01T00:00:04Z Machine name: 'n1'\n"),
+             "log_partial"),                                            # the field outside "Set up job"
+            (job_logs(tmp, host, end="2026-01-01T00:00:08Z Cleaning\n"), "log_partial"),
+            (job_logs(tmp, host, end=END_LOG + "2026-01-01T00:00:10Z more\n"), "log_partial"),
+            (job_logs(tmp, host, end=""), "log_empty"),
+            (job_logs(tmp, host, record=lambda r: dict(r, run_id=4243)), "log_run"),
+            (job_logs(tmp, host, record=lambda r: dict(r, run_attempt=2)), "log_run"),
+            (job_logs(tmp, host, record=lambda r: dict(r, run_attempt="1")), "log_run"),
+            (job_logs(tmp, host, record=lambda r: dict(r, status="in_progress")), "log_record"),
+            (job_logs(tmp, host, record=steps(lambda s: s[1:])), "log_record"),      # no "Set up job"
+            (job_logs(tmp, host, record=steps(lambda s: s[:-1])), "log_record"),     # no "Complete job"
+            (job_logs(tmp, host, record=steps(lambda s: [s[0], s[3], s[1], s[2], s[4]])), "log_record"),
+            (job_logs(tmp, host, record=steps(lambda s: s[:1] + [dict(s[1], status="in_progress")] + s[2:])),
+             "log_record"),
+            # The record lists a step the folder lacks: the folder is not the whole job.
+            (job_logs(tmp, host, record=steps(lambda s: s[:4] + [
+                {"number": 5, "name": "Upload", "status": "completed", "conclusion": "success"}] + s[4:])),
+             "log_partial"),
+        ]
+        for args, code in cases:
+            with self.assertRaisesRegex(g.Incomplete, "^%s$" % code, msg=args):
+                self.scan(args)
+        args = job_logs(tmp, host)
+        with open(args[-1], "w") as handle:
+            handle.write('{"run_id": 4242, "run_id": 4242}')
+        with self.assertRaisesRegex(g.Incomplete, "^log_record$"):
+            self.scan(args)
+        empty = job_logs(tmp, host)
+        for name in os.listdir(empty[4]):
+            os.remove(os.path.join(empty[4], name))
+        with self.assertRaisesRegex(g.Incomplete, "^log_empty$"):
+            self.scan(empty)
+
+
 class CommandLine(unittest.TestCase):
     def setUp(self):
         # A neutral scratch root: macOS per-user temp folders are home-like paths.
@@ -889,71 +1021,41 @@ class CommandLine(unittest.TestCase):
         result = self.run_gate(["register-masks"], env={g.MARKERS_ENV: store(PRIVATE).decode()})
         self.assertEqual(result.returncode, 2)
 
-    def write_logs(self, *texts):
-        folder = tempfile.mkdtemp(prefix="logs.", dir=self.tmp)
-        for index, text in enumerate(texts):
-            with open(os.path.join(folder, "job%d.txt" % index), "w") as handle:
-                handle.write(text)
-        return ["scan", "--profile", "logs", "--root", folder]
-
-    def test_logs_machine_name_field(self):
-        host = "synthetic-host"
-        setup = "2026-01-01T00:00:00Z Machine name: '%s'\n" % host
-        later = "2026-01-01T00:00:02Z ##[group]Run actions/checkout\n2026-01-01T00:00:03Z done\n"
-        end = "2026-01-01T00:00:09Z Cleaning up orphan processes\n"
-        tabbed = "Build\tSet up job\t2026-01-01T00:00:00.1234567Z Machine name: '%s'\n" % host
-        tabbed_end = "Build\tComplete job\t\ufeff2026-01-01T00:00:09.1234567Z Cleaning up orphan processes\n"
-        cases = [
-            # (log files, machine name fd value, accept switch, extra markers, exit status)
-            ((setup + later + end,), None, False, (), 1),        # the name blocks by default
-            ((setup + later + end,), host, True, (), 0),         # accepted: switch on and the admitted name
-            ((tabbed + "Build\tRun\tok\n" + tabbed_end,), host, True, (), 0),
-            ((setup + later + end,), "other-host", True, (), 1),  # not the admitted name
-            ((setup.replace(host, "neutral-name") + later + end,), "other-host", False, (), 1),  # unexpected
-            ((setup.replace(host, "neutral-name") + later + end,), "neutral-name", False, (), 0),
-            ((setup + setup + later + end,), host, True, (), 1),  # duplicate field in one file
-            ((setup + later + end, setup + later), host, True, (), 1),  # duplicate field across files
-            ((setup + later + end + "later " + host + "\n",), host, True, (), 1),  # the name elsewhere
-            ((tabbed.replace("Build", "Build " + PRIVATE) + "Build\tRun\tok\n" + tabbed_end,), host, True, (), 1),
-            # Inside the admitted value only the literal equal to the whole name is accepted.
-            ((setup + later + end,), host, True, ("thetic-ho",), 1),
-            ((setup + later + end,), host, True, (": 'synth",), 1),  # a literal across the value's edge
-            ((setup + later + end,), host, True, ("ic-host'",), 1),
-            # Partial input: no setup field (missing, or after the first step started), no job end.
-            ((later + end,), host, True, (), 3),
-            ((later + setup + end,), host, True, (), 3),
-            ((setup + later,), host, True, (), 3),
-            ((later, end), None, False, (), 3),
-        ]
-        for texts, name, accept, extra, status in cases:
-            result = self.run_gate(self.write_logs(*texts), lines=(PRIVATE, host) + extra, machine_name=name,
-                                   accept_runner_machine_name_line=accept)
-            self.assertEqual(result.returncode, status, (texts, name, accept, extra, result.stderr))
-        # The switch needs the admitted name; empty input is incomplete.
-        self.assertEqual(self.run_gate(self.write_logs(setup + end), lines=(host,),
-                                       accept_runner_machine_name_line=True).returncode, 2)
-        self.assertEqual(self.run_gate(self.write_logs(), lines=(host,)).returncode, 3)
-        self.assertEqual(self.run_gate(self.write_logs(""), lines=(host,)).returncode, 3)
-
-    def test_logs_allow_only_the_release_host_work_folder(self):
+    def test_logs_cli(self):
         neutral = "/opt/ottto-release/runners/4242/_work"
-        setup = "2026-01-01T00:00:00Z Machine name: 'neutral-name'\n"
-        end = "2026-01-01T00:00:09Z Cleaning up orphan processes\n"
         cases = [
-            ("Temporarily overriding HOME='%s/_temp/0a1b'" % neutral, ["--run-id", "4242"], 0),
-            ("Working directory is '%s/repo/repo'" % neutral, ["--run-id", "4242"], 0),
-            ("Temporarily overriding HOME='%s/_temp/0a1b'" % neutral, [], 1),               # no run id
-            ("HOME='/opt/ottto-release/runners/4243/_work/_temp'", ["--run-id", "4242"], 1),  # other run
-            ("HOME='/x/opt/ottto-release/runners/4242/_work/_temp'", ["--run-id", "4242"], 1),  # other root
-            ("HOME='/srv/actions/_work/_temp'", ["--run-id", "4242"], 1),
-            ("HOME='%s/_temp' and %s" % (neutral, HOME_ROOT + "someone/x"), ["--run-id", "4242"], 1),
+            ("Temporarily overriding HOME='%s/_temp/0a1b'" % neutral, 0),
+            ("Working directory is '%s/repo/repo'" % neutral, 0),
+            ("HOME='/opt/ottto-release/runners/4243/_work/_temp'", 1),  # another run's folder
+            ("HOME='/x/opt/ottto-release/runners/4242/_work/_temp'", 1),  # another root
+            ("HOME='/srv/actions/_work/_temp'", 1),
+            ("HOME='%s/_temp' and %s" % (neutral, HOME_ROOT + "someone/x"), 1),
         ]
-        for line, extra, status in cases:
-            args = self.write_logs(setup + line + "\n" + end) + extra
+        for line, status in cases:
+            args = job_logs(self.tmp, "neutral-name", build=line + "\n")
             result = self.run_gate(args, machine_name="neutral-name")
-            self.assertEqual(result.returncode, status, (line, extra, result.stderr))
-        self.assertEqual(self.run_gate(["scan", "--profile", "dispatch", "--run-id", "4242"],
-                                       env=self.dispatch_env()).returncode, 2)
+            self.assertEqual(result.returncode, status, (line, result.stderr))
+        # An independent literal equal to the admitted runner name blocks under the switch:
+        # without host literals the name is only a listed private literal.
+        result = self.run_gate(job_logs(self.tmp, "synthetic-host"), lines=(PRIVATE, "synthetic-host"),
+                               machine_name="synthetic-host", accept_runner_machine_name_line=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"class=private code=machine_name_equal", result.stderr)
+        # A missing middle step is incomplete.
+        result = self.run_gate(job_logs(self.tmp, "neutral-name", omit=(2,)), machine_name="neutral-name")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn(b"code=log_partial", result.stderr)
+        # The logs profile needs the run, the attempt and the job record; no other profile takes them.
+        args = job_logs(self.tmp, "neutral-name")
+        for drop in ("--run-id", "--run-attempt", "--job-record"):
+            at = args.index(drop)
+            self.assertEqual(self.run_gate(args[:at] + args[at + 2:], machine_name="neutral-name").returncode, 2)
+        bad = list(args)
+        bad[bad.index("--run-attempt") + 1] = "x1"
+        self.assertEqual(self.run_gate(bad, machine_name="neutral-name").returncode, 2)
+        for extra in (["--run-id", "4242"], ["--run-attempt", "1"], ["--job-record", args[-1]]):
+            self.assertEqual(self.run_gate(["scan", "--profile", "dispatch"] + extra,
+                                           env=self.dispatch_env()).returncode, 2)
 
     def release_env(self, **extra):
         env_file = os.path.join(self.tmp, "github_env")

@@ -60,6 +60,8 @@ require_grep 'scripts/macos_package\.sh' 'packaging step'
 # shellcheck disable=SC2016 # These assertions intentionally match literal variables.
 deny_grep '--app-root' 'the app root reaches macos_package through the runner environment, not argv'
 require_grep 'test -n "\$\{OTTTO_MACOS_APP_ROOT:-\}"' 'app root required from the runner environment'
+# The packager's staging-folder rule (scripts/macos_package.sh) keys on the lane.
+require_grep '^      OTTTO_RELEASE_LANE: ' 'release lane in the job environment'
 # shellcheck disable=SC2016
 require_grep '--app-source-commit "\$OTTTO_MACOS_APP_SOURCE_COMMIT"' 'release-tag app source commit passed into macos_package'
 # The release record names no private repository, so the workflow reads none.
@@ -280,6 +282,69 @@ for case in "124|$neutral/_temp|$neutral/repo/repo" "123|$neutral/tmp|$neutral/r
     exit 1
   fi
 done
+
+# [behaviour] A host path that cannot be read or linked gives one fixed line:
+# the shell's or Python's own error would name the path. The synthetic marker
+# folder stands for a private host folder.
+for step in "Bind stable-candidate RC evidence|rc.sh" "Sign and verify release manifest from manual keychain|keychain.sh"; do
+  python3 - "$WORKFLOW" "${step%|*}" "$policy_dir/${step#*|}" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = lines.index("      - name: " + sys.argv[2])
+run = next(i for i in range(start, len(lines)) if lines[i] == "        run: |")
+body = []
+for line in lines[run + 1 :]:
+    if line.strip() and not line.startswith(" " * 10):
+        break
+    body.append(line[10:])
+Path(sys.argv[3]).write_text("\n".join(body) + "\n", encoding="utf-8")
+PY
+done
+marker_dir="$policy_dir/zq-synthetic-marker-host"
+mkdir -p "$marker_dir" "$policy_dir/job/dist/macos" "$policy_dir/no-output" "$policy_dir/work"
+# expect_fixed_failure <status> <message> <label> <actual status>: checks $policy_dir/out.
+expect_fixed_failure() {
+  local status="$1" message="$2" label="$3" actual="$4"
+  if [[ "$actual" != "$status" ]] || ! grep -Fxq -- "$message" "$policy_dir/out"; then
+    echo "$label: expected exit $status and one fixed line" >&2
+    cat "$policy_dir/out" >&2
+    exit 1
+  fi
+  if grep -Fq "zq-synthetic-marker-host" "$policy_dir/out"; then
+    echo "$label: the failure printed the host path" >&2
+    exit 1
+  fi
+}
+printf '{}\n' > "$marker_dir/evidence.json"
+chmod 000 "$marker_dir/evidence.json"
+if [[ -r "$marker_dir/evidence.json" ]]; then
+  echo "The unreadable-file case needs a non-root user" >&2
+  exit 1
+fi
+rc=0
+(cd "$policy_dir/job" && env -i PATH="$PATH" OTTTO_STABLE_CANDIDATE_RC_EVIDENCE="$marker_dir/evidence.json" \
+  bash "$policy_dir/rc.sh") >"$policy_dir/out" 2>&1 || rc=$?
+expect_fixed_failure 1 "Stable-candidate RC evidence could not be read." "unreadable RC evidence" "$rc"
+chmod 600 "$marker_dir/evidence.json"
+rc=0
+(cd "$policy_dir/no-output" && env -i PATH="$PATH" OTTTO_STABLE_CANDIDATE_RC_EVIDENCE="$marker_dir/evidence.json" \
+  bash "$policy_dir/rc.sh") >"$policy_dir/out" 2>&1 || rc=$?
+expect_fixed_failure 1 "Stable-candidate RC evidence could not be read." "RC evidence copy without its folder" "$rc"
+printf 'synthetic keychain\n' > "$marker_dir/signing.keychain-db"
+# A file already at the link path: os.symlink fails.
+: > "$policy_dir/work/manual-signing.keychain-db"
+rc=0
+(cd "$policy_dir/job" && env -i PATH="$PATH" OTTTO_MANUAL_SIGNING_KEYCHAIN="$marker_dir/signing.keychain-db" \
+  OTTTO_PRIVACY_WORK="$policy_dir/work" bash "$policy_dir/keychain.sh") >"$policy_dir/out" 2>&1 || rc=$?
+expect_fixed_failure 2 "The manual signing keychain link could not be made." "keychain link over a file" "$rc"
+rc=0
+(cd "$policy_dir/job" && env -i PATH="$PATH" OTTTO_MANUAL_SIGNING_KEYCHAIN="$marker_dir/signing.keychain-db" \
+  OTTTO_PRIVACY_WORK="$policy_dir/absent" bash "$policy_dir/keychain.sh") >"$policy_dir/out" 2>&1 || rc=$?
+expect_fixed_failure 2 "The manual signing keychain link could not be made." "keychain link in a missing folder" "$rc"
 
 # run_policy <ref> <channel> <version>: no app source identity is set.
 run_policy() {

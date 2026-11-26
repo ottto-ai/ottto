@@ -173,6 +173,34 @@ if [[ -z "$MAC_APP_ROOT" ]]; then
   echo "--app-root is required: pass the app's Swift package root" >&2
   exit 2
 fi
+# The release workflow's signing lane (OTTTO_RELEASE_LANE, set in its job
+# environment) builds only from the release host's neutral per-run app staging
+# folder, so the one app path a child tool gets (the compiler's prefix map)
+# names no private folder. Checked before any message or tool can name the
+# path; the checkout's physical path is checked again once it is known.
+RELEASE_APP_SRC_BASE="/opt/ottto-release/app-src"
+RELEASE_APP_SRC_RUN=""
+# ottto_macos_release_app_src_path <path>: true for a path inside this run's
+# app staging folder.
+ottto_macos_release_app_src_path() {
+  case "$1/" in
+    "$RELEASE_APP_SRC_RUN/"?*) return 0 ;;
+  esac
+  return 1
+}
+if [[ -n "${OTTTO_RELEASE_LANE:-}" ]]; then
+  if [[ ! "${GITHUB_RUN_ID:-}" =~ ^[1-9][0-9]{0,19}$ ]]; then
+    echo "The release lane needs the workflow run id." >&2
+    exit 2
+  fi
+  RELEASE_APP_SRC_RUN="$RELEASE_APP_SRC_BASE/$GITHUB_RUN_ID"
+  release_app_root_physical="$(cd "$MAC_APP_ROOT" 2>/dev/null && pwd -P)" || release_app_root_physical=""
+  if ! ottto_macos_release_app_src_path "$MAC_APP_ROOT" ||
+    ! ottto_macos_release_app_src_path "$release_app_root_physical"; then
+    echo "The release lane builds only from the release host's app staging folder for this run." >&2
+    exit 2
+  fi
+fi
 if [[ -n "$MAC_APP_SOURCE_PIN" && ! "$MAC_APP_SOURCE_PIN" =~ ^[0-9a-f]{40}$ ]]; then
   echo "--app-source-commit must be a 40-hex app source commit" >&2
   exit 2
@@ -261,6 +289,11 @@ if [[ -z "$MAC_APP_GIT_ROOT" ]]; then
 fi
 MAC_APP_GIT_ROOT="$(cd "$MAC_APP_GIT_ROOT" && pwd -P)"
 MAC_APP_ROOT="$(cd "$MAC_APP_ROOT" && pwd -P)"
+# The prefix map names the checkout: in the release lane it is the staging folder.
+if [[ -n "$RELEASE_APP_SRC_RUN" ]] && ! ottto_macos_path_within "$MAC_APP_GIT_ROOT" "$RELEASE_APP_SRC_RUN"; then
+  echo "The release lane builds only from the release host's app staging folder for this run." >&2
+  exit 2
+fi
 case "$MAC_APP_ROOT/" in
   "$MAC_APP_GIT_ROOT/"*)
     MAC_APP_SOURCE_PATH="${MAC_APP_ROOT#"$MAC_APP_GIT_ROOT"/}"

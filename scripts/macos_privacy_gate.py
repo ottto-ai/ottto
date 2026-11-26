@@ -96,7 +96,7 @@ MACHINE_NAME_LINE = re.compile(r"(?P<step>[^\t\n]*\t(?P<name>[^\t\n]*)\t)?\ufeff
 # The runner's last job line ("Complete job" step): a log set without it is not the whole job.
 JOB_END_LINE = re.compile(r"(?:[^\t\n]*\tComplete job\t)?\ufeff?"
                           r"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Cleaning up orphan processes\r?")
-# The release host's runner work folder for one run (logs profile with --run-id only). Its
+# The release host's runner work folder for one run (logs profile, from --run-id). Its
 # checkout and attestation output name this neutral folder before the mask step runs.
 RELEASE_WORK_PREFIX = "/opt/ottto-release/runners/%s/_work/"
 # The dedicated release account is neutral by design: its user and full name are not
@@ -2144,7 +2144,8 @@ def run_profile(args, gate, policy):
     if profile == "dispatch":
         return scan_dispatch(gate), context, []
     if profile == "logs":
-        return scan_logs(gate, args.root, policy, read_machine_name(args, policy), args.run_id), context, []
+        return scan_logs(gate, args.root, policy, read_machine_name(args, policy), args.run_id,
+                         args.run_attempt, args.job_record), context, []
     if profile == "unsigned":
         required, optional = {"app_bundle", "cli_binary", "service_binary"}, set()
         context["signed"] = False
@@ -2294,18 +2295,63 @@ def read_machine_name(args, policy):
     return value
 
 
-def scan_logs(gate, root, policy, expected_name, run_id=None):
-    """One job's complete logs, every text searched. The runner's one "Set up job" Machine name
-    field across the whole set is checked on its own (check_machine_name); a set without that
-    field or without the job's last line is partial (incomplete), a second field is a finding.
-    With run_id, "/_work/" inside that run's release-host work folder is not a path finding."""
-    files = sorted(list_files(root))
+JOB_RECORD_MAX = 1 << 20
+STEP_LOG = re.compile(r"(?P<number>[1-9][0-9]{0,3})_(?P<name>[^/\0]+)\.txt")
+
+
+def load_job_record(path, run_id, run_attempt):
+    """The job's API record (GET /repos/{owner}/{repo}/actions/jobs/{job_id}) for the selected
+    run and attempt: a completed job whose steps run from "Set up job" to "Complete job"."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(JOB_RECORD_MAX + 1)
+        record = json.loads(data.decode("utf-8", "strict"), object_pairs_hook=no_duplicate_keys)
+    except (OSError, ValueError):
+        raise Incomplete("log_record")
+    if len(data) > JOB_RECORD_MAX or not isinstance(record, dict):
+        raise Incomplete("log_record")
+    if type(record.get("run_id")) is not int or record["run_id"] != int(run_id) \
+            or type(record.get("run_attempt")) is not int or record["run_attempt"] != int(run_attempt):
+        raise Incomplete("log_run")
+    steps = record.get("steps")
+    if record.get("status") != "completed" or not isinstance(steps, list) or len(steps) < 2:
+        raise Incomplete("log_record")
+    previous = 0
+    for step in steps:
+        if not isinstance(step, dict) or type(step.get("number")) is not int \
+                or not isinstance(step.get("name"), str) or step.get("status") != "completed" \
+                or not isinstance(step.get("conclusion"), str) or not previous < step["number"] <= 9999:
+            raise Incomplete("log_record")
+        previous = step["number"]
+    first, last = steps[0], steps[-1]
+    if (first["number"], first["name"]) != (1, "Set up job") or last["name"] != "Complete job" \
+            or "skipped" in (first["conclusion"], last["conclusion"]):
+        raise Incomplete("log_record")
+    return steps
+
+
+def scan_logs(gate, root, policy, expected_name, run_id, run_attempt, job_record):
+    """One job's complete logs from the selected run attempt, bound to the job's API record: the
+    folder holds exactly the runner's step files (<number>_<step name>.txt) for every step the
+    record lists as run, from "Set up job" to "Complete job", plus the optional system.txt; a
+    missing, extra or renamed file is incomplete. Every text is searched. The one Machine name
+    field in the "Set up job" file is checked on its own (check_machine_name); a second field
+    anywhere is a finding; a job whose "Complete job" file does not end with the runner's last
+    line is incomplete. "/_work/" inside that run's release-host work folder is not a path
+    finding."""
+    steps = load_job_record(job_record, run_id, run_attempt)
+    expected = {"%d_%s.txt" % (step["number"], step["name"]): step["number"]
+                for step in steps if step["conclusion"] != "skipped"}
+    files = list_files(root)
     if not files:
         raise Incomplete("log_empty")
-    if run_id:
-        gate.work_prefix = RELEASE_WORK_PREFIX % run_id
+    if files - {"system.txt"} != set(expected) or not all(STEP_LOG.fullmatch(name) for name in expected):
+        raise Incomplete("log_partial")
+    gate.work_prefix = RELEASE_WORK_PREFIX % run_id
+    order = sorted(files, key=lambda name: expected.get(name, 0))
+    setup_file, end_file = "1_Set up job.txt", "%d_Complete job.txt" % steps[-1]["number"]
     logs, fields, job_end = [], [], False
-    for index, rel in enumerate(files):
+    for index, rel in enumerate(order):
         path = os.path.join(root, rel)
         if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_FILE:
             raise Incomplete("log_type")
@@ -2319,23 +2365,22 @@ def scan_logs(gate, root, policy, expected_name, run_id=None):
             raise Incomplete("log_encoding")
         label = "log%d" % index
         gate.scan_name(rel, Representation(label, (label, "name")), 0)
-        lines, setup = text.split("\n"), True
+        lines = text.split("\n")
         for number, line in enumerate(lines):
             match = MACHINE_NAME_LINE.fullmatch(line)
-            if match and (match.group("name") == "Set up job" if match.group("step") is not None else setup):
-                fields.append((label, len(logs), number, match))
-            if "##[group]Run " in line:
-                setup = False
-            if JOB_END_LINE.fullmatch(line):
-                job_end = True
+            if match:
+                fields.append((rel == setup_file and match.group("step") is None, label, len(logs), number, match))
+        if rel == end_file:
+            body = lines[:-1] if lines[-1] == "" else lines
+            job_end = bool(body) and JOB_END_LINE.fullmatch(body[-1]) is not None
         logs.append((label, lines))
-    if not fields or not job_end:
+    if not job_end or not any(field[0] for field in fields):
         raise Incomplete("log_partial")
     if len(fields) > 1:
         # Every copy stays in the text and is searched like any other line.
         gate.finding("logs", "host_runner_line", "duplicate")
     else:
-        label, index, number, match = fields[0]
+        _setup, label, index, number, match = fields[0]  # the setup file's own field
         lines = logs[index][1]
         start, end = match.span("value")
         check_machine_name(gate, policy, label, lines[number], (start, end), expected_name)
@@ -2349,8 +2394,10 @@ def scan_logs(gate, root, policy, expected_name, run_id=None):
 def check_machine_name(gate, policy, label, line, span, expected_name):
     """The setup field on its intact line. Every literal or path match that touches the value is
     decided here: under the policy switch, with the admitted name from --machine-name-fd, only a
-    literal equal to the value and matching exactly its span (the host name itself) is accepted;
-    any other match inside or across the value stays a finding of its own class."""
+    host-name literal (class "host") equal to the value and matching exactly its span is
+    accepted. Any other match inside or across the value, and any other class's literal equal
+    to it (a listed private, owner or signer literal, a user or runner string), stays a finding
+    of its own class."""
     value = line[span[0]:span[1]]
     if expected_name is not None and value != expected_name:
         gate.finding(label, "structure", "machine_name_unexpected")
@@ -2376,7 +2423,10 @@ def check_machine_name(gate, policy, label, line, span, expected_name):
     for index in sorted(other):
         gate.finding(label, gate.markers[index].cls, "machine_name_inner")
     for index in sorted(exact - other):
-        if admitted:
+        cls = gate.markers[index].cls
+        if cls != "host":
+            gate.finding(label, cls, "machine_name_equal")
+        elif admitted:
             key = (label, "host_runner_line", "accepted")
             gate.diagnostics[key] = gate.diagnostics.get(key, 0) + 1
         else:
@@ -2534,6 +2584,8 @@ def main(argv=None):
     scan.add_argument("--stage", choices=("attest-1", "attest-2"))
     scan.add_argument("--machine-name-fd", type=int)
     scan.add_argument("--run-id")
+    scan.add_argument("--run-attempt")
+    scan.add_argument("--job-record")
     markers = sub.add_parser("markers")
     markers.add_argument("--store")
     markers.add_argument("--owner-store-v3", action="store_true")
@@ -2553,9 +2605,13 @@ def main(argv=None):
         parser.error("--lane is required for this profile")
     if args.command == "scan" and (args.profile == "attest") != (args.stage is not None):
         parser.error("--stage attest-1|attest-2 goes with --profile attest only")
-    if args.command == "scan" and args.run_id is not None and (
-            args.profile != "logs" or not re.fullmatch(r"[1-9][0-9]{0,19}", args.run_id)):
-        parser.error("--run-id <digits> goes with --profile logs only")
+    if args.command == "scan":
+        log_args = [value is not None for value in (args.run_id, args.run_attempt, args.job_record)]
+        if (args.profile == "logs" and not all(log_args)) or (args.profile != "logs" and any(log_args)):
+            parser.error("--profile logs needs --run-id, --run-attempt and --job-record; no other profile takes them")
+        if args.profile == "logs" and not (re.fullmatch(r"[1-9][0-9]{0,19}", args.run_id)
+                                           and re.fullmatch(r"[1-9][0-9]{0,4}", args.run_attempt)):
+            parser.error("--run-id and --run-attempt take digits")
     handlers = {"scan": command_scan, "markers": command_markers, "policy": command_policy,
                 "leaf": command_leaf, "register-masks": command_register_masks, "roles": command_roles,
                 "check-record": command_check_record}
