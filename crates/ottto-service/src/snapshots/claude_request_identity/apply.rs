@@ -5,15 +5,12 @@
 use super::{
     accepted, budget, count_cause, install, max_parts_per_item, protect_accepted_shares,
     record_refusal_causes, reproduces, row_costs, row_identity, strip, wire_grouping, Amounts,
-    AuthorityKey, Grouping, Ineligible, OverCap, RowIdentity, Tagged, COLLECTOR,
+    AuthorityKey, CapMeasurement, Grouping, Ineligible, OverCap, RowIdentity, Tagged, COLLECTOR,
     COST_MISSING_COLLAPSE, MAX_AUTHORITY_KEYS, MAX_EVIDENCE_ENTRIES, MAX_ITEM_BYTES,
     MAX_PARTS_PER_ROW, MAX_ROWS, OVER_CAP_STRIP, REFUSAL_CAUSES,
 };
 #[cfg(test)]
-use super::{bucket_row_count, cycle_contract, effective_item_cap, Contribution};
-#[cfg(test)]
-use crate::snapshots::claude_request_identity::accepted::AcceptedBuckets;
-use crate::snapshots::claude_request_identity::budget::Measurement as CapMeasurement;
+use super::{bucket_row_count, cycle_contract, effective_item_cap, AcceptedBuckets, Contribution};
 use crate::snapshots::{
     row_key_from_model_usage, snapshot_fingerprint, RowKey, SnapshotItem, SnapshotModelUsage,
     SnapshotSource,

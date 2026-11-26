@@ -10,11 +10,10 @@ use super::COLLECTOR;
 use super::{
     accepted, bucket_row_count, classify_ref, copy_derived_rows, from_account_rule,
     request_occurrence_facts, request_owned_grouping, spanless_first_sequence, wire_login_is_valid,
-    CopyInvalidation, Grouping, IdentityRef, Ineligible, MarkerVerdict, Refusal, RequestFacts,
-    ScanEvidence, Tagged,
+    AcceptedBuckets, CopyInvalidation, Grouping, IdentityRef, Ineligible, MarkerVerdict, Refusal,
+    RequestFacts, ScanEvidence, Tagged,
 };
 use crate::snapshots::claude_request_accounts::{local_subscription, normalize_activity};
-use crate::snapshots::claude_request_identity::accepted::AcceptedBuckets;
 use crate::snapshots::{
     activity_bucket_from_timestamp, build_row_identity, codex_identity_is_uuid_shaped,
     rfc3339_unix_seconds, RowKey, SelectorCapture, SnapshotItem, UsageTotals,
