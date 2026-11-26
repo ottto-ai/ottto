@@ -532,19 +532,6 @@ pub(crate) mod withheld_support {
     pub(crate) fn withheld_settled(index: &ScanIndex) -> bool {
         upload_settled_without_account_holds(index, true)
     }
-
-    pub(crate) fn deferred_tokens(
-        scan: &crate::snapshots::SourceScanResult,
-    ) -> BTreeMap<String, u64> {
-        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-        disposition.defer_sessions(
-            scan.snapshots
-                .iter()
-                .map(|item| item.source_session_id.clone())
-                .collect(),
-        );
-        disposition.account_deferred_tokens(&scan.snapshots)
-    }
 }
 
 /// Process-local, content-free count of `Rejected` pages whose local holds

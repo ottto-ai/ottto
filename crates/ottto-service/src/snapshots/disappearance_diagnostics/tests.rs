@@ -1062,7 +1062,7 @@ fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
 /// ordinary vanished path: its request-census record goes with its entry
 /// (counted), and so does its snapshot incidence, as for an untagged member.
 /// Its ACKed history stays: every body the server accepted is still recorded
-/// as accepted after the entry is gone.
+/// as accepted when the entry goes.
 #[test]
 fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
     for account_held in [false, true] {
@@ -1097,12 +1097,12 @@ fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_
                 .is_some(),
             "precondition: the real parse recorded the member's census"
         );
-        let acked = index
+        // The raw page helper runs no upload finalization, so it records no
+        // incidence: seed the member's accepted body.
+        let acked = std::collections::BTreeSet::from(["member-body".to_string()]);
+        index
             .file_snapshot_fingerprints
-            .get(&second_key)
-            .cloned()
-            .unwrap_or_default();
-        assert!(!acked.is_empty(), "precondition: the member has bodies");
+            .insert(second_key.clone(), acked.clone());
         index.record_accepted_snapshot_fingerprints(&acked);
         let entry = index.files.get_mut(&second_key).unwrap();
         tag_as_older_build(entry);
@@ -1890,9 +1890,12 @@ fn claude_directory_proof_keeps_listed_names_and_drops_stale_twins() {
 
 /// [behaviour] Positive recreation wins on the same page: a key that its
 /// directory's complete read did not list, recreated before the page's
-/// secure absence proof, is not retired. Its entry and older-build tag stay,
-/// and the page counts no vanished retirement, lost usage or account
-/// release. The control without the recreation retires it once.
+/// secure absence proof, is not retired by that proof: the page counts no
+/// vanished retirement, lost usage or account release. An older build's tag
+/// no longer retains the unobserved entry: the clean generation's
+/// reconciliation drops it as it drops an untagged one, and the next walk
+/// lists the recreated file again. The control without the recreation
+/// retires it once.
 #[cfg(unix)]
 #[test]
 fn claude_directory_proof_yields_to_same_page_recreation() {
@@ -1942,16 +1945,21 @@ fn claude_directory_proof_yields_to_same_page_recreation() {
             assert_eq!(vanished, [[0; VANISHED]; 3]);
             continue;
         }
-        assert!(index
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.has_sampled_tag()));
+        assert!(
+            !index.files.contains_key(&key),
+            "reconciliation drops the unobserved entry, tag or not"
+        );
         assert_eq!(vanished, [[0; VANISHED]; 3], "no vanished retirement");
         for row in &rows {
             for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
                 assert!(row["counts"].get(count).is_none(), "{count}: {row}");
             }
         }
+        claude_generation(&mut index, &root, RETRY, 10, &[]);
+        assert!(
+            index.files.contains_key(&key),
+            "the next walk lists the recreated file"
+        );
     }
 
     // Exercise ordinary entries on both sides of the NEW directory

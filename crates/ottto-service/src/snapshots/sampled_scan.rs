@@ -238,11 +238,18 @@ impl Context {
             "no_curve",
         ]))
     }
-    pub(super) fn record_mode(&mut self, mode: ReadMode) {
+    /// Count a planned read. `census_verify`: a Full is the queued
+    /// census-verify re-read, counted under that page cause.
+    pub(super) fn record_mode(&mut self, mode: ReadMode, census_verify: bool) {
         match mode {
             ReadMode::Full(reason) => {
                 self.full_files += 1;
-                self.full_reasons[reason.slot()] += 1;
+                let cause = if census_verify {
+                    crate::transcript_acquisition::FullCause::CensusVerify
+                } else {
+                    crate::transcript_acquisition::FullCause::Reason(reason)
+                };
+                self.full_reasons[cause.slot()] += 1;
             }
             ReadMode::Tail => self.tail_files += 1,
             ReadMode::Unchanged => self.unchanged_files += 1,
@@ -326,12 +333,6 @@ pub(super) mod test_hooks {
         static AFTER_SELECTION: RefCell<Option<SelectionHook>> = const { RefCell::new(None) };
         static UNREADABLE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
         static FINISH_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        static ACTIVE_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-
-    /// Run `hook` each time this thread reaches `point`, until `clear`.
-    pub(in crate::snapshots) fn set(point: Point, hook: impl FnMut() + 'static) {
-        HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
     }
 
     pub(in crate::snapshots) fn after_selection(
@@ -366,19 +367,6 @@ pub(super) mod test_hooks {
             hook();
         }
         HOOKS.with(|hooks| hooks.borrow_mut().extend(fired));
-    }
-
-    /// `fire`, with the candidate's index key readable through
-    /// `active_key` while the hooks run.
-    pub(in crate::snapshots) fn fire_for_key(point: Point, key: &str) {
-        ACTIVE_KEY.with(|active| *active.borrow_mut() = Some(key.to_owned()));
-        fire(point);
-        ACTIVE_KEY.with(|active| active.borrow_mut().take());
-    }
-
-    /// The key `fire_for_key` is firing for, if any.
-    pub(in crate::snapshots) fn active_key() -> Option<String> {
-        ACTIVE_KEY.with(|active| active.borrow().clone())
     }
 
     /// A census unreadable cause, by its `UnreadableCause` ordinal.

@@ -3294,14 +3294,17 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         assert!(crate::snapshot_sync::withheld_support::withheld_settled(
             &removed
         ));
-        // This applies equally to the NO-HINT healthy-census path:
-        // removal discharges only the now-unfulfillable debt, never incidence
-        // custody or an entity ACK. Completed settlement remains unblocked.
-        assert_eq!(
-            removed.file_snapshot_fingerprints.get(&key),
-            Some(&incidence)
-        );
-        assert_eq!(removed.accepted_snapshot_fingerprints, acknowledgements);
+        // This applies equally to the NO-HINT healthy-census path: proven
+        // deletion is an ordinary removal of the now-unheld entry. Its
+        // incidence goes with it, no ACK is minted, and only its own ACKs may
+        // age out. Completed settlement remains unblocked.
+        assert_eq!(removed.file_snapshot_fingerprints.get(&key), None);
+        assert!(removed
+            .accepted_snapshot_fingerprints
+            .is_subset(&acknowledgements));
+        assert!(acknowledgements
+            .difference(&removed.accepted_snapshot_fingerprints)
+            .all(|fingerprint| incidence.contains(fingerprint)));
         assert_eq!(counts["withheld_hold_released"]["deleted"], 1);
         assert_eq!(
             counts["withheld_hold_released"]["deleted_tokens"],
@@ -3431,8 +3434,15 @@ fn withheld_removed_project_releases_account_debt() {
         assert!(crate::snapshot_sync::withheld_support::withheld_settled(
             &after
         ));
-        assert_eq!(after.file_snapshot_fingerprints.get(&key), Some(&incidence));
-        assert_eq!(after.accepted_snapshot_fingerprints, acknowledgements);
+        // An ordinary removal: incidence goes, no ACK is minted, and only the
+        // removed file's own ACKs may age out.
+        assert_eq!(after.file_snapshot_fingerprints.get(&key), None);
+        assert!(after
+            .accepted_snapshot_fingerprints
+            .is_subset(&acknowledgements));
+        assert!(acknowledgements
+            .difference(&after.accepted_snapshot_fingerprints)
+            .all(|fingerprint| incidence.contains(fingerprint)));
         assert!(after.withheld_memo.held_gauge().is_none());
         let counts = page_counts(&counts);
         assert_eq!(counts["withheld_hold_released"]["deleted"], 1);

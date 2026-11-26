@@ -527,10 +527,7 @@ impl OwnedSourceScan {
                 return true;
             };
             #[cfg(test)]
-            sampled_scan::test_hooks::fire_for_key(
-                sampled_scan::test_hooks::Point::AfterRetain,
-                &local_index_key(&candidate.path),
-            );
+            sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterRetain);
             let joined_owner = if aliases.is_empty() {
                 None
             } else {
@@ -1408,7 +1405,7 @@ impl OwnedSourceScan {
         acquisition.tier_prefix_replay = true;
         if let Some(context) = self.sampling.as_mut() {
             context.priority_replays += 1;
-            context.record_mode(mode);
+            context.record_mode(mode, false);
         }
         self.resource_probe
             .full_parse_reason(mode, active.parse_reason, active.prior_stamp, 1, 0);

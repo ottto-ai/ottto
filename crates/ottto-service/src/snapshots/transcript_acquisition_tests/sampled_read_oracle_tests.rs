@@ -202,7 +202,8 @@ fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
 /// the next pre-save step counts it once as `unverifiable`.
 /// Two more pages and a clock six hours on queue nothing and read nothing,
 /// even with the record held again at the same state. An append changes the
-/// file's state, which allows exactly one new attempt.
+/// file's state; past the six-hour floor after the last attempt, that allows
+/// exactly one new attempt.
 ///
 /// A lossy parse writes a `Lossy` record, not an identity-incomplete one; the
 /// hold is seeded again after each read to stand for a parse that stays
@@ -283,8 +284,28 @@ fn an_unverifiable_identity_hold_reads_full_once_per_file_state() {
         index = next;
     }
 
+    // A new attempt needs a changed file and the floor after the last
+    // attempt: the clock is past both. The watcher hints the appended file,
+    // as the daemon's does; the fixture's fixed collection time never
+    // re-lists a kept walk on its own.
+    sampled_scan::set_test_now(Some(
+        start + crate::snapshots::LISTING_OWED_PACE_SECONDS + 1,
+    ));
+    let size = index.files[&key].size_bytes;
     fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let (next, _, _) = production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+    let (next, _, modes) = production_scan_hinted(
+        &fixture,
+        source,
+        index,
+        Some(cache.clone()),
+        "account-a",
+        std::slice::from_ref(&fixture.file.0),
+    );
+    assert_ne!(modes, (0, 0, 0), "the hinted append is read");
+    assert!(
+        next.files[&key].size_bytes > size,
+        "the entry records the file's new state"
+    );
     index = next;
     seed_identity_incomplete_hold(&mut index, &fixture.file.0);
     assert_eq!(

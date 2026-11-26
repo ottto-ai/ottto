@@ -833,17 +833,6 @@ struct ScanFixture {
     file: Fixture,
 }
 impl ScanFixture {
-    // Claude fixtures need no private prompt. Codex discovery requires
-    // its real session_meta header, which also carries a private replay window.
-    fn without_prompt(self) -> Self {
-        let header: Value =
-            serde_json::from_str(&fs::read_to_string(&self.file.0).unwrap()).unwrap();
-        if header["type"] == "user" {
-            fs::write(&self.file.0, b"").unwrap();
-        }
-        self
-    }
-
     fn new(source: SnapshotSource) -> Self {
         let file = Fixture::new(source);
         let dir = file.0.with_extension("scan-fixture");
@@ -1948,9 +1937,9 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
             Some(cache.clone()),
             "scan-pressure",
         );
-        // More cold admissions than the shared count cap. Their old source
-        // timestamps must not promote them over the recent active session.
-        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+        // Many cold admissions. Their old source timestamps must not
+        // promote them over the recent active session.
+        for _ in 0..272 {
             let historical = ScanFixture::new(source);
             historical
                 .file

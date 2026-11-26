@@ -685,15 +685,6 @@ impl Checkpoint {
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.samples.sealed_offset
     }
-    /// Whether the opened object `file` still has the content this
-    /// checkpoint committed (`FileStamp::same_content`): no append,
-    /// truncation or mtime-moving edit since; a ctime-only change keeps it.
-    /// The gate before a release for this copy. It reads the open
-    /// handle, so a path replaced after revalidation is not seen here; the
-    /// next take's `Replaced` check catches it (at most one wasted release).
-    pub(crate) fn stamp_matches(&self, file: &File) -> io::Result<bool> {
-        Ok(FileStamp::capture(file.metadata()?)?.same_content(&self.stamp))
-    }
     /// The count to store beside this checkpoint's durable certificate made
     /// with `birth_nanos`: only under that same known birth.
     pub(crate) fn write_generation_for(&self, birth_nanos: u64) -> Option<std::num::NonZeroU32> {
@@ -701,11 +692,6 @@ impl Checkpoint {
             .filter(|generation| birth_nanos != 0 && generation.birth_nanos == birth_nanos)
             .map(WriteGeneration::count)
     }
-    /// The interpretation scope this checkpoint was made under.
-    pub(crate) fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
     #[cfg(test)]
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified_unix_seconds
@@ -952,13 +938,30 @@ pub(crate) enum FullReason {
     HeadChanged,
     BoundaryChanged,
     UnsupportedIdentity,
-    /// A re-armed read of a file whose identity-incomplete census record holds
-    /// its root: it reads Full, never from stored state, so it can verify it.
+}
+
+/// Why a counted Full read happened, for the page's `full_reasons` counters
+/// only: its `FullReason`, or the queued census-verify re-read of a file whose
+/// identity-incomplete census record holds its root. Never stored; the read
+/// itself carries `FullReason::StateMissing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullCause {
+    Reason(FullReason),
     CensusVerify,
 }
 
-/// The number of `FullReason` slots (`FullReason::slot`).
+/// The number of `FullCause` slots the page counters index: every
+/// `FullReason` slot, then `census_verify`.
 pub(crate) const FULL_REASON_COUNT: usize = 12;
+
+impl FullCause {
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            Self::Reason(reason) => reason.slot(),
+            Self::CensusVerify => FULL_REASON_COUNT - 1,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -968,7 +971,9 @@ pub(crate) enum ReadMode {
     Unchanged,
 }
 
-// New codes must never be written to a stored field: an older reader fails on an unknown code.
+// The retired Codex `ProofRefusal::Seal` makes this variant set part of the
+// pinned Codex head layout: never add a code. A diagnostics-only cause
+// belongs in `FullCause`.
 #[cfg(unix)]
 crate::durable_tail_codec::durable_enum!(FullReason {
     0 => StateMissing,
@@ -982,7 +987,6 @@ crate::durable_tail_codec::durable_enum!(FullReason {
     8 => HeadChanged,
     9 => BoundaryChanged,
     10 => UnsupportedIdentity,
-    11 => CensusVerify,
 });
 
 impl FullReason {
@@ -999,7 +1003,6 @@ impl FullReason {
             Self::HeadChanged => 8,
             Self::BoundaryChanged => 9,
             Self::UnsupportedIdentity => 10,
-            Self::CensusVerify => 11,
         }
     }
 }

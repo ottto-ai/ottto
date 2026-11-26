@@ -129,14 +129,14 @@ fn context_posture_survives_a_split_family_refold() {
         assert_eq!(before.compaction_count, Some(1));
         assert!(!before.compaction_timestamps.is_empty());
         let prior = commit(&session, together);
-        // Check that the ordinary Tail provenance and matching census record
-        // survived the real save/load before changing the page composition.
+        // The real save/load strips the older build's complete tag to the
+        // plain version and keeps the matching unverified census record,
+        // before the page composition changes.
         let key = root_path.to_str().unwrap();
-        assert!(prior.files[key]
-            .scan_identity_version
-            .as_deref()
-            .unwrap()
-            .ends_with(":c"));
+        assert_eq!(
+            prior.files[key].scan_identity_version.as_deref(),
+            Some("semantic_sync:v2")
+        );
         assert!(prior
             .claude_request_census_for_test()
             .get(key)

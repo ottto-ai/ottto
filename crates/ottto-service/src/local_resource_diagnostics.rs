@@ -2732,23 +2732,24 @@ pub(crate) struct PageEvents {
 pub(crate) struct FullReasons(pub(crate) [usize; crate::transcript_acquisition::FULL_REASON_COUNT]);
 impl Serialize for FullReasons {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::transcript_acquisition::FullCause::{CensusVerify, Reason};
         use crate::transcript_acquisition::FullReason::*;
         let mut map = serializer.serialize_map(None)?;
-        for (reason, key) in [
-            (StateMissing, "state_missing"),
-            (AuditDue, "audit_due"),
-            (ClockChanged, "clock_changed"),
-            (ScopeChanged, "scope_changed"),
-            (InvalidCheckpoint, "invalid_checkpoint"),
-            (Replaced, "replaced"),
-            (Shrunk, "shrunk"),
-            (SameSizeEdit, "same_size_edit"),
-            (HeadChanged, "head_changed"),
-            (BoundaryChanged, "boundary_changed"),
-            (UnsupportedIdentity, "unsupported_identity"),
+        for (cause, key) in [
+            (Reason(StateMissing), "state_missing"),
+            (Reason(AuditDue), "audit_due"),
+            (Reason(ClockChanged), "clock_changed"),
+            (Reason(ScopeChanged), "scope_changed"),
+            (Reason(InvalidCheckpoint), "invalid_checkpoint"),
+            (Reason(Replaced), "replaced"),
+            (Reason(Shrunk), "shrunk"),
+            (Reason(SameSizeEdit), "same_size_edit"),
+            (Reason(HeadChanged), "head_changed"),
+            (Reason(BoundaryChanged), "boundary_changed"),
+            (Reason(UnsupportedIdentity), "unsupported_identity"),
             (CensusVerify, "census_verify"),
         ] {
-            let count = self.0[reason.slot()];
+            let count = self.0[cause.slot()];
             if count != 0 {
                 map.serialize_entry(key, &count)?;
             }

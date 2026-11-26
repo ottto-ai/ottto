@@ -362,6 +362,8 @@ impl OwnedSourceScan {
         // Counted once the page actually reads the file: a fence
         // or deferral below does not inflate the read diagnostics.
         let mut planned_mode = None;
+        // The planned read is the queued census-verify re-read.
+        let mut planned_census_verify = false;
         if let Some(context) = self
             .sampling
             .as_mut()
@@ -516,13 +518,14 @@ impl OwnedSourceScan {
                     {
                         tail_source::counters::bump(self.source, "tail_bootstrap_full", "new_file");
                     }
-                    // A re-armed read of a held census record reads Full under
-                    // its own reason (`reuses_stored` declined the stored state).
-                    #[cfg(unix)]
-                    let mut tail_proven_full = (allow_sample
+                    // A re-armed read of a held census record: `reuses_stored`
+                    // declined the stored state, so a Full with no other
+                    // reason is counted on the page as `census_verify`.
+                    let census_verify = allow_sample
                         && parse_reason == Some(CandidateParseReason::Rearmed)
-                        && claude_request_census::holds_for_verifying_read(&self.index, &key))
-                    .then_some(crate::transcript_acquisition::FullReason::CensusVerify);
+                        && claude_request_census::holds_for_verifying_read(&self.index, &key);
+                    #[cfg(unix)]
+                    let mut tail_proven_full = None;
                     #[cfg(unix)]
                     let retained = match tail_load {
                         Some(route) => {
@@ -680,6 +683,11 @@ impl OwnedSourceScan {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, &self.index);
                     }
                     planned_mode = Some(mode);
+                    planned_census_verify = census_verify
+                        && mode
+                            == crate::transcript_acquisition::ReadMode::Full(
+                                crate::transcript_acquisition::FullReason::StateMissing,
+                            );
                     file_sampling = Some(sampled_scan::Active {
                         key,
                         scope,
@@ -862,7 +870,7 @@ impl OwnedSourceScan {
         }
         if let Some(context) = self.sampling.as_mut() {
             if let Some(mode) = planned_mode {
-                context.record_mode(mode);
+                context.record_mode(mode, planned_census_verify);
                 context.same_size_touch_proven +=
                     usize::from(active.parser.reader.acquisition.as_ref().is_some_and(
                         crate::transcript_acquisition::ReadPlan::same_size_touch_proven,

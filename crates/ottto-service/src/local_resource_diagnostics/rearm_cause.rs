@@ -1,6 +1,6 @@
 //! Process-local clear provenance. Never serialized with an index or upload.
 //! Sync reloads indexes between pages, so skipped entry fields are insufficient.
-use crate::snapshots::{CandidateParseReason, ScanIndex, ScanIndexEntry};
+use crate::snapshots::{CandidateParseReason, ScanIndex};
 use crate::transcript_acquisition::ReadMode;
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
@@ -55,7 +55,8 @@ fn with_tags<T>(f: impl FnOnce(&mut Tags) -> T) -> T {
 pub(crate) fn retain(index: &ScanIndex) {
     with_tags(|tags| tags.retain(index));
 }
-pub(crate) fn clear(key: &str, entry: &mut ScanIndexEntry, cause: Cause) {
+#[cfg(test)]
+pub(crate) fn clear(key: &str, entry: &mut crate::snapshots::ScanIndexEntry, cause: Cause) {
     if !entry.source_file_fingerprint.is_empty() {
         with_tags(|tags| {
             tags.0.insert(key.to_owned(), cause);

@@ -1467,7 +1467,6 @@ pub(super) fn growth_read_admitted_at(
             FullReason::StateMissing
                 | FullReason::InvalidCheckpoint
                 | FullReason::UnsupportedIdentity
-                | FullReason::CensusVerify
         )
     ) {
         return match claim_growth_full(index, &key, now) {
