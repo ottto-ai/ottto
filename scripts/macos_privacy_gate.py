@@ -954,12 +954,16 @@ class Gate:
 
     # --- byte and text passes
     def scan_buffer(self, buffer, base, rep, seen_upto=0):
-        """seen_upto: this buffer's leading bytes the previous chunk already held in full."""
+        """seen_upto: this buffer's leading bytes the previous chunk already held in full. A
+        "/_work/" hit inside them was classified there with its whole look-behind; every other
+        hit is classified again here (home paths need look-ahead past the previous chunk)."""
         lowered = buffer.lower()
         for index, start, end in self.matcher.raw(lowered):
             self.record(rep, index, base + start, base + end, "raw")
         for start, end in path_hits_bytes(lowered):
-            if end > seen_upto and not self.work_allowed(lowered, start, end):
+            if end <= seen_upto and lowered[start:end] == b"/_work/":
+                continue
+            if not self.work_allowed(lowered, start, end):
                 self.record_path(rep, base + start, base + end, "raw")
 
     def scan_bytes(self, data, rep):
@@ -2334,30 +2338,45 @@ def scan_logs(gate, root, policy, expected_name, run_id=None):
         label, index, number, match = fields[0]
         lines = logs[index][1]
         start, end = match.span("value")
+        check_machine_name(gate, policy, label, lines[number], (start, end), expected_name)
+        # Matches that touch the value were all handled on the intact line.
         lines[number] = lines[number][:start] + "\0" + lines[number][end:]
-        check_machine_name(gate, policy, label, match.group("value"), expected_name)
     for label, lines in logs:
         gate.scan_plain_text("\n".join(lines).encode("utf-8"), Representation(label, (label, "rest")))
     return [label for label, _lines in logs]
 
 
-def check_machine_name(gate, policy, label, value, expected_name):
-    """The setup field's value. Under the policy switch, with the admitted name from
-    --machine-name-fd, only a literal equal to the whole value (the host name itself) is accepted;
-    any other literal or path inside the value stays a finding of its own class."""
-    data = value.encode("utf-8")
+def check_machine_name(gate, policy, label, line, span, expected_name):
+    """The setup field on its intact line. Every literal or path match that touches the value is
+    decided here: under the policy switch, with the admitted name from --machine-name-fd, only a
+    literal equal to the value and matching exactly its span (the host name itself) is accepted;
+    any other match inside or across the value stays a finding of its own class."""
+    value = line[span[0]:span[1]]
     if expected_name is not None and value != expected_name:
         gate.finding(label, "structure", "machine_name_unexpected")
     admitted = policy.accept_machine_name_line and expected_name is not None and value == expected_name
-    if any(path_hits_bytes(data.lower())) or any(path_hits_text(norm(value))):
+    lowered = line.encode("utf-8").lower()
+    byte_span = (len(line[:span[0]].encode("utf-8")), len(line[:span[1]].encode("utf-8")))
+    normalized = norm(line)
+    text_start = len(norm(line[:span[0]]))
+    text_span = (text_start, text_start + len(norm(value)))
+
+    def touches(start, end, window):
+        return start < window[1] and end > window[0]
+
+    if any(touches(a, b, byte_span) for a, b in path_hits_bytes(lowered)) or \
+            any(touches(a, b, text_span) for a, b in path_hits_text(normalized)):
         gate.finding(label, "path", "machine_name")
-    hits = {index for index, _start, _end in gate.matcher.raw(data.lower())}
-    hits |= {index for index, _start, _end in gate.matcher.text(norm(value))}
-    for index in sorted(hits):
-        marker = gate.markers[index]
-        if norm(marker.value) != norm(value):
-            gate.finding(label, marker.cls, "machine_name_inner")
-        elif admitted:
+    exact, other = set(), set()
+    for hits, window in ((gate.matcher.raw(lowered), byte_span), (gate.matcher.text(normalized), text_span)):
+        for index, start, end in hits:
+            if touches(start, end, window):
+                same = (start, end) == window and norm(gate.markers[index].value) == norm(value)
+                (exact if same else other).add(index)
+    for index in sorted(other):
+        gate.finding(label, gate.markers[index].cls, "machine_name_inner")
+    for index in sorted(exact - other):
+        if admitted:
             key = (label, "host_runner_line", "accepted")
             gate.diagnostics[key] = gate.diagnostics.get(key, 0) + 1
         else:

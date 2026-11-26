@@ -203,6 +203,21 @@ class Matching(unittest.TestCase):
             g.CHUNK = saved
         self.assertEqual(gate.findings, {"private": 1})
 
+    def test_home_path_split_across_chunks(self):
+        # A chunk that ends right after the Shared folder's name cannot see that the name goes on.
+        saved = g.CHUNK
+        g.CHUNK = 64
+        try:
+            data = b"x" * (64 - len(HOME_ROOT + "Shared")) + (HOME_ROOT + "Sharedperson/lib").encode()
+            gate = make_gate(PRIVATE)
+            gate.scan_bytes(data, rep())
+            self.assertEqual(gate.findings, {"path": 1})
+            gate = make_gate(PRIVATE)
+            gate.scan_stream(io.BytesIO(data), rep())
+            self.assertEqual(gate.findings, {"path": 1})
+        finally:
+            g.CHUNK = saved
+
     def test_generic_paths(self):
         self.assertEqual(self.found((HOME_ROOT + "jdoe/lib").encode()), {"path": 1})
         self.assertEqual(self.found((HOME_ROOT + "J Doe").encode("utf-16-le")), {"path": 1})
@@ -902,6 +917,8 @@ class CommandLine(unittest.TestCase):
             ((tabbed.replace("Build", "Build " + PRIVATE) + "Build\tRun\tok\n" + tabbed_end,), host, True, (), 1),
             # Inside the admitted value only the literal equal to the whole name is accepted.
             ((setup + later + end,), host, True, ("thetic-ho",), 1),
+            ((setup + later + end,), host, True, (": 'synth",), 1),  # a literal across the value's edge
+            ((setup + later + end,), host, True, ("ic-host'",), 1),
             # Partial input: no setup field (missing, or after the first step started), no job end.
             ((later + end,), host, True, (), 3),
             ((later + setup + end,), host, True, (), 3),

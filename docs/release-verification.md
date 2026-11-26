@@ -212,7 +212,7 @@ The `macos-stable-release` environment holds one variable,
 | `advisory_xattrs` | A subset of `macl` and `provenance`. A listed attribute's presence on a shipped file is counted but does not stop the release. Any marker in any attribute name or value still blocks. |
 | `leaf_sha256` | One or two distinct SHA-256 digests of the Developer ID leaf certificate (DER). Every signature the gate trusts must chain to Apple's Developer ID root and end in one of these leaves. Two entries cover a certificate rotation; both release lanes use the same list. |
 | `markers_sha256` | The marker list digest (below). |
-| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the job's one `Machine name: '…'` field (in the "Set up job" section) passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); only a literal equal to that whole name is counted as `host_runner_line` `accepted`. Any other literal or path inside the value, the rest of that line and the name anywhere else still block. |
+| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the job's one `Machine name: '…'` field (in the "Set up job" section) passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); only a literal match spanning exactly that value is counted as `host_runner_line` `accepted`. Any other literal or path inside or across the value, the rest of that line and the name anywhere else still block. |
 
 Duplicate keys, unknown keys, wrong types and missing required keys are
 refused. The canonical form is the object with every key (including the
