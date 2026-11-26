@@ -2501,8 +2501,8 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 }
 
 fn bounded_shape(bytes: &[u8]) -> anyhow::Result<()> {
-    // Same 8,192-node/depth-64 gate as snapshot_retry::state_shape. The lexical
-    // pass already proved grammar; count tokens without converting 1e400 to f64.
+    // An 8,192-node/depth-64 gate. The lexical pass already proved grammar;
+    // count tokens without converting 1e400 to f64.
     let mut nodes = 0;
     let mut depth = 0usize;
     let mut quoted = false;

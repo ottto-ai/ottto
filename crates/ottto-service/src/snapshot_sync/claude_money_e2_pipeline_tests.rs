@@ -2586,7 +2586,6 @@ fn retry_case(conflict: bool) {
             &index_path,
             &progress_path,
             || Ok(()),
-            None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
             None,
             Default::default(),
