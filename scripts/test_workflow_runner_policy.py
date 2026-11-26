@@ -10,10 +10,10 @@ standard YAML library) and checked:
   runner variable (vars.OTTTO_MACOS_STABLE_RUNNER_LABELS): not as a literal label, not in a
   list or group/labels form, not as an expression default, not through the job's matrix, and
   not through a local reusable workflow it calls. Labels and expressions are compared
-  case-insensitively, as GitHub matches them. Such a job's runs-on reads no expression
-  context but matrix, and its matrix none at all: a variable, input, event payload or job
-  output could name those labels. It calls no reusable workflow from another repository,
-  whose runners this check cannot read.
+  case-insensitively, as GitHub matches them. Such a job's runs-on is a literal or exactly
+  ${{ matrix.<name> }}, and its strategy has no expression: a variable, input, event payload
+  or job output could name those labels. It passes no release label to a reusable workflow
+  and calls none from another repository, whose runners this check cannot read.
 - The stable release workflow's trigger set is exactly workflow_dispatch.
 
 Synthetic workflow fixtures prove each rule fails closed.
@@ -33,10 +33,9 @@ STABLE = WORKFLOWS + "/macos-stable-release.yml"
 RELEASE_LABELS = ("ottto-signing-mac", "ottto-release-bootstrap")
 RUNNER_VARIABLE = "ottto_macos_stable_runner_labels"
 GUARDED_EVENTS = {"pull_request", "pull_request_target", "merge_group"}
-# A context read inside ${{ }}: a name followed by "." or "[" (functions take "(").
-EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-CONTEXT = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_-]*)\s*[.\[]")
-STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+# The one expression a guarded job's runs-on may hold; its matrix values are checked as
+# literals. Any other expression is refused, not parsed.
+MATRIX_ONLY = re.compile(r"\$\{\{\s*matrix\.[a-z0-9_-]+\s*\}\}")
 
 
 class PolicyError(Exception):
@@ -93,7 +92,7 @@ def job_problems(docs, path, name, job, chain=()):
     if not isinstance(job, dict):
         return ["%s: job is not a mapping" % where]
     problems = []
-    for field in ("runs-on", "strategy"):
+    for field in ("runs-on", "strategy", "with"):
         for text in strings(job.get(field)):
             lowered = text.lower()
             for label in RELEASE_LABELS:
@@ -102,10 +101,8 @@ def job_problems(docs, path, name, job, chain=()):
             if RUNNER_VARIABLE in lowered:
                 problems.append("%s: %s reads the stable runner variable" % (where, field))
                 continue
-            allowed = {"matrix"} if field == "runs-on" else set()
-            for expression in EXPRESSION.findall(lowered):
-                for context in sorted(set(CONTEXT.findall(STRING_LITERAL.sub("''", expression))) - allowed):
-                    problems.append("%s: %s reads %s, whose value this check cannot resolve" % (where, field, context))
+            if "${{" in text and (field == "strategy" or (field == "runs-on" and not MATRIX_ONLY.fullmatch(lowered))):
+                problems.append("%s: %s has an expression other than ${{ matrix.<name> }}" % (where, field))
     uses = job.get("uses")
     if isinstance(uses, str) and not uses.startswith("./"):
         problems.append("%s: calls a reusable workflow from another repository" % where)
@@ -207,21 +204,32 @@ def fixture_cases():
         ("matrix runner names", {other: pr("pull_request", "    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n"
                                                          "    runs-on: ${{ matrix.os }}\n")}, None),
         ("other repository variable",
-         {other: pr("pull_request", "    runs-on: ${{ vars.FIXTURE_RUNNER }}\n")}, "runs-on reads vars"),
+         {other: pr("pull_request", "    runs-on: ${{ vars.FIXTURE_RUNNER }}\n")}, "runs-on has an expression"),
         ("event payload",
-         {other: pr("pull_request", "    runs-on: ${{ github.event.pull_request.title }}\n")}, "runs-on reads github"),
+         {other: pr("pull_request", "    runs-on: ${{ github.event.pull_request.title }}\n")}, "runs-on has an expression"),
         ("job output",
-         {other: pr("pull_request", "    runs-on: ${{ fromJSON(needs.pick.outputs.runner) }}\n")}, "runs-on reads needs"),
+         {other: pr("pull_request", "    runs-on: ${{ fromJSON(needs.pick.outputs.runner) }}\n")}, "runs-on has an expression"),
         ("matrix from an expression",
          {other: pr("pull_request", "    strategy:\n      matrix:\n        os: ${{ fromJSON(vars.FIXTURE) }}\n"
-                                    "    runs-on: ${{ matrix.os }}\n")}, "strategy reads vars"),
+                                    "    runs-on: ${{ matrix.os }}\n")}, "strategy has an expression"),
         ("label passed to a local reusable workflow",
          {other: "on: pull_request\njobs:\n  call:\n    uses: ./" + WORKFLOWS + "/called.yml\n"
                  "    with:\n      runner: ottto-signing-mac\n",
           WORKFLOWS + "/called.yml": "on:\n  workflow_call:\n    inputs:\n      runner:\n        type: string\n"
                                      "jobs:\n  run:\n    runs-on: ${{ inputs.runner }}\n    steps:\n"
                                      "      - run: echo ok\n"},
-         "runs-on reads inputs"),
+         "with names the release label ottto-signing-mac"),
+        ("whole-context read in a local reusable workflow",
+         {other: "on: pull_request\njobs:\n  call:\n    uses: ./" + WORKFLOWS + "/called.yml\n",
+          WORKFLOWS + "/called.yml": "on: workflow_call\njobs:\n  run:\n"
+                                     "    runs-on: ${{ fromJSON(toJSON(inputs)).runner }}\n"},
+         "runs-on has an expression"),
+        ("closing braces inside a quoted string",
+         {other: pr("pull_request", "    runs-on: ${{ '}}' != '' && inputs.runner }}\n")},
+         "runs-on has an expression"),
+        ("matrix expression with more after it",
+         {other: pr("pull_request", "    runs-on: ${{ matrix.os }}-${{ vars.SUFFIX }}\n")},
+         "runs-on has an expression"),
         ("remote reusable workflow",
          {other: "on: pull_request\njobs:\n  call:\n    uses: example/other/.github/workflows/x.yml@v1\n"},
          "another repository"),
