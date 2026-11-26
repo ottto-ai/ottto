@@ -343,11 +343,14 @@ class Formats(unittest.TestCase):
     def app_zip(self, app, entries=()):
         """A ZIP of the tree with Unix modes, plus extra (name, mode, data) entries."""
         buffer = io.BytesIO()
+        replaced = {name for name, _mode, _data in entries}
         with zipfile.ZipFile(buffer, "w") as archive:
             for directory, dirs, files in os.walk(app):
                 for name in sorted(dirs) + sorted(files):
                     full = os.path.join(directory, name)
                     rel = "Ottto.app/" + os.path.relpath(full, app) + ("/" if name in dirs else "")
+                    if rel in replaced:
+                        continue
                     info = zipfile.ZipInfo(rel, (2026, 1, 1, 0, 0, 0))
                     info.create_system = 3
                     info.external_attr = os.lstat(full).st_mode << 16
@@ -875,9 +878,12 @@ class CommandLine(unittest.TestCase):
         return env, env_file
 
     def test_register_masks_in_release_workflow(self):
-        env, env_file = self.release_env()
-        env[g.MARKERS_ENV] = store("per%cent value", "owner+signer:" + SIGNER).decode()
-        result = self.run_gate(["register-masks"], lines=("per%cent value", "owner+signer:" + SIGNER), env=env,
+        # Literals with "%" so the escaped mask lines never repeat them verbatim.
+        signer = "Qwvz%Signer Name"
+        env, env_file = self.release_env(
+            OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: %s (ABCDE12345)" % signer)
+        env[g.MARKERS_ENV] = store("per%cent value", "owner+signer:" + signer).decode()
+        result = self.run_gate(["register-masks"], lines=("per%cent value", "owner+signer:" + signer), env=env,
                                mode="enforce")
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.decode().splitlines()
@@ -901,6 +907,25 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(result.returncode, 2, extra)
             self.assertIn(b"code=selector_", result.stderr)
             self.assertEqual(read_bytes(env_file), b"")
+
+    def test_dispatch_inputs_come_from_the_event_inside_the_workflow(self):
+        env, _env_file = self.release_env()
+        event = os.path.join(self.tmp, "event.json")
+        inputs = {"version": "1.2.3-rc1", "channel": "stable-candidate", "release_notes": "Bug fixes",
+                  "artifact_base_url":
+                      "https://install.ottto.net/ottto-local-platform/releases/stable-candidate/1.2.3-rc1",
+                  "release_mode": "standard", "publish_intent": "none", "github_release_mirror": False}
+        env["GITHUB_EVENT_PATH"] = event
+        # Step environment values are ignored inside the workflow.
+        env.update({k: "ignored" for k in self.dispatch_env()})
+        for notes, extra, status in (("Bug fixes", {}, 0), ("Fix " + PRIVATE.title(), {}, 1),  # mixed case: no mask would cover it
+                                     ("Bug fixes", {"operator_" + "note": PRIVATE}, 1)):
+            with open(event, "w") as handle:
+                json.dump({"inputs": dict(inputs, release_notes=notes, **extra)}, handle)
+            result = self.run_gate(["scan", "--profile", "dispatch"], env=env)
+            self.assertEqual(result.returncode, status, (notes, extra, result.stderr))
+        os.remove(event)
+        self.assertEqual(self.run_gate(["scan", "--profile", "dispatch"], env=env).returncode, 3)
 
     def test_policy_rotation_between_stages_stops_the_next_scan(self):
         state = os.path.join(self.tmp, "state")

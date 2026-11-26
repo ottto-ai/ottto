@@ -139,6 +139,15 @@ if names[:4] != ["Checkout", "Load release privacy policy", "Check dispatch inpu
     print("The privacy policy load, then the dispatch input check, must come first after checkout",
           file=sys.stderr)
     sys.exit(1)
+# The runner prints a step's environment first: the dispatch check reads the
+# event file, and host-path variables are not in the job environment.
+if "inputs." in bodies["Check dispatch inputs for private strings"]:
+    print("The dispatch input check must not receive inputs through its environment", file=sys.stderr)
+    sys.exit(1)
+for name in ("OTTTO_MANUAL_SIGNING_KEYCHAIN", "OTTTO_STABLE_CANDIDATE_RC_EVIDENCE"):
+    if name in workflow.split("    steps:", 1)[0]:
+        print(f"{name} must reach only the step that reads it", file=sys.stderr)
+        sys.exit(1)
 # No input value in a policy message: the step's echo lines name no input variable.
 for line in bodies["Enforce dispatch policy"].splitlines():
     if "echo" in line and re.search(r"\$\{?(VERSION|CHANNEL|ARTIFACT_BASE_URL|RELEASE_NOTES|RELEASE_MODE|"

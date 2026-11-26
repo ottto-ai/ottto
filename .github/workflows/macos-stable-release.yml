@@ -79,8 +79,6 @@ jobs:
       OTTTO_RELEASE_REPOSITORY: ${{ github.repository }}
       OTTTO_RELEASE_SIGNER_WORKFLOW: .github/workflows/macos-stable-release.yml
       OTTTO_RELEASE_SOURCE_REF: ${{ github.ref }}
-      OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
-      OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
       # Release privacy gate (docs/release-verification.md). The policy is not
       # secret; the marker list secret goes only to the gate steps.
       OTTTO_RELEASE_PRIVACY_POLICY: ${{ vars.OTTTO_RELEASE_PRIVACY_POLICY }}
@@ -104,17 +102,12 @@ jobs:
         run: python3 -I scripts/macos_privacy_gate.py register-masks
 
       # Before any step can print an input value: every dispatch input is
-      # checked for private strings. Later messages name no input value.
+      # checked for private strings. The gate reads the inputs from the event
+      # file, because the runner prints a step's environment before its
+      # script runs. Later messages name no input value.
       - name: Check dispatch inputs for private strings
         env:
           OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
-          OTTTO_DISPATCH_VERSION: ${{ inputs.version }}
-          OTTTO_DISPATCH_CHANNEL: ${{ inputs.channel }}
-          OTTTO_DISPATCH_ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
-          OTTTO_DISPATCH_RELEASE_NOTES: ${{ inputs.release_notes }}
-          OTTTO_DISPATCH_RELEASE_MODE: ${{ inputs.release_mode }}
-          OTTTO_DISPATCH_OPERATOR_APPROVAL: ${{ inputs.operator_approval }}
-          OTTTO_DISPATCH_PUBLISH_INTENT: ${{ inputs.publish_intent }}
         run: python3 -I scripts/macos_privacy_gate.py scan --profile dispatch --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
 
       - name: Enforce dispatch policy
@@ -322,8 +315,12 @@ jobs:
             dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
           mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
 
+      # Host paths stay out of the job environment, which every step prints;
+      # they reach only the step that reads them, after the mask step.
       - name: Bind stable-candidate RC evidence
         if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
+        env:
+          OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
         run: |
           set -euo pipefail
           test -n "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
@@ -491,6 +488,8 @@ jobs:
 
       - name: Sign and verify release manifest from manual keychain
         if: inputs.release_mode == 'manual-no-sparkle'
+        env:
+          OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
         run: |
           set -euo pipefail
           test -n "$OTTTO_MANUAL_SIGNING_KEYCHAIN" || {

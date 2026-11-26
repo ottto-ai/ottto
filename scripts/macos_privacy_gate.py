@@ -381,10 +381,13 @@ def host_literals():
     add("runner", os.environ.get("RUNNER_NAME"))
     for var in ("GITHUB_WORKSPACE", "RUNNER_TEMP", "RUNNER_WORKSPACE", "RUNNER_TOOL_CACHE", "TMPDIR"):
         add("runner", os.environ.get(var), path=True)
+    # The full name keeps its own entry: another machine string with the same value stays an
+    # independent literal with no omissions.
     unique, seen = [], set()
     for marker in found:
-        if norm(marker.value) not in seen:
-            seen.add(norm(marker.value))
+        key = (norm(marker.value), marker.full_name)
+        if key not in seen:
+            seen.add(key)
             unique.append(marker)
     return unique
 
@@ -1354,7 +1357,7 @@ class Gate:
             self.detach(whole)
         if size != decoded_size:
             raise Incomplete("dmg_read_size")
-        mount = tempfile.mkdtemp(dir=self.scratch)
+        mount = os.path.realpath(tempfile.mkdtemp(dir=self.scratch))  # hdiutil reports the real path
         whole, volume, entities = self.attach(name, parent, ["-mountpoint", mount])
         try:
             mounted = [e for e in entities if "mount-point" in e]
@@ -1766,8 +1769,11 @@ def check_frozen(root, policy):
         if policy.mode == "enforce":
             raise Incomplete("freeze_unavailable")
         return
-    if not os.lstat(root).st_flags & stat.UF_IMMUTABLE:  # also a loose file, which os.walk skips
+    st = os.lstat(root)
+    if not st.st_flags & stat.UF_IMMUTABLE:  # also a loose file, which os.walk does not visit
         raise Incomplete("not_frozen")
+    if not stat.S_ISDIR(st.st_mode):
+        return
     for directory, dirs, files in os.walk(root, onerror=walk_error):
         for name in [directory] + [os.path.join(directory, n) for n in files + dirs]:
             if not os.lstat(name).st_flags & stat.UF_IMMUTABLE:
@@ -2091,15 +2097,38 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+DISPATCH_DEFAULTS = {"RELEASE_MODE": "standard", "OPERATOR_APPROVAL": "", "PUBLISH_INTENT": "none"}
+
+
+def dispatch_inputs():
+    """({NAME: value}, [(key, text) of every input]). Inside the release workflow the inputs come
+    from the dispatch event file, so no step environment has shown them before this check;
+    elsewhere from OTTTO_DISPATCH_<NAME> (a caller's check before it dispatches)."""
+    if not in_release_workflow():
+        values = {name: os.environ.get("OTTTO_DISPATCH_" + name, "") for name in DISPATCH_INPUTS}
+        return values, sorted(values.items())
+    path = os.environ.get("GITHUB_EVENT_PATH", "")
+    event = read_json_file(path) if path else None
+    inputs = event.get("inputs") if isinstance(event, dict) else None
+    if not isinstance(inputs, dict):
+        raise Incomplete("dispatch_event")
+    values = {name: inputs.get(name.lower(), DISPATCH_DEFAULTS.get(name)) for name in DISPATCH_INPUTS}
+    if not all(isinstance(v, str) for v in values.values()):
+        raise Incomplete("dispatch_event")
+    every = [(str(k), v if isinstance(v, str) else json.dumps(v)) for k, v in sorted(inputs.items())]
+    return values, every
+
+
 def scan_dispatch(gate):
-    """Workflow inputs (OTTTO_DISPATCH_<NAME>): every value searched; fixed shapes checked."""
-    values = {name: os.environ.get("OTTTO_DISPATCH_" + name, "") for name in DISPATCH_INPUTS}
-    for index, name in enumerate(DISPATCH_INPUTS):
-        rep = Representation("dispatch", ("dispatch", name))
-        gate.scan_bytes(values[name].encode("utf-8"), rep)
-        gate.scan_text(values[name], rep, index)
-        if "%" in values[name]:
-            gate.scan_text(url_decoded(values[name]), rep, index, "url")
+    """Workflow inputs: every input name and value searched; fixed shapes checked."""
+    values, every = dispatch_inputs()
+    for index, (key, value) in enumerate(every):
+        rep = Representation("dispatch", ("dispatch", key))
+        gate.scan_name(key, rep, 0)
+        gate.scan_bytes(value.encode("utf-8"), rep)
+        gate.scan_text(value, rep, index)
+        if "%" in value:
+            gate.scan_text(url_decoded(value), rep, index, "url")
     channel, version = values["CHANNEL"], values["VERSION"]
     if channel not in ("stable-candidate", "stable") or not re.fullmatch(r"[0-9]+(\.[0-9]+){1,3}(-rc[0-9]+)?", version) \
             or values["ARTIFACT_BASE_URL"] != "https://install.ottto.net/ottto-local-platform/releases/%s/%s" % (

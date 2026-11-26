@@ -343,7 +343,9 @@ workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
 `OTTTO_DISPATCH_ARTIFACT_BASE_URL`, `OTTTO_DISPATCH_RELEASE_NOTES`,
 `OTTTO_DISPATCH_RELEASE_MODE`, `OTTTO_DISPATCH_OPERATOR_APPROVAL` and
 `OTTTO_DISPATCH_PUBLISH_INTENT`, so a caller can check them before it
-dispatches; the artifact base URL must be exactly
+dispatches. Inside the release workflow it reads every input name and value
+from the dispatch event file (`GITHUB_EVENT_PATH`) instead, because the
+runner prints a step's environment before the step runs; the artifact base URL must be exactly
 `https://install.ottto.net/ottto-local-platform/releases/<channel>/<version>`. The policy comes from
 `OTTTO_RELEASE_PRIVACY_POLICY`; the markers from a file descriptor, a local
 store, or, only inside the release workflow, `OTTTO_PRIVACY_MARKERS`.
@@ -450,7 +452,11 @@ design and is scanned again at each later stage.
 ### Workflow output
 
 - The dispatch input check runs right after the policy step and before any
-  step that could print an input; policy messages name no input value. A
+  step that could print an input; it reads the inputs from the event file,
+  not its environment, and policy messages name no input value. Host-path
+  variables (`OTTTO_STABLE_CANDIDATE_RC_EVIDENCE`,
+  `OTTTO_MANUAL_SIGNING_KEYCHAIN`) are set only on the step that reads them,
+  not in the job environment every step prints. A
   caller that dispatches the workflow runs the same `dispatch` profile on the
   exact input values first.
 - `register-masks` also checks the secret-backed tool selectors before any
