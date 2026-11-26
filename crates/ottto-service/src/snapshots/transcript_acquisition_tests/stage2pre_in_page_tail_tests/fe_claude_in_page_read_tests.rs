@@ -1566,11 +1566,11 @@ fn fe_identity_incomplete_record_cannot_bind_recomposed_body() {
     }
 }
 
-/// Historical replay keeps only protected Codex history, so a Claude FE
-/// prefix entry is dropped with the rest: a replay reset cannot turn it into
-/// `None` or a clean identity, and the replayed file is read again whole.
+/// Historical replay keeps a Claude FE prefix entry: its sealed-prefix tag is
+/// file-owned recovery evidence, so a replay reset neither drops it nor turns
+/// it into `None` or a clean identity.
 #[test]
-fn fe_prefix_entry_is_dropped_by_replay_reset() {
+fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1580,8 +1580,16 @@ fn fe_prefix_entry_is_dropped_by_replay_reset() {
     grown
         .index
         .prepare_historical_replay("fe-prefix-replay".into());
-    assert!(
-        !grown.index.files.contains_key(&key),
-        "replay keeps no Claude prefix entry"
-    );
+    let entry = grown
+        .index
+        .files
+        .get(&key)
+        .expect("replay retains a prefix entry");
+    assert!(entry.has_prefix_provenance());
+    assert!(entry
+        .scan_identity_version
+        .as_deref()
+        .unwrap()
+        .ends_with(":p"));
+    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
 }

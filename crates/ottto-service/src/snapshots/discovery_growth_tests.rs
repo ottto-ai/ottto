@@ -541,30 +541,11 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             }
         }
     };
-    let usage = |items: &[SnapshotItem]| {
-        items
-            .iter()
-            .map(|item| {
-                (
-                    item.source_session_id.clone(),
-                    [
-                        item.input_tokens,
-                        item.output_tokens,
-                        item.cache_read_tokens,
-                        item.reasoning_output_tokens,
-                        item.request_count,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>()
-    };
     let bound = index.clone();
     let fragment_bytes = candidate.size_bytes - checkpoint.sealed_offset();
-    let mut first_pass = Vec::new();
-    let mut first_scan = None;
-    // The index right after the first re-read, while the entry still exists.
-    let mut known = None;
-    for pass in 0..2 {
+    // One reloaded pass; the later no-re-read pass is the idle page at the end,
+    // after the growth checks that need the entry and its stored Tail.
+    let first_scan = {
         let (next, scan, reads, rows) = f.page(source, index);
         let modes = reads.0.lock().unwrap().0.clone();
         let repeats = rows
@@ -572,51 +553,28 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
             .filter_map(|row| row["counts"].get("codex_fragment_tail_repeat"))
             .map(|repeat| (repeat["files"].clone(), repeat["bytes"].as_u64()))
             .collect::<Vec<_>>();
-        let emitted = usage(&scan.snapshots);
-        if pass == 0 {
-            // The first reloaded pass: one ordinary fragment-only Tail. It
-            // counts the complete record and records the full length.
+        // The first reloaded pass: one ordinary fragment-only Tail. It
+        // counts the complete record and records the full length.
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "the reloaded pass re-reads the fragment once"
+        );
+        assert_eq!(modes, vec![growth_mode()], "one read, never a Full");
+        if crate::heap_layout_bound::layout_supported() {
             assert_eq!(
-                scan.scanned_file_count, 1,
-                "the reloaded pass re-reads the fragment once"
+                repeats,
+                vec![(json!(1), Some(fragment_bytes))],
+                "one fragment-only Tail, byte-bounded to the fragment"
             );
-            assert_eq!(modes, vec![growth_mode()], "one read, never a Full");
-            if crate::heap_layout_bound::layout_supported() {
-                assert_eq!(
-                    repeats,
-                    vec![(json!(1), Some(fragment_bytes))],
-                    "one fragment-only Tail, byte-bounded to the fragment"
-                );
-            }
-            assert!(
-                !scan.snapshots.is_empty(),
-                "the complete unterminated record counts on the re-read"
-            );
-            assert_eq!(
-                next.files[&key].size_bytes, candidate.size_bytes,
-                "the ordinary re-read records the full length"
-            );
-            first_pass = emitted;
-            first_scan = Some(scan.clone());
-        } else {
-            // Later passes: the file is unchanged since that read, so nothing
-            // is re-read until it changes.
-            assert_eq!(scan.scanned_file_count, 0, "pass {pass}: no re-read");
-            assert!(modes.is_empty(), "pass {pass}: no read: {modes:?}");
-            assert!(repeats.is_empty(), "pass {pass}: no repeat: {repeats:?}");
-            assert!(scan.snapshots.is_empty(), "pass {pass}: no snapshot");
-            for (session, totals) in &emitted {
-                let first = first_pass
-                    .iter()
-                    .find(|(first, _)| first == session)
-                    .map(|(_, first)| first)
-                    .unwrap_or_else(|| panic!("pass {pass}: new usage for {session}"));
-                assert!(
-                    totals.iter().zip(first).all(|(now, first)| now <= first),
-                    "pass {pass}: no snapshot above the first re-read: {totals:?} > {first:?}"
-                );
-            }
         }
+        assert!(
+            !scan.snapshots.is_empty(),
+            "the complete unterminated record counts on the re-read"
+        );
+        assert_eq!(
+            next.files[&key].size_bytes, candidate.size_bytes,
+            "the ordinary re-read records the full length"
+        );
         if !scan.snapshots.is_empty() {
             let (cold_index, cold) = cold_full(&scan.snapshots[0].collected_at);
             sampled_scan::transition_fixture::money_oracle::assert_equivalent(
@@ -624,23 +582,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                 &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
             );
         }
-        if pass == 0 {
-            assert!(!next.files[&key].has_sampled_tag());
-            known = Some(next.clone());
-        } else {
-            // Unchanged and past the window, the file owes nothing: the walk
-            // does not observe it, and the clean generation's reconciliation
-            // prunes its entry, as for any aged file. Nothing re-reads it.
-            assert!(
-                !next.files.contains_key(&key),
-                "pass {pass}: the aged, untagged entry is pruned"
-            );
-        }
+        assert!(!next.files[&key].has_sampled_tag());
         index = next;
-    }
-    // The growth below is measured against the entry the first re-read left,
-    // as if the file had stayed inside the window.
-    let index = known.expect("the first re-read kept the entry");
+        Some(scan)
+    };
     // Metadata-only change: the certified prefix still names the observed EOF,
     // so ctime adoption must use that extent, not just the committed prefix.
     use std::os::unix::fs::PermissionsExt;
@@ -837,9 +782,16 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &sampled_scan::transition_fixture::scan_money(source, &cold_index, &cold),
         &sampled_scan::transition_fixture::scan_money(source, &caught, &emitted),
     );
-    let (_, idle, reads, _) = f.page(source, caught);
+    let (idle_index, idle, reads, _) = f.page(source, caught);
     assert!(idle.snapshots.is_empty(), "emitted once");
     assert!(reads.0.lock().unwrap().0.is_empty());
+    // Unchanged and past the window, the file owes nothing: the walk does not
+    // observe it, and the clean generation's reconciliation prunes its entry,
+    // as for any aged file. Nothing re-reads it.
+    assert!(
+        !idle_index.files.contains_key(&key),
+        "the aged, untagged entry is pruned"
+    );
 }
 
 /// One usage record (with the session header first) in each source's format.
