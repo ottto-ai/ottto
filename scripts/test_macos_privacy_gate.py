@@ -111,6 +111,28 @@ def cms(signer_count=1, trailing=b""):
     return der(0x30, der(0x06, bytes.fromhex("2a864886f70d010702")) + der(0xA0, signed)) + trailing
 
 
+class patched_env:
+    """Set (or with None, remove) environment variables for a block."""
+
+    def __init__(self, values):
+        self.values, self.saved = values, {}
+
+    def __enter__(self):
+        for key, value in self.values.items():
+            self.saved[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def __exit__(self, *_exc):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class PolicyAndMarkers(unittest.TestCase):
     def test_policy_canonical_digest_and_grammar(self):
         a = g.Policy(policy_text("b" * 64, advisory_xattrs=["provenance", "macl"]))
@@ -274,8 +296,8 @@ class Formats(unittest.TestCase):
 
     def scan_zip(self, data, *lines):
         gate = make_gate(*lines or (PRIVATE,))
-        gate.verified_bytes = lambda *_: True
-        gate.scan_binary_zip(None, "cli_zip", data)
+        gate.verified_bytes = lambda content, *_: [(0, len(content))]
+        gate.scan_binary_zip("cli_zip", data)
         return gate
 
     def test_zip_framing_and_members(self):
@@ -308,22 +330,216 @@ class Formats(unittest.TestCase):
         finally:
             g.MAX_FILE = saved
 
-    def test_app_zip_omits_signer_only_in_verified_source_tree(self):
+    def app_tree(self, payload=b"", helper=None):
         top = tempfile.mkdtemp(dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
         self.addCleanup(shutil.rmtree, top)
         app = os.path.join(top, "Ottto.app")
-        helper = os.path.join(app, "Contents", "Helpers", "ottto")
+        helper = helper or os.path.join(app, "Contents", "Helpers", "ottto")
         os.makedirs(os.path.dirname(helper))
         with open(helper, "wb") as handle:
-            handle.write(macho(payload=SIGNER.encode()))
+            handle.write(macho(payload=payload))
+        return top, app
+
+    def app_zip(self, app, entries=()):
+        """A ZIP of the tree with Unix modes, plus extra (name, mode, data) entries."""
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
-            archive.write(helper, "Ottto.app/Contents/Helpers/ottto")
+            for directory, dirs, files in os.walk(app):
+                for name in sorted(dirs) + sorted(files):
+                    full = os.path.join(directory, name)
+                    rel = "Ottto.app/" + os.path.relpath(full, app) + ("/" if name in dirs else "")
+                    info = zipfile.ZipInfo(rel, (2026, 1, 1, 0, 0, 0))
+                    info.create_system = 3
+                    info.external_attr = os.lstat(full).st_mode << 16
+                    archive.writestr(info, b"" if name in dirs else read_bytes(full))
+            for name, mode, data in entries:
+                info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.external_attr = mode << 16
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, data)
+        return buffer.getvalue()
+
+    def scan_app_zip(self, data, app, verified=True, lines=("owner+signer:" + SIGNER,)):
+        gate = make_gate(*lines)
+        gate.verified_signature = lambda *_args, _v=verified, **_kw: _v
+        work = tempfile.mkdtemp(dir=gate.scratch)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:  # a stand-in for ditto -x off macOS
+            for info in archive.infolist():
+                if not info.filename.endswith("/"):
+                    target = os.path.join(work, info.filename)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "wb") as handle:
+                        handle.write(archive.read(info))
+                    os.chmod(target, (info.external_attr >> 16) & 0o777)
+        gate.extract_app_zip = lambda _path: os.path.join(work, "Ottto.app")
+        gate.scan_app_zip(None, data, "app_zip", app)
+        return gate
+
+    def test_app_zip_omits_signer_only_in_verified_tree(self):
+        _top, app = self.app_tree(payload=SIGNER.encode())
+        data = self.app_zip(app)
         for verified, expected in ((True, set()), (False, {"owner+signer"})):
-            gate = make_gate("owner+signer:" + SIGNER)
-            gate.verified_signature = lambda *_args, _v=verified, **_kw: _v
-            gate.scan_app_zip(buffer.getvalue(), "app_zip", app)
+            gate = self.scan_app_zip(data, app, verified)
             self.assertEqual(set(gate.findings), expected, gate.diagnostics)
+
+    def test_app_zip_directory_members_are_empty_typed_and_moded(self):
+        _top, app = self.app_tree()
+        clean = self.scan_app_zip(self.app_zip(app), app)
+        self.assertEqual(clean.findings, {}, clean.diagnostics)
+        hidden = PRIVATE.encode() * 50
+        cases = (("Ottto.app/Contents/Extra/", 0o040755, hidden, "zip_directory"),   # payload in a directory
+                 ("Ottto.app/Contents/Helpers/", 0o040700, b"", "zip_directory"),    # mode differs
+                 ("Ottto.app/Contents/Other/", 0o100644, b"", "zip_member_type"),    # slash name, file type
+                 ("Ottto.app/Contents/Plain", 0o040755, b"", "zip_member_type"))     # directory type, no slash
+        for name, mode, data, code in cases:
+            gate = self.scan_app_zip(self.app_zip(app, ((name, mode, data),)), app, lines=(PRIVATE,))
+            self.assertIn(("app_zip", "structure", code), gate.diagnostics, name)
+        gate = self.scan_app_zip(self.app_zip(app, (("Ottto.app/Contents/Extra/", 0o040755, hidden),)), app,
+                                 lines=(PRIVATE,))
+        self.assertIn("private", gate.findings)
+
+    def test_app_zip_extracted_tree_must_match(self):
+        _top, app = self.app_tree()
+        data = self.app_zip(app)
+        gate = make_gate()
+        gate.verified_signature = lambda *_a, **_k: True
+        other = os.path.join(tempfile.mkdtemp(dir=gate.scratch), "Ottto.app")
+        os.makedirs(os.path.join(other, "Contents", "Helpers"))
+        with open(os.path.join(other, "Contents", "Helpers", "ottto"), "wb") as handle:
+            handle.write(macho(payload=b"different"))
+        gate.extract_app_zip = lambda _path: other
+        gate.scan_app_zip(None, data, "app_zip", app)
+        self.assertIn(("app_zip", "structure", "zip_extracted"), gate.diagnostics)
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/ditto"), "native ditto")
+    def test_real_ditto_app_zip_is_accepted(self):
+        top, app = self.app_tree(payload=SIGNER.encode())
+        zip_path = os.path.join(top, "ottto-app-notary.zip")
+        subprocess.run(["/usr/bin/ditto", "-c", "-k", "--keepParent", "--norsrc", "--noextattr", app, zip_path],
+                       check=True)
+        gate = make_gate("owner+signer:" + SIGNER)
+        gate.verified_signature = lambda *_a, **_k: True
+        gate.scan_app_zip(zip_path, read_bytes(zip_path), "app_zip", app)
+        self.assertEqual((gate.findings, gate.incomplete), ({}, 0), gate.diagnostics)
+
+    def test_signer_omission_only_in_each_verified_slice(self):
+        arm, intel = macho(payload=SIGNER.encode()), macho(cpu=g.CPU_X86_64, payload=SIGNER.encode())
+        data = bytearray(fat([(g.CPU_ARM64, arm), (g.CPU_X86_64, intel)]))
+        slices = g.macho_slices(bytes(data))
+        padding = slices[0][1] + slices[0][2]  # fat padding after the first slice
+        data[padding:padding + len(SIGNER)] = SIGNER.encode()
+        data = bytes(data)
+        for failing, expected in ((None, 1), ("x86_64", 3)):
+            gate = make_gate("owner+signer:" + SIGNER)
+            calls = []
+
+            def verify(_path, _role, deep=False, arch=None, _failing=failing):
+                calls.append(arch)
+                return arch != _failing
+
+            gate.verified_signature = verify
+            intervals = gate.verified_intervals("unused", "r", data)
+            self.assertEqual(calls, ["arm64", "x86_64"][:len(calls)])
+            gate.scan_bytes(data, g.Representation("r", "k", intervals=[(lo, hi, True, False) for lo, hi in intervals]))
+            # The padding copy always blocks; a failing slice drops every omission.
+            self.assertEqual(gate.findings, {"owner+signer": expected}, failing)
+        duplicate = fat([(g.CPU_ARM64, macho()), (g.CPU_ARM64, macho(uuid=b"\x33" * 16))])
+        with self.assertRaisesRegex(g.Incomplete, "macho_fat_duplicate"):
+            g.macho_slices(duplicate)
+
+    def test_binary_property_lists_are_decoded_by_format(self):
+        rel = "Contents/Frameworks/Sparkle.framework/Versions/B/Resources/en.lproj/Sparkle.strings"
+        # Found only after decoding: the binary plist stores this as UTF-16BE with a sharp s.
+        data = plistlib.dumps({"Title": "STRA\u00dfE EXAMPLE"}, fmt=plistlib.FMT_BINARY)
+        gate = make_gate("strasse example")
+        gate.scan_bytes(data, rep())
+        self.assertEqual(gate.findings, {})
+        gate.scan_member(rel, data, "r", "k", None)
+        self.assertEqual(gate.findings, {"private": 1})
+        with self.assertRaisesRegex(g.Incomplete, "plist_parse"):
+            make_gate().scan_member(rel, data[:-12], "r", "k", None)
+
+    def test_json_numbers_cover_reserialized_forms(self):
+        gate = make_gate("12345000")
+        gate.scan_json(b'{"bom": {"version": 1.2345e7}}', rep())
+        self.assertEqual(gate.findings, {"private": 1})
+        self.assertIn("10000000000000000000000", g.number_forms(1e22))
+        with self.assertRaisesRegex(g.Incomplete, "json_number"):
+            g.number_forms(10 ** 400)
+
+    def test_dmg_topology_and_profile(self):
+        entities = [{"content-hint": "GUID_partition_scheme", "dev-entry": "/dev/disk4"},
+                    {"content-hint": "Apple_APFS", "dev-entry": "/dev/disk4s1"},
+                    {"content-hint": g.APFS_CONTAINER_HINT, "dev-entry": "/dev/disk5"},
+                    {"content-hint": "41504653-0000-11AA-AA11-00306543ECAC", "dev-entry": "/dev/disk5s1",
+                     "volume-kind": "apfs"}]
+        self.assertEqual(g.dmg_topology(entities), ("/dev/disk4", "/dev/disk5s1"))
+        for broken in (entities[:3], entities + [{"dev-entry": "/dev/disk6"}],
+                       [dict(entities[0], **{"content-hint": "FDisk_partition_scheme"})] + entities[1:],
+                       entities[:3] + [dict(entities[3], **{"dev-entry": "/dev/disk7s1"})]):
+            with self.assertRaisesRegex(g.Incomplete, "dmg_topology"):
+                g.dmg_topology(broken)
+        info = {"Format": "UDZO", "Segments": ["one"], "Properties": {"Encrypted": False, "Compressed": True},
+                "Size Information": {"Sector Count": 100, "Total Bytes": 51200},
+                "partitions": {"partition-scheme": "GUID", "block-size": 512, "partitions": [
+                    {"partition-hint": "MBR", "partition-synthesized": True},
+                    {"partition-hint": "Apple_APFS", "partition-filesystems": {"APFS": "Name"}}]}}
+        for change, expected in (({}, {}), ({"Format": "UDRW"}, {"structure": 1}),
+                                 ({"Segments": ["one", "two"]}, {"structure": 1})):
+            gate = make_gate()
+            output = argparse.Namespace(returncode=0, stdout=plistlib.dumps(dict(info, **change)), stderr=b"")
+            saved, g.run_tool = g.run_tool, lambda *_a, **_k: output
+            try:
+                self.assertEqual(gate.dmg_profile("x.dmg", "/", "app_dmg"), 51200)
+            finally:
+                g.run_tool = saved
+            self.assertEqual(gate.findings, expected)
+        missing = argparse.Namespace(returncode=0, stdout=plistlib.dumps({"Format": "UDZO"}), stderr=b"")
+        saved, g.run_tool = g.run_tool, lambda *_a, **_k: missing
+        try:
+            with self.assertRaisesRegex(g.Incomplete, "dmg_imageinfo"):
+                make_gate().dmg_profile("x.dmg", "/", "app_dmg")
+        finally:
+            g.run_tool = saved
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/hdiutil"), "native hdiutil")
+    def test_native_dmg_profile_topology_and_read(self):
+        top = tempfile.mkdtemp(dir="/private/tmp")
+        self.addCleanup(g.remove_tree, top)
+        source = os.path.join(top, "src")
+        helper = os.path.join(source, "Ottto.app", "Contents", "Helpers", "ottto")
+        os.makedirs(os.path.dirname(helper))
+        with open(helper, "wb") as handle:
+            handle.write(macho())
+        os.symlink("/Applications", os.path.join(source, "Applications"))
+
+        def image(name, filesystem):
+            path = os.path.join(top, name)
+            subprocess.run(["/usr/bin/hdiutil", "create", "-quiet", "-fs", filesystem, "-format", "UDZO",
+                            "-srcfolder", source, "-volname", "Synthetic", path], check=True)
+            return path
+
+        apfs = image("apfs.dmg", "APFS")
+        gate = make_gate(PRIVATE)
+        gate.verified_signature = lambda *_a, **_k: False
+        gate.scan_dmg(apfs, "app_dmg")
+        self.assertEqual(gate.incomplete, 0, gate.diagnostics)
+        codes = {code for (_role, cls, code) in gate.diagnostics if cls == "structure"}
+        self.assertNotIn("dmg_profile", codes)
+        self.assertNotIn("dmg_root", codes)
+        # A decoded disk shorter or longer than the image metadata says is incomplete.
+        gate = make_gate(PRIVATE)
+        gate.verified_signature = lambda *_a, **_k: False
+        gate.dmg_profile = lambda *_a: 512
+        with self.assertRaisesRegex(g.Incomplete, "dmg_read_size"):
+            gate.scan_dmg(apfs, "app_dmg")
+        # Another filesystem profile is refused and never mounted.
+        gate = make_gate(PRIVATE)
+        gate.verified_signature = lambda *_a, **_k: False
+        with self.assertRaisesRegex(g.Incomplete, "dmg_topology"):
+            gate.scan_dmg(image("hfs.dmg", "HFS+"), "app_dmg")
+        self.assertIn(("app_dmg", "structure", "dmg_profile"), gate.diagnostics)
 
     def test_cms_structure(self):
         self.assertEqual(g.cms_signer_certificate(cms()), certificate(b"\x08", ISSUER))
@@ -335,18 +551,16 @@ class Formats(unittest.TestCase):
 class ReceiptAndContract(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
-        self.addCleanup(shutil.rmtree, self.tmp)
+        self.addCleanup(g.remove_tree, self.tmp)
 
-    def state(self, gate, digest, lane, verdicts=None):
-        state = os.path.join(self.tmp, "state-" + lane)
+    def state(self, gate, digest, lane, verdicts=None, rows=None, name=None):
+        state = os.path.join(self.tmp, name or "state-" + lane)
         os.mkdir(state)
-        records = [("dispatch", [])] + [("unsigned", ["app_bundle"])] + [("notary", [r]) for r in g.NOTARY_ROLES]
-        if lane != "manual":
-            records += [("attest", ["app_dmg"]), ("attest", ["app_dmg"])]
-        for index, (profile, roles) in enumerate(records):
-            record = {"profile": profile, "roles": roles, "verdict": (verdicts or {}).get(index, "clean"),
-                      "policy_sha256": gate.policy.sha256, "markers_sha256": digest}
-            with open(os.path.join(state, "stage-%02d-%s.json" % (index, profile)), "w") as handle:
+        for stage in g.lane_stages(lane)[:-1]:
+            record = {"stage": stage, "verdict": (verdicts or {}).get(stage, "clean"),
+                      "policy_sha256": gate.policy.sha256, "markers_sha256": digest,
+                      "rows": (rows or {}).get(stage, [])}
+            with open(g.stage_path(state, stage), "w") as handle:
                 json.dump(record, handle)
         return state
 
@@ -363,40 +577,90 @@ class ReceiptAndContract(unittest.TestCase):
                 handle)
         environment = {"OTTTO_MACOS_APP_SOURCE_COMMIT": "b" * 40, "GITHUB_SHA": "c" * 40,
                        "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "2"}
-        saved = {k: os.environ.get(k) for k in environment}
-        os.environ.update(environment)
-        try:
+        with patched_env(environment):
             receipt = g.make_receipt(args, gate, [], self.tmp)
-        finally:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
         self.assertEqual((receipt["run_id"], receipt["run_attempt"], receipt["lane"]), (123456, 2, args.lane))
         self.assertEqual(set(receipt["stages"].values()), {"clean"})
         self.assertIn("notary:app_notary_zip", receipt["stages"])
 
-    def test_receipt_refuses_missing_blocked_or_foreign_stages(self):
+    def test_receipt_refuses_missing_blocked_foreign_or_rotated_stages(self):
         gate = make_gate(PRIVATE)
         digest = gate.policy.markers_sha256
-        state = self.state(gate, digest, "stable")
-        os.remove(os.path.join(state, "stage-07-attest.json"))
-        cases = [argparse.Namespace(state=state, lane="stable", markers_digest=digest),
-                 argparse.Namespace(state=self.state(gate, digest, "candidate", {2: "blocked"}), lane="candidate",
-                                    markers_digest=digest),
-                 argparse.Namespace(state=self.state(gate, digest, "manual"), lane="manual",
+        missing = self.state(gate, digest, "stable")
+        os.remove(g.stage_path(missing, "attest-2"))
+        foreign = self.state(gate, digest, "manual")
+        shutil.copy(g.stage_path(missing, "attest-1"), g.stage_path(foreign, "attest-1"))
+        cases = [argparse.Namespace(state=missing, lane="stable", markers_digest=digest),
+                 argparse.Namespace(state=self.state(gate, digest, "candidate", {"notary:app_dmg": "blocked"}),
+                                    lane="candidate", markers_digest=digest),
+                 argparse.Namespace(state=foreign, lane="manual", markers_digest=digest),
+                 argparse.Namespace(state=self.state(gate, digest, "stable", name="rotated"), lane="stable",
                                     markers_digest="d" * 64)]
         for args in cases:
             with self.assertRaisesRegex(g.Incomplete, "receipt_stages"):
                 g.recorded_stages(args, gate)
 
-    def test_host_alias_of_listed_literal_keeps_listed_class(self):
+    def test_boundaries_bind_the_same_bytes(self):
+        gate = make_gate(PRIVATE)
+        digest = gate.policy.markers_sha256
+
+        def rows(**changed):
+            return [{"role": r, "path": g.ROLE_FILES[r], "size": 1, "sha256": changed.get(r, "a" * 64)}
+                    for r in g.checksum_subjects("stable") + ("checksums",)]
+
+        earlier = {"notary:cli_zip": rows(), "notary:service_zip": rows(), "attest-1": rows(), "attest-2": rows()}
+        state = self.state(gate, digest, "stable", rows=earlier)
+        args = argparse.Namespace(state=state, lane="stable", markers_digest=digest)
+        g.check_bindings(args, gate, "attest-1", rows())
+        # The binder changes the manifest and checksums between the two attestations; nothing else.
+        g.check_bindings(args, gate, "attest-2", rows(manifest="b" * 64, checksums="b" * 64))
+        g.check_bindings(args, gate, "upload", rows())
+        self.assertEqual(gate.verdict(), "clean")
+        # A subject replaced after the first attestation, with checksums refreshed to match.
+        for stage, changed in (("attest-2", {"cli_zip": "c" * 64, "checksums": "c" * 64}),
+                               ("attest-1", {"service_zip": "c" * 64}),
+                               ("upload", {"sbom": "c" * 64, "checksums": "c" * 64}),
+                               ("upload", {"checksums": "c" * 64})):
+            probe = make_gate(PRIVATE)
+            g.check_bindings(args, probe, stage, rows(**changed))
+            self.assertEqual(probe.verdict(), "blocked", stage)
+            self.assertIn((stage, "structure", "binding_changed"), probe.diagnostics)
+        manual = self.state(gate, digest, "manual", rows=earlier)
+        probe = make_gate(PRIVATE)
+        g.check_bindings(argparse.Namespace(state=manual, lane="manual", markers_digest=digest), probe, "upload",
+                         rows(cli_zip="c" * 64))
+        self.assertEqual(probe.verdict(), "blocked")
+        os.remove(g.stage_path(state, "attest-1"))
+        with self.assertRaisesRegex(g.Incomplete, "binding_missing"):
+            g.check_bindings(args, make_gate(PRIVATE), "attest-2", rows())
+
+    def test_baseline_pins_the_attempt(self):
+        gate = make_gate(PRIVATE)
+        digest = gate.policy.markers_sha256
+        state = os.path.join(self.tmp, "state")
+        attempt = {"GITHUB_RUN_ID": "77", "GITHUB_RUN_ATTEMPT": "1", "OTTTO_RELEASE_LANE": "stable"}
+        with patched_env(attempt):
+            g.write_baseline(state, gate.policy, digest)
+            g.check_baseline(state, gate.policy, digest, "stable")
+            for policy, markers, lane in ((gate.policy, "d" * 64, None), (gate.policy, digest, "candidate"),
+                                          (g.Policy(policy_text(digest, advisory_xattrs=["macl"])), digest, None)):
+                with self.assertRaisesRegex(g.GateError, "baseline_mismatch"):
+                    g.check_baseline(state, policy, markers, lane)
+        with patched_env(dict(attempt, GITHUB_RUN_ATTEMPT="2")):
+            with self.assertRaisesRegex(g.GateError, "baseline_mismatch"):
+                g.check_baseline(state, gate.policy, digest)
+        enforce = g.Policy(policy_text(digest, mode="enforce"))
+        with self.assertRaisesRegex(g.GateError, "baseline_missing"):
+            g.check_baseline(os.path.join(self.tmp, "none"), enforce, digest)
+
+    def test_only_the_full_name_alias_takes_a_listed_tag(self):
         saved = g.host_literals
         sharp = "Stra\u00dfe Example"
-        listed, _ = g.parse_markers(store("owner+signer:" + SIGNER, "STRASSE EXAMPLE"))
-        g.host_literals = lambda: [g.Marker(SIGNER, "user"), g.Marker(SIGNER.upper(), "user"),
-                                   g.Marker(sharp, "user"), g.Marker("synthetic-account", "user")]
+        listed, digest = g.parse_markers(store("owner+signer:" + SIGNER, "STRASSE EXAMPLE"))
+        g.host_literals = lambda: [g.Marker(SIGNER, "user", full_name=True),
+                                   g.Marker(SIGNER.upper(), "user", full_name=True),
+                                   g.Marker(sharp, "user", full_name=True), g.Marker("synthetic-account", "user"),
+                                   g.Marker(SIGNER.lower(), "host")]
         try:
             combined = g.with_host_literals(listed)
         finally:
@@ -404,11 +668,82 @@ class ReceiptAndContract(unittest.TestCase):
         self.assertEqual([(m.value, m.cls, m.owner, m.signer) for m in combined],
                          [(SIGNER, "owner+signer", True, True), ("STRASSE EXAMPLE", "private", False, False),
                           (SIGNER.upper(), "owner+signer", True, True), (sharp, "private", False, False),
-                          ("synthetic-account", "user", False, False)])
-        # The host spelling is still found in raw bytes, which casefold patterns of the listed form miss.
-        gate = g.Gate(g.Policy(policy_text(_)), combined, "test")
+                          ("synthetic-account", "user", False, False), (SIGNER.lower(), "host", False, False)])
+        # The full-name spelling is still found in raw bytes, which casefold patterns of the listed form miss.
+        gate = g.Gate(g.Policy(policy_text(digest)), combined, "test")
         gate.scan_bytes(sharp.encode("utf-8"), rep(signed=True))
         self.assertEqual(gate.findings, {"private": 1})
+        # A host name equal to the signer literal is its own class and blocks in signed bytes.
+        gate = g.Gate(g.Policy(policy_text(digest)), combined, "test")
+        gate.scan_bytes(SIGNER.encode("utf-8"), rep(signed=True))
+        self.assertEqual(gate.findings, {"host": 1})
+
+    def host_strings(self, name, full_name, home="/" + "Us" + "ers/synthetic-home"):
+        """host_literals() for a synthetic account on a machine with no host names set."""
+        saved = (g.pwd.getpwuid, g.socket.gethostname, g.run_tool)
+        entry = argparse.Namespace(pw_name=name, pw_gecos=full_name + ",,,", pw_dir=home)
+        no_value = argparse.Namespace(returncode=1, stdout=b"", stderr=b"not set")
+        g.pwd.getpwuid = lambda _uid: entry
+        g.socket.gethostname = lambda: "localhost"
+        g.run_tool = lambda *_a, **_k: no_value
+        try:
+            with patched_env({"USER": name, "LOGNAME": name, "HOME": home, "RUNNER_NAME": None,
+                              "GITHUB_WORKSPACE": None, "RUNNER_TEMP": None, "RUNNER_WORKSPACE": None,
+                              "RUNNER_TOOL_CACHE": None, "TMPDIR": None}):
+                return g.host_literals()
+        finally:
+            g.pwd.getpwuid, g.socket.gethostname, g.run_tool = saved
+
+    def test_neutral_release_account_names_are_not_markers(self):
+        # The installer text the stable lane generates (the generator's heredoc body).
+        generator = read_bytes(os.path.join(HERE, "hosted_native_installer.sh"))
+        installer = generator.split(b"<<'INSTALLER'\n", 1)[1].split(b"\nINSTALLER\n", 1)[0]
+        self.assertIn(g.NEUTRAL_RELEASE_ACCOUNT[1].lower().encode(), installer.lower())  # the collision
+        listed, digest = g.parse_markers(store(PRIVATE, OWNER))
+        neutral = self.host_strings(*g.NEUTRAL_RELEASE_ACCOUNT)
+        self.assertNotIn(g.NEUTRAL_RELEASE_ACCOUNT[0], [m.value for m in neutral])
+        self.assertNotIn(g.NEUTRAL_RELEASE_ACCOUNT[1], [m.value for m in neutral])
+        gate = g.Gate(g.Policy(policy_text(digest)), listed + neutral, "test")
+        gate.scan_plain_text(installer, g.Representation("installer", "installer"))
+        self.assertEqual(gate.findings, {})
+        # Another account with the same full name keeps it as a marker, and so would hold.
+        other = self.host_strings("synthetic-operator", g.NEUTRAL_RELEASE_ACCOUNT[1])
+        gate = g.Gate(g.Policy(policy_text(digest)), listed + other, "test")
+        gate.scan_plain_text(installer, g.Representation("installer", "installer"))
+        self.assertIn("user", gate.findings)
+        # The neutral account with a personal full name keeps that name as a marker.
+        personal = self.host_strings(g.NEUTRAL_RELEASE_ACCOUNT[0], "Qwvz Personal Person")
+        self.assertIn("Qwvz Personal Person", [m.value for m in personal])
+        # On the neutral account, a personal name from the list in personal-data context still blocks,
+        # and so does the account's own home path.
+        text = installer + ("\n# maintainer: %s <%s>\n" % (OWNER, "/" + "Us" + "ers/synthetic-home/x")).encode()
+        gate = g.Gate(g.Policy(policy_text(digest)), listed + neutral, "test")
+        gate.scan_plain_text(text, g.Representation("installer", "installer"))
+        self.assertEqual(set(gate.findings), {"private", "user", "path"})
+
+    def test_seal_takes_single_regular_files_only(self):
+        policy = g.Policy(policy_text("b" * 64))
+        for kind in ("fifo", "hard_link", "symlink"):
+            source = tempfile.mkdtemp(dir=self.tmp)
+            os.chmod(source, 0o700)
+            target = os.path.join(source, g.ROLE_FILES["sbom"])
+            if kind == "fifo":
+                os.mkfifo(target)
+            else:
+                other = os.path.join(source, "other")
+                with open(other, "w") as handle:
+                    handle.write("{}")
+                (os.link if kind == "hard_link" else os.symlink)(other, target)
+            with self.assertRaisesRegex(g.Incomplete, "seal_source"):
+                g.seal(source, os.path.join(source, "sealed"), {"sbom"})
+        loose = os.path.join(self.tmp, "loose")
+        with open(loose, "w") as handle:
+            handle.write("x")
+        if hasattr(os, "chflags"):
+            with self.assertRaisesRegex(g.Incomplete, "not_frozen"):
+                g.check_frozen(loose, policy)
+            g.freeze(loose, policy)
+            g.check_frozen(loose, policy)
 
     def test_legal_bytes_from_exported_tree(self):
         export = os.path.join(self.tmp, "export")
@@ -441,7 +776,7 @@ class CommandLine(unittest.TestCase):
     def tearDown(self):
         g.remove_tree(self.tmp)
 
-    def run_gate(self, args, lines=(PRIVATE,), env=None, **extra):
+    def run_gate(self, args, lines=(PRIVATE,), env=None, machine_name=None, **extra):
         data = store(*lines)
         digest = g.parse_markers(data)[1]
         environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.tmp,
@@ -450,11 +785,19 @@ class CommandLine(unittest.TestCase):
         read, write = os.pipe()
         os.write(write, data)
         os.close(write)
+        fds = [read]
         command = [sys.executable, "-I", GATE] + args
         if args[0] == "scan":
             command += ["--markers-fd", str(read), "--host-literals", "off", "--scratch", self.tmp]
-        result = subprocess.run(command, env=environment, pass_fds=(read,), capture_output=True)
-        os.close(read)
+        if machine_name is not None:
+            name_read, name_write = os.pipe()
+            os.write(name_write, machine_name.encode())
+            os.close(name_write)
+            fds.append(name_read)
+            command += ["--machine-name-fd", str(name_read)]
+        result = subprocess.run(command, env=environment, pass_fds=tuple(fds), capture_output=True)
+        for fd in fds:
+            os.close(fd)
         for stream in (result.stdout, result.stderr):
             for line in lines:
                 self.assertNotIn(line.split(":", 1)[-1].encode(), stream)
@@ -485,26 +828,57 @@ class CommandLine(unittest.TestCase):
         result = self.run_gate(["register-masks"], env={g.MARKERS_ENV: store(PRIVATE).decode()})
         self.assertEqual(result.returncode, 2)
 
-    def test_logs_machine_name_line(self):
-        os.mkdir(os.path.join(self.tmp, "logs"))
-        with open(os.path.join(self.tmp, "logs", "job.txt"), "w") as handle:
-            handle.write("2026-01-01T00:00:00Z Machine name: 'synthetic-host'\n2026-01-01T00:00:01Z done\n")
-        args = ["scan", "--profile", "logs", "--root", os.path.join(self.tmp, "logs")]
-        self.assertEqual(self.run_gate(args, lines=("synthetic-host",)).returncode, 1)
-        result = self.run_gate(args, lines=("synthetic-host",), accept_runner_machine_name_line=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        with open(os.path.join(self.tmp, "logs", "job.txt"), "a") as handle:
-            handle.write("later synthetic-host\n")
-        self.assertEqual(self.run_gate(args, lines=("synthetic-host",),
-                                       accept_runner_machine_name_line=True).returncode, 1)
+    def write_logs(self, *texts):
+        folder = tempfile.mkdtemp(prefix="logs.", dir=self.tmp)
+        for index, text in enumerate(texts):
+            with open(os.path.join(folder, "job%d.txt" % index), "w") as handle:
+                handle.write(text)
+        return ["scan", "--profile", "logs", "--root", folder]
 
-    def test_register_masks_in_release_workflow(self):
+    def test_logs_machine_name_field(self):
+        host = "synthetic-host"
+        setup = "2026-01-01T00:00:00Z Machine name: '%s'\n" % host
+        later = "2026-01-01T00:00:02Z ##[group]Run actions/checkout\n2026-01-01T00:00:03Z done\n"
+        tabbed = "Build\tSet up job\t2026-01-01T00:00:00.1234567Z Machine name: '%s'\n" % host
+        cases = [
+            # (log files, machine name fd value, accept switch, exit status)
+            ((setup + later,), None, False, 1),        # the name blocks by default
+            ((setup + later,), host, True, 0),         # accepted: switch on and the admitted name
+            ((tabbed + "Build\tRun\tok\n",), host, True, 0),
+            ((setup + later,), "other-host", True, 1),  # not the admitted name
+            ((setup.replace(host, "neutral-name") + later,), "other-host", False, 1),  # unexpected metadata
+            ((setup.replace(host, "neutral-name") + later,), "neutral-name", False, 0),
+            ((setup + setup + later,), host, True, 1),  # duplicate field
+            ((later + setup,), host, True, 1),          # misplaced: after the first step started
+            ((setup + later + "later " + host + "\n",), host, True, 1),  # the name elsewhere
+            ((tabbed.replace("Build", "Build " + PRIVATE) + "Build\tRun\tok\n",), host, True, 1),  # same line
+        ]
+        for texts, name, accept, status in cases:
+            result = self.run_gate(self.write_logs(*texts), lines=(PRIVATE, host), machine_name=name,
+                                   accept_runner_machine_name_line=accept)
+            self.assertEqual(result.returncode, status, (texts, name, accept, result.stderr))
+        # The switch needs the admitted name; empty input is incomplete.
+        self.assertEqual(self.run_gate(self.write_logs(setup), lines=(host,),
+                                       accept_runner_machine_name_line=True).returncode, 2)
+        self.assertEqual(self.run_gate(self.write_logs(), lines=(host,)).returncode, 3)
+        self.assertEqual(self.run_gate(self.write_logs(""), lines=(host,)).returncode, 3)
+
+    def release_env(self, **extra):
         env_file = os.path.join(self.tmp, "github_env")
         open(env_file, "w").close()
         env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "RUNNER_TEMP": self.tmp,
                "GITHUB_WORKFLOW_REF": "owner/repo/" + g.WORKFLOW + "@refs/tags/v1.2.3", "GITHUB_ENV": env_file,
-               g.MARKERS_ENV: store("per%cent value").decode()}
-        result = self.run_gate(["register-masks"], lines=("per%cent value",), env=env, mode="enforce")
+               "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1", "OTTTO_RELEASE_LANE": "candidate",
+               "OTTTO_NOTARY_PROFILE": "release-notary",
+               "OTTTO_MACOS_CODESIGN_IDENTITY": "Developer ID Application: %s (ABCDE12345)" % SIGNER}
+        env.update(extra)
+        return env, env_file
+
+    def test_register_masks_in_release_workflow(self):
+        env, env_file = self.release_env()
+        env[g.MARKERS_ENV] = store("per%cent value", "owner+signer:" + SIGNER).decode()
+        result = self.run_gate(["register-masks"], lines=("per%cent value", "owner+signer:" + SIGNER), env=env,
+                               mode="enforce")
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.decode().splitlines()
         self.assertTrue(lines and all(line.startswith("::add-mask::") for line in lines))
@@ -512,7 +886,40 @@ class CommandLine(unittest.TestCase):
         self.assertNotIn(ID_LINE[3:].encode(), result.stdout)
         work = read_bytes(env_file).decode().strip().split("=", 1)[1]
         self.assertTrue(os.path.isdir(work))
-        os.rmdir(work)
+        self.addCleanup(g.remove_tree, work)
+        baseline = json.loads(read_bytes(os.path.join(work, "state", "baseline.json")))
+        self.assertEqual((baseline["run_id"], baseline["run_attempt"], baseline["lane"]), (4242, 1, "candidate"))
+
+    def test_register_masks_checks_selectors(self):
+        lines = (PRIVATE, "owner+signer:" + SIGNER)
+        for extra in ({"OTTTO_NOTARY_PROFILE": "profile with space"}, {"OTTTO_NOTARY_PROFILE": PRIVATE},
+                      {"OTTTO_MACOS_CODESIGN_IDENTITY": "Apple Development: x (ABCDE12345)"},
+                      {"OTTTO_MACOS_CODESIGN_IDENTITY": "Developer ID Application: %s (ABCDE12345)" % PRIVATE}):
+            env, env_file = self.release_env(**extra)
+            env[g.MARKERS_ENV] = store(*lines).decode()
+            result = self.run_gate(["register-masks"], lines=lines, env=env, mode="enforce")
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertIn(b"code=selector_", result.stderr)
+            self.assertEqual(read_bytes(env_file), b"")
+
+    def test_policy_rotation_between_stages_stops_the_next_scan(self):
+        state = os.path.join(self.tmp, "state")
+        attempt = {"GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1", "OTTTO_RELEASE_LANE": "candidate"}
+        markers, digest = g.parse_markers(store(PRIVATE))
+        with patched_env(attempt):
+            g.write_baseline(state, g.Policy(policy_text(digest)), digest)
+        args = ["scan", "--profile", "dispatch", "--state", state]
+        env = dict(self.dispatch_env(), **attempt)
+        self.assertEqual(self.run_gate(args, env=env).returncode, 0)
+        # The same stage twice, or any stage with a rotated list or policy, is refused before scanning.
+        self.assertEqual(self.run_gate(args, env=env).returncode, 2)
+        unsigned = ["scan", "--profile", "unsigned", "--root", self.tmp, "--state", state]
+        result = self.run_gate(unsigned, lines=(PRIVATE, "rotated-value"), env=env)
+        self.assertEqual((result.returncode, result.stdout), (2, b""))
+        self.assertIn(b"code=baseline_mismatch", result.stderr)
+        result = self.run_gate(unsigned, env=env, advisory_xattrs=["macl"])
+        self.assertEqual((result.returncode, result.stdout), (2, b""))
+        self.assertFalse(os.path.exists(g.stage_path(state, "unsigned")))
 
     def test_roles_and_missing_files(self):
         result = self.run_gate(["roles", "--profile", "publish", "--lane", "stable"])
@@ -566,6 +973,17 @@ class CommandLine(unittest.TestCase):
         self.assertEqual([r["role"] for r in rows], ["app_bundle", "cli_binary", "service_binary"])
         record = [sys.executable, "-I", GATE, "check-record", "--state", state, "--root", root]
         self.assertEqual(subprocess.run(record, capture_output=True).returncode, 0)
+        # In the workflow (policy set) the record must also belong to this attempt's baseline.
+        digest = g.parse_markers(store(PRIVATE))[1]
+        attempt = {"GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1", "OTTTO_RELEASE_LANE": "stable"}
+        with patched_env(attempt):
+            g.write_baseline(os.path.join(self.tmp, "baseline-only"), g.Policy(policy_text(digest)), digest)
+        shutil.copy(os.path.join(self.tmp, "baseline-only", "baseline.json"), os.path.join(state, "baseline.json"))
+        workflow_env = dict(os.environ, **attempt)
+        workflow_env[g.POLICY_ENV] = policy_text(digest)
+        self.assertEqual(subprocess.run(record, capture_output=True, env=workflow_env).returncode, 0)
+        workflow_env["GITHUB_RUN_ATTEMPT"] = "2"
+        self.assertEqual(subprocess.run(record, capture_output=True, env=workflow_env).returncode, 2)
         g.unfreeze(os.path.join(root, "ottto"))
         with open(os.path.join(root, "ottto"), "ab") as handle:
             handle.write(b"changed")

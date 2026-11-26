@@ -38,8 +38,10 @@ usage() {
 Usage: macos_package.sh [options]
 
 Options:
-  --app-root <path>          Required. The app's Swift package root: a tracked,
-                             clean subdirectory of its Git checkout.
+  --app-root <path>          Required (or OTTTO_MACOS_APP_ROOT). The app's Swift
+                             package root: a tracked, clean subdirectory of its
+                             Git checkout. The release workflow uses the
+                             environment variable so the path is not on argv.
   --app-source-commit <sha>  40-hex commit the app checkout must be at.
                              Required for stable-candidate and stable;
                              dev and preview default to the checkout HEAD.
@@ -158,6 +160,9 @@ esac
 if [[ "$PACKAGE_STAGE" == "finish" && -z "$PRIVACY_STATE" ]]; then
   echo "--stage finish requires --privacy-state" >&2
   exit 2
+fi
+if [[ -z "$MAC_APP_ROOT" ]]; then
+  MAC_APP_ROOT="${OTTTO_MACOS_APP_ROOT:-}"
 fi
 if [[ -z "$MAC_APP_ROOT" ]]; then
   echo "--app-root is required: pass the app's Swift package root" >&2

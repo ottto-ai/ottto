@@ -96,6 +96,13 @@ PRIVACY_MARKERS="${OTTTO_PRIVACY_MARKERS-}"
 unset OTTTO_PRIVACY_MARKERS
 PRIVACY_SEALED=""
 PRIVACY_SEALS=0
+# Fixed status lines (notary id/status, gate verdicts) go to OTTTO_STATUS_FD
+# when macos_quiet_step.sh discards everything else; otherwise to stderr.
+STATUS_FD="${OTTTO_STATUS_FD:-2}"
+if [[ ! "$STATUS_FD" =~ ^[0-9]$ ]]; then
+  echo "OTTTO_STATUS_FD must be a single-digit file descriptor" >&2
+  exit 2
+fi
 if [[ "$PRIVACY_GATE" == "true" && "$VALIDATE_ONLY" != "true" ]]; then
   if [[ -z "$PRIVACY_MARKERS" && -z "${OTTTO_PRIVACY_MARKERS_STORE:-}" ]] || [[ -z "${OTTTO_PRIVACY_WORK:-}" ]]; then
     echo "The release privacy gate needs the marker list and OTTTO_PRIVACY_WORK" >&2
@@ -131,13 +138,14 @@ privacy_seal() {
   PRIVACY_SEALED="$OTTTO_PRIVACY_WORK/notary-$PRIVACY_SEALS-$role"
   local -a gate=(python3 -I "$SCRIPT_DIR/macos_privacy_gate.py" scan --profile notary --role "$role"
     --seal-from "$source" --root "$PRIVACY_SEALED" --state "$OTTTO_PRIVACY_WORK/state" "$@")
+  # The gate's own diagnostics are fixed lines (stage, role, class, code, count).
   if [[ -n "$PRIVACY_MARKERS" ]]; then
-    "${gate[@]}" --markers-fd 3 3< <(printf '%s' "$PRIVACY_MARKERS") >/dev/null || rc=$?
+    "${gate[@]}" --markers-fd 3 3< <(printf '%s' "$PRIVACY_MARKERS") >/dev/null 2>&"$STATUS_FD" || rc=$?
   else
-    "${gate[@]}" --markers-store "$OTTTO_PRIVACY_MARKERS_STORE" >/dev/null || rc=$?
+    "${gate[@]}" --markers-store "$OTTTO_PRIVACY_MARKERS_STORE" >/dev/null 2>&"$STATUS_FD" || rc=$?
   fi
   if [[ "$rc" != 0 ]]; then
-    echo "Release privacy gate refused $role (exit $rc); nothing was sent to Apple." >&2
+    echo "Release privacy gate refused $role (exit $rc); nothing was sent to Apple." >&"$STATUS_FD"
     exit 1
   fi
   case "$role" in
@@ -145,6 +153,17 @@ privacy_seal() {
     app_dmg) PRIVACY_SEALED="$PRIVACY_SEALED/Ottto-macos-arm64.dmg" ;;
     cli_zip) PRIVACY_SEALED="$PRIVACY_SEALED/ottto-macos-arm64.zip" ;;
     service_zip) PRIVACY_SEALED="$PRIVACY_SEALED/ottto-service-macos-arm64.zip" ;;
+  esac
+}
+
+# notary_label <archive>: a fixed label for a status line, never a path.
+notary_label() {
+  case "$(basename "$1")" in
+    ottto-app-notary.zip|ottto-app-notary*.zip) printf 'app_notary_zip' ;;
+    Ottto-macos-arm64.dmg) printf 'app_dmg' ;;
+    ottto-macos-arm64.zip) printf 'cli_zip' ;;
+    ottto-service-macos-arm64.zip) printf 'service_zip' ;;
+    *) printf 'other' ;;
   esac
 }
 
@@ -342,10 +361,13 @@ notary_submit() {
     return 2
   fi
 
-  # Print only Apple's submission id and status lines, never paths.
-  local output rc=0
+  # Print only Apple's submission id and status, each checked as a typed field,
+  # never a whole line from notarytool.
+  local output rc=0 id status
   output="$(run_with_timeout "$process_timeout_seconds" "${submit_args[@]}" 2>&1)" || rc=$?
-  grep -E '^[[:space:]]*(id|status):' <<<"$output" || true
+  id="$(sed -nE 's/^[[:space:]]*id: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[[:space:]]*$/\1/p' <<<"$output" | tail -n 1)"
+  status="$(sed -nE 's/^[[:space:]]*status: (Accepted|Invalid|Rejected|In Progress)[[:space:]]*$/\1/p' <<<"$output" | tail -n 1)"
+  echo "notary: archive=$(notary_label "$archive") id=${id:-none} status=${status:-none}" >&"$STATUS_FD"
   if [[ "$rc" != 0 ]]; then
     echo "notarytool failed or exceeded the ${process_timeout_seconds}s whole-process timeout: $(basename "$archive")" >&2
     return 1

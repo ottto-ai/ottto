@@ -58,7 +58,8 @@ require_grep 'actions/attest@[0-9a-f]{40}' 'pinned attest action'
 require_grep 'actions/upload-artifact@[0-9a-f]{40}' 'pinned upload-artifact action'
 require_grep 'scripts/macos_package\.sh' 'packaging step'
 # shellcheck disable=SC2016 # These assertions intentionally match literal variables.
-require_grep '--app-root "\$\{OTTTO_MACOS_APP_ROOT:\?\}"' 'app root passed into macos_package from the runner'
+deny_grep '--app-root' 'the app root reaches macos_package through the runner environment, not argv'
+require_grep 'test -n "\$\{OTTTO_MACOS_APP_ROOT:-\}"' 'app root required from the runner environment'
 # shellcheck disable=SC2016
 require_grep '--app-source-commit "\$OTTTO_MACOS_APP_SOURCE_COMMIT"' 'release-tag app source commit passed into macos_package'
 # The release record names no private repository, so the workflow reads none.
@@ -82,14 +83,16 @@ require_grep '--stage prepare' 'unsigned prepare stage'
 require_grep 'macos_privacy_gate\.py scan --profile unsigned' 'unsigned artifact check before signing'
 require_grep '--stage finish' 'signing finish stage'
 # shellcheck disable=SC2016 # These assertions match literal variables.
-require_grep 'scan --profile attest .*--root "\$OTTTO_PRIVACY_WORK/attest-1"' 'first attestation subjects sealed'
+require_grep 'scan --profile attest .*--stage attest-1 .*--root "\$OTTTO_PRIVACY_WORK/attest-1"' 'first attestation subjects sealed'
 # shellcheck disable=SC2016
-require_grep 'scan --profile attest .*--root "\$OTTTO_PRIVACY_WORK/attest-2"' 'final attestation subjects sealed'
+require_grep 'scan --profile attest .*--stage attest-2 .*--root "\$OTTTO_PRIVACY_WORK/attest-2"' 'final attestation subjects sealed'
 # shellcheck disable=SC2016
 require_grep 'scan --profile upload .*--root "\$OTTTO_PRIVACY_WORK/upload"' 'upload set sealed'
 require_grep 'path: \$\{\{ env\.OTTTO_PRIVACY_WORK \}\}/upload/$' 'uploader reads only the sealed upload folder'
 require_grep 'name: ottto-macos-\$\{\{ inputs\.channel \}\}-\$\{\{ inputs\.version \}\}-attempt-\$\{\{ github\.run_attempt \}\}' 'artifact name carries the run attempt'
 deny_grep 'subject-checksums: dist/macos|sbom-path: dist/macos' 'attestations must read sealed copies'
+# shellcheck disable=SC2016 # These assertions match literal variables.
+deny_grep '--keychain "\$OTTTO_MANUAL_SIGNING_KEYCHAIN"' 'tools get a neutral keychain link, not the keychain path'
 
 # Optional, verification-only GitHub Release mirror.
 require_grep 'github_release_mirror:' 'github_release_mirror input'
@@ -131,9 +134,29 @@ if not (0 <= record < first_checksums < first_sign):
 steps = re.split(r"\n      - name: ", workflow)
 names = [step.split("\n", 1)[0] for step in steps[1:]]
 bodies = dict(zip(names, steps[1:]))
-if names[:2] != ["Checkout", "Load release privacy policy"]:
-    print("The privacy policy load must be the first step after checkout", file=sys.stderr)
+if names[:4] != ["Checkout", "Load release privacy policy", "Check dispatch inputs for private strings",
+                 "Enforce dispatch policy"]:
+    print("The privacy policy load, then the dispatch input check, must come first after checkout",
+          file=sys.stderr)
     sys.exit(1)
+# No input value in a policy message: the step's echo lines name no input variable.
+for line in bodies["Enforce dispatch policy"].splitlines():
+    if "echo" in line and re.search(r"\$\{?(VERSION|CHANNEL|ARTIFACT_BASE_URL|RELEASE_NOTES|RELEASE_MODE|"
+                                   r"OPERATOR_APPROVAL|PUBLISH_INTENT|GITHUB_REF)\b", line):
+        print("A dispatch policy message names an input value: " + line.strip(), file=sys.stderr)
+        sys.exit(1)
+# Release tools print paths, names and selector values: each runs through the
+# fixed-status wrapper, whose output is one line.
+quiet = re.compile(r"scripts/(macos_package|macos_notarize|macos_attestation_bind|macos_manifest_signature|"
+                   r"macos_stable_preflight|homebrew_formula|hosted_native_installer|macos_release_source_check|"
+                   r"macos_release_gate)\.sh")
+for name, body in bodies.items():
+    if "if: false" in body:
+        continue
+    for line in body.splitlines():
+        if quiet.search(line) and "macos_quiet_step.sh" not in line:
+            print(f"{name}: release tool output must go through macos_quiet_step.sh", file=sys.stderr)
+            sys.exit(1)
 for name, body in bodies.items():
     if "secrets.OTTTO_PRIVACY_MARKERS" in body and not (
         "macos_privacy_gate.py" in body or "scripts/macos_notarize.sh" in body
@@ -230,6 +253,12 @@ expect_policy_reject() {
 }
 
 expect_policy_accept refs/tags/v0.1.2 stable 0.1.2
+# A rejected input value is never printed back.
+expect_policy_reject "Invalid version input." refs/tags/v0.1.2 stable "0.1.2 synthetic-input-value"
+if grep -Fq "synthetic-input-value" "$policy_dir/out"; then
+  echo "The dispatch policy printed a rejected input value" >&2
+  exit 1
+fi
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc1
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc12
 expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/heads/main stable 0.1.2

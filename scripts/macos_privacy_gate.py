@@ -10,6 +10,7 @@ classes, error codes and counts; never a marker, an excerpt or a raw path.
 import argparse
 import ctypes
 import ctypes.util
+import decimal
 import hashlib
 import html
 import json
@@ -50,6 +51,7 @@ TOOLS = {
     "scutil": "/usr/sbin/scutil",
     "bash": "/bin/bash",
     "git": "/usr/bin/git",
+    "ditto": "/usr/bin/ditto",
 }
 # Developer ID Application: Apple anchor, Developer ID intermediate and leaf.
 DEVID_REQ = ("=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6]"
@@ -87,7 +89,15 @@ PROFILES = ("unsigned", "notary", "attest", "upload", "publish", "dispatch", "lo
 DISPATCH_INPUTS = ("VERSION", "CHANNEL", "ARTIFACT_BASE_URL", "RELEASE_NOTES",
                    "RELEASE_MODE", "OPERATOR_APPROVAL", "PUBLISH_INTENT")
 SEPARATORS = "/\0\r\n\"'"
-MACHINE_NAME_LINE = re.compile(r"^(?:\S+\s+)?Machine name: '[^'\n]*'\s*$", re.M)
+# The runner's "Set up job" field, one line: optional `gh run view --log` job and step
+# columns, an optional timestamp, then the quoted machine name.
+MACHINE_NAME_LINE = re.compile(r"(?P<step>[^\t\n]*\t(?P<name>[^\t\n]*)\t)?"
+                               r"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Machine name: '(?P<value>[^'\n]*)'\r?")
+# The dedicated release account is neutral by design: its user and full name are not
+# markers (its full name is ordinary product text). Any other account keeps both.
+NEUTRAL_RELEASE_ACCOUNT = ("ottto-release", "Ottto Release")
+STAGES = ("dispatch", "unsigned", "notary:app_notary_zip", "notary:app_dmg", "notary:cli_zip",
+          "notary:service_zip", "attest-1", "attest-2", "upload")
 
 
 class GateError(Exception):
@@ -174,10 +184,11 @@ TAGS = {"owner": (True, False), "signer": (False, True), "owner+signer": (True, 
 
 
 class Marker:
-    __slots__ = ("value", "cls", "owner", "signer")
+    __slots__ = ("value", "cls", "owner", "signer", "full_name")
 
-    def __init__(self, value, cls, owner=False, signer=False):
+    def __init__(self, value, cls, owner=False, signer=False, full_name=False):
         self.value, self.cls, self.owner, self.signer = value, cls, owner, signer
+        self.full_name = full_name  # the account's discovered full name (may alias a listed literal)
 
 
 def parse_markers(data):
@@ -312,14 +323,15 @@ GENERIC_VALUES = {"localhost", "localhost.localdomain"}
 
 
 def with_host_literals(markers):
-    """Marker list plus this host's strings. A host string equal to a listed literal (NFC, casefold)
-    takes that literal's tag, so its scoped omissions apply, and keeps its own spelling."""
+    """Marker list plus this host's strings. Only the account's full name, when equal to a listed
+    literal (NFC, casefold), takes that literal's tag, so its scoped omissions apply; it keeps its
+    own spelling. Every other host string (user, home, host, runner, paths) stays its own class."""
     listed = {norm(m.value): m for m in markers}
     values = {m.value for m in markers}
     extra = []
     for marker in host_literals():
         match = listed.get(norm(marker.value))
-        if match is None:
+        if match is None or not marker.full_name:
             extra.append(marker)
         elif marker.value not in values:
             extra.append(Marker(marker.value, match.cls, match.owner, match.signer))
@@ -330,10 +342,10 @@ def host_literals():
     """Strings of this machine and job: user, home, full name, host and runner names, work roots."""
     found = []
 
-    def add(cls, value, path=False):
+    def add(cls, value, path=False, full_name=False):
         value = (value or "").strip()
         if len(value) >= 4 and value.lower() not in GENERIC_VALUES:
-            found.append(Marker(value, cls))
+            found.append(Marker(value, cls, full_name=full_name))
         if path and value:
             real = os.path.realpath(value)
             if real != value and len(real) >= 4:
@@ -343,12 +355,19 @@ def host_literals():
         entry = pwd.getpwuid(os.getuid())
     except KeyError:
         raise GateError("host_lookup")
-    add("user", entry.pw_name)
-    add("user", entry.pw_gecos.split(",")[0])
+    full = entry.pw_gecos.split(",")[0]
+    # The neutral release account's own user and full name are not markers; its home and
+    # work paths still are. Any other full name on that account is kept.
+    neutral = entry.pw_name == NEUTRAL_RELEASE_ACCOUNT[0]
+    if not neutral:
+        add("user", entry.pw_name)
+    if not (neutral and full.strip() == NEUTRAL_RELEASE_ACCOUNT[1]):
+        add("user", full, full_name=True)
     for value in (entry.pw_dir, os.environ.get("HOME")):
         add("user", value, path=True)
     for var in ("USER", "LOGNAME"):
-        add("user", os.environ.get(var))
+        if not (neutral and os.environ.get(var) == entry.pw_name):
+            add("user", os.environ.get(var))
     hostname = socket.gethostname()
     add("host", hostname)
     add("host", hostname.split(".")[0])
@@ -510,8 +529,8 @@ def u64(data, offset, little):
     return int.from_bytes(data[offset:offset + 8], "little" if little else "big")
 
 
-MACHO_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
-                b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf", b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"}
+FAT_MAGICS = {b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf", b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"}
+MACHO_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce"} | FAT_MAGICS
 
 
 def is_macho(head):
@@ -521,7 +540,7 @@ def is_macho(head):
 def macho_slices(data):
     """Bounds-checked slices of a thin or fat 64-bit Mach-O: [(cputype, offset, size)]."""
     magic = data[:4]
-    if magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf", b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"):
+    if magic in FAT_MAGICS:
         little = magic in (b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca")
         wide = magic in (b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca")
         count = u32(data, 4, little)
@@ -540,6 +559,8 @@ def macho_slices(data):
             if align > 20 or offset % (1 << align) or offset < header_end or size == 0 or offset + size > len(data):
                 raise Incomplete("macho_fat_slice")
             slices.append((cpu, offset, size))
+        if len({cpu for cpu, _, _ in slices}) != len(slices):
+            raise Incomplete("macho_fat_duplicate")
         ordered = sorted(slices, key=lambda s: s[1])
         for (_, a_off, a_size), (_, b_off, _) in zip(ordered, ordered[1:]):
             if a_off + a_size > b_off:
@@ -843,7 +864,6 @@ class Gate:
         self.scratch = scratch
         self.legal_hashes = None
         self.sparkle = None
-        self.trust_cache = {}
 
     # --- results
     def finding(self, role, cls, code, count=1):
@@ -954,6 +974,11 @@ class Gate:
                     self.scan_text(url_decoded(item), rep, counter[0], "url")
             elif isinstance(item, (bytes, bytearray)):
                 self.scan_bytes(bytes(item), Representation(rep.role, (rep.key, "data", counter[0])))
+            elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                # A consumer that reserializes the document (the attestation action sends the
+                # SBOM as a parsed object) can print a number in another form.
+                for form in number_forms(item):
+                    self.scan_text(form, rep, counter[0], "number")
         visit(value, key)
 
     def scan_plist(self, data, rep):
@@ -1006,18 +1031,20 @@ class Gate:
     def trust_tool_available(self):
         return sys.platform == "darwin" and os.path.exists(TOOLS["codesign"])
 
-    def verified_signature(self, path, role, deep=False):
-        """Native Developer ID verification of a signed path plus the pinned leaf."""
+    def verified_signature(self, path, role, deep=False, arch=None):
+        """Native Developer ID verification of a signed path (or one architecture of it) plus the
+        pinned leaf of that same signature."""
         if not self.trust_tool_available():
             raise Incomplete("trust_unavailable")
         parent, name = os.path.split(os.path.abspath(path))
-        args = ["--verify", "--strict"] + (["--deep"] if deep else []) + ["-R", DEVID_REQ, name]
+        select = ["-a", arch] if arch else []
+        args = ["--verify", "--strict"] + select + (["--deep"] if deep else []) + ["-R", DEVID_REQ, name]
         if run_tool("codesign", args, cwd=parent).returncode != 0:
             self.finding(role, "signature", "verify")
             return False
         work = tempfile.mkdtemp(dir=self.scratch)
         try:
-            run_tool("codesign", ["-d", "--extract-certificates=" + os.path.join(work, "cert"), name],
+            run_tool("codesign", ["-d"] + select + ["--extract-certificates=" + os.path.join(work, "cert"), name],
                      cwd=parent, check=True)
             try:
                 with open(os.path.join(work, "cert0"), "rb") as handle:
@@ -1031,6 +1058,21 @@ class Gate:
             return False
         return True
 
+    def verified_intervals(self, path, role, data):
+        """Byte intervals of the Mach-O slices whose own signature verifies against the pin.
+
+        Each slice of a universal file is verified on its own (`codesign -a`); one failing slice
+        drops them all. Fat headers and padding are never inside an interval."""
+        slices = macho_slices(data)
+        if data[:4] not in FAT_MAGICS:
+            return [(0, len(data))] if self.verified_signature(path, role) else []
+        intervals = []
+        for cpu, offset, size in slices:
+            if cpu not in ARCH_NAMES or not self.verified_signature(path, role, arch=ARCH_NAMES[cpu]):
+                return []
+            intervals.append((offset, offset + size))
+        return intervals
+
     def verified_bytes(self, data, role, name):
         work = tempfile.mkdtemp(dir=self.scratch)
         try:
@@ -1038,7 +1080,7 @@ class Gate:
             with open(path, "wb") as handle:
                 handle.write(data)
             os.chmod(path, 0o755)
-            return self.verified_signature(path, role)
+            return self.verified_intervals(path, role, data)
         finally:
             remove_tree(work)
 
@@ -1071,7 +1113,9 @@ class Gate:
 
     # --- files and trees
     def scan_member(self, rel, data, role, rep_key, signed_ok, legal_name=None):
-        """Scan one file's bytes by its relative path in an app tree or archive."""
+        """Scan one file's bytes by its relative path in an app tree or archive.
+
+        signed_ok(rel, data) returns the verified slice intervals of a signed Mach-O (or [])."""
         legal = legal_name is not None and self.legal_ok(legal_name, data)
         rep = Representation(role, rep_key, legal=legal)
         if is_macho(data[:4]):
@@ -1079,9 +1123,10 @@ class Gate:
             if rel.startswith(SPARKLE_DIR):
                 slot = "sparkle:" + rel[len(SPARKLE_DIR):]
             self.check_macho(data, role, slot)
-            rep.signed = bool(signed_ok and signed_ok(rel, data))
+            rep.intervals = [(low, high, True, False) for low, high in (signed_ok(rel, data) if signed_ok else [])]
             self.scan_bytes(data, rep)
-        elif rel.endswith(".plist") or rel.endswith("/_CodeSignature/CodeResources"):
+        elif data[:8] == b"bplist00" or rel.endswith(".plist") or rel.endswith("/_CodeSignature/CodeResources"):
+            # By format too: Sparkle's localized .strings files ship as binary property lists.
             self.scan_plist(data, rep)
         elif rel.endswith(".json"):
             self.scan_json(data, rep)
@@ -1110,8 +1155,10 @@ class Gate:
             else:
                 self.finding(role, "xattr_presence", short or "unexpected")
 
-    def walk_tree(self, top, role, shipped, signed_ok=None, link_ok=None, legal_dir=None, inventory=None):
-        """Walk a folder without following links; scan names, links, attributes and files."""
+    def walk_tree(self, top, role, shipped, signed_ok=None, link_ok=None, legal_dir=None, inventory=None,
+                  scan=True):
+        """Walk a folder without following links; scan names, links, attributes and files.
+        With scan=False only the inventory (types, modes, digests, link targets) is built."""
         count = [0]
 
         def visit(directory, rel_dir, depth):
@@ -1125,14 +1172,16 @@ class Gate:
                     raise Incomplete("tree_entries")
                 rel = rel_dir + entry.name
                 key = (role, "tree", rel)
-                self.scan_name(rel, Representation(role, key), 0)
                 st = os.lstat(entry.path)
-                self.scan_xattrs(entry.path, role, key, shipped)
+                if scan:
+                    self.scan_name(rel, Representation(role, key), 0)
+                    self.scan_xattrs(entry.path, role, key, shipped)
                 if stat.S_ISLNK(st.st_mode):
                     target = os.readlink(entry.path)
-                    self.scan_name(target, Representation(role, (key, "link")), 0)
-                    if not (link_ok and link_ok(rel, target)):
-                        self.finding(role, "structure", "unexpected_link")
+                    if scan:
+                        self.scan_name(target, Representation(role, (key, "link")), 0)
+                        if not (link_ok and link_ok(rel, target)):
+                            self.finding(role, "structure", "unexpected_link")
                     if inventory is not None:
                         inventory[rel] = ("l", target)
                 elif stat.S_ISDIR(st.st_mode):
@@ -1147,7 +1196,8 @@ class Gate:
                     with open(entry.path, "rb") as handle:
                         data = handle.read()
                     legal_name = entry.name if legal_dir is not None and rel_dir == legal_dir else None
-                    self.scan_member(rel, data, role, key, signed_ok, legal_name)
+                    if scan:
+                        self.scan_member(rel, data, role, key, signed_ok, legal_name)
                     if inventory is not None:
                         inventory[rel] = ("f", stat.S_IMODE(st.st_mode), sha256(data))
                 else:
@@ -1159,14 +1209,9 @@ class Gate:
     def scan_app_tree(self, path, role, signed, shipped, inventory=None):
         """Ottto.app: unsigned before signing, or a verified signed bundle."""
         tree_ok = signed and self.verified_signature(path, role, deep=True)
-        leaf_cache = {}
 
-        def signed_ok(rel, _data):
-            if not tree_ok:
-                return False
-            if rel not in leaf_cache:
-                leaf_cache[rel] = self.verified_signature(os.path.join(path, rel), role)
-            return leaf_cache[rel]
+        def signed_ok(rel, data):
+            return self.verified_intervals(os.path.join(path, rel), role, data) if tree_ok else []
 
         if self.sparkle is None:
             self.sparkle = sparkle_expected()
@@ -1182,7 +1227,7 @@ class Gate:
         if seen_macho != expected:
             self.finding(role, "structure", "macho_slots")
 
-    def scan_binary_zip(self, path, role, data):
+    def scan_binary_zip(self, role, data):
         members = zip_members(data)
         exe = ZIP_EXECUTABLES[role]
         legal = set(legal_names(archive=True))
@@ -1197,10 +1242,11 @@ class Gate:
                 if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o755:
                     self.finding(role, "structure", "zip_mode")
                 self.check_macho(content, role, "product")
-                ok = self.verified_bytes(content, role, exe)
-                self.scan_bytes(content, Representation(role, rep_key, signed=ok))
+                verified = self.verified_bytes(content, role, exe)
+                self.scan_bytes(content, Representation(role, rep_key, intervals=[
+                    (low, high, True, False) for low, high in verified]))
                 if stored:
-                    intervals.append((stored[0], stored[1], ok, False))
+                    intervals += [(stored[0] + low, stored[0] + high, True, False) for low, high in verified]
             else:
                 approved = name in legal and self.legal_ok(name, content)
                 self.scan_plain_text(content, Representation(role, rep_key, legal=approved),
@@ -1209,110 +1255,191 @@ class Gate:
                     intervals.append((stored[0], stored[1], False, approved))
         self.scan_bytes(data, Representation(role, (role, "raw"), intervals=intervals))
 
-    def scan_app_zip(self, data, role, expect_app):
-        """The temporary app ZIP: exactly the checked, verified app tree."""
-        inventory = {}
-        tree_ok = self.verified_signature(expect_app, role, deep=True)
-        leaf_cache = {}
+    def scan_app_zip(self, path, data, role, expect_app):
+        """The temporary app ZIP: exactly the checked app tree, and the app extracted from these
+        exact bytes verifies natively (deep, strict, Developer ID, pinned leaf per slice)."""
+        expected = {"": ("d", stat.S_IMODE(os.lstat(expect_app).st_mode))}
+        source_ok = self.verified_signature(expect_app, role, deep=True)
 
-        def tree_signed(rel, _data=None):
-            if not tree_ok:
-                return False
-            if rel not in leaf_cache:
-                leaf_cache[rel] = self.verified_signature(os.path.join(expect_app, rel), role)
-            return leaf_cache[rel]
+        def source_signed(rel, content):
+            return self.verified_intervals(os.path.join(expect_app, rel), role, content) if source_ok else []
 
-        self.walk_tree(expect_app, role, False, tree_signed, app_link_ok, "Contents/Resources/", inventory)
+        self.walk_tree(expect_app, role, False, source_signed, app_link_ok, "Contents/Resources/", expected)
         members = zip_members(data)
-        actual = {}
-        intervals = []
+        extracted = self.extract_app_zip(path)
+        extracted_ok = self.verified_signature(extracted, role, deep=True)
+        copy = {}
+        self.walk_tree(extracted, role, False, inventory=copy, scan=False)
+        files = {k: v for k, v in expected.items() if v[0] != "d"}
+        if {k: v for k, v in copy.items() if v[0] != "d"} != files:
+            self.finding(role, "structure", "zip_extracted")
+        cache = {}
+
+        def signed_ok(rel, content):
+            if rel not in cache:
+                cache[rel] = (self.verified_intervals(os.path.join(extracted, rel), role, content)
+                              if extracted_ok and files.get(rel, (None,))[-1] == sha256(content) else [])
+            return cache[rel]
+
+        actual, intervals = {}, []
         for name, mode, stored, content in members:
             if not name.startswith("Ottto.app/") or "/._" in "/" + name or name.startswith("__MACOSX"):
                 self.finding(role, "structure", "zip_members")
+                self.scan_bytes(content, Representation(role, (role, "member", name)))
                 continue
             rel = name[len("Ottto.app/"):]
             rep_key = (role, "member", name)
             self.scan_name(name, Representation(role, rep_key), 0)
-            if name.endswith("/"):
-                actual[rel] = ("d", stat.S_IMODE(mode))
+            kind = stat.S_IFMT(mode)
+            if name.endswith("/") != (kind == stat.S_IFDIR) or kind not in (stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK):
+                self.finding(role, "structure", "zip_member_type")
+                self.scan_bytes(content, Representation(role, rep_key))
                 continue
-            if stat.S_ISLNK(mode):
-                actual[rel] = ("l", content.decode("utf-8", "replace"))
-                self.scan_name(content.decode("utf-8", "replace"), Representation(role, (rep_key, "link")), 0)
+            if kind == stat.S_IFDIR:
+                # A directory entry carries no data and has the checked tree's mode.
+                if content or expected.get(rel) != ("d", stat.S_IMODE(mode)):
+                    self.finding(role, "structure", "zip_directory")
+                    self.scan_bytes(content, Representation(role, rep_key))
+                continue
+            if kind == stat.S_IFLNK:
+                target = content.decode("utf-8", "replace")
+                actual[rel] = ("l", target)
+                self.scan_bytes(content, Representation(role, (rep_key, "link")))
+                self.scan_name(target, Representation(role, (rep_key, "link")), 0)
                 continue
             actual[rel] = ("f", stat.S_IMODE(mode), sha256(content))
-
-            def signed_ok(r, d, _rel=rel):
-                return inventory.get(_rel, (None,))[-1] == sha256(d) and tree_signed(_rel)
-
             legal_name = rel.rsplit("/", 1)[-1] if rel.startswith("Contents/Resources/") and rel.count("/") == 2 else None
             self.scan_member(rel, content, role, rep_key, signed_ok, legal_name)
             if stored:
-                signed = is_macho(content[:4]) and signed_ok(rel, content)
-                legal = legal_name is not None and self.legal_ok(legal_name, content)
-                intervals.append((stored[0], stored[1], signed, legal))
-        directories = {k for k, v in actual.items() if v[0] == "d"}
-        if {k: v for k, v in actual.items() if v[0] != "d"} != {k: v for k, v in inventory.items() if v[0] != "d"} \
-                or not directories <= {k for k, v in inventory.items() if v[0] == "d"} | {""}:
+                if is_macho(content[:4]):
+                    intervals += [(stored[0] + low, stored[0] + high, True, False)
+                                  for low, high in signed_ok(rel, content)]
+                elif legal_name is not None and self.legal_ok(legal_name, content):
+                    intervals.append((stored[0], stored[1], False, True))
+        if actual != files:
             self.finding(role, "structure", "zip_inventory")
         self.scan_bytes(data, Representation(role, (role, "raw"), intervals=intervals))
 
+    def extract_app_zip(self, path):
+        """Extract the sealed app ZIP with ditto into a fresh scratch folder; returns the app."""
+        work = tempfile.mkdtemp(dir=self.scratch)
+        parent, name = os.path.split(os.path.abspath(path))
+        run_tool("ditto", ["-x", "-k", name, work], cwd=parent, check=True)
+        app = os.path.join(work, "Ottto.app")
+        if os.listdir(work) != ["Ottto.app"] or not stat.S_ISDIR(os.lstat(app).st_mode):
+            raise Incomplete("zip_extract")
+        return app
+
     def scan_dmg(self, path, role):
+        """The signed DMG: native profile (single-segment UDZO, GPT with one APFS partition), its raw
+        file, the whole decoded disk of exactly that size, and the mounted APFS volume of the same
+        attachment. A check that cannot run makes the scan incomplete."""
         if not self.trust_tool_available():
             raise Incomplete("trust_unavailable")
         signed = self.verified_signature(path, role)
         parent, name = os.path.split(os.path.abspath(path))
         if run_tool("hdiutil", ["verify", "-quiet", name], cwd=parent).returncode != 0:
             self.finding(role, "structure", "dmg_verify")
+        decoded_size = self.dmg_profile(name, parent, role)
         with open(path, "rb") as handle:
             self.scan_stream(handle, Representation(role, (role, "raw"), signed=signed))
-        device = self.attach(name, parent, ["-nomount"])
+        whole, _volume, _entities = self.attach(name, parent, ["-nomount"])
         try:
-            with open("/dev/r" + device[len("/dev/"):], "rb") as disk:
-                self.scan_stream(disk, Representation(role, (role, "disk"), signed=signed), limit=4 * MAX_FILE)
+            with open("/dev/r" + whole[len("/dev/"):], "rb") as disk:
+                size, _ = self.scan_stream(disk, Representation(role, (role, "disk"), signed=signed),
+                                           limit=4 * MAX_FILE)
         except OSError:
             raise Incomplete("dmg_read")
         finally:
-            self.detach(device)
+            self.detach(whole)
+        if size != decoded_size:
+            raise Incomplete("dmg_read_size")
         mount = tempfile.mkdtemp(dir=self.scratch)
-        device = self.attach(name, parent, ["-mountpoint", mount], mount)
+        whole, volume, entities = self.attach(name, parent, ["-mountpoint", mount])
         try:
-            entries = set(os.listdir(mount))
-            if not {"Ottto.app", "Applications"} <= entries or entries - {"Ottto.app", "Applications", ".fseventsd"}:
-                self.finding(role, "structure", "dmg_root")
-            self.scan_app_tree(os.path.join(mount, "Ottto.app"), role, True, True)
-            for extra in sorted(entries - {"Ottto.app"}):
-                full = os.path.join(mount, extra)
-                self.scan_name(extra, Representation(role, (role, "root", extra)), 0)
-                self.scan_xattrs(full, role, (role, "root", extra), True)
-                if os.path.islink(full):
-                    if extra != "Applications" or os.readlink(full) != "/Applications":
-                        self.finding(role, "structure", "unexpected_link")
-                elif os.path.isdir(full) and extra == ".fseventsd":
-                    self.walk_tree(full, role, True)
-                else:
-                    self.finding(role, "structure", "dmg_root")
+            mounted = [e for e in entities if "mount-point" in e]
+            if [(e.get("dev-entry"), e["mount-point"]) for e in mounted] != [(volume, mount)] \
+                    or os.stat(mount).st_dev != os.stat(volume).st_rdev:
+                raise Incomplete("dmg_mount")
+            self.scan_dmg_root(mount, role)
         finally:
-            self.detach(device)
+            self.detach(whole)
             os.rmdir(mount)
 
-    def attach(self, name, parent, extra, mount=None):
+    def scan_dmg_root(self, mount, role):
+        entries = set(os.listdir(mount))
+        if not {"Ottto.app", "Applications"} <= entries or entries - {"Ottto.app", "Applications", ".fseventsd"}:
+            self.finding(role, "structure", "dmg_root")
+        self.scan_xattrs(mount, role, (role, "root", ""), True)
+        for entry in sorted(entries):
+            full = os.path.join(mount, entry)
+            mode = os.lstat(full).st_mode
+            if entry != "Ottto.app":
+                self.scan_name(entry, Representation(role, (role, "root", entry)), 0)
+                self.scan_xattrs(full, role, (role, "root", entry), True)
+            if entry == "Ottto.app" and stat.S_ISDIR(mode):
+                self.scan_app_tree(full, role, True, True)
+            elif entry == "Applications" and stat.S_ISLNK(mode):
+                target = os.readlink(full)
+                self.scan_name(target, Representation(role, (role, "root", entry, "link")), 0)
+                if target != "/Applications":
+                    self.finding(role, "structure", "unexpected_link")
+            elif entry == ".fseventsd" and stat.S_ISDIR(mode):
+                self.walk_tree(full, role, True)
+            else:
+                self.finding(role, "structure", "dmg_root")
+
+    def dmg_profile(self, name, parent, role):
+        """Native image metadata; returns the decoded disk size in bytes."""
+        result = run_tool("hdiutil", ["imageinfo", "-plist", name], cwd=parent)
+        try:
+            info = plistlib.loads(result.stdout) if result.returncode == 0 else None
+        except Exception:
+            info = None
+        if not isinstance(info, dict):
+            raise Incomplete("dmg_imageinfo")
+        try:
+            props, sizes, table = info["Properties"], info["Size Information"], info["partitions"]
+            sectors, total = sizes["Sector Count"], sizes["Total Bytes"]
+            partitions = [p for p in table["partitions"] if not p.get("partition-synthesized")]
+            ok = (info["Format"] == "UDZO" and len(info["Segments"]) == 1 and props["Encrypted"] is False
+                  and props["Compressed"] is True and table["partition-scheme"] == "GUID"
+                  and table["block-size"] == 512 and len(partitions) == 1
+                  and partitions[0].get("partition-hint") == "Apple_APFS"
+                  and list(partitions[0].get("partition-filesystems", {})) == ["APFS"]
+                  and type(total) is int and total == sectors * 512 > 0)
+        except (KeyError, TypeError, AttributeError):
+            raise Incomplete("dmg_imageinfo")
+        if not ok:
+            self.finding(role, "structure", "dmg_profile")
+        return total
+
+    def attach(self, name, parent, extra):
+        """Attach read-only; returns (whole disk, APFS volume device, entities) of the one expected
+        topology: GPT whole disk, its APFS partition, the synthesized container and one volume."""
         result = run_tool("hdiutil", ["attach", "-readonly", "-nobrowse", "-noautoopen", "-plist"] + extra + [name],
                           cwd=parent)
         if result.returncode != 0:
             raise Incomplete("dmg_attach")
         try:
-            entities = plistlib.loads(result.stdout).get("system-entities", [])
+            entities = plistlib.loads(result.stdout)["system-entities"]
+            if not isinstance(entities, list) or not all(isinstance(e, dict) for e in entities):
+                raise ValueError
         except Exception:
             raise Incomplete("dmg_attach")
-        devices = sorted({e.get("dev-entry", "") for e in entities})
-        whole = sorted((d for d in devices if re.fullmatch(r"/dev/disk[0-9]+", d)), key=lambda d: int(d[9:]))
-        mounts = [e["mount-point"] for e in entities if "mount-point" in e]
-        if not whole or (mount is None and mounts) or (mount is not None and mounts != [mount]):
-            if whole:
-                self.detach(whole[0])
-            raise Incomplete("dmg_attach")
-        return whole[0]
+        try:
+            topology = dmg_topology(entities)
+            if "-nomount" in extra and any("mount-point" in e for e in entities):
+                raise Incomplete("dmg_topology")
+        except Incomplete:
+            for device in sorted({e.get("dev-entry", "") for e in entities}):
+                if re.fullmatch(r"/dev/disk[0-9]+", device):
+                    try:
+                        self.detach(device)
+                    except Incomplete:
+                        pass  # already gone with its parent; the scan is incomplete either way
+            raise
+        return topology + (entities,)
 
     def detach(self, device):
         if run_tool("hdiutil", ["detach", device]).returncode != 0:
@@ -1373,9 +1500,9 @@ class Gate:
             self.check_macho(data, role, "product")
             self.scan_bytes(data, rep)
         elif role in ZIP_EXECUTABLES:
-            self.scan_binary_zip(path, role, data)
+            self.scan_binary_zip(role, data)
         elif role == "app_notary_zip":
-            self.scan_app_zip(data, role, context["expect_app"])
+            self.scan_app_zip(path, data, role, context["expect_app"])
         elif role in JSON_ROLES:
             self.scan_json(data, rep)
         elif role == "manifest_sig":
@@ -1393,6 +1520,42 @@ class Gate:
         else:
             raise Incomplete("role_unknown")
         return size, sha256(data)
+
+
+def number_forms(value):
+    """Decimal spellings a JSON number can take when reserialized (Python and JavaScript)."""
+    try:
+        as_float = float(value)
+    except OverflowError:
+        raise Incomplete("json_number")
+    if as_float != as_float or as_float in (float("inf"), float("-inf")):
+        raise Incomplete("json_number")
+    forms = {repr(as_float), format(decimal.Decimal(repr(as_float)), "f")}
+    if isinstance(value, int):
+        forms.add(str(value))
+    if as_float == int(as_float):
+        forms.add(str(int(as_float)))
+    return sorted(forms)
+
+
+APFS_CONTAINER_HINT = "EF57347C-0000-11AA-AA11-00306543ECAC"
+
+
+def dmg_topology(entities):
+    """(GPT whole disk, APFS volume device) of one attached image, else Incomplete."""
+    def devices(match):
+        return [e.get("dev-entry", "") for e in entities if match(e)]
+
+    gpt = devices(lambda e: e.get("content-hint") == "GUID_partition_scheme")
+    part = devices(lambda e: e.get("content-hint") == "Apple_APFS")
+    container = devices(lambda e: e.get("content-hint") == APFS_CONTAINER_HINT)
+    volume = devices(lambda e: e.get("volume-kind") == "apfs")
+    whole = re.compile(r"/dev/disk[0-9]+")
+    if len(entities) != 4 or len(gpt) != 1 or not whole.fullmatch(gpt[0]) or part != [gpt[0] + "s1"] \
+            or len(container) != 1 or not whole.fullmatch(container[0]) or container == gpt \
+            or volume != [container[0] + "s1"]:
+        raise Incomplete("dmg_topology")
+    return gpt[0], volume[0]
 
 
 def url_decoded(value):
@@ -1531,9 +1694,13 @@ def checksum_subjects(lane):
     return CHECKSUM_SUBJECTS + (("installer",) if lane in ("stable", "manual") else ())
 
 
+def walk_error(_error):
+    raise Incomplete("tree_read")
+
+
 def list_files(root):
     found = set()
-    for directory, dirs, files in os.walk(root):
+    for directory, dirs, files in os.walk(root, onerror=walk_error):
         for name in files + [d for d in dirs if os.path.islink(os.path.join(directory, d))]:
             found.add(os.path.relpath(os.path.join(directory, name), root))
     return found
@@ -1549,26 +1716,35 @@ def seal(source, dest, roles):
     for role in sorted(roles):
         rel = ROLE_FILES[role]
         parts = rel.split("/")
-        directory = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            directory = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise Incomplete("seal_source")
         try:
             for part in parts[:-1]:
                 inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
                 os.close(directory)
                 directory = inner
             try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                # Non-blocking, so a FIFO cannot stall the open before its type is checked.
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
             except OSError:
                 raise Incomplete("seal_source")
         finally:
             os.close(directory)
         with os.fdopen(fd, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            st = os.fstat(handle.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > MAX_FILE:
                 raise Incomplete("seal_source")
             target_dir = os.path.join(dest, *parts[:-1])
             os.makedirs(target_dir, 0o700, exist_ok=True)
             out = os.open(os.path.join(target_dir, parts[-1]), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            written = 0
             with os.fdopen(out, "wb") as target:
                 for chunk in iter(lambda: handle.read(CHUNK), b""):
+                    written += len(chunk)
+                    if written > MAX_FILE:
+                        raise Incomplete("size_limit")
                     target.write(chunk)
 
 
@@ -1590,7 +1766,9 @@ def check_frozen(root, policy):
         if policy.mode == "enforce":
             raise Incomplete("freeze_unavailable")
         return
-    for directory, dirs, files in os.walk(root):
+    if not os.lstat(root).st_flags & stat.UF_IMMUTABLE:  # also a loose file, which os.walk skips
+        raise Incomplete("not_frozen")
+    for directory, dirs, files in os.walk(root, onerror=walk_error):
         for name in [directory] + [os.path.join(directory, n) for n in files + dirs]:
             if not os.lstat(name).st_flags & stat.UF_IMMUTABLE:
                 raise Incomplete("not_frozen")
@@ -1607,29 +1785,118 @@ def lane_stages(lane):
     return stages + ["upload"]
 
 
+def stage_name(args):
+    """The fixed stage a scan records in the attempt's state folder (None: not a workflow stage)."""
+    if args.profile in ("dispatch", "unsigned", "upload"):
+        return args.profile
+    if args.profile == "notary":
+        return "notary:" + (args.role or "")
+    if args.profile == "attest":
+        return args.stage
+    return None
+
+
+def stage_path(state, stage):
+    return os.path.join(state, "stage-%s.json" % stage.replace(":", "-"))
+
+
+def read_json_file(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise Incomplete("state_read")
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise Incomplete("state_read")
+        try:
+            return json.loads(handle.read(1 << 20).decode("utf-8"), object_pairs_hook=no_duplicate_keys)
+        except ValueError:
+            raise Incomplete("state_read")
+
+
+def read_stage(state, stage):
+    return read_json_file(stage_path(state, stage))
+
+
+def baseline_record(policy, markers_digest):
+    """This attempt's run, attempt and lane with the policy and list loaded at its start."""
+    env = os.environ
+    run_id, attempt, lane = env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", ""), env.get(
+        "OTTTO_RELEASE_LANE", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or not re.fullmatch(r"[1-9][0-9]{0,4}", attempt) \
+            or lane not in LANES:
+        raise GateError("baseline_context")
+    return {"schema": "ottto.release-privacy-baseline", "schema_version": 1, "run_id": int(run_id),
+            "run_attempt": int(attempt), "lane": lane, "policy_sha256": policy.sha256,
+            "markers_sha256": markers_digest}
+
+
+def write_baseline(state, policy, markers_digest):
+    record = baseline_record(policy, markers_digest)
+    os.makedirs(state, 0o700)
+    path = os.path.join(state, "baseline.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, sort_keys=True)
+    if hasattr(os, "chflags"):
+        os.chflags(path, os.lstat(path).st_flags | stat.UF_IMMUTABLE)
+
+
+def check_baseline(state, policy, markers_digest, lane=None):
+    """A workflow scan runs only on the policy and list its attempt loaded first (enforce mode
+    requires the record; it is checked before anything is scanned or approved)."""
+    record = read_json_file(os.path.join(state, "baseline.json"))
+    if record is None:
+        if policy.mode == "enforce":
+            raise GateError("baseline_missing")
+        return
+    if record != baseline_record(policy, markers_digest) or (lane and record["lane"] != lane):
+        raise GateError("baseline_mismatch")
+
+
+def check_bindings(args, gate, stage, rows):
+    """Bytes that cross several boundaries are the same bytes at each: the notarized binary ZIPs
+    at the first attestation (manual: the upload), the first attestation's unchanged subjects at
+    the final one, and the final attestation's subjects and checksums at the upload."""
+    if not args.state or stage not in ("attest-1", "attest-2", "upload"):
+        return
+    if stage == "attest-1" or (stage == "upload" and args.lane == "manual"):
+        pairs = [("notary:cli_zip", ("cli_zip",)), ("notary:service_zip", ("service_zip",))]
+    elif stage == "attest-2":
+        pairs = [("attest-1", tuple(r for r in checksum_subjects(args.lane) if r != "manifest"))]
+    else:
+        pairs = [("attest-2", checksum_subjects(args.lane) + ("checksums",))]
+    current = {r["role"]: (r["size"], r["sha256"]) for r in rows}
+    for earlier, roles in pairs:
+        record = read_stage(args.state, earlier)
+        if not isinstance(record, dict) or record.get("verdict") != "clean":
+            raise Incomplete("binding_missing")
+        before = {r["role"]: (r["size"], r["sha256"]) for r in record.get("rows", [])}
+        for role in roles:
+            if role not in before or current.get(role) != before[role]:
+                gate.finding(stage, "structure", "binding_changed")
+
+
 def recorded_stages(args, gate):
-    """Stage name -> verdict from this attempt's state; every record clean and on this policy and list."""
-    stages, attest = {}, 0
-    for name in sorted(os.listdir(args.state)) if args.state else []:
-        if not (name.startswith("stage-") and name.endswith(".json")):
+    """Stage name -> verdict: every earlier stage of this lane recorded clean on this policy and
+    list, under its fixed name, and no stage outside the lane."""
+    expected = lane_stages(args.lane)
+    stages = {}
+    for stage in STAGES[:-1]:
+        record = read_stage(args.state, stage) if args.state else None
+        if record is None:
+            if stage in expected:
+                raise Incomplete("receipt_stages")
             continue
-        with open(os.path.join(args.state, name), encoding="utf-8") as handle:
-            record = json.load(handle)
-        profile = record.get("profile")
-        if profile == "notary" and len(record.get("roles", [])) == 1:
-            stage = "notary:" + record["roles"][0]
-        elif profile == "attest":
-            attest += 1
-            stage = "attest-%d" % attest
-        else:
-            stage = profile
-        if stage in stages or record.get("verdict") != "clean" \
+        if stage not in expected or record.get("stage") != stage or record.get("verdict") != "clean" \
                 or record.get("policy_sha256") != gate.policy.sha256 \
                 or record.get("markers_sha256") != args.markers_digest:
             raise Incomplete("receipt_stages")
         stages[stage] = "clean"
     stages["upload"] = gate.verdict()
-    if sorted(stages) != sorted(lane_stages(args.lane)) or set(stages.values()) != {"clean"}:
+    if sorted(stages) != sorted(expected) or set(stages.values()) != {"clean"}:
         raise Incomplete("receipt_stages")
     return stages
 
@@ -1662,11 +1929,12 @@ def write_state(args, gate, roles):
     if not args.state:
         return
     os.makedirs(args.state, 0o700, exist_ok=True)
-    index = len([n for n in os.listdir(args.state) if n.startswith("stage-")])
-    record = {"profile": args.profile, "roles": sorted(roles), "verdict": gate.verdict(),
+    stage = stage_name(args)
+    record = {"stage": stage, "profile": args.profile, "roles": sorted(roles), "verdict": gate.verdict(),
               "policy_sha256": gate.policy.sha256, "markers_sha256": args.markers_digest,
               "advisory_xattrs": gate.advisory, "rows": args.rows}
-    with open(os.path.join(args.state, "stage-%02d-%s.json" % (index, args.profile)), "w", encoding="utf-8") as handle:
+    fd = os.open(stage_path(args.state, stage), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(record, handle, sort_keys=True)
 
 
@@ -1676,6 +1944,12 @@ def command_scan(args):
     args.markers_digest = digest
     if args.host_literals == "off" and policy.mode == "enforce":
         raise GateError("host_literals_required")
+    if args.state:
+        if stage_name(args) is None:
+            raise GateError("state_profile")
+        check_baseline(args.state, policy, digest, args.lane)
+        if os.path.lexists(stage_path(args.state, stage_name(args))):
+            raise GateError("stage_repeated")
     if args.host_literals != "off":
         markers = with_host_literals(markers)
     scratch = args.scratch or os.environ.get("OTTTO_PRIVACY_WORK") or (
@@ -1725,7 +1999,7 @@ def run_profile(args, gate, policy):
     if profile == "dispatch":
         return scan_dispatch(gate), context, []
     if profile == "logs":
-        return scan_logs(gate, args.root, policy), context, []
+        return scan_logs(gate, args.root, policy, read_machine_name(args, policy)), context, []
     if profile == "unsigned":
         required, optional = {"app_bundle", "cli_binary", "service_binary"}, set()
         context["signed"] = False
@@ -1787,6 +2061,7 @@ def run_profile(args, gate, policy):
             gate.incomplete_input(role, str(error))
             continue
         rows.append({"role": role, "path": ROLE_FILES[role], "size": size, "sha256": digest})
+    check_bindings(args, gate, stage_name(args), rows)
     if profile == "upload" and gate.verdict() == "clean":
         receipt = make_receipt(args, gate, rows, args.root)
         path = os.path.join(args.root, ROLE_FILES["privacy_receipt"])
@@ -1833,34 +2108,84 @@ def scan_dispatch(gate):
     return ["dispatch"]
 
 
-def scan_logs(gate, root, policy):
-    """Job logs: every text searched; the runner's Machine name line is counted on its own."""
+def read_machine_name(args, policy):
+    """The admitted runner machine name, from --machine-name-fd (never argv)."""
+    if args.machine_name_fd is None:
+        if policy.accept_machine_name_line:
+            raise GateError("machine_name_expected")
+        return None
+    try:
+        data = os.read(args.machine_name_fd, 512)
+        os.close(args.machine_name_fd)
+        value = data.decode("utf-8", "strict")
+    except (OSError, UnicodeDecodeError):
+        raise GateError("machine_name_fd")
+    value = value[:-1] if value.endswith("\n") else value
+    if not re.fullmatch(r"[^'\x00-\x1f\x7f]{1,255}", value):
+        raise GateError("machine_name_fd")
+    return value
+
+
+def scan_logs(gate, root, policy, expected_name):
+    """Job logs, every text searched. The runner's one "Set up job" Machine name field is counted
+    on its own (host_runner_line); it passes only under the policy switch with the admitted name.
+    Everything else on that line, and the name anywhere else, stays a normal finding."""
+    files = sorted(list_files(root))
+    if not files:
+        raise Incomplete("log_empty")
     roles = []
-    for index, rel in enumerate(sorted(list_files(root))):
+    for index, rel in enumerate(files):
         path = os.path.join(root, rel)
         if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_FILE:
             raise Incomplete("log_type")
         with open(path, "rb") as handle:
             data = handle.read()
+        if not data:
+            raise Incomplete("log_empty")
         try:
             text = data.decode("utf-8", "strict")
         except UnicodeDecodeError:
             raise Incomplete("log_encoding")
         label = "log%d" % index
-        machine_lines = [m.span() for m in MACHINE_NAME_LINE.finditer(text)]
-        rest = MACHINE_NAME_LINE.sub("", text)
-        gate.scan_plain_text(rest.encode("utf-8"), Representation(label, (label, "rest")))
         gate.scan_name(rel, Representation(label, (label, "name")), 0)
-        for number, (start, end) in enumerate(machine_lines):
-            probe = Gate(policy, gate.markers, "probe")
-            probe.scan_plain_text(text[start:end].encode("utf-8"), Representation(label, "line"))
-            if probe.findings or probe.incomplete:
-                if policy.accept_machine_name_line:
-                    gate.diagnostics[(label, "host_runner_line", "accepted")] = 1
-                else:
-                    gate.finding(label, "host_runner_line", "machine_name")
+        lines, fields, setup = text.split("\n"), [], True
+        for number, line in enumerate(lines):
+            match = MACHINE_NAME_LINE.fullmatch(line)
+            if match and (match.group("name") == "Set up job" if match.group("step") is not None else setup):
+                fields.append((number, match))
+            if "##[group]Run " in line:
+                setup = False
+        if len(fields) > 1:
+            gate.finding(label, "host_runner_line", "duplicate")
+            fields = []
+        if fields:
+            number, match = fields[0]
+            start, end = match.span("value")
+            lines[number] = lines[number][:start] + "\0" + lines[number][end:]
+            check_machine_name(gate, policy, label, match.group("value"), expected_name)
+        gate.scan_plain_text("\n".join(lines).encode("utf-8"), Representation(label, (label, "rest")))
         roles.append(label)
     return roles
+
+
+def check_machine_name(gate, policy, label, value, expected_name):
+    probe = Gate(policy, gate.markers, "probe")
+    probe.scan_plain_text(value.encode("utf-8"), Representation(label, "value"))
+    if probe.incomplete:
+        raise Incomplete("log_field")
+    if probe.findings.get("path"):
+        gate.finding(label, "path", "machine_name")
+    named = sum(count for cls, count in probe.findings.items() if cls != "path")
+    if expected_name is not None and value != expected_name:
+        gate.finding(label, "structure", "machine_name_unexpected")
+        if named:
+            gate.finding(label, "host_runner_line", "machine_name")
+    elif named:
+        if policy.accept_machine_name_line and expected_name is not None:
+            key = (label, "host_runner_line", "accepted")
+            gate.diagnostics[key] = gate.diagnostics.get(key, 0) + 1
+        else:
+            gate.finding(label, "host_runner_line", "machine_name")
 
 
 def command_markers(args):
@@ -1914,6 +2239,7 @@ def command_register_masks(_args):
     markers, digest = parse_markers(env_value.encode("utf-8"))
     if digest != policy.markers_sha256:
         raise GateError("markers_digest_mismatch")
+    check_selectors(policy, with_host_literals(markers))
     values = set()
     for marker in with_host_literals(markers):
         value = marker.value
@@ -1928,10 +2254,28 @@ def command_register_masks(_args):
     probe.scan_text(work, Representation("work", "work"), 0)
     if probe.findings:
         raise GateError("scratch_not_neutral")
+    write_baseline(os.path.join(work, "state"), policy, digest)
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
         handle.write("OTTTO_PRIVACY_WORK=%s\n" % work)
     print("privacy-gate: masks registered count=%d policy_sha256=%s" % (len(values), policy.sha256), file=sys.stderr)
     return EXIT_CLEAN
+
+
+def check_selectors(policy, markers):
+    """The secret-backed tool selectors are checked before any tool gets them on its argv: the
+    notary profile name is a plain token with no marker; the signing identity is the public
+    Developer ID name, where only signer-class literals may appear."""
+    profile = os.environ.get("OTTTO_NOTARY_PROFILE", "")
+    identity = os.environ.get("OTTTO_MACOS_CODESIGN_IDENTITY", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", profile):
+        raise GateError("selector_notary_profile")
+    if not re.fullmatch(r"Developer ID Application: [^\x00-\x1f\x7f\"]{1,160} \([A-Z0-9]{10}\)", identity):
+        raise GateError("selector_identity")
+    probe = Gate(policy, markers, "probe")
+    probe.scan_text(profile, Representation("selector", ("selector", "notary")), 0)
+    probe.scan_text(identity, Representation("selector", ("selector", "identity"), signed=True), 1)
+    if probe.findings:
+        raise GateError("selector_private")
 
 
 def command_roles(args):
@@ -1943,19 +2287,21 @@ def command_roles(args):
 
 
 def command_check_record(args):
-    """The prepared unsigned tree still has the inventory its clean unsigned scan recorded."""
-    records = []
-    for name in sorted(os.listdir(args.state)):
-        if name.startswith("stage-") and name.endswith("-unsigned.json"):
-            with open(os.path.join(args.state, name), encoding="utf-8") as handle:
-                records.append(json.load(handle))
-    if not records or records[-1]["verdict"] != "clean":
+    """The prepared unsigned tree still has the inventory its clean unsigned scan recorded, and that
+    scan ran in this attempt on the policy and list loaded at its start."""
+    record = read_stage(args.state, "unsigned")
+    if not isinstance(record, dict) or record.get("verdict") != "clean" or record.get("stage") != "unsigned":
         raise GateError("unsigned_record")
+    if os.environ.get(POLICY_ENV, "").strip():
+        policy = load_policy()
+        if record.get("policy_sha256") != policy.sha256:
+            raise GateError("unsigned_record_policy")
+        check_baseline(args.state, policy, record.get("markers_sha256"))
     gate = Gate(Policy(json.dumps({"version": 1, "mode": "rehearsal", "advisory_xattrs": [],
                                    "leaf_sha256": ["0" * 64], "markers_sha256": "0" * 64})),
                 [Marker("\0unused\0", "private")], "record")
     current = []
-    for row in records[-1]["rows"]:
+    for row in record["rows"]:
         path = os.path.join(args.root, row["path"])
         if row["role"] == "app_bundle":
             inventory = {}
@@ -1964,7 +2310,7 @@ def command_check_record(args):
         else:
             size, digest = os.path.getsize(path), file_sha256(path)
         current.append({"role": row["role"], "path": row["path"], "size": size, "sha256": digest})
-    if current != records[-1]["rows"]:
+    if current != record["rows"]:
         raise GateError("unsigned_changed")
     print("privacy-gate: unsigned record matches", file=sys.stderr)
     return EXIT_CLEAN
@@ -1987,6 +2333,8 @@ def main(argv=None):
     scan.add_argument("--state")
     scan.add_argument("--scratch")
     scan.add_argument("--host-literals", choices=("on", "off"), default="on")
+    scan.add_argument("--stage", choices=("attest-1", "attest-2"))
+    scan.add_argument("--machine-name-fd", type=int)
     markers = sub.add_parser("markers")
     markers.add_argument("--store")
     markers.add_argument("--owner-store-v3", action="store_true")
@@ -2004,6 +2352,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "scan" and args.profile in ("attest", "upload", "publish") and not args.lane:
         parser.error("--lane is required for this profile")
+    if args.command == "scan" and (args.profile == "attest") != (args.stage is not None):
+        parser.error("--stage attest-1|attest-2 goes with --profile attest only")
     handlers = {"scan": command_scan, "markers": command_markers, "policy": command_policy,
                 "leaf": command_leaf, "register-masks": command_register_masks, "roles": command_roles,
                 "check-record": command_check_record}

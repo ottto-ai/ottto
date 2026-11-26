@@ -210,7 +210,7 @@ The `macos-stable-release` environment holds one variable,
 | `advisory_xattrs` | A subset of `macl` and `provenance`. A listed attribute's presence on a shipped file is counted but does not stop the release. Any marker in any attribute name or value still blocks. |
 | `leaf_sha256` | One or two distinct SHA-256 digests of the Developer ID leaf certificate (DER). Every signature the gate trusts must chain to Apple's Developer ID root and end in one of these leaves. Two entries cover a certificate rotation; both release lanes use the same list. |
 | `markers_sha256` | The marker list digest (below). |
-| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the runner log line `Machine name: '…'` is counted as `host_runner_line` instead of blocking. Everything else in a log still blocks. |
+| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the one `Machine name: '…'` field of a job log's "Set up job" section passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); it is counted as `host_runner_line` `accepted`. Everything else in a log, including the rest of that line and the name anywhere else, still blocks. |
 
 Duplicate keys, unknown keys, wrong types and missing required keys are
 refused. The canonical form is the object with every key (including the
@@ -247,7 +247,12 @@ digest and counts, never a literal.
   Every literal is matched on its own, including overlapping matches.
 - JSON keys and values, property list keys, strings and data, XML text and
   attributes, HTML entities in the license page and percent escapes in URL
-  fields are decoded and searched again after case folding and NFC.
+  fields are decoded and searched again after case folding and NFC. A file
+  that starts with `bplist00` is decoded as a binary property list wherever it
+  is (Sparkle's localized `.strings` files are binary property lists); one that
+  does not parse is `incomplete`. JSON numbers are also searched in the
+  decimal forms a consumer that reserializes the document can print (the
+  attestation action sends the SBOM as a parsed object).
 - A home folder (`/Users/<name>` other than `/Users/Shared`, `/home/<name>`),
   a per-user temp folder (`/var/folders/…`) or a runner work folder
   (`/_work/`, `actions-runner`) blocks wherever it appears.
@@ -265,15 +270,26 @@ digest and counts, never a literal.
 - `signer:` and `owner+signer:` literals are not reported in signed bytes
   whose signature the gate verified (code signature, Developer ID chain and
   pinned leaf): signed Mach-O files, the signed DMG file and its decoded disk,
-  and the CMS manifest signature. They are searched everywhere else, including
+  and the CMS manifest signature. In a universal Mach-O file each architecture
+  slice is verified on its own (`codesign -a`, with that slice's leaf), and the
+  omission covers only the bytes of verified slices: never the fat header,
+  padding between slices or a match that crosses a slice edge. One failing
+  slice drops every omission in that file, and two slices of one architecture
+  make the file `incomplete`. They are searched everywhere else, including
   the decoded manifest, mounted files, names and attributes. So the owner's
   name inside signed bytes is not flagged; it is public through `NOTICE` and
   every signature. A legal name that appears in the license files must be
   tagged `owner+signer:`, because the decoded disk has no per-file exception.
-- A string the gate reads from the build machine (user, full name, host)
-  that equals a listed literal (NFC, case-folded) takes that literal's tag
-  and omissions and is still searched in its own spelling; other machine
-  strings are searched as their own literals with no omissions.
+- The account's full name, when it equals a listed literal (NFC,
+  case-folded), takes that literal's tag and omissions and is still searched
+  in its own spelling. Every other machine string (user, home, host, runner,
+  work and temp paths) is its own literal with no omissions, even when it
+  equals a listed one.
+- The dedicated release account `ottto-release` is neutral by design: its
+  user name and its full name `Ottto Release` (which is ordinary product text)
+  are not machine literals. Its home and work paths still are, and so is any
+  other full name set on that account. Every other account, including an
+  operator's publisher run, keeps its user and full name.
 
 ### Roles and lanes
 
@@ -312,13 +328,17 @@ prints the role table for a lane as JSON.
 python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder> \
   [--lane candidate|stable|manual] [--appcast present|absent] \
   [--seal-from <folder>] [--markers-fd <n> | --markers-store <file>] \
-  [--response-fd <n>] [--state <folder>]
+  [--response-fd <n>] [--state <folder>] [--stage attest-1|attest-2] \
+  [--machine-name-fd <n>]
 ```
 
 Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
-`attest` (the attestation subjects, SBOM and checksums), `upload`, `publish`,
-`dispatch` and `logs` (every text file under `--root`). `dispatch` reads the
+`attest` (the attestation subjects, SBOM and checksums; `--stage attest-1`
+or `--stage attest-2` is required), `upload`, `publish`, `dispatch` and
+`logs` (every text file under `--root`; an empty folder or file is
+`incomplete`; the admitted runner name, when the policy accepts the
+machine-name field, comes from `--machine-name-fd <n>`, never argv). `dispatch` reads the
 workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
 `OTTTO_DISPATCH_ARTIFACT_BASE_URL`, `OTTTO_DISPATCH_RELEASE_NOTES`,
 `OTTTO_DISPATCH_RELEASE_MODE`, `OTTTO_DISPATCH_OPERATOR_APPROVAL` and
@@ -329,7 +349,24 @@ dispatches; the artifact base URL must be exactly
 store, or, only inside the release workflow, `OTTTO_PRIVACY_MARKERS`.
 With `--seal-from`, the gate copies the role files into the new `--root`
 folder, scans the copies and makes the folder and files immutable
-(`uchg`); consumers read only the sealed copies.
+(`uchg`); consumers read only the sealed copies. A source that is a link, not
+a regular file, has more than one hard link or is over the size limit is
+`incomplete`.
+
+The temporary app ZIP must hold exactly the checked app tree: every member's
+type, mode and bytes match it, a directory entry has no data and the tree's
+mode, and the app that `ditto -x -k` extracts from the sealed ZIP verifies
+natively (deep, strict, Developer ID, pinned leaf) and has the same files.
+The DMG must be a single-segment, unencrypted UDZO image whose native
+metadata (`hdiutil imageinfo`) shows a GUID partition map with one APFS
+partition. The gate reads its raw file, attaches it without mounting,
+requires exactly that topology (GPT whole disk, its APFS partition, the
+APFS container and one APFS volume), reads the whole decoded disk and
+requires the byte count the metadata states, then mounts the same image and
+requires the mounted volume to be that attachment's APFS volume. The volume
+root may hold only `Ottto.app` (a real folder), `Applications` (a link whose
+target is `/Applications`, searched as text) and `.fseventsd`; the root's own
+attributes are scanned. Any check that cannot run is `incomplete`.
 
 The response is one JSON object, written to `--response-fd` (or standard
 output) and nothing else:
@@ -382,6 +419,62 @@ set of stages is exactly the lane's; otherwise the upload stage is
 `ottto-macos-<channel>-<version>-attempt-<n>`. A publisher accepts only a
 receipt from that exact run attempt whose digests equal its own policy and
 marker digests.
+
+### Workflow state
+
+The first gate step (`register-masks`) writes `baseline.json` into the
+attempt's state folder (`$OTTTO_PRIVACY_WORK/state`, mode 0700) and makes it
+immutable: run ID, run attempt, lane, `policy_sha256` and `markers_sha256`.
+Every later scan with `--state` (and `check-record` before signing) first
+requires that record to equal this attempt's run, attempt, lane, policy and
+list; otherwise it exits 2 before scanning, so the next consumer never runs.
+In `enforce` mode the record is required.
+
+Each stage writes one record under a fixed name (`stage-dispatch.json`,
+`stage-unsigned.json`, `stage-notary-<role>.json`, `stage-attest-1.json`,
+`stage-attest-2.json`, `stage-upload.json`); a stage that already has a
+record is refused. Records carry the scanned rows (role, path, size,
+SHA-256), and later stages are bound to them before they approve anything:
+
+| Stage | Must equal |
+|---|---|
+| `attest-1` | `cli_zip` and `service_zip` as their notary stages sealed them |
+| `attest-2` | every `attest-1` subject except the manifest (the binder changes it), so the checksums can change only with the manifest |
+| `upload` (`candidate`, `stable`) | every `attest-2` subject and the checksums |
+| `upload` (`manual`) | `cli_zip` and `service_zip` as their notary stages sealed them |
+
+A changed file is a `binding_changed` finding; a missing or blocked earlier
+record is `incomplete`. The stapled DMG differs from its notary input by
+design and is scanned again at each later stage.
+
+### Workflow output
+
+- The dispatch input check runs right after the policy step and before any
+  step that could print an input; policy messages name no input value. A
+  caller that dispatches the workflow runs the same `dispatch` profile on the
+  exact input values first.
+- `register-masks` also checks the secret-backed tool selectors before any
+  tool gets them: `OTTTO_NOTARY_PROFILE` must be a plain token
+  (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`) with no marker, and
+  `OTTTO_MACOS_CODESIGN_IDENTITY` must be a `Developer ID Application: … (TEAMID)`
+  name in which only `signer:` and `owner+signer:` literals appear.
+- Release tools run through `scripts/macos_quiet_step.sh`, which discards
+  their output and prints one fixed line (`<step>: ok` or
+  `<step>: failed (exit N)`). The notary helper prints only `notary:` lines
+  with a fixed archive label and Apple's submission ID and status, each
+  checked as a typed field, plus the gate's fixed diagnostics.
+- The app root reaches `macos_package.sh` through `OTTTO_MACOS_APP_ROOT`,
+  and the manual lane's keychain through a fixed link in the gate's neutral
+  work folder, not through argv.
+- Not covered here: the checkout and runner setup run before the mask step
+  (they print public repository facts and the runner's own setup fields, which
+  the `logs` profile checks); build tools started by `macos_package.sh` get
+  host paths on their own argv on the runner (never in the log); the pinned
+  attestation action writes its bundle path under `RUNNER_TEMP` to a step
+  output and a runner file (that root is a masked runner literal and must be
+  neutral). That the Actions runner registers each mask and omits the
+  `::add-mask::` command echo is proven only by a real release candidate's log
+  scan.
 
 ## Verify Stable Candidate RC
 
