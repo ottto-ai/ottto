@@ -443,9 +443,12 @@ struct FirstRequestParts {
 }
 crate::heap_layout_bound::fields!(FirstRequestParts; uncached_input, cache_read, cache_write_5m, cache_write_1h);
 
-/// The one extension layout this build reads: `varint 1 | bool sealed |
-/// Option<FirstRequestParts> | length-prefixed token state`. Another layout
-/// version is a later build's and is not kept.
+/// The extension layout this build writes in tests and reads in full:
+/// `varint layout | u8 seal (0 provisional, 1 sealed) | u8 request1 (0 not
+/// sealed, 1 proven, 2 unproven) | the breakdown, present iff proven |
+/// length-prefixed token state`. The header up to the breakdown is the same
+/// in every layout; a later layout only appends after it, so this build
+/// honours a later layout's header and keeps its bytes.
 const CODEX_START_EXTENSION_LAYOUT: u64 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -857,20 +860,22 @@ impl SessionStartState {
     }
 
     /// Restores a version 2 prelude fact's extension. A sealed start is kept
-    /// with its bytes; a provisional one, or another layout, is dropped, so
-    /// the fact is written back as version 1 and this build's own reading of
-    /// the prelude stands. A malformed sealed or provisional extension is
-    /// corrupt.
+    /// with its bytes, whatever this build later reads in the prelude; a
+    /// provisional one is dropped, so the fact is written back as version 1
+    /// and this build's own reading of the prelude stands. A header outside
+    /// its rules, or a layout 1 extension with bytes after its token state,
+    /// is corrupt.
     pub(in crate::snapshots) fn take_codex_prelude_extension(
         &mut self,
         extension: &[u8],
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
-        use crate::durable_tail_codec::{Dec, Durable};
+        use crate::durable_tail_codec::{Corrupt, Dec, Durable};
         let mut d = Dec::new(extension);
-        if d.varint()? != CODEX_START_EXTENSION_LAYOUT {
-            return Ok(());
+        let layout = d.varint()?;
+        let (seal, request1) = (d.raw(1)?[0], d.raw(1)?[0]);
+        if layout == 0 || !matches!((seal, request1), (0, 0) | (1, 1) | (1, 2)) {
+            return Err(Corrupt);
         }
-        let sealed = bool::take(&mut d)?;
         let first_request = if bool::take(&mut d)? {
             Some(FirstRequestParts {
                 uncached_input: Durable::take(&mut d)?,
@@ -881,26 +886,35 @@ impl SessionStartState {
         } else {
             None
         };
-        d.len_prefixed()?;
-        d.finish()?;
-        self.codex_sealed_start = sealed.then(|| SealedCodexStart {
+        if first_request.is_some() != (request1 == 1) {
+            return Err(Corrupt);
+        }
+        if layout == CODEX_START_EXTENSION_LAYOUT {
+            d.len_prefixed()?;
+            d.finish()?;
+        }
+        self.codex_sealed_start = (seal == 1).then(|| SealedCodexStart {
             extension: extension.to_vec(),
             first_request,
         });
         Ok(())
     }
 
-    /// A version 2 prelude fact's extension as a later build writes it.
+    /// A version 2 prelude fact's extension: `layout`, `seal`, `request1`
+    /// and the breakdown as given, then `rest` (layout 1: the token state,
+    /// length-prefixed).
     #[cfg(test)]
     pub(in crate::snapshots) fn codex_start_extension_for_test(
-        sealed: bool,
+        layout: u64,
+        seal: u8,
+        request1: u8,
         first_request: Option<(u64, u64, Option<u64>, Option<u64>)>,
-        token_state: &[u8],
+        rest: &[u8],
     ) -> Vec<u8> {
         use crate::durable_tail_codec::{Durable, Enc};
         Enc::count_write(usize::MAX, |e| {
-            e.varint(CODEX_START_EXTENSION_LAYOUT)?;
-            sealed.put(e)?;
+            e.varint(layout)?;
+            e.raw(&[seal, request1])?;
             first_request.is_some().put(e)?;
             if let Some((uncached, read, write_5m, write_1h)) = first_request {
                 uncached.put(e)?;
@@ -908,7 +922,7 @@ impl SessionStartState {
                 write_5m.put(e)?;
                 write_1h.put(e)?;
             }
-            e.len_prefixed(token_state)
+            e.raw(rest)
         })
         .unwrap()
     }

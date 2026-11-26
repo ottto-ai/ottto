@@ -486,9 +486,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   read back for content. A refusal is a counted Full; only a newer build's
   head holds. The Codex prelude fact is v1, or v2 (v1 followed by one length-prefixed
   extension) for a start a later build counted and sealed. This build keeps a sealed
-  extension, writes it back byte for byte and sends the request-1 breakdown it sealed
-  (none when it proved none); it drops a provisional one or a later layout and writes
-  v1. That build can therefore roll back to this one with no hold, no Full and no
+  extension of any layout (the header is the same in all), writes it back byte for byte
+  on every save and sends the request-1 breakdown it sealed (none when it proved none);
+  it drops a provisional one and writes v1. That build can therefore roll back to this one with no hold, no Full and no
   change in what a sealed start sends. `codex_start_fact` counts staged v1 and v2 facts. An equal-size mtime move at or before the indexed read's nonzero ctime can
   restore from that read's certificate when size and stored mtime bind it to the entry,
   births are known and equal, and both bounded sample digests match. This removes a

@@ -778,12 +778,13 @@ fn codex_content_loads_back_from_its_session_facts() {
 
 /// [money] The Codex prelude fact is written as v1 unless it carries a
 /// sealed start a later build counted (v2: the v1 fields, then one
-/// length-prefixed extension). A sealed extension loads with no hold and no
-/// Full, is written back byte for byte, and the start sends the breakdown
-/// that build sealed, or none when it proved none. A provisional extension,
-/// or a later layout, is dropped: the fact is written back as its v1 bytes
-/// and the start sends what it sends today. A malformed extension is corrupt;
-/// a newer fact version holds.
+/// length-prefixed extension). A sealed extension, of this layout or a later
+/// one, loads with no hold and no Full and is written back byte for byte,
+/// also after the file grows and this build reads on; the start sends the
+/// breakdown that build sealed, or none when it proved none. A provisional
+/// extension is dropped: the fact is written back as its v1 bytes and the
+/// start sends what it sends today. An extension outside its header rules is
+/// corrupt; a newer fact version holds.
 #[test]
 fn a_sealed_codex_start_survives_a_rollback_unchanged() {
     use crate::snapshots::session_start::{SessionStartState, CODEX_PARTS_METHOD};
@@ -800,7 +801,7 @@ fn a_sealed_codex_start_survives_a_rollback_unchanged() {
         staged
     };
     let len_prefixed =
-        |extension: &[u8]| Enc::count_write(usize::MAX, |e| e.len_prefixed(extension)).unwrap();
+        |bytes: &[u8]| Enc::count_write(usize::MAX, |e| e.len_prefixed(bytes)).unwrap();
     // The fact page a save writes, and the request-1 breakdown the start sends.
     let saved = |acc: &SnapshotAccumulator| {
         super::super::fact_pages(acc)
@@ -813,13 +814,15 @@ fn a_sealed_codex_start_survives_a_rollback_unchanged() {
     let first_request = |acc: &SnapshotAccumulator| {
         SessionStartState::clone(&acc.session_start)
             .finish(true, Some(100), CODEX_PARTS_METHOD, None, None, None)
-            .map(|start| {
-                (
-                    start.first_request_uncached_input_tokens,
-                    start.first_request_cache_read_tokens,
-                    start.first_request_cache_write_5m_tokens,
-                    start.first_request_cache_write_1h_tokens,
-                )
+            .and_then(|start| {
+                start.first_request_uncached_input_tokens.map(|uncached| {
+                    (
+                        uncached,
+                        start.first_request_cache_read_tokens,
+                        start.first_request_cache_write_5m_tokens,
+                        start.first_request_cache_write_1h_tokens,
+                    )
+                })
             })
     };
     let today = loaded(&staged(1, &[]));
@@ -829,42 +832,58 @@ fn a_sealed_codex_start_survives_a_rollback_unchanged() {
         "v1 loads and saves back to its own bytes"
     );
     let sent_today = first_request(&today);
-    assert!(
-        sent_today.is_some_and(|parts| parts.0.is_some()),
-        "today's build sends a breakdown for this start: {sent_today:?}"
-    );
-    let extension = |sealed: bool, proven: Option<(u64, u64, Option<u64>, Option<u64>)>| {
-        SessionStartState::codex_start_extension_for_test(sealed, proven, b"token state")
-    };
+    assert!(sent_today.is_some(), "today's build sends a breakdown here");
+    let extension = SessionStartState::codex_start_extension_for_test;
+    let token_state = len_prefixed(b"token state");
     let proven = (7, 3, Some(2), None);
-    for (label, sealed, first, sends) in [
+    let sealed = [
         (
             "sealed proven",
-            true,
-            Some(proven),
-            Some((Some(7), Some(3), Some(2), None)),
+            extension(1, 1, 1, Some(proven), &token_state),
+            Some((7, Some(3), Some(2), None)),
         ),
-        ("sealed unproven", true, None, None),
-    ] {
-        let tail = len_prefixed(&extension(sealed, first));
-        let file = staged(2, &tail);
+        (
+            "sealed unproven",
+            extension(1, 1, 2, None, &token_state),
+            None,
+        ),
+        (
+            "later layout, sealed unproven",
+            extension(2, 1, 2, None, b"what a later layout appends"),
+            None,
+        ),
+    ];
+    for (label, bytes, sends) in sealed {
+        let file = staged(2, &len_prefixed(&bytes));
         assert_eq!(cause(&file), None, "{label}: loads, no hold, no Full");
-        let back = loaded(&file);
+        let mut back = loaded(&file);
         assert_eq!(
             saved(&back),
             file.pages[&page],
             "{label}: saved byte for byte"
         );
-        let sent = first_request(&back).map(|parts| parts.0.map(|_| parts));
-        assert_eq!(sent.flatten(), sends, "{label}: the sealed breakdown");
+        assert_eq!(first_request(&back), sends, "{label}: the sealed breakdown");
+        // The file grows: this build reads on (its v1 part may change), and
+        // the sealed extension is written back unchanged.
+        for line in turn(3) {
+            apply_codex_line(&serde_json::from_str(&line).unwrap(), &mut back);
+        }
+        let grown = saved(&back);
+        assert_eq!(grown[..2], [5, 2], "{label}: still version 2");
+        assert!(
+            grown.ends_with(&len_prefixed(&bytes)),
+            "{label}: the extension is kept byte for byte"
+        );
+        assert_eq!(first_request(&back), sends, "{label}: after growth");
     }
-    let mut later = vec![2];
-    later.extend_from_slice(b"a later layout");
-    for (label, tail) in [
-        ("provisional", len_prefixed(&extension(false, Some(proven)))),
-        ("later layout", len_prefixed(&later)),
+    for (label, bytes) in [
+        ("provisional", extension(1, 0, 0, None, &token_state)),
+        (
+            "later layout, provisional",
+            extension(2, 0, 0, None, b"more"),
+        ),
     ] {
-        let back = loaded(&staged(2, &tail));
+        let back = loaded(&staged(2, &len_prefixed(&bytes)));
         assert_eq!(saved(&back), v1, "{label}: written back as v1");
         assert_eq!(
             first_request(&back),
@@ -872,19 +891,55 @@ fn a_sealed_codex_start_survives_a_rollback_unchanged() {
             "{label}: today's breakdown"
         );
     }
-    let mut bad_header = extension(true, Some(proven));
-    bad_header[1] = 9;
-    let mut trailing_inside = extension(true, None);
-    trailing_inside.push(0);
+    let mut trailing = extension(1, 1, 2, None, &token_state);
+    trailing.push(0);
     for (label, tail) in [
         ("no extension", Vec::new()),
         ("short", vec![4, 1]),
         (
             "after the extension",
-            [len_prefixed(&extension(true, None)), vec![0]].concat(),
+            [
+                len_prefixed(&extension(1, 1, 2, None, &token_state)),
+                vec![0],
+            ]
+            .concat(),
         ),
-        ("bad header", len_prefixed(&bad_header)),
-        ("inside the extension", len_prefixed(&trailing_inside)),
+        (
+            "layout 0",
+            len_prefixed(&extension(0, 1, 2, None, &token_state)),
+        ),
+        (
+            "seal 2",
+            len_prefixed(&extension(1, 2, 2, None, &token_state)),
+        ),
+        (
+            "request1 3",
+            len_prefixed(&extension(1, 1, 3, None, &token_state)),
+        ),
+        (
+            "provisional with request1",
+            len_prefixed(&extension(1, 0, 2, None, &token_state)),
+        ),
+        (
+            "sealed without request1",
+            len_prefixed(&extension(1, 1, 0, None, &token_state)),
+        ),
+        (
+            "proven without breakdown",
+            len_prefixed(&extension(1, 1, 1, None, &token_state)),
+        ),
+        (
+            "unproven with breakdown",
+            len_prefixed(&extension(1, 1, 2, Some(proven), &token_state)),
+        ),
+        (
+            "provisional with breakdown",
+            len_prefixed(&extension(1, 0, 0, Some(proven), &token_state)),
+        ),
+        (
+            "layout 1, bytes after the token state",
+            len_prefixed(&trailing),
+        ),
     ] {
         assert_eq!(
             cause(&staged(2, &tail)),
