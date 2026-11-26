@@ -227,12 +227,22 @@ pub(in crate::snapshots) fn take_head_writes(
             }))
     })
 }
-/// `head`'s pages, one short read transaction, streamed to `visit`. See
-/// `tail::load_pages` for its outcomes.
+#[cfg(test)]
 pub(in crate::snapshots) fn load_tail(
     index: &ScanIndex,
     key: &str,
     head: &TailHead,
+    visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    load_tail_pages(index, key, head, |_| true, visit)
+}
+
+/// Stream the selected collections from the head's generation in one short read transaction.
+pub(in crate::snapshots) fn load_tail_pages(
+    index: &ScanIndex,
+    key: &str,
+    head: &TailHead,
+    include: impl Fn(Collection) -> bool,
     mut visit: impl FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
@@ -243,6 +253,7 @@ pub(in crate::snapshots) fn load_tail(
             key.as_bytes(),
             head,
             stamp.0,
+            include,
             &mut |collection, page, value: Vec<u8>| {
                 bytes = bytes.saturating_add(value.len() as u64);
                 visit(collection, page, value)

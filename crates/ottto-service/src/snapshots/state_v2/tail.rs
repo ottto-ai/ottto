@@ -1057,12 +1057,13 @@ pub(super) fn load_pages(
     file: &[u8],
     head: &TailHead,
     generation: u64,
+    include: impl Fn(Collection) -> bool,
     visit: &mut dyn FnMut(Collection, u64, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     ensure!(!head.metadata_only, "state_v2_tail_metadata_only");
     let pages = Collection::ALL
         .into_iter()
-        .filter(|c| *c != Collection::Revisions);
+        .filter(|c| *c != Collection::Revisions && include(*c));
     stream(tx, file, head, generation, pages, visit)
 }
 /// `head`'s revisions (debt), by revision id, under the same checks.
@@ -1328,7 +1329,12 @@ fn write_file(
     let (mut revision, mut table, mut common, mut reduction, mut write_generation) =
         if let Some(reset) = reset {
             // Acquisition state only: committed debt stays and merges.
-            let (revision, table, common) = committed_debt(tx, file, Some(reset.revision))?;
+            let (revision, table, common) = committed_debt(tx, file, Some(reset.revision))
+                .inspect_err(|error| {
+                    if error.downcast_ref::<Hold>() == Some(&Hold::Future) {
+                        telemetry::event("tail_reset_newer_refused", &1_u64);
+                    }
+                })?;
             delete_rows(tx, file, true)?;
             (revision, table, common, None, None)
         } else {
@@ -1486,6 +1492,10 @@ fn committed_debt(
     };
     let (revision, mut common) =
         prior.map_or((0, Common::default()), |head| (head.revision, head.common));
+    ensure!(
+        reset_revision.is_none_or(|max| revision <= max),
+        Hold::Future
+    );
     let mut table = MembershipTable::new();
     let rows = revision_rows(tx, file)?;
     if damaged {
@@ -1538,6 +1548,14 @@ pub(super) fn future_head_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Res
 pub(super) fn put_head_for_test(tx: &mut dyn Transaction, file: &[u8], head: &[u8]) -> Result<()> {
     write_value(tx, file, HEAD_OWNER, 0, &row(HEAD, file, 0)?, head)?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn head_bytes_for_test(tx: &mut dyn Transaction, file: &[u8]) -> Result<Vec<u8>> {
+    let header = tx
+        .get(&row(HEAD, file, 0)?)?
+        .context("missing fixture head")?;
+    read_value(tx, file, HEAD_OWNER, 0, &header)
 }
 /// Retire over a future head written in `tx`, which the caller drops uncommitted.
 #[cfg(test)]

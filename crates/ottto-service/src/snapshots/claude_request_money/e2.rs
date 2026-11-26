@@ -1925,12 +1925,20 @@ pub(crate) fn finish_page(
         telemetry,
         hold_reasons,
         queued_family_deferred_paths,
-        &content_held,
+        PageCopyHolds {
+            content: &content_held,
+            newer_build: &BTreeSet::new(),
+        },
         &records,
     )
 }
 
 pub(crate) type ContributionLocations<'a> = BTreeMap<LocationKey, &'a String>;
+
+pub(crate) struct PageCopyHolds<'a> {
+    pub(crate) content: &'a BTreeSet<String>,
+    pub(crate) newer_build: &'a BTreeSet<String>,
+}
 
 /// `finish_page` for one evidence chunk of a page whose content-twin holds
 /// were decided once over the whole page.
@@ -1940,7 +1948,7 @@ pub(crate) fn finish_page_planned(
     telemetry: TelemetryRead,
     hold_reasons: &mut BTreeMap<&'static str, u64>,
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
-    page_content_held: &BTreeSet<String>,
+    page_holds: PageCopyHolds<'_>,
     records: &ContributionLocations<'_>,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
@@ -2149,7 +2157,7 @@ pub(crate) fn finish_page_planned(
         .collect::<Vec<_>>();
     let content_held = locations
         .iter()
-        .filter(|(session, _)| page_content_held.contains(*session))
+        .filter(|(session, _)| page_holds.content.contains(*session))
         .map(|(session, _)| (*session).to_owned())
         .collect::<BTreeSet<_>>();
     if !content_held.is_empty() {
@@ -2162,6 +2170,7 @@ pub(crate) fn finish_page_planned(
         items,
         index,
         queued_family_deferred_paths,
+        page_holds.newer_build,
         hold_reasons,
     );
     held.extend(content_held.iter().cloned());

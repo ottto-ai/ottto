@@ -525,9 +525,12 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2. OpeningSettings has its own v2: the v1 payload followed by the request-1 MCP schema
   count, written only when that count is present (a measured zero included); without it the
-  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact as
-  future state: a per-file hold that keeps the checkpoint, loses no data and re-reads nothing
-  until a compatible build returns. No historical sessions are selected just to enrich metadata.
+  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact it
+  cannot read. The per-file hold keeps the checkpoint and changes no money. Even if the file
+  changed or was pulled as a forced twin, it never reads Full. It withholds copies that depend
+  on the held twin for that pass. Builds released before this protection could read such a
+  file once in full and keep only the facts they knew. No historical sessions are selected just
+  to enrich metadata.
 - Claude Desktop store discovery reads ordinary directories at any depth, retaining
   symlink rejection and the per-scan entry budget. Its identity census token enters a
   session fingerprint only when that session carries original Desktop identity evidence.

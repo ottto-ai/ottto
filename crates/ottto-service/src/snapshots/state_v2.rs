@@ -77,12 +77,14 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, load_head, load_job_head, load_revisions, load_tail,
-    observe_tail, observe_tails, retire_tail, set_aside_tail, stage_job, stage_tail,
-    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_job_head, load_revisions,
+    load_tail_pages, observe_tail, observe_tails, retire_tail, set_aside_tail, stage_job,
+    stage_tail, tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
-pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
+pub(in crate::snapshots) use runtime::tail_route::{
+    load_tail, staged_head_for_test, LOAD_HEAD_CALLS,
+};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
     unused_imports,
@@ -667,6 +669,16 @@ pub(crate) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
 #[cfg(test)]
 pub(crate) fn seed_future_carrier_head_for_test(index: &ScanIndex, key: &str) {
     seed_tail_head_for_test(index, |tx| tail::future_head_for_test(tx, key.as_bytes()));
+}
+
+#[cfg(test)]
+pub(crate) fn tail_head_bytes_for_test(index: &ScanIndex, key: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        bytes = tail::head_bytes_for_test(&mut tx, key.as_bytes()).unwrap();
+    });
+    bytes
 }
 
 #[cfg(test)]

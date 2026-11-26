@@ -924,17 +924,11 @@ impl Fact {
         }
     }
 
-    /// One fact page into a decoded head's state.
-    fn take(
-        page: u64,
-        bytes: &[u8],
-        into: &mut SnapshotAccumulator,
-    ) -> Result<(), ReconstructCause> {
+    fn tag(page: u64, d: &mut Dec<'_>) -> Result<(Self, u64), ReconstructCause> {
         let fact = usize::try_from(page)
             .ok()
             .and_then(|at| FACTS.get(at).copied())
             .ok_or(ReconstructCause::INCOMPATIBLE)?;
-        let mut d = Dec::new(bytes);
         if d.varint()? != page {
             return Err(ReconstructCause::Corrupt);
         }
@@ -945,6 +939,17 @@ impl Fact {
         {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
+        Ok((fact, version))
+    }
+
+    /// One fact page into a decoded head's state.
+    fn take(
+        page: u64,
+        bytes: &[u8],
+        into: &mut SnapshotAccumulator,
+    ) -> Result<(), ReconstructCause> {
+        let mut d = Dec::new(bytes);
+        let (fact, version) = Self::tag(page, &mut d)?;
         match fact {
             Self::Title => into.title = <Option<String> as Durable>::take(&mut d)?,
             Self::FirstPrompt => {
