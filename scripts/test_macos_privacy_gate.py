@@ -848,16 +848,16 @@ class ReceiptAndContract(unittest.TestCase):
 
 
 JOB = "Release job"
-SETUP_LOG = ("﻿2026-01-01T00:00:00.1000000Z Current runner version: '2.300.0'\n"
+SETUP_LOG = ("\ufeff2026-01-01T00:00:00.1000000Z Current runner version: '2.300.0'\n"
              "2026-01-01T00:00:00.1500000Z Runner name: 'runner-1'\n"
              "2026-01-01T00:00:00.2000000Z Machine name: '%s'\n"
              "2026-01-01T00:00:00.3000000Z Complete job name: Release job\n")
-END_LOG = "﻿2026-01-01T00:00:09.1000000Z Cleaning up orphan processes\n"
+END_LOG = "\ufeff2026-01-01T00:05:09.1000000Z Cleaning up orphan processes\n"
 BUILD_LOG = "2026-01-01T00:00:02.0000000Z ##[group]Run make\n2026-01-01T00:00:03.0000000Z done\n"
 SYSTEM_LOG = ("2025-12-31T23:59:58.5000000Z Requested labels: self-hosted\n"
               "2025-12-31T23:59:59.5000000Z Job is about to start running on the runner: runner-1\n")
 RECORD_TIMES = {"created_at": "2025-12-31T23:59:58Z", "started_at": "2026-01-01T00:00:00Z",
-                "completed_at": "2026-01-01T00:00:10Z"}
+                "completed_at": "2026-01-01T00:05:10Z"}
 
 
 def shifted(seconds):
@@ -886,9 +886,9 @@ def job_logs(tmp, name, setup=None, build=BUILD_LOG, end=END_LOG, omit=(), extra
              (2, "Checkout", "success", "2026-01-01T00:00:01.0000000Z ##[group]Run actions/checkout\n", "00:00:01"),
              (3, "Optional step", "skipped", None, "00:00:02"),
              (4, "Build", "success", build, "00:00:02"),
-             (7, "Complete job", "success", end, "00:00:09")]
+             (7, "Complete job", "success", end, "00:05:09")]
     if whole is None:
-        whole = "﻿" + "".join(text.lstrip("﻿") for _n, _s, _c, text, _t in steps if text)
+        whole = "\ufeff" + "".join(text.lstrip("\ufeff") for _n, _s, _c, text, _t in steps if text)
     files = [("1_" + JOB + ".txt", whole)] + [(rel, text) for rel, text in top]
     inside = list(extra) + ([("system.txt", system)] if system is not None else [])
     if layout == "steps":
@@ -1023,16 +1023,27 @@ class LogScan(unittest.TestCase):
             (job_logs(tmp, host, layout="whole", setup=SETUP_LOG.replace("Machine name", "Machine") % host),
              "log_partial"),
             (job_logs(tmp, host, layout="whole", extra=(("4_Build.txt", BUILD_LOG),)), "log_partial"),  # some steps
-            # The logs belong to another attempt: an earlier attempt's archive with the same names.
+            # The logs belong to another attempt: an earlier attempt's archive with the same names
+            # (also the closest possible rerun, created right after the earlier attempt's last line),
+            # or a later attempt's archive under the earlier record.
             (job_logs(tmp, host, attempt=2, record=shifted(1800)), "log_attempt"),
             (job_logs(tmp, host, attempt=2, record=shifted(1800), layout="whole"), "log_attempt"),
-            (job_logs(tmp, host, attempt=2, record=shifted(-1800)), "log_attempt"),
+            (job_logs(tmp, host, attempt=2, record=shifted(312)), "log_attempt"),
+            (job_logs(tmp, host, attempt=2, record=shifted(312), layout="whole"), "log_attempt"),
+            (job_logs(tmp, host, record=shifted(-312)), "log_attempt"),
+            (job_logs(tmp, host, record=shifted(-1800)), "log_attempt"),
+            # A job too short for its times to tell attempts apart.
+            (job_logs(tmp, host, end="\ufeff2026-01-01T00:01:59.1000000Z Cleaning up orphan processes\n",
+                      record=lambda r: dict(steps(lambda s: s[:-1] + [dict(s[-1], started_at="2026-01-01T00:01:59Z")])(r),
+                                            completed_at="2026-01-01T00:02:00Z")), "log_attempt"),
             # A record whose job ended before the "Complete job" step's line, or a log that starts
             # long before the job started.
             (job_logs(tmp, host, record=lambda r: dict(r, completed_at="2025-12-31T23:59:00Z")), "log_attempt"),
-            (job_logs(tmp, host, record=steps(lambda s: s[:-1] + [dict(s[-1], started_at="2026-01-01T00:05:00Z")])),
+            (job_logs(tmp, host, record=steps(lambda s: s[:-1] + [dict(s[-1], started_at="2026-01-01T00:09:00Z")])),
              "log_attempt"),
             (job_logs(tmp, host, record=lambda r: dict(r, started_at="2026-01-01T00:03:00Z")), "log_attempt"),
+            (job_logs(tmp, host, record=lambda r: dict(r, created_at="2025-12-31T23:50:00Z",
+                                                       started_at="2025-12-31T23:58:00Z")), "log_attempt"),
             # A step file from another attempt beside this attempt's whole log.
             (job_logs(tmp, host, build="2025-12-31T23:00:02.0000000Z ##[group]Run make\n"), "log_attempt"),
             # Another job's name or another runner.

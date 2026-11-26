@@ -2306,10 +2306,10 @@ STEP_LOG = re.compile(r"(?P<number>[1-9][0-9]{0,3})_(?P<name>[^/\0]+)\.txt")
 JOB_LOG = re.compile(r"[0-9]{1,4}_(?P<name>[^/\0]+)\.txt")
 JOB_NAME = re.compile(r"[^/\0\r\n]{1,255}")
 API_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
-LOG_TIME = re.compile(r"﻿?(?P<time>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z) ")
-JOB_NAME_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Complete job name: (?P<value>[^\r\n]*?)\r?")
-RUNNER_NAME_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Runner name: '(?P<value>[^'\r\n]*)'\r?")
-SYSTEM_RUNNER_LINE = re.compile(r"﻿?[0-9T:.Z-]+ Job is about to start running on the (?:hosted )?runner: "
+LOG_TIME = re.compile(r"\ufeff?(?P<time>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z) ")
+JOB_NAME_LINE = re.compile(r"\ufeff?[0-9T:.Z-]+ Complete job name: (?P<value>[^\r\n]*?)\r?")
+RUNNER_NAME_LINE = re.compile(r"\ufeff?[0-9T:.Z-]+ Runner name: '(?P<value>[^'\r\n]*)'\r?")
+SYSTEM_RUNNER_LINE = re.compile(r"\ufeff?[0-9T:.Z-]+ Job is about to start running on the (?:hosted )?runner: "
                                 r"(?P<value>[^\r\n]*?)\r?")
 # Runner clock against the API's whole-second times.
 LOG_CLOCK_SLACK = 60
@@ -2401,13 +2401,17 @@ def ends_job(lines):
 
 def check_log_attempt(record, whole, setup_end, step_logs, system):
     """The logs belong to the record's run attempt: every timestamped line lies between the
-    job's creation and completion, the whole-job log starts after the job started and ends
-    after its "Complete job" step started (an earlier attempt's logs end before this attempt
-    was created), it names the record's job, and every runner name the logs state is the
-    record's runner."""
+    job's creation and completion, the whole-job log starts when the job started and ends
+    after its "Complete job" step started, it names the record's job, and every runner name
+    the logs state is the record's runner. Attempts of one job do not overlap: an earlier
+    attempt's logs end before this attempt was created, a later one's start after it ended.
+    Times tell them apart only for a job that runs longer than twice the clock slack, so a
+    shorter job is incomplete."""
     times = [record["created_at"], record["started_at"], record["completed_at"], record["steps"][-1]["started_at"]]
     created, started, completed, last_step = [utc_seconds(value) for value in times]
     low, high = created - LOG_CLOCK_SLACK, completed + 1 + LOG_CLOCK_SLACK
+    if last_step - max(created, started) < 2 * LOG_CLOCK_SLACK:
+        raise Incomplete("log_attempt")
 
     def stamp(line):
         match = LOG_TIME.match(line)
@@ -2420,7 +2424,8 @@ def check_log_attempt(record, whole, setup_end, step_logs, system):
                 raise Incomplete("log_attempt")
     body = whole[:-1] if whole[-1] == "" else whole
     first, end = stamp(body[0]), stamp(body[-1])
-    if first is None or end is None or first < started - LOG_CLOCK_SLACK or end < last_step - LOG_CLOCK_SLACK:
+    if first is None or end is None or not started - LOG_CLOCK_SLACK <= first <= started + LOG_CLOCK_SLACK \
+            or end < last_step - LOG_CLOCK_SLACK:
         raise Incomplete("log_attempt")
     if JOB_NAME_LINE.fullmatch(whole[setup_end]).group("value") != record["name"]:
         raise Incomplete("log_attempt")

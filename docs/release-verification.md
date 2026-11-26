@@ -527,15 +527,19 @@ The `logs` profile checks one job of one run attempt and needs all of:
   An empty archive or file is `incomplete` too.
 - The logs must belong to the record's attempt (else `incomplete`,
   `log_attempt`): every timestamped line lies between the job's `created_at`
-  and `completed_at` (60 seconds of clock slack), the whole-job log starts no
-  earlier than `started_at` and ends no earlier than the `Complete job` step's
-  `started_at` (both less the slack), its `Complete job name` line names the
+  and `completed_at` (60 seconds of clock slack), the whole-job log starts
+  within the slack of `started_at` and ends no earlier than the `Complete job`
+  step's `started_at` less the slack, its `Complete job name` line names the
   record's job, and every runner name the logs state (`Runner name` in the
   setup lines, the runner `system.txt` names) is the record's `runner_name`,
-  at least one of them present. An earlier attempt's archive, even with the
-  same file names, ends before the later attempt was created. The job record
-  carries no identifier that appears in the logs, so the times, the job name
-  and the runner name are the binding.
+  at least one of them present. Attempts of one job do not overlap: an
+  earlier attempt's archive, even with the same file names, ends before the
+  later attempt was created, and a later one starts after the earlier one
+  ended. Times tell attempts apart only when the `Complete job` step starts
+  at least twice the slack (120 seconds) after the job was created and
+  started, so a shorter job is `incomplete` too. The job record carries no
+  identifier that appears in the logs, so the times, the job name and the
+  runner name are the binding.
 
 Every file is searched. The whole-job log's setup field and, in the step
 layout, its copy in the `Set up job` file are each checked on their own and
