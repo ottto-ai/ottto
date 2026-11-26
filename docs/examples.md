@@ -33,14 +33,17 @@ the local daemon and require this Mac to be connected. `--app
 codex|claude-code|pi` is available as a local app alias, while `--source`
 accepts backend source slugs for local, API, and cloud-provider data.
 
-## Cloud Connector Status
+## Cloud Connectors
 
 ```bash
+ottto cloud connect --source bedrock --json --watch
 ottto cloud status --source vertex --json
+ottto cloud status --attempt <id> --json
+ottto cloud cancel --attempt <id> --json
 ```
 
-`ottto cloud status` is read-only. Connect or change AWS and Google Cloud
-connectors in the web app at <https://app.ottto.net/apps>.
+Approve Bedrock setup with Touch ID or a browser passkey. Use the
+[Ottto web app](https://app.ottto.net/connections) for Vertex AI setup.
 
 ## Headless Setup
 

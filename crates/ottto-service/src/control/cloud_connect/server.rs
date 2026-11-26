@@ -9,15 +9,56 @@ use crate::control::backend_post_json;
 use crate::control::backend_send_raw_json;
 use crate::control::setup::claims::credentials::refresh_setup_run_token_checked;
 use crate::control::setup::claims::credentials::setup_run_token_for_connection_with_refresh;
+use crate::control::staging_pair;
 use crate::control::validated_api_base_url;
 use crate::control::SetupRunRefreshResponse;
+use crate::control::DEFAULT_API_BASE_URL;
 use crate::LocalApiError;
 use crate::LocalDaemon;
+use ottto_protocol::cloud_uuid;
 use serde::Deserialize;
 use serde::Serialize;
 
 /// The server's answer to a refused run token; any other 401 (a bad proof) is final.
 const SETUP_RUN_TOKEN_INVALID: &str = "setup_run_token_invalid";
+
+const PRODUCTION_PAIR: (&str, &str) = (DEFAULT_API_BASE_URL, "https://app.ottto.net");
+const CLAIM_WEB_ROUTE: &str = "/setup/cloud-keys?claim=";
+
+/// The (API, web) origin pair for `api_base_url`: production, or the staging pair a non-stable
+/// candidate build compiled in. The pair only chooses web pages and the approval audience; which
+/// APIs this service sends credentials to is `validated_api_base_url`'s decision.
+pub(super) fn claim_origin_pair(api_base_url: &str) -> Option<(&'static str, &'static str)> {
+    let api_base_url = api_base_url.trim().trim_end_matches('/');
+    [Some(PRODUCTION_PAIR), staging_pair()]
+        .into_iter()
+        .flatten()
+        .find(|(api, _)| *api == api_base_url)
+}
+
+/// The `aud` a native approval must name for `api_base_url`: the host of its paired web origin
+/// (`app.ottto.net` for production). An API with no pair keeps the production audience.
+pub(super) fn approval_audience(api_base_url: &str) -> &'static str {
+    let (_, web) = claim_origin_pair(api_base_url).unwrap_or(PRODUCTION_PAIR);
+    web.strip_prefix("https://").unwrap_or(web)
+}
+
+/// The connections page on the web origin compiled for `api_base_url`, the only web page cloud
+/// setup replies may send the user to. `None` for any other API.
+pub(in crate::control) fn paired_connect_url(api_base_url: &str) -> Option<String> {
+    claim_origin_pair(api_base_url).map(|(_, web)| format!("{web}/connections"))
+}
+
+/// Replaces a reply's `connect_url` with `web`, or drops it when the API has no compiled web
+/// origin.
+pub(in crate::control) fn set_connect_url(reply: &mut serde_json::Value, web: Option<String>) {
+    if let Some(object) = reply.as_object_mut() {
+        object.remove("connect_url");
+        if let Some(url) = web {
+            object.insert("connect_url".into(), url.into());
+        }
+    }
+}
 
 #[derive(Serialize)]
 pub(super) struct ClaimStartBody<'a> {
@@ -35,6 +76,27 @@ pub(super) struct ClaimStarted {
     pub(super) expires_at: String,
 }
 
+/// Validate against the API selected for this request, including any token retry.
+pub(super) fn checked_claim_start(
+    api_base_url: &str,
+    start: impl FnOnce() -> Result<ClaimStarted, ServerError>,
+) -> Result<ClaimStarted, ServerError> {
+    let untrusted = || ServerError::local("server_untrusted");
+    let (_, web_origin) = claim_origin_pair(api_base_url).ok_or_else(untrusted)?;
+    let started = start()?;
+    let browser_claim = started
+        .claim_url
+        .strip_prefix(web_origin)
+        .and_then(|route| route.strip_prefix(CLAIM_WEB_ROUTE));
+    if !cloud_uuid(&started.key_claim_id)
+        || browser_claim != Some(started.key_claim_id.as_str())
+        || !super::wire::is_key_code(&started.key_code)
+    {
+        return Err(untrusted());
+    }
+    Ok(started)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ClaimState {
     pub(super) state: String,
@@ -45,14 +107,6 @@ pub(super) struct DeviceChallenge {
     pub(super) challenge_id: String,
     /// The signed payload, unpadded base64url.
     pub(super) payload_bytes: String,
-}
-
-/// The setup run and organization a request was sent under: what a challenge's signed facts must
-/// name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RunScope {
-    pub(super) run_id: String,
-    pub(super) org_id: String,
 }
 
 /// This Mac's cloud-key identity as the server's challenges name it.
@@ -94,7 +148,7 @@ pub(super) struct ServerError {
 }
 
 impl ServerError {
-    fn local(code: &str) -> Self {
+    pub(super) fn local(code: &str) -> Self {
         Self {
             code: code.to_string(),
             status: None,
@@ -102,8 +156,13 @@ impl ServerError {
         }
     }
 
-    fn from_local(error: &LocalApiError) -> Self {
+    pub(super) fn from_local(error: &LocalApiError) -> Self {
         match error {
+            LocalApiError::Backend(details)
+                if details.kind == crate::BackendErrorKind::ResponseUnexpected =>
+            {
+                Self::local("invalid_server_field")
+            }
             LocalApiError::Backend(details) => Self {
                 code: details.reason_code.clone().unwrap_or_else(|| {
                     match details.status {
@@ -131,14 +190,14 @@ impl ServerError {
 
 /// The cloud-key routes the signer channel calls.
 pub(super) trait CloudKeyServer {
-    /// Starts (or replays) a key claim for these public keys.
+    /// Starts or replays a claim and verifies its browser link against the connected API.
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError>;
     fn claim_state(&self, key_claim_id: &str) -> Result<ClaimState, ServerError>;
     /// A challenge for `request`, with the run and organization it was requested on.
     fn device_challenge(
         &self,
         request: &ChallengeRequest<'_>,
-    ) -> Result<(RunScope, DeviceChallenge), ServerError>;
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError>;
     /// Sends the frozen enrollment body once.
     fn enroll(
         &self,
@@ -161,19 +220,54 @@ pub(super) struct SetupRunServer<'a> {
     pub(super) daemon: &'a LocalDaemon,
 }
 
+/// The setup run, organization and API a request is sent under: what a challenge's signed facts
+/// must name, and what a token refresh must keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BoundRun {
+    pub(super) id: String,
+    pub(super) organization_id: String,
+    pub(super) api_base_url: String,
+}
+
 impl SetupRunServer<'_> {
-    /// Runs `send` with the run's cloud route prefix and run token. A refused run token is
-    /// refreshed once with the device secret. The server checks the token before it reads a
-    /// proof, so the exact request may be resent on the same run and organization.
+    pub(super) fn bound_run(&self) -> Result<BoundRun, ServerError> {
+        let (connection, organization_id) = self
+            .daemon
+            .cloud_connect_binding()
+            .map_err(|error| ServerError::from_local(&error))?;
+        Ok(BoundRun {
+            id: connection.setup_run_id,
+            organization_id,
+            api_base_url: connection.api_base_url,
+        })
+    }
+
     fn call<T>(
         &self,
+        send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
+    ) -> Result<T, ServerError> {
+        self.call_bound(None, send)
+    }
+
+    /// The exact signed request may be resent after a refused token if the
+    /// refreshed authority still names the same run and organization.
+    pub(super) fn call_bound<T>(
+        &self,
+        run: Option<&BoundRun>,
         send: impl Fn(&str, &str) -> Result<T, LocalApiError>,
     ) -> Result<T, ServerError> {
         let (connection, organization_id) = self
             .daemon
             .cloud_connect_binding()
             .map_err(|error| ServerError::from_local(&error))?;
-        let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))
+        if run.is_some_and(|run| {
+            run.id != connection.setup_run_id
+                || run.organization_id != organization_id
+                || run.api_base_url != connection.api_base_url
+        }) {
+            return Err(ServerError::local("not_paired"));
+        }
+        let api_base_url = validated_api_base_url(Some(&connection.api_base_url))
             .map_err(|error| ServerError::from_local(&error))?;
         let refresh = || {
             refresh_setup_run_token_checked(&api_base_url, &connection, |response| {
@@ -231,12 +325,15 @@ pub(super) fn send_with_refresh<T>(
 
 impl CloudKeyServer for SetupRunServer<'_> {
     fn start_claim(&self, body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
-        self.call(|prefix, token| {
-            backend_post_json(
-                &format!("{prefix}/key-claims"),
-                body,
-                &[("X-Ottto-Setup-Run-Token", token)],
-            )
+        let run = self.bound_run()?;
+        checked_claim_start(&run.api_base_url, || {
+            self.call_bound(Some(&run), |prefix, token| {
+                backend_post_json(
+                    &format!("{prefix}/key-claims"),
+                    body,
+                    &[("X-Ottto-Setup-Run-Token", token)],
+                )
+            })
         })
     }
 
@@ -252,23 +349,16 @@ impl CloudKeyServer for SetupRunServer<'_> {
     fn device_challenge(
         &self,
         request: &ChallengeRequest<'_>,
-    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
-        let (connection, org_id) = self
-            .daemon
-            .cloud_connect_binding()
-            .map_err(|error| ServerError::from_local(&error))?;
-        let challenge = self.call(|prefix, token| {
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError> {
+        let run = self.bound_run()?;
+        let challenge = self.call_bound(Some(&run), |prefix, token| {
             backend_post_json(
                 &format!("{prefix}/device-challenges"),
                 request,
                 &[("X-Ottto-Setup-Run-Token", token)],
             )
         })?;
-        let scope = RunScope {
-            run_id: connection.setup_run_id,
-            org_id,
-        };
-        Ok((scope, challenge))
+        Ok((run, challenge))
     }
 
     fn enroll(

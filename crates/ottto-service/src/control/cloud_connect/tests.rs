@@ -4,6 +4,7 @@ use super::queue::SignOutcome;
 use super::queue::SignQueue;
 use super::queue::SignQueueError;
 use super::resolve_signer_start;
+use super::server::BoundRun;
 use super::server::ClaimStartBody;
 use super::server::ClaimStarted;
 use super::server::ClaimState;
@@ -13,9 +14,8 @@ use super::server::DeviceChallenge;
 use super::server::Enrolled;
 use super::server::HelloFacts;
 use super::server::Revoked;
-use super::server::RunScope;
 use super::server::ServerError;
-use super::server::{check_refresh_binding, send_with_refresh};
+use super::server::{check_refresh_binding, checked_claim_start, send_with_refresh};
 use super::signer;
 use super::wake::app_bundle_of;
 use super::wire;
@@ -39,6 +39,15 @@ const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
 const ORG_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CLAIM_URL: &str =
     "https://app.ottto.net/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
+/// A synthetic staging deployment, compiled in only by `with_staging`. Source names no real host.
+const STAGING_API: &str = "https://staging.example.invalid:8443";
+const STAGING_WEB: &str = "https://staging.example.invalid";
+
+/// Runs `test` as a candidate build made with `OTTTO_CLOUD_STAGING_PAIR` set to the synthetic pair.
+fn with_staging<T>(test: impl FnOnce() -> T) -> T {
+    crate::control::with_test_staging_pair((STAGING_API, STAGING_WEB), test)
+}
+
 /// `30 06 02 01 01 02 01 01`: r = 1, s = 1.
 const DER_SIGNATURE_B64: &str = "MAYCAQECAQE";
 
@@ -49,6 +58,7 @@ type SentEnrollment = (Vec<u8>, String, Option<String>);
 #[derive(Default)]
 struct FakeServer {
     claim_fields: Option<(&'static str, &'static str)>,
+    claim_api_base: Option<&'static str>,
     /// Return a challenge whose signed hash differs from the one asked for.
     tamper_challenge: bool,
     challenges: RefCell<Vec<(String, String)>>,
@@ -59,11 +69,14 @@ struct FakeServer {
 impl CloudKeyServer for FakeServer {
     fn start_claim(&self, _body: &ClaimStartBody<'_>) -> Result<ClaimStarted, ServerError> {
         let (claim_url, key_code) = self.claim_fields.unwrap_or((CLAIM_URL, "AB23-EFG7"));
-        Ok(ClaimStarted {
-            key_claim_id: CLAIM_ID.to_string(),
-            claim_url: claim_url.to_string(),
-            key_code: key_code.to_string(),
-            expires_at: "2026-11-24T12:00:00Z".to_string(),
+        let api_base = self.claim_api_base.unwrap_or("https://api.ottto.net");
+        checked_claim_start(api_base, || {
+            Ok(ClaimStarted {
+                key_claim_id: CLAIM_ID.to_string(),
+                claim_url: claim_url.to_string(),
+                key_code: key_code.to_string(),
+                expires_at: "2026-11-24T12:00:00Z".to_string(),
+            })
         })
     }
 
@@ -76,7 +89,7 @@ impl CloudKeyServer for FakeServer {
     fn device_challenge(
         &self,
         request: &ChallengeRequest<'_>,
-    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError> {
         self.challenges.borrow_mut().push((
             request.operation.to_string(),
             request.request_sha256.to_string(),
@@ -129,10 +142,11 @@ impl CloudKeyServer for FakeServer {
     }
 }
 
-fn run_scope() -> RunScope {
-    RunScope {
-        run_id: RUN_ID.to_string(),
-        org_id: ORG_ID.to_string(),
+fn run_scope() -> BoundRun {
+    BoundRun {
+        id: RUN_ID.to_string(),
+        organization_id: ORG_ID.to_string(),
+        api_base_url: "https://api.ottto.net".to_string(),
     }
 }
 
@@ -220,6 +234,10 @@ fn enroll_args() -> Value {
 const ENROLL_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/enroll_wire_v1.json");
 /// The signer channel's wire, shared with the Mac app's tests.
 const SIGNER_WIRE: &str = include_str!("../../../../../fixtures/cloud_connect/signer_wire_v1.json");
+/// The server's Mac approval signing vector, vendored byte for byte: the server serves this
+/// payload in R2 and accepts this signature in R5.
+const APPROVAL_SIGNATURE: &str =
+    include_str!("../../../../../fixtures/cloud_connect/signatures_v4.json");
 
 fn fixture(text: &str) -> Value {
     serde_json::from_str(text).expect("fixture is JSON")
@@ -386,9 +404,10 @@ fn signer_wire_matches_the_shared_fixture() {
             }),
             agent_connect: Some(state["agent_connect"].clone()),
         },
-        scope: RunScope {
-            run_id: text(state, "run_id").to_string(),
-            org_id: text(binding, "org_id").to_string(),
+        scope: BoundRun {
+            id: text(state, "run_id").to_string(),
+            organization_id: text(binding, "org_id").to_string(),
+            api_base_url: "https://api.ottto.net".to_string(),
         },
         now: state["now"].as_i64().unwrap(),
         vector: fixture(ENROLL_WIRE),
@@ -444,7 +463,7 @@ fn signer_wire_matches_the_shared_fixture() {
 /// server's enrollment vector.
 struct FixtureServer {
     hello: HelloFacts,
-    scope: RunScope,
+    scope: BoundRun,
     now: i64,
     vector: Value,
     enrolls: RefCell<Vec<SentEnrollment>>,
@@ -489,7 +508,7 @@ impl CloudKeyServer for FixtureServer {
     fn device_challenge(
         &self,
         request: &ChallengeRequest<'_>,
-    ) -> Result<(RunScope, DeviceChallenge), ServerError> {
+    ) -> Result<(BoundRun, DeviceChallenge), ServerError> {
         let write = &self.vector[request.operation];
         Ok((
             self.scope.clone(),
@@ -858,6 +877,88 @@ fn claim_start_and_state_reach_the_server() {
     );
 }
 
+/// [behaviour] The signer opens claims only on the web origin for the connected API. A staging
+/// pair exists only in a build that compiled one in; crossed pairs are refused either way.
+#[test]
+fn claim_start_requires_the_connected_apis_compiled_web_origin() {
+    const PRODUCTION_API: &str = "https://api.ottto.net";
+    const STAGING_CLAIM: &str =
+        "https://staging.example.invalid/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
+    const OTHER_CLAIM: &str =
+        "https://example.test/setup/cloud-keys?claim=11111111-2222-4333-8444-555555555555";
+    let claim = |api: &'static str, claim_url: &'static str| {
+        let channel = Channel::new(FakeServer {
+            claim_api_base: Some(api),
+            claim_fields: Some((claim_url, "AB23-EFG7")),
+            ..FakeServer::default()
+        });
+        channel.hello(1);
+        channel.send(
+            1,
+            "cloud_keys_claim_start",
+            json!({ "client_claim_id": CLAIM_ID, "device_key_spki_b64": "BBBB" }),
+        )
+    };
+    let check = |api, claim_url, accepted| {
+        let reply = claim(api, claim_url);
+        if accepted {
+            assert_eq!(reply["result"]["claim_url"], claim_url, "{api}");
+        } else {
+            assert_eq!(error_code(&reply), "server_untrusted", "{api} {claim_url}");
+            assert!(reply.get("result").is_none());
+        }
+    };
+
+    with_staging(|| {
+        for (api, claim_url, accepted) in [
+            (PRODUCTION_API, CLAIM_URL, true),
+            (STAGING_API, STAGING_CLAIM, true),
+            (PRODUCTION_API, STAGING_CLAIM, false),
+            (STAGING_API, CLAIM_URL, false),
+            (PRODUCTION_API, OTHER_CLAIM, false),
+            (STAGING_API, OTHER_CLAIM, false),
+            ("https://example.test", CLAIM_URL, false),
+            (STAGING_WEB, STAGING_CLAIM, false),
+        ] {
+            check(api, claim_url, accepted);
+        }
+        assert_eq!(
+            crate::control::validated_api_base_url(Some(STAGING_API)).unwrap(),
+            STAGING_API
+        );
+        assert!(crate::control::validated_api_base_url(Some(
+            "https://staging.example.invalid:8444"
+        ))
+        .is_err());
+    });
+    // A stable build has no staging pair: staging is neither a claim origin nor a trusted API.
+    check(PRODUCTION_API, CLAIM_URL, true);
+    check(STAGING_API, STAGING_CLAIM, false);
+    assert!(crate::control::validated_api_base_url(Some(STAGING_API)).is_err());
+}
+
+/// [behaviour] Only a well-formed build setting compiles in a staging pair, and never production.
+#[test]
+fn staging_pair_setting_accepts_two_bare_https_origins() {
+    use crate::control::backend_http::parse_staging_pair;
+    let pair = format!("{STAGING_API}|{STAGING_WEB}");
+    assert_eq!(parse_staging_pair(&pair), Some((STAGING_API, STAGING_WEB)));
+    for setting in [
+        "",
+        STAGING_API,
+        "https://staging.example.invalid:8443|",
+        "http://staging.example.invalid:8443|https://staging.example.invalid",
+        "https://staging.example.invalid:8443/api|https://staging.example.invalid",
+        "https://user@staging.example.invalid|https://staging.example.invalid",
+        "https://staging.example.invalid|https://staging.example.invalid",
+        "https://api.ottto.net|https://staging.example.invalid",
+        "https://staging.example.invalid:8443|https://app.ottto.net",
+        "https://staging.example.invalid:8443|https://staging.example.invalid|https://x.invalid",
+    ] {
+        assert_eq!(parse_staging_pair(setting), None, "{setting}");
+    }
+}
+
 /// [behaviour] No browser link or forward code is returned until both pass the local checks.
 #[test]
 fn claim_start_refuses_untrusted_browser_fields() {
@@ -1167,4 +1268,277 @@ fn wake_targets_the_bundle_around_this_service() {
     ] {
         assert_eq!(app_bundle_of(Path::new(executable)), None, "{executable}");
     }
+}
+
+/// [behaviour] A native approval's answer is retained for its approval id, and a retired attempt
+/// keeps its approvals retired.
+#[test]
+fn queue_keeps_the_retained_native_answer() {
+    let channel = Channel::new(FakeServer::default());
+    let approval = |index| SignKind::Approval {
+        attempt_id: format!("attempt_{index}"),
+        approval_id: format!("approval_{index}"),
+    };
+    channel.hello(1);
+    let queue = &channel.queue;
+    let deadline = unix_now() + 60;
+    let first = queue.enqueue(approval(0), vec![0], deadline).unwrap();
+    channel.send(1, "cloud_sign_poll", json!({}));
+    assert_eq!(
+        channel.send(
+            1,
+            "cloud_sign_result",
+            json!({"request_id": first.request_id, "outcome": "declined"}),
+        )["ok"],
+        true,
+    );
+    assert_eq!(
+        queue
+            .enqueue(approval(0), vec![0], deadline)
+            .unwrap()
+            .request_id,
+        first.request_id,
+    );
+    assert_eq!(
+        queue.approval_outcome(&first.request_id),
+        Some(SignOutcome::Declined)
+    );
+    queue.cancel_attempt("attempt_0");
+    let replay = queue.enqueue(approval(0), vec![0], deadline).unwrap();
+    assert_eq!(replay.request_id, first.request_id);
+    assert_eq!(
+        queue.approval_outcome(&replay.request_id),
+        Some(SignOutcome::Superseded)
+    );
+}
+
+/// [behaviour] A browser approval link opens only on the web origin paired with the run's API,
+/// for production and staging alike, and never on a crossed pair.
+#[test]
+fn approval_link_uses_the_runs_paired_web_origin() {
+    use super::agent::approval_browser_url;
+    let id = "44444444-4444-4444-8444-444444444444";
+    let path = format!("/connections/cloud-approve?attempt={id}");
+    with_staging(|| {
+        for (api, web) in [
+            ("https://api.ottto.net", "https://app.ottto.net"),
+            (STAGING_API, STAGING_WEB),
+        ] {
+            let expected = Some(format!("{web}{path}"));
+            assert_eq!(approval_browser_url(api, id, &path), expected, "{api}");
+            assert_eq!(
+                approval_browser_url(api, id, &format!("{web}{path}")),
+                expected,
+                "{api}"
+            );
+        }
+        for (api, offered) in [
+            ("https://api.ottto.net", format!("{STAGING_WEB}{path}")),
+            (STAGING_API, format!("https://app.ottto.net{path}")),
+            (
+                "https://api.ottto.net",
+                "https://app.ottto.net/connections/cloud-approve?attempt=other".to_string(),
+            ),
+            ("http://127.0.0.1:8000", path.clone()),
+        ] {
+            assert_eq!(
+                approval_browser_url(api, id, &offered),
+                None,
+                "{api} {offered}"
+            );
+        }
+    });
+    assert_eq!(approval_browser_url(STAGING_API, id, &path), None);
+}
+
+/// [behaviour] Cloud setup replies and refusals link only to the connections page on the web
+/// origin compiled for this Mac's API (staging on staging), never to the page the server named.
+#[test]
+fn cloud_replies_link_only_the_paired_web_origin() {
+    use super::agent::with_connect_url;
+    use super::server::paired_connect_url;
+    let staging = with_staging(|| paired_connect_url(&format!("{STAGING_API}/")));
+    assert_eq!(
+        staging.as_deref(),
+        Some("https://staging.example.invalid/connections")
+    );
+    assert_eq!(paired_connect_url(STAGING_API), None);
+    assert_eq!(
+        paired_connect_url("https://api.ottto.net").as_deref(),
+        Some("https://app.ottto.net/connections")
+    );
+    let server =
+        || json!({"state": "web_open", "connect_url": "https://app.ottto.net/connections"});
+    let reply = with_connect_url(Ok(server()), staging.clone());
+    assert_eq!(
+        reply["connect_url"],
+        "https://staging.example.invalid/connections"
+    );
+    let refusal = ottto_protocol::CloudConnectFailure::new("use_web", "Use the web.", "use_web");
+    let reply = with_connect_url(Err(refusal.clone()), staging);
+    assert_eq!(
+        reply["cloud_error"]["connect_url"],
+        "https://staging.example.invalid/connections"
+    );
+    // An API with no compiled web origin gets no link at all.
+    assert_eq!(paired_connect_url("http://127.0.0.1:8000"), None);
+    assert!(with_connect_url(Ok(server()), None)
+        .get("connect_url")
+        .is_none());
+    let mut linked = refusal;
+    linked.connect_url = Some("https://app.ottto.net/connections".into());
+    assert!(with_connect_url(Err(linked), None)["cloud_error"]["connect_url"].is_null());
+}
+
+/// [behaviour] A queued native approval in the server's approval.v4 shape: the service signs the
+/// server's exact payload bytes and posts R5 as `{approval_id, signature}` with an unpadded
+/// base64url signature, which is what the server's approval route verifies.
+#[test]
+fn approval_payload_is_signed_unchanged_and_posted_as_the_r5_body() {
+    use super::agent::{approval_body, checked_approval, ApprovalScope, CheckedApproval};
+    use super::server::approval_audience;
+    let attempt_id = "44444444-4444-4444-8444-444444444444";
+    let approval_id = "55555555-5555-4555-8555-555555555555";
+    let account = "000000000001";
+    let sign_by = 4_102_444_800_i64;
+    let facts = |operation: &str, replaces: Value, aud: &str, target: &str| {
+        json!({
+            "v": "ottto.cloud_connect.approval.v4", "aud": aud,
+            "approval_id": approval_id, "attempt_id": attempt_id,
+            "org_id": ORG_ID, "org_name": "Example", "source": "bedrock",
+            "operation": operation,
+            "target": {"kind": "aws_account", "id": target, "org_role": "management",
+                "payer_account_id": target},
+            "reach": "all_linked_accounts",
+            "grant": {"variant": "cli_billing",
+                "role_arn": format!("arn:aws:iam::{target}:role/ottto-read-b-abcde234"),
+                "installed_sha256": "d".repeat(64), "metrics": false},
+            "replaces": replaces, "input_revision": 1,
+            "device_id": "22222222-2222-4222-8222-222222222222", "device_generation": 12,
+            "control_generation": 3, "dialog_sha256": "e".repeat(64),
+            "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "iat": sign_by - 300,
+            "sign_by": sign_by,
+        })
+    };
+    // The server's canonical encoding: sorted keys, no spaces.
+    let canonical = |value: &Value| serde_json::to_vec(value).unwrap();
+    let approval = |payload: &[u8]| {
+        json!({
+            "approval_id": approval_id, "payload_b64": wire::encode_base64url(payload),
+            "sign_by": "2100-01-01T00:00:00Z", "next_actions": ["approve_on_mac"],
+        })
+    };
+    let attempt = json!({"attempt_id": attempt_id, "account_id": account, "input_revision": 1});
+    let check_for = |payload: &[u8], audience| {
+        let scope = ApprovalScope {
+            audience,
+            organization_id: ORG_ID,
+            attempt_id,
+            account,
+        };
+        checked_approval(&approval(payload), &attempt, &scope)
+    };
+    let check = |payload: &[u8]| check_for(payload, "app.ottto.net");
+
+    let payload = canonical(&facts("connect", Value::Null, "app.ottto.net", account));
+    assert_eq!(
+        check(&payload).unwrap(),
+        CheckedApproval {
+            approval_id: approval_id.into(),
+            payload: payload.clone(),
+            sign_by,
+        }
+    );
+    let replaced = json!({"integration_config_id": "66666666-6666-4666-8666-666666666666",
+        "credential_revision": 2, "active": true,
+        "target": {"kind": "aws_account", "id": "000000000002"}, "connected_by_name": null});
+    assert!(check(&canonical(&facts(
+        "replace",
+        replaced,
+        "app.ottto.net",
+        account
+    )))
+    .is_ok());
+
+    let signature = wire::decode_base64url(DER_SIGNATURE_B64).unwrap();
+    assert_eq!(
+        String::from_utf8(approval_body(approval_id, &signature)).unwrap(),
+        format!(r#"{{"approval_id":"{approval_id}","signature":"{DER_SIGNATURE_B64}"}}"#)
+    );
+
+    // The audience follows the run's pair: the staging host only when a staging build selected it.
+    let staging_aud = with_staging(|| {
+        assert_eq!(approval_audience("https://api.ottto.net"), "app.ottto.net");
+        approval_audience(STAGING_API)
+    });
+    assert_eq!(staging_aud, "staging.example.invalid");
+    assert_eq!(approval_audience(STAGING_API), "app.ottto.net");
+    let staging = canonical(&facts("connect", Value::Null, staging_aud, account));
+    assert!(check_for(&staging, staging_aud).is_ok());
+    assert_eq!(check(&staging).unwrap_err().code, "invalid_server_field");
+    assert_eq!(
+        check_for(&payload, staging_aud).unwrap_err().code,
+        "invalid_server_field"
+    );
+    let mut other_target = facts("connect", Value::Null, "app.ottto.net", account);
+    other_target["target"]["kind"] = json!("gcp_project");
+    assert_eq!(
+        check(&canonical(&other_target)).unwrap_err().code,
+        "invalid_server_field"
+    );
+
+    for (payload, code) in [
+        (
+            facts("connect", Value::Null, "staging", account),
+            "invalid_server_field",
+        ),
+        (
+            facts("replace", Value::Null, "app.ottto.net", account),
+            "invalid_server_field",
+        ),
+        (
+            facts("connect", Value::Null, "app.ottto.net", "000000000002"),
+            "account_mismatch",
+        ),
+    ] {
+        assert_eq!(check(&canonical(&payload)).unwrap_err().code, code);
+    }
+}
+
+/// [behaviour] The server's approval signing vector passes the service's fact checks unchanged,
+/// and the R5 body carries its approval ID and signature exactly as the server accepts them.
+#[test]
+fn approval_signing_vector_reaches_r5_unchanged() {
+    use super::agent::{approval_body, checked_approval, ApprovalScope};
+    let vector = fixture(APPROVAL_SIGNATURE);
+    let payload_b64 = text(&vector, "payload_b64");
+    let payload = wire::decode_base64url(payload_b64).unwrap();
+    let facts: Value = serde_json::from_slice(&payload).unwrap();
+    let approval_id = text(&facts, "approval_id");
+    let attempt_id = text(&facts, "attempt_id");
+    let account = text(&facts["target"], "id");
+    // sign_by 1764000600 as the R2 approval object states it.
+    let approval = json!({
+        "approval_id": approval_id, "payload_b64": payload_b64,
+        "sign_by": "2025-11-24T16:10:00Z", "next_actions": ["approve_on_mac"],
+    });
+    let attempt = json!({"attempt_id": attempt_id, "account_id": account, "input_revision": 1});
+    let scope = ApprovalScope {
+        audience: "app.ottto.net",
+        organization_id: text(&facts, "org_id"),
+        attempt_id,
+        account,
+    };
+    let checked = checked_approval(&approval, &attempt, &scope).unwrap();
+    assert_eq!(checked.payload, payload);
+    assert_eq!(checked.sign_by, 1_764_000_600);
+    let signature = text(&vector, "signature");
+    let body = approval_body(
+        &checked.approval_id,
+        &wire::decode_base64url(signature).unwrap(),
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        format!(r#"{{"approval_id":"{approval_id}","signature":"{signature}"}}"#)
+    );
 }

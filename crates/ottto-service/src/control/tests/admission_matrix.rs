@@ -211,6 +211,65 @@ const ROWS: &[Row] = &[
         cells: [I, N, N, N, A, A, I, I, I, P, P, A],
     },
     Row {
+        name: "CloudConnectCancel",
+        authority: "LocalCli",
+        sample: || LocalControlCommand::CloudConnectCancel {
+            attempt_id: "".into(),
+            timeout_ms: 0,
+        },
+        cells: [I, N, N, N, A, A, O, A, A, P, P, A],
+    },
+    Row {
+        name: "CloudConnectPoll",
+        authority: "LocalCli",
+        sample: || LocalControlCommand::CloudConnectPoll {
+            attempt_id: "".into(),
+            observed_aws_account_id: "".into(),
+            timeout_ms: 0,
+        },
+        cells: [I, N, N, N, A, A, O, A, A, P, P, A],
+    },
+    Row {
+        name: "CloudConnectSubmit",
+        authority: "LocalCli",
+        sample: || LocalControlCommand::CloudConnectSubmit {
+            attempt_id: "".into(),
+            body: ottto_protocol::CloudConnectSubmit {
+                input_revision: 0,
+                account_id: "".into(),
+                stack_id: "".into(),
+                request_id: "".into(),
+            },
+            timeout_ms: 0,
+        },
+        cells: [I, N, N, N, A, A, O, A, A, P, P, A],
+    },
+    Row {
+        name: "CloudConnectEnsure",
+        authority: "LocalCli",
+        sample: || LocalControlCommand::CloudConnectEnsure {
+            body: ottto_protocol::CloudConnectEnsure {
+                source: "".into(),
+                reconnect: false,
+                restart: false,
+                metrics: false,
+                client_request_id: "".into(),
+                observed_aws_account_id: "".into(),
+            },
+            timeout_ms: 0,
+        },
+        cells: [I, N, N, N, A, A, O, A, A, P, P, A],
+    },
+    Row {
+        name: "CloudConnectStatus",
+        authority: "LocalCli",
+        sample: || LocalControlCommand::CloudConnectStatus {
+            attempt_id: None,
+            timeout_ms: 0,
+        },
+        cells: [I, N, N, N, A, A, O, A, A, P, P, A],
+    },
+    Row {
         name: "AuthStart",
         authority: "Local",
         sample: || LocalControlCommand::AuthStart,
@@ -634,6 +693,11 @@ fn row_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AgentSessions { .. } => "AgentSessions",
         LocalControlCommand::AgentRecommendations { .. } => "AgentRecommendations",
         LocalControlCommand::AgentProviderImpact { .. } => "AgentProviderImpact",
+        LocalControlCommand::CloudConnectStatus { .. } => "CloudConnectStatus",
+        LocalControlCommand::CloudConnectEnsure { .. } => "CloudConnectEnsure",
+        LocalControlCommand::CloudConnectSubmit { .. } => "CloudConnectSubmit",
+        LocalControlCommand::CloudConnectPoll { .. } => "CloudConnectPoll",
+        LocalControlCommand::CloudConnectCancel { .. } => "CloudConnectCancel",
         LocalControlCommand::CloudStatus { .. } => "CloudStatus",
         LocalControlCommand::AuthStart => "AuthStart",
         LocalControlCommand::AuthComplete { .. } => "AuthComplete",
@@ -1064,7 +1128,7 @@ fn assert_boundary(
 fn matrix_names_are_unique_exhaustive_and_cells_match_authority() {
     let names: BTreeSet<_> = ROWS.iter().map(|row| row.name).collect();
     let samples: BTreeSet<_> = ROWS.iter().map(|row| row_name(&(row.sample)())).collect();
-    assert_eq!(ROWS.len(), 65);
+    assert_eq!(ROWS.len(), 70);
     assert_eq!(names.len(), ROWS.len());
     assert_eq!(names, samples);
     assert_eq!(

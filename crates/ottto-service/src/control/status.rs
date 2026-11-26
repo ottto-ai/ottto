@@ -231,37 +231,53 @@ fn observe_setup_run_read<T>(
 }
 
 /// `ottto cloud status`: read-only connector status through the setup-run
-/// bridge. Connecting or changing a cloud connector happens in the web app.
+/// bridge, plus whether this service serves the Mac app's signer. Attempt-specific status and
+/// Bedrock setup use the cloud-connect control commands.
 pub(super) fn cloud_status(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     source: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_status_source(source.as_deref())?;
-    observe_setup_run_read(
+    let (mut status, web) = observe_setup_run_read(
         daemon,
         authorization,
         "ottto cloud",
-        |api_base_url, connection, setup_run_token| match cloud_status_with_base(
-            api_base_url,
-            connection,
-            setup_run_token,
-            source.as_deref(),
-        ) {
-            Ok(value) => Ok(value),
-            Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-                let refreshed =
-                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                cloud_status_with_base(
-                    api_base_url,
-                    &refreshed.connection,
-                    &refreshed.setup_run_token,
-                    source.as_deref(),
-                )
+        |api_base_url, connection, setup_run_token| {
+            let web = crate::control::cloud_connect::paired_connect_url(api_base_url);
+            match cloud_status_with_base(
+                api_base_url,
+                connection,
+                setup_run_token,
+                source.as_deref(),
+            ) {
+                Ok(value) => Ok(value),
+                Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+                    let refreshed =
+                        refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                    cloud_status_with_base(
+                        api_base_url,
+                        &refreshed.connection,
+                        &refreshed.setup_run_token,
+                        source.as_deref(),
+                    )
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
+            .map(|value| (value, web))
         },
-    )
+    )?;
+    // The connections link names the web origin compiled for this API, never the server's own.
+    crate::control::cloud_connect::set_connect_url(&mut status, web);
+    if let Some(status) = status.as_object_mut() {
+        let signer = if crate::control::cloud_connect::signer_available() {
+            "available"
+        } else {
+            "unavailable"
+        };
+        status.insert("signer".to_string(), serde_json::Value::from(signer));
+    }
+    Ok(status)
 }
 
 pub(super) fn validate_cloud_status_source(source: Option<&str>) -> Result<(), LocalApiError> {

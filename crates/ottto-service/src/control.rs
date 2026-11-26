@@ -284,8 +284,11 @@ use backend_http::reattach_required_state;
 #[cfg(test)]
 use backend_http::safe_backend_body_excerpt;
 use backend_http::safe_backend_endpoint;
+use backend_http::staging_pair;
 pub(crate) use backend_http::terminal_refresh_rejection;
 use backend_http::validated_api_base_url;
+#[cfg(test)]
+use backend_http::with_test_staging_pair;
 pub(crate) use backend_http::TerminalRefreshRejection;
 #[cfg(test)]
 use backend_http::MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE;
@@ -1319,6 +1322,13 @@ fn handle_command(
             agent_provider_impact(daemon, &authorization, query)
         }
         LocalControlCommand::CloudStatus { source } => cloud_status(daemon, &authorization, source),
+        command @ (LocalControlCommand::CloudConnectStatus { .. }
+        | LocalControlCommand::CloudConnectEnsure { .. }
+        | LocalControlCommand::CloudConnectSubmit { .. }
+        | LocalControlCommand::CloudConnectPoll { .. }
+        | LocalControlCommand::CloudConnectCancel { .. }) => {
+            Ok(cloud_connect::dispatch_agent(daemon, command))
+        }
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
