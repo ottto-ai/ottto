@@ -62,7 +62,7 @@ fn assert_sibling(index: &ScanIndex) {
 }
 
 #[test]
-fn lenient_positive_matrix_load_and_both_cas_readers() {
+fn lenient_positive_matrix_load_and_cas_save() {
     for (field, key, bad) in [
         ("snapshot_activity_at", format!("{:064x}", 1), "17"),
         ("snapshot_activity_at", format!("{:064x}", 1), "1e400"),
@@ -74,48 +74,42 @@ fn lenient_positive_matrix_load_and_both_cas_readers() {
             "{\"invalid\":true}",
         ),
     ] {
-        for bounded in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-positive");
-            let path = scratch.as_ref().join("index.json");
-            let working = fixture();
-            write_decoder_fixture(&working, &path);
-            let mut value = serde_json::to_value(&working).unwrap();
-            let sentinel = "HOSTILE_RAW_TOKEN";
-            if field == "snapshot_activity_at" {
-                value[field][&key] = Value::String(sentinel.into());
-            } else {
-                value[field]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(Value::String(sentinel.into()));
-            }
-            let bytes = serde_json::to_string(&value)
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-positive");
+        let path = scratch.as_ref().join("index.json");
+        let working = fixture();
+        write_decoder_fixture(&working, &path);
+        let mut value = serde_json::to_value(&working).unwrap();
+        let sentinel = "HOSTILE_RAW_TOKEN";
+        if field == "snapshot_activity_at" {
+            value[field][&key] = Value::String(sentinel.into());
+        } else {
+            value[field]
+                .as_array_mut()
                 .unwrap()
-                .replace(&format!("\"{sentinel}\""), bad)
-                .into_bytes();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-            let before = scan_index_containment_lines_for_test().len();
-            let loaded = read_decoder_fixture(&path).unwrap();
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert_eq!(loaded.generation, working.generation);
-            assert_sibling(&loaded);
-            assert!(loaded.decode_holds.is_empty());
-            assert_eq!(corrupt_count(scratch.as_ref()), 0);
-            let lines = scan_index_containment_lines_for_test();
-            assert!(lines[before..]
-                .iter()
-                .any(|line| line.contains("index kept")));
-            assert!(lines[before..]
-                .iter()
-                .all(|line| !line.contains("HOSTILE") && !line.contains("synthetic")));
-            let mut native = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            if bounded {
-                native.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                native.save(&path).unwrap();
-            }
-            assert_sibling(&ScanIndex::load(&path).unwrap());
+                .push(Value::String(sentinel.into()));
         }
+        let bytes = serde_json::to_string(&value)
+            .unwrap()
+            .replace(&format!("\"{sentinel}\""), bad)
+            .into_bytes();
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+        let before = scan_index_containment_lines_for_test().len();
+        let loaded = read_decoder_fixture(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(loaded.generation, working.generation);
+        assert_sibling(&loaded);
+        assert!(loaded.decode_holds.is_empty());
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        let lines = scan_index_containment_lines_for_test();
+        assert!(lines[before..]
+            .iter()
+            .any(|line| line.contains("index kept")));
+        assert!(lines[before..]
+            .iter()
+            .all(|line| !line.contains("HOSTILE") && !line.contains("synthetic")));
+        let mut native = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+        native.save(&path).unwrap();
+        assert_sibling(&ScanIndex::load(&path).unwrap());
     }
 }
 
@@ -144,79 +138,69 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
         ),
     ];
     for (field, key, bad) in cases {
-        for bounded in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-hold");
-            let path = scratch.as_ref().join("index.json");
-            let mut working = fixture();
-            write_decoder_fixture(&working, &path);
-            let generation = working.generation;
-            let mut value = serde_json::to_value(&working).unwrap();
-            if value.get(field).is_none() {
-                value[field] = serde_json::json!({});
-            }
-            value[field][&key] = bad.clone();
-            let bytes = serde_json::to_vec_pretty(&value).unwrap();
-            let original_slot = raw_slot(&bytes, field, &key);
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-            let result = if bounded {
-                working.save_with_read_limit(&path, 1024 * 1024)
-            } else {
-                working.save(&path)
-            };
-            assert!(
-                result.is_err(),
-                "an unadopted working graph cannot replace decoder input"
-            );
-            assert_eq!(working.generation, generation);
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-            assert_eq!(corrupt_count(scratch.as_ref()), 0);
-            let lines_before = scan_index_containment_lines_for_test().len();
-            let mut loaded = read_decoder_fixture(&path).unwrap();
-            let lines = scan_index_containment_lines_for_test();
-            assert_eq!(lines.len() - lines_before, 1);
-            assert!(lines[lines_before].contains("decode_held=1"));
-            assert!(!lines[lines_before].contains("PRIVATE_FUTURE_DISPOSITION"));
-            assert!(!lines[lines_before].contains("synthetic"));
-            assert!(!loaded.decode_holds.is_empty());
-            assert_sibling(&loaded);
-            assert_eq!(loaded.generation, generation);
-            if field == "quarantined_snapshot_fingerprints" {
-                loaded
-                    .reason_reoffer_retries
-                    .insert(key.clone(), "lease".into());
-                assert!(!loaded.quarantine_requires_retry(&key));
-                assert!(!loaded.quarantine_requires_retry_body(&key, "different-body"));
-            } else if field == "files" {
-                assert!(loaded.decode_holds_file(&key));
-                assert!(loaded.decode_holds_indexed_entity(&key, &format!("{:064x}", 0)));
-                loaded.remove_file_entry(&key);
-                assert!(loaded.file_snapshot_fingerprints.contains_key(&key));
-            } else {
-                assert!(loaded.decode_holds_family(&key));
-            }
-            let subset = loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
-            assert!(subset.decode_holds.same_as(&loaded.decode_holds));
-            let subset_bytes = serde_json::to_vec_pretty(&subset).unwrap();
-            assert_eq!(raw_slot(&subset_bytes, field, &key), original_slot);
-            loaded.resume_after_path = Some("unrelated-progress".into());
-            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            if bounded {
-                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                loaded.save(&path).unwrap();
-            }
-            assert_eq!(
-                raw_slot(
-                    &serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap(),
-                    field,
-                    &key
-                ),
-                original_slot
-            );
-            let restarted = ScanIndex::load(&path).unwrap();
-            assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
-            assert_sibling(&restarted);
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-hold");
+        let path = scratch.as_ref().join("index.json");
+        let mut working = fixture();
+        write_decoder_fixture(&working, &path);
+        let generation = working.generation;
+        let mut value = serde_json::to_value(&working).unwrap();
+        if value.get(field).is_none() {
+            value[field] = serde_json::json!({});
         }
+        value[field][&key] = bad.clone();
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        let original_slot = raw_slot(&bytes, field, &key);
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+        let result = working.save(&path);
+        assert!(
+            result.is_err(),
+            "an unadopted working graph cannot replace decoder input"
+        );
+        assert_eq!(working.generation, generation);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        let lines_before = scan_index_containment_lines_for_test().len();
+        let mut loaded = read_decoder_fixture(&path).unwrap();
+        let lines = scan_index_containment_lines_for_test();
+        assert_eq!(lines.len() - lines_before, 1);
+        assert!(lines[lines_before].contains("decode_held=1"));
+        assert!(!lines[lines_before].contains("PRIVATE_FUTURE_DISPOSITION"));
+        assert!(!lines[lines_before].contains("synthetic"));
+        assert!(!loaded.decode_holds.is_empty());
+        assert_sibling(&loaded);
+        assert_eq!(loaded.generation, generation);
+        if field == "quarantined_snapshot_fingerprints" {
+            loaded
+                .reason_reoffer_retries
+                .insert(key.clone(), "lease".into());
+            assert!(!loaded.quarantine_requires_retry(&key));
+            assert!(!loaded.quarantine_requires_retry_body(&key, "different-body"));
+        } else if field == "files" {
+            assert!(loaded.decode_holds_file(&key));
+            assert!(loaded.decode_holds_indexed_entity(&key, &format!("{:064x}", 0)));
+            loaded.remove_file_entry(&key);
+            assert!(loaded.file_snapshot_fingerprints.contains_key(&key));
+        } else {
+            assert!(loaded.decode_holds_family(&key));
+        }
+        let subset = loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+        assert!(subset.decode_holds.same_as(&loaded.decode_holds));
+        let subset_bytes = serde_json::to_vec_pretty(&subset).unwrap();
+        assert_eq!(raw_slot(&subset_bytes, field, &key), original_slot);
+        loaded.resume_after_path = Some("unrelated-progress".into());
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+        loaded.save(&path).unwrap();
+        assert_eq!(
+            raw_slot(
+                &serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap(),
+                field,
+                &key
+            ),
+            original_slot
+        );
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
+        assert_sibling(&restarted);
     }
 }
 
@@ -241,30 +225,24 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
             if field == "generation" && bad == "256" {
                 continue;
             }
-            for bounded in [false, true] {
-                let scratch = crate::test_scratch::ScratchDir::new("lenient-controls");
-                let path = scratch.as_ref().join("index.json");
-                let mut working = fixture();
-                write_decoder_fixture(&working, &path);
-                let generation = working.generation;
-                let mut value = serde_json::to_value(&working).unwrap();
-                value[field] = Value::String("CONTROL_TOKEN".into());
-                let bytes = serde_json::to_string(&value)
-                    .unwrap()
-                    .replace("\"CONTROL_TOKEN\"", bad)
-                    .into_bytes();
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-                assert!(read_decoder_fixture(&path).is_err(), "{field} {bad}");
-                let result = if bounded {
-                    working.save_with_read_limit(&path, 1024 * 1024)
-                } else {
-                    working.save(&path)
-                };
-                assert!(result.is_err(), "{field} {bad}");
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-                assert_eq!(working.generation, generation);
-                assert_eq!(corrupt_count(scratch.as_ref()), 0);
-            }
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-controls");
+            let path = scratch.as_ref().join("index.json");
+            let mut working = fixture();
+            write_decoder_fixture(&working, &path);
+            let generation = working.generation;
+            let mut value = serde_json::to_value(&working).unwrap();
+            value[field] = Value::String("CONTROL_TOKEN".into());
+            let bytes = serde_json::to_string(&value)
+                .unwrap()
+                .replace("\"CONTROL_TOKEN\"", bad)
+                .into_bytes();
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+            assert!(read_decoder_fixture(&path).is_err(), "{field} {bad}");
+            let result = working.save(&path);
+            assert!(result.is_err(), "{field} {bad}");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(working.generation, generation);
+            assert_eq!(corrupt_count(scratch.as_ref()), 0);
         }
     }
 }
@@ -461,7 +439,7 @@ fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
             index.claude_usage_authority_quarantine["family"].proof_correction
         );
         loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-        loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        loaded.save(&path).unwrap();
         // Losing a family witness must also freeze its intact correction debt.
         let mut value = serde_json::to_value(&loaded).unwrap();
         value["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
@@ -497,9 +475,7 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
         Value::Array(vec![Value::Null; crate::snapshot_retry::STATE_NODES]);
     let bytes = serde_json::to_vec(&value).unwrap();
     e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-    assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-    assert!(index.save_with_read_limit(&path, bytes.len() - 1).is_err());
+    assert!(index.save(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     let mut value = serde_json::to_value(&index).unwrap();
     value["unknown_padding"] = Value::String("p".repeat(1024 * 1024));
@@ -560,7 +536,6 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
         e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         assert!(read_decoder_fixture(&path).is_err());
         assert!(index.save(&path).is_err());
-        assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(corrupt_count(scratch.as_ref()), 0);
     }
@@ -580,88 +555,75 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
 
 #[test]
 fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_reload() {
-    for bounded in [false, true] {
-        for changed_again in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-repair-provenance");
-            let path = scratch.as_ref().join("index.json");
-            let fingerprint = "e".repeat(64);
-            let mut index = fixture();
-            index.file_snapshot_fingerprints.insert(
-                "/synthetic/0.jsonl".into(),
-                BTreeSet::from([fingerprint.clone()]),
-            );
-            index
-                .snapshot_activity_at
-                .insert(fingerprint.clone(), Some("2026-10-22T00:00:00Z".into()));
-            write_decoder_fixture(&index, &path);
-            let mut value = serde_json::to_value(&index).unwrap();
-            value["quarantined_snapshot_fingerprints"][&fingerprint]
-                ["failed_reconstruction_count"] = serde_json::json!(300);
-            e2_pipeline_scan_fixture::legacy_input_for_test(
-                &path,
-                &serde_json::to_vec(&value).unwrap(),
-            );
-            let mut loaded = read_decoder_fixture(&path).unwrap();
-            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            loaded.retain_quarantined_fingerprints(&BTreeMap::new());
-            loaded.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
-            assert!(!loaded
-                .quarantined_snapshot_fingerprints
-                .contains_key(&fingerprint));
-            if changed_again {
-                value["quarantined_snapshot_fingerprints"][&fingerprint]
-                    ["failed_reconstruction_count"] = serde_json::json!(400);
-            }
-            let bytes = serde_json::to_vec(&value).unwrap();
-            if changed_again {
-                e2_pipeline_scan_fixture::seed_json_for_test(&path, &bytes);
-            }
-            let generation = loaded.generation;
-            let result = if bounded {
-                loaded.save_with_read_limit(&path, 1024 * 1024)
-            } else {
-                loaded.save(&path)
-            };
-            if changed_again {
-                assert!(result.is_err(), "a superseded native owner must reload");
-                assert_eq!(loaded.generation, generation);
-            } else {
-                result.unwrap();
-                let reloaded = ScanIndex::load(&path).unwrap();
-                assert!(reloaded.accepted_snapshot_fingerprint_recorded(&fingerprint));
-                assert!(!reloaded
-                    .quarantined_snapshot_fingerprints
-                    .contains_key(&fingerprint));
-            }
-        }
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-authority-advance");
+    for changed_again in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-repair-provenance");
         let path = scratch.as_ref().join("index.json");
+        let fingerprint = "e".repeat(64);
         let mut index = fixture();
-        index.insert_retry_pending_claude_authority_for_test("family");
+        index.file_snapshot_fingerprints.insert(
+            "/synthetic/0.jsonl".into(),
+            BTreeSet::from([fingerprint.clone()]),
+        );
+        index
+            .snapshot_activity_at
+            .insert(fingerprint.clone(), Some("2026-10-22T00:00:00Z".into()));
         write_decoder_fixture(&index, &path);
         let mut value = serde_json::to_value(&index).unwrap();
-        value["claude_usage_authority_quarantine"]["family"]["failed_reconstruction_count"] =
+        value["quarantined_snapshot_fingerprints"][&fingerprint]["failed_reconstruction_count"] =
             serde_json::json!(300);
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
             &serde_json::to_vec(&value).unwrap(),
         );
         let mut loaded = read_decoder_fixture(&path).unwrap();
-        loaded.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
         loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-        if bounded {
-            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-        } else {
-            loaded.save(&path).unwrap();
+        loaded.retain_quarantined_fingerprints(&BTreeMap::new());
+        loaded.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
+        assert!(!loaded
+            .quarantined_snapshot_fingerprints
+            .contains_key(&fingerprint));
+        if changed_again {
+            value["quarantined_snapshot_fingerprints"][&fingerprint]
+                ["failed_reconstruction_count"] = serde_json::json!(400);
         }
-        assert_eq!(
-            ScanIndex::load(&path)
-                .unwrap()
-                .claude_usage_authority_quarantine["family"]
-                .disposition,
-            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
-        );
+        let bytes = serde_json::to_vec(&value).unwrap();
+        if changed_again {
+            e2_pipeline_scan_fixture::seed_json_for_test(&path, &bytes);
+        }
+        let generation = loaded.generation;
+        let result = loaded.save(&path);
+        if changed_again {
+            assert!(result.is_err(), "a superseded native owner must reload");
+            assert_eq!(loaded.generation, generation);
+        } else {
+            result.unwrap();
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert!(reloaded.accepted_snapshot_fingerprint_recorded(&fingerprint));
+            assert!(!reloaded
+                .quarantined_snapshot_fingerprints
+                .contains_key(&fingerprint));
+        }
     }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-authority-advance");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.insert_retry_pending_claude_authority_for_test("family");
+    write_decoder_fixture(&index, &path);
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["claude_usage_authority_quarantine"]["family"]["failed_reconstruction_count"] =
+        serde_json::json!(300);
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&value).unwrap());
+    let mut loaded = read_decoder_fixture(&path).unwrap();
+    loaded.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+    loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+    loaded.save(&path).unwrap();
+    assert_eq!(
+        ScanIndex::load(&path)
+            .unwrap()
+            .claude_usage_authority_quarantine["family"]
+            .disposition,
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+    );
 }
 #[test]
 fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
@@ -749,7 +711,7 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
 }
 
 /// [money] An invalid optional census must not erase a sibling's durable ACK
-/// during load, either CAS writer, or restart. Depth 257 crosses the decoder
+/// during load, the CAS writer, or restart. Depth 257 crosses the decoder
 /// limit with a small fixture; allocation measurements add no money behaviour.
 #[test]
 fn sibling_ack_survives_lenient_optional_decode_failure() {
@@ -765,18 +727,12 @@ fn sibling_ack_survives_lenient_optional_decode_failure() {
         .retain(|key| key == &sibling);
     write_decoder_fixture(&seed, &path);
     let prefix = fs::read(&path).unwrap();
-    let input_len = write_deep_optional(&path, &prefix, 257);
+    write_deep_optional(&path, &prefix, 257);
     let loaded = read_decoder_fixture(&path).unwrap();
     assert_sibling(&loaded);
     assert!(loaded.claude_request_census.is_empty());
     let mut ordinary = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
     ordinary.save(&path).unwrap();
-    let restarted = ScanIndex::load(&path).unwrap();
-    assert_sibling(&restarted);
-    assert!(restarted.claude_request_census.is_empty());
-    write_deep_optional(&path, &prefix, 257);
-    let mut bounded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-    bounded.save_with_read_limit(&path, input_len).unwrap();
     let restarted = ScanIndex::load(&path).unwrap();
     assert_sibling(&restarted);
     assert!(restarted.claude_request_census.is_empty());
@@ -797,16 +753,9 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
     .into_bytes();
     e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(format!("{:#}", read_decoder_fixture(&path).unwrap_err()).contains("resource cap"));
-    for bounded in [false, true] {
-        let result = if bounded {
-            seed.save_with_read_limit(&path, bytes.len())
-        } else {
-            seed.save(&path)
-        };
-        assert!(result.is_err());
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-    }
+    assert!(seed.save(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
     for invalid in [
         "{\"files\":{},\"unknown\":[}",
         "{\"files\":{},\"unknown\":[0 1]}",
@@ -879,71 +828,64 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
 #[test]
 fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restart() {
     for exact_empty in [false, true] {
-        for bounded in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-incidence-ack");
-            let path = scratch.as_ref().join("index.json");
-            let mut seed = fixture();
-            let key = "/synthetic/0.jsonl";
-            let ack = format!("{:064x}", 0);
-            seed.file_snapshot_fingerprints.remove(key);
-            if exact_empty {
-                seed.file_snapshot_fingerprints
-                    .insert(key.into(), BTreeSet::new());
-            }
-            write_decoder_fixture(&seed, &path);
-            let mut value = serde_json::to_value(&seed).unwrap();
-            value["files"][key] = Value::Bool(false);
-            e2_pipeline_scan_fixture::legacy_input_for_test(
-                &path,
-                &serde_json::to_vec(&value).unwrap(),
-            );
-            let mut loaded = read_decoder_fixture(&path).unwrap();
-            assert!(loaded.decode_holds_file(key));
-            assert_eq!(loaded.decode_has_opaque_file_incidence(), !exact_empty);
-            assert!(loaded.accepted_snapshot_fingerprints.contains(&ack));
-            loaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-            assert_eq!(
-                loaded.accepted_snapshot_fingerprints.contains(&ack),
-                !exact_empty
-            );
-            loaded.retain_quarantined_fingerprints(&BTreeMap::new());
-            assert_eq!(
-                loaded.accepted_snapshot_fingerprints.contains(&ack),
-                !exact_empty
-            );
-            let subset = loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
-            assert_eq!(
-                subset.accepted_snapshot_fingerprints.contains(&ack),
-                !exact_empty
-            );
-            if !exact_empty {
-                let mut tentative = loaded.clone();
-                tentative
-                    .file_snapshot_fingerprints
-                    .insert(key.into(), BTreeSet::new());
-                assert!(!tentative.decode_has_opaque_file_incidence());
-                let partial =
-                    tentative.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
-                assert!(partial.decode_has_opaque_file_incidence());
-                assert!(partial.accepted_snapshot_fingerprints.contains(&ack));
-            }
-            assert!(!loaded
-                .eligible_snapshot_fingerprint_refs()
-                .any(|fp| fp == ack));
-            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            if bounded {
-                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                loaded.save(&path).unwrap();
-            }
-            let restarted = ScanIndex::load(&path).unwrap();
-            assert_eq!(
-                restarted.accepted_snapshot_fingerprints.contains(&ack),
-                !exact_empty
-            );
-            assert_eq!(restarted.decode_has_opaque_file_incidence(), !exact_empty);
-            assert_sibling(&restarted);
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-incidence-ack");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        let key = "/synthetic/0.jsonl";
+        let ack = format!("{:064x}", 0);
+        seed.file_snapshot_fingerprints.remove(key);
+        if exact_empty {
+            seed.file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::new());
         }
+        write_decoder_fixture(&seed, &path);
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["files"][key] = Value::Bool(false);
+        e2_pipeline_scan_fixture::legacy_input_for_test(
+            &path,
+            &serde_json::to_vec(&value).unwrap(),
+        );
+        let mut loaded = read_decoder_fixture(&path).unwrap();
+        assert!(loaded.decode_holds_file(key));
+        assert_eq!(loaded.decode_has_opaque_file_incidence(), !exact_empty);
+        assert!(loaded.accepted_snapshot_fingerprints.contains(&ack));
+        loaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints.contains(&ack),
+            !exact_empty
+        );
+        loaded.retain_quarantined_fingerprints(&BTreeMap::new());
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints.contains(&ack),
+            !exact_empty
+        );
+        let subset = loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            subset.accepted_snapshot_fingerprints.contains(&ack),
+            !exact_empty
+        );
+        if !exact_empty {
+            let mut tentative = loaded.clone();
+            tentative
+                .file_snapshot_fingerprints
+                .insert(key.into(), BTreeSet::new());
+            assert!(!tentative.decode_has_opaque_file_incidence());
+            let partial = tentative.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+            assert!(partial.decode_has_opaque_file_incidence());
+            assert!(partial.accepted_snapshot_fingerprints.contains(&ack));
+        }
+        assert!(!loaded
+            .eligible_snapshot_fingerprint_refs()
+            .any(|fp| fp == ack));
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+        loaded.save(&path).unwrap();
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            restarted.accepted_snapshot_fingerprints.contains(&ack),
+            !exact_empty
+        );
+        assert_eq!(restarted.decode_has_opaque_file_incidence(), !exact_empty);
+        assert_sibling(&restarted);
     }
 }
 
@@ -1034,49 +976,43 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
                 valid,
                 "{field}: {bad}"
             );
-            for bounded in [false, true] {
-                let scratch = crate::test_scratch::ScratchDir::new("si-strict-refusal");
-                let path = scratch.as_ref().join("index.json");
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-                let before = scan_index_containment_lines_for_test().len();
-                let loaded = read_decoder_fixture(&path);
-                let mut working = seed.clone();
-                let saved = if bounded {
-                    working.save_with_read_limit(&path, 1024 * 1024)
-                } else {
-                    working.save(&path)
-                };
-                if valid {
-                    let decoded = loaded.unwrap();
-                    let mut native = e2_pipeline_scan_fixture::seed_index_for_test(&decoded, &path);
-                    native.save(&path).unwrap();
-                    continue;
-                }
-                assert!(loaded.is_err(), "{field}: {bad}");
-                assert!(saved.is_err(), "{field}: {bad}");
-                assert_eq!(working.generation, 37);
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-                assert_eq!(corrupt_count(scratch.as_ref()), 0);
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&bytes).unwrap()["generation"],
-                    37
-                );
-                let lines = scan_index_containment_lines_for_test();
-                assert_eq!(
-                    lines[before..]
-                        .iter()
-                        .filter(|s| s.contains("refusal_kind=strict_decode"))
-                        .count(),
-                    1
-                );
-                assert!(lines[before..]
-                    .iter()
-                    .all(|s| !s.contains("sibling-session") && !s.contains("bad")));
+            let scratch = crate::test_scratch::ScratchDir::new("si-strict-refusal");
+            let path = scratch.as_ref().join("index.json");
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+            let before = scan_index_containment_lines_for_test().len();
+            let loaded = read_decoder_fixture(&path);
+            let mut working = seed.clone();
+            let saved = working.save(&path);
+            if valid {
+                let decoded = loaded.unwrap();
+                let mut native = e2_pipeline_scan_fixture::seed_index_for_test(&decoded, &path);
+                native.save(&path).unwrap();
+                continue;
             }
+            assert!(loaded.is_err(), "{field}: {bad}");
+            assert!(saved.is_err(), "{field}: {bad}");
+            assert_eq!(working.generation, 37);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(corrupt_count(scratch.as_ref()), 0);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["generation"],
+                37
+            );
+            let lines = scan_index_containment_lines_for_test();
+            assert_eq!(
+                lines[before..]
+                    .iter()
+                    .filter(|s| s.contains("refusal_kind=strict_decode"))
+                    .count(),
+                1
+            );
+            assert!(lines[before..]
+                .iter()
+                .all(|s| !s.contains("sibling-session") && !s.contains("bad")));
         }
     }
     // Actual contained damage elsewhere permits commit without touching this
-    // independent binding's canonical slot, through both CAS readers.
+    // independent binding's canonical slot, through the CAS save.
     {
         let scratch = crate::test_scratch::ScratchDir::new("si-binding-control");
         let path = scratch.as_ref().join("index.json");
@@ -1120,44 +1056,33 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
 
 #[test]
 fn si_unknown_contract_persists_through_save_and_restart() {
-    for bounded in [false, true] {
-        let scratch = crate::test_scratch::ScratchDir::new("si-unknown-contract");
-        let path = scratch.as_ref().join("index.json");
-        let mut seed = fixture();
-        seed.claude_request_identity_contract = Some("FUTURE_UNKNOWN".into());
-        write_decoder_fixture(&seed, &path);
-        let mut loaded = read_decoder_fixture(&path).unwrap();
-        assert_eq!(
-            loaded.claude_request_identity_contract.as_deref(),
-            Some("FUTURE_UNKNOWN")
-        );
-        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-        if bounded {
-            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-        } else {
-            loaded.save(&path).unwrap();
-        }
-        let restarted = ScanIndex::load(&path).unwrap();
-        assert_eq!(
-            restarted.claude_request_identity_contract,
-            loaded.claude_request_identity_contract
-        );
-        let generation = loaded.generation;
-        let mut bad = serde_json::to_value(&loaded).unwrap();
-        bad["claude_request_identity_contract"] = serde_json::json!(17);
-        let bytes = serde_json::to_vec(&bad).unwrap();
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-        assert!(read_decoder_fixture(&path).is_err());
-        assert!(if bounded {
-            loaded.save_with_read_limit(&path, 1024 * 1024)
-        } else {
-            loaded.save(&path)
-        }
-        .is_err());
-        assert_eq!(loaded.generation, generation);
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(corrupt_count(scratch.as_ref()), 0);
-    }
+    let scratch = crate::test_scratch::ScratchDir::new("si-unknown-contract");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.claude_request_identity_contract = Some("FUTURE_UNKNOWN".into());
+    write_decoder_fixture(&seed, &path);
+    let mut loaded = read_decoder_fixture(&path).unwrap();
+    assert_eq!(
+        loaded.claude_request_identity_contract.as_deref(),
+        Some("FUTURE_UNKNOWN")
+    );
+    loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+    loaded.save(&path).unwrap();
+    let restarted = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        restarted.claude_request_identity_contract,
+        loaded.claude_request_identity_contract
+    );
+    let generation = loaded.generation;
+    let mut bad = serde_json::to_value(&loaded).unwrap();
+    bad["claude_request_identity_contract"] = serde_json::json!(17);
+    let bytes = serde_json::to_vec(&bad).unwrap();
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+    assert!(read_decoder_fixture(&path).is_err());
+    assert!(loaded.save(&path).is_err());
+    assert_eq!(loaded.generation, generation);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
 
 #[test]
@@ -2258,11 +2183,7 @@ fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
                 assert_eq!(fs::read(&path).unwrap(), bytes);
                 assert_eq!(corrupt_count(scratch.as_ref()), 0);
                 let mut working = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-                if bounded {
-                    working.save_with_read_limit(&path, 1024 * 1024).unwrap();
-                } else {
-                    working.save(&path).unwrap();
-                }
+                working.save(&path).unwrap();
                 let mut restarted = ScanIndex::load(&path).unwrap();
                 assert_sibling(&restarted);
                 assert_eq!(restarted.generation, working.generation);
@@ -2498,81 +2419,75 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
 
 #[test]
 fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() {
-    for bounded in [false, true] {
-        for (case, damaged) in [
-            ("null", serde_json::json!(null)),
-            ("string", serde_json::json!("damaged-handoff")),
-            (
-                "negative-generation",
-                serde_json::json!({
-                    "destination_namespace_hash": "c".repeat(64),
-                    "committed_generation": -1,
-                    "bodies": {"d".repeat(64): "e".repeat(64)}
-                }),
-            ),
-        ] {
-            let scratch = crate::test_scratch::ScratchDir::new("lenient-ack-handoff");
-            let path = scratch.join("index.json");
-            let source = SnapshotSource::ClaudeCode;
-            let seed = override_identity_seed("handoff-owner");
-            write_decoder_fixture(&seed, &path);
-            let mut value = serde_json::to_value(&seed).unwrap();
-            value["upload_ack_retirement_handoff"] = damaged;
-            let bytes = serde_json::to_vec(&value).unwrap();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+    for (case, damaged) in [
+        ("null", serde_json::json!(null)),
+        ("string", serde_json::json!("damaged-handoff")),
+        (
+            "negative-generation",
+            serde_json::json!({
+                "destination_namespace_hash": "c".repeat(64),
+                "committed_generation": -1,
+                "bodies": {"d".repeat(64): "e".repeat(64)}
+            }),
+        ),
+    ] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-ack-handoff");
+        let path = scratch.join("index.json");
+        let source = SnapshotSource::ClaudeCode;
+        let seed = override_identity_seed("handoff-owner");
+        write_decoder_fixture(&seed, &path);
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["upload_ack_retirement_handoff"] = damaged;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
 
-            let before = scan_index_containment_lines_for_test().len();
-            let mut loaded = read_decoder_fixture(&path).unwrap();
-            assert!(!scan_index_rebuild_paused(source), "{case}");
-            assert!(loaded.upload_ack_retirement_handoff.is_none(), "{case}");
-            assert_identity_carried(&loaded, &seed, case);
-            assert_eq!(
-                loaded.accepted_snapshot_fingerprints,
-                seed.accepted_snapshot_fingerprints
-            );
-            assert_eq!(as_json(&loaded.files), as_json(&seed.files));
-            assert_eq!(
-                loaded.file_snapshot_fingerprints,
-                seed.file_snapshot_fingerprints
-            );
-            assert_eq!(loaded.snapshot_activity_at, seed.snapshot_activity_at);
-            assert_eq!(loaded.generation, seed.generation);
-            assert!(loaded.decode_holds.is_empty(), "{case}");
-            assert_eq!(
-                fs::read(&path).unwrap(),
-                bytes,
-                "load never rewrites {case}"
-            );
-            assert_eq!(corrupt_count(&scratch), 0);
-            assert!(
-                !scan_index_containment_lines_for_test()[before..]
-                    .iter()
-                    .any(|line| line.contains("source_paused=1")),
-                "{case}"
-            );
+        let before = scan_index_containment_lines_for_test().len();
+        let mut loaded = read_decoder_fixture(&path).unwrap();
+        assert!(!scan_index_rebuild_paused(source), "{case}");
+        assert!(loaded.upload_ack_retirement_handoff.is_none(), "{case}");
+        assert_identity_carried(&loaded, &seed, case);
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints,
+            seed.accepted_snapshot_fingerprints
+        );
+        assert_eq!(as_json(&loaded.files), as_json(&seed.files));
+        assert_eq!(
+            loaded.file_snapshot_fingerprints,
+            seed.file_snapshot_fingerprints
+        );
+        assert_eq!(loaded.snapshot_activity_at, seed.snapshot_activity_at);
+        assert_eq!(loaded.generation, seed.generation);
+        assert!(loaded.decode_holds.is_empty(), "{case}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "load never rewrites {case}"
+        );
+        assert_eq!(corrupt_count(&scratch), 0);
+        assert!(
+            !scan_index_containment_lines_for_test()[before..]
+                .iter()
+                .any(|line| line.contains("source_paused=1")),
+            "{case}"
+        );
 
-            // Both CAS readers must accept the repaired cleanup field, too.
-            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            if bounded {
-                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                loaded.save(&path).unwrap();
-            }
-            let (reloaded, origin) =
-                e2_pipeline_scan_fixture::load_source_for_test(&path, source, scratch.as_ref())
-                    .unwrap();
-            assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
-            assert!(reloaded.upload_ack_retirement_handoff.is_none());
-            assert_identity_carried(&reloaded, &seed, case);
-            assert_eq!(
-                reloaded.accepted_snapshot_fingerprints,
-                seed.accepted_snapshot_fingerprints
-            );
-            assert_eq!(
-                reloaded.file_snapshot_fingerprints,
-                seed.file_snapshot_fingerprints
-            );
-        }
+        // The CAS save must accept the repaired cleanup field, too.
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+        loaded.save(&path).unwrap();
+        let (reloaded, origin) =
+            e2_pipeline_scan_fixture::load_source_for_test(&path, source, scratch.as_ref())
+                .unwrap();
+        assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
+        assert!(reloaded.upload_ack_retirement_handoff.is_none());
+        assert_identity_carried(&reloaded, &seed, case);
+        assert_eq!(
+            reloaded.accepted_snapshot_fingerprints,
+            seed.accepted_snapshot_fingerprints
+        );
+        assert_eq!(
+            reloaded.file_snapshot_fingerprints,
+            seed.file_snapshot_fingerprints
+        );
     }
 }
 
@@ -3465,9 +3380,7 @@ fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override(
             );
             carried = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
             if bounded {
-                carried
-                    .save_with_read_limit(&path, 4 * 1024 * 1024)
-                    .unwrap();
+                carried.save(&path).unwrap();
             } else {
                 carried.save_fixture(&path).unwrap();
             }

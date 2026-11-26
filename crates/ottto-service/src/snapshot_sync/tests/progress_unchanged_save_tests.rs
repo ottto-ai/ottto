@@ -83,11 +83,8 @@ fn unchanged_pass_writes_no_progress_bytes() {
     f.progress.save_fixture(&f.path).unwrap();
     let generation = f.progress.generation;
     let progress = file(&f.path);
-    // Unchanged batch persist, bounded-retry persist and pass end.
+    // Unchanged batch persist and pass end.
     f.progress.save_fixture(&f.path).unwrap();
-    f.progress
-        .save_fixture_with_read_limit(&f.path, Some(crate::snapshot_retry::RESPONSE_BYTES))
-        .unwrap();
     f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, generation, "no generation claimed");
     assert_eq!(file(&f.path), progress, "progress: 0 bytes written");
@@ -191,8 +188,8 @@ fn compact_progress_decodes_across_pretty_writers() {
     assert_eq!(restored.generation, 4);
     assert_eq!(restored.accepted_cache_heads, progress.accepted_cache_heads);
 
-    // Every decode path reads compact bytes: full load, CAS stamp (plain and
-    // bounded) and the state-v2 owner check.
+    // Every decode path reads compact bytes: full load, CAS stamp and the
+    // state-v2 owner check.
     let namespace = progress.destination_namespace_hash.clone();
     let full: SnapshotUploadProgress = serde_json::from_slice(&compact_4).unwrap();
     assert_eq!(full.generation, 4);
@@ -202,9 +199,6 @@ fn compact_progress_decodes_across_pretty_writers() {
         (SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION, 4)
     );
     assert_eq!(cas.destination_namespace_hash, namespace);
-    let bounded: SnapshotUploadProgressCas =
-        crate::snapshot_retry::decode_state(&compact_4).unwrap();
-    assert_eq!(bounded.generation, 4);
     validate_state_v2_original_progress(&compact_4, &namespace).unwrap();
 
     // Downgrade: an older daemon's pretty save over the compact ledger; this

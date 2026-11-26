@@ -760,7 +760,6 @@ impl ApcFixture {
                 || Ok(()),
                 None,
                 None,
-                None,
                 body_drains,
             )
             .expect("checkpoint shed page");
