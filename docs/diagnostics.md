@@ -259,6 +259,20 @@ emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
+A nonzero-only `codex_side_only_reselect` record counts selection decisions on
+physically unchanged Codex rollouts whose stored head binding (created thread,
+spawn family, identity conflict) no longer matches the current home side files,
+so the certified unchanged shortcut does not apply. A head stores a binding
+whenever its rollout path is recognized, even with no side rows, so a state row
+or spawn edge that lands after the last read counts here. A nonzero-only
+`codex_side_only_first_binding` record counts the same decision for a head that
+stored no binding at all, such as one written before bindings were stored; it
+repeats on each walk until the file is read again. Both are counted before read
+admission, so a counted file can still be skipped, retried or held, and both
+count decisions, not distinct files. A held created thread re-read because its
+hold memo's side facts moved is not counted. Side-file changes do not wake the
+walk gate, so these show up on the next walk, and with the gate off on every
+walk.
 Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
 paced candidates count as delays. The RAM
 pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
@@ -976,8 +990,8 @@ sources. Existing identity/anchor controls remain in
 `reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
 `transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
 `transcript_acquisition::tests::shrink_and_replacement_reset_even_with_identical_samples`,
-`fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure`,
-`fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses`,
+`fe_claude_truncate_then_regrow_after_short_eof_keeps_main_failure`,
+`fe_claude_regrow_after_reader_passes_frozen_with_new_head_refuses`,
 and the certificate restore tests in `transcript_acquisition`.
 They retain counted rebuilds for observed rewrites/shrink/sample mismatches;
 length-only retention grants no Tail authority. Existing sampled acquisition's
@@ -1734,7 +1748,34 @@ and manifest stay current; check-in beats keep them fresh, and while a record is
 armed the cycle-start beat carries no scan start. Nothing was read, uploaded or
 saved. A hint, a listing request, a changed input, a failure, an account switch
 or a restart makes the next pass walk, and a settled source still walks at
-least once every listing interval (three hours).
+least once every listing interval (three hours). Codex home side files are not
+inputs: a change to them waits for the next walk.
+
+Each pass that starts a walk instead of resting
+emits one `local_resources` point with stage `walk_gate` and a fixed-enum
+`rest_veto`: the first condition that failed, in the gate's order. The values
+are `uncovered` (no live watcher over every root), `upload:<kind>` (owed
+upload or cycle work: `backfill`, `reoffer`, `fresh_index`, `copy_prefix`,
+`ack_capacity`, `cache_heads`, `context_resend`, `head_conflict`,
+`identity_503`, `quarantine_retry`, `reason_reoffer`, `quarantine_due`,
+`continuation`, `telemetry`), `gap` (no pass within the pass gap, including
+the first pass after a start), `key:<input>` (the first gate input that moved:
+`scope`, `index_path`, `context`, `replay`, `hint`, `policy`, `upload_context`,
+`telemetry`, `launch_inbox`, `sidecar_epoch`), `generation`, `backstop`,
+`owes:<kind>` (index debt: `persistence`, `unsettled_upload`, `decode_hold`,
+`account_hold`, `authority_quarantine`, `authority_correction`,
+`growth_claim`, `file_debt`), `cleared:<why>` (the record was dropped by a
+`hint`, a `listing` request, `disabled` collection, a `window_zero` stop, an
+`account_switch`, `walk_all`, a `failure`, a `resumed` source or an
+`idle_page_walked`) and
+`no_record`. A rest the gate allowed but the scan's sidecar or census health
+check refused reports `health`. Passes inside a walk and resting passes emit
+nothing. A finish that retires a walk emits one `walk_gate` point with `arm`:
+`armed`, or `not:<why>` (`unsettled`, `upload`, `telemetry_unread`,
+`owes:<kind>`, `no_start`, `key:<input>` for an input that moved during the
+walk, or `generation`; a retiring finish that exits before arming reports
+`entity_deferred`, `entity_refused` or `receipt_failed`). Counts and enum
+names only.
 
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher

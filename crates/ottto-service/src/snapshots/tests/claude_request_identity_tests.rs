@@ -21,7 +21,7 @@ fn w0_index() -> Value {
     serde_json::from_slice(&fs::read(w0_path("index.json")).unwrap()).unwrap()
 }
 
-/// Every W0 body (old/new/rejected batches and bare P1 items) by name.
+/// Every fixture body (old/new/rejected batches and bare historical receiver items) by name.
 fn w0_bodies() -> Vec<(String, Value, Value)> {
     let index = w0_index();
     let mut out = Vec::new();
@@ -201,7 +201,7 @@ fn typed_item(value: &Value) -> SnapshotItem {
 }
 
 #[test]
-fn w0_r5_bounds_match_daemon_caps() {
+fn bounds_match_daemon_caps() {
     let bounds = &w0_index()["bounds"];
     assert_eq!(
         bounds["evidence_entries"],
@@ -239,7 +239,7 @@ fn w0_r5_bounds_match_daemon_caps() {
 /// The daemon's own component hashing reproduces W0 for every body: today's
 /// bytes for old collectors, the identity leaf and coverage for the new one.
 #[test]
-fn w0_r5_usage_accounting_and_attribution_hash_parity() {
+fn usage_accounting_and_attribution_hash_parity() {
     let bodies = w0_bodies();
     assert_eq!(bodies.len(), 63);
     for (name, value, entry) in bodies {
@@ -265,7 +265,7 @@ fn w0_r5_usage_accounting_and_attribution_hash_parity() {
 
 /// Typed rows serialize to the exact W0 wire members (names, omission rules).
 #[test]
-fn w0_r5_wire_round_trip() {
+fn wire_round_trip() {
     for (name, value, _) in w0_bodies() {
         let item = typed_item(&value);
         let rows = item.model_usage.iter().chain(
@@ -508,7 +508,7 @@ fn stripped(item: &SnapshotItem) -> SnapshotItem {
 /// identical rows/evidence for canonical bodies, an identical hash leaf for
 /// the reordered ones (the server canonicalizes any order).
 #[test]
-fn w0_r5_builder_reproduces_tagged_bodies() {
+fn builder_reproduces_tagged_bodies() {
     let mut checked = 0;
     for (name, value, _) in w0_bodies() {
         let mut expected = typed_item(&value);
@@ -569,7 +569,7 @@ fn w0_r5_builder_reproduces_tagged_bodies() {
 /// The cap rule emits W0's fallback shape: today's rows under the new
 /// collector with refusals = bucket rows that lost identity (>= 1).
 #[test]
-fn w0_r5_cap_fallbacks_match_bodies() {
+fn cap_fallbacks_match_bodies() {
     for (tagged, fallback) in [
         ("new-cap-identities-32", "new-cap-identities-33-fallback"),
         ("new-cap-evidence-32", "new-cap-evidence-33-fallback"),

@@ -177,6 +177,31 @@ class RetryTests(unittest.TestCase):
                  '   Doc-tests ottto_service\n', self.summary(2, 0), self.total(2)]
         self.assertEqual(self.plan(lines), ([('a::one', ['ottto_service-89abcdef']), ('case', ['cli-0123abcd'])], None))
 
+    def test_a_name_split_from_its_verdict_comes_from_the_failures_list(self):
+        # --nocapture: other output landed between "test NAME ..." and "FAILED"
+        # (merge-queue run 45641961926); only libtest's closing list names it.
+        name = 'mcp_inventory::tests::probe_mcp_protected_deadline_defers_busy_inventory_until_safe'
+        split = [self.LIB, f'test {name} ... \n', f"thread '{name}' (171418) panicked at src/m.rs:1:9:\n",
+                 'ottto-service: local_resources {"stage":"walk_gate"}\n', 'FAILED\n', 'test a::two ... ok\n',
+                 '\n', 'failures:\n', '\n', 'failures:\n', f'    {name}\n', '\n', self.summary(1, 1),
+                 self.exited('ottto_service-89abcdef'), self.total(1)]
+        self.assertEqual(self.plan(split), ([(name, ['ottto_service-89abcdef'])], None))
+        # Captured output first, then the names: only the last list counts.
+        captured = [self.LIB, 'test a::one ... \n', 'noise\n', 'FAILED\n', '\n', 'failures:\n', '\n',
+                    '---- a::one stdout ----\n', '    not_a_test_name\n', '\n', 'failures:\n', '    a::one\n', '\n',
+                    self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(1)]
+        self.assertEqual(self.plan(captured), ([('a::one', ['ottto_service-89abcdef'])], None))
+        # A child probe's list is not the binary's: the last summary wins.
+        child = [self.LIB, 'failures:\n', '    child::probe\n', self.summary(0, 1), 'test a::one ... \n', 'FAILED\n',
+                 self.summary(0, 1), self.exited('ottto_service-89abcdef'), self.total(1)]
+        plan, reason = self.plan(child)
+        self.assertEqual(plan, [])
+        self.assertIn('cannot retry by test name', reason)
+        # The list must still agree with the summary count.
+        short = [self.LIB, 'test a::one ... \n', 'FAILED\n', 'failures:\n', '    a::one\n', '\n', self.summary(0, 2),
+                 self.exited('ottto_service-89abcdef'), self.total(1)]
+        self.assertEqual(self.plan(short)[0], [])
+
     def test_retries_nothing_it_cannot_tie_to_a_name(self):
         lib_fail = [self.LIB, 'test a::one ... FAILED\n']
         flaky_one = [self.CLI, 'test case ... FAILED\n', self.summary(0, 1), self.exited('cli-0123abcd'), self.total(2)]

@@ -106,6 +106,33 @@ fn backstop_walk_rows_stay_under_the_alarm() {
     f.close();
 }
 
+/// The same change found by a long walk (a busy Codex walk took 148 min)
+/// ages past 6 h before that walk's last page, so the walk alarms: a wait the
+/// walk gate allows past the window is reported, never shown fresh.
+#[test]
+fn long_backstop_walk_alarms_past_six_hours() {
+    const LONG_WALK: u64 = 148 * 60;
+    const { assert!(WALK_GAP + LISTING_ALLOWANCE + LONG_WALK > super::ALARM_AFTER) };
+    let mut f = Fixture::new(Source::Claude, "walk-gap-long");
+    let first = base();
+    let row = walk(&mut f, first, first + LONG_WALK);
+    assert_eq!(row["alarm"], false, "{row}");
+    let changed = f.file("changed.jsonl", 40);
+    stamp(&changed, first + 1);
+    let backstop = first + WALK_GAP + LISTING_ALLOWANCE;
+    let row = walk(&mut f, backstop, backstop + LONG_WALK);
+    let debt = &row["debt"];
+    assert_eq!(debt["outstanding_files"], 1, "{row}");
+    // Past 6 h only by the walk's end: the alarm reads the end-of-walk age.
+    assert_eq!(
+        debt["oldest_age_s"],
+        WALK_GAP + LISTING_ALLOWANCE + LONG_WALK - 1
+    );
+    assert_eq!(row["alarm"], true, "{row}");
+    crate::snapshots::sampled_scan::set_test_now(None);
+    f.close();
+}
+
 /// Just before, at and after 6 h, through the real walk end and failed-pass
 /// report: a slow listing, a failed listing (the last walk re-aged) and debt
 /// that was already old. Only past 6 h alarms; with no walk yet, unknown alarms.

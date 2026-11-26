@@ -476,7 +476,7 @@ fn every_absence_exit_drops_census_marks_and_removals() {
     holder_kept(&index);
 }
 
-/// [money] H3. A census record with no index entry is e2's held-new
+/// [money] A census record with no index entry is e2's held-new
 /// custody: it survives a restart and complete terminals until a
 /// positive-absence exit. v2 counterpart: `no_cap_money_survives_v1_v2_restore`.
 #[test]
@@ -493,7 +493,7 @@ fn held_new_census_survives_restart() {
     assert_eq!(restarted.claude_request_census_for_test(), &held);
 }
 
-/// [money] H5. An older release's retired record (count kept, no ids) and
+/// [money] An older release's retired record (count kept, no ids) and
 /// over-budget tombstone load unchanged: nothing rebuilds their ids, so they
 /// prove nothing until their file is read again, and no terminal drops them.
 #[test]
@@ -526,7 +526,7 @@ fn upgrade_with_retired_and_overbudget_records_stays_hashless() {
     }
 }
 
-/// [money] H7. A rename moves the census record whole (ids, birth,
+/// [money] A rename moves the census record whole (ids, birth,
 /// modification time), with the file's marks and stored removals; a
 /// destination that already holds a record keeps its own.
 #[test]

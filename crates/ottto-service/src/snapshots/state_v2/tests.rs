@@ -23,6 +23,9 @@ impl Scratch {
             },
         }
     }
+    /// `finish_import` releases the owner lock and the store reopens at once. A process another
+    /// test spawns meanwhile can still hold a copy of that lock, so every test that reopens a
+    /// finished import runs isolated (`test_isolation::run_here`).
     fn live_store(&self) -> sqlite::Sqlite {
         self.store().finish_import().unwrap();
         {
@@ -60,7 +63,10 @@ fn value(tx: &mut impl Transaction, h: &Header) -> Vec<u8> {
 
 /// [format] f8 owner replacement reclaims all superseded parts atomically.
 #[test]
-fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
+fn owner_replacement_reclaims_all_superseded_parts_atomically() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("traversal".into());
@@ -93,7 +99,7 @@ fn f8_owner_replacement_reclaims_all_superseded_parts_atomically() {
 
 /// [format] f8 64 mib admission checks before read allocation.
 #[test]
-fn f8_64_mib_admission_checks_before_read_allocation() {
+fn the_64_mib_admission_checks_before_read_allocation() {
     let key = raw_hold("large".into());
     let admitted = preflight(&RowInput {
         value_version: 1,
@@ -115,7 +121,7 @@ fn f8_64_mib_admission_checks_before_read_allocation() {
 
 /// [format] f8 json raw spelling hashes and positional neighbours survive.
 #[test]
-fn f8_json_raw_spelling_hashes_and_positional_neighbours_survive() {
+fn json_raw_spelling_hashes_and_positional_neighbours_survive() {
     let raw = br#"{ "source_file_fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "raw": {"retry_after_unix_seconds":"mistyped"}, "positional":[7,null,8], "unicode":"\u0041" }"#;
     for chunk in [1, 3, 32, 32768] {
         let mut encoder = codec::Encoder::new(Vec::new());
@@ -205,7 +211,7 @@ fn damaged_row_checksum_or_value_digest_refuses_before_any_value_byte() {
 
 /// [format] f8 orphan and dangling parts are damage without silent gc.
 #[test]
-fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {
+fn orphan_and_dangling_parts_are_damage_without_silent_gc() {
     let tmp = Scratch::new();
     let mut db = tmp.store();
     sqlite::orphan_part_for_test(&mut db);
@@ -219,6 +225,9 @@ fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {
 /// [format] wrong fixed type and generation refuse without publishing.
 #[test]
 fn wrong_fixed_type_and_generation_refuse_without_publishing() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     {
@@ -244,7 +253,10 @@ fn wrong_fixed_type_and_generation_refuse_without_publishing() {
 
 /// [format] f6 import is journal off and has no import wal.
 #[test]
-fn f6_import_is_journal_off_and_has_no_import_wal() {
+fn import_is_journal_off_and_has_no_import_wal() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.store();
     sqlite::assert_mmap_for_test(&db);
@@ -281,6 +293,9 @@ fn f6_import_is_journal_off_and_has_no_import_wal() {
 /// [regress] owner sidecar allows sqlite init migration publication and reopen.
 #[test]
 fn owner_sidecar_allows_sqlite_init_migration_publication_and_reopen() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let tmp = Scratch::new();
@@ -345,7 +360,10 @@ fn owner_sidecar_rejects_symlinks_and_hardlinks_before_db_creation() {
 
 /// [format] f5 independent identity mismatch refuses before wal mutation.
 #[test]
-fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
+fn independent_identity_mismatch_refuses_before_wal_mutation() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let db = tmp.store();
     db.finish_import().unwrap();
@@ -360,7 +378,10 @@ fn f5_independent_identity_mismatch_refuses_before_wal_mutation() {
 
 /// [format] f6 pl in values requires purge even with hash only keys.
 #[test]
-fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
+fn pl_in_values_requires_purge_even_with_hash_only_keys() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.store();
     let key = raw_hold("h".repeat(64));
@@ -391,6 +412,9 @@ fn f6_pl_in_values_requires_purge_even_with_hash_only_keys() {
 /// refusing the save: the budget bounds memory, never ingestion.
 #[test]
 fn over_budget_path_diff_commits_and_requires_erasure() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = file("synthetic-progress".into());
@@ -414,7 +438,10 @@ fn over_budget_path_diff_commits_and_requires_erasure() {
 
 /// [format] f6 passive complete can leave allocated wal and allows next write.
 #[test]
-fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
+fn passive_complete_can_leave_allocated_wal_and_allows_next_write() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let db = tmp.store();
     db.finish_import().unwrap();
@@ -444,7 +471,7 @@ fn f6_passive_complete_can_leave_allocated_wal_and_allows_next_write() {
 
 /// [format] f9 unknown top nested array tail and reserved money pause.
 #[test]
-fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
+fn unknown_top_nested_array_tail_and_reserved_money_pause() {
     for (raw, expected) in [
         (
             r#"{"files":{},"future_custody":{"owed":true}}"#,
@@ -477,7 +504,7 @@ fn f9_unknown_top_nested_array_tail_and_reserved_money_pause() {
 
 /// [format] f9 unknown plus malformed is a conversion refusal without writes.
 #[test]
-fn f9_unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
+fn unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
     let raw = br#"{"files":{},"future_custody": { definitely malformed"#;
     assert_eq!(
         codec::inventory(std::io::Cursor::new(raw)),
@@ -490,6 +517,9 @@ fn f9_unknown_plus_malformed_is_a_conversion_refusal_without_writes() {
 /// [format] aborted journal off import is never finishable.
 #[test]
 fn aborted_journal_off_import_is_never_finishable() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.store();
     {
@@ -502,6 +532,9 @@ fn aborted_journal_off_import_is_never_finishable() {
 /// [format] independent identity is write once.
 #[test]
 fn independent_identity_is_write_once() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = RowKey::Meta("identity".into());
@@ -526,7 +559,10 @@ fn independent_identity_is_write_once() {
 
 /// [format] f6 deadline keeps writes live without resetting oldest purge.
 #[test]
-fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
+fn deadline_keeps_writes_live_without_resetting_oldest_purge() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = test_record("private-value".into());
@@ -572,7 +608,10 @@ fn f6_deadline_keeps_writes_live_without_resetting_oldest_purge() {
 
 /// [format] f8 vacuum churn removes deleted keys and pl values.
 #[test]
-fn f8_vacuum_churn_removes_deleted_keys_and_pl_values() {
+fn vacuum_churn_removes_deleted_keys_and_pl_values() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     tmp.store().finish_import().unwrap();
     let database = tmp.0.join("index.v2.sqlite");
@@ -794,7 +833,10 @@ fn colliding_candidate_before_exact_match_is_not_aliased_or_overwritten() {
 
 /// [format] f8 set last reference reclaims parts without reusing ids.
 #[test]
-fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
+fn set_last_reference_reclaims_parts_without_reusing_ids() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use interning::{intern_request_set, release_request_set, RequestEvidence};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -828,7 +870,10 @@ fn f8_set_last_reference_reclaims_parts_without_reusing_ids() {
 
 /// [format] f6 busy purge retains obligation paces retry and allows in deadline writes.
 #[test]
-fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
+fn busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -878,7 +923,10 @@ fn f6_busy_purge_retains_obligation_paces_retry_and_allows_in_deadline_writes() 
 
 /// [format] f6 restart between vacuum and metadata clear keeps pending debt.
 #[test]
-fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
+fn restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = test_record("private".into());
@@ -904,7 +952,10 @@ fn f6_restart_between_vacuum_and_metadata_clear_keeps_pending_debt() {
 
 /// [format] f6 overdue recovery overrides a future attempt clock.
 #[test]
-fn f6_overdue_recovery_overrides_a_future_attempt_clock() {
+fn overdue_recovery_overrides_a_future_attempt_clock() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -962,7 +1013,10 @@ fn growth_retention_follows_runtime_custody_through_clones_subsets_and_baselines
 }
 /// [format] c1 same key rewrites and path set diffs.
 #[test]
-fn c1_same_key_rewrites_and_path_set_diffs() {
+fn same_key_rewrites_and_path_set_diffs() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("queue".into());
@@ -987,6 +1041,9 @@ fn c1_same_key_rewrites_and_path_set_diffs() {
 /// [format] clean checkpoint is durable and next write marks dirty before mutation.
 #[test]
 fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(1));
@@ -1013,6 +1070,9 @@ fn clean_checkpoint_is_durable_and_next_write_marks_dirty_before_mutation() {
 /// [format] purge starts at twelve hours and busy source pauses at twenty.
 #[test]
 fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("private".into());
@@ -1060,6 +1120,9 @@ fn purge_starts_at_twelve_hours_and_busy_source_pauses_at_twenty() {
 /// [format] changed reference diff is atomic and daily drift holds.
 #[test]
 fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use interning::{intern_request_set, RequestEvidence};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -1104,6 +1167,9 @@ fn changed_reference_diff_is_atomic_and_daily_drift_holds() {
 /// the reference check stays quiet-gated.
 #[test]
 fn store_growth_sample_runs_on_a_busy_cycle() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let mut tx = db.begin(TxnMode::Write).unwrap();
@@ -1126,6 +1192,9 @@ fn store_growth_sample_runs_on_a_busy_cycle() {
 /// sample, and its failure names a fixed cause.
 #[test]
 fn store_growth_sample_survives_a_reference_check_over_budget() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     fn over_budget(
         _: &Header,
         _: &dyn Value,
@@ -1160,6 +1229,9 @@ fn store_growth_sample_survives_a_reference_check_over_budget() {
 /// [regress] Claude and Codex stores keep separate latest samples.
 #[test]
 fn store_growth_samples_stay_separate_per_store() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let (claude, codex) = (Scratch::new(), Scratch::new());
     let mut claude_db = claude.live_store();
     let mut identity = codex.identity();
@@ -1186,6 +1258,9 @@ fn store_growth_samples_stay_separate_per_store() {
 /// [behaviour] Maintenance reports optional, non-negative cache counters each pass.
 #[test]
 fn maintenance_cache_counters_are_optional_counts() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     for _ in 0..2 {
@@ -1205,6 +1280,9 @@ fn maintenance_cache_counters_are_optional_counts() {
 /// that row counts every cache access since the previous printed row, once.
 #[test]
 fn write_transaction_prints_only_the_commit_maintenance_row() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("one".into());
@@ -1242,6 +1320,9 @@ fn write_transaction_prints_only_the_commit_maintenance_row() {
 /// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     fn refs(h: &Header, _: &dyn Value, emit: &mut dyn FnMut(&RowKey) -> Result<()>) -> Result<()> {
         if matches!(&h.key, RowKey::Record { kind, .. } if kind.name() == "raw_hold.files") {
             emit(&RowKey::RequestSet(1))?;
@@ -1316,6 +1397,9 @@ fn store_growth_gauge_is_daily_and_counts_only() {
 /// the purge's epoch rows.
 #[test]
 fn freshness_bookkeeping_never_counts_toward_the_save_target() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let debt = |id: u64| RowKey::record("tail.revision", "/synthetic/debt.jsonl", id).unwrap();
@@ -1371,6 +1455,9 @@ fn freshness_bookkeeping_never_counts_toward_the_save_target() {
 /// save's totals, and an identical rewrite is skipped before it is charged.
 #[test]
 fn save_reports_charged_rows_and_bytes_per_kind() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     for (generation, rows) in [(0, ["a", "b", "c"]), (1, ["a", "b", "changed"])] {
@@ -1407,6 +1494,9 @@ fn save_reports_charged_rows_and_bytes_per_kind() {
 /// [format] one save commits all dirty rows above soft targets.
 #[test]
 fn one_save_commits_all_dirty_rows_above_soft_targets() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let mut tx = db.begin(TxnMode::Write).unwrap();
@@ -1425,6 +1515,9 @@ fn one_save_commits_all_dirty_rows_above_soft_targets() {
 /// [behaviour] a written row at 78% of its target reports a counts-only gauge and alarm.
 #[test]
 fn row_near_its_cap_reports_gauge_and_alarm() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = mapper::key("file.progress", "synthetic-private-row", 0).unwrap();
@@ -1456,6 +1549,9 @@ fn row_near_its_cap_reports_gauge_and_alarm() {
 /// byte-identical and alarms above 100%: the target never refuses the save.
 #[test]
 fn mutable_row_over_its_target_commits_and_alarms() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = mapper::key("proof.usage", "synthetic-family", 1).unwrap();
@@ -1484,6 +1580,9 @@ fn mutable_row_over_its_target_commits_and_alarms() {
 /// [format] sqlite full at a row or chunk write rolls back the complete save.
 #[test]
 fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let chunked = serde_json::to_vec(&"x".repeat(PART_BYTES)).unwrap();
     for chunk_write in [false, true] {
         let tmp = Scratch::new();
@@ -1539,6 +1638,9 @@ fn sqlite_full_at_row_or_chunk_write_rolls_back_the_complete_save() {
 /// reload demand, nothing visible, and the same save is retryable.
 #[test]
 fn refused_commit_reopens_and_classifies_not_published() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("uncommitted".into());
@@ -1670,7 +1772,10 @@ fn typed_keys_and_json_headers_round_trip_every_physical_owner() {
 }
 /// [format] f8 damaged header refuses both lookup and scan before owned copy.
 #[test]
-fn f8_damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
+fn damaged_header_refuses_both_lookup_and_scan_before_owned_copy() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     for oversized in [false, true] {
         let tmp = Scratch::new();
         let mut db = tmp.live_store();
@@ -1797,7 +1902,10 @@ fn extra_chunks_and_shared_record_owner_aliases_are_refused() {
 }
 /// [format] f8 corrupted refcount cannot reclaim evidence or commit sibling changes.
 #[test]
-fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
+fn corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     use interning::{intern_request_set, release_request_set, RequestEvidence};
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
@@ -1825,6 +1933,9 @@ fn f8_corrupted_refcount_cannot_reclaim_evidence_or_commit_sibling_changes() {
 /// [format] private labels aliases and raw holds create erasure epochs.
 #[test]
 fn private_labels_aliases_and_raw_holds_create_erasure_epochs() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = file("file".into());
@@ -1850,6 +1961,9 @@ fn test_record(key: String) -> RowKey {
 /// failed write cannot be ignored and then committed with a sibling row.
 #[test]
 fn oversized_control_refuses_before_parse_and_fails_the_save() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("traversal".into());
@@ -1888,6 +2002,9 @@ fn key_admission_rejects_invalid_keys_before_sqlite_reads() {
 /// [format] overdue external reader is a breach and recovery precedes collection.
 #[test]
 fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("private".into());
@@ -1920,6 +2037,9 @@ fn overdue_external_reader_is_a_breach_and_recovery_precedes_collection() {
 /// [format] space recovery after restart purges before collection despite recent failure.
 #[test]
 fn space_recovery_after_restart_purges_before_collection_despite_recent_failure() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     let key = traversal("private".into());
@@ -1955,6 +2075,9 @@ fn space_recovery_after_restart_purges_before_collection_despite_recent_failure(
 /// [format] external owner lock is counted without clearing overdue debt.
 #[test]
 fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.control("erasure_pending", &1_u64).unwrap();
@@ -1969,6 +2092,9 @@ fn external_owner_lock_is_counted_without_clearing_overdue_debt() {
 /// [regress] an ordinary failed idle purge retains debt without stopping collection or spinning.
 #[test]
 fn failed_idle_purge_keeps_paced_debt_without_stopping_collection() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.control("erasure_pending", &1_u64).unwrap();
@@ -2004,6 +2130,9 @@ fn failed_idle_purge_keeps_paced_debt_without_stopping_collection() {
 /// [regress] repeated failed overdue recovery has bounded pauses and keeps its alarm/debt.
 #[test]
 fn repeated_overdue_recovery_failure_cannot_stop_collection_indefinitely() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
     let tmp = Scratch::new();
     let mut db = tmp.live_store();
     db.control("erasure_pending", &1_u64).unwrap();

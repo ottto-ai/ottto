@@ -151,7 +151,7 @@ fn inplace_retry_resends_only_unsettled_bodies() {
     assert_eq!(driven.progress.accepted_fingerprints.len(), 75);
 }
 
-/// T5: at most two resends and 10 s of waiting per upload call, across all of
+/// At most two resends and 10 s of waiting per upload call, across all of
 /// its pages. A failure that outlasts the budget takes today's path unchanged.
 #[test]
 #[serial(client_report)]
@@ -240,7 +240,7 @@ fn never_retried_failure(name: &str) -> anyhow::Error {
     }
 }
 
-/// T7: no 4xx, transport, relay-token, ACK, authority or disabled outcome is
+/// No 4xx, transport, relay-token, ACK, authority or disabled outcome is
 /// ever resent in place, and a multi-item 504 still bisects.
 #[test]
 #[serial(client_report)]
@@ -311,7 +311,7 @@ fn never_retried_in_place() {
     assert!(driven.waits.is_empty());
 }
 
-/// T7: a head-CAS bootstrap probe that met a fast 500 is resent once. When
+/// A head-CAS bootstrap probe that met a fast 500 is resent once. When
 /// the first write had in fact applied, the resend sees a CAS conflict and
 /// the probe is quarantined as today's next-cycle replay would leave it,
 /// never double-acknowledged.
@@ -370,7 +370,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
     assert!(progress.accepted_cache_heads.is_empty());
 }
 
-/// T9: each resend re-runs the upload boundary. An account switch during the
+/// Each resend re-runs the upload boundary. An account switch during the
 /// wait fails that boundary; the result is that error and nothing is ACKed.
 #[test]
 #[serial(client_report)]
@@ -560,7 +560,7 @@ fn cursor_and_lock_shed_codes_are_retried_in_place_through_the_client() {
     }
 }
 
-// --- T4: one real Claude prepare/finish cycle against a loopback backend ---
+// --- one real Claude prepare/finish cycle against a loopback backend ---
 
 struct InplaceRetryServer {
     url: String,
@@ -810,7 +810,7 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
     }
 }
 
-/// T4: a Claude cycle whose first batch is shed with `Retry-After: 1` and
+/// A Claude cycle whose first batch is shed with `Retry-After: 1` and
 /// recovered in place saves exactly what a clean cycle saves: every offered
 /// body ACKed, no unsettled-upload mark on the bounded sweep, and the same
 /// terminal status. Without the resend the shed abandons the page and marks

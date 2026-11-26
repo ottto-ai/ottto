@@ -1721,7 +1721,7 @@ fn verify_codex_zst_downgrade_roundtrip() {
 /// [format] A historical census cannot erase the archive object: ordinary
 /// discovery schedules it again after re-upgrade, without fabricating ACKs.
 #[test]
-fn historical_census_saved_singleton_schedules_a1_on_reupgrade() {
+fn historical_census_saved_singleton_schedules_on_reupgrade() {
     let Some(root) = std::env::var_os("OTTTO_ZST_DOWNGRADE_FIXTURE_DIR").map(PathBuf::from)
     else {
         return;

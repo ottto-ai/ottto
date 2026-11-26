@@ -587,14 +587,15 @@ impl OwnedSourceScan {
             || (source == SnapshotSource::ClaudeCode
                 && claude_identity_census_was_complete
                 && claude_title_metadata.original_identity_census_incomplete);
-        if walk_idle_allowed
-            && index.traversal.is_none()
-            && !sidecar_restart
+        let healthy = !sidecar_restart
             && !claude_sidecar_was_incomplete
             && state_census_complete
             && sidecar_census_complete
-            && !claude_title_metadata.original_identity_census_incomplete
-        {
+            && !claude_title_metadata.original_identity_census_incomplete;
+        if walk_idle_allowed && index.traversal.is_none() && !healthy {
+            crate::snapshots::walk_idle::report_health_veto(source);
+        }
+        if walk_idle_allowed && index.traversal.is_none() && healthy {
             let mut idle = Self::new_continuation(
                 &[],
                 owned_index,

@@ -49,10 +49,10 @@ fn uploadable(index: &mut ScanIndex, items: &[SnapshotItem]) -> Vec<SnapshotItem
 /// the same login and bytes (C1); a member without it stays Unknown with its
 /// creator head unchanged (C2). A stamped body the server holds is never
 /// replaced by Unknown while its session is bound, whether its ACK was kept
-/// or lost (C4), including after an older store's family proof is dropped
-/// (C5); an unbound session uploads Unknown, the disclosed residual. Families
+/// or lost, including after an older store's family proof is dropped;
+/// an unbound session uploads Unknown, the disclosed residual. Families
 /// on two accounts, with a switch or a side call, emit the same bytes as
-/// before, and the candidate roots are unchanged (C7). A child billed only
+/// before, and the candidate roots are unchanged. A child billed only
 /// outside the subscription keeps its own proved login on the wire; an
 /// unhealthy trace read leaves it Unknown with its money unchanged.
 #[test]
@@ -61,7 +61,7 @@ fn family_stamp_removal_money_table() {
     let child = items[1].source_session_id.clone();
     let a = login('a');
 
-    // C7: the roots the evidence stage reads are the files' own.
+    // The roots the evidence stage reads are the files' own.
     let roots = |items: &[SnapshotItem]| {
         items
             .iter()
@@ -90,7 +90,7 @@ fn family_stamp_removal_money_table() {
     assert_eq!(exact_session_account_hash(&previous[1]), Some(a.clone()));
     let cold = route(Mode::ColdFull, &current);
 
-    // C4/C5: the previous build emitted the stamped child; its session is bound.
+    // The previous build emitted the stamped child; its session is bound.
     for (case, acked, upgraded, bound) in [
         ("local tagged ACK", true, false, true),
         ("lost first ACK, bound", false, false, true),

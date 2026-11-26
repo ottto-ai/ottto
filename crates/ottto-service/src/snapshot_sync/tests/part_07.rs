@@ -40,6 +40,6 @@ pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("scoped_cross_root_tests.rs");
     }
 }
-mod p12_pipeline_original_tests {
-    include!("p12_pipeline_original_tests.rs");
+mod claude_family_lines_fixture {
+    include!("claude_family_lines_fixture.rs");
 }

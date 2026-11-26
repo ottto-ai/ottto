@@ -780,7 +780,7 @@ fn usage_identical_note_never_covers_an_additive_body_change() {
     item.cache_observations_state = None;
     item.source_file_fingerprint = Some("a".repeat(64));
     let mut changed = item.clone();
-    super::h357_ack_tests::change_witnessed_body(&mut changed);
+    super::exact_body_ack_tests::change_witnessed_body(&mut changed);
     assert_eq!(
         crate::snapshots::snapshot_fingerprint(source, &changed),
         crate::snapshots::snapshot_fingerprint(source, &item),

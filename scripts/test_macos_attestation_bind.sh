@@ -81,12 +81,16 @@ chmod +x "$mock_bin/gh"
 export PATH="$mock_bin:$PATH"
 export GH_MOCK_LOG="$TMP_DIR/gh.log"
 
-artifact="$TMP_DIR/Ottto-macos-arm64.dmg"
-cli="$TMP_DIR/ottto-macos-arm64.zip"
-daemon="$TMP_DIR/ottto-service-macos-arm64.zip"
-sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
-installer="$TMP_DIR/install-macos.sh"
-manifest="$TMP_DIR/release-manifest.json"
+# The release folder path has a space, and the binder runs from elsewhere.
+REL="$TMP_DIR/release folder"
+ELSEWHERE="$TMP_DIR/elsewhere"
+mkdir -p "$REL" "$ELSEWHERE"
+artifact="$REL/Ottto-macos-arm64.dmg"
+cli="$REL/ottto-macos-arm64.zip"
+daemon="$REL/ottto-service-macos-arm64.zip"
+sbom="$REL/ottto-local-platform-sbom.cdx.json"
+installer="$REL/install-macos.sh"
+manifest="$REL/release-manifest.json"
 printf 'app artifact\n' > "$artifact"
 printf 'cli artifact\n' > "$cli"
 printf 'daemon artifact\n' > "$daemon"
@@ -96,7 +100,7 @@ jq -n '{bomFormat: "CycloneDX", specVersion: "1.7", version: 1}' > "$sbom"
 sbom_sha="$(shasum -a 256 "$sbom" | awk '{print $1}')"
 
 jq -n \
-  --arg sbom "$sbom" \
+  --arg sbom "$(basename "$sbom")" \
   --arg sbom_sha "$sbom_sha" \
   '{
     schema_version: 1,
@@ -128,10 +132,10 @@ jq -n \
           commit: "abcdef123456abcdef123456abcdef123456abcd"
         },
         {
-          kind: "git_subtree",
-          repository: "example-org/example-app",
+          kind: "private_source",
+          name: "ottto-macos-app",
+          visibility: "private",
           commit: "123456abcdef123456abcdef123456abcdef1234",
-          path: "tools/ottto-macos-app",
           tree: "fedcba654321fedcba654321fedcba654321fedc",
           clean: true
         }
@@ -165,16 +169,31 @@ jq -n \
     artifacts: []
   }' > "$manifest"
 
-(
-  cd "$TMP_DIR"
-  shasum -a 256 \
-    Ottto-macos-arm64.dmg \
-    ottto-macos-arm64.zip \
-    ottto-service-macos-arm64.zip \
-    ottto-local-platform-sbom.cdx.json \
-    release-manifest.json \
-    install-macos.sh > subject.checksums.txt
-)
+write_checksums() {
+  (
+    cd "$REL"
+    shasum -a 256 \
+      Ottto-macos-arm64.dmg \
+      ottto-macos-arm64.zip \
+      ottto-service-macos-arm64.zip \
+      ottto-local-platform-sbom.cdx.json \
+      release-manifest.json \
+      install-macos.sh > subject.checksums.txt
+  )
+}
+write_checksums
+
+# run_binder <manifest> <checksums>: bind from a directory outside the release.
+run_binder() {
+  (
+    cd "$ELSEWHERE"
+    OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" \
+      --manifest "$1" \
+      --subject-checksums "$2" \
+      --repo ottto-ai/ottto \
+      --signer-workflow .github/workflows/macos-stable-release.yml
+  )
+}
 
 before_without_supply="$TMP_DIR/before-without-supply.json"
 after_without_supply="$TMP_DIR/after-without-supply.json"
@@ -183,7 +202,7 @@ jq 'del(.supply_chain)' "$manifest" > "$before_without_supply"
 # [behaviour] The source ref has no default: without it the binder refuses to run.
 if (unset OTTTO_RELEASE_SOURCE_REF; "$BINDER" \
   --manifest "$manifest" \
-  --subject-checksums "$TMP_DIR/subject.checksums.txt" \
+  --subject-checksums "$REL/subject.checksums.txt" \
   --repo ottto-ai/ottto >"$TMP_DIR/no-ref.out" 2>&1); then
   echo "Expected binder to fail without a source ref" >&2
   exit 1
@@ -193,11 +212,40 @@ if ! grep -Fq "Source ref is required" "$TMP_DIR/no-ref.out" || [[ -s "$GH_MOCK_
   exit 1
 fi
 
-OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" \
-  --manifest "$manifest" \
-  --subject-checksums "$TMP_DIR/subject.checksums.txt" \
-  --repo ottto-ai/ottto \
-  --signer-workflow .github/workflows/macos-stable-release.yml >/dev/null
+# A checksum list must name plain files beside the manifest; anything else is
+# refused before any attestation is verified.
+expect_subject_rejection() {
+  local label="$1"
+  local message="$2"
+  local checksums="$3"
+  if run_binder "$manifest" "$checksums" >"$TMP_DIR/$label.out" 2>&1; then
+    echo "Expected binder to reject $label subjects" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$message" "$TMP_DIR/$label.out" || [[ -s "$GH_MOCK_LOG" ]]; then
+    echo "Binder did not refuse $label subjects up front: $(cat "$TMP_DIR/$label.out")" >&2
+    exit 1
+  fi
+}
+first_line="$(head -n 1 "$REL/subject.checksums.txt")"
+digest="${first_line%% *}"
+printf '%s  %s\n' "$digest" "$REL/Ottto-macos-arm64.dmg" > "$REL/absolute.checksums.txt"
+expect_subject_rejection absolute "must name a release file beside the manifest" "$REL/absolute.checksums.txt"
+printf '%s  %s\n' "$digest" "../release folder/Ottto-macos-arm64.dmg" > "$REL/escaping.checksums.txt"
+expect_subject_rejection escaping "must name a release file beside the manifest" "$REL/escaping.checksums.txt"
+printf '%s\n%s\n' "$first_line" "$first_line" > "$REL/duplicate.checksums.txt"
+expect_subject_rejection duplicate "duplicate subject" "$REL/duplicate.checksums.txt"
+printf '%s  %s\n' "$digest" "missing.dmg" > "$REL/missing.checksums.txt"
+expect_subject_rejection missing "missing or not a regular file" "$REL/missing.checksums.txt"
+ln -s Ottto-macos-arm64.dmg "$REL/linked.dmg"
+printf '%s  %s\n' "$digest" "linked.dmg" > "$REL/symlink.checksums.txt"
+expect_subject_rejection symlink "missing or not a regular file" "$REL/symlink.checksums.txt"
+printf 'not a checksum line\n' > "$REL/malformed.checksums.txt"
+expect_subject_rejection malformed "not shasum-compatible" "$REL/malformed.checksums.txt"
+cp "$REL/subject.checksums.txt" "$ELSEWHERE/subject.checksums.txt"
+expect_subject_rejection elsewhere "must sit beside the manifest" "$ELSEWHERE/subject.checksums.txt"
+
+run_binder "$manifest" "$REL/subject.checksums.txt" >/dev/null
 
 jq 'del(.supply_chain)' "$manifest" > "$after_without_supply"
 if ! cmp -s "$before_without_supply" "$after_without_supply"; then
@@ -214,12 +262,34 @@ jq -e '
   and .supply_chain.slsa_build.source_ref == "refs/tags/v0.1.0"
   and .supply_chain.slsa_build.source_digest == "abcdef123456"
   and (.supply_chain.slsa_build.subjects | index("release-manifest.json") != null)
-  and .supply_chain.materials[1].repository == "example-org/example-app"
-  and .supply_chain.materials[1].path == "tools/ottto-macos-app"
+  and .supply_chain.materials[1].kind == "private_source"
   and .supply_chain.materials[1].tree == "fedcba654321fedcba654321fedcba654321fedc"
   and .supply_chain.sbom.attested == true
   and .supply_chain.sbom.verified == true
 ' "$manifest" >/dev/null
+
+# The recorded commands are examples run from the release folder: one subject
+# operand relative to it and never a build-host path. The real verifications
+# above ran on the actual files.
+# The binder resolves subjects in the physical release folder (on macOS a
+# temporary folder under /var is /private/var).
+REL_PHYSICAL="$(cd "$REL" && pwd -P)"
+jq -e --arg rel "$REL" --arg rel_physical "$REL_PHYSICAL" '
+  [.supply_chain.slsa_build.verification_command, .supply_chain.sbom.verification_command]
+  | length == 2
+    and all(.[]; startswith("gh attestation verify ./Ottto-macos-arm64.dmg --repo ottto-ai/ottto ")
+      and (contains($rel) | not)
+      and (contains($rel_physical) | not)
+      and (test(" /") | not))
+' "$manifest" >/dev/null || {
+  echo "Recorded verification commands must name ./<subject> only" >&2
+  exit 1
+}
+if ! grep -Fq -- "verify $REL_PHYSICAL/Ottto-macos-arm64.dmg " "$GH_MOCK_LOG" ||
+  ! grep -Fq -- "verify $REL_PHYSICAL/install-macos.sh " "$GH_MOCK_LOG"; then
+  echo "Expected gh attestation verify to run on the real subject files" >&2
+  exit 1
+fi
 
 expected_invocations=$((6 * 2))
 actual_invocations="$(wc -l < "$GH_MOCK_LOG" | tr -d ' ')"
@@ -244,7 +314,17 @@ if ! grep -Fq -- "--source-ref refs/tags/v0.1.0" "$GH_MOCK_LOG" || ! grep -Fq --
   exit 1
 fi
 
-failed_manifest="$TMP_DIR/failed-manifest.json"
+# Binding again after the workflow regenerates checksums writes the same bytes.
+first_bind="$TMP_DIR/first-bind.json"
+cp "$manifest" "$first_bind"
+write_checksums
+run_binder "$manifest" "$REL/subject.checksums.txt" >/dev/null
+if ! cmp -s "$first_bind" "$manifest"; then
+  echo "Rebinding changed the manifest bytes" >&2
+  exit 1
+fi
+
+failed_manifest="$REL/failed-manifest.json"
 cp "$manifest" "$failed_manifest"
 jq '.supply_chain.slsa_build.verified = false | .supply_chain.sbom.verified = false' \
   "$failed_manifest" > "$failed_manifest.next"
@@ -252,7 +332,7 @@ mv "$failed_manifest.next" "$failed_manifest"
 export GH_ATTEST_FAIL=1
 if OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" \
   --manifest "$failed_manifest" \
-  --subject-checksums "$TMP_DIR/subject.checksums.txt" \
+  --subject-checksums "$REL/subject.checksums.txt" \
   --repo ottto-ai/ottto >/dev/null 2>&1; then
   echo "Expected binder to fail when gh attestation verify fails" >&2
   exit 1

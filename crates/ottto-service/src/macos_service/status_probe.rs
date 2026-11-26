@@ -262,10 +262,10 @@ mod tests {
         );
         assert_eq!(
             callers(status_owner.clone()),
-            ["control/mod.rs", "control/status.rs"]
+            ["control.rs", "control/status.rs"]
         );
         let text = |name: &str| &files.iter().find(|(file, _)| file == name).unwrap().1;
-        let control = text("control/mod.rs");
+        let control = text("control.rs");
         assert_eq!(control.matches(&status_owner).count(), 1);
         let arm = &control[control.find("LocalControlCommand::Status {").unwrap()..];
         let arm = &arm[..arm.find("LocalControlCommand::Receipts {").unwrap()];

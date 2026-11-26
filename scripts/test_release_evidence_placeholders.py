@@ -35,7 +35,7 @@ class ReleaseEvidencePlaceholdersTests(unittest.TestCase):
                 "product": "ottto-local-platform", "channel": "stable-candidate",
                 "version": "0.1.252-rc1", "commit": "a" * 40,
                 "min_protocol_version": 15,
-                "supply_chain": {"materials": [{"kind": "git_subtree", "commit": "b" * 40}]},
+                "supply_chain": {"materials": [{"kind": "private_source", "commit": "b" * 40}]},
             }))
             result = subprocess.run([
                 "bash", str(SCRIPTS / "macos_public_rc_evidence_template.sh"),
@@ -50,13 +50,14 @@ class ReleaseEvidencePlaceholdersTests(unittest.TestCase):
         })
         cls.evidence["update_lifecycle"].update({
             "launch_provenance": "launchservices_bundle", "user_update_actions": 1,
-            "homebrew_service_reached_target": True,
-            "lower_gui_remained_running_after_homebrew_update": True,
+            "starting_service_owner": "app_bundle",
+            "service_restarted_on_target_version": True,
             "sparkle_terminated_old_process": True, "sparkle_relaunched_target_bundle": True,
-            "process_id_changed": True, "manual_process_termination": False,
+            "process_id_changed": True, "final_service_owner": "app_bundle",
+            "manual_process_termination": False,
             "manual_app_launch": False, "account_continuity_verified": True,
-            "source_continuity_verified": True, "diagnostics_via_homebrew_socket": True,
-            "verify_via_homebrew_socket": True,
+            "source_continuity_verified": True, "diagnostics_via_app_service_socket": True,
+            "verify_via_app_service_socket": True,
             "owner_prefix_protocol_schema_version_converged": True,
         })
         cls.evidence["operator_notes"] = ["redacted stable-candidate RC evidence"]

@@ -61,9 +61,11 @@ require_grep 'scripts/macos_package\.sh' 'packaging step'
 require_grep '--app-root "\$\{OTTTO_MACOS_APP_ROOT:\?\}"' 'app root passed into macos_package from the runner'
 # shellcheck disable=SC2016
 require_grep '--app-source-commit "\$OTTTO_MACOS_APP_SOURCE_COMMIT"' 'release-tag app source commit passed into macos_package'
-# shellcheck disable=SC2016 # This assertion matches the literal secret expression.
-require_grep '^      OTTTO_MACOS_APP_SOURCE_REPOSITORY: \$\{\{ secrets\.OTTTO_MACOS_APP_SOURCE_REPOSITORY \}\}' 'job-wide app source repository from the release secret'
-require_grep 'OTTTO_MACOS_APP_SOURCE_REPOSITORY must be configured in owner/name form' 'required app source repository validation'
+# The release record names no private repository, so the workflow reads none.
+if grep -Fq 'OTTTO_MACOS_APP_SOURCE_REPOSITORY' "$WORKFLOW"; then
+  echo "macOS stable release workflow must not read an app source repository identity" >&2
+  exit 1
+fi
 require_grep 'scripts/macos_notarize\.sh' 'notarization step'
 require_grep 'scripts/macos_attestation_bind\.sh' 'attestation binding step'
 require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature step'
@@ -76,6 +78,7 @@ require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evid
 # Optional, verification-only GitHub Release mirror.
 require_grep 'github_release_mirror:' 'github_release_mirror input'
 require_grep "inputs\.channel == 'stable' && inputs\.github_release_mirror == true" 'release mirror is stable-only and input-gated'
+require_grep "if: false && inputs\.channel == 'stable' && inputs\.github_release_mirror == true" 'release mirror stays disabled until it publishes a checked folder'
 require_grep 'gh release create' 'release mirror uses gh release create'
 require_grep '--verify-tag' 'release mirror publishes the existing release tag only'
 deny_grep '--target' 'release mirror must never create a tag'
@@ -142,10 +145,9 @@ for line in lines[run + 1 :]:
 Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
 PY
 
-# run_policy <ref> <channel> <version> [repository]
+# run_policy <ref> <channel> <version>: no app source identity is set.
 run_policy() {
   env -i PATH="$PATH" \
-    OTTTO_MACOS_APP_SOURCE_REPOSITORY="${4-example-org/example-app}" \
     GITHUB_EVENT_NAME=workflow_dispatch \
     GITHUB_REF="$1" \
     CHANNEL="$2" \
@@ -181,9 +183,6 @@ expect_policy_reject() {
 }
 
 expect_policy_accept refs/tags/v0.1.2 stable 0.1.2
-expect_policy_accept refs/tags/v0.1.2 stable 0.1.2 other-org/other-app
-expect_policy_reject "must be configured in owner/name form" refs/tags/v0.1.2 stable 0.1.2 ""
-expect_policy_reject "must be configured in owner/name form" refs/tags/v0.1.2 stable 0.1.2 evil.invalid/example-org/example-app
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc1
 expect_policy_accept refs/tags/v0.1.2 stable-candidate 0.1.2-rc12
 expect_policy_reject "must run from a v<X.Y.Z> release tag" refs/heads/main stable 0.1.2

@@ -414,7 +414,7 @@ impl ReofferPipeline {
         Self::build(name, first, start, false)
     }
 
-    /// The same pipeline with request-identity capture on (R12).
+    /// The same pipeline with request-identity capture on.
     fn with_capture(name: &str, first: Answer, start: u64) -> Self {
         Self::build(name, first, start, true)
     }
@@ -754,7 +754,7 @@ fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
         day1.progress_json["permanent_rejections"][&fingerprint]["reason"],
         "other"
     );
-    // R7: the repeat refusal settles the traversal; health stays red.
+    // The repeat refusal settles the traversal; health stays red.
     assert!(!day1.index.bounded_sweep_had_unsettled_upload());
     assert!(!day1
         .index
@@ -1240,7 +1240,7 @@ fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
         .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
 }
 
-/// F1: cache capability on, no accepted head and CAS optional. The recorded
+/// Cache capability on, no accepted head and CAS optional. The recorded
 /// refusal belongs to the stripped probe, not the cache-enriched scan item.
 #[test]
 #[serial]
@@ -1821,8 +1821,8 @@ fn reemission_list_path(support: &Path) -> PathBuf {
 /// below the active one, no list, a saved history cutoff after its birth; the
 /// refusal in the ledger is prior history) with a due original-pair re-offer
 /// lease is not re-offered. Where no list is intended, only an unverified
-/// Mac or a move under a non-`full` claim still holds history (StateMissing
-/// N1); the index's durable move marker stands for that hold here. The lease is granted but
+/// Mac or a move under a non-`full` claim still holds history (see `no_list_hold`);
+/// the index's durable move marker stands for that hold here. The lease is granted but
 /// never delivered: no body reaches the server, the refusal and its
 /// original-pair extension stay, nothing is accepted and the hold stays
 /// terminal. Once an installed list lets the upgrade through, the same lease
@@ -1913,8 +1913,8 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
 /// A completed first cycle is not a kill before its first save: it publishes
 /// a native fence and its state database. Deleting that fence and clearing the
 /// ledger's ACKs must not turn the database's history into a fresh installation.
-/// A replay claim is still not server attestation (the separate StateMissing
-/// N1 test covers that); it cannot waive a missing published-root refusal.
+/// A replay claim is still not server attestation (the separate
+/// `claude_prior_history` test covers that); it cannot waive a missing published-root refusal.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -2987,8 +2987,8 @@ mod held_probe_listing_tests {
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn adopted_w0_head_first_w1() {
-    if !supported("adopted_w0_head_first_w1") {
+fn adopted_head_first() {
+    if !supported("adopted_head_first") {
         return;
     }
     struct Patched;

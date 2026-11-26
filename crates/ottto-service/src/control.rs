@@ -1831,5 +1831,5 @@ const SETUP_RECONCILE_REFUSED_RETRY: Duration = Duration::from_secs(24 * 60 * 60
 pub(crate) mod tests;
 
 #[cfg(all(test, unix))]
-#[path = "tests/control_smoke_session_tests.rs"]
+#[path = "control/tests/control_smoke_session_tests.rs"]
 mod smoke_session_tests;

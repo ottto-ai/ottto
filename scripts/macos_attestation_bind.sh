@@ -135,8 +135,14 @@ if [[ ! "$SOURCE_DIGEST" =~ ^[0-9A-Fa-f]{7,64}$ ]]; then
   exit 2
 fi
 
-manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
-checksum_dir="$(cd "$(dirname "$SUBJECT_CHECKSUMS")" && pwd)"
+# Subjects are release files beside the manifest, so the checksum list must
+# live in the same release folder and name them by plain filename.
+manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd -P)"
+checksum_dir="$(cd "$(dirname "$SUBJECT_CHECKSUMS")" && pwd -P)"
+if [[ "$checksum_dir" != "$manifest_dir" ]]; then
+  echo "Subject checksums file must sit beside the manifest" >&2
+  exit 2
+fi
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -149,10 +155,11 @@ from __future__ import annotations
 import json
 import re
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-checksums = Path(sys.argv[1]).resolve()
-checksum_dir = Path(sys.argv[2]).resolve()
+checksums = Path(sys.argv[1])
+checksum_dir = Path(sys.argv[2])
+RELEASE_FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
 subjects: list[dict[str, str]] = []
 seen: set[str] = set()
 
@@ -164,20 +171,16 @@ for line_number, raw in enumerate(checksums.read_text(encoding="utf-8").splitlin
         print(f"subject checksums line {line_number} is not shasum-compatible", file=sys.stderr)
         sys.exit(1)
     digest, name = match.groups()
-    if name.startswith("/") or "\\" in name:
-        print(f"subject checksums line {line_number} must use a relative POSIX subject path", file=sys.stderr)
-        sys.exit(1)
-    posix = PurePosixPath(name)
-    if any(part in {"", ".", ".."} for part in posix.parts):
-        print(f"subject checksums line {line_number} has unsafe subject path: {name}", file=sys.stderr)
+    if not RELEASE_FILENAME.fullmatch(name):
+        print(f"subject checksums line {line_number} must name a release file beside the manifest", file=sys.stderr)
         sys.exit(1)
     if name in seen:
         print(f"subject checksums contain duplicate subject: {name}", file=sys.stderr)
         sys.exit(1)
     seen.add(name)
-    path = (checksum_dir / Path(*posix.parts)).resolve()
-    if not path.is_file():
-        print(f"subject file is missing: {name}", file=sys.stderr)
+    path = checksum_dir / name
+    if path.is_symlink() or not path.is_file():
+        print(f"subject file is missing or not a regular file: {name}", file=sys.stderr)
         sys.exit(1)
     subjects.append({"name": name, "sha256": digest, "path": str(path)})
 
@@ -243,9 +246,12 @@ while IFS= read -r subject; do
 done < <(jq -c '.[]' <<<"$subjects_json")
 
 subjects_names_json="$(jq -c '[.[].name] | sort' <<<"$subjects_json")"
-first_subject_path="$(jq -r '.[0].path' <<<"$subjects_json")"
-slsa_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY --predicate-type $slsa_predicate_type --signer-workflow $signer_workflow_identity --source-ref $SOURCE_REF --source-digest $SOURCE_DIGEST --format json"
-sbom_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY --predicate-type $sbom_predicate_type --signer-workflow $signer_workflow_identity --source-ref $SOURCE_REF --source-digest $SOURCE_DIGEST --format json"
+# The recorded commands are examples to run from the release folder; they name
+# the first subject relative to it and never a path on the build host.
+first_subject_operand="./$(jq -r '.[0].name' <<<"$subjects_json")"
+quoted_source_ref="$(printf '%q' "$SOURCE_REF")"
+slsa_verification_command="gh attestation verify $first_subject_operand --repo $REPOSITORY --predicate-type $slsa_predicate_type --signer-workflow $signer_workflow_identity --source-ref $quoted_source_ref --source-digest $SOURCE_DIGEST --format json"
+sbom_verification_command="gh attestation verify $first_subject_operand --repo $REPOSITORY --predicate-type $sbom_predicate_type --signer-workflow $signer_workflow_identity --source-ref $quoted_source_ref --source-digest $SOURCE_DIGEST --format json"
 
 tmp_manifest="$(mktemp "$manifest_dir/release-manifest.attestation-bind.XXXXXX")"
 trap 'rm -f "$tmp_manifest"' EXIT

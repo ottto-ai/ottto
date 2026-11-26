@@ -85,6 +85,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -113,8 +114,8 @@ CHECKS = [
     "verify_codex",
     "diagnostics_redaction",
     "update_check",
-    "mixed_owner_app_version_truth",
-    "mixed_owner_sparkle_autonomous_lifecycle",
+    "app_owner_version_truth",
+    "app_owner_sparkle_autonomous_lifecycle",
     "rollback_notes",
     "stable_formula_static",
     "stable_hosted_installer_static",
@@ -152,11 +153,13 @@ materials = require_object(manifest.get("supply_chain"), "manifest.supply_chain"
 app_source_commits = [
     material.get("commit")
     for material in (materials if isinstance(materials, list) else [])
-    if isinstance(material, dict) and material.get("kind") == "git_subtree"
+    if isinstance(material, dict) and material.get("kind") == "private_source"
 ]
 if len(app_source_commits) != 1:
     die("manifest must record exactly one app source commit in supply_chain.materials")
 app_source_commit = require_string(app_source_commits[0], "manifest app source commit")
+if not re.fullmatch(r"[0-9a-f]{40}", app_source_commit):
+    die("manifest app source commit must be a 40-hex commit")
 min_protocol_version = manifest.get("min_protocol_version")
 if product != "ottto-local-platform":
     die(f"expected product=ottto-local-platform, got {product}")
@@ -206,17 +209,18 @@ evidence = {
     "update_lifecycle": {
         "launch_provenance": "TODO_launchservices_bundle",
         "user_update_actions": 0,
-        "homebrew_service_reached_target": False,
-        "lower_gui_remained_running_after_homebrew_update": False,
+        "starting_service_owner": "TODO_app_bundle",
+        "service_restarted_on_target_version": False,
         "sparkle_terminated_old_process": False,
         "sparkle_relaunched_target_bundle": False,
         "process_id_changed": False,
+        "final_service_owner": "TODO_app_bundle",
         "manual_process_termination": True,
         "manual_app_launch": True,
         "account_continuity_verified": False,
         "source_continuity_verified": False,
-        "diagnostics_via_homebrew_socket": False,
-        "verify_via_homebrew_socket": False,
+        "diagnostics_via_app_service_socket": False,
+        "verify_via_app_service_socket": False,
         "owner_prefix_protocol_schema_version_converged": False,
     },
     "resource_scorecard": {"schema_version": 1, "policy": "resource-stage1-v1", "status": "not_run"},
@@ -234,8 +238,10 @@ evidence = {
         ),
         (
             "The update_lifecycle object must describe one foreground update action "
-            "from a canonical LaunchServices bundle launch. Any manual signal, force "
-            "quit, executable-path launch, or manual reopen fails the gate."
+            "from a canonical LaunchServices bundle launch of a lower app that owns "
+            "net.ottto.service, ending with the app-owned service on the target "
+            "version. Any manual signal, force quit, executable-path launch, or "
+            "manual reopen fails the gate."
         ),
     ],
 }

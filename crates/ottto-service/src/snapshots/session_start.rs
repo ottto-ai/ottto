@@ -23,6 +23,7 @@ use crate::codex_prelude_footprint::{char_count as units, BlockKind, CodexPrelud
 use crate::composition_kinds::shell::{
     extension, normalize_path, shell_changes_directory, shell_path_tokens, MAX_SHELL_PATH_TOKENS,
 };
+use crate::composition_kinds::split_mcp_name;
 use crate::snapshots::UsageTotals;
 use serde::Serialize;
 use serde_json::Value;
@@ -370,6 +371,13 @@ fn str_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+/// A request-1 `shape.tools` entry the model got in full: an MCP tool
+/// (`mcp__<server>__<tool>`) not marked `defer_loading: true`.
+fn mcp_schema_in_full(tool: &Value) -> bool {
+    let mcp = str_at(tool, "name").and_then(split_mcp_name).is_some();
+    mcp && tool.get("defer_loading").and_then(Value::as_bool) != Some(true)
+}
+
 /// Model-visible length of a tool result: text blocks (or a plain string).
 fn tool_output_units(content: Option<&Value>) -> u64 {
     match content {
@@ -483,6 +491,10 @@ pub(in crate::snapshots) struct SessionStartState {
     codex_tools_logged: bool,
     config_digest: Option<ConfigDigest>,
     claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    /// Request 1's MCP tool schemas sent in full, a part of its tools:
+    /// staged with `claude_shape`, kept only once request 1 is measured.
+    /// Stored in the opening-settings fact, never in the head.
+    mcp_schemas: Option<u64>,
     claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
     memory_units: Option<u64>,
     instruction_load_cut: Option<bool>,
@@ -557,7 +569,7 @@ crate::durable_tail_codec::durable_struct!(OpeningFileState {
     N client_loaded: [bool; 2],
     N truncated: [bool; 2],
 });
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, mcp_schemas, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 crate::durable_tail_codec::durable_struct!(SessionStartState {
     U client_version: Option<String>,
     N user_turns: u8,
@@ -573,6 +585,8 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N codex_tools_logged: bool,
     X config_digest: Option<ConfigDigest>,
     D claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    // Stored in the opening-settings fact (v2), so no head byte changes.
+    I mcp_schemas: Option<u64>,
     D claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
     N memory_units: Option<u64>,
     N instruction_load_cut: Option<bool>,
@@ -607,6 +621,14 @@ impl SessionStartState {
 
     pub(in crate::snapshots) fn parts_for_test(&self) -> Vec<u64> {
         self.parts.to_vec()
+    }
+
+    pub(in crate::snapshots) fn set_mcp_schemas_for_test(&mut self, chars: Option<u64>) {
+        self.mcp_schemas = chars;
+    }
+
+    pub(in crate::snapshots) fn mcp_schemas_for_test(&self) -> Option<u64> {
+        self.mcp_schemas
     }
 
     pub(in crate::snapshots) fn requests_present_for_test(&self) -> Vec<bool> {
@@ -690,6 +712,7 @@ impl SessionStartState {
         if !self.parts_closed {
             self.parts_closed = true;
             self.parts_unmeasurable = true;
+            self.mcp_schemas = None;
         }
         self.instructions = None;
         if let Some(parser) = self.codex_prelude.as_mut() {
@@ -704,9 +727,11 @@ impl SessionStartState {
 
     /// Whether there is opening content a record body never carries (`X`:
     /// instruction text, opening files with their paths, config digests, each
-    /// opening call's file paths). The Codex prelude is its own fact.
+    /// opening call's file paths; `I`: the request-1 MCP schema count). The
+    /// Codex prelude is its own fact.
     pub(in crate::snapshots) fn has_opening_fact(&self) -> bool {
-        self.instructions.is_some()
+        self.mcp_schemas.is_some()
+            || self.instructions.is_some()
             || !self.files.is_empty()
             || self.config_digest.is_some()
             || self
@@ -716,8 +741,15 @@ impl SessionStartState {
             || self.calls.values().any(|call| !call.files.is_empty())
     }
 
+    /// Whether the opening-settings fact appends the request-1 MCP schema
+    /// count (its v2).
+    pub(in crate::snapshots) fn has_mcp_schemas(&self) -> bool {
+        self.mcp_schemas.is_some()
+    }
+
     /// The opening-settings session fact: that content, beside the
-    /// record body that keeps its keys (blob and call ids, in key order).
+    /// record body that keeps its keys (blob and call ids, in key order),
+    /// then the MCP schema count when there is one.
     pub(in crate::snapshots) fn put_opening_fact(
         &self,
         e: &mut crate::durable_tail_codec::Enc<'_>,
@@ -739,6 +771,9 @@ impl SessionStartState {
         e.varint(self.calls.len() as u64)?;
         for call in self.calls.values() {
             call.files.put(e)?;
+        }
+        if let Some(chars) = self.mcp_schemas {
+            chars.put(e)?;
         }
         Ok(())
     }
@@ -772,10 +807,12 @@ impl SessionStartState {
     }
 
     /// Restores the opening-settings fact into a decoded body: its blob and
-    /// call keys must be the ones the fact was written beside.
+    /// call keys must be the ones the fact was written beside. Only a v2
+    /// fact holds the MCP schema count; a v1 fact leaves it unknown.
     pub(in crate::snapshots) fn take_opening_fact(
         &mut self,
         d: &mut crate::durable_tail_codec::Dec<'_>,
+        with_mcp_schemas: bool,
     ) -> Result<(), crate::durable_tail_codec::Corrupt> {
         use crate::durable_tail_codec::{Corrupt, Durable};
         let digest =
@@ -808,6 +845,11 @@ impl SessionStartState {
         for call in self.calls.values_mut() {
             call.files = Vec::<String>::take(d)?;
         }
+        self.mcp_schemas = if with_mcp_schemas {
+            Some(u64::take(d)?)
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -986,19 +1028,27 @@ impl SessionStartState {
             .filter_map(|block| str_at(block, "text"))
             .map(units)
             .sum();
-        let tools = shape
+        let mut tools = 0;
+        let mut mcp_schemas = 0;
+        for tool in shape
             .get("tools")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .map(json_units)
-            .sum();
+        {
+            let chars = json_units(tool);
+            tools += chars;
+            if mcp_schema_in_full(tool) {
+                mcp_schemas += chars;
+            }
+        }
         let key = ClaudeRequestKey::shape(str_at(value, "shapeHash").unwrap_or(""));
         if !self.charge(std::mem::size_of::<ClaudeRequestKey>()) {
             self.parts_unmeasurable = true;
             return;
         }
         self.claude_shape = Some((key, system, tools));
+        self.mcp_schemas = Some(mcp_schemas);
     }
 
     fn claude_blob(&mut self, value: &Value) {
@@ -1051,6 +1101,8 @@ impl SessionStartState {
     fn claude_request(&mut self, value: &Value) {
         self.parts_closed = true;
         let shape = self.claude_shape.take();
+        // Kept below only when request 1 measures in full.
+        let mcp_schemas = self.mcp_schemas.take();
         let blobs = std::mem::take(&mut self.claude_blobs);
         self.recount_held();
         let tail = value.get("tail").and_then(Value::as_array);
@@ -1086,6 +1138,7 @@ impl SessionStartState {
                 }
             }
         }
+        self.mcp_schemas = mcp_schemas.filter(|_| !self.parts_unmeasurable);
     }
 
     fn claude_tool_uses(&mut self, value: &Value, response: u8, cwd: Option<&Path>) {
@@ -1644,6 +1697,10 @@ impl SessionStartState {
                 parts;
             start.start_chars_tools =
                 (method != CODEX_PARTS_METHOD || self.codex_tools_logged).then_some(tools);
+            // Only beside the tools it is a part of: the server clears a lone value.
+            if start.start_chars_tools.is_some() {
+                start.start_chars_mcp_schemas = self.mcp_schemas;
+            }
             start.start_chars_system = Some(system);
             start.start_chars_instructions = Some(instructions);
             start.start_chars_memory = Some(memory);
@@ -1806,6 +1863,11 @@ pub struct SnapshotSessionStart {
     pub start_parts_method: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_chars_tools: Option<u64>,
+    /// The part of `start_chars_tools` that is MCP tools sent in full (no
+    /// `defer_loading`). Claude only; unknown when request 1 was not fully
+    /// recorded, and never sent without `start_chars_tools`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_chars_mcp_schemas: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_chars_system: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1844,7 +1906,7 @@ pub struct SnapshotSessionStart {
 
 crate::heap_layout_bound::fields!(SnapshotOpeningFile; request, tool, repo_path, path_hash, ext, chars, reads, instruction_segments, client_loaded, truncated);
 crate::heap_layout_bound::fields!(OpeningFileCandidate; row, repo_path, path_hash, ext);
-crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, counted_request_10_context_tokens, counted_request_20_context_tokens, counted_request_50_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard, policy_applied, opening_files_unknown);
+crate::heap_layout_bound::fields!(SnapshotSessionStart; client_version, user_turn_count, first_request_uncached_input_tokens, first_request_cache_read_tokens, first_request_cache_write_5m_tokens, first_request_cache_write_1h_tokens, opening_request_count, request_2_context_tokens, request_3_context_tokens, counted_request_10_context_tokens, counted_request_20_context_tokens, counted_request_50_context_tokens, opening_output_tokens, opening_tool_calls, opening_truncated_outputs, opening_files, opening_file_overflow, instruction_load_cut, start_parts_method, start_chars_tools, start_chars_mcp_schemas, start_chars_system, start_chars_instructions, start_chars_memory, start_chars_skills, start_chars_agents, start_chars_mcp_names, start_chars_mcp_instructions, start_chars_hooks_env, start_chars_prompt, start_chars_other, start_config_fingerprint, file_candidates, files_over_guard, policy_applied, opening_files_unknown);
 
 impl SnapshotSessionStart {
     /// Picks each entry's identity under the current consent: a plain path
@@ -1954,6 +2016,7 @@ pub(crate) fn session_start_verdict(item: &crate::snapshots::SnapshotItem) -> St
         instruction_load_cut,
         start_parts_method,
         start_chars_tools,
+        start_chars_mcp_schemas,
         start_chars_system,
         start_chars_instructions,
         start_chars_memory,
@@ -1981,6 +2044,7 @@ pub(crate) fn session_start_verdict(item: &crate::snapshots::SnapshotItem) -> St
             opening_truncated_outputs,
             opening_file_overflow,
             start_chars_tools,
+            start_chars_mcp_schemas,
             start_chars_system,
             start_chars_instructions,
             start_chars_memory,

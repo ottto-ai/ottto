@@ -1927,7 +1927,7 @@ mod growth_tests {
 
     /// [money] f1 resumed reconciliation keeps growth after hold and restart.
     #[test]
-    fn f1_resumed_reconciliation_keeps_growth_after_hold_and_restart() {
+    fn resumed_reconciliation_keeps_growth_after_hold_and_restart() {
         for age_days in [31, 40] {
             let fixture = Fixture::new();
             let held = fixture.index();
@@ -2017,7 +2017,7 @@ mod growth_tests {
 
     /// [money] Growth settlement keeps a progress restart's audit debt.
     #[test]
-    fn f2_progress_restart_growth_settlement_keeps_audit_debt() {
+    fn progress_restart_growth_settlement_keeps_audit_debt() {
         let fixture = Fixture::new();
         let mut index = fixture.index();
         fixture.grow();
@@ -2045,7 +2045,7 @@ mod growth_tests {
 
     /// [off=main] f3 off preserves v1 age and bytes.
     #[test]
-    fn f3_off_preserves_v1_age_and_bytes() {
+    fn off_preserves_v1_age_and_bytes() {
         let fixture = Fixture::new();
         let mut index = fixture.legacy_index();
         fixture.grow();
@@ -2094,7 +2094,7 @@ mod growth_tests {
 
     /// [money] f9 uncertainty alarms on fourth consecutive saved pass without dropping.
     #[test]
-    fn f9_uncertainty_alarms_on_fourth_consecutive_saved_pass_without_dropping() {
+    fn uncertainty_alarms_on_fourth_consecutive_saved_pass_without_dropping() {
         let fixture = Fixture::new();
         let mut index = fixture.index();
         let missing_root = fixture.root.join("not-configured");
@@ -2170,7 +2170,7 @@ mod growth_tests {
 
     /// [money] f3 identity causes are not reclassified as retained growth.
     #[test]
-    fn f3_identity_causes_are_not_reclassified_as_retained_growth() {
+    fn identity_causes_are_not_reclassified_as_retained_growth() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         let fixture = Fixture::new();
         let mut index = fixture.index();
@@ -2230,7 +2230,7 @@ mod growth_tests {
 
     /// [money] f2 growth subset restores debt for unsettled file only.
     #[test]
-    fn f2_growth_subset_restores_debt_for_unsettled_file_only() {
+    fn growth_subset_restores_debt_for_unsettled_file_only() {
         let fixture = Fixture::new();
         let mut previous = fixture.index();
         fixture.grow();
@@ -2351,7 +2351,7 @@ mod growth_tests {
 
     /// [money] f3 growth full claim survives restart failure and subset save.
     #[test]
-    fn f3_growth_full_claim_survives_restart_failure_and_subset_save() {
+    fn growth_full_claim_survives_restart_failure_and_subset_save() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         for reason in [
             FullReason::StateMissing,
@@ -2456,7 +2456,7 @@ mod growth_tests {
 
     /// [money] f3 growth full without durable index never reads.
     #[test]
-    fn f3_growth_full_without_durable_index_never_reads() {
+    fn growth_full_without_durable_index_never_reads() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         let fixture = Fixture::new();
         let mut index = fixture.index();
@@ -2484,7 +2484,7 @@ mod growth_tests {
 
     /// [money] f3 recent claim outlives removal until interval expires.
     #[test]
-    fn f3_recent_claim_outlives_removal_until_interval_expires() {
+    fn recent_claim_outlives_removal_until_interval_expires() {
         let fixture = Fixture::new();
         let mut index = fixture.index();
         index.v2_mut().growth_retention.insert(
@@ -2505,7 +2505,7 @@ mod growth_tests {
     }
     /// [money] f3 malformed growth claim stays held across codec round trips.
     #[test]
-    fn f3_malformed_growth_claim_stays_held_across_codec_round_trips() {
+    fn malformed_growth_claim_stays_held_across_codec_round_trips() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         let fixture = Fixture::new();
         let initial = fixture.index();
@@ -2550,7 +2550,7 @@ mod growth_tests {
 
     /// [money] f3 failed claim save never authorizes full or spends memory only.
     #[test]
-    fn f3_failed_claim_save_never_authorizes_full_or_spends_memory_only() {
+    fn failed_claim_save_never_authorizes_full_or_spends_memory_only() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         let fixture = Fixture::new();
         let path = fixture.storage_path();
@@ -2585,7 +2585,7 @@ mod growth_tests {
     }
     /// [money] f3 claim receipt rejects same generation checkpoint replacement.
     #[test]
-    fn f3_claim_receipt_rejects_same_generation_checkpoint_replacement() {
+    fn claim_receipt_rejects_same_generation_checkpoint_replacement() {
         use crate::transcript_acquisition::{FullReason, ReadMode};
         let fixture = Fixture::new();
         let path = fixture.storage_path();

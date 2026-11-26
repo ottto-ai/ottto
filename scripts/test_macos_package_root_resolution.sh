@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -45,13 +43,13 @@ fi
 for zip_stage in 'CLI_ZIP cli' 'DAEMON_ZIP daemon'; do
   zip_var="${zip_stage% *}"
   stage="${zip_stage#* }"
-  if ! grep -Fxq "  ditto -c -k \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
+  if ! grep -Fxq "  ottto_release_zip \"\$ZIP_STAGE_ROOT/$stage\" \"\$$zip_var\"" "$package_script"; then
     echo "Package script must zip the $stage staging folder with its license notices." >&2
     exit 1
   fi
 done
 # shellcheck disable=SC2016
-if grep -Eq 'ditto -c -k "\$OUTPUT_DIR/ottto(-service)?"' "$package_script"; then
+if grep -Eq '(ditto -c -k|ottto_release_zip) "\$OUTPUT_DIR/ottto(-service)?"' "$package_script"; then
   echo "Package script must not zip a bare executable without its license notices." >&2
   exit 1
 fi
@@ -63,6 +61,7 @@ cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_sc
 cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companion_entitlements.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
 cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 11;
@@ -109,8 +108,8 @@ package_expect_failure missing-app-root "--app-root is required" \
 
 # [behaviour] A missing app root is named as passed.
 package_expect_failure absent-app-root \
-  "macOS app root does not exist: $resolved_repo/tools/ottto-macos-app" \
-  --app-root "$resolved_repo/tools/ottto-macos-app" \
+  "macOS app root does not exist: $resolved_repo/inputs/SampleApp" \
+  --app-root "$resolved_repo/inputs/SampleApp" \
   --version 0.1.0-dev --channel dev
 
 # [behaviour] A package root outside any Git checkout is refused after the
@@ -120,5 +119,24 @@ mkdir -p "$loose_app"
 printf '// fixture\n' > "$loose_app/Package.swift"
 package_expect_failure loose-app-root "macOS app root must belong to the private Git checkout" \
   --app-root "$loose_app" --version 0.1.0-dev --channel dev
+
+# [behaviour] The app package must be a subdirectory of its checkout: the
+# record binds that subdirectory's tree, never the whole checkout.
+root_app="$TMP_DIR/root-app"
+mkdir -p "$root_app"
+printf '// fixture\n' > "$root_app/Package.swift"
+git -C "$root_app" init -q
+git -C "$root_app" config user.email "macos-package-root-test@example.invalid"
+git -C "$root_app" config user.name "macOS Package Root Test"
+git -C "$root_app" add .
+git -C "$root_app" commit -qm "fixture"
+package_expect_failure checkout-root-app "macOS app root must be a subdirectory of its Git checkout" \
+  --app-root "$root_app" --version 0.1.0-dev --channel dev
+
+# [behaviour] The packager records no private repository identity or path.
+if grep -Eq 'OTTTO_MACOS_APP_SOURCE_REPOSITORY|mac_app_source_path|git_subtree' "$ROOT/scripts/macos_package.sh"; then
+  echo "Package script must not record a private repository identity or path" >&2
+  exit 1
+fi
 
 echo "macOS package root resolution test passed"

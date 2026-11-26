@@ -2341,7 +2341,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// is selected. After R2's gate removal, a later append reuses the
 /// head as Tail even beyond `commit + I`.
 #[test]
-fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
+fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

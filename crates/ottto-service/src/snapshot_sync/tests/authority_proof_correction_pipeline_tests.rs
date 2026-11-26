@@ -25,7 +25,7 @@
 // writes one count/hash-only JSON receipt line directly to stderr, outside the
 // test harness capture.
 
-use super::p12_pipeline_original_tests::{
+use super::claude_family_lines_fixture::{
     rearm_evidence_lines as apc_evidence_lines, rearm_family_sessions as apc_family_sessions,
     rearm_member_session as apc_member_session, rearm_transcript_line as apc_transcript_line,
 };
@@ -126,7 +126,7 @@ struct ApcEstablished {
     items: BTreeMap<String, SnapshotItem>,
 }
 
-/// An owed correction under the stored witness P1.
+/// An owed correction under the stored witness.
 struct ApcGrant {
     hour: u32,
     proof: String,
@@ -1337,7 +1337,7 @@ impl ApcFixture {
             }
             (Some((_, owed_before)), None) => {
                 if let Some(after) = &after {
-                    // R3: a failed parse under the proof replaces the record as
+                    // A failed parse under the proof replaces the record as
                     // a terminal one with no correction, bound to the proof.
                     let before = before.as_ref().unwrap();
                     assert_eq!(after.contract, "claude_usage_authority_quarantine:v1");
@@ -1519,7 +1519,7 @@ impl Drop for ApcFixture {
     }
 }
 
-/// SHED, R6 and acceptance additions 1 and 4: a crash after the parse and
+/// A crash after the parse and
 /// before any settlement leaves the durable index byte-identical; a shed page
 /// that actually offered an owed corrected body records no ACK for it and
 /// keeps that member owed through the real partial checkpoint and a restart
@@ -1642,7 +1642,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
     );
 }
 
-/// R4: a member's revision changes while it is owed under the same proof. A
+/// A member's revision changes while it is owed under the same proof. A
 /// late ACK of the superseded revision's corrected body, presented at the
 /// real settlement seam, drains nothing; the current revision's ACK drains it
 /// and records that revision in the same settlement.
@@ -1743,7 +1743,7 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
     );
 }
 
-/// R3 and the unhealthy-proof control: corrupt API evidence after the grant
+/// The unhealthy-proof control: corrupt API evidence after the grant
 /// demotes the owed family. The record is replaced as terminal with no
 /// correction, still bound to the granted proof, with the counter saturated
 /// and the deadline unchanged; held bodies are never ACKed; and an unhealthy
@@ -3242,7 +3242,7 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
 }
 
-/// F1 (review-942) setup: withholds the owner proof of `held` for one
+/// Setup: withholds the owner proof of `held` for one
 /// accepting generation, so every other owed member drains and each held
 /// member's account hold is committed; then turns on the production
 /// account-audit release (no retained custody), restores the owner proof of
@@ -3299,7 +3299,7 @@ fn apc_f1_hold_then_release(
     (pages, release)
 }
 
-/// F1 on the release page: the audit release cleared each released member's
+/// On the release page: the audit release cleared each released member's
 /// saved revision after its drain. Each stays owed under the same proof with
 /// its pre-drain pair in the saved index reloaded from disk (the restart),
 /// and the page is not fully settled.
@@ -3401,7 +3401,7 @@ fn apc_f1_redrain(
     }
 }
 
-/// [regress] F1, last owed member, exact ACK. The owed
+/// [regress] Last owed member, exact ACK. The owed
 /// member's committed account hold is released on a settled page and its corrected body is
 /// ACKed, which drains the last owed member. The production account-audit
 /// release then finds no retained custody: it clears the member's saved
@@ -3458,7 +3458,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
     );
 }
 
-/// [regress] F1, proven no-op, with another member still
+/// [regress] Proven no-op, with another member still
 /// owed. Agent b's corrected body is its accepted body, so its release page no-op-drains it
 /// without an upload, and the account-audit release then clears its saved
 /// revision. It stays owed with its pre-drain pair beside the held root, and
@@ -3531,7 +3531,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
     assert_eq!(owed, BTreeSet::from([still_held]));
 }
 
-/// [regress] F1: the released member's body is
+/// [regress] The released member's body is
 /// permanently refused on a fully settled page, so the post-selection settlement drains the
 /// last owed member. The account-audit release then clears its saved
 /// revision. That drain joins the finish restore: the member stays owed with

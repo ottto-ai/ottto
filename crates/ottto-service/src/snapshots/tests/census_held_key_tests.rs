@@ -1,4 +1,4 @@
-// Census P2 keeps these mechanisms: a locally held key reverts to its
+// The census keeps these mechanisms: a locally held key reverts to its
 // committed revision, and an observed but unindexed Codex file is read once
 // after a restart. All fixtures are synthetic and content-free.
 use super::*;

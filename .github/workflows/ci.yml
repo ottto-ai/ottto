@@ -85,9 +85,9 @@ jobs:
     # skip) can be reverted on its own at any time.
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
-    # The main merge queue usually takes about 38 minutes. A previous 40-minute limit
-    # cut off a run, so keep extra time for slower runs.
-    timeout-minutes: 55
+    # A full run usually takes about 45 minutes and a slow runner about 54. A 55-minute
+    # limit cut off a run whose tests had all passed, so keep about 30% headroom.
+    timeout-minutes: 70
     runs-on: macos-15
     env: &rust-contract-env
       OTTTO_REQUIRE_LAYOUT: "1"
@@ -198,7 +198,7 @@ jobs:
     name: Rust contracts (partial pre-check)
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name == 'workflow_dispatch' && inputs.rust_test_filter != '' && !(inputs.money_equivalence || inputs.scan_stack_margin) }}
-    timeout-minutes: 55
+    timeout-minutes: 70
     runs-on: macos-15
     env: *rust-contract-env
     steps: *rust-contract-steps

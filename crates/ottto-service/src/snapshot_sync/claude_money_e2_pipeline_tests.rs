@@ -4752,7 +4752,7 @@ mod state_v2_money_tests {
 mod evidence_chunk_tests;
 
 #[cfg(unix)]
-mod s2_oracle_tests;
+mod claude_tail_oracle_tests;
 
 #[cfg(unix)]
 mod codex_tail_oracle_tests;

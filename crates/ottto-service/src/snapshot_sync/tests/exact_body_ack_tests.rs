@@ -164,7 +164,7 @@ fn reload_ledger(index_path: &Path, witness: SnapshotQuarantineWitness) -> Snaps
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_mixed_50_43_exact_ack_restart_holds_only_rejected_bodies() {
+fn mixed_50_43_exact_ack_restart_holds_only_rejected_bodies() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -223,7 +223,7 @@ fn h357_mixed_50_43_exact_ack_restart_holds_only_rejected_bodies() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
+fn missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -332,7 +332,7 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
+fn exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -383,7 +383,7 @@ fn h357_exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_reason_vocabulary_never_echoes_response_detail_or_unknown_reason() {
+fn reason_vocabulary_never_echoes_response_detail_or_unknown_reason() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -400,7 +400,7 @@ fn h357_reason_vocabulary_never_echoes_response_detail_or_unknown_reason() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() {
+fn terminal_partial_reports_exact_progress_without_a_clean_success_clock() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -444,11 +444,11 @@ fn h357_terminal_partial_reports_exact_progress_without_a_clean_success_clock() 
     assert_eq!(clean.last_success_at, clean.last_scan_finished_at);
 }
 
-/// [regress] H359 server-permanent exact bodies cannot resend after restart,
+/// [regress] Server-permanent exact bodies cannot resend after restart,
 /// even when version-only witness normalization needs a diagnostic save.
 #[test]
 #[serial_test::serial(client_report)]
-fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_timer() {
+fn permanent_exact_body_survives_retirement_epoch_restart_and_premature_timer() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -581,7 +581,7 @@ fn h359_all_rejected(reason: &str) -> (SnapshotUploadProgress, ResumableUploadRe
 /// chooser; the dominated twin is below.
 #[test]
 #[serial_test::serial(client_report)]
-fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
+fn all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -620,7 +620,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
 /// goes through the settled-residue chooser instead of the error path.
 #[test]
 #[serial_test::serial(client_report)]
-fn h359_all_dominated_rejected_reports_the_settled_residue_state() {
+fn all_dominated_rejected_reports_the_settled_residue_state() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -648,7 +648,7 @@ fn h359_all_dominated_rejected_reports_the_settled_residue_state() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h359_unrelated_refusal_never_blocks_a_healthy_exact_probe_page() {
+fn unrelated_refusal_never_blocks_a_healthy_exact_probe_page() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -683,7 +683,7 @@ fn h359_unrelated_refusal_never_blocks_a_healthy_exact_probe_page() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h357_malformed_http200_is_typed_backend_response_not_network_failure() {
+fn malformed_http200_is_typed_backend_response_not_network_failure() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -748,7 +748,7 @@ fn h357_malformed_http200_is_typed_backend_response_not_network_failure() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues() {
+fn refused_cache_probe_settles_without_head_and_healthy_sibling_continues() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -899,7 +899,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_quarantined_probe_carries_exact_held_body_without_request() {
+fn quarantined_probe_carries_exact_held_body_without_request() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -993,7 +993,7 @@ fn h360_quarantined_probe_carries_exact_held_body_without_request() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page() {
+fn mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1204,7 +1204,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
+fn preflight_rejected_probe_self_quarantines_then_settles_as_held() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1322,7 +1322,7 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
+fn probe_conflict_defers_without_source_abort_and_merges_count() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1572,7 +1572,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
+fn unexact_leased_or_accepted_probe_refuses_held_fallback() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1645,7 +1645,7 @@ fn h360_unexact_leased_or_accepted_probe_refuses_held_fallback() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
+fn body_witness_mismatch_in_cas_stage_mints_no_head() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1705,7 +1705,7 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
+fn persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1801,7 +1801,7 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head() {
+fn head_required_mode_has_no_probe_and_held_body_never_retires_pending_head() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1870,7 +1870,7 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
 
 #[test]
 #[serial_test::serial(client_report)]
-fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due() {
+fn restart_restores_held_probe_quarantine_from_index_and_retries_when_due() {
     let _guard = SNAPSHOT_SYNC_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -2024,7 +2024,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
     );
 }
 
-/// T5: a retryable deferral stays `server_error`, whatever the ledger holds.
+/// A retryable deferral stays `server_error`, whatever the ledger holds.
 #[test]
 fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
     let mut ledger = progress();
@@ -2038,7 +2038,7 @@ fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
     }
 }
 
-/// F1: a newer body of a refused entity with a retryable conflict owes its own
+/// A newer body of a refused entity with a retryable conflict owes its own
 /// outcome. The older dominated refusal is no longer the entity's terminal
 /// record, so it cannot make the cycle a settled success.
 #[test]

@@ -7,7 +7,7 @@
 // content-free. The state-machine section is CONTROLLED: it seeds a granted
 // index, then runs the production seams in production order. The lifecycle
 // through real pages, uploads and reloads lives in
-// `snapshot_sync/authority_proof_correction_pipeline_tests.rs`.
+// `snapshot_sync/tests/authority_proof_correction_pipeline_tests.rs`.
 use super::*;
 
 const APC_ROOT: &str = "e1111111-1111-4111-8111-111111111111";
@@ -246,7 +246,7 @@ fn only_owed_or_changed_members_bypass_the_terminal_gate() {
     let mut changed = apc_candidate(&index, 0);
     changed.source_file_fingerprint = apc_hex('5');
     assert_eq!(apc_decision(&index, &changed), PARSE_FOR_AUTHORITY);
-    // The R3 failure shape the demotion path writes.
+    // The failure shape the demotion path writes.
     let record = index
         .claude_usage_authority_quarantine
         .get_mut(APC_ROOT)
@@ -280,7 +280,7 @@ fn apc_load_value(scratch: &Path, name: &str, value: &Value) -> (ScanIndex, bool
     (loaded, quarantined)
 }
 
-/// T5/R7 strict load: the proof, record digest and retained witness are one
+/// Strict load: the proof, record digest and retained witness are one
 /// binding; owed is non-empty and a subset of the recorded members; contract
 /// v2 exactly when a correction is present, on a terminal record. Every other
 /// shape drops only the authority record.
@@ -427,7 +427,7 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
     );
 }
 
-/// R7 against the actual pre-change decoder source. The pinned base has no
+/// Test against the actual pre-change decoder source. The pinned base has no
 /// `deny_unknown_fields` on the record, so a v2 record still decodes and the
 /// field is dropped; its record predicate then rejects the v2 contract, so the
 /// old loader takes its invalid-index branch: whole-index quarantine and a
@@ -726,7 +726,7 @@ fn apc_quarantine_bytes(index: &ScanIndex) -> Vec<u8> {
 /// changes. At an incomplete census the paired facts persist, and a later page
 /// of a complete census drains them after restart.
 #[test]
-fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_census() {
+fn current_revision_empty_member_drains_without_a_body_only_at_a_complete_census() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let current = apc_revisions()[0].clone();
@@ -768,7 +768,7 @@ fn m2_current_revision_empty_member_drains_without_a_body_only_at_a_complete_cen
 /// (an incomplete one where the read failed), and reloads intact. The last
 /// shape then advances on its own same-pass empty parse and drains.
 #[test]
-fn m2_older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
+fn older_legacy_failed_partial_and_unpaired_empty_facts_stay_owed() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let current = apc_revisions()[0].clone();
@@ -903,13 +903,13 @@ fn current_page_reads_defer_a_previously_durable_empty_pair_until_settlement() {
     }
 }
 
-/// A1 then A3 (Addendum 4 acceptance 1 and 5). A new empty revision parsed on
+/// A new empty revision parsed on
 /// an earlier partial page advances only the member's map revision, with the
 /// owed set, counter, deadline, proof and every acceptance and entity debt
 /// byte-identical; the three facts persist together through restart; the
 /// next page of a complete census then drains the member with no upload.
 #[test]
-fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_drains() {
+fn earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_drains() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let new = apc_hex('4');
@@ -960,14 +960,14 @@ fn a1_earlier_partial_empty_page_advances_only_the_map_then_a_complete_census_dr
     apc_save_reload(&mut loaded, &scratch.join("advanced.json"));
 }
 
-/// A3 control (Addendum 4 acceptance 2 and 5). The committed state holds an
+/// Control. The committed state holds an
 /// older empty entry while the record holds a newer revision; this page
 /// parses that newer revision to a body a hold keeps from the upload. Neither
 /// the non-empty parse nor borrowed or consuming held restoration of the old
 /// empty entry advances the map, and neither the current-page drain nor a
 /// later page of a complete census after restart drains the member.
 #[test]
-fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
+fn held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let older = apc_hex('0');
@@ -1032,7 +1032,7 @@ fn a3_held_restoration_of_an_older_empty_entry_never_advances_or_drains() {
 /// restart and a later complete census. Held restoration of an unrelated held
 /// body carries the paired advance intact.
 #[test]
-fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_member() {
+fn shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_member() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let new = apc_hex('4');
@@ -1099,7 +1099,7 @@ fn a2_shed_after_an_empty_advance_rolls_the_map_back_and_keeps_the_last_owed_mem
 /// empty mark, persists through restart, and a later page of a complete census
 /// drains it and clears the record.
 #[test]
-fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_complete_census() {
+fn partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_complete_census() {
     let [root, agent] = apc_members();
     let [_, agent_key] = apc_keys();
     let new = apc_hex('4');
@@ -1144,11 +1144,11 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
     apc_save_reload(&mut loaded, &scratch.join("shed.json"));
 }
 
-/// A3 (Addendum 4 acceptance 4 and 5): a complete non-empty parse at a new
+/// A complete non-empty parse at a new
 /// revision never advances the map at any census; the changed revision takes
-/// the existing R4 path, and the member stays owed through restart.
+/// the existing `AuthorityQuarantine` path, and the member stays owed through restart.
 #[test]
-fn a3_a_non_empty_parse_never_advances_the_map() {
+fn a_non_empty_parse_never_advances_the_map() {
     let [root, agent] = apc_members();
     let [root_key, _] = apc_keys();
     let changed = apc_hex('6');
@@ -1874,7 +1874,7 @@ fn apc_r2_page(last_owed: bool, revision: &str) -> (ScanIndex, ScanIndex, Claude
 /// accepted body are unchanged, and the restarted index parses the
 /// member again for its correction.
 #[test]
-fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed() {
+fn a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed() {
     let [root, _] = apc_members();
     let [root_key, _] = apc_keys();
     let moved = apc_hex('5');
@@ -1925,7 +1925,7 @@ fn r2_a_no_op_drain_whose_revision_the_partial_save_does_not_select_stays_owed()
 /// and with a moved one a save that carries the working entry (a page with
 /// no holds) carries it. The restore changes nothing in either case.
 #[test]
-fn r2_a_drain_at_the_selected_revision_settles_exactly_as_before() {
+fn a_drain_at_the_selected_revision_settles_exactly_as_before() {
     let [root, _] = apc_members();
     let [root_key, _] = apc_keys();
     let unmoved = apc_revisions()[0].clone();
