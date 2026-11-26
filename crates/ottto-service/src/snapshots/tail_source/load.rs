@@ -35,6 +35,15 @@ use crate::snapshots::*;
 use crate::transcript_acquisition::{CertificateRefusal, FullReason, Scope};
 use crate::transcript_cache::Retained;
 
+/// Why a held file waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::snapshots) enum HoldKind {
+    /// A newer build's head or session fact: this build cannot progress it.
+    NewerBuild,
+    /// A live input not available now: a later pass may read it.
+    LiveUnavailable,
+}
+
 /// What a load hands the read.
 pub(in crate::snapshots) enum Load {
     /// Continue from the stored reduction. `base` is `None` for a file set
@@ -42,7 +51,7 @@ pub(in crate::snapshots) enum Load {
     Reused(Box<Retained<CachedJsonlReduction>>, Option<TailBase>),
     /// A newer build's head, or a live input not available now: the file
     /// waits, untouched, with its debt.
-    Held,
+    Held(HoldKind),
     /// Start a Full read now, with the reason the file proved, if any.
     Cold(Option<FullReason>),
 }
@@ -309,7 +318,8 @@ fn load_with_bytes<S: TailSource>(
             crate::local_resource_diagnostics::tail_loaded(source.api_slug(), hit.page_bytes);
             return (Load::Reused(hit.retained, base), hit.page_bytes);
         }
-        Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
+        Err(Miss::Future | Miss::FutureFact) => ("held", None, Load::Held(HoldKind::NewerBuild)),
+        Err(Miss::LiveUnavailable) => ("held", None, Load::Held(HoldKind::LiveUnavailable)),
         // Valid stored state for a file that changed: an ordinary Full. A
         // shorter file is main's counted Full; no floor holds it.
         Err(Miss::Changed(reason)) => {

@@ -489,7 +489,10 @@ fn a_future_revision_holds() {
     state_v2::stage_tail(&route.path, &key, staged).unwrap();
     route.save(false);
     let (load, records) = loaded(&route, &route.dir.join("a.jsonl"), &key);
-    assert!(matches!(load, Load::Held));
+    assert!(matches!(
+        load,
+        Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
+    ));
     assert_eq!(counted(&records), ("held".into(), vec![]));
     assert!(state_v2::tail_head_keys(&route.index)
         .unwrap()

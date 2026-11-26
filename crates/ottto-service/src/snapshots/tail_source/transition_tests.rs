@@ -918,7 +918,10 @@ fn a_future_codex_head_holds_without_a_smaller_reemit() {
     staged.revision = Codex::REDUCTION_REVISION + 1;
     state_v2::stage_tail(&route.path, &key, staged).unwrap();
     route.save(false);
-    assert!(matches!(load_at::<Codex>(&route, &path, &key), Load::Held));
+    assert!(matches!(
+        load_at::<Codex>(&route, &path, &key),
+        Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
+    ));
     let mut held = codex_emitted(Mode::Restart, &route.index, &[]);
     held.accepted = prior.accepted.clone();
     money_oracle::assert_no_smaller_reemit(

@@ -393,7 +393,7 @@ fn touched_under_hold(
                 true
             }
             Load::Cold(_) => false,
-            Load::Held => panic!("{generations:?}: a touch never holds"),
+            Load::Held(_) => panic!("{generations:?}: a touch never holds"),
         };
         assert_eq!(holds(&route.index), held, "{generations:?}: the hold stays");
         continued
