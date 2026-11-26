@@ -1008,7 +1008,7 @@ impl CycleSettlement {
 
 impl Drop for CycleSettlement {
     fn drop(&mut self) {
-        for source in super::SNAPSHOT_SOURCES {
+        for source in super::lane::SNAPSHOT_SOURCES {
             if !self.collecting.contains(&source) {
                 drop_paced_request(source);
             }
