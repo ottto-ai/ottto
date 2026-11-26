@@ -108,7 +108,6 @@ use super::ShedSnapshotIndexes;
 use super::SnapshotProgressLock;
 use super::SnapshotQuarantineDisposition;
 use super::SnapshotSourceManifest;
-#[cfg(test)]
 use super::SnapshotUploadPolicy;
 use super::SnapshotUploadProgress;
 use crate::local_resource_diagnostics::pass_outcomes;
