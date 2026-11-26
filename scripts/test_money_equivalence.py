@@ -1103,10 +1103,9 @@ class StepTraceTests(unittest.TestCase):
 class RequiredStepTraceTests(unittest.TestCase):
     def test_the_required_list_is_every_fixed_and_scheduling_cycle(self):
         required = money_equivalence.REQUIRED_STEP_TRACES
-        self.assertEqual(len(required), 932)
+        self.assertEqual(len(required), 897)
         self.assertEqual(sum(name.startswith("schedule_") for name in required), 848)
-        self.assertLessEqual({"c11_both-15", "c11_marker-16"}, required)
-        self.assertFalse({"c11_both-16", "c11_marker-17"} & required)
+        self.assertFalse({name for name in required if name.startswith("c11_")})
         # Each scheduling run is listed at its full length, and each result row once per run.
         self.assertLessEqual({"schedule_claude-0", "schedule_claude-4", "schedule_claude-1164",
                               "schedule_codex-1929", "schedule_pi-1929",

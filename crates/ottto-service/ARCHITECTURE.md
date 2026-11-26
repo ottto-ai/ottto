@@ -38,7 +38,7 @@ file-system hint / periodic listing → select file → read new bytes from save
   stand, and check-in beats (sent with no scan start while a record is armed) keep them fresh.
   Anything else walks as before: any failure, an account switch, a restart, another writer's
   save, or a policy stop (collection disabled or a zero backfill window, which withdraws the
-  server's census). A due sampled audit waits for the next walk, at the latest the backstop. A
+  server's census). A
   pass that took a hint clears the record before any fallible step, so a failed pass is
   followed by a walk. An
   idle pass never emits a body. A watcher overflow, a dropped-event rescan (FSEvents
@@ -69,15 +69,16 @@ file-system hint / periodic listing → select file → read new bytes from save
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
   by cause. Re-reading unchanged content that was already uploaded is treated as a bug.
   Forced Claude twins with a current, verified, loss-free census may use the same validated Tail
-  loader. They still provide no copy proof or body-binding authority. Without audit capacity or
-  when the loader holds, they read natively on their holder's page. Exact/Empty growth can lose
+  loader. They still provide no copy proof or body-binding authority. When the loader holds,
+  they read natively on their holder's page. Exact/Empty growth can lose
   census verification and require a native read on the next force.
   Every plain Full/Tail acquisition with a read plan stops at its opening frozen length.
   Appends beyond that extent belong to the next ordinary pass. A grown in-page read
   validates its held-file prefix and path before publishing; it keeps no new Tail
-  checkpoint and earns no Full-audit or source-verification credit. An unfinished
-  boundary record remains withheld. If the prefix would weaken a committed body or
-  cannot reserve its audit marker, that file gets one same-walk retry; a second growth
+  checkpoint and earns no Full or source-verification credit; its index entry carries a
+  sealed-prefix tag until a whole native read replaces it. An unfinished
+  boundary record remains withheld. If the prefix would weaken a committed body,
+  that file gets one same-walk retry; a second growth
   refusal releases a committed body to the next pass, or leaves a new file unreadable.
   A changed scope or object at strict revalidation discards the attempt and shares this
   persisted same-walk retry, which holds the walk as a census member until the file reads
@@ -87,8 +88,8 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
 - **Codex counting.** Every new parse uses V2. An accepted old-formula file keeps its
-  accepted body until its physical content stamp changes, including during audit,
-  retry and cursor resume. A changed file is recounted to cold V2 exactly, even when
+  accepted body until its physical content stamp changes, including during retry
+  and cursor resume. A changed file is recounted to cold V2 exactly, even when
   the total falls; a joined group recounts together when any member changes.
   Missing or corrupt old heads remain skipped with repair owed. Index rebuilds and
   a new destination start with V2. V2 heads and paused jobs ignore retired counting
@@ -499,10 +500,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   descriptor reports the same count at commit and the read sealed the whole
   opening length; it is stored beside the certificate in the Tail head (envelope 2,
   writer capability 7) and compared only under the same inode and the same known
-  birth. A due audit still reads Full, so a touch never stands in for an audit or
-  reaches a quiet retirement. Otherwise a proven touch reads both samples (the
+  birth. A proven touch reads both samples (the
   retained checkpoint's, or the restore's) and then continues as an unchanged
-  file does: it carries the certificate's verification and debt, earns
+  file does: it carries the certificate's verification, earns
   no Full credit, and never enters `same_content`/`unchanged`, so an exact-stamp
   seal and Full-verification credit ignore the count. Without a count (another
   platform or file system, a zero count, a head written before counts, a file set
@@ -539,7 +539,7 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   restart, changed traversal context, unhealthy retry or clean follow-up keeps pacing.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
-  request identities, complete-negative evidence, Full audit credit or upload acceptance.
+  request identities, complete-negative evidence, Full credit or upload acceptance.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

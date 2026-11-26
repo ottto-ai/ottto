@@ -283,17 +283,16 @@ impl Disk {
         self.begin(&owner, source);
         owner
     }
-    /// The daemon's commit: save the index, then the post-save reconcile for
-    /// this owner. Returns the index as the next process loads it.
+    /// The daemon's commit: save the index. Returns the index as the next
+    /// process loads it.
     fn commit(
         &self,
-        cache: &crate::snapshots::sampled_scan::SharedCache,
+        _cache: &crate::snapshots::sampled_scan::SharedCache,
         source: SnapshotSource,
         index: &mut ScanIndex,
     ) -> ScanIndex {
         let path = self.path(source);
         index.save_fixture(path).unwrap();
-        crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
         ScanIndex::load(path).unwrap()
     }
 }

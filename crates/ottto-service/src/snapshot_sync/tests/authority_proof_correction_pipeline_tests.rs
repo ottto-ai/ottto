@@ -165,9 +165,6 @@ struct ApcFixture {
     listing_hour: std::cell::Cell<Option<i64>>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
-    /// Opt-in production account-audit release on settled pages, with no
-    /// retained custody. Old APC tests keep their original finish.
-    audit_release: std::cell::Cell<bool>,
 }
 
 impl ApcFixture {
@@ -195,7 +192,6 @@ impl ApcFixture {
             listing_hour: std::cell::Cell::new(None),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
-            audit_release: std::cell::Cell::new(false),
         };
         for (session, path) in [
             (
@@ -447,8 +443,7 @@ impl ApcFixture {
     /// One bounded page with the same acquisition and retry clock.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         // The minute suffix identifies bounded pages of one synthetic visit.
-        // Keep their acquisition clock fixed so every member's one-hour
-        // audit becomes due together on the following visit.
+        // Keep their acquisition clock fixed across the visit.
         let now = OffsetDateTime::parse(collected_at, &Rfc3339)
             .unwrap()
             .unix_timestamp() as u64
@@ -748,7 +743,7 @@ impl ApcFixture {
             progress
                 .save_fixture(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index_with_audit_release(
+            checkpoint_partial_snapshot_index_with_drains(
                 &index,
                 &committed_index,
                 &progress,
@@ -758,7 +753,6 @@ impl ApcFixture {
                 &self.index_path,
                 &self.progress_path,
                 || Ok(()),
-                None,
                 None,
                 None,
                 body_drains,
@@ -809,9 +803,7 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        // The production finish order. The opt-in account-audit release has
-        // no retained custody: a released hold's entry is cleared and queued
-        // for retry.
+        // The production finish order.
         let fully_settled = finish_selected_settlement(
             &mut index,
             SelectedSettlementInputs {
@@ -822,11 +814,6 @@ impl ApcFixture {
                 cutoff_candidates: &cutoff_candidates,
                 transport_fully_settled: settlement.fully_settled,
                 body_drains,
-                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
-                    previous: &committed_index,
-                    roots: std::slice::from_ref(&self.root),
-                    backfill_window_days: 183,
-                }),
             },
         );
         self.trace_stage(collected_at, "after_selected_settlement", &index);
@@ -3240,366 +3227,4 @@ fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     assert!(owed.contains(&held_member), "a held member never drains");
     fixture.withheld_owners.borrow_mut().clear();
     apc_r2_redrain(&fixture, grant.hour + 2, &reverted, &entities);
-}
-
-/// Setup: withholds the owner proof of `held` for one
-/// accepting generation, so every other owed member drains and each held
-/// member's account hold is committed; then turns on the production
-/// account-audit release (no retained custody), restores the owner proof of
-/// `released` and runs one generation with `upload`. Returns that
-/// generation's pages and the first one that parsed every released member.
-fn apc_f1_hold_then_release(
-    fixture: &ApcFixture,
-    grant: &ApcGrant,
-    held: &BTreeSet<String>,
-    released: &BTreeSet<String>,
-    upload: ApcUpload,
-) -> (Vec<ApcPage>, usize) {
-    assert!(held.is_subset(&grant.owed), "{held:?} {:?}", grant.owed);
-    assert!(released.is_subset(held));
-    fixture.withheld_owners.borrow_mut().clone_from(held);
-    let deferred = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
-    for member in held {
-        assert!(
-            deferred
-                .iter()
-                .any(|page| page.held_sessions.contains(member)),
-            "the withheld owner proof defers {member}"
-        );
-    }
-    let last = deferred.last().expect("terminal page");
-    let (_, owed) = last
-        .record()
-        .and_then(|record| record.correction)
-        .expect("the correction stays pending");
-    assert_eq!(&owed, held, "every other owed member drained");
-    assert!(
-        last.index.claude_account_deferred_hold_count() >= held.len(),
-        "each held member's account hold is committed"
-    );
-    fixture.audit_release.set(true);
-    fixture
-        .withheld_owners
-        .borrow_mut()
-        .retain(|member| !released.contains(member));
-    let pages = fixture.generation(grant.hour + 2, |_| upload);
-    let release = pages
-        .iter()
-        .position(|page| released.is_subset(&page.parsed))
-        .expect("a page parses every released member");
-    let page = &pages[release];
-    assert!(
-        page.index.claude_account_deferred_hold_count()
-            < page.before.claude_account_deferred_hold_count(),
-        "the page released a committed account hold"
-    );
-    for member in released {
-        assert!(!page.held_sessions.contains(member), "{member} is released");
-    }
-    (pages, release)
-}
-
-/// On the release page: the audit release cleared each released member's
-/// saved revision after its drain. Each stays owed under the same proof with
-/// its pre-drain pair in the saved index reloaded from disk (the restart),
-/// and the page is not fully settled.
-fn apc_f1_released_members_stay_owed(
-    page: &ApcPage,
-    grant: &ApcGrant,
-    released: &BTreeSet<String>,
-    label: &str,
-) {
-    let keys = ApcFixture::family_keys(&page.index);
-    let pairs_before = page
-        .record_before()
-        .expect("an owed record before the release")
-        .member_source_file_fingerprints;
-    let record = page.record().expect("the record is kept");
-    let (proof, owed) = record.correction.clone().expect("the correction is owed");
-    assert_eq!(proof, grant.proof, "{label}: the same proof");
-    for member in released {
-        assert!(
-            page.index.files[&keys[member]]
-                .source_file_fingerprint
-                .is_empty(),
-            "{label}: the account-audit release cleared {member}'s saved revision"
-        );
-        assert!(owed.contains(member), "{label}: {member} stays owed");
-        assert_eq!(
-            record.member_source_file_fingerprints.get(member),
-            pairs_before.get(member),
-            "{label}: {member} keeps its pre-drain pair"
-        );
-    }
-    assert!(
-        !page.fully_settled,
-        "{label}: the debt keeps the page unsettled"
-    );
-}
-
-/// The pages after the release page, plus one more accepting generation if a
-/// released member is still owed after them (the matching-carried control):
-/// every drain certifies the revision its saved entry has
-/// (`apc_r2_drained_pairs`), and each released member drains again on its
-/// exact ACK or as a no-op. The audit-release retry re-reads a cleared entry
-/// without its prior body tuple, so the body may be offered again (this
-/// harness keeps no durable upload ledger between accepting pages), but only
-/// the same exact body: tokens and cost are unchanged.
-fn apc_f1_redrain(
-    fixture: &ApcFixture,
-    hour: u32,
-    later: &[ApcPage],
-    released: &BTreeSet<String>,
-    bodies: &BTreeSet<String>,
-) {
-    let mut drained = BTreeSet::new();
-    let mut check = |page: &ApcPage, label: &str| {
-        let transition = ApcFixture::check(page, label);
-        apc_r2_drained_pairs(page, label);
-        assert!(transition.granted.is_none(), "{label}: no fresh grant");
-        assert!(!transition.failed, "{label}: no failure");
-        drained.extend(transition.noop);
-        drained.extend(transition.acked);
-        for member in released {
-            if let Some((fingerprint, _)) = page.offered_bodies.get(member) {
-                assert!(
-                    bodies.contains(fingerprint),
-                    "{label}: {member} is offered only its same exact body"
-                );
-            }
-        }
-    };
-    for (number, page) in later.iter().enumerate() {
-        check(page, &format!("release generation later page {number}"));
-    }
-    let owes_released = |page: &ApcPage| {
-        page.record()
-            .and_then(|record| record.correction)
-            .is_some_and(|(_, owed)| !owed.is_disjoint(released))
-    };
-    let mut pages = Vec::new();
-    if later.last().is_none_or(owes_released) {
-        pages = fixture.generation(hour, |_| ApcUpload::Accept);
-        for (number, page) in pages.iter().enumerate() {
-            check(page, &format!("re-drain page {number}"));
-        }
-    }
-    assert!(
-        released.is_subset(&drained),
-        "each released member drains again: {released:?} {drained:?}"
-    );
-    let last = pages.last().or(later.last()).expect("a later page");
-    assert!(!owes_released(last), "no released member is owed");
-    let keys = ApcFixture::family_keys(&last.index);
-    for member in released {
-        assert!(
-            !last.index.files[&keys[member]]
-                .source_file_fingerprint
-                .is_empty(),
-            "{member}'s saved entry has its drained revision again"
-        );
-    }
-}
-
-/// [regress] Last owed member, exact ACK. The owed
-/// member's committed account hold is released on a settled page and its corrected body is
-/// ACKed, which drains the last owed member. The production account-audit
-/// release then finds no retained custody: it clears the member's saved
-/// revision and queues a retry. The save keeps the record with the member
-/// owed under the same proof and its pre-drain pair, never a cleared record
-/// beside an unselected drained revision. The retry drains it again at the
-/// revision its saved entry has, offering at most the same exact body.
-/// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). With the wrong order, the restore runs
-/// before the release, carries the drain and clears the record, so
-/// `apc_f1_released_members_stay_owed` panics "the record is kept".
-#[test]
-#[serial(source_manifests)]
-fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-f1-last", true);
-    let grant = fixture.pre_flip_grant();
-    // Agent a's note after the delivery changed its body, so its correction
-    // needs an exact ACK.
-    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
-    let (pages, release) =
-        apc_f1_hold_then_release(&fixture, &grant, &held, &held, ApcUpload::Accept);
-    let page = &pages[release];
-    let transition = ApcFixture::check(page, "release page");
-    assert!(transition.granted.is_none() && !transition.failed);
-    let mut acked = BTreeSet::new();
-    for member in &held {
-        let (fingerprint, _) = page.offered_bodies.get(member).expect("offered");
-        assert!(page.uploaded.contains(fingerprint), "{member} is ACKed");
-        assert!(page
-            .index
-            .accepted_snapshot_fingerprint_recorded(fingerprint));
-        acked.insert(fingerprint.clone());
-    }
-    let (_, owed_before) = page
-        .record_before()
-        .and_then(|record| record.correction)
-        .expect("owed before the release");
-    assert_eq!(owed_before, held, "the released member is the last owed");
-    apc_f1_released_members_stay_owed(page, &grant, &held, "last owed");
-    assert_eq!(
-        page.record().and_then(|record| record.correction),
-        Some((grant.proof.clone(), held.clone())),
-        "the re-bound record owes only the released member"
-    );
-    apc_f1_redrain(
-        &fixture,
-        grant.hour + 3,
-        &pages[release + 1..],
-        &held,
-        &acked,
-    );
-}
-
-/// [regress] Proven no-op, with another member still
-/// owed. Agent b's corrected body is its accepted body, so its release page no-op-drains it
-/// without an upload, and the account-audit release then clears its saved
-/// revision. It stays owed with its pre-drain pair beside the held root, and
-/// drains again once the retry re-reads it.
-/// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). This case alone can pass in either order
-/// if selection kept agent b's committed re-arm marker. Both orders leave
-/// it owed, and the page exposes no pre-release entry to distinguish them.
-/// The last-owed and permanent-refusal cases distinguish the ordering.
-#[test]
-#[serial(source_manifests)]
-fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-f1-owed", true);
-    let grant = fixture.pre_flip_grant();
-    let released = BTreeSet::from([apc_member_session(Some(APC_AGENTS[1]))]);
-    let still_held = apc_member_session(None);
-    let held = released
-        .iter()
-        .cloned()
-        .chain([still_held.clone()])
-        .collect::<BTreeSet<_>>();
-    let (pages, release) =
-        apc_f1_hold_then_release(&fixture, &grant, &held, &released, ApcUpload::Accept);
-    let page = &pages[release];
-    let transition = ApcFixture::check(page, "release page");
-    assert!(transition.granted.is_none() && !transition.failed);
-    let keys = ApcFixture::family_keys(&page.index);
-    let mut accepted = BTreeSet::new();
-    for member in &released {
-        assert!(
-            page.captured_members().contains(member),
-            "{member}'s correction is captured"
-        );
-        assert!(
-            !page.offered_bodies.contains_key(member),
-            "{member} is not offered"
-        );
-        let entities = page.index.file_snapshot_fingerprints[&keys[member]].clone();
-        assert!(!entities.is_empty());
-        for fingerprint in &entities {
-            assert!(
-                page.before
-                    .accepted_snapshot_fingerprint_recorded(fingerprint),
-                "{member}'s body was accepted before the page: a no-op"
-            );
-        }
-        accepted.extend(entities);
-    }
-    apc_f1_released_members_stay_owed(page, &grant, &released, "no-op beside a held member");
-    let (_, owed) = page
-        .record()
-        .and_then(|record| record.correction)
-        .expect("owed");
-    assert!(owed.contains(&still_held), "the held member stays owed");
-    apc_f1_redrain(
-        &fixture,
-        grant.hour + 3,
-        &pages[release + 1..],
-        &released,
-        &accepted,
-    );
-    let last = ScanIndex::load(&fixture.index_path).expect("restart");
-    let (_, owed) = last
-        .claude_authority_record_for_test(APC_ROOT)
-        .and_then(|record| record.correction)
-        .expect("the held member keeps the correction");
-    assert_eq!(owed, BTreeSet::from([still_held]));
-}
-
-/// [regress] The released member's body is
-/// permanently refused on a fully settled page, so the post-selection settlement drains the
-/// last owed member. The account-audit release then clears its saved
-/// revision. That drain joins the finish restore: the member stays owed with
-/// its pre-drain pair, and drains again at the revision its saved entry has
-/// once the retry re-reads it.
-/// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). With the wrong order, the drain never
-/// reaches the restore and clears the record, so
-/// `apc_f1_released_members_stay_owed` panics "the record is kept".
-#[test]
-#[serial(source_manifests)]
-// A rejected entity records Poisoned in the shared client_report counters.
-#[serial(client_report)]
-fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
-    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
-    let _source_manifests = SourceManifestTestGuard::new();
-    let fixture = ApcFixture::new("claude-authority-proof-correction-f1-permanent", true);
-    let grant = fixture.pre_flip_grant();
-    // Agent a's changed body is offered, so the server can refuse it.
-    let held = BTreeSet::from([apc_member_session(Some(APC_AGENTS[0]))]);
-    let (pages, release) = apc_f1_hold_then_release(
-        &fixture,
-        &grant,
-        &held,
-        &held,
-        ApcUpload::PermanentRejection,
-    );
-    let page = &pages[release];
-    for member in &held {
-        let (fingerprint, witness) = page.offered_bodies.get(member).expect("offered");
-        assert_eq!(
-            page.progress
-                .permanent_rejections
-                .get(fingerprint)
-                .map(|rejection| &rejection.body_witness),
-            Some(witness),
-            "{member}'s exact body is permanently refused"
-        );
-        assert!(!page
-            .index
-            .accepted_snapshot_fingerprint_recorded(fingerprint));
-    }
-    apc_f1_released_members_stay_owed(page, &grant, &held, "permanent refusal");
-    let owes_held = |page: &ApcPage| {
-        page.record()
-            .and_then(|record| record.correction)
-            .is_some_and(|(_, owed)| !owed.is_disjoint(&held))
-    };
-    let mut later = pages.into_iter().skip(release + 1).collect::<Vec<_>>();
-    if later.last().is_none_or(owes_held) {
-        later.extend(fixture.generation(grant.hour + 3, |_| ApcUpload::PermanentRejection));
-    }
-    for (number, page) in later.iter().enumerate() {
-        apc_r2_drained_pairs(page, &format!("permanent later page {number}"));
-    }
-    let last = later.last().expect("a later page");
-    assert!(
-        !owes_held(last),
-        "the retry drains the refused member again"
-    );
-    let keys = ApcFixture::family_keys(&last.index);
-    for member in &held {
-        assert!(
-            !last.index.files[&keys[member]]
-                .source_file_fingerprint
-                .is_empty(),
-            "{member}'s saved entry has its drained revision again"
-        );
-    }
 }

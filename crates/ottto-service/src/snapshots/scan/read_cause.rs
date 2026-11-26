@@ -22,17 +22,12 @@ impl ScanIndex {
         source_change: Option<SourceChange>,
     ) {
         let key = local_index_key(&candidate.path);
-        let grew = self
-            .files
-            .get(&key)
-            .is_some_and(|entry| candidate.size_bytes > entry.size_bytes);
         let (token, cause) = self.change_reason(
             source,
             &key,
             reason,
             source_change,
             candidate.fingerprint_changed_nanos,
-            grew,
         );
         counts::selected(source.api_slug(), key, token, cause);
     }
@@ -40,9 +35,7 @@ impl ScanIndex {
     /// `(first cause, admin_other cause)`. `SourceChanged` labels three
     /// causes: a pending copy removal, a moved fingerprint (sidecars, launcher
     /// context, scan identity) and an account memo-miss. `changed_nanos` is
-    /// the ctime the candidate's fingerprint used. A due audit on a file that
-    /// grew past its index entry reads the appended bytes, so it counts as an
-    /// append like `TranscriptChanged`.
+    /// the ctime the candidate's fingerprint used.
     fn change_reason(
         &self,
         source: SnapshotSource,
@@ -50,7 +43,6 @@ impl ScanIndex {
         reason: Option<CandidateParseReason>,
         source_change: Option<SourceChange>,
         changed_nanos: u64,
-        grew: bool,
     ) -> (Token, AdminCause) {
         use CandidateParseReason as R;
         let delivered = || {
@@ -60,7 +52,6 @@ impl ScanIndex {
         };
         let token = match reason {
             Some(R::TranscriptChanged) => Token::Append,
-            Some(R::Audit) if grew => Token::Append,
             Some(R::NewFile) => {
                 let token = counts::new_file_token(source.api_slug());
                 return (token, AdminCause::NewFileFreshIndex);
@@ -72,7 +63,6 @@ impl ScanIndex {
                 return (self.revision_change_reason(key), AdminCause::Adoption);
             }
             Some(R::Rearmed) => return (Token::AdminOther, AdminCause::Rearm),
-            Some(R::Audit) => return (Token::AdminOther, AdminCause::Audit),
             Some(R::UploadContext) if delivered() && counts::privacy_off(source.api_slug()) => {
                 Token::PrivacyOffErase
             }
@@ -141,12 +131,11 @@ mod tests {
         let reset = ReadMode::Full(FullReason::SameSizeEdit);
         type Setup = fn(&mut ScanIndex);
         let none: Setup = |_| {};
-        let cases: [(R, Setup, ReadMode, &str); 10] = [
+        let cases: [(R, Setup, ReadMode, &str); 9] = [
             (R::TranscriptChanged, none, tail, "append"),
             (R::TranscriptChanged, none, reset, "source_reset"),
             (R::TerminalDisposition, none, tail, "parser_revision"),
             (R::ForcedFamily, none, tail, "copy_ownership"),
-            (R::Audit, none, tail, "admin_other"),
             (
                 R::NewFile,
                 |_| counts::index_loaded("claude_code", true, Some(PriorHistory::Moved)),
@@ -230,14 +219,8 @@ mod tests {
                 .file_snapshot_fingerprints
                 .insert(key.into(), BTreeSet::from([entity.clone()]));
             setup(&mut index);
-            let (token, cause) = index.change_reason(
-                SnapshotSource::ClaudeCode,
-                key,
-                Some(reason),
-                change,
-                0,
-                false,
-            );
+            let (token, cause) =
+                index.change_reason(SnapshotSource::ClaudeCode, key, Some(reason), change, 0);
             counts::selected("claude_code", key.into(), token, cause);
             counts::read("claude_code", key, mode, 10, 2);
             counts::propagate("claude_code", &index);
@@ -268,7 +251,6 @@ mod tests {
             (R::BodyWitnessAdoption, None, 5, "adoption"),
             (R::Rearmed, None, 5, "rearm"),
             (R::NewFile, None, 5, "new_file_fresh_index"),
-            (R::Audit, None, 5, "audit"),
             (R::UnknownOutcome, None, 5, "other"),
         ];
         for (reason, change, changed_nanos, expected) in cases {
@@ -287,7 +269,6 @@ mod tests {
                 Some(reason),
                 change,
                 changed_nanos,
-                false,
             );
             counts::selected("claude_code", key.into(), token, cause);
             counts::read("claude_code", key, ReadMode::Tail, 10, 2);
@@ -297,44 +278,6 @@ mod tests {
             assert_eq!(split.len(), 1, "{reason:?}");
             assert_eq!(split[&format!("{expected}.tail")]["files"], 1, "{reason:?}");
             assert_eq!(page["read"]["admin_other"]["files"], 1, "{reason:?}");
-            counts::index_loaded("claude_code", false, None);
-        }
-    }
-
-    /// [behaviour] A due audit on a grown file counts its read as an append
-    /// (a Full read of it as a source reset); an audit of an unchanged-size
-    /// file stays `admin_other` under `audit`.
-    #[test]
-    fn audit_of_a_grown_file_counts_as_append() {
-        use crate::transcript_acquisition::{FullReason, ReadMode};
-        let key = "/synthetic/one.jsonl";
-        let reset = ReadMode::Full(FullReason::SameSizeEdit);
-        for (grew, mode, expected) in [
-            (true, ReadMode::Tail, "append"),
-            (true, reset, "source_reset"),
-            (false, ReadMode::Tail, "admin_other"),
-        ] {
-            let mut index = ScanIndex::default();
-            index.files.insert(key.into(), ScanIndexEntry::default());
-            let (token, cause) = index.change_reason(
-                SnapshotSource::ClaudeCode,
-                key,
-                Some(CandidateParseReason::Audit),
-                None,
-                0,
-                grew,
-            );
-            counts::selected("claude_code", key.into(), token, cause);
-            counts::read("claude_code", key, mode, 10, 2);
-            counts::admin_read("claude_code", key, Some((mode, 10)), 0);
-            let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
-            assert_eq!(page["read"][expected]["files"], 1, "{grew} {expected}");
-            let split = page["admin_other_read"].as_object();
-            assert_eq!(
-                split.is_some_and(|split| split.contains_key("audit.tail")),
-                !grew,
-                "{grew}"
-            );
             counts::index_loaded("claude_code", false, None);
         }
     }

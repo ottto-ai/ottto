@@ -883,15 +883,12 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
 }
 
 /// [money] A main deferred before acquisition cannot let its pulled content
-/// twin replace the session. Growth pacing, then audit-cap pacing, both hold
-/// until a later complete page matches the native Full union after restart.
-/// ROOT's exact heads per phase: 20/2, then 30/3, no body while held, then
-/// exactly one 70/7 body.
+/// twin replace the session. Growth pacing holds until a later complete page
+/// matches the native Full union after restart. ROOT's exact heads per phase:
+/// 20/2, then 30/3, no body while held, then exactly one 70/7 body.
 #[test]
 fn deferred_main_with_read_content_twin_holds_until_complete() {
-    use crate::snapshots::e2_pipeline_scan_fixture::{
-        indexed_size, owe_claimed_growth, pace_cap_for_test,
-    };
+    use crate::snapshots::e2_pipeline_scan_fixture::{indexed_size, owe_claimed_growth};
     // A page's ROOT bodies: wire input tokens and requests.
     fn heads(page: &Page) -> Vec<(u64, u64)> {
         (page.scan.snapshots.iter())
@@ -953,78 +950,74 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
             let mut reference = sent_money(&full);
             reference.mode = Mode::ColdFull;
 
-            let mut scanner = if restart {
+            let scanner = if restart {
                 E2ScanFixture::default()
             } else {
                 owner
             };
-            // These are the same no-capacity controls as the forced-member
-            // fixture. Only M is paced: the content twin still reads natively.
-            for paced in [true, false] {
-                let mut selected = owe_claimed_growth(&prior, &c.base, &main, paced);
-                owe(&mut selected);
-                // Preserve accepted-body ownership; remove delivery receipts
-                // so this held attempt must prove it cannot earn a new one.
-                for key in [&main_key, &twin_key] {
-                    selected.files.get_mut(key).unwrap().upload_context_receipt = None;
-                }
-                if restart {
-                    selected = c.reload(&mut selected);
-                }
-                if !paced {
-                    scanner.set_audit_slots(0);
-                    pace_cap_for_test(&scanner, &main);
-                }
-                let mut held = c.raw(
-                    &scanner,
-                    selected.clone(),
-                    100,
-                    true,
-                    std::slice::from_ref(&main),
-                );
-                assert!(
-                    !scanner.paths().contains(&main),
-                    "M is deferred before acquisition"
-                );
-                assert!(
-                    scanner.paths().contains(&twin),
-                    "M pulled T before its deferral"
-                );
-                assert_eq!(indexed_size(&held.index, &main), size);
-                assert!(
-                    held.scan.snapshots.iter().any(|item| {
-                        item.claude_money
-                            .as_deref()
-                            .and_then(e2::FileFold::location_key)
-                            == Some(location_key(&twin_key))
-                    }),
-                    "the held page has a real T fold"
-                );
-                held.enrich(&c);
-                assert_eq!(
-                    held.disposition
-                        .request_owned_hold_reasons
-                        .get("absent_content_twin"),
-                    Some(&1)
-                );
-                let holds = held.finish();
-                assert!(holds.progress_blocking);
-                assert!(heads(&held).is_empty(), "T alone cannot publish S");
-                prior = accept_finished_monotone_page(&c, &selected, held, &mut accepted, holds);
-                assert_eq!(
-                    accepted[ROOT], 3,
-                    "held pages never change the receiver ledger"
-                );
-                for key in [&main_key, &twin_key] {
-                    assert!(
-                        prior.files[key].upload_context_receipt.is_none(),
-                        "held files earn no receipt"
-                    );
-                }
+            // Only M is paced: the content twin still reads natively.
+            let mut selected = owe_claimed_growth(&prior, &c.base, &main, true);
+            owe(&mut selected);
+            // Preserve accepted-body ownership; remove delivery receipts
+            // so this held attempt must prove it cannot earn a new one.
+            for key in [&main_key, &twin_key] {
+                selected.files.get_mut(key).unwrap().upload_context_receipt = None;
             }
-            // The durable growth claim is now due. A fresh page has capacity
-            // and must acquire M+T together, without filtering any fold.
-            scanner.set_audit_slots(1);
+            if restart {
+                selected = c.reload(&mut selected);
+            }
+            let mut held = c.raw(
+                &scanner,
+                selected.clone(),
+                100,
+                true,
+                std::slice::from_ref(&main),
+            );
+            assert!(
+                !scanner.paths().contains(&main),
+                "M is deferred before acquisition"
+            );
+            assert!(
+                scanner.paths().contains(&twin),
+                "M pulled T before its deferral"
+            );
+            assert_eq!(indexed_size(&held.index, &main), size);
+            assert!(
+                held.scan.snapshots.iter().any(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(e2::FileFold::location_key)
+                        == Some(location_key(&twin_key))
+                }),
+                "the held page has a real T fold"
+            );
+            held.enrich(&c);
+            assert_eq!(
+                held.disposition
+                    .request_owned_hold_reasons
+                    .get("absent_content_twin"),
+                Some(&1)
+            );
+            let holds = held.finish();
+            assert!(holds.progress_blocking);
+            assert!(heads(&held).is_empty(), "T alone cannot publish S");
+            prior = accept_finished_monotone_page(&c, &selected, held, &mut accepted, holds);
+            assert_eq!(
+                accepted[ROOT], 3,
+                "held pages never change the receiver ledger"
+            );
+            for key in [&main_key, &twin_key] {
+                assert!(
+                    prior.files[key].upload_context_receipt.is_none(),
+                    "held files earn no receipt"
+                );
+            }
+            // Age the durable growth claim past its interval: a fresh page
+            // must acquire M+T together, without filtering any fold.
+            prior = owe_claimed_growth(&prior, &c.base, &main, false);
+            if restart {
+                prior = c.reload(&mut prior);
+            }
             let mut recovered = c.raw(
                 &scanner,
                 prior.clone(),

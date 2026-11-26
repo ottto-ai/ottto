@@ -152,9 +152,6 @@ macro_rules! codex_cursor_events {
             jobs_deferred_inputs,
             /// Start refused because the held file's stamp could not be read.
             jobs_start_unstartable,
-            /// A tail reached its audit deadline before commit: restarted as
-            /// the full audit, uncounted.
-            jobs_audit_restarted,
             /// Committed, then the native finish refused publication.
             jobs_finish_failed,
             /// A dropped scan frame returned its intact job to the slot.
@@ -168,10 +165,8 @@ macro_rules! codex_cursor_events {
             /// A resume found a live job of another namespace in the slot.
             namespace_busy,
             cursor_disabled_unsupported_layout,
-            /// Certified at or after its audit deadline: the debt stays staged.
-            audit_overdue,
             /// A completion on a file that did not grow withheld an unterminated
-            /// final record (N2): debt staged, the record left to main's EOF path.
+            /// final record (N2), left to main's EOF path.
             sealed_fragment_withheld,
             /// A completion at genuine unchanged EOF applied its withheld final
             /// record with main's trailing-line rule (strict finish identity).
@@ -895,9 +890,6 @@ fn drain(source: &str, slots: &[(&'static str, usize)]) -> BTreeMap<&'static str
         .filter(|(_, count)| *count > 0)
         .collect()
 }
-pub(crate) fn audit_retired_absent(source: &str) {
-    source_count(source, 12, |slot| slot.fetch_add(1, Relaxed));
-}
 /// One aged gate retained a grown indexed file (not a unique-file count).
 pub(crate) fn discovery_retained_grown(source: &str) {
     source_count(source, 10, |slot| slot.fetch_add(1, Relaxed));
@@ -1394,8 +1386,6 @@ impl Probe {
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            audit_retired_absent: BTreeMap<&'static str, u64>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             discovery_retained: BTreeMap<&'static str, u64>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             codex_fragment_tail_repeat: BTreeMap<&'static str, u64>,
@@ -1449,7 +1439,6 @@ impl Probe {
                     ("withheld_absence_ambiguous", 18),
                 ],
             ),
-            audit_retired_absent: drain(source, &[("events", 12)]),
             discovery_retained: drain(source, &[("grown", 10)]),
             codex_fragment_tail_repeat: drain(source, &[("files", 13), ("bytes", 14)]),
             withheld_hold_released: drain(source, &WITHHELD_RELEASED),
@@ -2629,7 +2618,6 @@ pub(crate) struct ReadCounts {
     pub(crate) completed_guard_bytes: u64,
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
-    pub(crate) index_state_at_page_end: IndexState,
     /// Resumable large-file Codex read cursor. `null` when its
     /// snapshot could not be obtained (no Codex cursor page tick in this scan,
     /// or the cursor state was busy at completion): unknown, never zero
@@ -2679,8 +2667,6 @@ pub(crate) struct CodexCursorRetained {
     pub(crate) parked_entries: u32,
     pub(crate) invalidation_entries: u32,
     pub(crate) rotation_waiters: u32,
-    /// Process-lifetime maximum `now - due` of an overdue certification.
-    pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
 }
 impl Serialize for CodexCursorRetained {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2694,10 +2680,6 @@ impl Serialize for CodexCursorRetained {
             ("parked_entries", self.parked_entries),
             ("invalidation_entries", self.invalidation_entries),
             ("rotation_waiters", self.rotation_waiters),
-            (
-                "lifetime_audit_overdue_max_age_seconds",
-                self.lifetime_audit_overdue_max_age_seconds,
-            ),
         ] {
             if count != 0 {
                 map.serialize_entry(key, &count)?;
@@ -2728,46 +2710,14 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) sidecar_census_complete: AssessedBool,
     pub(crate) reduction_dependencies_available: AssessedBool,
     pub(crate) index_entry_present: AssessedBool,
-    pub(crate) audit_metadata_supported: AssessedBool,
     pub(crate) protected_history: AssessedBool,
     pub(crate) forced_family: AssessedBool,
-    pub(crate) audit_debt_present: AssessedBool,
-    pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
 crate::heap_layout_bound::no_heap!(false; AcquisitionAdmission);
 
-/// Existing audit point, using already computed final/previous fingerprints.
-/// Additive aliases retain their meaning; neither comparison is an audit-policy
-/// benefit verdict (a suffix or policy change can also change either witness).
-pub(crate) fn sampled_audit_comparison(
-    source: &str,
-    semantic: (Option<&str>, Option<&str>),
-    additive: (Option<&str>, Option<&str>),
-) {
-    #[derive(Serialize)]
-    struct Counts {
-        body_comparison_available: bool,
-        effective_body_changed: bool,
-        semantic_comparison_available: bool,
-        semantic_changed: bool,
-    }
-    emit(&Record {
-        schema_version: SCHEMA_VERSION,
-        process_id: std::process::id(),
-        stage: "sampled_audit_comparison",
-        source: Source::from_slug(source),
-        observation: Observation::point(),
-        counts: Counts {
-            body_comparison_available: additive.1.is_some(),
-            effective_body_changed: additive.0 != additive.1,
-            semantic_comparison_available: semantic.1.is_some(),
-            semantic_changed: semantic.0 != semantic.1,
-        },
-    });
-}
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
     #[serde(skip_serializing_if = "rearm_cause::Counts::is_empty")]
@@ -2776,18 +2726,6 @@ pub(crate) struct PageEvents {
     pub(crate) full_by_parse_reason: claude_reread::FullByParseReason,
     pub(crate) full_reasons: FullReasons,
     pub(crate) priority_full_replays: usize,
-    pub(crate) audits_started: usize,
-    pub(crate) audits_completed: usize,
-    pub(crate) max_start_overdue_seconds: u64,
-    pub(crate) max_completion_overdue_seconds: u64,
-}
-#[derive(Debug, Serialize)]
-pub(crate) struct IndexState {
-    pub(crate) audit_quiet_retired: usize,
-    pub(crate) audit_cap_full: usize,
-    pub(crate) pending_audits: usize,
-    pub(crate) overdue_audits: usize,
-    pub(crate) oldest_due_age_seconds: u64,
 }
 /// Reuse the existing counters; serialize only nonzero closed reason keys.
 #[derive(Debug)]
@@ -3343,11 +3281,8 @@ mod tests {
                 sidecar_census_complete: gate,
                 reduction_dependencies_available: gate,
                 index_entry_present: gate,
-                audit_metadata_supported: gate,
                 protected_history: gate,
                 forced_family: gate,
-                audit_debt_present: gate,
-                audit_slot_available: gate,
                 sampling_allowed: gate,
                 prepare_started: usize::MAX,
                 prepare_failed: usize::MAX,
@@ -3357,17 +3292,6 @@ mod tests {
                 full_by_parse_reason: Default::default(),
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
-                audits_started: usize::MAX,
-                audits_completed: usize::MAX,
-                max_start_overdue_seconds: u64::MAX,
-                max_completion_overdue_seconds: u64::MAX,
-            },
-            index_state_at_page_end: IndexState {
-                audit_quiet_retired: usize::MAX,
-                audit_cap_full: usize::MAX,
-                pending_audits: usize::MAX,
-                overdue_audits: usize::MAX,
-                oldest_due_age_seconds: u64::MAX,
             },
             codex_cursor: Some(Box::new(max_codex_cursor_counts())),
         }
@@ -3389,7 +3313,6 @@ mod tests {
                 parked_entries: m,
                 invalidation_entries: m,
                 rotation_waiters: m,
-                lifetime_audit_overdue_max_age_seconds: m,
             },
         }
     }
@@ -4443,7 +4366,6 @@ mod tests {
             TerminalDisposition,
             NewFile,
             AuthorityQuarantine,
-            Audit,
             BodyWitnessAdoption,
             UploadContext,
             ActivityOrQuarantineRetry,
@@ -4974,10 +4896,7 @@ mod tests {
         // an unobtainable snapshot is `null`, never zeros.
         let cursor = &records[0]["counts"]["sampled_acquisition"]["codex_cursor"];
         assert_eq!(cursor["during_scan_window"]["jobs_started"], u32::MAX);
-        assert_eq!(
-            cursor["retained"]["lifetime_audit_overdue_max_age_seconds"],
-            u32::MAX
-        );
+        assert_eq!(cursor["retained"]["rotation_waiters"], u32::MAX);
         let unavailable = ReadCounts {
             codex_cursor: None,
             ..max_read_counts()

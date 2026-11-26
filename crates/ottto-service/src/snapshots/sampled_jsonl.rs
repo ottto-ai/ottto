@@ -1,7 +1,7 @@
 //! Native reduction adapter for the shared acquisition mechanism. The
 //! existing parser step and finish remain the only semantic implementation.
 use super::*;
-use crate::transcript_acquisition::{AuditDebt, Checkpoint, FullReason, ReadMode, ReadPlan, Scope};
+use crate::transcript_acquisition::{Checkpoint, FullReason, ReadMode, ReadPlan, Scope};
 use crate::transcript_cache::Retained;
 
 /// Disclosed terminal loss can settle native output, but cannot verify source
@@ -102,13 +102,12 @@ pub(super) enum SideCertificate {
 }
 
 impl OwnedJsonlParser {
-    /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
-    /// durable debt must be supplied by the existing source/index authority.
+    /// Invoked on a fresh safely-opened parser before any fill/read. The scope
+    /// must be supplied by the existing source authority.
     pub(super) fn prepare_acquisition(
         &mut self,
         mut old: Option<Box<Retained<CachedJsonlReduction>>>,
         scope: &Scope,
-        debt: Option<AuditDebt>,
         now: u64,
     ) -> Result<ReadMode> {
         // Checkpoints, samples and resume offsets are physical-file bytes. A
@@ -152,7 +151,6 @@ impl OwnedJsonlParser {
             self.reader.reader.get_mut(),
             old.as_deref().map(|old| &old.checkpoint),
             scope,
-            debt,
             now,
         )?;
         let mode = plan.mode();

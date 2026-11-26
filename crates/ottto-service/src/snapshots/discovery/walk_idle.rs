@@ -339,8 +339,7 @@ pub(crate) fn idle_finish(index: &ScanIndex) -> bool {
     index.traversal.is_none()
 }
 
-/// The first kind of index debt that needs a walk, if any (a due audit waits
-/// for the backstop).
+/// The first kind of index debt that needs a walk, if any.
 fn owes(index: &ScanIndex, days: u64, now: u64) -> Option<&'static str> {
     if !index.persistence_available() {
         Some("persistence")
@@ -362,7 +361,7 @@ fn owes(index: &ScanIndex, days: u64, now: u64) -> Option<&'static str> {
         Some("growth_claim")
     } else if index.files.iter().any(|(key, entry)| {
         is_recent_enough_at(entry.modified_unix_seconds, now, days)
-            && stored_stamp_selects(index, key, entry, now)
+            && stored_stamp_selects(index, key, entry)
     }) {
         Some("file_debt")
     } else {
@@ -375,10 +374,9 @@ pub(in crate::snapshots) fn stored_stamp_selects(
     index: &ScanIndex,
     key: &str,
     entry: &ScanIndexEntry,
-    now: u64,
 ) -> bool {
     let candidate = stored_candidate(key, entry);
-    let (decision, reason) = index.candidate_walk_debt(&candidate, now);
+    let (decision, reason) = index.candidate_walk_debt(&candidate);
     // The walk skips a held member owed only a proof correction.
     decision != CandidateDecision::Skip
         && !(reason == Some(CandidateParseReason::AuthorityQuarantine)

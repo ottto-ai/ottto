@@ -47,17 +47,18 @@ fn reports(root: &str, extra: bool) -> (Api, Trace) {
 struct SelectionFixture {
     _scratch: crate::test_scratch::ScratchDir,
     roots: [PathBuf; 1],
-    paths: [PathBuf; 4], // A, audit B, uncommitted C, A's subagent
+    paths: [PathBuf; 4], // A, rearmed B, uncommitted C, A's subagent
     index_path: PathBuf,
     previous: ScanIndex,
 }
 impl SelectionFixture {
     fn new() -> Self {
-        Self::with_audit_deadline(true)
+        Self::with_rearmed_b(true)
     }
-    /// `audit` gives B its overdue audit deadline; without it no prior member
-    /// is unverified.
-    fn with_audit_deadline(audit: bool) -> Self {
+    /// `rearmed` gives B, listed unchanged, a cleared source fingerprint: an
+    /// ordinary re-read that is not a watcher hint, so the census order
+    /// selects it first. Without it no prior member owes a read.
+    fn with_rearmed_b(rearmed: bool) -> Self {
         let scratch = crate::test_scratch::ScratchDir::new("envelope-selection-matrix");
         let root = scratch.join("native");
         fs::create_dir_all(&root).unwrap();
@@ -98,15 +99,15 @@ impl SelectionFixture {
                 previous.accepted_snapshot_fingerprints.insert(body);
             }
         }
-        if audit {
-            // B is an unchanged audit, not synthetic source growth. Native
+        if rearmed {
+            // B is an unchanged re-read, not synthetic source growth. Native
             // reconciliation must not queue bytes hidden by a placeholder size.
             let metadata = fs::metadata(&paths[1]).unwrap();
             let entry = previous.files.get_mut(&local_index_key(&paths[1])).unwrap();
             entry.size_bytes = metadata.len();
             entry.modified_unix_nanos = metadata.modified().ok().and_then(unix_nanos);
             entry.modified_unix_seconds = metadata.modified().ok().and_then(unix_seconds).unwrap();
-            entry.set_unverified_deadline(1);
+            entry.source_file_fingerprint.clear();
         }
         let index_path = scratch.join("index.json");
         previous.save_fixture(&index_path).unwrap();
@@ -223,7 +224,7 @@ fn recovery_priority_scan(
 }
 
 #[test]
-fn recovery_selection_preserves_ordinary_audit_order_and_page_limit() {
+fn recovery_selection_preserves_ordinary_order_and_page_limit() {
     let fixture = SelectionFixture::new();
     let mut rearmed = fixture.previous.clone();
     let key = local_index_key(&fixture.paths[0]);
@@ -520,12 +521,8 @@ fn selected_restore_keeps_invalidated_census_record_absent() {
                 vec![1],
             ),
         );
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .set_unverified_deadline(1);
-    assert!(index.retire_vanished_claude_audit_debt_entry(&key));
+    index.remove_file_entry_unless_held(&key);
+    assert!(!index.files.contains_key(&key));
     let selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
     assert_eq!(
         serde_json::to_vec(&selected.files[&key]).unwrap(),
@@ -559,9 +556,9 @@ fn selection_page(
 
 #[test]
 fn partial_locked_save_and_restart_keep_exact_debt() {
-    for audit in [false, true] {
+    for rearmed in [false, true] {
         let (fixture, index, scan, previous) =
-            selected_fixture_from(SelectionFixture::with_audit_deadline(audit));
+            selected_fixture_from(SelectionFixture::with_rearmed_b(rearmed));
         let progress = fixture._scratch.join("partial-progress.json");
         let selected = crate::snapshot_sync::checkpoint_unselected_for_test(
             &index,
@@ -586,14 +583,8 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             serde_json::to_vec(&previous.files[&key]).unwrap()
         );
         let mut expected = e2_pipeline_scan_fixture::pending_keys_for_test(&index);
-        expected.extend(
-            fixture.paths[..3]
-                .iter()
-                .enumerate()
-                .filter(|(slot, _)| !audit || *slot != 1)
-                .map(|(_, path)| local_index_key(path)),
-        );
-        assert_eq!(expected.len(), if audit { 3 } else { 4 });
+        expected.extend(fixture.paths[..3].iter().map(|path| local_index_key(path)));
+        assert_eq!(expected.len(), 4, "rearmed={rearmed}");
         assert_eq!(
             restarted
                 .traversal
@@ -607,10 +598,9 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             e2_pipeline_scan_fixture::pending_keys_for_test(&restarted),
             expected
         );
-        assert_eq!(
+        assert!(
             expected.contains(&key),
-            !audit,
-            "audit-due restored B waits for the next walk"
+            "a restored B is owed again, rearmed={rearmed}"
         );
         // An immediate unsampled Full retry is paced by the native claim
         // retained across the partial save, exactly as on a daemon restart.
@@ -631,7 +621,7 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             "the paced attempt does not commit or discharge any owed key"
         );
         // Age only the witnessed claim in the saved baseline. Advancing the
-        // whole clock would also release the excluded audit B's unrelated debt.
+        // whole clock would also release unrelated claims.
         let mut prior = restarted;
         for key in &paced_keys {
             e2_pipeline_scan_fixture::expire_observed_growth_for_test(
@@ -690,66 +680,6 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
         assert_eq!(read, expected);
         assert!(e2_pipeline_scan_fixture::pending_keys_for_test(&prior).is_empty());
     }
-}
-
-/// [regress] Failed audit B cannot re-enter ahead of A, C and the unread agent.
-#[test]
-fn unkept_audit_key_does_not_starve_pending_census_at_page_limit_one() {
-    let mut fixture = SelectionFixture::new();
-    // These cold members have not changed; synthetic placeholder stamps would
-    // now promote them, testing hint priority instead of audit fairness.
-    for slot in [0, 3] {
-        let metadata = fs::metadata(&fixture.paths[slot]).unwrap();
-        let entry = fixture
-            .previous
-            .files
-            .get_mut(&local_index_key(&fixture.paths[slot]))
-            .unwrap();
-        entry.size_bytes = metadata.len();
-        entry.modified_unix_nanos = metadata.modified().ok().and_then(unix_nanos);
-        entry.modified_unix_seconds = metadata.modified().ok().and_then(unix_seconds).unwrap();
-    }
-    let (fixture, index, scan, previous) = selected_fixture_from(fixture);
-    let progress = fixture._scratch.join("audit-fair-progress.json");
-    let mut prior = crate::snapshot_sync::checkpoint_unselected_for_test(
-        &index,
-        &previous,
-        &scan,
-        &fixture.index_path,
-        &progress,
-    )
-    .unwrap();
-    let audit = local_index_key(&fixture.paths[1]);
-    assert!(prior.files[&audit].audit_requires_full(sampled_scan::now_seconds()));
-    let expected = [0, 2, 3]
-        .map(|slot| local_index_key(&fixture.paths[slot]))
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        e2_pipeline_scan_fixture::pending_keys_for_test(&prior),
-        expected
-    );
-    let mut selected_keys = BTreeSet::new();
-    for _ in 0..3 {
-        let (selected, working, scan) = selection_page(&fixture, prior.clone(), 1);
-        assert_eq!(selected.len(), 1);
-        assert!(!selected.contains(&audit));
-        assert!(selected_keys.insert(selected.into_iter().next().unwrap()));
-        prior = crate::snapshot_sync::checkpoint_unselected_for_test(
-            &working,
-            &prior,
-            &scan,
-            &fixture.index_path,
-            &progress,
-        )
-        .unwrap();
-        assert!(!e2_pipeline_scan_fixture::pending_keys_for_test(&prior).contains(&audit));
-        assert!(prior.files[&audit].audit_requires_full(sampled_scan::now_seconds()));
-    }
-    assert_eq!(
-        selected_keys, expected,
-        "every other pending key selected within three failed pages"
-    );
 }
 
 #[test]
@@ -1026,85 +956,6 @@ fn unknown_input_creates_no_false_credit_or_new_debt() {
     );
     assert_eq!(serde_json::to_vec(&generic).unwrap(), before_body);
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
-}
-
-#[test]
-fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
-    for partial in [false, true] {
-        // No prior member is unverified: only the synthetic audits remain.
-        let (fixture, mut index, mut scan, mut previous) =
-            selected_fixture_from(SelectionFixture::with_audit_deadline(false));
-        let copy = queued_prior_key(&index, &previous);
-        let key = local_index_key(&fixture.paths[2]);
-        let entry = index.files[&key].clone();
-        previous.files.insert(key.clone(), entry.clone());
-        previous
-            .file_snapshot_fingerprints
-            .insert(key.clone(), index.file_snapshot_fingerprints[&key].clone());
-        previous
-            .claude_account_deferred_holds
-            .insert(key.clone(), entry.source_file_fingerprint.clone());
-        index
-            .claude_account_deferred_holds
-            .insert(key.clone(), entry.source_file_fingerprint.clone());
-        for n in 0..crate::transcript_cache::CACHE_ENTRIES {
-            let audit_key = format!("/synthetic-unavailable-release/{n}.jsonl");
-            let mut audit_entry = entry.clone();
-            audit_entry.set_unverified_deadline(1);
-            index.files.insert(audit_key.clone(), audit_entry.clone());
-            previous.files.insert(audit_key, audit_entry);
-        }
-        let selected = if partial {
-            let progress = fixture._scratch.join("released-progress.json");
-            crate::snapshot_sync::checkpoint_account_release_for_test(
-                index,
-                &previous,
-                &mut scan,
-                &fixture.roots,
-                (&fixture.index_path, &progress),
-            )
-            .unwrap()
-        } else {
-            let mut selected = crate::snapshot_sync::accept_account_release_for_test(
-                index,
-                &previous,
-                &mut scan,
-                &fixture.roots,
-            );
-            selected.save_fixture(&fixture.index_path).unwrap();
-            selected
-        };
-        assert!(!selected.claude_account_deferred_holds.contains_key(&key));
-        assert!(selected.files[&key].source_file_fingerprint.is_empty());
-        assert_eq!(
-            selected
-                .files
-                .values()
-                .filter(|entry| entry.has_unverified_source())
-                .count(),
-            crate::transcript_cache::CACHE_ENTRIES
-        );
-        assert_eq!(
-            serde_json::to_value(&selected.files[&copy]).unwrap(),
-            serde_json::to_value(&previous.files[&copy]).unwrap()
-        );
-        assert_eq!(
-            selected.file_snapshot_fingerprints[&copy],
-            previous.file_snapshot_fingerprints[&copy]
-        );
-        let restarted = ScanIndex::load(&fixture.index_path).unwrap();
-        assert!(restarted.files[&key].source_file_fingerprint.is_empty());
-        assert!(restarted
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_candidates
-            .iter()
-            .any(|candidate| local_index_key(&candidate.path) == key));
-        if partial {
-            assert!(restarted.bounded_sweep_had_unsettled_upload());
-        }
-    }
 }
 
 #[test]

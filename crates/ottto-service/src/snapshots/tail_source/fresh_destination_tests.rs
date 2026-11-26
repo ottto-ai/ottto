@@ -74,7 +74,7 @@ fn fresh_destination_first_cycle_keeps_tail_across_restart() {
                 panic!("first saved Claude Tail survives for {presence}");
             };
             let mut parser = transition::open::<Claude>(&transcript);
-            let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), None, NOW) else {
+            let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), NOW) else {
                 panic!("the restarted read prepares");
             };
             if append {
@@ -92,7 +92,7 @@ fn fresh_destination_first_cycle_keeps_tail_across_restart() {
                     transition::finish::<Claude>(&route, &transcript, parser, Some(base), |_| {});
                 assert!(tail.publish(&native));
                 let mut cold = transition::open::<Claude>(&transcript);
-                cold.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+                cold.prepare_acquisition(None, &scope(), NOW).unwrap();
                 while !cold.step().unwrap() {}
                 let (_, expected) =
                     transition::finish::<Claude>(&route, &transcript, cold, None, |_| {});

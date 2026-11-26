@@ -1590,9 +1590,8 @@ fn native_read(
         Some(&CodexTitleMetadata::default()),
     )
     .expect("parser");
-    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
     let mode = parser
-        .prepare_acquisition(old.map(Box::new), &scope, debt, now)
+        .prepare_acquisition(old.map(Box::new), &scope, now)
         .expect("prepare");
     while !parser.step().expect("step") {}
     let acquisition = parser

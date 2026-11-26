@@ -248,7 +248,7 @@ impl ScanIndex {
             // forget the held file's CONTENT memo and force a re-read.
             && !self.claude_account_deferred_holds.contains_key(&key)
             && self
-                .candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
+                .candidate_decision_with_reason(candidate)
                 .1
                 == Some(CandidateParseReason::UploadContext)
     }

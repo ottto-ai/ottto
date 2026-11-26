@@ -1456,7 +1456,7 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
 /// EOF-record handling for a paged group's live member. A quiescent live member
 /// ending in a valid unterminated record has it applied at its genuine
 /// unchanged EOF, like a singleton: counted once, verified, and the next
-/// generation reads nothing (no hourly audit debt).
+/// generation reads nothing.
 #[test]
 fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1486,7 +1486,7 @@ fn quiescent_live_member_unterminated_record_applied_at_genuine_eof() {
     assert!(!index
         .files
         .get(&local_index_key(&live))
-        .is_some_and(|entry| entry.has_unverified_source()));
+        .is_some_and(|entry| entry.has_sampled_tag()));
     with_test_limits(2048, 1024, 64, || {
         let replay = group_replays();
         let ((_, again), bytes) = observe_consumed(|| next_generation(&root, index, &cache, 1));

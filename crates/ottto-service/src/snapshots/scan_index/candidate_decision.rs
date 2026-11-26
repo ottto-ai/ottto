@@ -14,33 +14,17 @@ impl ScanIndex {
         &self,
         candidate: &CandidateFile,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
+        self.candidate_decision_with_reason_gated(candidate, true)
     }
 
+    /// The gated decision, naming the `SourceChanged` arm that selected the
+    /// file in `source_change`.
     pub(in crate::snapshots) fn candidate_decision_in_window(
         &self,
         candidate: &CandidateFile,
-        audit_now: u64,
         source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_refined(candidate, audit_now, true, true, source_change)
-    }
-
-    #[cfg(test)]
-    pub(in crate::snapshots) fn candidate_decision_at(
-        &self,
-        candidate: &CandidateFile,
-        now: u64,
-    ) -> CandidateDecision {
-        self.candidate_decision_with_reason_at(candidate, now).0
-    }
-
-    pub(in crate::snapshots) fn candidate_decision_with_reason_at(
-        &self,
-        candidate: &CandidateFile,
-        now: u64,
-    ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_with_reason_gated(candidate, now, true)
+        self.candidate_decision_refined(candidate, true, source_change)
     }
 
     /// True when only the body-witness revision selects this candidate: the
@@ -48,12 +32,11 @@ impl ScanIndex {
     pub(in crate::snapshots) fn candidate_requires_only_body_witness_adoption(
         &self,
         candidate: &CandidateFile,
-        now: u64,
     ) -> bool {
         self.effective_upload_body_witness_revision_requires_adoption(&local_index_key(
             &candidate.path,
         )) && self
-            .candidate_decision_with_reason_gated(candidate, now, false)
+            .candidate_decision_with_reason_gated(candidate, false)
             .0
             == CandidateDecision::Skip
     }
@@ -90,20 +73,18 @@ impl ScanIndex {
     pub(in crate::snapshots) fn candidate_decision_with_reason_gated(
         &self,
         candidate: &CandidateFile,
-        now: u64,
         body_witness_adoption: bool,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_refined(candidate, now, body_witness_adoption, true, &mut None)
+        self.candidate_decision_refined(candidate, body_witness_adoption, &mut None)
     }
 
-    /// The walk gate's projection: no body-witness gate (it is in the gate's
-    /// key) and no sampled audit (the backstop serves it).
+    /// The walk gate's projection: the gated decision without the
+    /// body-witness gate, which is in the walk gate's key.
     pub(in crate::snapshots) fn candidate_walk_debt(
         &self,
         candidate: &CandidateFile,
-        now: u64,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
-        self.candidate_decision_refined(candidate, now, false, false, &mut None)
+        self.candidate_decision_refined(candidate, false, &mut None)
     }
 
     /// The gated decision; `source_change` names the `SourceChanged` arm that
@@ -111,9 +92,7 @@ impl ScanIndex {
     fn candidate_decision_refined(
         &self,
         candidate: &CandidateFile,
-        now: u64,
         body_witness_adoption: bool,
-        audit: bool,
         source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
@@ -171,9 +150,6 @@ impl ScanIndex {
         }
         let withheld_unchanged = !entry.source_file_fingerprint.is_empty()
             && self.withheld_account_unchanged(&key, candidate);
-        // A withheld key's audit debt (carried onto its reverted entry) cannot
-        // settle while held; an unchanged one defers it to its next counted
-        // re-parse, usually the binding read, instead of a Full every pass.
         // A committed ownership change selects one finished copy read.
         if self
             .claude_copy_removals
@@ -184,10 +160,6 @@ impl ScanIndex {
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::SourceChanged),
             );
-        }
-        let audit_due = audit && entry.audit_requires_full(now) && !withheld_unchanged;
-        if audit_due {
-            return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
         // gate. Otherwise a projection change selects even an unchanged v2
@@ -310,8 +282,10 @@ impl ScanIndex {
                 Some(CandidateParseReason::LegacyActivity),
             );
         }
+        // A sampled tag (a sealed prefix, or an older build's tag a load did
+        // not strip yet) is no owed revision.
         if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-            && !entry.has_unverified_source()
+            && !entry.has_sampled_tag()
         {
             // An owed revision is not observed: it parses, never migrates.
             return if entry.source_file_fingerprint.as_str()
@@ -531,7 +505,7 @@ impl ScanIndex {
         let scan_identity_version = self
             .files
             .get(&key)
-            .map(ScanIndexEntry::carried_audit_version)
+            .map(ScanIndexEntry::carried_identity_version)
             .unwrap_or_else(|| LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
         // The body witness and `codex_counting_v2` are carried; a configured
         // singleton parse then sets the latter to that parse's decided version.

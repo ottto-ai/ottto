@@ -63,17 +63,15 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
     )
 }
 
-/// Whether this selection loads the committed Tail. A due `Audit` certifies
-/// against the committed head: an unchanged file retires quietly, and only
-/// what the file proves changed reads Full. An `UnknownOutcome` re-read
-/// continues as well. Growth beats a quarantine-retry or activity selection,
-/// which precedes `TranscriptChanged`: a file that `grew` past its committed
-/// entry is an append and continues as for `TranscriptChanged`, even while a
-/// body of it waits on a retry (unless its session owes a head-CAS answer).
-/// `BodyWitnessAdoption` and every legacy
-/// selection stay native. A `NewFile` is a first read, except one `e2` withheld
-/// (`held_new`): its committed head is custody, never acceptance, and it
-/// continues as a changed file does.
+/// Whether this selection loads the committed Tail. An `UnknownOutcome`
+/// re-read continues from it. Growth beats a quarantine-retry or activity
+/// selection, which precedes `TranscriptChanged`: a file that `grew` past its
+/// committed entry is an append and continues as for `TranscriptChanged`, even
+/// while a body of it waits on a retry (unless its session owes a head-CAS
+/// answer). `BodyWitnessAdoption` and every legacy selection stay native. A
+/// `NewFile` is a first read, except one `e2` withheld (`held_new`): its
+/// committed head is custody, never acceptance, and it continues as a changed
+/// file does.
 ///
 /// A late-evidence re-fold needs complete stored state: a set-aside file
 /// reads natively instead. A body waiting on a server retry re-folds: it is
@@ -90,11 +88,9 @@ pub(in crate::snapshots) fn reuses_stored(
 ) -> bool {
     match reason {
         None
-        | Some(
-            CandidateParseReason::TranscriptChanged
-            | CandidateParseReason::Audit
-            | CandidateParseReason::UnknownOutcome,
-        ) => true,
+        | Some(CandidateParseReason::TranscriptChanged | CandidateParseReason::UnknownOutcome) => {
+            true
+        }
         Some(CandidateParseReason::ActivityOrQuarantineRetry) if grew => true,
         // Same-generation loss is cumulative in the saved head. Its certificate
         // still refuses a replaced object; shrink never enters this arm.

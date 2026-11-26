@@ -37,9 +37,7 @@ fn seed<S: FixtureSource>(
     touch(&path, SystemTime::now() - Duration::from_secs(20 * 86400));
     let metadata = std::fs::metadata(&path).unwrap();
     let mut parser = open::<S>(&path);
-    parser
-        .prepare_acquisition(None, &scope(), None, NOW)
-        .unwrap();
+    parser.prepare_acquisition(None, &scope(), NOW).unwrap();
     let (reduction, checkpoint) = native_cold::finish_record(&mut parser, &scope(), NOW);
     let mut cert = checkpoint
         .durable_certificate(birth_unix_nanos(&metadata))
@@ -97,7 +95,7 @@ fn reused<S: FixtureSource>() {
     );
     let mut parser = open::<S>(&path);
     let mode = parser
-        .prepare_acquisition(Some(taken), &scope(), None, NOW)
+        .prepare_acquisition(Some(taken), &scope(), NOW)
         .unwrap();
     assert_eq!(mode, ReadMode::Unchanged);
     assert_eq!(parser.reader.consumed_bytes(), 0);
@@ -230,9 +228,7 @@ fn a_touch_keeps_append_and_unsealed_tail_semantics() {
                 .write_all(b"{\"padding\":")
                 .unwrap();
             let mut parser = open::<Claude>(&path);
-            parser
-                .prepare_acquisition(None, &scope(), None, NOW)
-                .unwrap();
+            parser.prepare_acquisition(None, &scope(), NOW).unwrap();
             let (reduction, checkpoint) = native_cold::finish_record(&mut parser, &scope(), NOW);
             let metadata = std::fs::metadata(&path).unwrap();
             let cert = checkpoint
@@ -267,7 +263,7 @@ fn a_touch_keeps_append_and_unsealed_tail_semantics() {
         let mut parser = open::<Claude>(&path);
         assert_eq!(
             parser
-                .prepare_acquisition(Some(taken), &scope(), None, NOW)
+                .prepare_acquisition(Some(taken), &scope(), NOW)
                 .unwrap(),
             ReadMode::Tail
         );

@@ -54,12 +54,7 @@ type Encoded = Result<Option<StagedFile>, Refuse>;
 impl PendingTail {
     /// A certified `S` completion on a state database route. `None`: no
     /// route or no valid certificate, so nothing is written for this read.
-    /// `base` is the committed head the load continued; `quiet` a quiet audit
-    /// this completion retires, so the head no longer carries its debt.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the certificate binds every completion input"
-    )]
+    /// `base` is the committed head the load continued.
     pub(in crate::snapshots) fn new<S: TailSource>(
         index: &ScanIndex,
         completed: &CompletedNativeAcquisition,
@@ -68,14 +63,10 @@ impl PendingTail {
         held: &File,
         capture: bool,
         base: Option<TailBase>,
-        quiet: bool,
     ) -> Option<Self> {
         let route = state_v2::runtime_path(index).ok()??;
         let birth = crate::transcript_acquisition::birth_unix_nanos(&held.metadata().ok()?);
-        let mut certificate = completed.checkpoint.durable_certificate(birth)?;
-        if quiet {
-            certificate.audit_debt_unix_seconds = None;
-        }
+        let certificate = completed.checkpoint.durable_certificate(birth)?;
         let write_generation = completed.checkpoint.write_generation_for(birth);
         Some(Self {
             source: S::SOURCE,

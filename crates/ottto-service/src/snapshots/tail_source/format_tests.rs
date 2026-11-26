@@ -132,14 +132,7 @@ fn legacy_erasure_is_counted_before_the_first_load() {
     );
     let fresh = super::settlement_tests::candidate(&path);
     let (load, records) = capture(|| {
-        begin_source_pass(
-            &cache,
-            &route.dir,
-            SnapshotSource::ClaudeCode,
-            &route.path,
-            &scope(),
-            false,
-        );
+        begin_source_pass(&cache, &route.dir, SnapshotSource::ClaudeCode, &route.path);
         let mut held = File::open(&path).unwrap();
         load::<Claude>(
             &route.index,

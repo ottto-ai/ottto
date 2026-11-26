@@ -245,11 +245,11 @@ impl OwnedSourceScan {
                     .retire_absent_account_hold(index_key, &account_members);
 
                 // Successful retirement is complete; an uncertain
-                // disappearance must not enter the older audit exit.
+                // disappearance must not enter the ordinary removal below.
                 continue;
             }
             // F4 or indexed reconciliation may already have retired the
-            // audit entry this page. Its retained incidence is
+            // entry this page. Its retained incidence is
             // not a second ordinary file removal (and grants no ACK).
             if self.source == SnapshotSource::ClaudeCode
                 && !self.index.files.contains_key(index_key)
@@ -266,31 +266,11 @@ impl OwnedSourceScan {
                 .is_some_and(ScanIndexEntry::codex_history_is_protected)
             {
                 // A member that vanished beneath its present parent
-                // also drops its unverified audit debt, proven again
-                // here; every other removal keeps that debt. Both
-                // retire its request-census record.
+                // retires its request-census record with its entry.
                 let vanished = self.census.claude_vanished_index_keys.contains(index_key);
                 let census_record =
                     vanished && self.index.claude_request_census.get(index_key).is_some();
-                if vanished
-                    && self
-                        .index
-                        .files
-                        .get(index_key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source)
-                    && sampled_audit::proven_absent(Path::new(index_key), &self.roots)
-                    && self
-                        .index
-                        .retire_vanished_claude_audit_debt_entry(index_key)
-                {
-                    crate::local_resource_diagnostics::audit_retired_absent(self.source.api_slug());
-                    disappearance_diagnostics::vanished(
-                        self.source,
-                        disappearance_diagnostics::Vanished::AuditDebtDropped,
-                    );
-                } else {
-                    self.index.remove_file_entry_unless_held(index_key);
-                }
+                self.index.remove_file_entry_unless_held(index_key);
                 if census_record && self.index.claude_request_census.get(index_key).is_none() {
                     disappearance_diagnostics::vanished(
                         self.source,
@@ -783,36 +763,6 @@ impl OwnedSourceScan {
             rearm_cause::retain(&self.index);
         }
         let sampled_acquisition = self.sampling.as_ref().map(|context| {
-            let audit_now = sampled_scan::now_seconds();
-            let pending = self.index
-                .files
-                .values()
-                .filter(|entry| entry.has_unverified_source())
-                .count();
-            let overdue = self.index
-                .files
-                .values()
-                .filter(|entry| entry.audit_requires_full(audit_now))
-                .count();
-            let oldest_due_age = self.index
-                .files
-                .values()
-                .filter_map(|entry| entry.audit_obligation(audit_now))
-                .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
-                .max()
-                .unwrap_or(0);
-            if context.audit_cap_full > 0 {
-                crate::local_resource_diagnostics::traversal_point("sampled_audit_cap_alarm", self.source.api_slug(),
-                    &serde_json::json!({"audit_cap_full": context.audit_cap_full, "pending_audits": pending}));
-            }
-            if context.audit_cap_delay > 0 {
-                crate::local_resource_diagnostics::traversal_point("sampled_audit_cap_delay", self.source.api_slug(),
-                    &serde_json::json!({"audit_cap_delay": context.audit_cap_delay}));
-            }
-            if context.pace_evicted > 0 {
-                crate::local_resource_diagnostics::traversal_point("sampled_audit_pace_alarm", self.source.api_slug(),
-                    &serde_json::json!({"pace_evicted": context.pace_evicted}));
-            }
             if context.same_size_touch_proven > 0 {
                 crate::local_resource_diagnostics::traversal_point("same_size_touch_proven", self.source.api_slug(),
                     &serde_json::json!({"same_size_touch_proven": context.same_size_touch_proven}));
@@ -840,17 +790,6 @@ impl OwnedSourceScan {
                         context.full_reasons,
                     ),
                     priority_full_replays: context.priority_replays,
-                    audits_started: context.audits_started,
-                    audits_completed: context.audits_completed,
-                    max_start_overdue_seconds: context.start_overdue_seconds,
-                    max_completion_overdue_seconds: context.completion_overdue_seconds,
-                },
-                index_state_at_page_end: crate::local_resource_diagnostics::IndexState {
-                    audit_quiet_retired: context.audit_quiet_retired,
-                    audit_cap_full: context.audit_cap_full,
-                    pending_audits: pending,
-                    overdue_audits: overdue,
-                    oldest_due_age_seconds: oldest_due_age,
                 },
                 codex_cursor: context.cache.cursor_diagnostics(&self.codex_page),
             }

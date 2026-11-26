@@ -317,13 +317,7 @@ impl OwnedSourceScan {
                                 .filter(|candidate| {
                                     !grouped_paths.contains(&local_index_key(&candidate.path))
                                         && !self.index.context_only_read(candidate)
-                                        && self
-                                            .index
-                                            .candidate_decision_with_reason_at(
-                                                candidate,
-                                                sampled_scan::now_seconds(),
-                                            )
-                                            .0
+                                        && self.index.candidate_decision_with_reason(candidate).0
                                             != CandidateDecision::Skip
                                 })
                                 .count()
@@ -442,13 +436,7 @@ impl OwnedSourceScan {
                         .then(|| {
                             let disposable = |candidate: &CandidateFile| {
                                 self.index.context_only_read(candidate)
-                                    || self
-                                        .index
-                                        .candidate_decision_with_reason_at(
-                                            candidate,
-                                            sampled_scan::now_seconds(),
-                                        )
-                                        .0
+                                    || self.index.candidate_decision_with_reason(candidate).0
                                         == CandidateDecision::Skip
                             };
                             self.identified_candidates
@@ -889,13 +877,7 @@ impl OwnedSourceScan {
                     && (!self.index.file_upload_context_enabled()
                         || !self.identified_candidates.iter().any(|candidate| {
                             !self.index.context_only_read(candidate)
-                                && self
-                                    .index
-                                    .candidate_decision_with_reason_at(
-                                        candidate,
-                                        sampled_scan::now_seconds(),
-                                    )
-                                    .0
+                                && self.index.candidate_decision_with_reason(candidate).0
                                     == CandidateDecision::Parse
                         }))
                     && (!self.index.file_upload_context_enabled()
@@ -1026,10 +1008,7 @@ impl OwnedSourceScan {
             })
             && self.identified_candidates.iter().any(|candidate| {
                 !self.index.context_only_read(candidate)
-                    && self
-                        .index
-                        .candidate_decision_with_reason_at(candidate, sampled_scan::now_seconds())
-                        .0
+                    && self.index.candidate_decision_with_reason(candidate).0
                         == CandidateDecision::Parse
             });
         if active_file.is_none() && !rereads_wait() && !context_group_waits {

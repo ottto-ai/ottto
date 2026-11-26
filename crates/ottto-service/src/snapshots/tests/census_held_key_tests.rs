@@ -42,9 +42,9 @@ fn decision(
     index: &ScanIndex,
     candidate: &CandidateFile,
 ) -> (CandidateDecision, Option<CandidateParseReason>) {
-    let decided = index.candidate_decision_with_reason_at(candidate, 0);
+    let decided = index.candidate_decision_with_reason(candidate);
     // The reason is diagnostic only: it names a parse and never changes it.
-    assert_eq!(decided.0, index.candidate_decision_at(candidate, 0));
+    assert_eq!(decided.0, index.candidate_decision(candidate));
     assert_eq!(decided.1.is_some(), decided.0 == CandidateDecision::Parse);
     decided
 }

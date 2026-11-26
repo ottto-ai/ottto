@@ -391,7 +391,7 @@ fn truncate_then_regrow_past_committed_extent_rebuilds_from_zero() {
 /// the fragment witness across source preparations is a separate follow-up.
 #[test]
 fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
-    use crate::transcript_acquisition::{AuditDebt, ReadPlan, Scope};
+    use crate::transcript_acquisition::{ReadPlan, Scope};
     let f = Fixture::new();
     let source = SnapshotSource::Codex;
     let token = |n| {
@@ -466,7 +466,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     .unwrap();
     let now = sampled_scan::now_seconds();
     let scope = Scope("fragment-control".into());
-    let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, now).unwrap();
+    let mut plan = ReadPlan::prepare(&mut file, None, &scope, now).unwrap();
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).unwrap();
     plan.observe_record_fragment(&bytes[..prefix.len()], true)
@@ -488,17 +488,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         ScanParseOutcome::Snapshot,
     );
     index.files.get_mut(&key).unwrap().codex_fragment = Some(Box::new(fragment));
-    index.stage_sampled_audit(
-        &key,
-        &candidate.source_file_fingerprint,
-        AuditDebt {
-            due_unix_seconds: now + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-        },
-    );
-    assert!(
-        index.files[&key].has_unverified_source(),
-        "independent custody kept"
-    );
+    assert!(!index.files[&key].has_sampled_tag(), "no tag is staged");
     assert!(
         index.candidate_decision(&candidate) == CandidateDecision::Skip,
         "a certified unchanged fragment must not select another parse"
@@ -632,7 +622,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                 &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
             );
         }
-        assert!(next.files[&key].has_unverified_source());
+        assert!(!next.files[&key].has_sampled_tag());
         index = next;
     }
     // Metadata-only change: the certified prefix still names the observed EOF,
@@ -689,13 +679,13 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     );
     let (_, rows) = capture(|| {
         assert!(
-            retention.owes_stamped(
+            !retention.owes_stamped(
                 source,
                 &f.path,
                 metadata.len(),
                 sources::codex::eof_fragment::Stamp::metadata(&metadata)
             ),
-            "audit still owes it"
+            "a known fragment owes no read"
         )
     });
     assert!(!rows
@@ -717,7 +707,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         let entry = &reloaded.files[&key];
         assert!(entry.codex_fragment.is_none());
         let mut file = File::open(&f.path).unwrap();
-        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope, None, now).unwrap();
+        let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope, now).unwrap();
         assert_eq!(plan.mode(), crate::transcript_acquisition::ReadMode::Tail);
         let start = plan.start_offset();
         assert_eq!(start, entry.size_bytes);
@@ -1872,7 +1862,7 @@ fn settled_listing_fixture(source: SnapshotSource) -> (Fixture, ScanIndex, Vec<P
     for path in &paths {
         let entry = &index.files[&local_index_key(path)];
         assert!(index.listing_unchanged(path, &fs::metadata(path).unwrap()));
-        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
+        assert!(!entry.has_sampled_tag());
     }
     (f, index, paths)
 }

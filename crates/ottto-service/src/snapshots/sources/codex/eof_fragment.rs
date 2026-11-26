@@ -79,7 +79,6 @@ pub(in crate::snapshots) fn note_tail_repeat(
     // starts at the committed prefix, the unchanged sampled fingerprint binds
     // the previously observed EOF, and no terminated record advanced that prefix.
     if entry.codex_fragment.is_none()
-        && entry.has_unverified_source()
         && !entry.source_file_fingerprint.is_empty()
         && entry.source_file_fingerprint == candidate.source_file_fingerprint
         && matches!(read.mode, crate::transcript_acquisition::ReadMode::Tail)

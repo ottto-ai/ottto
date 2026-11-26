@@ -146,11 +146,10 @@ pub(in crate::snapshots) fn pending(
     held: &File,
     capture: bool,
     base: Option<seam::TailBase>,
-    quiet: bool,
 ) -> Option<seam::PendingTail> {
     with_codec!(
         source,
-        S => seam::PendingTail::new::<S>(index, completed, active, candidate, held, capture, base, quiet)
+        S => seam::PendingTail::new::<S>(index, completed, active, candidate, held, capture, base)
     )
 }
 

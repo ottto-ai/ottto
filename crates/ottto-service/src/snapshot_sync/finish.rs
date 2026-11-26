@@ -180,12 +180,6 @@ pub(super) struct LocalHoldSettlement {
     pub(super) progress_blocking: bool,
 }
 
-pub(super) struct AccountAuditRelease<'a> {
-    pub(super) previous: &'a ScanIndex,
-    pub(super) roots: &'a [PathBuf],
-    pub(super) backfill_window_days: u64,
-}
-
 impl LocalHoldSettlement {
     /// Record the durable account-hold disclosure, classify which holds a
     /// later page could still change, and remove every held entity from the
@@ -329,101 +323,6 @@ pub(crate) fn classify_holds_for_test(
     );
 }
 
-#[cfg(test)]
-pub(super) fn classify_account_release_for_test(
-    index: &mut ScanIndex,
-    scan: &mut SourceScanResult,
-) -> (LocalHoldSettlement, SnapshotUploadProgress) {
-    let source = SnapshotSource::ClaudeCode;
-    let holds = LocalHoldSettlement::classify(
-        source,
-        index,
-        scan,
-        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
-    );
-    assert!(!holds.page_held());
-    let mut progress =
-        SnapshotUploadProgress::new(format!("{:064x}", 99), snapshot_quarantine_witness(source));
-    let groups = cache_head_file_groups(index);
-    for item in &scan.snapshots {
-        progress
-            .record_pending_cache_head_identity(
-                item.source_file_fingerprint.as_ref(),
-                &item.snapshot_fingerprint,
-                &cache_session_key(&item.source_session_id),
-                &groups,
-                true,
-            )
-            .unwrap();
-    }
-    assert!(
-        !progress.pending_cache_heads.is_empty(),
-        "required head bindings recorded"
-    );
-    (holds, progress)
-}
-
-#[cfg(test)]
-pub(crate) fn accept_account_release_for_test(
-    mut index: ScanIndex,
-    previous: &ScanIndex,
-    scan: &mut SourceScanResult,
-    roots: &[PathBuf],
-) -> ScanIndex {
-    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
-    progress.accepted_fingerprints.extend(
-        scan.snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone()),
-    );
-    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-    let mut settled = settle_completed_upload(index, previous, &progress, &holds);
-    assert!(settled.fully_settled);
-    scan.preserve_released_account_audits(
-        &mut settled.index,
-        previous,
-        roots,
-        crate::snapshots::BACKFILL_WINDOW_DAYS,
-    );
-    settled.index
-}
-
-#[cfg(test)]
-pub(crate) fn checkpoint_account_release_for_test(
-    mut index: ScanIndex,
-    previous: &ScanIndex,
-    scan: &mut SourceScanResult,
-    roots: &[PathBuf],
-    paths: (&Path, &Path),
-) -> Result<ScanIndex> {
-    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
-    progress.destination_namespace_hash =
-        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(paths.0).1;
-    let (progress_path, mut progress) = tests::routed_progress(previous, paths.0, progress);
-    // Actual no-ACK partial save restores the prior accepted entry before
-    // transferring retry custody. Head binding above still had to succeed.
-    progress.save(&progress_path)?;
-    checkpoint_partial_snapshot_index_with_audit_release(
-        &index,
-        previous,
-        &progress,
-        &scan.snapshots,
-        Some(scan),
-        &holds.held_fingerprints,
-        paths.0,
-        &progress_path,
-        || Ok(()),
-        None,
-        Some(UnsettledUploadCause::UploadError),
-        Some(AccountAuditRelease {
-            previous,
-            roots,
-            backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
-        }),
-        Default::default(),
-    )
-}
-
 /// The page items a server answer names: an indexed validation rejection
 /// (422), an identity-deferral shed (503) or ACK refs that echoed another
 /// body witness. `None` when nothing is named or a location falls outside
@@ -548,8 +447,8 @@ pub(super) fn settle_upload_corrections_after_selection(
 ) -> bool {
     // This drain is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
-    // It settles against the selected entries, but a later account-audit
-    // release can still clear one; its drains join the finish restore.
+    // It settles against the selected entries; its drains join the finish
+    // restore.
     if transport_fully_settled {
         let drains = index.settle_claude_proof_corrections_with_permanent(
             committed_index,
@@ -595,13 +494,11 @@ pub(super) struct SelectedSettlementInputs<'a> {
     pub(super) cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
     pub(super) transport_fully_settled: bool,
     pub(super) body_drains: crate::snapshots::ClaudeProofBodyDrains,
-    pub(super) audit_release: Option<AccountAuditRelease<'a>>,
 }
 
 /// The finish order after save selection, shared with the proof-correction
 /// pipeline harness so its regressions guard this order: correction settle,
-/// account-audit release (which can clear a drained entry's revision), then the
-/// body-drain restore. Returns whether the page is fully settled.
+/// then the body-drain restore. Returns whether the page is fully settled.
 pub(super) fn finish_selected_settlement(
     index: &mut ScanIndex,
     inputs: SelectedSettlementInputs<'_>,
@@ -614,7 +511,6 @@ pub(super) fn finish_selected_settlement(
         cutoff_candidates,
         transport_fully_settled,
         mut body_drains,
-        audit_release,
     } = inputs;
     let mut fully_settled = settle_upload_corrections_after_selection(
         index,
@@ -626,17 +522,8 @@ pub(super) fn finish_selected_settlement(
         transport_fully_settled,
         &mut body_drains,
     );
-    if let Some(release) = audit_release {
-        scan.preserve_released_account_audits(
-            index,
-            release.previous,
-            release.roots,
-            release.backfill_window_days,
-        );
-    }
-    // After every selected-entry restore and the account-audit release, which
-    // can clear a drained entry's revision: a drain (pre-selection or settlement)
-    // whose entry this save does not keep stays owed.
+    // After every selected-entry restore: a drain (pre-selection or
+    // settlement) whose entry this save does not keep stays owed.
     if index.restore_unselected_claude_proof_body_drains(body_drains) {
         fully_settled = false;
     }
@@ -844,7 +731,7 @@ pub(crate) fn checkpoint_page_for_test(
         return Ok(index);
     }
     progress.save_fixture(progress_path)?;
-    checkpoint_partial_snapshot_index_with_audit_release(
+    checkpoint_partial_snapshot_index_with_drains(
         index,
         committed,
         &progress,
@@ -854,7 +741,6 @@ pub(crate) fn checkpoint_page_for_test(
         index_path,
         progress_path,
         || Ok(()),
-        None,
         None,
         None,
         Default::default(),
@@ -877,7 +763,7 @@ pub(super) fn checkpoint_partial_snapshot_index(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
 ) -> Result<ScanIndex> {
-    checkpoint_partial_snapshot_index_with_audit_release(
+    checkpoint_partial_snapshot_index_with_drains(
         index,
         committed_index,
         progress,
@@ -887,7 +773,6 @@ pub(super) fn checkpoint_partial_snapshot_index(
         index_path,
         progress_path,
         validate_destination,
-        None,
         None,
         None,
         Default::default(),
@@ -922,9 +807,9 @@ pub(super) const PARTIAL_CHECKPOINT_FAILURES: [&str; 9] = [
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "partial checkpoint keeps the selected body, audit and drain inputs together"
+    reason = "partial checkpoint keeps the selected body and drain inputs together"
 )]
-pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
+pub(super) fn checkpoint_partial_snapshot_index_with_drains(
     index: &ScanIndex,
     committed_index: &ScanIndex,
     progress: &SnapshotUploadProgress,
@@ -936,7 +821,6 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
     cause: Option<UnsettledUploadCause>,
-    audit_release: Option<AccountAuditRelease<'_>>,
     body_drains: crate::snapshots::ClaudeProofBodyDrains,
 ) -> Result<ScanIndex> {
     let progress_owner =
@@ -1025,14 +909,6 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
         // Settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
-    }
-    if let (Some(scan), Some(release)) = (correction_scan, audit_release) {
-        scan.preserve_released_account_audits(
-            &mut committable,
-            release.previous,
-            release.roots,
-            release.backfill_window_days,
-        );
     }
     // After every selected-entry restore above: a drain whose entry this
     // save does not keep stays owed.
@@ -1644,7 +1520,7 @@ pub(super) fn finish_sync_source(
         // partial-checkpoint settlement rules: unACKed files stay owed, exact
         // durable receipts remain authoritative, and no manifest is published.
         withdraw_source_manifest(&upload_destination_namespace, source);
-        checkpoint_partial_snapshot_index_with_audit_release(
+        checkpoint_partial_snapshot_index_with_drains(
             &index,
             &committed_index,
             &upload_progress,
@@ -1659,11 +1535,6 @@ pub(super) fn finish_sync_source(
             },
             None,
             Some(UnsettledUploadCause::UploadError),
-            (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-                previous: &committed_index,
-                roots: claude_scan_roots.as_deref().unwrap_or_default(),
-                backfill_window_days: receipt_window_days,
-            }),
             // Pre-upload recovery: no proof corrections were drained yet.
             Default::default(),
         )?;
@@ -2097,7 +1968,7 @@ pub(super) fn finish_sync_source(
     // release fails the pass.
     let mut partial_checkpoint =
         |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {
-            match checkpoint_partial_snapshot_index_with_audit_release(
+            match checkpoint_partial_snapshot_index_with_drains(
                 &index,
                 &committed_index,
                 &upload_progress,
@@ -2112,11 +1983,6 @@ pub(super) fn finish_sync_source(
                 },
                 None,
                 Some(cause),
-                (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-                    previous: &committed_index,
-                    roots: claude_scan_roots.as_deref().unwrap_or_default(),
-                    backfill_window_days: receipt_window_days,
-                }),
                 std::mem::take(&mut claude_proof_body_drains),
             ) {
                 Ok(committable) => {
@@ -2330,11 +2196,6 @@ pub(super) fn finish_sync_source(
             cutoff_candidates: &claude_cutoff_corrections,
             transport_fully_settled: upload_fully_settled,
             body_drains: claude_proof_body_drains,
-            audit_release: (source == SnapshotSource::ClaudeCode).then_some(AccountAuditRelease {
-                previous: &committed_index,
-                roots: claude_scan_roots.as_deref().unwrap_or_default(),
-                backfill_window_days: receipt_window_days,
-            }),
         },
     );
     let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
@@ -2404,14 +2265,6 @@ pub(super) fn finish_sync_source(
     scan_result.report_discovery_growth_after_save(&index);
     context_rearm_counts.emit(source);
     index.emit_upload_context_owed(source);
-    #[cfg(unix)]
-    crate::snapshots::after_source_save(
-        &daemon.transcript_cache,
-        support_dir,
-        source,
-        &mut index,
-        &index_path,
-    );
     if let Some(((roots, removed), named)) = claude_scan_roots
         .as_deref()
         .zip(telemetry_removed.as_ref())

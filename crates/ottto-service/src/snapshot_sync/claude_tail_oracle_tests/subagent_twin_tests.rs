@@ -705,10 +705,8 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
                         &prior,
                         &key
                     )
-                    .unwrap()
-                    .audit_debt()
                     .is_some(),
-                    "Tail keeps its Full-audit debt"
+                    "a Tail keeps its continuation"
                 );
             }
         }
@@ -1048,18 +1046,16 @@ fn late_main_side_call(c: &Corpus) {
     }
 }
 
-/// [regress] A main whose live copy grows with its audit overdue reads only
-/// its two copies after an exact ACK and save: both copies fold, no unchanged
+/// [regress] A main whose live copy grows reads only its two copies after an
+/// exact ACK and save: both copies fold, no unchanged
 /// child loads or re-folds on that page or the next, and money matches cold
 /// with the children's bodies carried. A move of the main's usage logs alone
 /// still re-reads the family on its page, then settles the same way. A
 /// child's activity retry or a change to the other main copy also keeps
 /// the whole-family read, with cold-equivalent money and placement.
 #[test]
-fn root_twin_audit_overdue_growth_does_not_repull_family() {
-    use crate::snapshots::e2_pipeline_scan_fixture::{
-        overdue_audit_for_test, tail_counter_for_test,
-    };
+fn root_twin_growth_does_not_repull_family() {
+    use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
     with_e2(|| {
         for case in [
             "growth",
@@ -1083,13 +1079,10 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
             let mut carried = acked(&first);
             let mut prior = commit(&session, first);
             let main = c.root.join(format!("z/{ROOT}.jsonl"));
-            if matches!(case, "growth" | "usage_logs") {
-                overdue_audit_for_test(&mut prior, &main);
-            }
             if case == "usage_logs" {
                 late_main_side_call(&c);
             } else {
-                append(&main, &line(ROOT, "audit-growth", GROW, 8));
+                append(&main, &line(ROOT, "root-growth", GROW, 8));
             }
             let mut hints = vec![main];
             if case == "child_activity_retry" {
@@ -1143,7 +1136,7 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
                 money_oracle::assert_carried_equivalent(&cold(&c), &actual);
             } else {
                 assert_eq!(refolds() - before, 2, "only the main's two copies fold");
-                assert_eq!(seeds.get("audit"), Some(&1));
+                assert_eq!(seeds.get("transcript_changed"), Some(&1));
                 assert_eq!(seeds.get("root_member"), Some(&1));
                 assert_eq!(seeds.get("child_member"), None);
                 assert_eq!(selection.get("forced_family_roots"), None);
@@ -1152,8 +1145,8 @@ fn root_twin_audit_overdue_growth_does_not_repull_family() {
             }
             carried.extend(acked(&warm));
             prior = commit(&session, warm);
-            // The main's audit stays due, so the next page may fold its two
-            // copies again; no child loads, re-folds or re-sends.
+            // The next page folds at most the main's two copies; no child
+            // loads, re-folds or re-sends.
             let before = refolds();
             let next = page(&c, prior, 100, true);
             assert!(refolds() - before <= 2, "{case}: the next page");

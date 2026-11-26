@@ -1,9 +1,9 @@
 // Durable holder-forced twins: acquisition cost and page/money parity.
-// Lives beside Disk so save/reload and after_source_save stay real.
+// Lives beside Disk so save/reload stays real.
 use super::*;
 use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    continuation_for_test, damage_tail_for_test, forced_needs_native_for_test, pace_cap_for_test,
+    continuation_for_test, damage_tail_for_test, forced_needs_native_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_store;
 use crate::snapshots::sampled_scan::transition_fixture::{
@@ -569,79 +569,33 @@ fn forced_twin_last_clock_is_equal_on_tail_full_and_restart() {
     });
 }
 
-/// [money] Each newly reachable delay falls back to native on the same page:
-/// (a) cap pacing, (b) an unfunded completion, (c) a future-head hold.
-/// A restart without audit capacity holds the session until its holder joins.
+/// [money] A future-head hold falls back to native on the same page, with
+/// page, ACK and placement parity.
 #[test]
-fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
+fn forced_verified_twin_with_a_future_head_stays_on_its_page() {
     if !supported("forced_twin_page") {
         return;
     }
     with_e2(|| {
-        for arm in ["cap", "completion", "future"] {
-            let mut f = Twin::new(&format!("forced-twin-{arm}"), true);
-            diag::round(0);
-            append(&f.twin, &line(ROOT, "own-later", AT, 9));
-            input_clock(&f.twin);
-            if arm == "future" {
-                damage_tail_for_test(&f.prior, &f.key, "future");
-                f.prior = f
-                    .disk
-                    .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
-            }
-            if arm == "completion" {
-                // Held-new custody has a census and committed head but no
-                // entry: it bypasses the cap gate and would pend at completion.
-                assert!(f.prior.files.remove(&f.key).is_some());
-            }
-            f.force("holder-later");
-            let mut restart = f.restart();
-            if arm != "future" {
-                f.owner.set_audit_slots(0);
-                restart.set_audit_slots(0);
-            }
-            if arm == "cap" {
-                pace_cap_for_test(&f.owner, &f.twin);
-                pace_cap_for_test(&restart, &f.twin);
-            }
-            let cold = E2ScanFixture::capturing_identity();
-            let mut pages = f.pages(&cold, &restart, f.page(&f.owner));
-            f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
-            if arm != "future" {
-                // Depends on the content-session co-scheduling fix landing
-                // first: a pre-acquisition holder deferral must hold the whole
-                // session, even when its pulled twin completes natively.
-                let held_page = &mut pages[2];
-                with_scan_clock(f.now.get(), || {
-                    held_page.enrich(&f.c);
-                    held_page.finish();
-                });
-                let held = mixed_route(held_page, &e2_progress(), Mode::DiskRestore);
-                assert!(
-                    !held.snapshots.contains_key(ROOT),
-                    "the deferred holder holds the session; no partial body publishes"
-                );
-                let prior = with_scan_clock(f.now.get(), || {
-                    f.disk.commit(
-                        &held_page.cache,
-                        SnapshotSource::ClaudeCode,
-                        &mut held_page.index,
-                    )
-                });
-                restart.set_audit_slots(256);
-                diag::round("retry");
-                diag::owner("restart");
-                pages[2] = with_scan_clock(f.now.get(), || {
-                    f.c.raw(&restart, prior, 2, true, std::slice::from_ref(&f.holder))
-                });
-            }
-            let pages = f.compare(&cold, &restart, pages);
-            assert!(!pages[2].index.files[&f.key]
-                .scan_identity_version
-                .as_deref()
-                .unwrap()
-                .contains("sampled_unverified"));
-        }
+        let mut f = Twin::new("forced-twin-future", true);
+        diag::round(0);
+        append(&f.twin, &line(ROOT, "own-later", AT, 9));
+        input_clock(&f.twin);
+        damage_tail_for_test(&f.prior, &f.key, "future");
+        f.prior = f
+            .disk
+            .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
+        f.force("holder-later");
+        let restart = f.restart();
+        let cold = E2ScanFixture::capturing_identity();
+        let pages = f.pages(&cold, &restart, f.page(&f.owner));
+        f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
+        let pages = f.compare(&cold, &restart, pages);
+        assert!(!pages[2].index.files[&f.key]
+            .scan_identity_version
+            .as_deref()
+            .unwrap()
+            .contains("sampled_unverified"));
     });
 }
 

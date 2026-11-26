@@ -516,7 +516,7 @@ impl PipelineFixture {
             Ok(result) => result,
             Err(error) => {
                 assert_eq!(upload, PipelineUpload::UploadError);
-                checkpoint_partial_snapshot_index_with_audit_release(
+                checkpoint_partial_snapshot_index_with_drains(
                     &index,
                     &committed_index,
                     &progress,
@@ -528,7 +528,6 @@ impl PipelineFixture {
                     || Ok(()),
                     None,
                     Some(crate::snapshots::UnsettledUploadCause::UploadError),
-                    None,
                     Default::default(),
                 )?;
                 return Err(error);
@@ -583,7 +582,7 @@ impl PipelineFixture {
             ),
             PipelineUpload::Shed => {
                 assert!(matches!(result, ResumableUploadResult::Shed { .. }));
-                let index = checkpoint_partial_snapshot_index_with_audit_release(
+                let index = checkpoint_partial_snapshot_index_with_drains(
                     &index,
                     &committed_index,
                     &progress,
@@ -595,7 +594,6 @@ impl PipelineFixture {
                     || Ok(()),
                     None,
                     Some(crate::snapshots::UnsettledUploadCause::Shed),
-                    None,
                     Default::default(),
                 )?;
                 UploadIndexSettlement {

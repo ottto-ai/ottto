@@ -384,9 +384,8 @@ impl OwnedJsonlParser {
     }
 
     /// Certify a complete traversal of a grown physical frozen extent.
-    /// The checkpoint is deliberately dropped. The existing audit obligation
-    /// remains prepared; FE2's sample-preserving rewrite residual is bounded
-    /// by the quiet Full audit and its sampled_audit_comparison diagnostics.
+    /// The checkpoint is deliberately dropped; the caller tags the entry as a
+    /// sealed prefix.
     pub(in crate::snapshots) fn commit_grown_prefix(
         &mut self,
         path: &Path,

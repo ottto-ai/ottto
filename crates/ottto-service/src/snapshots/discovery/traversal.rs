@@ -574,7 +574,7 @@ pub(in crate::snapshots) fn pace_listing_owed(
 /// Watcher hints go through `ScanIndex::hint_settled`: a settled file
 /// (ctime-only events included) is dropped; a vanished one is kept for the
 /// exact removal path. Owner requests keep their unchanged files: leased reason
-/// re-offers and ordinary retries here, the audit retry through the queue directly.
+/// re-offers and ordinary retries here.
 /// A hint never admits a first read past the first-read bound.
 pub(in crate::snapshots) fn changed_watcher_hints(
     index: &ScanIndex,
@@ -1042,8 +1042,8 @@ pub(in crate::snapshots) fn release_codex_inventory_hold(
 
 impl ScanIndex {
     /// A re-listing pass leaves a file alone when its stamp is unchanged
-    /// since the last read and nothing is owed on it (empty fingerprint or an
-    /// unverified sampled generation). Other reasons to read an unchanged file
+    /// since the last read and nothing is owed on it (an empty fingerprint, or
+    /// a nonempty file whose final group was cleared). Other reasons to read an unchanged file
     /// were weighed by this generation's walk; their owners and the next walk
     /// re-offer them, as on main, rather than every pass. Stat-only.
     pub(in crate::snapshots) fn listing_stamp_matches(

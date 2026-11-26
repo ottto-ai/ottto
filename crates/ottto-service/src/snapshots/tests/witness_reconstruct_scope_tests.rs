@@ -165,7 +165,7 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
 
 /// How an idle (unread) family member's census record and index entry stand.
 /// Every case but `none` stores an unverified record at revision `e`.
-const IDLE_CASES: [&str; 5] = ["none", "verified", "unverified", "mismatch", "missing"];
+const IDLE_CASES: [&str; 5] = ["none", "verified", "tagged", "mismatch", "missing"];
 
 /// Stage an idle member of `root`'s family: it is not in the page, so only
 /// its own index entry can bind its unverified census record.
@@ -177,10 +177,13 @@ fn stage_idle_member(index: &mut ScanIndex, dir: &Path, root: &str, case: &str) 
     if case != "missing" {
         let mut entry = manifest_index_entry(None);
         entry.source_file_fingerprint = hex64(if case == "mismatch" { 'f' } else { 'e' });
-        if case == "unverified" {
-            entry.set_unverified_deadline(1);
+        if case == "tagged" {
+            entry.scan_identity_version = Some(format!(
+                "{}+sampled_unverified:v2:0:p",
+                crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+            ));
         }
-        assert_eq!(entry.has_unverified_source(), case == "unverified");
+        assert_eq!(entry.has_sampled_tag(), case == "tagged");
         index.files.insert(key.clone(), entry);
     }
     if case != "none" {
@@ -223,8 +226,8 @@ fn posture_withheld(items: &[SnapshotItem]) -> serde_json::Value {
 }
 
 /// [money] An idle subagent whose own index entry is verified at its census
-/// revision no longer clears its family's context posture. A matching ordinary
-/// unverified entry also binds; a fingerprint mismatch or no entry still
+/// revision no longer clears its family's context posture. A matching entry
+/// with a sealed-prefix tag also binds; a fingerprint mismatch or no entry still
 /// clears it, and the cache rows stay on the strict in-batch rule.
 #[test]
 fn idle_verified_member_keeps_family_context_posture() {
@@ -282,7 +285,7 @@ fn idle_verified_member_keeps_family_context_posture() {
         );
 
         let child = &items[1];
-        let kept = matches!(case, "none" | "verified" | "unverified");
+        let kept = matches!(case, "none" | "verified" | "tagged");
         assert_eq!(
             context_posture(child),
             if kept {
@@ -307,14 +310,14 @@ fn idle_verified_member_keeps_family_context_posture() {
             disposition.quarantined_source_session_ids.is_empty(),
             "{case}"
         );
-        if matches!(case, "verified" | "unverified") {
+        if matches!(case, "verified" | "tagged") {
             withheld.insert(case, posture_withheld(&items));
         }
         let _ = fs::remove_dir_all(dir);
     }
     // Same index fingerprints, only the entry's verification differs: the
     // bodies are equal except the posture fields.
-    assert_eq!(withheld["verified"], withheld["unverified"]);
+    assert_eq!(withheld["verified"], withheld["tagged"]);
 }
 
 /// [money] On an ordinary-money (excluded) witnessed family, the posture
@@ -323,7 +326,7 @@ fn idle_verified_member_keeps_family_context_posture() {
 #[test]
 fn idle_verified_member_leaves_usage_rebuild_and_hold_strict() {
     let mut outcomes = BTreeMap::new();
-    for case in ["none", "verified", "unverified"] {
+    for case in ["none", "verified", "tagged"] {
         let families = witnessed_families(&format!("census-posture-usage-{case}"), 1);
         let root = family_root(0);
         let mut index = families.index.clone();
@@ -378,5 +381,5 @@ fn idle_verified_member_leaves_usage_rebuild_and_hold_strict() {
         );
         let _ = fs::remove_dir_all(&families.dir);
     }
-    assert_eq!(outcomes["verified"], outcomes["unverified"]);
+    assert_eq!(outcomes["verified"], outcomes["tagged"]);
 }

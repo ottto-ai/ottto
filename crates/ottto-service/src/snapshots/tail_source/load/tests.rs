@@ -126,7 +126,7 @@ pub(super) fn read(
     taken: Option<Box<Retained<CachedJsonlReduction>>>,
 ) -> (OwnedJsonlParser, ReadMode, u64) {
     let mut parser = route.open(path);
-    let Ok(mode) = parser.prepare_acquisition(taken, &scope(), None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(taken, &scope(), NOW) else {
         panic!("the read prepares");
     };
     let start = parser

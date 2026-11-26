@@ -3,7 +3,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{ReadMode, Scope};
-use crate::transcript_cache::{CACHE_BYTES, CACHE_ENTRIES};
+use crate::transcript_cache::CACHE_BYTES;
 
 // The existing owner enforces aggregate parked/optional-send overlap. The
 // separate 1MiB reserve covers bounded marker strings in existing index copies
@@ -20,73 +20,18 @@ mod retired_records;
 #[cfg(all(test, unix))]
 pub(crate) mod transition_fixture;
 
-// RAM-only per-key cap pacing; unify with the shared Full-read pacing at integration.
-// Fixed slots charge their full inline size through SharedCache, with no path heap.
-pub(super) const CAP_PACE_SECONDS: u64 = 6 * 60 * 60;
-const CAP_CLOCK_SANITY_SECONDS: u64 = 30 * 24 * 60 * 60;
-#[derive(Clone, Copy)]
-struct CapStamp {
-    key: [u8; 32],
-    at: SystemTime,
-}
-struct CapPace {
-    entries: [Option<CapStamp>; CACHE_ENTRIES],
-}
-impl Default for CapPace {
-    fn default() -> Self {
-        Self {
-            entries: [None; CACHE_ENTRIES],
-        }
-    }
-}
-impl CapPace {
-    /// (may read Full, evicted). Backwards/implausible clocks expire, never hold.
-    fn admit(&mut self, key: &str, now: SystemTime) -> (bool, bool) {
-        let key: [u8; 32] = Sha256::digest(key.as_bytes()).into();
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|old| old.key == key))
-        {
-            let old = slot.expect("matched pace");
-            if now.duration_since(old.at).is_ok_and(|elapsed| {
-                elapsed.as_secs() <= CAP_CLOCK_SANITY_SECONDS
-                    && elapsed.as_secs() < CAP_PACE_SECONDS
-            }) {
-                return (false, false);
-            }
-            *slot = Some(CapStamp { key, at: now });
-            return (true, false);
-        }
-        let empty = self.entries.iter().position(Option::is_none);
-        let slot = empty.unwrap_or_else(|| {
-            self.entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.expect("full pace").at)
-                .expect("nonempty pace")
-                .0
-        });
-        self.entries[slot] = Some(CapStamp { key, at: now });
-        (true, empty.is_none())
-    }
-}
-
 pub(crate) struct SharedCache {
     /// Reusable Codex home facts for the active cycle scope only. Cycles are
     /// serialized; returning facts replace every idle scope's entry.
     sidecars: Mutex<BTreeMap<String, crate::snapshots::sources::codex::sidecar::SidecarFacts>>,
     desktop_titles: Mutex<super::sources::claude::desktop_titles::DesktopTitleFacts>,
     pub(crate) withheld_memo: withheld_account::Memo,
-    cap_pace: Mutex<CapPace>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here.
     cursor: Mutex<codex_cursor::CursorState>,
-    /// Quiet retirements of the current passes, and the retired record
-    /// directory's failed-removal ages. A leaf lock, never held while taking
-    /// another. Outside the state budget: pass-scoped, never walked.
+    /// Per `SnapshotSource::slot`: the source began a pass in this process.
     #[cfg(unix)]
-    pub(in crate::snapshots) quiet: Mutex<sampled_audit::quiet_retirement::QuietRetirements>,
+    begun_passes: [std::sync::atomic::AtomicBool; 3],
     /// The state database this owner's fixture scans continue from: Claude's
     /// continuation lives there, not in RAM.
     #[cfg(test)]
@@ -98,13 +43,24 @@ impl Default for SharedCache {
             sidecars: Mutex::default(),
             desktop_titles: Mutex::default(),
             withheld_memo: Default::default(),
-            cap_pace: Mutex::new(CapPace::default()),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             #[cfg(unix)]
-            quiet: Mutex::default(),
+            begun_passes: Default::default(),
             #[cfg(test)]
             test_route: Default::default(),
         }
+    }
+}
+#[cfg(unix)]
+impl SharedCache {
+    /// Records that `source` began a pass in this process.
+    pub(in crate::snapshots) fn note_pass_begun(&self, source: SnapshotSource) {
+        self.begun_passes[source.slot()].store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `source` has begun a pass in this process.
+    pub(in crate::snapshots) fn pass_begun(&self, source: SnapshotSource) -> bool {
+        self.begun_passes[source.slot()].load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 impl std::fmt::Debug for SharedCache {
@@ -190,11 +146,6 @@ impl SharedCache {
 
 #[cfg(test)]
 impl SharedCache {
-    pub(super) fn cap_pace_for_test(&self, key: &str, now: SystemTime) -> (bool, bool, usize) {
-        let mut pace = self.cap_pace.lock().unwrap();
-        let (admitted, evicted) = pace.admit(key, now);
-        (admitted, evicted, pace.entries.iter().flatten().count())
-    }
     /// Tests only: panic while holding the cursor lock.
     pub(crate) fn panic_under_cursor_lock_for_test(&self) {
         self.with_cursor(|_| panic!("W9: panic under the cursor lock (test)"));
@@ -227,8 +178,6 @@ impl SharedCache {
 pub(super) struct Context {
     pub(super) cache: Arc<SharedCache>,
     pub(super) namespace: Scope,
-    pub(super) audit_metadata_supported: bool,
-    pub(super) audit_slots: usize,
     pub(super) full_files: usize,
     pub(super) tail_files: usize,
     pub(super) unchanged_files: usize,
@@ -238,12 +187,6 @@ pub(super) struct Context {
     pub(super) sample_bytes: u64,
     pub(super) full_reasons: [usize; 11],
     pub(super) priority_replays: usize,
-    pub(super) audits_started: usize,
-    pub(super) audits_completed: usize,
-    pub(super) audit_quiet_retired: usize,
-    pub(super) audit_cap_full: usize,
-    pub(super) audit_cap_delay: usize,
-    pub(super) pace_evicted: usize,
     /// Same-size files whose moved mtime a write generation count proved a
     /// touch: continued from stored state instead of a Full.
     pub(super) same_size_touch_proven: usize,
@@ -254,54 +197,24 @@ pub(super) struct Context {
     /// The same, for a head that stored no binding at all (for example one
     /// written before bindings were stored). Both count selection decisions.
     pub(super) codex_side_only_first_binding: usize,
-    pub(super) start_overdue_seconds: u64,
-    pub(super) completion_overdue_seconds: u64,
     pub(super) admission: crate::local_resource_diagnostics::AcquisitionAdmission,
 }
-crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
+crate::heap_layout_bound::fields!(Context; cache, namespace,
     full_files, tail_files, unchanged_files, native_bytes, full_native_bytes, sample_bytes, full_reasons,
-    priority_replays, audits_started, audits_completed, audit_quiet_retired, audit_cap_full, audit_cap_delay, pace_evicted, same_size_touch_proven, codex_side_only_reselect, codex_side_only_first_binding, start_overdue_seconds,
-    completion_overdue_seconds, admission);
+    priority_replays, same_size_touch_proven, codex_side_only_reselect, codex_side_only_first_binding,
+    admission);
 
 pub(super) struct Active {
     pub(super) key: String,
     pub(super) scope: Scope,
     pub(super) mode: ReadMode,
-    pub(super) audit_due: Option<u64>,
     /// This read is a protected-tier replay: a non-Full read found protected
     /// tiers and re-reads the file from its start (`tier_prefix_replay`).
     pub(super) tier_prefix_replay: bool,
     pub(super) census_base_bound: bool,
     pub(super) resident_loaded_bytes: u64,
 }
-crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, tier_prefix_replay, census_base_bound, resident_loaded_bytes);
-
-impl Context {
-    #[inline(never)]
-    pub(super) fn cap_candidate(&mut self, key: &str) -> bool {
-        let now = cap_wall_time();
-        let (admit, evicted) = self
-            .cache
-            .cap_pace
-            .lock()
-            .map(|mut pace| pace.admit(key, now))
-            .unwrap_or((true, false));
-        self.pace_evicted += usize::from(evicted);
-        if admit {
-            self.audit_cap_full += 1;
-        } else {
-            self.audit_cap_delay += 1;
-        }
-        admit
-    }
-}
-fn cap_wall_time() -> SystemTime {
-    #[cfg(test)]
-    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
-        return UNIX_EPOCH + std::time::Duration::from_secs(now);
-    }
-    SystemTime::now()
-}
+crate::heap_layout_bound::fields!(Active; key, scope, mode, tier_prefix_replay, census_base_bound, resident_loaded_bytes);
 
 impl Context {
     pub(super) fn file_scope(
@@ -325,19 +238,11 @@ impl Context {
             "no_curve",
         ]))
     }
-    pub(super) fn record_mode(&mut self, mode: ReadMode, audit_due: Option<u64>) {
+    pub(super) fn record_mode(&mut self, mode: ReadMode) {
         match mode {
             ReadMode::Full(reason) => {
                 self.full_files += 1;
                 self.full_reasons[reason.slot()] += 1;
-                // A Full carries any staged debt; only one already due is
-                // an audit start.
-                let now = now_seconds();
-                if let Some(due) = audit_due.filter(|due| now >= *due) {
-                    self.audits_started += 1;
-                    self.start_overdue_seconds =
-                        self.start_overdue_seconds.max(now.saturating_sub(due));
-                }
             }
             ReadMode::Tail => self.tail_files += 1,
             ReadMode::Unchanged => self.unchanged_files += 1,
@@ -356,12 +261,6 @@ impl Context {
             .sample_bytes
             .saturating_add(metrics.sample_bytes as u64);
     }
-    pub(super) fn complete_audit(&mut self, due: u64) {
-        self.audits_completed += 1;
-        self.completion_overdue_seconds = self
-            .completion_overdue_seconds
-            .max(now_seconds().saturating_sub(due));
-    }
 }
 
 impl OwnedSourceScan {
@@ -379,20 +278,9 @@ impl OwnedSourceScan {
         let admitted = cfg!(unix) || self.source != SnapshotSource::Pi;
         if admitted {
             sampled_audit::normalize_marker_storage(&mut self.index);
-            let pending = self
-                .index
-                .files
-                .values()
-                .filter(|entry| entry.has_unverified_source())
-                .take(CACHE_ENTRIES + 1)
-                .count();
             self.sampling = Some(Context {
                 cache,
                 namespace,
-                // Legacy prefix/audit scheduling and diagnostic observations
-                // keep these values; ordinary restore never gates on them.
-                audit_metadata_supported: pending <= CACHE_ENTRIES,
-                audit_slots: CACHE_ENTRIES.saturating_sub(pending),
                 full_files: 0,
                 tail_files: 0,
                 unchanged_files: 0,
@@ -401,17 +289,9 @@ impl OwnedSourceScan {
                 sample_bytes: 0,
                 full_reasons: [0; 11],
                 priority_replays: 0,
-                audits_started: 0,
-                audits_completed: 0,
-                audit_quiet_retired: 0,
-                audit_cap_full: 0,
-                audit_cap_delay: 0,
-                pace_evicted: 0,
                 same_size_touch_proven: 0,
                 codex_side_only_reselect: 0,
                 codex_side_only_first_binding: 0,
-                start_overdue_seconds: 0,
-                completion_overdue_seconds: 0,
                 admission: Default::default(),
             });
         }
@@ -804,54 +684,5 @@ mod retained_heap_tests {
             cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"]
                 > empty["codex_sidecar_facts_bytes"]
         );
-    }
-}
-
-#[cfg(test)]
-mod record_mode_tests {
-    use super::*;
-    use crate::transcript_acquisition::FullReason;
-
-    /// [behaviour] A Full that carries a debt not yet due is no audit start;
-    /// one carrying a due debt starts an audit with its overdue seconds.
-    #[test]
-    fn only_a_due_debt_counts_as_an_audit_start() {
-        let mut context = Context {
-            cache: Arc::new(SharedCache::default()),
-            namespace: Scope(String::new()),
-            audit_metadata_supported: true,
-            audit_slots: CACHE_ENTRIES,
-            full_files: 0,
-            tail_files: 0,
-            unchanged_files: 0,
-            native_bytes: 0,
-            full_native_bytes: 0,
-            sample_bytes: 0,
-            full_reasons: [0; 11],
-            priority_replays: 0,
-            audits_started: 0,
-            audits_completed: 0,
-            audit_quiet_retired: 0,
-            audit_cap_full: 0,
-            audit_cap_delay: 0,
-            pace_evicted: 0,
-            same_size_touch_proven: 0,
-            codex_side_only_reselect: 0,
-            codex_side_only_first_binding: 0,
-            start_overdue_seconds: 0,
-            completion_overdue_seconds: 0,
-            admission: Default::default(),
-        };
-        set_test_now(Some(1_000));
-        let full = ReadMode::Full(FullReason::SameSizeEdit);
-        context.record_mode(full, Some(1_001));
-        assert_eq!((context.full_files, context.audits_started), (1, 0));
-        context.record_mode(full, Some(940));
-        context.record_mode(full, Some(1_000));
-        context.record_mode(full, None);
-        set_test_now(None);
-        assert_eq!(context.full_files, 4);
-        assert_eq!(context.audits_started, 2);
-        assert_eq!(context.start_overdue_seconds, 60);
     }
 }

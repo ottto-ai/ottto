@@ -99,7 +99,10 @@ impl ScanIndex {
 
     /// The one post-load step of both load entry points. Growth-claim lineage
     /// binds here for every v2-active source, so the two cannot drift apart.
+    /// An older build's sampled tag is normalized in memory here; the next
+    /// ordinary save writes it.
     fn settle_loaded_index(&mut self, path: &Path) {
+        sampled_audit::normalize_marker_storage(self);
         if sampled_audit::growth_active(self) {
             sampled_audit::bind_growth_claims(self, path);
         }

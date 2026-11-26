@@ -25,7 +25,7 @@
 //!   private to `codex_cursor`; the unmodified `codex_cursor_tests` pin it.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle::observe;
-use crate::transcript_acquisition::{AuditDebt, FullReason};
+use crate::transcript_acquisition::FullReason;
 use std::cell::Cell;
 use std::io::Write;
 use std::ops::Range;
@@ -57,7 +57,6 @@ struct InPage {
     consumed: u64,
     cursor: bool,
     extent_limit: Option<u64>,
-    debt: Option<AuditDebt>,
 }
 
 fn in_page(active: &OwnedActiveFile) -> Option<InPage> {
@@ -70,7 +69,6 @@ fn in_page(active: &OwnedActiveFile) -> Option<InPage> {
         consumed: active.parser.reader.consumed_bytes(),
         cursor: active.cursor.is_some(),
         extent_limit: active.parser.reader.extent_limit,
-        debt: plan.audit_obligation(),
     })
 }
 

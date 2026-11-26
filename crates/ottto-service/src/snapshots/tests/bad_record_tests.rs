@@ -106,9 +106,7 @@ fn stored<S: SourceFixture>(route: &Route, path: &Path) -> (OwnedJsonlParser, Ta
         panic!("committed loss is progress, never reconstruction");
     };
     let mut p = parser::<S>(path);
-    let mode = p
-        .prepare_acquisition(Some(taken), &scope(), None, NOW)
-        .unwrap();
+    let mode = p.prepare_acquisition(Some(taken), &scope(), NOW).unwrap();
     (p, base, mode)
 }
 
@@ -189,7 +187,7 @@ fn regression<S: SourceFixture>() {
     let cold = emitted::<S>(Mode::ColdFull, &route, &parsed.snapshots);
     // The RAM arm continues the real PRE accumulator and checkpoint.
     let mut p = parser::<S>(&path);
-    p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+    p.prepare_acquisition(None, &scope(), NOW).unwrap();
     while !p.step().unwrap() {}
     let reduction = p.durable_test_reduction_copy();
     let cp = p
@@ -203,7 +201,7 @@ fn regression<S: SourceFixture>() {
     });
     let mut ram = parser::<S>(&path);
     assert_eq!(
-        ram.prepare_acquisition(Some(retained), &scope(), None, NOW)
+        ram.prepare_acquisition(Some(retained), &scope(), NOW)
             .unwrap(),
         ReadMode::Unchanged
     );
@@ -408,7 +406,7 @@ fn suffix<S: SourceFixture>() {
         }
         fs::write(&path, rows.join("\n")).unwrap();
         let mut p = parser::<S>(&path);
-        p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+        p.prepare_acquisition(None, &scope(), NOW).unwrap();
         p.reader
             .set_extent_limit(fs::metadata(&path).unwrap().len());
         while !p.step().unwrap() {}
@@ -923,7 +921,7 @@ fn codex_occurrences() {
         },
     )
     .unwrap();
-    p.prepare_acquisition(None, &scope(), None, NOW).unwrap();
+    p.prepare_acquisition(None, &scope(), NOW).unwrap();
     while !p.step().unwrap() {}
     let counts = p
         .accumulator

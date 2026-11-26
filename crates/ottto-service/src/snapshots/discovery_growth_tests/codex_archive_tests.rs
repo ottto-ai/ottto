@@ -15,11 +15,13 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         entry.last_snapshot_fingerprint = Some("final".into());
         index.files.insert(key.clone(), entry);
         if owed {
+            // A cleared source fingerprint owes a parse.
             index
                 .files
                 .get_mut(&key)
                 .unwrap()
-                .set_unverified_deadline(11);
+                .source_file_fingerprint
+                .clear();
         } else {
             crate::snapshots::upload::freshness_debt::tests::accept(
                 SnapshotSource::Codex,

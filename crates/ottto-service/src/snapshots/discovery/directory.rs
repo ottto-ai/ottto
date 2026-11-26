@@ -727,34 +727,6 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
             // or uncertain ancestor keeps its obligation and also stops here.
             continue;
         }
-        // An unobserved marked entry still needs positive filesystem proof;
-        // unsafe ancestors, missing roots and permission failures keep debt.
-        if !observed
-            && index
-                .files
-                .get(key)
-                .is_some_and(ScanIndexEntry::has_unverified_source)
-            && index
-                .traversal
-                .as_ref()
-                .is_some_and(|walk| sampled_audit::proven_absent(Path::new(key), &walk.scan_roots))
-        {
-            if index
-                .files
-                .get(key)
-                .is_some_and(ScanIndexEntry::codex_history_is_protected)
-            {
-                index
-                    .files
-                    .get_mut(key)
-                    .expect("protected audit")
-                    .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-            } else {
-                index.retire_vanished_claude_audit_debt_entry(key);
-            }
-            crate::local_resource_diagnostics::audit_retired_absent(source.api_slug());
-            continue; // Debt retirement alone does not prune incidence.
-        }
         if !observed
             && !index.decode_holds_file(key)
             && !index

@@ -107,14 +107,14 @@ fn settled_entry(index: &mut ScanIndex, modified: u64) {
     index.snapshot_activity_at.insert("fp".into(), None);
 }
 
-fn selects(index: &ScanIndex, now: u64) -> bool {
-    stored_stamp_selects(index, KEY, index.files.get(KEY).unwrap(), now)
+fn selects(index: &ScanIndex) -> bool {
+    stored_stamp_selects(index, KEY, index.files.get(KEY).unwrap())
 }
 
 /// The ordinary walk's decision for the same unchanged file.
-fn walk_decision(index: &ScanIndex, now: u64) -> (CandidateDecision, Option<CandidateParseReason>) {
+fn walk_decision(index: &ScanIndex) -> (CandidateDecision, Option<CandidateParseReason>) {
     let candidate = stored_candidate(KEY, index.files.get(KEY).unwrap());
-    index.candidate_decision_with_reason_at(&candidate, now)
+    index.candidate_decision_with_reason(&candidate)
 }
 
 #[test]
@@ -419,38 +419,9 @@ fn claude_sidecar_and_otlp_rows_are_inputs() {
     assert!(!before.same(&after), "drained journal rows wake the walk");
 }
 
-#[test]
-fn overdue_audit_is_served_by_the_backstop_walk() {
-    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
-    let mut index = ScanIndex::default();
-    settled_entry(&mut index, START);
-    assert!(!selects(&index, START));
-    let entry = index.files.get_mut(KEY).unwrap();
-    entry.set_unverified_deadline(START - 60);
-    let ordinary = walk_decision(&index, START + 60);
-    assert_eq!(ordinary.1, Some(CandidateParseReason::Audit));
-    assert!(!selects(&index, START + 60), "a due audit does not wake");
-    fixture.walk(&index, START);
-    for gap in (1800..WALK_GAP).step_by(1800) {
-        assert!(
-            fixture.gate(&index, START + gap),
-            "the audit waits at +{gap}s"
-        );
-    }
-    assert!(
-        !fixture.gate(&index, START + WALK_GAP),
-        "the backstop walks"
-    );
-    assert_eq!(
-        walk_decision(&index, START + WALK_GAP).1,
-        Some(CandidateParseReason::Audit),
-        "and that walk reads the audit"
-    );
-}
-
 /// For every combination of index states over an unchanged file, the
-/// projection selects exactly what the walk's own decision selects, except
-/// a due sampled audit, which only the backstop walk serves.
+/// projection selects exactly what the walk's own decision selects. An older
+/// build's sampled audit tag selects neither.
 #[test]
 fn projection_owes_iff_walk_selects() {
     let mutations: [fn(&mut ScanIndex); 6] = [
@@ -471,11 +442,9 @@ fn projection_owes_iff_walk_selects() {
                 .insert("fp".into(), Some("not-a-time".into()));
         },
         |index| {
-            index
-                .files
-                .get_mut(KEY)
-                .unwrap()
-                .set_unverified_deadline(START - 1)
+            index.files.get_mut(KEY).unwrap().scan_identity_version = Some(format!(
+                "{LOCAL_SCAN_INDEX_IDENTITY_VERSION}+sampled_unverified:v2:1:c"
+            ));
         },
     ];
     let mut selected = 0;
@@ -487,16 +456,13 @@ fn projection_owes_iff_walk_selects() {
                 mutate(&mut index);
             }
         }
-        let (decision, reason) = walk_decision(&index, START);
+        let (decision, reason) = walk_decision(&index);
         let walk_selects = decision != CandidateDecision::Skip;
-        let projected = selects(&index, START);
-        if reason == Some(CandidateParseReason::Audit) {
-            // The audit gate runs first; the projection sees what is left.
-            assert!(walk_selects, "mask {mask:#08b}");
-        } else {
-            assert_eq!(projected, walk_selects, "mask {mask:#08b}: {reason:?}");
+        let projected = selects(&index);
+        assert_eq!(projected, walk_selects, "mask {mask:#08b}: {reason:?}");
+        if mask == 0b100000 {
+            assert!(!projected, "an older build's tag alone owes nothing");
         }
-        assert!(!projected || walk_selects, "mask {mask:#08b}");
         selected += usize::from(projected);
         let owed = !owes(&index, DAYS, START).is_none();
         assert_eq!(owed, projected || mask & 0b1000 != 0, "mask {mask:#08b}");

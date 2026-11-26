@@ -25,9 +25,7 @@ fn job_full(
     use crate::transcript_acquisition::ReadMode;
     let mut parser = route.open(path);
     assert!(matches!(
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap(),
+        parser.prepare_acquisition(None, &scope(), NOW).unwrap(),
         ReadMode::Full(_)
     ));
     seed_full_job_template(

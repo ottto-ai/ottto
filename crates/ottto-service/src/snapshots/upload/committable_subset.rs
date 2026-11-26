@@ -416,7 +416,7 @@ impl ScanIndex {
             if !result.files.get(key).is_some_and(|retained| {
                 (working.source_file_fingerprint.is_empty()
                     && !retained.source_file_fingerprint.is_empty())
-                    || retained.carry_sampled_audit_changes(working)
+                    || retained.carry_prefix_provenance_changes(working)
             }) {
                 continue;
             }
@@ -429,7 +429,7 @@ impl ScanIndex {
             if working.source_file_fingerprint.is_empty() {
                 retained.source_file_fingerprint.clear();
             }
-            retained.carry_sampled_audit(working);
+            retained.carry_prefix_provenance(working);
         }
         result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);

@@ -2,8 +2,8 @@
 //! `Tail` reads. The extension is the Claude twin of Codex in-page reads: a reader-relative extent
 //! limit, an in-page genuine-EOF apply for a quiescent unterminated row, and a
 //! grown-read route that publishes the sealed prefix `[0, s)` as a
-//! certificate only: no checkpoint, copy, cache insert or audit credit, the
-//! prepared debt re-staged, and the index left at the opened stamp.
+//! certificate only: no checkpoint, copy, cache insert or Full credit, the
+//! entry tagged as a sealed prefix, and the index left at the opened stamp.
 //!
 //! Tests marked RED assert FE's behavior and fail on main for the reason in
 //! their doc comment (the "acquisition exceeds stable source" failure,
@@ -261,12 +261,11 @@ fn grown_full() -> Grown {
     }
 }
 
-/// (RED): a Claude file with no copy and a prepared (not yet due)
-/// audit debt; complete rows are appended after the open step of its in-page
-/// `Full`. FE publishes `[0, s)` (here `s` = frozen) with no checkpoint or
-/// cache insert and no `complete_full_audit` (the debt stays staged at its
-/// deadline); the index keeps the opened stamp; the next page re-selects the
-/// grown file and reads `Full` with body parity.
+/// (RED): a Claude file with no copy; complete rows are appended after the
+/// open step of its in-page `Full`. FE publishes `[0, s)` (here `s` = frozen)
+/// with no checkpoint or cache insert and tags the entry as a sealed prefix;
+/// the index keeps the opened stamp; the next page re-selects the grown file
+/// and reads `Full` with body parity.
 ///
 /// Growth stops at the frozen extent; it is never an `OpenRead` failure.
 #[test]
@@ -279,12 +278,6 @@ fn fe_claude_append_during_full_read_publishes_sealed_prefix() {
         &base.cache,
         &base.index,
     );
-    let due = sampled_scan::now_seconds() + 1800;
-    base.index
-        .files
-        .get_mut(&base.key)
-        .unwrap()
-        .set_unverified_deadline(due);
     let path = base.path.clone();
     let appended = row_bytes(CLAUDE, 6..9);
     let index = std::mem::take(&mut base.index);
@@ -294,28 +287,22 @@ fn fe_claude_append_during_full_read_publishes_sealed_prefix() {
         });
     assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(
-        read.debt.map(|debt| debt.due_unix_seconds),
-        Some(due),
-        "precondition: the Full owes the prepared audit"
-    );
     assert_prefix_published("SP-1c", &base, &index, full, &seen, &read, read.frozen);
-    assert_eq!(
-        index.files[&base.key].unverified_deadline(),
-        Some(due),
-        "SP-1c: no complete_full_audit; the prepared debt stays staged"
+    assert!(
+        index.files[&base.key].has_prefix_provenance(),
+        "SP-1c: the entry is tagged as a sealed prefix"
     );
     next_full("SP-1c", &base, index, STATE_MISSING);
 }
 
 /// (RED): the same during a Claude in-page `Tail` from `s` of a
 /// committed head. FE publishes `[0, frozen)`, keeps no copy (no checkpoint
-/// or cache insert), and re-stages the Tail's prepared debt unchanged; the
-/// next page continues from the head as a Tail with body parity.
+/// or cache insert), and tags the entry as a sealed prefix; the next page
+/// continues from the head as a Tail with body parity.
 ///
 /// Red on main: the stable-source failure (one `OpenRead`), and the taken copy is dropped.
 #[test]
-fn fe_claude_prime_append_during_tail_read_publishes_prefix_and_restages_debt() {
+fn fe_claude_prime_append_during_tail_read_publishes_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -332,12 +319,10 @@ fn fe_claude_prime_append_during_tail_read_publishes_prefix_and_restages_debt() 
     );
     assert_eq!(read.start, base.sealed, "precondition: Tail from s");
     assert_eq!(seen.modes, (0, 1, 0));
-    assert!(read.debt.is_some(), "precondition: a Tail owes its audit");
     assert_prefix_published("SP-1c'", &base, &index, tail, &seen, &read, read.frozen);
-    assert_eq!(
-        index.files[&base.key].unverified_deadline(),
-        read.debt.map(|debt| debt.due_unix_seconds),
-        "SP-1c': the prepared debt is re-staged unchanged"
+    assert!(
+        index.files[&base.key].has_prefix_provenance(),
+        "SP-1c': the entry is tagged as a sealed prefix"
     );
     next_tail("SP-1c'", &base, index);
 }
@@ -692,8 +677,6 @@ fn fe_claude_replace_during_tail_not_grown_is_scope_object() {
         }
     }
     paced_reopen_refuses_without_retry();
-    changed_reopen_shares_growth_retry(CLAUDE);
-    changed_reopen_shares_growth_retry(SnapshotSource::Codex);
 }
 
 /// A Claude growth Full that spent its six-hour claim: a retry could only be
@@ -721,96 +704,6 @@ fn paced_reopen_refuses_without_retry() {
             .is_none_or(|walk| !walk.residue.growth_retries.contains_key(&base.key)),
         "{id}: no retry spent"
     );
-}
-
-/// Growth and a changed strict reopen share the file's one retry in a walk:
-/// after either spends it, the other takes its existing second-hit outcome.
-fn changed_reopen_shares_growth_retry(source: SnapshotSource) {
-    for growth_first in [true, false] {
-        let base = baseline(source, 4, 2);
-        let retry_state = |index: &ScanIndex| {
-            index
-                .traversal
-                .as_ref()?
-                .residue
-                .growth_retries
-                .get(&base.key)
-                .copied()
-        };
-        let mut index = base.index.clone();
-        for attempt in 0..2 {
-            let grow = growth_first == (attempt == 0);
-            let id =
-                format!("shared retry {source:?} growth_first={growth_first} attempt={attempt}");
-            let mut injected = None;
-            let mut released = false;
-            let (next, result, seen) = page(&base.fixture, source, index, &base.cache, |scan| {
-                // The completed page can already have retired this walk.
-                released |= retry_state(&scan.index) == Some(true);
-                if injected.is_none()
-                    && let Some(read) = opened(scan)
-                {
-                    injected = Some(read.mode);
-                    if grow {
-                        assert!(
-                            !scan.index.files[&base.key].has_unverified_source(),
-                            "{id}: the grown prefix must need a new audit slot"
-                        );
-                        // Deny publication capacity after the read is admitted.
-                        scan.sampling.as_mut().unwrap().audit_slots = 0;
-                        append_raw(&base.path, &row_bytes(source, 9..10));
-                    } else {
-                        assert!(
-                            !sampled_audit::growth_full_paced(
-                                &scan.index,
-                                &base.key,
-                                sampled_scan::now_seconds()
-                            ),
-                            "{id}: replacement must reach the shared retry check"
-                        );
-                        replace(&base.path, &bytes_of(&base.path));
-                    }
-                }
-            });
-            let mode = injected
-                .unwrap_or_else(|| panic!("{id}: expected in-page read did not open; {seen:?}"));
-            // Only a preceding replacement invalidates the committed Tail.
-            let mode_matches = if growth_first || attempt == 0 {
-                is_tail(mode)
-            } else {
-                is_full(mode)
-            };
-            assert!(mode_matches, "{id}: unexpected mode {mode:?}");
-            assert!(result.snapshots.is_empty(), "{id}: nothing published");
-            if attempt == 0 {
-                assert_eq!(seen.unreadable, 0, "{id}: causes={:?}", seen.causes);
-                assert_eq!(
-                    retry_state(&next),
-                    Some(false),
-                    "{id}: first refusal requeues"
-                );
-            } else if growth_first {
-                assert_refused(&result, &seen, SCOPE_OBJECT, &id);
-                assert_eq!(
-                    retry_state(&next),
-                    Some(false),
-                    "{id}: the refusal leaves the entry"
-                );
-            } else {
-                // Growth's second hit: the committed body waits for the next walk.
-                assert_eq!(seen.unreadable, 0, "{id}: causes={:?}", seen.causes);
-                assert!(
-                    released,
-                    "{id}: growth released the file in the current walk"
-                );
-                assert_eq!(
-                    next.files[&base.key].size_bytes, base.sealed,
-                    "{id}: growth keeps the committed entry"
-                );
-            }
-            index = next;
-        }
-    }
 }
 
 /// (GREEN): truncated below frozen during a Claude `Tail`, no regrow.
@@ -917,8 +810,8 @@ fn fe_claude_rewrite_to_exactly_frozen_keeps_main_failure() {
 /// detection): after the reader passed them, already-read tail bytes outside
 /// both 4 KiB sample windows are truncated and regrown with a different row
 /// of the same length, plus growth. The grown-prefix check accepts it as the cursor does: the
-/// page publishes the bytes it read; only a later Full (the quiet audit) sees
-/// the edit.
+/// page publishes the bytes it read and tags the entry as a sealed prefix;
+/// only a later Full sees the edit.
 ///
 /// Red on main: revalidation sees the grown identity and refuses the page as
 /// one `ScopeObject`.
@@ -967,36 +860,24 @@ fn fe_claude_residual_sample_preserving_rewrite_after_read_is_accepted() {
         content(frozen_body),
         "SP-5 residual (Claude): the bytes read before the edit are published"
     );
-    // FE2: even a grown Full that had no previous debt must retain a
-    // deadline. A Full audit sees the interior rewrite and counts it; only a
-    // file with no stored continuation reaches it.
-    assert!(index.files[&base.key].unverified_deadline().is_some());
+    // FE2: the grown publication is tagged as a sealed prefix. A later Full
+    // of a file with no stored continuation sees the interior rewrite.
+    assert!(index.files[&base.key].has_prefix_provenance());
     crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(&base.cache, &index);
-    index
-        .files
-        .get_mut(&base.key)
-        .unwrap()
-        .set_unverified_deadline(0);
-    let ((_, next, audit), diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        plain(&base.fixture, CLAUDE, index, &base.cache)
-    });
+    sampled_scan::set_test_now(Some(
+        sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+    ));
+    let (_, next, full) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    sampled_scan::set_test_now(None);
     assert_eq!(
-        audit.full_reasons[STATE_MISSING], 1,
+        full.full_reasons[STATE_MISSING], 1,
         "FE2: prefix has no checkpoint, so Full is StateMissing"
     );
-    assert_eq!(audit.unreadable, 0, "FE2: audit completes");
+    assert_eq!(full.unreadable, 0, "FE2: the Full completes");
     assert_eq!(
         content(production_body(CLAUDE, next)),
         content(full_body(&base.fixture, CLAUDE)),
-        "FE2: audit repairs the body"
-    );
-    assert!(
-        diagnostics
-            .iter()
-            .any(|row| row["stage"] == "sampled_audit_comparison"
-                && row["counts"]["semantic_comparison_available"] == true
-                && row["counts"]["semantic_changed"] == true),
-        "FE2: audit mismatch counted"
+        "FE2: the Full repairs the body"
     );
 }
 
@@ -1050,7 +931,7 @@ fn fe_claude_bad_record_tail_keeps_valid_siblings() {
 }
 
 /// A grown Tail publishes the same sealed prefix with a bad physical row;
-/// the post-open append stays owed, with no retained copy or audit credit.
+/// the post-open append stays owed, with no retained copy or Full credit.
 #[test]
 fn fe_claude_bad_record_grown_tail_keeps_valid_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1071,10 +952,10 @@ fn fe_claude_bad_record_grown_tail_keeps_valid_prefix() {
     assert_prefix_published("SP-7b-c", &base, &index, tail, &seen, &read, read.frozen);
 }
 
-/// An overdue checkpoint still Tails the append without Full-audit credit.
-/// In-page grown-prefix deadline handling remains a separate concern.
+/// An older build's complete tag whose deadline has passed still Tails the
+/// append: no `AuditDue` Full, and the tag is gone afterwards.
 #[test]
-fn fe_claude_overdue_checkpoint_tails_and_keeps_debt_staged() {
+fn fe_claude_past_due_complete_tag_tails_and_is_stripped() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1084,13 +965,18 @@ fn fe_claude_overdue_checkpoint_tails_and_keeps_debt_staged() {
         .files
         .get_mut(&base.key)
         .unwrap()
-        .set_unverified_deadline(due);
+        .scan_identity_version = Some(format!(
+        "{LOCAL_SCAN_INDEX_IDENTITY_VERSION}+sampled_unverified:v2:{due}:c"
+    ));
     let index = std::mem::take(&mut base.index);
     let (index, result, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
     assert_eq!(seen.modes, (0, 1, 0));
     assert_eq!(seen.full_reasons[AUDIT_DUE], 0);
     assert_eq!(seen.unreadable, 0);
-    assert_eq!(index.files[&base.key].unverified_deadline(), Some(due));
+    assert_eq!(
+        index.files[&base.key].scan_identity_version.as_deref(),
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+    );
     assert_eq!(
         content(production_body(CLAUDE, result)),
         content(full_body(&base.fixture, CLAUDE))
@@ -1137,7 +1023,6 @@ fn fe_claude_codex_in_page_full_with_append_keeps_main_failure() {
                 assert_eq!(seen.unreadable, 0, "{source:?}: {:?}", seen.causes);
                 assert_eq!(read.extent_limit, Some(read.frozen - read.start));
                 assert_eq!(index.files[&base.key].size_bytes, read.frozen);
-                assert!(index.files[&base.key].has_unverified_source());
                 assert!(index.files[&base.key].has_prefix_provenance());
                 let grown = bytes_of(&path);
                 if partial && !full {
@@ -1278,7 +1163,7 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
 
 /// Census-record control (GREEN): in this fixture a quiescent sampled `Full` writes a
 /// source-verified request-census record of its requests, and a quiescent `Tail` (which
-/// owes its audit) writes an unverified one.
+/// verifies no source) writes an unverified one.
 #[test]
 fn fe_claude_control_quiescent_full_verified_tail_unverified() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1302,7 +1187,10 @@ fn fe_claude_control_quiescent_full_verified_tail_unverified() {
         .claude_request_census_for_test()
         .get(&base.key)
         .expect("control: the Tail writes a D1 record");
-    assert!(record.unverified_for_test(), "control: Tail owes its audit");
+    assert!(
+        record.unverified_for_test(),
+        "control: Tail is not source-verified"
+    );
     assert_eq!(
         record.request_hashes_for_test(),
         census_hashes(0..6).as_slice()
@@ -1415,7 +1303,7 @@ fn fe_claude_growth_after_applied_fragment_keeps_strict_identity() {
     append_raw(&fixture.0, &bytes);
     let (mut parser, _, scope) = native_parser(&fixture, CLAUDE);
     parser
-        .prepare_acquisition(None, &scope, None, sampled_scan::now_seconds())
+        .prepare_acquisition(None, &scope, sampled_scan::now_seconds())
         .unwrap();
     let frozen = parser.reader.acquisition.as_ref().unwrap().frozen_length();
     parser.reader.set_extent_limit(frozen);
@@ -1431,201 +1319,8 @@ fn fe_claude_growth_after_applied_fragment_keeps_strict_identity() {
     );
 }
 
-/// Exhausted prefix slots defer only this file. The acquisition remains
-/// bounded and cannot turn capacity refusal into a walk-wide read failure.
-#[test]
-fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for supported in [false, true] {
-        let base = baseline(CLAUDE, 4, 2);
-        crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
-            &base.cache,
-            &base.index,
-        );
-        let mut read = None;
-        let mut selected = None;
-        let (index, result, seen) = page(&base.fixture, CLAUDE, base.index, &base.cache, |scan| {
-            if let Some(context) = scan.sampling.as_mut() {
-                context.audit_metadata_supported = supported;
-                context.audit_slots = 0;
-            }
-            if read.is_none() {
-                if let Some(opened) = opened(scan) {
-                    selected = Some((
-                        scan.census_window_end.clone(),
-                        scan.selected_flags[&base.key],
-                    ));
-                    assert!(is_full(opened.mode));
-                    assert_eq!(
-                        opened.extent_limit,
-                        Some(opened.frozen - opened.start),
-                        "audit capacity does not disable the acquisition extent"
-                    );
-                    append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
-                    read = Some(opened);
-                }
-            }
-        });
-        assert!(read.is_some());
-        assert_eq!(seen.unreadable, 0, "FE capacity: {:?}", seen.causes);
-        assert!(result.snapshots.is_empty());
-        // The read plan freezes the admitted extent independently of audit capacity.
-        // With no audit slot, the committed body and census membership stay owed.
-        assert_eq!(seen.causes, [0; 8], "capacity defers only this file");
-        assert!(!index
-            .files
-            .values()
-            .any(ScanIndexEntry::has_unverified_source));
-        let (window, flags) = selected.unwrap();
-        let walk = index.traversal.as_ref().expect("capacity keeps same walk");
-        assert_eq!(walk.census_window_end, window);
-        assert_eq!(walk.residue.growth_retries.get(&base.key), Some(&false));
-        let pending = walk
-            .pending_candidates
-            .iter()
-            .find(|p| p.path == base.path)
-            .unwrap();
-        assert_eq!((pending.census_member, pending.watcher_hint), flags);
-        assert!(result.census_status.pending_work);
-        // Capacity returns on the retry; do not leave the candidate silently lost.
-        sampled_scan::set_test_now(Some(
-            sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
-        ));
-        let (index, recovered, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
-        sampled_scan::set_test_now(None);
-        assert_eq!(seen.unreadable, 0, "capacity blocker cleared");
-        assert_eq!(index.files[&base.key].size_bytes, len(&base.path));
-        assert_eq!(
-            content(production_body(CLAUDE, recovered)),
-            content(full_body(&base.fixture, CLAUDE)),
-        );
-    }
-    stable_extent_growth_retry_stops_after_second_hit();
-}
-
-/// Two growing reads exhaust the file's allowance, even across pages/restart.
-/// A third page in that walk opens no transcript; a committed body releases
-/// to the next pass, while a new file keeps an unreadable census.
-fn stable_extent_growth_retry_stops_after_second_hit() {
-    for committed_body in [true, false] {
-        let base = baseline(CLAUDE, 4, 2);
-        crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
-            &base.cache,
-            &base.index,
-        );
-        let mut index = if committed_body {
-            base.index.clone()
-        } else {
-            ScanIndex::default()
-        };
-        let now = sampled_scan::now_seconds();
-        let mut total_reads = 0;
-        let mut window = None;
-        for attempt in 0..2 {
-            sampled_scan::set_test_now(Some(now + attempt * sampled_audit::GROWTH_FULL_INTERVAL));
-            let mut injected = false;
-            let (next, result, seen) = page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
-                scan.sampling.as_mut().unwrap().audit_slots = 0;
-                if !injected && opened(scan).is_some() {
-                    if let Some(window) = window.as_ref() {
-                        assert_eq!(&scan.census_window_end, window, "same walk");
-                    } else {
-                        window = Some(scan.census_window_end.clone());
-                    }
-                    append_raw(&base.path, &row_bytes(CLAUDE, 9..10));
-                    if attempt == 1 {
-                        // Keep discovery open through the third page. Its relist
-                        // may queue the file again, but cannot renew the retry.
-                        scan.index
-                            .traversal
-                            .as_mut()
-                            .unwrap()
-                            .pending_directories
-                            .push_back(ScanTraversalPath {
-                                scan_root: base.fixture.root.clone(),
-                                path: base.fixture.root.clone(),
-                                census_member: true,
-                                watcher_hint: false,
-                            });
-                    }
-                    injected = true;
-                }
-            });
-            assert!(injected, "each of the two allowed reads opened");
-            assert_eq!(seen.modes, (1, 0, 0));
-            total_reads += seen.modes.0;
-            assert!(result.snapshots.is_empty());
-            assert_eq!(
-                seen.unreadable,
-                usize::from(attempt == 1 && !committed_body)
-            );
-            let walk = next.traversal.as_ref().expect("walk still active");
-            assert_eq!(walk.residue.growth_retries[&base.key], attempt == 1);
-            if attempt == 1 && committed_body {
-                let pending = walk
-                    .pending_candidates
-                    .iter()
-                    .find(|p| p.path == base.path)
-                    .unwrap();
-                assert_eq!((pending.census_member, pending.watcher_hint), (false, true));
-                assert_eq!(next.files[&base.key].size_bytes, base.sealed);
-            }
-            // A resumed saved walk keeps the consumed retry allowance.
-            let resumed: ScanTraversalCheckpoint =
-                serde_json::from_value(serde_json::to_value(walk).unwrap()).unwrap();
-            assert_eq!(resumed.residue.growth_retries, walk.residue.growth_retries);
-            index = next;
-        }
-        let (index, third, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
-        assert_eq!(seen.modes, (0, 0, 0), "no third read in the walk");
-        assert_eq!(total_reads, 2);
-        assert!(third.snapshots.is_empty());
-        if committed_body {
-            let walk = index
-                .traversal
-                .as_ref()
-                .expect("growth reconciliation page");
-            let pending = walk
-                .pending_candidates
-                .iter()
-                .find(|p| p.path == base.path)
-                .expect("next-pass release hint");
-            assert_eq!((pending.census_member, pending.watcher_hint), (false, true));
-            assert_eq!(index.files[&base.key].size_bytes, base.sealed);
-            assert!(index.files[&base.key].source_file_fingerprint.is_empty());
-            assert!(index.files[&base.key].last_snapshot_fingerprint.is_some());
-            // Growth revalidation retains the debt and reports queued work
-            // once. The next metadata-only page finishes reconciliation;
-            // neither page may reopen the transcript in this walk.
-            let (index, retired, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
-            assert_eq!(seen.modes, (0, 0, 0), "reconciliation opens no transcript");
-            assert!(retired.snapshots.is_empty());
-            assert!(
-                index.traversal.is_none(),
-                "released for the next ordinary pass"
-            );
-            sampled_scan::set_test_now(Some(now + 2 * sampled_audit::GROWTH_FULL_INTERVAL));
-            let (_, recovered, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
-            assert_eq!(seen.unreadable, 0);
-            assert_eq!(
-                content(production_body(CLAUDE, recovered)),
-                content(full_body(&base.fixture, CLAUDE)),
-            );
-        } else {
-            assert!(index.traversal.as_ref().unwrap().has_retryable_problems());
-            assert!(
-                third.census_status.retryable_problem,
-                "new file cannot claim completion"
-            );
-        }
-        sampled_scan::set_test_now(None);
-    }
-}
-
 /// Source loss discovered during response finalization excludes that response
-/// while a grown prefix preserves every healthy response without audit credit.
+/// while a grown prefix preserves every healthy response without Full credit.
 #[test]
 fn fe_claude_finalizer_response_loss_keeps_valid_grown_prefix() {
     // Resolver conflict as drop residue is gate-off only; gate on it is a disclosed `e2` conflict.
@@ -1687,7 +1382,7 @@ fn fe_claude_full_without_admission_keeps_strict_completion() {
     append_raw(&fixture.0, &row_bytes(CLAUDE, 0..2));
     let (mut parser, _, scope) = native_parser(&fixture, CLAUDE);
     parser
-        .prepare_acquisition(None, &scope, None, sampled_scan::now_seconds())
+        .prepare_acquisition(None, &scope, sampled_scan::now_seconds())
         .unwrap();
     while !parser.step().unwrap() {}
     assert_eq!(parser.reader.extent_limit, None);
@@ -1755,8 +1450,8 @@ fn fe_claude_prefix_then_complete_tail_at_eof_clears_the_prefix_tag() {
     );
     assert_eq!(seen.unreadable, 0);
     assert!(
-        index.files[&base.key].has_unverified_source(),
-        "Tail still owes audit"
+        !index.files[&base.key].has_sampled_tag(),
+        "the complete Tail clears the tag"
     );
     assert!(index
         .claude_request_census_for_test()
@@ -1835,7 +1530,6 @@ fn fe_grown_prefix_still_marks_prefix_after_ordinary_record() {
         );
         assert_eq!(seen.unreadable, 0, "{reset:?}: causes={:?}", seen.causes);
         let entry = &index.files[&base.key];
-        assert!(entry.has_unverified_source(), "{reset:?}");
         assert!(entry.has_prefix_provenance(), "{reset:?}");
         assert!(
             entry
@@ -1851,7 +1545,7 @@ fn fe_grown_prefix_still_marks_prefix_after_ordinary_record() {
 
 /// Only loss-free, identity-complete request-census shapes may bind a
 /// recomposed body. An identity-incomplete record keeps its root excluded
-/// until a Full audit verifies it.
+/// until a Full read verifies it.
 #[test]
 fn fe_identity_incomplete_record_cannot_bind_recomposed_body() {
     use crate::snapshots::claude_request_census::{
@@ -1872,34 +1566,22 @@ fn fe_identity_incomplete_record_cannot_bind_recomposed_body() {
     }
 }
 
-/// Historical replay keeps every stem entry and
-/// re-sets its deadline with the prefix flag preserved, so a replay reset
-/// cannot turn an FE prefix into `None` or a clean identity. Before the next
-/// re-record, the replayed prefix still mints no positive verdict.
+/// Historical replay keeps only protected Codex history, so a Claude FE
+/// prefix entry is dropped with the rest: a replay reset cannot turn it into
+/// `None` or a clean identity, and the replayed file is read again whole.
 #[test]
-fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
+fn fe_prefix_entry_is_dropped_by_replay_reset() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let mut grown = grown_full();
     let key = grown.base.key.clone();
-    let before = grown.index.files[&key].unverified_deadline();
     assert!(grown.index.files[&key].has_prefix_provenance());
     grown
         .index
         .prepare_historical_replay("fe-prefix-replay".into());
-    let entry = grown
-        .index
-        .files
-        .get(&key)
-        .expect("replay retains a stem entry");
-    assert!(entry.has_unverified_source());
-    assert!(entry.has_prefix_provenance());
-    assert!(entry
-        .scan_identity_version
-        .as_deref()
-        .unwrap()
-        .ends_with(":p"));
-    assert_eq!(entry.unverified_deadline(), before);
-    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
+    assert!(
+        !grown.index.files.contains_key(&key),
+        "replay keeps no Claude prefix entry"
+    );
 }

@@ -176,7 +176,7 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
         let progress_path = snapshot_upload_progress_path(&index_path);
         progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        checkpoint_partial_snapshot_index_with_audit_release(
+        checkpoint_partial_snapshot_index_with_drains(
             &p.index,
             &prior,
             &progress,
@@ -188,7 +188,6 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
             || Ok(()),
             None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
-            None,
             Default::default(),
         )
         .unwrap();

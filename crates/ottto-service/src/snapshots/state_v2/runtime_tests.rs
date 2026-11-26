@@ -797,6 +797,47 @@ mod hydrate_parity {
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
         }
     }
+    /// [format] Rollback carry: once a load normalizes an older build's
+    /// complete sampled tag, the next ordinary save writes the entry as the
+    /// row that build writes itself for a verified entry (the plain version,
+    /// every other field unchanged). A reader of either build loads it with
+    /// no refusal, and a plain version on an unchanged file selects no read.
+    #[test]
+    fn a_normalized_tag_saves_as_the_row_an_older_build_writes() {
+        let key = "/synthetic/family.jsonl";
+        let plain = || {
+            let mut index = seed();
+            index.files.get_mut(key).unwrap().scan_identity_version =
+                Some(s::LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            index
+        };
+        let mut tagged = plain();
+        tagged.files.get_mut(key).unwrap().scan_identity_version = Some(format!(
+            "{}+sampled_unverified:v2:1700000000:c",
+            s::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+        ));
+        let f = Fixture::new();
+        publish(&f, &tagged);
+        let mut loaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(
+            loaded.files[key].scan_identity_version, tagged.files[key].scan_identity_version,
+            "a raw hydrate keeps the stored row"
+        );
+        s::sampled_audit::normalize_marker_storage(&mut loaded);
+        save_with(&f.path, &mut loaded).unwrap();
+        let reloaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded.files[key]).unwrap(),
+            serde_json::to_value(&plain().files[key]).unwrap()
+        );
+        // A second normalization finds nothing left to change.
+        let mut again = reloaded;
+        s::sampled_audit::normalize_marker_storage(&mut again);
+        assert_eq!(
+            again.files[key].scan_identity_version.as_deref(),
+            Some(s::LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        );
+    }
     /// [format] A hydrate clears a stale retired sweep cursor after its
     /// baseline, so the next save writes the layout-1 row as null.
     #[test]

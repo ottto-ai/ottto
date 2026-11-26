@@ -480,11 +480,10 @@ impl OwnedSourceScan {
             let diagnostic_path = candidate.path.clone();
             let mut independent_contributions = Vec::new();
             let mut independent_group = false;
-            let group_members = group.as_deref_mut().map_or(0, |group| {
+            if let Some(group) = group.as_deref_mut() {
                 independent_group = group.independent;
                 independent_contributions = std::mem::take(&mut group.contributions);
-                group.members.len()
-            });
+            }
             let _first_read = first_read;
             let mut parser = parser;
             if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
@@ -527,14 +526,6 @@ impl OwnedSourceScan {
             ) else {
                 return true;
             };
-            // Retain the obligation until native finish and RAM admission.
-            // Only due complete-c Unchanged acquisitions can retire it;
-            // incidental telemetry refreshes keep the original obligation.
-            let quiet_audit_checked = self.check_quiet_audit(
-                completed_acquisition.as_ref(),
-                file_sampling.as_ref(),
-                &mut parser,
-            );
             #[cfg(test)]
             sampled_scan::test_hooks::fire_for_key(
                 sampled_scan::test_hooks::Point::AfterRetain,
@@ -614,7 +605,6 @@ impl OwnedSourceScan {
                         parser.reader.reader.get_ref(),
                         self.claude_request_identity_capture,
                         tail_base,
-                        quiet_audit_checked,
                     )
                 })
                 // A certified cursor job stages its Tail the same way,
@@ -737,7 +727,7 @@ impl OwnedSourceScan {
 
             // Claude response conflicts may be discovered only by native
             // finalization. A prefix cannot publish that late loss: it
-            // would have neither a committed audit marker nor necessarily
+            // would have neither a committed prefix tag nor necessarily
             // a request-census record when the record budget is exhausted.
             if claude_grown_prefix && !parse_complete {
                 claude_request_census::invalidate_claude_request_census(
@@ -854,64 +844,6 @@ impl OwnedSourceScan {
                         )),
                 }
             }
-            // A new prefix/lossy obligation without a slot cannot publish
-            // or mutate its index entry. Existing marked files keep custody.
-            let needs_marker = cursor_fragment.is_some()
-                || completed_acquisition
-                    .as_ref()
-                    .is_some_and(|completed| completed.checkpoint.audit_debt().is_some())
-                || (completed_acquisition.is_none()
-                    && file_sampling
-                        .as_ref()
-                        .is_some_and(|active| active.audit_due.is_some()));
-            let slot_unfunded = self
-                .sampling
-                .as_ref()
-                .is_some_and(|context| context.audit_slots == 0)
-                && !self
-                    .index
-                    .files
-                    .get(&index_key)
-                    .is_some_and(ScanIndexEntry::has_unverified_source);
-            if (grown_prefix && slot_unfunded)
-                || (needs_marker
-                    && !self
-                        .index
-                        .claude_account_deferred_holds
-                        .contains_key(&index_key)
-                    && (slot_unfunded || !self.index.can_stage_sampled_audit(&index_key)))
-            {
-                if grown_prefix {
-                    // No new audit slot: retain the committed body and
-                    // census membership, without poisoning the traversal.
-                    if let Some(context) = self.sampling.as_mut() {
-                        context.audit_cap_delay += 1;
-                    }
-                    scan::owned_scan::retry_grown_file(
-                        &mut self.index,
-                        &self.selected_flags,
-                        &candidate,
-                        &mut self.census,
-                        true,
-                    );
-                    return true;
-                }
-                #[cfg(test)]
-                twin_diagnostics::event(&candidate.path, || {
-                    format!(
-                    "defer completion needs_marker={needs_marker} slot_unfunded={slot_unfunded} can_stage={}",
-                    self.index.can_stage_sampled_audit(&index_key),
-                )
-                });
-                // A refused prefix/lossy completion is a delay, not a Full.
-                if let Some(context) = self.sampling.as_mut() {
-                    context.audit_cap_delay += 1;
-                }
-                sampled_audit::queue_cap_retry(&mut self.index, &candidate);
-                self.census
-                    .record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
-                return true;
-            }
             if let Some(job) = job_template.filter(|_| parse_complete) {
                 let key = local_index_key(&job_template_file.path);
                 let saved = state_v2::tail_route_path(&self.index).and_then(|route| {
@@ -923,8 +855,8 @@ impl OwnedSourceScan {
                     return true;
                 }
             }
-            // Debt-free after quiet retirement is scheduling state, not
-            // Full authority, including a later forced Unchanged read.
+            // Only a whole Full read verifies the source; a later forced
+            // Unchanged read is no Full authority.
             let source_verified = sampled_jsonl::loss_free_source_report(
                 &report,
                 recognized_usage_drop_count,
@@ -936,9 +868,7 @@ impl OwnedSourceScan {
                         crate::transcript_acquisition::ReadMode::Full(_)
                     )
                 })
-                && completed_acquisition
-                    .as_ref()
-                    .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
+                && completed_acquisition.is_some()
                 || (file_sampling.is_none()
                     && self.state_census_complete
                     && self.sidecar_census_complete));
@@ -1014,29 +944,10 @@ impl OwnedSourceScan {
                 .last()
                 .map(|snapshot| snapshot.snapshot_fingerprint.clone());
             let parsed_snapshot_count = parsed.len();
-            let sampled_audit_verified = parse_complete
-                && cursor_fragment.is_none()
-                && completed_acquisition
-                    .as_ref()
-                    .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
-                && file_sampling
-                    .as_ref()
-                    .is_some_and(|active| active.audit_due.is_some());
-            if sampled_audit_verified {
-                if let Some(context) = self.sampling.as_mut() {
-                    context.complete_audit(
-                        file_sampling
-                            .as_ref()
-                            .and_then(|active| active.audit_due)
-                            .expect("verified audit due"),
-                    );
-                }
-            }
             self.pending_finalization.push(PendingIndexFinalization {
                 withheld_content: parse_complete
                     .then(|| self.index.withheld_completed_seen(&candidate))
                     .flatten(),
-                sampled_audit_verified,
                 codex_pending_recovery: self
                     .index
                     .files
@@ -1110,8 +1021,7 @@ impl OwnedSourceScan {
                 // Tail head), the entry records only `[0, s)` as read, so
                 // the next page tails the withheld record with main's EOF
                 // behavior. Without a continuation it records the length
-                // read and the staged debt re-selects it at the audit
-                // cadence.
+                // read.
                 let prefix_continued = tail_reused == Some(true);
                 let bound_fragment = cursor_fragment.and_then(|fragment| {
                     completed_acquisition.as_ref().and_then(|completed| {
@@ -1132,11 +1042,6 @@ impl OwnedSourceScan {
                 {
                     recorded.size_bytes = fragment.offset;
                 }
-                // record consumes the candidate but does not use its root.
-                // Move that existing allocation into the commit-sensitive
-                // retry instead of cloning it or guessing a nested root.
-                let quiet_scan_root =
-                    quiet_audit_checked.then(|| std::mem::take(&mut recorded.scan_root));
                 if parse_complete && !non_progressing_residue {
                     sampled_audit::settle_growth(&mut self.index, &index_key);
                 }
@@ -1149,46 +1054,9 @@ impl OwnedSourceScan {
                     entry.codex_counting_owner = counting_owner.clone().map(String::into_boxed_str);
                     entry.codex_fragment = bound_fragment.map(Box::new);
                 }
-                // Each grouped member, aliases included, settles its own
-                // audit on its native-created entry: verified retires and counts.
-                for member in aliases.iter().take(group_members) {
-                    let key = local_index_key(&member.path);
-                    let marked = self
-                        .index
-                        .files
-                        .get(&key)
-                        .and_then(ScanIndexEntry::unverified_deadline);
-                    if let Some(context) = self.sampling.as_mut() {
-                        if let Some(owed) = marked.filter(|_| source_verified) {
-                            context.complete_audit(owed);
-                        }
-                    }
-                }
-                // Native settlement accepts disclosed terminal row loss, even
-                // though that acquisition cannot certify a verified prefix.
-                // Its sampled publication still owes the prepared deadline;
-                // losing a completion certificate must never erase that debt.
-                let obligation = match completed_acquisition.as_ref() {
-                    Some(completed) => completed.checkpoint.audit_debt(),
-                    None => file_sampling
-                        .as_ref()
-                        .and_then(|active| active.audit_due)
-                        .map(
-                            |due_unix_seconds| crate::transcript_acquisition::AuditDebt {
-                                due_unix_seconds,
-                            },
-                        ),
-                };
-                if let Some(debt) = obligation {
-                    self.stage_audit_debt(
-                        &index_key,
-                        &source_file_fingerprint,
-                        debt,
-                        slot_unfunded,
-                    );
-                } else if source_verified {
+                if source_verified {
                     self.index
-                        .complete_full_audit(&index_key, &source_file_fingerprint);
+                        .complete_native_recomposition(&index_key, &source_file_fingerprint);
                 }
                 if grown_prefix {
                     self.index
@@ -1208,74 +1076,6 @@ impl OwnedSourceScan {
                 {
                     self.index
                         .complete_native_recomposition(&index_key, &source_file_fingerprint);
-                }
-                if let Some(fragment) = cursor_fragment {
-                    self.stage_audit_debt(
-                        &index_key,
-                        &source_file_fingerprint,
-                        fragment.debt,
-                        slot_unfunded,
-                    );
-                }
-                // Codex: after every audit staging above (staging
-                // matches the fingerprint), before this entry's save
-                // settles the degraded publication.
-                if let Some(mut completed) = completed_acquisition {
-                    if let Some(context) = self.sampling.as_mut() {
-                        let retained = tail_reused == Some(true);
-                        let quiet_retired = quiet_audit_checked
-                            && !completed.unsealed
-                            && retained
-                            && cursor_fragment.is_none()
-                            && self.state_census_complete
-                            && self.sidecar_census_complete
-                            && parse_complete;
-                        // All source/census/Full-credit decisions above saw
-                        // the owed debt. This clears only scheduling state.
-                        if quiet_retired {
-                            completed.checkpoint.retire_quiet_audit();
-                        }
-                        // The completion's continuation is its committed
-                        // head on its route, or none.
-                        let quiet_proven = quiet_retired
-                            && context
-                                .cache
-                                .quiet_certified(&index_key, &completed.checkpoint);
-                        drop(completed);
-                        if retained {
-                            if quiet_retired {
-                                // A partial save may restore the old marker.
-                                // Preserve this path AND its exact scope root
-                                // until a committed retirement makes it skip.
-                                sampled_audit::queue_quiet_retirement(
-                                    &mut self.index,
-                                    &index_key,
-                                    quiet_scan_root.expect("checked quiet retirement root"),
-                                );
-                            }
-                            #[cfg(unix)]
-                            let durable_pending = quiet_retired
-                                && context.cache.quiet_stage(
-                                    self.source,
-                                    &index_key,
-                                    &source_file_fingerprint,
-                                    quiet_proven,
-                                );
-                            #[cfg(not(unix))]
-                            let durable_pending = false;
-                            if quiet_retired
-                                && !durable_pending
-                                && self
-                                    .index
-                                    .retire_quiet_audit(&index_key, &source_file_fingerprint)
-                            {
-                                context.audit_quiet_retired += 1;
-                                // Reuse only on the next committed scan:
-                                // partial-save reconciliation may restore
-                                // this marker without accepting its body.
-                            }
-                        }
-                    }
                 }
                 for key in joined_keys {
                     if let Some(entry) = self.index.files.get_mut(&key) {
@@ -1353,7 +1153,6 @@ impl OwnedSourceScan {
             let alias_fingerprint = alias.source_file_fingerprint.clone();
             self.pending_finalization.push(PendingIndexFinalization {
                 withheld_content: None,
-                sampled_audit_verified: false,
                 codex_pending_recovery: self
                     .index
                     .files
@@ -1419,7 +1218,7 @@ impl OwnedSourceScan {
             } else {
                 match self
                     .index
-                    .candidate_decision_with_reason_at(&active.candidate, self.audit_now)
+                    .candidate_decision_with_reason(&active.candidate)
                     .1
                 {
                     Some(CandidateParseReason::LegacyIdentity) => {
@@ -1581,10 +1380,8 @@ impl OwnedSourceScan {
         };
 
         let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-        let debt =
-            sampled_audit::debt_for_key(&self.index, &acquisition.key, sampled_scan::now_seconds());
         let Ok(mode) =
-            parser.prepare_acquisition(None, &acquisition.scope, debt, sampled_scan::now_seconds())
+            parser.prepare_acquisition(None, &acquisition.scope, sampled_scan::now_seconds())
         else {
             self.census
                 .record_unreadable_file(UnreadableCause::Reduction, &active.candidate.path);
@@ -1611,7 +1408,7 @@ impl OwnedSourceScan {
         acquisition.tier_prefix_replay = true;
         if let Some(context) = self.sampling.as_mut() {
             context.priority_replays += 1;
-            context.record_mode(mode, acquisition.audit_due);
+            context.record_mode(mode);
         }
         self.resource_probe
             .full_parse_reason(mode, active.parse_reason, active.prior_stamp, 1, 0);
@@ -1696,77 +1493,6 @@ impl OwnedSourceScan {
         Some((digest, live, stamp, sidecar))
     }
 
-    /// Whether a due audit of an unchanged file was checked against the
-    /// held descriptor, so the obligation can retire after native finish.
-    #[inline(never)]
-    fn check_quiet_audit(
-        &mut self,
-        completed_acquisition: Option<&sampled_jsonl::CompletedNativeAcquisition>,
-        file_sampling: Option<&sampled_scan::Active>,
-        parser: &mut OwnedJsonlParser,
-    ) -> bool {
-        if let (Some(completed), Some(file_sampling), Some(context)) =
-            (completed_acquisition, file_sampling, self.sampling.as_mut())
-        {
-            if file_sampling.mode == crate::transcript_acquisition::ReadMode::Unchanged
-                // Withheld bodies retain their obligation until release.
-                && !self.index.claude_account_deferred_holds.contains_key(&file_sampling.key)
-                && self.index.files.get(&file_sampling.key).is_some_and(|entry| {
-                    entry.audit_requires_full(self.audit_now)
-                        && !entry.has_prefix_provenance()
-                })
-                && !self.index.claude_request_census.get(&file_sampling.key).is_some_and(
-                    claude_request_census::ClaudeRequestCensusRecord::identity_incomplete_hold,
-                )
-            {
-                let mut bytes = 0;
-                let checked = completed
-                    .checkpoint
-                    .quiet_audit_matches(
-                        parser.reader.reader.get_mut(),
-                        &file_sampling.scope,
-                        &mut bytes,
-                    )
-                    .unwrap_or(false);
-                context.sample_bytes = context.sample_bytes.saturating_add(bytes as u64);
-                checked
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Stage an audit obligation on the file's entry. A newly marked entry
-    /// spends one of the page's audit slots.
-    #[inline(never)]
-    fn stage_audit_debt(
-        &mut self,
-        index_key: &str,
-        source_file_fingerprint: &str,
-        debt: crate::transcript_acquisition::AuditDebt,
-        slot_unfunded: bool,
-    ) {
-        let was_pending = self
-            .index
-            .files
-            .get(index_key)
-            .is_some_and(ScanIndexEntry::has_unverified_source);
-        // Held retries bypass cap Full/counting, not the
-        // committed-slot reservation for a NEW marker.
-        if !slot_unfunded
-            && self
-                .index
-                .stage_sampled_audit(index_key, source_file_fingerprint, debt)
-            && !was_pending
-        {
-            if let Some(context) = self.sampling.as_mut() {
-                context.audit_slots = context.audit_slots.saturating_sub(1);
-            }
-        }
-    }
-
     /// Complete this read's acquisition: a cursor certificate, a grown-prefix
     /// grant, or a revalidated retained reduction. `None` means the phase
     /// stops; the inner `None` continues without a retained acquisition.
@@ -1801,7 +1527,7 @@ impl OwnedSourceScan {
                 });
                 // A passed certificate permits native finish of
                 // this prefix only. Discard its checkpoint: no cache copy,
-                // audit credit or source verification can follow it.
+                // Full credit or source verification can follow it.
                 let prefix = current_scope
                     .as_ref()
                     .filter(|_| aliases.is_empty())
@@ -1839,7 +1565,6 @@ impl OwnedSourceScan {
                         &self.selected_flags,
                         candidate,
                         &mut self.census,
-                        false,
                     );
                     return None;
                 }
@@ -1849,7 +1574,7 @@ impl OwnedSourceScan {
         };
         // Cursor finish grants also occupy sealed_prefix, including
         // quiescent reads and withheld fragments. Only this in-page
-        // growth certificate needs the new debt/provenance handling.
+        // growth certificate needs the prefix provenance handling.
         let grown_prefix = prefix.as_ref().is_some_and(|result| result.is_ok());
         let completed_acquisition = if let Some(certificate) = cursor_certificate {
             certificate.map(|checkpoint| sampled_jsonl::CompletedNativeAcquisition {
@@ -1861,15 +1586,6 @@ impl OwnedSourceScan {
                 match prefix {
                     Ok(grant) => {
                         parser.reader.sealed_prefix = Some(grant);
-                        file_sampling
-                            .as_mut()
-                            .expect("prefix acquisition")
-                            .audit_due
-                            .get_or_insert_with(|| {
-                                sampled_scan::now_seconds().saturating_add(
-                                    crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-                                )
-                            });
                     }
                     Err(crate::transcript_acquisition::PrefixRefusal::Invalidated(
                         crate::transcript_acquisition::FullReason::InvalidCheckpoint,
@@ -1881,17 +1597,6 @@ impl OwnedSourceScan {
                             &self.selected_flags,
                             candidate,
                             &mut self.census,
-                            false,
-                        );
-                        return None;
-                    }
-                    Err(crate::transcript_acquisition::PrefixRefusal::AuditDue) => {
-                        scan::owned_scan::retry_grown_file(
-                            &mut self.index,
-                            &self.selected_flags,
-                            candidate,
-                            &mut self.census,
-                            false,
                         );
                         return None;
                     }

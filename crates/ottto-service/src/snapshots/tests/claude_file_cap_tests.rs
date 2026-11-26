@@ -354,7 +354,7 @@ fn former_caps_admit_usage_and_tail_for_all_sources() {
         );
         let scope = Scope("former-file-cap-growth".into());
         let mut reader = File::open(fixture.path()).unwrap();
-        let mut plan = ReadPlan::prepare(&mut reader, None, &scope, None, 100).unwrap();
+        let mut plan = ReadPlan::prepare(&mut reader, None, &scope, 100).unwrap();
         reader.read_exact(&mut vec![0; prefix.len()]).unwrap();
         plan.observe_record_fragment(&prefix, true).unwrap();
         let checkpoint = plan
@@ -374,7 +374,7 @@ fn former_caps_admit_usage_and_tail_for_all_sources() {
         assert!((prefix.len() as u64) < former_size_seam);
         assert!(fs::metadata(fixture.path()).unwrap().len() > former_size_seam);
         let mut reader = File::open(fixture.path()).unwrap();
-        let tail = ReadPlan::prepare(&mut reader, Some(&checkpoint), &scope, None, 101).unwrap();
+        let tail = ReadPlan::prepare(&mut reader, Some(&checkpoint), &scope, 101).unwrap();
         assert_eq!(tail.mode(), ReadMode::Tail);
         assert_eq!(tail.start_offset(), prefix.len() as u64);
         let mut suffix = Vec::new();

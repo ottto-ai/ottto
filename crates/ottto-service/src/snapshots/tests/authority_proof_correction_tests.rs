@@ -143,8 +143,8 @@ fn apc_decision(
     index: &ScanIndex,
     candidate: &CandidateFile,
 ) -> (CandidateDecision, Option<CandidateParseReason>) {
-    let decided = index.candidate_decision_with_reason_at(candidate, 0);
-    assert_eq!(decided.0, index.candidate_decision_at(candidate, 0));
+    let decided = index.candidate_decision_with_reason(candidate);
+    assert_eq!(decided.0, index.candidate_decision(candidate));
     decided
 }
 
@@ -669,7 +669,6 @@ fn apc_pending(
 ) -> PendingIndexFinalization {
     PendingIndexFinalization {
         withheld_content: None,
-        sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: apc_keys()[slot].clone(),
         source_file_fingerprint: revision.to_string(),

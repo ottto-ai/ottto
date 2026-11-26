@@ -780,7 +780,7 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
     assert!(progress.accepted_identity_buckets.is_empty());
-    checkpoint_partial_snapshot_index_with_audit_release(
+    checkpoint_partial_snapshot_index_with_drains(
         &index,
         &index,
         &progress,
@@ -792,7 +792,6 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
         || Ok(()),
         None,
         Some(UnsettledUploadCause::Shed),
-        None,
         Default::default(),
     )
     .expect("an unsaved ledger rebind does not refuse the partial checkpoint");
@@ -2193,7 +2192,7 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
         }
         let index_before = serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap();
         let progress_before = serde_json::to_value(f.load().1).unwrap();
-        let result = checkpoint_partial_snapshot_index_with_audit_release(
+        let result = checkpoint_partial_snapshot_index_with_drains(
             &working,
             &committed,
             &progress,
@@ -2205,7 +2204,6 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
             || Ok(()),
             None,
             Some(UnsettledUploadCause::Shed),
-            None,
             Default::default(),
         );
         assert_eq!(serde_json::to_value(f.load().1).unwrap(), progress_before);
@@ -2336,7 +2334,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             }
             let persisted_progress = serde_json::to_value(load()).unwrap();
             working.mark_bounded_sweep_unsettled();
-            let saved = checkpoint_partial_snapshot_index_with_audit_release(
+            let saved = checkpoint_partial_snapshot_index_with_drains(
                 &working,
                 &committed,
                 &progress,
@@ -2353,7 +2351,6 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                     Ok(())
                 },
                 read_limit,
-                None,
                 None,
                 Default::default(),
             )

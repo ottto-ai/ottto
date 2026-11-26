@@ -652,7 +652,7 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
     fs::write(&path, &prefix).unwrap();
     let scope = Scope("ld-planned-offsets".into());
     let mut file = File::open(&path).unwrap();
-    let mut full = ReadPlan::prepare(&mut file, None, &scope, None, 100).unwrap();
+    let mut full = ReadPlan::prepare(&mut file, None, &scope, 100).unwrap();
     let mut read = Vec::new();
     file.read_to_end(&mut read).unwrap();
     full.observe_complete_records(&read).unwrap();
@@ -676,14 +676,7 @@ fn planned_tail_delivers_absolute_offsets_on_linux() {
     let mut active = scan.active_file.take().unwrap();
     let reader = &mut active.parser.reader;
     assert_eq!(reader.consumed_bytes(), 0);
-    let tail = ReadPlan::prepare(
-        reader.reader.get_mut(),
-        Some(&checkpoint),
-        &scope,
-        None,
-        101,
-    )
-    .unwrap();
+    let tail = ReadPlan::prepare(reader.reader.get_mut(), Some(&checkpoint), &scope, 101).unwrap();
     assert_eq!(tail.mode(), ReadMode::Tail);
     let start = tail.start_offset();
     assert_eq!(start, prefix.len() as u64);
@@ -914,10 +907,9 @@ pub(in crate::snapshots) fn unselected_page(source: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// A file with an accepted sampled generation keeps verification rescue.
+/// A nonempty file whose final group was cleared keeps verification rescue.
 fn rescue(files: &mut SharedMap<String, ScanIndexEntry>, path: &Path) {
-    let mut entry = crate::snapshots::tests::manifest_index_entry(None);
-    entry.set_unverified_deadline(0);
+    let entry = crate::snapshots::tests::manifest_index_entry(None);
     files.insert(local_index_key(path), entry);
 }
 
@@ -1260,10 +1252,9 @@ fn grown_retention_covers_age_gates_without_counting_overlapping_arms_twice() {
             set_old(&path(name));
             let mut entry = crate::snapshots::tests::manifest_index_entry(Some("final"));
             entry.size_bytes = committed;
-            assert!(!entry.has_unverified_source());
             if recovery_overlap && name == "grown" {
-                entry.set_unverified_deadline(0);
-                assert!(entry.has_unverified_source());
+                // An explicit re-parse owes the same file a second way.
+                entry.source_file_fingerprint.clear();
             }
             index.files.insert(local_index_key(&path(name)), entry);
         }
@@ -1560,8 +1551,8 @@ fn codex_roster_refreshes_large_directory_and_later_ones_in_one_tick() {
 }
 
 /// [behaviour] Growth followed by more than W of downtime is still read exactly once.
-/// Committing the new length releases this exemption; generic Tail audit debt
-/// is discharged explicitly before asserting ordinary aging, as in the hold fixture.
+/// Committing the new length releases this exemption; nothing else owes the
+/// file, so ordinary aging then retires it.
 #[test]
 fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
     let root = Root::new("ld-grown-sleep");
@@ -1609,7 +1600,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
     let (committed, first, _) = page(ScanIndex::default(), 0);
     assert_eq!(first.scanned_file_count, 1);
     assert!(committed.claude_account_deferred_holds.is_empty());
-    assert!(!committed.files[&key].has_unverified_source());
+    assert!(!committed.files[&key].has_sampled_tag());
     append(&path, &assistant_line("u2"));
     let length = fs::metadata(&path).unwrap().len();
     assert!(length > committed.files[&key].size_bytes);
@@ -1673,14 +1664,8 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
             &result,
         ),
     );
-    let fingerprint = caught_up.files[&key].source_file_fingerprint.clone();
-    assert_eq!(
-        caught_up.files[&key].has_unverified_source(),
-        held_growth_mode() == DeliveryMode::Tail
-    );
-    if caught_up.files[&key].has_unverified_source() {
-        assert!(caught_up.complete_full_audit(&key, &fingerprint));
-    }
+    // Neither a Tail nor a Full leaves a sampled tag that would owe the key.
+    assert!(!caught_up.files[&key].has_sampled_tag());
     assert!(!discovery_retention!(caught_up).owes_with_len(
         SnapshotSource::ClaudeCode,
         &path,
@@ -1997,20 +1982,9 @@ fn withheld_account_growth_is_read_after_idling_past_the_window() {
         resolved.record_claude_account_deferred_holds(result.completed_parses(), &BTreeMap::new())
     );
     assert!(resolved.claude_account_deferred_holds.is_empty());
-    // The u4 Tail (supported layouts only) is an accepted sampled generation:
-    // `sampled_audit` stages its pre-existing audit debt, which keeps the key
-    // owed until a Full audit, held or not. A Full (Linux) stages none. Clear
-    // it as a completed audit would, so only the hold arm is under test.
-    let entry = &resolved.files[&key];
-    assert_eq!(
-        entry.has_unverified_source(),
-        held_growth_mode() == DeliveryMode::Tail,
-        "only a Tail stages audit debt"
-    );
-    let fingerprint = entry.source_file_fingerprint.clone();
-    if entry.has_unverified_source() {
-        assert!(resolved.complete_full_audit(&key, &fingerprint));
-    }
+    // The u4 read, Tail or Full, leaves no sampled tag, so only the hold arm
+    // is under test.
+    assert!(!resolved.files[&key].has_sampled_tag());
     // The exemption ends at resolution: nothing owes the resolved key.
     assert!(!discovery_retention!(resolved).owes(&path));
     let (after, again, recorder) = page(resolved, &days_from_now(9));
@@ -2324,11 +2298,6 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             assert!(resolved
                 .record_claude_account_deferred_holds(result.completed_parses(), &BTreeMap::new()));
             assert!(resolved.claude_account_deferred_holds.is_empty());
-            let entry = &resolved.files[&new_key];
-            if entry.has_unverified_source() {
-                let fingerprint = entry.source_file_fingerprint.clone();
-                assert!(resolved.complete_full_audit(&new_key, &fingerprint));
-            }
             let (_, quiet, _) = finish(make(resolved, &at, 1_000));
             assert!(
                 quiet.snapshots.is_empty(),
@@ -2479,24 +2448,6 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         assert_eq!(reads, Vec::new(), "unchanged pass {pass}: Skip, no parse");
     }
     assert_eq!(reparses(), BTreeMap::new());
-
-    // A held Tail's audit debt is carried onto the reverted committed entry
-    // (`committable_subset_with_local_holds`), where no audit can settle it.
-    // Past due, it must not force a Full on every pass of an unchanged key.
-    let fingerprint = committed.files[&key].source_file_fingerprint.clone();
-    let debt = crate::transcript_acquisition::AuditDebt {
-        due_unix_seconds: 1,
-    };
-    assert!(committed.stage_sampled_audit(&key, &fingerprint, debt));
-    assert!(committed.files[&key].audit_requires_full(2));
-    for pass in 0..2 {
-        let (_, _, reads) = page(committed.clone(), &cache);
-        assert_eq!(reads, Vec::new(), "held audit debt, pass {pass}: deferred");
-    }
-    assert_eq!(reparses(), BTreeMap::new());
-    // The binding parse discharges the audit debt. Clear it so the
-    // later steps keep their read modes.
-    assert!(committed.complete_full_audit(&key, &fingerprint));
 
     // Account evidence arrives (the api sidecar the resolver reads).
     fs::write(&api_sidecar, b"{}\n").unwrap();
@@ -3226,8 +3177,8 @@ fn codex_live_observer_receives_large_row_before_terminal_usage() {
     assert_eq!(metric(&feed, "codex_prelude_gap_dropped"), 0);
 }
 
-/// [behaviour] Real Completed account settlement carries Tail audit debt onto the committed
-/// subset. Only positively proven deletion may retire both obligations.
+/// [behaviour] Real Completed account settlement keeps the hold on the committed
+/// subset. Only positively proven deletion may retire it.
 #[test]
 fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
     use crate::local_resource_diagnostics::withheld_support::take_withheld;
@@ -3286,25 +3237,12 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         // page instead enters account classification BEFORE upload, so only
         // the baseline's real ACKs exist at this production seam.
         parsed.accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
-        let mut held =
-            crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
+        let held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
         assert_eq!(
             held.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
             "account-held acquisition grants no ACK"
         );
         assert!(held.claude_account_deferred_holds.contains_key(&key));
-        // Linux refuses the native cache layout; still exercise the same audit
-        // obligation in CI without pretending it performed a Tail there.
-        if !held.files[&key].has_unverified_source() {
-            let fp = held.files[&key].source_file_fingerprint.clone();
-            assert!(held.stage_sampled_audit(
-                &key,
-                &fp,
-                crate::transcript_acquisition::AuditDebt {
-                    due_unix_seconds: 1
-                }
-            ));
-        }
         assert!(!crate::snapshot_sync::withheld_support::withheld_settled(
             &held
         ));
@@ -3325,7 +3263,7 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
         sampled_scan::set_test_now(Some(1_000));
         let (first, scan, recorder, _) = page(held, &hints, &days_from_now(0));
         assert!(first.claude_account_deferred_holds.contains_key(&key));
-        assert!(first.files[&key].has_unverified_source());
+        assert!(first.files.contains_key(&key));
         assert!(recorder.events().is_empty());
         assert_eq!(scan.scanned_file_count, 0);
         sampled_scan::set_test_now(Some(1_600));
@@ -3369,7 +3307,6 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             counts["withheld_hold_released"]["deleted_tokens"],
             known_tokens
         );
-        assert_eq!(counts["audit_retired_absent"]["events"], 1);
         assert!(
             removed.withheld_memo.held_gauge().is_none(),
             "no gauge membership remains"
@@ -3383,10 +3320,10 @@ fn completed_withheld_sampled_deletion_releases_debt_with_and_without_hint() {
             .any(|e| matches!(e, Event::Begin(v) if v.mode == DeliveryMode::Full)));
     }
 }
-/// [behaviour] Withheld missing parent keeps account and audit debt.
+/// [behaviour] Withheld missing parent keeps account debt.
 
 #[test]
-fn withheld_missing_parent_keeps_account_and_audit_debt() {
+fn withheld_missing_parent_keeps_account_debt() {
     let root = Root::new("ld-missing-parent-held");
     let parent = root.projects().join("missing");
     fs::create_dir(&parent).unwrap();
@@ -3396,31 +3333,24 @@ fn withheld_missing_parent_keeps_account_and_audit_debt() {
     let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
     append(&path, &assistant_line("u2"));
     let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
-    let mut held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
-    let fp = held.files[&key].source_file_fingerprint.clone();
-    assert!(held.stage_sampled_audit(
-        &key,
-        &fp,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: 1
-        }
-    ));
+    let held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
     // A missing configured root is uncertain; a missing project beneath a
     // readable configured root is now positive absence.
     fs::remove_dir_all(root.projects()).unwrap();
     assert!(!sampled_audit::proven_absent(&path, &[root.projects()]));
     let (kept, _, _) = finish(new_scan(&root.projects(), held));
-    assert!(kept.files[&key].has_unverified_source());
+    assert!(kept.files.contains_key(&key));
     assert!(kept.claude_account_deferred_holds.contains_key(&key));
     assert!(!crate::snapshot_sync::withheld_support::withheld_settled(
         &kept
     ));
 }
 
-/// [behaviour] Deleting a project beneath a readable root retires both indexed debts,
-/// through either a remove hint or the existing bounded reconciliation page.
+/// [behaviour] Deleting a project beneath a readable root retires the account
+/// hold and its entry, through either a remove hint or the existing bounded
+/// reconciliation page.
 #[test]
-fn withheld_removed_project_releases_account_and_audit_debt() {
+fn withheld_removed_project_releases_account_debt() {
     for hinted in [false, true] {
         let root = Root::new("ld-removed-project-held");
         let project = root.projects().join("project");
@@ -3445,21 +3375,12 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
         // page instead enters account classification BEFORE upload, so only
         // the baseline's real ACKs exist at this production seam.
         parsed.accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
-        let mut held =
-            crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
+        let held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
         assert_eq!(
             held.accepted_snapshot_fingerprints, previous.accepted_snapshot_fingerprints,
             "account-held acquisition grants no ACK"
         );
         assert!(held.claude_account_deferred_holds.contains_key(&key));
-        let fp = held.files[&key].source_file_fingerprint.clone();
-        assert!(held.stage_sampled_audit(
-            &key,
-            &fp,
-            crate::transcript_acquisition::AuditDebt {
-                due_unix_seconds: 1
-            }
-        ));
         let incidence = held.file_snapshot_fingerprints[&key].clone();
         let acknowledgements = held.accepted_snapshot_fingerprints.clone();
         let known_tokens = serde_json::to_value(held.withheld_memo.held_gauge().unwrap()).unwrap()
@@ -3476,7 +3397,7 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
             new_scan(&root.projects(), held).with_line_observer("test", Box::new(recorder.clone())),
         );
         assert!(held.claude_account_deferred_holds.contains_key(&key));
-        assert!(held.files[&key].has_unverified_source());
+        assert!(held.files.contains_key(&key));
         assert!(recorder.events().is_empty());
         assert_eq!(first.scanned_file_count, 0);
         sampled_scan::set_test_now(Some(1_600));
@@ -3519,7 +3440,6 @@ fn withheld_removed_project_releases_account_and_audit_debt() {
             counts["withheld_hold_released"]["deleted_tokens"],
             known_tokens
         );
-        assert_eq!(counts["audit_retired_absent"]["events"], 1);
         fs::create_dir_all(&parent).unwrap();
         append(&path, &assistant_line("new-object"));
         let recorder = Recorder::default();
@@ -3736,12 +3656,6 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
                 .unwrap_or(0),
             u64::from(!missing_root)
         );
-        assert_eq!(
-            counts["audit_retired_absent"]["events"]
-                .as_u64()
-                .unwrap_or(0),
-            0
-        );
     }
 }
 
@@ -3749,7 +3663,7 @@ fn withheld_new_completed_checkpoint_requires_positive_absence() {
 /// different tree and call its ENOENT a deletion of the original owed object.
 #[cfg(unix)]
 #[test]
-fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
+fn withheld_remove_hint_through_intermediate_symlink_keeps_account_debt() {
     let root = Root::new("ld-held-symlink-ancestor");
     let project = root.projects().join("project");
     let parent = project.join("nested");
@@ -3760,15 +3674,7 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
     let (previous, _, _) = finish(new_scan(&root.projects(), ScanIndex::default()));
     append(&path, &assistant_line("u2"));
     let (parsed, scan, _) = finish(new_scan(&root.projects(), previous.clone()));
-    let mut held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
-    let fp = held.files[&key].source_file_fingerprint.clone();
-    assert!(held.stage_sampled_audit(
-        &key,
-        &fp,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: 1
-        }
-    ));
+    let held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
     let incidence = held.file_snapshot_fingerprints[&key].clone();
     let moved = root.0.join("original");
     fs::rename(&project, &moved).unwrap();
@@ -3797,7 +3703,7 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
         )
     });
     assert!(recorder.events().is_empty());
-    assert!(after.files[&key].has_unverified_source());
+    assert!(after.files.contains_key(&key));
     assert!(after.claude_account_deferred_holds.contains_key(&key));
     assert_eq!(after.file_snapshot_fingerprints.get(&key), Some(&incidence));
     assert!(!crate::snapshot_sync::withheld_support::withheld_settled(
@@ -3806,12 +3712,6 @@ fn withheld_remove_hint_through_intermediate_symlink_keeps_both_debts() {
     let counts = page_counts(&counts);
     assert_eq!(
         counts["withheld_hold_released"]["deleted"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert_eq!(
-        counts["audit_retired_absent"]["events"]
             .as_u64()
             .unwrap_or(0),
         0
@@ -3935,7 +3835,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let candidate = withheld_recovery_candidate(&root, &path, &previous);
     assert_eq!(candidate.source_file_fingerprint, fingerprint);
     assert_eq!(
-        previous.candidate_decision_with_reason_at(&candidate, 1),
+        previous.candidate_decision_with_reason(&candidate),
         (CandidateDecision::Parse, Some(reason)),
     );
     let accepted = previous.accepted_snapshot_fingerprints.clone();
@@ -4019,7 +3919,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         missing_activity.snapshot_activity_at.remove(fingerprint);
     }
     assert_eq!(
-        missing_activity.candidate_decision_at(&candidate, 1),
+        missing_activity.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
     // New retry authority must still precede that Skip.
@@ -4031,7 +3931,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         .quarantined_snapshot_fingerprints
         .insert(entity_fingerprint.clone(), quarantine);
     assert_eq!(
-        retry.candidate_decision_with_reason_at(&candidate, 1),
+        retry.candidate_decision_with_reason(&candidate),
         (
             CandidateDecision::Parse,
             Some(CandidateParseReason::ActivityOrQuarantineRetry)
@@ -4063,34 +3963,11 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         },
     );
     assert_eq!(
-        authority.candidate_decision_with_reason_at(&candidate, 1),
+        authority.candidate_decision_with_reason(&candidate),
         (
             CandidateDecision::Parse,
             Some(CandidateParseReason::AuthorityQuarantine)
         )
-    );
-    let mut audited = held.clone();
-    assert!(audited.stage_sampled_audit(
-        &key,
-        &fingerprint,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: 1
-        }
-    ));
-    assert!(audited.files[&key].audit_requires_full(2));
-    assert_eq!(
-        audited.candidate_decision_at(&candidate, 2),
-        CandidateDecision::Skip
-    );
-    audited
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
-    assert_eq!(
-        audited.candidate_decision_with_reason_at(&candidate, 2),
-        (CandidateDecision::Parse, Some(CandidateParseReason::Audit))
     );
     // A delivery context changes no parse: CONTENT stays valid.
     let mut context = held.clone();
@@ -4100,7 +3977,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     activate(&mut other_revision, revision - 1);
     assert!(!other_revision.withheld_account_unchanged(&key, &candidate));
     assert_eq!(
-        other_revision.candidate_decision_at(&candidate, 1),
+        other_revision.candidate_decision(&candidate),
         CandidateDecision::Parse
     );
     let mut rearmed = held.clone();
@@ -4111,15 +3988,12 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         .source_file_fingerprint
         .clear();
     assert_eq!(
-        rearmed.candidate_decision_at(&candidate, 1),
+        rearmed.candidate_decision(&candidate),
         CandidateDecision::Parse
     );
     let mut evidence = candidate.clone();
     evidence.withheld_content_stamp = Some("different-account-evidence".into());
-    assert_eq!(
-        held.candidate_decision_at(&evidence, 1),
-        CandidateDecision::Parse
-    );
+    assert_eq!(held.candidate_decision(&evidence), CandidateDecision::Parse);
 
     match failure {
         "missing" => withheld_account::support::restart(&memo),
@@ -4141,7 +4015,7 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
         _ => unreachable!(),
     }
     assert_eq!(
-        held.candidate_decision_at(&candidate, 1),
+        held.candidate_decision(&candidate),
         CandidateDecision::Parse,
         "{failure}"
     );

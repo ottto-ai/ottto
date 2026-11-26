@@ -381,7 +381,7 @@ fn compressed_rollout_uses_the_same_parser_and_original_file() {
     let mut parser = codex_parser(input, logical);
     // Physical-offset sampling and resume are refused for compressed input.
     let scope = Scope("compressed".into());
-    let refused = parser.prepare_acquisition(None, &scope, None, 100);
+    let refused = parser.prepare_acquisition(None, &scope, 100);
     assert!(refused.is_err());
     assert!(parser.reader.acquisition.is_none());
     assert_eq!(parse(parser, &expected, logical).unwrap(), oracle);

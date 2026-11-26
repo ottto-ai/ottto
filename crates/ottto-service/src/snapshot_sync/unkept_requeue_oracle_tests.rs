@@ -216,7 +216,7 @@ fn checkpoint(
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
     progress.save_fixture(&progress_path).unwrap();
-    checkpoint_partial_snapshot_index_with_audit_release(
+    checkpoint_partial_snapshot_index_with_drains(
         &page.index,
         &page.committed,
         progress,
@@ -228,7 +228,6 @@ fn checkpoint(
         || Ok(()),
         None,
         cause,
-        None,
         Default::default(),
     )
     .unwrap()

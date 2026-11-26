@@ -765,7 +765,7 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                 let (status, page_one) =
                     send_to(source, &first, &mut progress, path, &mut receiver);
                 assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-                let mut owed = checkpoint_partial_snapshot_index_with_audit_release(
+                let mut owed = checkpoint_partial_snapshot_index_with_drains(
                     &first.index,
                     &first.committed,
                     &progress,
@@ -775,7 +775,6 @@ fn progress_rows_restart_between_pages_equals_in_ram_pages() {
                     path,
                     &progress_path(path),
                     || Ok(()),
-                    None,
                     None,
                     None,
                     Default::default(),
@@ -1114,7 +1113,7 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
             let (status, page_one) = send_to(SOURCE, &first, &mut progress, path, &mut receiver);
             assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
             let owed = match arm {
-                "checkpoint" => checkpoint_partial_snapshot_index_with_audit_release(
+                "checkpoint" => checkpoint_partial_snapshot_index_with_drains(
                     &first.index,
                     &first.committed,
                     &progress,
@@ -1124,7 +1123,6 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
                     path,
                     &progress_path(path),
                     || Ok(()),
-                    None,
                     None,
                     None,
                     Default::default(),

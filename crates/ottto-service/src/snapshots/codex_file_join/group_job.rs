@@ -1259,8 +1259,7 @@ fn independent_member_eof(
 /// before the member's proof ends. The job
 /// then gets no certified grant (`finish_job`), so strict finish identity covers
 /// the record. Without it, a quiescent live member ending in an
-/// unterminated record would stage hourly audit debt and re-read the whole
-/// group each time.
+/// unterminated record would re-read the whole group each time.
 fn apply_live_eof_record(active: &mut OwnedActiveFile) {
     let Some(boot) = active
         .group

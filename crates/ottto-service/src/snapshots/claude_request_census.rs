@@ -330,7 +330,7 @@ impl ClaudeRequestCensusRecord {
     /// A current native body can supersede an unverified census record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
-    /// Identity-incomplete records wait for a Full audit: saved-witness
+    /// Identity-incomplete records wait for a Full read: saved-witness
     /// reconstruction does not itself refuse their bodies.
     pub(crate) fn can_bind_recomposed_body(&self) -> bool {
         self.current_derivation()
@@ -342,7 +342,7 @@ impl ClaudeRequestCensusRecord {
     }
 
     /// An unverified identity-incomplete record holds its root until a
-    /// Full audit verifies its source (delay, never cancel).
+    /// Full read verifies its source (delay, never cancel).
     pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
@@ -1943,7 +1943,8 @@ pub(crate) fn record_claude_request_census(
 
 /// Acquisition requires native evidence for missing or unbindable records,
 /// except verified loss-free twins may try the validated Tail loader. This
-/// grants no copy proof or body binding; identity-incomplete holds still audit.
+/// grants no copy proof or body binding; identity-incomplete holds still read
+/// natively.
 pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     index.claude_request_census.get(key).map_or(true, |record| {
         record.unverified_or_twin()
@@ -2634,7 +2635,7 @@ impl ScanIndex {
                         "body_witness": entry.last_upload_body_witness,
                         "confirmed_empty": self.confirmed_empty_files.contains(key),
                         "entities": self.file_snapshot_fingerprints.get(key),
-                        "unverified_source": entry.has_unverified_source(),
+                        "sampled_tag": entry.has_sampled_tag(),
                     }),
                 )
             })

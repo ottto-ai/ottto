@@ -56,17 +56,14 @@ impl Site {
 /// entry. Content-free and process-only, like the site split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Vanished {
-    /// Its unverified audit debt.
-    AuditDebtDropped,
     /// Its request-census record.
     RequestCensusRemoved,
 }
-const VANISHED: usize = 2;
+const VANISHED: usize = 1;
 impl Vanished {
     fn index(self) -> usize {
         match self {
-            Self::AuditDebtDropped => 0,
-            Self::RequestCensusRemoved => 1,
+            Self::RequestCensusRemoved => 0,
         }
     }
 }
@@ -110,8 +107,6 @@ impl Counters {
                     self.not_found_sites[site * OUTCOMES + outcome].load(Ordering::Relaxed)
                 })
             }),
-            vanished_audit_debt_dropped: self.vanished[Vanished::AuditDebtDropped.index()]
-                .load(Ordering::Relaxed),
             vanished_request_census_removed: self.vanished[Vanished::RequestCensusRemoved.index()]
                 .load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
@@ -124,8 +119,9 @@ static TOTALS: [Counters; 3] = [const { Counters::new() }; 3];
 /// Fixed order: NotFound, unresolved root, changed preflight, changed target.
 /// `not_found_sites` splits the walk, candidate and open NotFounds by site in
 /// `Site` order, each `[loss, removal]`; NotFound in `counts` includes both,
-/// and root NotFounds have no site. The `vanished_*` counts are what the
-/// page merge dropped with a vanished Claude member's retired entry.
+/// and root NotFounds have no site. `vanished_request_census_removed` counts
+/// the request-census records the page merge dropped with a vanished Claude
+/// member's retired entry.
 /// The sticky flag invalidates exact intervals; false is not a coherence proof.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Totals {
@@ -133,7 +129,6 @@ pub(super) struct Totals {
     scope: &'static str,
     counts: [u64; 4],
     not_found_sites: [[u64; OUTCOMES]; SITES],
-    vanished_audit_debt_dropped: u64,
     vanished_request_census_removed: u64,
     overflowed: bool,
 }
@@ -262,7 +257,6 @@ impl Totals {
             scope: "process_lifetime_not_window",
             counts: [u64::MAX; 4],
             not_found_sites: [[u64::MAX; OUTCOMES]; SITES],
-            vanished_audit_debt_dropped: u64::MAX,
             vanished_request_census_removed: u64::MAX,
             overflowed: true,
         }

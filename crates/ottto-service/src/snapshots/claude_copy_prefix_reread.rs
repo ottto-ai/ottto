@@ -518,7 +518,7 @@ fn prepare_request(
     Ok(pending)
 }
 
-/// Offer scoped debt before ordinary census/audits, earlier files first,
+/// Offer scoped debt before ordinary census work, earlier files first,
 /// within the SAME selection limit. Native history admission still charges
 /// all file/byte budgets and can hold it. No separate rate or continuation.
 pub(in crate::snapshots) fn select(
@@ -593,11 +593,10 @@ pub(in crate::snapshots) fn select(
 
 /// A scoped unchanged revision re-read also owes its qualified context. That
 /// second debt must not turn a history-budget hold into an ordinary read.
-/// Real changes and independent audit/authority reasons keep their rules.
+/// Real changes and independent authority reasons keep their rules.
 pub(in crate::snapshots) fn unchanged_requested(
     index: &ScanIndex,
     candidate: &CandidateFile,
-    now: u64,
 ) -> bool {
     let key = local_index_key(&candidate.path);
     index
@@ -614,7 +613,7 @@ pub(in crate::snapshots) fn unchanged_requested(
         // Re-evaluate every independent reason without revision or mode
         // debt. Sidecar changes, retries and source changes must still parse
         // locally under history holds, as before this scoped mechanism.
-        && index.candidate_decision_with_reason_gated(candidate, now, false).0 == CandidateDecision::Skip
+        && index.candidate_decision_with_reason_gated(candidate, false).0 == CandidateDecision::Skip
 }
 
 #[cfg(test)]

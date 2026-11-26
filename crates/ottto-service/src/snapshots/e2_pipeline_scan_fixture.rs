@@ -517,16 +517,12 @@ pub(crate) fn tail_counter_for_test(name: &'static str, label: &'static str) -> 
 
 /// The certified checkpoint a key continues from, read back for assertions.
 pub(crate) struct Continuation {
-    audit_debt: Option<crate::transcript_acquisition::AuditDebt>,
     last_full_verified: u64,
     sealed_offset: u64,
 }
 impl Continuation {
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.sealed_offset
-    }
-    pub(crate) fn audit_debt(&self) -> Option<crate::transcript_acquisition::AuditDebt> {
-        self.audit_debt
     }
     pub(crate) fn last_full_verified(&self) -> u64 {
         self.last_full_verified
@@ -548,9 +544,6 @@ pub(crate) fn continuation_for_test(
         SnapshotSource::Pi => head_certificate::<tail_source::pi::Pi>(index, key)?,
     };
     Some(Continuation {
-        audit_debt: certificate
-            .audit_debt_unix_seconds
-            .map(|due_unix_seconds| crate::transcript_acquisition::AuditDebt { due_unix_seconds }),
         last_full_verified: certificate.verified_unix_seconds,
         sealed_offset: certificate.sealed_offset,
     })
@@ -706,9 +699,6 @@ pub(crate) fn retain_indexed_walk_with_pending_for_test(
         let entry = &index.files[&local_index_key(&candidate.path)];
         assert!(entry.same_listing_stamp_as(&metadata));
         assert!(!entry.source_file_fingerprint.is_empty());
-        // A retained walk keeps a sampled prefix until its audit deadline;
-        // listing_unchanged would reject even that not-yet-due obligation.
-        assert!(!entry.audit_requires_full(sampled_scan::now_seconds()));
     }
     index
         .traversal
@@ -746,15 +736,6 @@ pub(crate) fn age_listing_for_test(index: &mut ScanIndex) {
     walk.listing_owed_requeued_unix_seconds
         .values_mut()
         .for_each(age);
-}
-
-/// `path`'s verification aged past the audit interval: its sampled audit is
-/// overdue, as a growing file's marker that never settles reads.
-pub(crate) fn overdue_audit_for_test(index: &mut ScanIndex, path: &Path) {
-    let due = sampled_scan::now_seconds() - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
-    let entry = index.files.get_mut(&local_index_key(path)).unwrap();
-    entry.set_unverified_deadline(due - 1);
-    assert!(entry.audit_requires_full(sampled_scan::now_seconds()));
 }
 
 /// The state database `index` is bound to, if any.
@@ -869,7 +850,6 @@ pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) acquisitions: Mutex<Vec<Acquisition>>,
-    audit_slots: Option<usize>,
     full_reasons: Mutex<[usize; 11]>,
     touches_proven: Mutex<usize>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
@@ -939,10 +919,6 @@ impl E2ScanFixture {
         *self.attribution.lock().unwrap() = attribution;
     }
 
-    pub(crate) fn set_audit_slots(&mut self, slots: usize) {
-        self.audit_slots = Some(slots);
-    }
-
     pub(crate) fn full_reasons(&self) -> [usize; 11] {
         *self.full_reasons.lock().unwrap()
     }
@@ -980,13 +956,7 @@ impl E2ScanFixture {
     /// Begins this owner's pass, as the daemon does before a scan.
     /// `state_dir` holds the index and the single-writer lock.
     pub(crate) fn begin_pass(&self, source: SnapshotSource, state_dir: &Path, index_path: &Path) {
-        let (scope, capture) = scan_binding(source);
-        let capture = if source == SnapshotSource::ClaudeCode {
-            self.capture_claude_identity
-        } else {
-            capture
-        };
-        begin_source_pass(&self.cache, state_dir, source, index_path, &scope, capture);
+        begin_source_pass(&self.cache, state_dir, source, index_path);
     }
 
     /// `index`'s files lose their continuation.
@@ -1101,11 +1071,6 @@ impl E2ScanFixture {
         let mut seen = BTreeSet::new();
         let mut recorded_active = false;
         for _ in 0..100_000 {
-            if let Some(slots) = self.audit_slots {
-                if let Some(context) = scan.sampling.as_mut() {
-                    context.audit_slots = slots;
-                }
-            }
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.
             if let Some(active) = scan.active_file.as_deref_mut() {
@@ -1575,13 +1540,6 @@ pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
 /// The acquisition gate, exposed without widening its production visibility.
 pub(crate) fn forced_needs_native_for_test(index: &ScanIndex, path: &Path) -> bool {
     claude_request_census::forced_member_needs_native(index, &local_index_key(path))
-}
-
-pub(crate) fn pace_cap_for_test(owner: &E2ScanFixture, path: &Path) {
-    let now = std::time::SystemTime::now();
-    let key = local_index_key(path);
-    assert!(owner.cache.cap_pace_for_test(&key, now).0);
-    assert!(!owner.cache.cap_pace_for_test(&key, now).0);
 }
 
 /// Resolve actual discovery revisions without staging a file reduction: this

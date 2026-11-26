@@ -22400,30 +22400,31 @@ fn held_page_subset_shares_every_entry_no_carry_changes() {
 /// The subset still applies both carries where they change an entry,
 /// with today's values, and copies no entry its carry leaves equal.
 #[test]
-fn held_page_subset_applies_debt_and_audit_carries() {
+fn held_page_subset_applies_debt_and_prefix_carries() {
+    const PREFIX: &str = "semantic_sync:v2+sampled_unverified:v2:0:p";
     let mut previous = ScanIndex::default();
-    let mut add = |key: &str, version: String| {
+    let mut add = |key: &str, version: &str| {
         let mut entry = manifest_index_entry(Some(format!("{key}-entity").as_str()));
-        entry.scan_identity_version = Some(version);
+        entry.scan_identity_version = Some(version.into());
         previous.files.insert(key.into(), entry);
     };
-    add("owed", "semantic_sync:v1".into());
-    add("v1", "semantic_sync:v2+sampled_unverified:v1:500".into());
-    add("v2-earlier", sampled_audit::marker(300));
-    add("v2-same", sampled_audit::marker(200));
+    add("owed", "semantic_sync:v1");
+    add("v1", "semantic_sync:v2+sampled_unverified:v1:500");
+    add("prefix-new", LOCAL_SCAN_INDEX_IDENTITY_VERSION);
+    add("prefix-same", PREFIX);
     let mut scanned = previous.clone();
     let owed = scanned.files.get_mut("owed").unwrap();
     owed.source_file_fingerprint.clear();
     owed.last_snapshot_fingerprint = Some("held-owed".into());
-    let earlier = scanned.files.get_mut("v2-earlier").unwrap();
-    earlier.scan_identity_version = Some(sampled_audit::marker(200));
-    earlier.last_snapshot_fingerprint = Some("held-v2".into());
+    let tagged = scanned.files.get_mut("prefix-new").unwrap();
+    tagged.scan_identity_version = Some(PREFIX.into());
+    tagged.last_snapshot_fingerprint = Some("held-prefix".into());
 
     let subset = scanned.committable_subset_with_local_holds(
         &previous,
         &BTreeSet::new(),
         &BTreeMap::new(),
-        &BTreeSet::from(["held-owed".to_string(), "held-v2".to_string()]),
+        &BTreeSet::from(["held-owed".to_string(), "held-prefix".to_string()]),
     );
     let owed = &subset.files["owed"];
     assert!(owed.source_file_fingerprint.is_empty());
@@ -22432,23 +22433,26 @@ fn held_page_subset_applies_debt_and_audit_carries() {
         Some("owed-entity")
     );
     assert_eq!(
-        subset.files["v1"].scan_identity_version.as_deref(),
-        Some("semantic_sync:v2+sampled_unverified:v2:500:p")
+        subset.files["prefix-new"].scan_identity_version.as_deref(),
+        Some(PREFIX)
     );
     assert_eq!(
-        subset.files["v2-earlier"].scan_identity_version.as_deref(),
-        Some("semantic_sync:v2+sampled_unverified:v2:200:c")
-    );
-    assert_eq!(
-        subset.files["v2-earlier"]
+        subset.files["prefix-new"]
             .last_snapshot_fingerprint
             .as_deref(),
-        Some("v2-earlier-entity")
+        Some("prefix-new-entity")
     );
-    assert!(Shared::ptr_eq(
-        subset.files.get_shared("v2-same").unwrap(),
-        previous.files.get_shared("v2-same").unwrap()
-    ));
+    // An entry that already carries a prefix tag (a v1 tag fails closed as
+    // one) is left shared.
+    for key in ["v1", "prefix-same"] {
+        assert!(
+            Shared::ptr_eq(
+                subset.files.get_shared(key).unwrap(),
+                previous.files.get_shared(key).unwrap()
+            ),
+            "{key}"
+        );
+    }
 }
 
 /// An exact refusal re-offer lease re-reads an unchanged,
@@ -22489,7 +22493,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
     candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
     candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
     assert_eq!(
-        index.candidate_decision_at(&candidate, 0),
+        index.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
     assert!(!index.quarantine_requires_retry_body("old-entity", "old-body"));
@@ -22500,7 +22504,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
     )]));
     assert_eq!(hinted, vec![PathBuf::from(&key)], "only the leased file");
     assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
+        index.candidate_decision_with_reason(&candidate),
         (
             CandidateDecision::Parse,
             Some(CandidateParseReason::ActivityOrQuarantineRetry)
@@ -22513,7 +22517,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
     // Runtime only: neither a save nor a committable subset persists it.
     let saved: ScanIndex = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
     assert_eq!(
-        saved.candidate_decision_at(&candidate, 0),
+        saved.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
 
@@ -22522,7 +22526,7 @@ fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold
         &candidate.source_file_fingerprint,
     );
     assert_eq!(
-        index.candidate_decision_at(&candidate, 0),
+        index.candidate_decision(&candidate),
         CandidateDecision::Skip,
         "a lease is scheduling permission only, never a family-hold bypass"
     );
@@ -22572,15 +22576,12 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
         CandidateDecision::Parse,
         Some(CandidateParseReason::ActivityOrQuarantineRetry),
     );
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
-        reread
-    );
+    assert_eq!(index.candidate_decision_with_reason(&candidate), reread);
 
     let cooldown = BTreeMap::from([("refused-entity".to_string(), "refused-body".to_string())]);
     index.activate_reason_reoffer_cooldowns(cooldown.clone());
     assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
+        index.candidate_decision_with_reason(&candidate),
         (CandidateDecision::Skip, None)
     );
     assert!(
@@ -22618,7 +22619,7 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
     assert!(!index.reason_reoffer_conflict_is_deferred("refused-entity", "refused-body"));
     index.activate_reason_reoffer_cooldowns(cooldown.clone());
     assert_eq!(
-        index.candidate_decision_with_reason_at(&grown, 0),
+        index.candidate_decision_with_reason(&grown),
         (
             CandidateDecision::Parse,
             Some(CandidateParseReason::TranscriptChanged)
@@ -22627,7 +22628,7 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
     let mut resourced = candidate.clone();
     resourced.source_file_fingerprint = "changed-sidecars".into();
     assert_eq!(
-        index.candidate_decision_with_reason_at(&resourced, 0),
+        index.candidate_decision_with_reason(&resourced),
         (
             CandidateDecision::Parse,
             Some(CandidateParseReason::SourceChanged)
@@ -22650,17 +22651,14 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
             ..conflict.clone()
         },
     );
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
-        reread
-    );
+    assert_eq!(index.candidate_decision_with_reason(&candidate), reread);
     index
         .file_snapshot_fingerprints
         .get_mut(&key)
         .unwrap()
         .remove("sibling-entity");
     assert_eq!(
-        index.candidate_decision_at(&candidate, 0),
+        index.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
 
@@ -22669,10 +22667,7 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
         "refused-entity".to_string(),
         "other-body".to_string(),
     )]));
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
-        reread
-    );
+    assert_eq!(index.candidate_decision_with_reason(&candidate), reread);
 
     // A release label alone keeps the cooldown; a changed contract re-reads.
     index.activate_reason_reoffer_cooldowns(cooldown.clone());
@@ -22682,32 +22677,26 @@ fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
         .quarantined_snapshot_fingerprints
         .insert("refused-entity".into(), older.clone());
     assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
+        index.candidate_decision_with_reason(&candidate),
         (CandidateDecision::Skip, None)
     );
     older.witness.contract.push_str("-older");
     index
         .quarantined_snapshot_fingerprints
         .insert("refused-entity".into(), older);
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
-        reread
-    );
+    assert_eq!(index.candidate_decision_with_reason(&candidate), reread);
     index
         .quarantined_snapshot_fingerprints
         .insert("refused-entity".into(), conflict.clone());
     assert_eq!(
-        index.candidate_decision_at(&candidate, 0),
+        index.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
 
     // The daily lease alone lets the exact body through.
     let hinted = index.activate_reason_reoffer_retries(cooldown.clone());
     assert_eq!(hinted, vec![PathBuf::from(&key)]);
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&candidate, 0),
-        reread
-    );
+    assert_eq!(index.candidate_decision_with_reason(&candidate), reread);
     index.activate_reason_reoffer_cooldowns(cooldown);
     index.note_reason_reoffer_cooldown_candidate(&candidate, true);
     assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 0);
@@ -22732,7 +22721,7 @@ fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
     candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
     candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
     assert_eq!(
-        previous.candidate_decision_at(&candidate, 0),
+        previous.candidate_decision(&candidate),
         CandidateDecision::Skip
     );
 
@@ -22762,7 +22751,7 @@ fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
     let saved: ScanIndex =
         serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
     assert_eq!(
-        saved.candidate_decision_at(&candidate, 0),
+        saved.candidate_decision(&candidate),
         CandidateDecision::Parse
     );
     assert_eq!(
