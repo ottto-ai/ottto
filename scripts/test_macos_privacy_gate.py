@@ -392,15 +392,23 @@ class ReceiptAndContract(unittest.TestCase):
                 g.recorded_stages(args, gate)
 
     def test_host_alias_of_listed_literal_keeps_listed_class(self):
-        markers, _ = g.parse_markers(store("owner+signer:" + SIGNER))
         saved = g.host_literals
-        g.host_literals = lambda: [g.Marker(SIGNER.upper(), "user"), g.Marker("synthetic-account", "user")]
+        sharp = "Stra\u00dfe Example"
+        listed, _ = g.parse_markers(store("owner+signer:" + SIGNER, "STRASSE EXAMPLE"))
+        g.host_literals = lambda: [g.Marker(SIGNER, "user"), g.Marker(SIGNER.upper(), "user"),
+                                   g.Marker(sharp, "user"), g.Marker("synthetic-account", "user")]
         try:
-            combined = g.with_host_literals(markers)
+            combined = g.with_host_literals(listed)
         finally:
             g.host_literals = saved
-        self.assertEqual([(m.value, m.cls) for m in combined],
-                         [(SIGNER, "owner+signer"), ("synthetic-account", "user")])
+        self.assertEqual([(m.value, m.cls, m.owner, m.signer) for m in combined],
+                         [(SIGNER, "owner+signer", True, True), ("STRASSE EXAMPLE", "private", False, False),
+                          (SIGNER.upper(), "owner+signer", True, True), (sharp, "private", False, False),
+                          ("synthetic-account", "user", False, False)])
+        # The host spelling is still found in raw bytes, which casefold patterns of the listed form miss.
+        gate = g.Gate(g.Policy(policy_text(_)), combined, "test")
+        gate.scan_bytes(sharp.encode("utf-8"), rep(signed=True))
+        self.assertEqual(gate.findings, {"private": 1})
 
     def test_legal_bytes_from_exported_tree(self):
         export = os.path.join(self.tmp, "export")

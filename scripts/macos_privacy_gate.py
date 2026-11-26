@@ -313,9 +313,17 @@ GENERIC_VALUES = {"localhost", "localhost.localdomain"}
 
 def with_host_literals(markers):
     """Marker list plus this host's strings. A host string equal to a listed literal (NFC, casefold)
-    is dropped: the listed literal keeps its own class and scoped omissions and still covers it."""
-    listed = {norm(m.value) for m in markers}
-    return markers + [m for m in host_literals() if norm(m.value) not in listed]
+    takes that literal's tag, so its scoped omissions apply, and keeps its own spelling."""
+    listed = {norm(m.value): m for m in markers}
+    values = {m.value for m in markers}
+    extra = []
+    for marker in host_literals():
+        match = listed.get(norm(marker.value))
+        if match is None:
+            extra.append(marker)
+        elif marker.value not in values:
+            extra.append(Marker(marker.value, match.cls, match.owner, match.signer))
+    return markers + extra
 
 
 def host_literals():

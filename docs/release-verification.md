@@ -271,9 +271,9 @@ digest and counts, never a literal.
   every signature. A legal name that appears in the license files must be
   tagged `owner+signer:`, because the decoded disk has no per-file exception.
 - A string the gate reads from the build machine (user, full name, host)
-  that equals a listed literal (NFC, case-folded) is covered by that listed
-  literal and its tag; other machine strings are searched as their own
-  literals with no omissions.
+  that equals a listed literal (NFC, case-folded) takes that literal's tag
+  and omissions and is still searched in its own spelling; other machine
+  strings are searched as their own literals with no omissions.
 
 ### Roles and lanes
 
