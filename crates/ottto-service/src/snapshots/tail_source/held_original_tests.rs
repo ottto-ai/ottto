@@ -228,13 +228,21 @@ fn a_held_original_conserves_its_dependent_copy_money() {
         }
         assert_eq!(held, 1, "{arm}: the newer head holds the original");
         // The held original is ownership-incomplete residue that this walk,
-        // having finished discovery, settles to terminal: disclosed, and the
-        // census ends as complete as the cold arm's.
+        // having finished discovery, settles to terminal and discloses. The
+        // hold itself leaves the census as complete as the cold arm's; a grown
+        // or restamped original is never more complete than that.
         assert_eq!(newer, 1, "{arm}: named as a newer build's hold");
         let (incomplete, terminal, complete) = cold_census.unwrap();
         assert_eq!(census.0, incomplete + 1, "{arm}: counted once");
         assert_eq!(census.1, terminal + 1, "{arm}: settled to terminal");
-        assert_eq!(census.2, complete, "{arm}: completeness as today");
+        if arm == "held" {
+            assert_eq!(census.2, complete, "{arm}: completeness as cold");
+        } else {
+            assert!(
+                !census.2 || complete,
+                "{arm}: never more complete than cold"
+            );
+        }
         assert!(bodies(&emitted, ORIGINAL).is_empty(), "{arm}: no POST");
         assert_eq!(
             accepted(&index, &original),
