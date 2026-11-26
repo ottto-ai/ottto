@@ -157,6 +157,11 @@ case "$PACKAGE_STAGE" in
     exit 2
     ;;
 esac
+# Absolute, so the steps that run inside the app checkout still write here.
+case "$OUTPUT_DIR" in
+  /*) ;;
+  *) OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+esac
 if [[ "$PACKAGE_STAGE" == "finish" && -z "$PRIVACY_STATE" ]]; then
   echo "--stage finish requires --privacy-state" >&2
   exit 2
@@ -247,7 +252,9 @@ if [[ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
 fi
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
 COMMIT="${SOURCE_COMMIT:0:12}"
-MAC_APP_GIT_ROOT="$(git -C "$MAC_APP_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+# Git and Swift run inside the app checkout with relative operands (the shell's
+# own cd): the checkout's path never reaches a child process's argv.
+MAC_APP_GIT_ROOT="$(cd "$MAC_APP_ROOT" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$MAC_APP_GIT_ROOT" ]]; then
   echo "macOS app root must belong to the private Git checkout: $MAC_APP_ROOT" >&2
   exit 2
@@ -267,16 +274,19 @@ if [[ "$MAC_APP_ROOT" == "$MAC_APP_GIT_ROOT" || -z "$MAC_APP_SOURCE_PATH" ]]; th
   echo "macOS app root must be a subdirectory of its Git checkout, not the checkout root" >&2
   exit 2
 fi
+mac_app_git() {
+  (cd "$MAC_APP_GIT_ROOT" && git "$@")
+}
 # The caller validates source ownership before handing off the app checkout.
-if ! git -C "$MAC_APP_GIT_ROOT" diff --quiet HEAD -- "$MAC_APP_SOURCE_PATH"; then
+if ! mac_app_git diff --quiet HEAD -- "$MAC_APP_SOURCE_PATH"; then
   echo "macOS app source subtree has tracked changes; freeze a clean private commit before packaging" >&2
   exit 2
 fi
-if [[ -n "$(git -C "$MAC_APP_GIT_ROOT" ls-files --others --exclude-standard -- "$MAC_APP_SOURCE_PATH")" ]]; then
+if [[ -n "$(mac_app_git ls-files --others --exclude-standard -- "$MAC_APP_SOURCE_PATH")" ]]; then
   echo "macOS app source subtree has untracked files; freeze a clean private commit before packaging" >&2
   exit 2
 fi
-MAC_APP_SOURCE_COMMIT="$(git -C "$MAC_APP_GIT_ROOT" rev-parse HEAD)"
+MAC_APP_SOURCE_COMMIT="$(mac_app_git rev-parse HEAD)"
 # Stable channels pin the app source commit (the release workflow takes it
 # from the release tag); dev and preview builds default to the checkout HEAD.
 MAC_APP_SOURCE_PIN="${MAC_APP_SOURCE_PIN:-$MAC_APP_SOURCE_COMMIT}"
@@ -284,20 +294,27 @@ if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_SOURCE_PIN" ]]; then
   echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not --app-source-commit $MAC_APP_SOURCE_PIN" >&2
   exit 2
 fi
-MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse --verify --quiet "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH" || true)"
+MAC_APP_SOURCE_TREE="$(mac_app_git rev-parse --verify --quiet "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH" || true)"
 if [[ ! "$MAC_APP_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || \
-  [[ "$(git -C "$MAC_APP_GIT_ROOT" cat-file -t "$MAC_APP_SOURCE_TREE" 2>/dev/null || true)" != "tree" ]]; then
+  [[ "$(mac_app_git cat-file -t "$MAC_APP_SOURCE_TREE" 2>/dev/null || true)" != "tree" ]]; then
   echo "macOS app root must be a tracked directory at the app source commit" >&2
   exit 2
 fi
-COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"
+COMPANION_ENTITLEMENTS_SOURCE="$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"
 # Bind the signed plist to the verified private commit, not the index.
-COMPANION_ENTITLEMENTS_BLOB="$(git -C "$MAC_APP_GIT_ROOT" rev-parse --verify --quiet "HEAD:$MAC_APP_SOURCE_PATH/Companion.entitlements.plist" || true)"
-if [[ -z "$COMPANION_ENTITLEMENTS_BLOB" || ! -f "$COMPANION_ENTITLEMENTS" ]] || \
-  [[ "$(git -C "$MAC_APP_GIT_ROOT" hash-object -- "$COMPANION_ENTITLEMENTS")" != "$COMPANION_ENTITLEMENTS_BLOB" ]]; then
+COMPANION_ENTITLEMENTS_BLOB="$(mac_app_git rev-parse --verify --quiet "HEAD:$COMPANION_ENTITLEMENTS_SOURCE" || true)"
+if [[ -z "$COMPANION_ENTITLEMENTS_BLOB" || ! -f "$MAC_APP_GIT_ROOT/$COMPANION_ENTITLEMENTS_SOURCE" ]] || \
+  [[ "$(mac_app_git hash-object -- "$COMPANION_ENTITLEMENTS_SOURCE")" != "$COMPANION_ENTITLEMENTS_BLOB" ]]; then
   echo "Companion entitlements plist must match the private app source commit" >&2
   exit 2
 fi
+# Tools read the committed plist from a neutral temporary folder, never from
+# the app checkout's path.
+ENTITLEMENTS_BASE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+COMPANION_ENTITLEMENTS_DIR="$(mktemp -d "${ENTITLEMENTS_BASE%/}/ottto-entitlements.XXXXXX")"
+trap 'rm -rf "$COMPANION_ENTITLEMENTS_DIR"' EXIT
+COMPANION_ENTITLEMENTS="$COMPANION_ENTITLEMENTS_DIR/Companion.entitlements.plist"
+mac_app_git cat-file blob "$COMPANION_ENTITLEMENTS_BLOB" > "$COMPANION_ENTITLEMENTS"
 if ! ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"; then
   exit 2
 fi
@@ -313,6 +330,7 @@ if ! ottto_macos_check_binary_policy "$CHANNEL" "$SKIP_BUILD" "$ROOT" "$OUTPUT_D
 fi
 SWIFT_SCRATCH_PATH="$(ottto_macos_swift_scratch "$CHANNEL" "$MAC_APP_ROOT")"
 ottto_macos_package_cleanup() {
+  rm -rf "$COMPANION_ENTITLEMENTS_DIR"
   if ottto_macos_is_stable_channel "$CHANNEL"; then
     rm -rf "$SWIFT_SCRATCH_PATH"
   fi
@@ -344,13 +362,18 @@ if [[ "$SKIP_BUILD" != "true" && "$PACKAGE_STAGE" != "finish" ]]; then
       cargo build --locked --release -p ottto-cli -p ottto-service
   )
   # --disable-automatic-resolution builds exactly the committed Package.resolved.
-  ottto_macos_run_logged "Swift release build" \
-    swift build -c release --package-path "$MAC_APP_ROOT" \
-    --scratch-path "$SWIFT_SCRATCH_PATH" \
-    --disable-automatic-resolution \
-    -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \
-    ${SWIFT_SCRATCH_MAP[@]+"${SWIFT_SCRATCH_MAP[@]}"} \
-    -Xlinker -oso_prefix -Xlinker "$SWIFT_OSO_PREFIX/"
+  # The package path is the working folder. SwiftPM hands the compiler absolute
+  # source paths itself, so the prefix map has to name the checkout to remove it.
+  (
+    cd "$MAC_APP_ROOT"
+    ottto_macos_run_logged "Swift release build" \
+      swift build -c release --package-path . \
+      --scratch-path "$SWIFT_SCRATCH_PATH" \
+      --disable-automatic-resolution \
+      -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \
+      ${SWIFT_SCRATCH_MAP[@]+"${SWIFT_SCRATCH_MAP[@]}"} \
+      -Xlinker -oso_prefix -Xlinker "$SWIFT_OSO_PREFIX/"
+  )
 fi
 
 APP_BUNDLE="$OUTPUT_DIR/Ottto.app"
@@ -421,10 +444,10 @@ cp "$CLI_BINARY" "$APP_HELPERS/ottto"
 cp "$DAEMON_BINARY" "$APP_HELPERS/ottto-service"
 # Ship the listed Resources of the recorded app commit (never its README).
 # Inside Ottto.app the app finds them through Bundle.main.
-ottto_macos_copy_companion_resources "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH" "$APP_RESOURCES"
+(cd "$MAC_APP_GIT_ROOT" && ottto_macos_copy_companion_resources . "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH" "$APP_RESOURCES")
 # License notices go into Resources before the app is signed. The Sparkle pin
 # comes from the verified app commit and must match the vendored license.
-sparkle_pin="$(ottto_macos_sparkle_pin "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
+sparkle_pin="$(cd "$MAC_APP_GIT_ROOT" && ottto_macos_sparkle_pin . "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
 sparkle_version="$(jq -r '.version' <<< "$sparkle_pin")"
 sparkle_revision="$(jq -r '.revision' <<< "$sparkle_pin")"
 ottto_check_sparkle_license_pin "$sparkle_version" "$sparkle_revision" "$APP_FRAMEWORKS/Sparkle.framework" || exit 2
@@ -624,7 +647,7 @@ fi
 # --stage finish: the prepared files must still be the ones the privacy gate
 # found clean. Only then are they made writable again for signing.
 if [[ "$PACKAGE_STAGE" == "finish" ]]; then
-  sparkle_pin="$(ottto_macos_sparkle_pin "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
+  sparkle_pin="$(cd "$MAC_APP_GIT_ROOT" && ottto_macos_sparkle_pin . "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
   sparkle_version="$(jq -r '.version' <<< "$sparkle_pin")"
   sparkle_revision="$(jq -r '.revision' <<< "$sparkle_pin")"
   ottto_check_sparkle_license_pin "$sparkle_version" "$sparkle_revision" "$APP_FRAMEWORKS/Sparkle.framework" || exit 2

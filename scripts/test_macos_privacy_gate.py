@@ -415,6 +415,22 @@ class Formats(unittest.TestCase):
         gate.scan_app_zip(None, data, "app_zip", app)
         self.assertIn(("app_zip", "structure", "zip_extracted"), gate.diagnostics)
 
+    def test_app_zip_layout_is_checked_before_extraction(self):
+        _top, app = self.app_tree()
+        cases = (("Ottto.app/Contents/Escape", 0o120755, b"../../outside"),          # link outside Sparkle
+                 ("Ottto.app/Contents/Helpers/extra", 0o100644, b"x"),                 # inventory differs
+                 ("Ottto.app/Contents/Helpers/ottto", 0o100755, macho(payload=b"z")))  # other bytes
+        for name, mode, data in cases:
+            gate = make_gate(PRIVATE)
+            gate.verified_signature = lambda *_a, **_k: True
+
+            def refuse(_path):
+                raise AssertionError("ditto must not see this archive")
+
+            gate.extract_app_zip = refuse
+            gate.scan_app_zip(None, self.app_zip(app, ((name, mode, data),)), "app_zip", app)
+            self.assertIn(("app_zip", "structure", "zip_layout"), gate.diagnostics, name)
+
     @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/ditto"), "native ditto")
     def test_real_ditto_app_zip_is_accepted(self):
         top, app = self.app_tree(payload=SIGNER.encode())
@@ -468,8 +484,35 @@ class Formats(unittest.TestCase):
         gate.scan_json(b'{"bom": {"version": 1.2345e7}}', rep())
         self.assertEqual(gate.findings, {"private": 1})
         self.assertIn("10000000000000000000000", g.number_forms(1e22))
+        # JSON.stringify spells 0.0000001 as 1e-7.
+        self.assertIn("1e-7", g.number_forms(0.0000001))
         with self.assertRaisesRegex(g.Incomplete, "json_number"):
             g.number_forms(10 ** 400)
+
+    def test_ecmascript_number_and_json_serializer(self):
+        # Number::toString cases (ECMA-262 Number.prototype.toString, radix 10).
+        for value, text in ((0.0, "0"), (-0.0, "0"), (1.0, "1"), (100.0, "100"), (123.456, "123.456"),
+                            (0.000001, "0.000001"), (1e-7, "1e-7"), (1.5e-7, "1.5e-7"), (-2.5, "-2.5"),
+                            (1e20, "100000000000000000000"), (1e21, "1e+21"), (1.2345e22, "1.2345e+22"),
+                            (5e-324, "5e-324"), (float(12345678901234567890), "12345678901234567000")):
+            self.assertEqual(g.es_number(value), text, value)
+        document = g.parse_es_json(b'{"b": "x\\u00e9\\u0001\\ud800", "1": [true, null, 0.0000001], "0": 10}')
+        self.assertEqual(g.es_json(document), '{"0":10,"1":[true,null,1e-7],"b":"x\u00e9\\u0001\\ud800"}')
+        with self.assertRaisesRegex(g.Incomplete, "json_number"):
+            g.es_json(g.parse_es_json(b'{"n": 1e400}'))
+
+    def test_sbom_predicate_is_searched_as_the_attestation_action_sends_it(self):
+        # Literals that appear only in JSON.stringify(JSON.parse(file)): the reordered index keys
+        # and the reserialized number.
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        path = os.path.join(folder, g.ROLE_FILES["sbom"])
+        with open(path, "wb") as handle:
+            handle.write(b'{"1": "zq-b", "0": "zq-a", "n": 0.0000001}')
+        for literal in ('zq-a","1', '"n":1e-7'):
+            gate = make_gate(literal)
+            gate.scan_role("sbom", path, {})
+            self.assertEqual(set(gate.findings), {"private"}, literal)
 
     def test_dmg_topology_and_profile(self):
         entities = [{"content-hint": "GUID_partition_scheme", "dev-entry": "/dev/disk4"},
@@ -842,29 +885,58 @@ class CommandLine(unittest.TestCase):
         host = "synthetic-host"
         setup = "2026-01-01T00:00:00Z Machine name: '%s'\n" % host
         later = "2026-01-01T00:00:02Z ##[group]Run actions/checkout\n2026-01-01T00:00:03Z done\n"
+        end = "2026-01-01T00:00:09Z Cleaning up orphan processes\n"
         tabbed = "Build\tSet up job\t2026-01-01T00:00:00.1234567Z Machine name: '%s'\n" % host
+        tabbed_end = "Build\tComplete job\t\ufeff2026-01-01T00:00:09.1234567Z Cleaning up orphan processes\n"
         cases = [
-            # (log files, machine name fd value, accept switch, exit status)
-            ((setup + later,), None, False, 1),        # the name blocks by default
-            ((setup + later,), host, True, 0),         # accepted: switch on and the admitted name
-            ((tabbed + "Build\tRun\tok\n",), host, True, 0),
-            ((setup + later,), "other-host", True, 1),  # not the admitted name
-            ((setup.replace(host, "neutral-name") + later,), "other-host", False, 1),  # unexpected metadata
-            ((setup.replace(host, "neutral-name") + later,), "neutral-name", False, 0),
-            ((setup + setup + later,), host, True, 1),  # duplicate field
-            ((later + setup,), host, True, 1),          # misplaced: after the first step started
-            ((setup + later + "later " + host + "\n",), host, True, 1),  # the name elsewhere
-            ((tabbed.replace("Build", "Build " + PRIVATE) + "Build\tRun\tok\n",), host, True, 1),  # same line
+            # (log files, machine name fd value, accept switch, extra markers, exit status)
+            ((setup + later + end,), None, False, (), 1),        # the name blocks by default
+            ((setup + later + end,), host, True, (), 0),         # accepted: switch on and the admitted name
+            ((tabbed + "Build\tRun\tok\n" + tabbed_end,), host, True, (), 0),
+            ((setup + later + end,), "other-host", True, (), 1),  # not the admitted name
+            ((setup.replace(host, "neutral-name") + later + end,), "other-host", False, (), 1),  # unexpected
+            ((setup.replace(host, "neutral-name") + later + end,), "neutral-name", False, (), 0),
+            ((setup + setup + later + end,), host, True, (), 1),  # duplicate field in one file
+            ((setup + later + end, setup + later), host, True, (), 1),  # duplicate field across files
+            ((setup + later + end + "later " + host + "\n",), host, True, (), 1),  # the name elsewhere
+            ((tabbed.replace("Build", "Build " + PRIVATE) + "Build\tRun\tok\n" + tabbed_end,), host, True, (), 1),
+            # Inside the admitted value only the literal equal to the whole name is accepted.
+            ((setup + later + end,), host, True, ("thetic-ho",), 1),
+            # Partial input: no setup field (missing, or after the first step started), no job end.
+            ((later + end,), host, True, (), 3),
+            ((later + setup + end,), host, True, (), 3),
+            ((setup + later,), host, True, (), 3),
+            ((later, end), None, False, (), 3),
         ]
-        for texts, name, accept, status in cases:
-            result = self.run_gate(self.write_logs(*texts), lines=(PRIVATE, host), machine_name=name,
+        for texts, name, accept, extra, status in cases:
+            result = self.run_gate(self.write_logs(*texts), lines=(PRIVATE, host) + extra, machine_name=name,
                                    accept_runner_machine_name_line=accept)
-            self.assertEqual(result.returncode, status, (texts, name, accept, result.stderr))
+            self.assertEqual(result.returncode, status, (texts, name, accept, extra, result.stderr))
         # The switch needs the admitted name; empty input is incomplete.
-        self.assertEqual(self.run_gate(self.write_logs(setup), lines=(host,),
+        self.assertEqual(self.run_gate(self.write_logs(setup + end), lines=(host,),
                                        accept_runner_machine_name_line=True).returncode, 2)
         self.assertEqual(self.run_gate(self.write_logs(), lines=(host,)).returncode, 3)
         self.assertEqual(self.run_gate(self.write_logs(""), lines=(host,)).returncode, 3)
+
+    def test_logs_allow_only_the_release_host_work_folder(self):
+        neutral = "/opt/ottto-release/runners/4242/_work"
+        setup = "2026-01-01T00:00:00Z Machine name: 'neutral-name'\n"
+        end = "2026-01-01T00:00:09Z Cleaning up orphan processes\n"
+        cases = [
+            ("Temporarily overriding HOME='%s/_temp/0a1b'" % neutral, ["--run-id", "4242"], 0),
+            ("Working directory is '%s/repo/repo'" % neutral, ["--run-id", "4242"], 0),
+            ("Temporarily overriding HOME='%s/_temp/0a1b'" % neutral, [], 1),               # no run id
+            ("HOME='/opt/ottto-release/runners/4243/_work/_temp'", ["--run-id", "4242"], 1),  # other run
+            ("HOME='/x/opt/ottto-release/runners/4242/_work/_temp'", ["--run-id", "4242"], 1),  # other root
+            ("HOME='/srv/actions/_work/_temp'", ["--run-id", "4242"], 1),
+            ("HOME='%s/_temp' and %s" % (neutral, HOME_ROOT + "someone/x"), ["--run-id", "4242"], 1),
+        ]
+        for line, extra, status in cases:
+            args = self.write_logs(setup + line + "\n" + end) + extra
+            result = self.run_gate(args, machine_name="neutral-name")
+            self.assertEqual(result.returncode, status, (line, extra, result.stderr))
+        self.assertEqual(self.run_gate(["scan", "--profile", "dispatch", "--run-id", "4242"],
+                                       env=self.dispatch_env()).returncode, 2)
 
     def release_env(self, **extra):
         env_file = os.path.join(self.tmp, "github_env")
@@ -1009,10 +1081,29 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(subprocess.run(record, capture_output=True, env=workflow_env).returncode, 0)
         workflow_env["GITHUB_RUN_ATTEMPT"] = "2"
         self.assertEqual(subprocess.run(record, capture_output=True, env=workflow_env).returncode, 2)
+        # With a baseline (here an enforce attempt's, as at --stage finish), a blank policy or a
+        # missing attempt is refused, never a skipped check.
+        enforced = os.path.join(self.tmp, "enforced")
+        with patched_env(attempt):
+            g.write_baseline(enforced, g.Policy(policy_text(digest, mode="enforce")), digest)
+        shutil.copy(g.stage_path(state, "unsigned"), g.stage_path(enforced, "unsigned"))
+        no_policy = dict(os.environ, **attempt)
+        no_policy.pop(g.POLICY_ENV, None)
+        finish = [sys.executable, "-I", GATE, "check-record", "--state", enforced, "--root", root]
+        result = subprocess.run(finish, capture_output=True, env=no_policy)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"code=policy_missing", result.stderr)
+        no_attempt = {k: v for k, v in workflow_env.items() if k != "GITHUB_RUN_ATTEMPT"}
+        result = subprocess.run(record, capture_output=True, env=no_attempt)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"code=baseline_context", result.stderr)
         g.unfreeze(os.path.join(root, "ottto"))
         with open(os.path.join(root, "ottto"), "ab") as handle:
             handle.write(b"changed")
-        self.assertEqual(subprocess.run(record, capture_output=True).returncode, 2)
+        workflow_env["GITHUB_RUN_ATTEMPT"] = "1"
+        result = subprocess.run(record, capture_output=True, env=workflow_env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"code=unsigned_changed", result.stderr)
         g.unfreeze(os.path.join(app, "Info.plist"))
         with open(os.path.join(app, "Info.plist"), "wb") as handle:
             plistlib.dump({"CFBundleIdentifier": "net.example.app", "Note": PRIVATE}, handle)

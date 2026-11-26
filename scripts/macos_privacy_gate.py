@@ -91,8 +91,14 @@ DISPATCH_INPUTS = ("VERSION", "CHANNEL", "ARTIFACT_BASE_URL", "RELEASE_NOTES",
 SEPARATORS = "/\0\r\n\"'"
 # The runner's "Set up job" field, one line: optional `gh run view --log` job and step
 # columns, an optional timestamp, then the quoted machine name.
-MACHINE_NAME_LINE = re.compile(r"(?P<step>[^\t\n]*\t(?P<name>[^\t\n]*)\t)?"
+MACHINE_NAME_LINE = re.compile(r"(?P<step>[^\t\n]*\t(?P<name>[^\t\n]*)\t)?\ufeff?"
                                r"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Machine name: '(?P<value>[^'\n]*)'\r?")
+# The runner's last job line ("Complete job" step): a log set without it is not the whole job.
+JOB_END_LINE = re.compile(r"(?:[^\t\n]*\tComplete job\t)?\ufeff?"
+                          r"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?Cleaning up orphan processes\r?")
+# The release host's runner work folder for one run (logs profile with --run-id only). Its
+# checkout and attestation output name this neutral folder before the mask step runs.
+RELEASE_WORK_PREFIX = "/opt/ottto-release/runners/%s/_work/"
 # The dedicated release account is neutral by design: its user and full name are not
 # markers (its full name is ordinary product text). Any other account keeps both.
 NEUTRAL_RELEASE_ACCOUNT = ("ottto-release", "Ottto Release")
@@ -824,6 +830,34 @@ def zip_members(data):
     return members
 
 
+def zip_layout(members, expected):
+    """The app ZIP's file and link inventory, or None when a member is outside Ottto.app, an
+    AppleDouble file, of another type, a directory entry with data or another mode, or a link
+    other than the allowed Sparkle version links."""
+    layout = {}
+    for name, mode, _stored, content in members:
+        kind = stat.S_IFMT(mode)
+        if not name.startswith("Ottto.app/") or "/._" in "/" + name or name.endswith("/") != (kind == stat.S_IFDIR):
+            return None
+        rel = name[len("Ottto.app/"):]
+        if kind == stat.S_IFDIR:
+            if content or expected.get(rel) != ("d", stat.S_IMODE(mode)):
+                return None
+        elif kind == stat.S_IFLNK:
+            try:
+                target = content.decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                return None
+            if not app_link_ok(rel, target):
+                return None
+            layout[rel] = ("l", target)
+        elif kind == stat.S_IFREG:
+            layout[rel] = ("f", stat.S_IMODE(mode), sha256(content))
+        else:
+            return None
+    return layout
+
+
 def check_zip_extra(extra):
     position = 0
     while position < len(extra):
@@ -867,6 +901,7 @@ class Gate:
         self.scratch = scratch
         self.legal_hashes = None
         self.sparkle = None
+        self.work_prefix = None
 
     # --- results
     def finding(self, role, cls, code, count=1):
@@ -900,13 +935,32 @@ class Gate:
             self.seen.add(key)
             self.finding(rep.role, "path", code)
 
+    def work_allowed(self, lowered, start, end):
+        """True for "/_work/" inside the one admitted release-host work folder (logs profile)."""
+        prefix = self.work_prefix
+        if not prefix or lowered[start:end] not in ("/_work/", b"/_work/"):
+            return False
+        low = end - len(prefix)
+        if low < 0:
+            return False
+        segment = lowered[low:end]
+        if (segment.decode("latin-1") if isinstance(segment, bytes) else segment) != prefix:
+            return False
+        if low == 0:
+            return True
+        before = lowered[low - 1:low]
+        before = before.decode("latin-1") if isinstance(before, bytes) else before
+        return not (before.isalnum() or before in "._-~/")
+
     # --- byte and text passes
-    def scan_buffer(self, buffer, base, rep):
+    def scan_buffer(self, buffer, base, rep, seen_upto=0):
+        """seen_upto: this buffer's leading bytes the previous chunk already held in full."""
         lowered = buffer.lower()
         for index, start, end in self.matcher.raw(lowered):
             self.record(rep, index, base + start, base + end, "raw")
         for start, end in path_hits_bytes(lowered):
-            self.record_path(rep, base + start, base + end, "raw")
+            if end > seen_upto and not self.work_allowed(lowered, start, end):
+                self.record_path(rep, base + start, base + end, "raw")
 
     def scan_bytes(self, data, rep):
         overlap = max(self.matcher.longest, 64)
@@ -916,7 +970,7 @@ class Gate:
         position = 0
         while position < len(data):
             start = max(0, position - overlap)
-            self.scan_buffer(data[start:position + CHUNK], start, rep)
+            self.scan_buffer(data[start:position + CHUNK], start, rep, position - start)
             position += CHUNK
 
     def scan_stream(self, handle, rep, limit=MAX_FILE):
@@ -932,7 +986,7 @@ class Gate:
                 raise Incomplete("size_limit")
             digest.update(chunk)
             buffer = tail + chunk
-            self.scan_buffer(buffer, base, rep)
+            self.scan_buffer(buffer, base, rep, len(tail))
             keep = min(len(buffer), overlap)
             base += len(buffer) - keep
             tail = buffer[len(buffer) - keep:]
@@ -943,7 +997,8 @@ class Gate:
         for index, start, end in self.matcher.text(normalized):
             self.record(rep, index, start, end, "%s:%d" % (code, field))
         for start, end in path_hits_text(normalized):
-            self.record_path(rep, start, end, "%s:%d" % (code, field))
+            if not self.work_allowed(normalized, start, end):
+                self.record_path(rep, start, end, "%s:%d" % (code, field))
 
     def scan_name(self, name, rep, field):
         self.scan_bytes(os.fsencode(name), Representation(rep.role, (rep.key, "name", field)))
@@ -1269,13 +1324,20 @@ class Gate:
 
         self.walk_tree(expect_app, role, False, source_signed, app_link_ok, "Contents/Resources/", expected)
         members = zip_members(data)
-        extracted = self.extract_app_zip(path)
-        extracted_ok = self.verified_signature(extracted, role, deep=True)
-        copy = {}
-        self.walk_tree(extracted, role, False, inventory=copy, scan=False)
         files = {k: v for k, v in expected.items() if v[0] != "d"}
-        if {k: v for k, v in copy.items() if v[0] != "d"} != files:
-            self.finding(role, "structure", "zip_extracted")
+        # ditto sees the archive only when its members are already exactly the checked tree with
+        # the allowed links; otherwise nothing is extracted and no signed omission applies.
+        extracted, extracted_ok = None, False
+        if zip_layout(members, expected) == files:
+            extracted = self.extract_app_zip(path)
+            extracted_ok = self.verified_signature(extracted, role, deep=True)
+            copy = {}
+            self.walk_tree(extracted, role, False, inventory=copy, scan=False)
+            if {k: v for k, v in copy.items() if v[0] != "d"} != files:
+                self.finding(role, "structure", "zip_extracted")
+                extracted_ok = False
+        else:
+            self.finding(role, "structure", "zip_layout")
         cache = {}
 
         def signed_ok(rel, content):
@@ -1508,6 +1570,11 @@ class Gate:
             self.scan_app_zip(path, data, role, context["expect_app"])
         elif role in JSON_ROLES:
             self.scan_json(data, rep)
+            if role == "sbom":
+                # The attestation action sends JSON.stringify(JSON.parse(file)) as the predicate:
+                # that exact text is searched too.
+                self.scan_plain_text(es_json(parse_es_json(data)).encode("utf-8"),
+                                     Representation(role, (role, "predicate")))
         elif role == "manifest_sig":
             self.scan_cms(data, role, context.get("manifest"))
         elif role == "checksums":
@@ -1533,12 +1600,80 @@ def number_forms(value):
         raise Incomplete("json_number")
     if as_float != as_float or as_float in (float("inf"), float("-inf")):
         raise Incomplete("json_number")
-    forms = {repr(as_float), format(decimal.Decimal(repr(as_float)), "f")}
+    forms = {repr(as_float), format(decimal.Decimal(repr(as_float)), "f"), es_number(as_float)}
     if isinstance(value, int):
         forms.add(str(value))
     if as_float == int(as_float):
         forms.add(str(int(as_float)))
     return sorted(forms)
+
+
+def es_number(value):
+    """ECMAScript Number::toString of a finite double (what JSON.stringify writes)."""
+    if value != value or value in (float("inf"), float("-inf")):
+        raise Incomplete("json_number")
+    if value == 0:
+        return "0"
+    # repr is the shortest round-trip digit string, the same digits ECMAScript chooses.
+    _sign, digits, exponent = decimal.Decimal(repr(abs(value))).normalize().as_tuple()
+    digits = "".join(map(str, digits))
+    k = len(digits)
+    n = exponent + k
+    if k <= n <= 21:
+        text = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        text = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        text = "0." + "0" * -n + digits
+    else:
+        text = digits[0] + ("." + digits[1:] if k > 1 else "") + "e" + ("+" if n - 1 >= 0 else "-") + str(abs(n - 1))
+    return ("-" if value < 0 else "") + text
+
+
+ES_ESCAPES = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+
+
+def es_string(text):
+    """ECMAScript QuoteJSONString: control characters and lone surrogates escaped, the rest kept."""
+    out = ['"']
+    for char in text:
+        code = ord(char)
+        if code in ES_ESCAPES:
+            out.append(ES_ESCAPES[code])
+        elif code < 0x20 or 0xD800 <= code <= 0xDFFF:
+            out.append("\\u%04x" % code)
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
+def es_index_key(key):
+    """An ECMAScript array index ("0" to "4294967294"): such keys come first, ascending."""
+    return re.fullmatch(r"0|[1-9][0-9]{0,9}", key) is not None and int(key) < 0xFFFFFFFF
+
+
+def es_json(value):
+    """JSON.stringify(JSON.parse(text)) for a document parsed with parse_es_json."""
+    if isinstance(value, dict):
+        keys = sorted((k for k in value if es_index_key(k)), key=int) + [k for k in value if not es_index_key(k)]
+        return "{" + ",".join(es_string(k) + ":" + es_json(value[k]) for k in keys) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(es_json(v) for v in value) + "]"
+    if isinstance(value, str):
+        return es_string(value)
+    if value is True or value is False or value is None:
+        return json.dumps(value)
+    return es_number(value)
+
+
+def parse_es_json(data):
+    """Parse JSON the way JSON.parse does for the attestation action: every number a double."""
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=no_duplicate_keys,
+                          parse_int=float, parse_float=float, parse_constant=lambda _c: float("nan"))
+    except (ValueError, OverflowError):
+        raise Incomplete("json_parse")
 
 
 APFS_CONTAINER_HINT = "EF57347C-0000-11AA-AA11-00306543ECAC"
@@ -1850,12 +1985,12 @@ def write_baseline(state, policy, markers_digest):
         os.chflags(path, os.lstat(path).st_flags | stat.UF_IMMUTABLE)
 
 
-def check_baseline(state, policy, markers_digest, lane=None):
+def check_baseline(state, policy, markers_digest, lane=None, required=False):
     """A workflow scan runs only on the policy and list its attempt loaded first (enforce mode
     requires the record; it is checked before anything is scanned or approved)."""
     record = read_json_file(os.path.join(state, "baseline.json"))
     if record is None:
-        if policy.mode == "enforce":
+        if policy.mode == "enforce" or required:
             raise GateError("baseline_missing")
         return
     if record != baseline_record(policy, markers_digest) or (lane and record["lane"] != lane):
@@ -2005,7 +2140,7 @@ def run_profile(args, gate, policy):
     if profile == "dispatch":
         return scan_dispatch(gate), context, []
     if profile == "logs":
-        return scan_logs(gate, args.root, policy, read_machine_name(args, policy)), context, []
+        return scan_logs(gate, args.root, policy, read_machine_name(args, policy), args.run_id), context, []
     if profile == "unsigned":
         required, optional = {"app_bundle", "cli_binary", "service_binary"}, set()
         context["signed"] = False
@@ -2155,14 +2290,17 @@ def read_machine_name(args, policy):
     return value
 
 
-def scan_logs(gate, root, policy, expected_name):
-    """Job logs, every text searched. The runner's one "Set up job" Machine name field is counted
-    on its own (host_runner_line); it passes only under the policy switch with the admitted name.
-    Everything else on that line, and the name anywhere else, stays a normal finding."""
+def scan_logs(gate, root, policy, expected_name, run_id=None):
+    """One job's complete logs, every text searched. The runner's one "Set up job" Machine name
+    field across the whole set is checked on its own (check_machine_name); a set without that
+    field or without the job's last line is partial (incomplete), a second field is a finding.
+    With run_id, "/_work/" inside that run's release-host work folder is not a path finding."""
     files = sorted(list_files(root))
     if not files:
         raise Incomplete("log_empty")
-    roles = []
+    if run_id:
+        gate.work_prefix = RELEASE_WORK_PREFIX % run_id
+    logs, fields, job_end = [], [], False
     for index, rel in enumerate(files):
         path = os.path.join(root, rel)
         if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > MAX_FILE:
@@ -2177,40 +2315,49 @@ def scan_logs(gate, root, policy, expected_name):
             raise Incomplete("log_encoding")
         label = "log%d" % index
         gate.scan_name(rel, Representation(label, (label, "name")), 0)
-        lines, fields, setup = text.split("\n"), [], True
+        lines, setup = text.split("\n"), True
         for number, line in enumerate(lines):
             match = MACHINE_NAME_LINE.fullmatch(line)
             if match and (match.group("name") == "Set up job" if match.group("step") is not None else setup):
-                fields.append((number, match))
+                fields.append((label, len(logs), number, match))
             if "##[group]Run " in line:
                 setup = False
-        if len(fields) > 1:
-            gate.finding(label, "host_runner_line", "duplicate")
-            fields = []
-        if fields:
-            number, match = fields[0]
-            start, end = match.span("value")
-            lines[number] = lines[number][:start] + "\0" + lines[number][end:]
-            check_machine_name(gate, policy, label, match.group("value"), expected_name)
+            if JOB_END_LINE.fullmatch(line):
+                job_end = True
+        logs.append((label, lines))
+    if not fields or not job_end:
+        raise Incomplete("log_partial")
+    if len(fields) > 1:
+        # Every copy stays in the text and is searched like any other line.
+        gate.finding("logs", "host_runner_line", "duplicate")
+    else:
+        label, index, number, match = fields[0]
+        lines = logs[index][1]
+        start, end = match.span("value")
+        lines[number] = lines[number][:start] + "\0" + lines[number][end:]
+        check_machine_name(gate, policy, label, match.group("value"), expected_name)
+    for label, lines in logs:
         gate.scan_plain_text("\n".join(lines).encode("utf-8"), Representation(label, (label, "rest")))
-        roles.append(label)
-    return roles
+    return [label for label, _lines in logs]
 
 
 def check_machine_name(gate, policy, label, value, expected_name):
-    probe = Gate(policy, gate.markers, "probe")
-    probe.scan_plain_text(value.encode("utf-8"), Representation(label, "value"))
-    if probe.incomplete:
-        raise Incomplete("log_field")
-    if probe.findings.get("path"):
-        gate.finding(label, "path", "machine_name")
-    named = sum(count for cls, count in probe.findings.items() if cls != "path")
+    """The setup field's value. Under the policy switch, with the admitted name from
+    --machine-name-fd, only a literal equal to the whole value (the host name itself) is accepted;
+    any other literal or path inside the value stays a finding of its own class."""
+    data = value.encode("utf-8")
     if expected_name is not None and value != expected_name:
         gate.finding(label, "structure", "machine_name_unexpected")
-        if named:
-            gate.finding(label, "host_runner_line", "machine_name")
-    elif named:
-        if policy.accept_machine_name_line and expected_name is not None:
+    admitted = policy.accept_machine_name_line and expected_name is not None and value == expected_name
+    if any(path_hits_bytes(data.lower())) or any(path_hits_text(norm(value))):
+        gate.finding(label, "path", "machine_name")
+    hits = {index for index, _start, _end in gate.matcher.raw(data.lower())}
+    hits |= {index for index, _start, _end in gate.matcher.text(norm(value))}
+    for index in sorted(hits):
+        marker = gate.markers[index]
+        if norm(marker.value) != norm(value):
+            gate.finding(label, marker.cls, "machine_name_inner")
+        elif admitted:
             key = (label, "host_runner_line", "accepted")
             gate.diagnostics[key] = gate.diagnostics.get(key, 0) + 1
         else:
@@ -2321,11 +2468,14 @@ def command_check_record(args):
     record = read_stage(args.state, "unsigned")
     if not isinstance(record, dict) or record.get("verdict") != "clean" or record.get("stage") != "unsigned":
         raise GateError("unsigned_record")
-    if os.environ.get(POLICY_ENV, "").strip():
+    # The release workflow, or a state folder with an attempt baseline, always needs the policy and
+    # this attempt's run, attempt and lane: a blank policy is refused, never a skipped check.
+    workflow = in_release_workflow() or os.path.lexists(os.path.join(args.state, "baseline.json"))
+    if workflow or os.environ.get(POLICY_ENV, "").strip():
         policy = load_policy()
         if record.get("policy_sha256") != policy.sha256:
             raise GateError("unsigned_record_policy")
-        check_baseline(args.state, policy, record.get("markers_sha256"))
+        check_baseline(args.state, policy, record.get("markers_sha256"), required=workflow)
     gate = Gate(Policy(json.dumps({"version": 1, "mode": "rehearsal", "advisory_xattrs": [],
                                    "leaf_sha256": ["0" * 64], "markers_sha256": "0" * 64})),
                 [Marker("\0unused\0", "private")], "record")
@@ -2364,6 +2514,7 @@ def main(argv=None):
     scan.add_argument("--host-literals", choices=("on", "off"), default="on")
     scan.add_argument("--stage", choices=("attest-1", "attest-2"))
     scan.add_argument("--machine-name-fd", type=int)
+    scan.add_argument("--run-id")
     markers = sub.add_parser("markers")
     markers.add_argument("--store")
     markers.add_argument("--owner-store-v3", action="store_true")
@@ -2383,6 +2534,9 @@ def main(argv=None):
         parser.error("--lane is required for this profile")
     if args.command == "scan" and (args.profile == "attest") != (args.stage is not None):
         parser.error("--stage attest-1|attest-2 goes with --profile attest only")
+    if args.command == "scan" and args.run_id is not None and (
+            args.profile != "logs" or not re.fullmatch(r"[1-9][0-9]{0,19}", args.run_id)):
+        parser.error("--run-id <digits> goes with --profile logs only")
     handlers = {"scan": command_scan, "markers": command_markers, "policy": command_policy,
                 "leaf": command_leaf, "register-masks": command_register_masks, "roles": command_roles,
                 "check-record": command_check_record}

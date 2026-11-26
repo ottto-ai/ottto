@@ -84,8 +84,25 @@ jobs:
       OTTTO_RELEASE_PRIVACY_POLICY: ${{ vars.OTTTO_RELEASE_PRIVACY_POLICY }}
       OTTTO_RELEASE_LANE: ${{ inputs.channel == 'stable-candidate' && 'candidate' || (inputs.release_mode == 'manual-no-sparkle' && 'manual' || 'stable') }}
     steps:
+      # Checkout prints its temporary folder, and setup output comes before the
+      # mask step: the job runs only in the release host's neutral per-run work
+      # folder (docs/release-verification.md, "Release host runner").
+      - name: Check neutral runner paths
+        run: |
+          set -euo pipefail
+          work="/opt/ottto-release/runners/$GITHUB_RUN_ID/_work"
+          repo="${GITHUB_REPOSITORY#*/}"
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ || "$RUNNER_TEMP" != "$work/_temp" ||
+                "$GITHUB_WORKSPACE" != "$work/$repo/$repo" ]]; then
+            echo "The job is not in the release host's neutral work folder." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        env:
+          # No account Git config to copy, so checkout names no home path.
+          HOME: ${{ runner.temp }}/checkout-home
         with:
           persist-credentials: false
           # Full history for the first-parent check on main.
@@ -315,23 +332,22 @@ jobs:
             dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
           mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
 
-      # Host paths stay out of the job environment, which every step prints;
-      # they reach only the step that reads them, after the mask step.
+      # Host paths stay out of every printed step environment: the release
+      # host's runner environment names the file, and the shell opens it by
+      # redirection, so no command gets the path on its argv.
       - name: Bind stable-candidate RC evidence
         if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
-        env:
-          OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
         run: |
           set -euo pipefail
-          test -n "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
-            echo "OTTTO_STABLE_CANDIDATE_RC_EVIDENCE must point to redacted stable-candidate RC evidence for stable releases." >&2
+          test -n "${OTTTO_STABLE_CANDIDATE_RC_EVIDENCE:-}" || {
+            echo "OTTTO_STABLE_CANDIDATE_RC_EVIDENCE must be set in the release runner's environment for stable releases." >&2
             exit 1
           }
           test -f "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
             echo "Stable-candidate RC evidence file named by OTTTO_STABLE_CANDIDATE_RC_EVIDENCE does not exist." >&2
             exit 1
           }
-          cp "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" dist/macos/stable-candidate-rc-qa.json
+          cat < "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" > dist/macos/stable-candidate-rc-qa.json
           candidate_sha="$(jq -r '.candidate_manifest.sha256 // empty' dist/macos/stable-candidate-rc-qa.json)"
           if [[ ! "$candidate_sha" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Stable-candidate RC evidence is missing candidate_manifest.sha256." >&2
@@ -465,13 +481,15 @@ jobs:
           subject-checksums: ${{ env.OTTTO_PRIVACY_WORK }}/attest-2/subject.checksums.txt
           sbom-path: ${{ env.OTTTO_PRIVACY_WORK }}/attest-2/ottto-local-platform-sbom.cdx.json
 
+      # Read-only on the frozen final set: nothing is rewritten after its seal.
       - name: Verify final attestations and manifest binding
         if: inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           scripts/macos_quiet_step.sh "attestation verify" scripts/macos_attestation_bind.sh \
-            --manifest dist/macos/release-manifest.json \
-            --subject-checksums dist/macos/subject.checksums.txt \
+            --verify-only \
+            --manifest "$OTTTO_PRIVACY_WORK/attest-2/release-manifest.json" \
+            --subject-checksums "$OTTTO_PRIVACY_WORK/attest-2/subject.checksums.txt" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow .github/workflows/macos-stable-release.yml
           scripts/macos_quiet_step.sh "release gate" scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
@@ -486,24 +504,24 @@ jobs:
           scripts/macos_quiet_step.sh "manifest verify" scripts/macos_manifest_signature.sh verify \
             --manifest dist/macos/release-manifest.json
 
+      # The release host's runner environment names the keychain (never a
+      # printed step environment). Tools get a neutral link in the gate's work
+      # folder, made from the environment, so no argv carries the keychain path.
       - name: Sign and verify release manifest from manual keychain
         if: inputs.release_mode == 'manual-no-sparkle'
-        env:
-          OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
         run: |
           set -euo pipefail
-          test -n "$OTTTO_MANUAL_SIGNING_KEYCHAIN" || {
-            echo "OTTTO_MANUAL_SIGNING_KEYCHAIN is required for a manual release." >&2
+          test -n "${OTTTO_MANUAL_SIGNING_KEYCHAIN:-}" || {
+            echo "OTTTO_MANUAL_SIGNING_KEYCHAIN must be set in the release runner's environment for a manual release." >&2
             exit 2
           }
           test -f "$OTTTO_MANUAL_SIGNING_KEYCHAIN" || {
             echo "Manual signing keychain does not exist." >&2
             exit 2
           }
-          # Tools get a neutral link in the gate's work folder, never the
-          # keychain's own path.
           keychain="$OTTTO_PRIVACY_WORK/manual-signing.keychain-db"
-          ln -s "$OTTTO_MANUAL_SIGNING_KEYCHAIN" "$keychain"
+          OTTTO_KEYCHAIN_LINK="$keychain" python3 -I -c \
+            'import os; os.symlink(os.environ["OTTTO_MANUAL_SIGNING_KEYCHAIN"], os.environ["OTTTO_KEYCHAIN_LINK"])'
           scripts/macos_quiet_step.sh "manifest sign" scripts/macos_manifest_signature.sh sign \
             --manifest dist/macos/release-manifest.json \
             --identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \

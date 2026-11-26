@@ -118,7 +118,9 @@ not a higher build level.
 Stable manifests should be bound with `macos_attestation_bind.sh` using the
 published `subject.checksums.txt`; the helper updates only the SLSA and SBOM
 manifest fields and refuses `verified=true` if GitHub attestation verification
-fails. Verify `release-manifest.json.sig` with
+fails. With `--verify-only` it writes nothing: it verifies the attestations
+and requires the manifest to already carry exactly those fields (the release
+workflow's final check runs this way on the sealed final set). Verify `release-manifest.json.sig` with
 `macos_manifest_signature.sh verify --manifest release-manifest.json --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"`
 before trusting the manifest as the stable release record so the CMS payload is
 bound to the expected Ottto Developer ID identity.
@@ -210,7 +212,7 @@ The `macos-stable-release` environment holds one variable,
 | `advisory_xattrs` | A subset of `macl` and `provenance`. A listed attribute's presence on a shipped file is counted but does not stop the release. Any marker in any attribute name or value still blocks. |
 | `leaf_sha256` | One or two distinct SHA-256 digests of the Developer ID leaf certificate (DER). Every signature the gate trusts must chain to Apple's Developer ID root and end in one of these leaves. Two entries cover a certificate rotation; both release lanes use the same list. |
 | `markers_sha256` | The marker list digest (below). |
-| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the one `Machine name: '…'` field of a job log's "Set up job" section passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); it is counted as `host_runner_line` `accepted`. Everything else in a log, including the rest of that line and the name anywhere else, still blocks. |
+| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the job's one `Machine name: '…'` field (in the "Set up job" section) passes if its value is exactly the admitted runner name (given on `--machine-name-fd`); only a literal equal to that whole name is counted as `host_runner_line` `accepted`. Any other literal or path inside the value, the rest of that line and the name anywhere else still block. |
 
 Duplicate keys, unknown keys, wrong types and missing required keys are
 refused. The canonical form is the object with every key (including the
@@ -251,11 +253,17 @@ digest and counts, never a literal.
   that starts with `bplist00` is decoded as a binary property list wherever it
   is (Sparkle's localized `.strings` files are binary property lists); one that
   does not parse is `incomplete`. JSON numbers are also searched in the
-  decimal forms a consumer that reserializes the document can print (the
-  attestation action sends the SBOM as a parsed object).
+  decimal forms a consumer that reserializes the document can print. The
+  attestation action sends the SBOM as `JSON.stringify(JSON.parse(file))`, so
+  the gate also searches that exact text (ECMAScript number spellings such as
+  `1e-7`, index-like keys first, ECMAScript string escapes); a number that
+  serializer cannot write is `incomplete`.
 - A home folder (`/Users/<name>` other than `/Users/Shared`, `/home/<name>`),
   a per-user temp folder (`/var/folders/…`) or a runner work folder
-  (`/_work/`, `actions-runner`) blocks wherever it appears.
+  (`/_work/`, `actions-runner`) blocks wherever it appears. The one exception
+  is the `logs` profile with `--run-id <id>`: there `/_work/` inside the
+  release host's work folder for that run,
+  `/opt/ottto-release/runners/<id>/_work/`, is not a finding.
 - File and folder names, symbolic link targets and extended attribute names
   and values are searched too. `com.apple.provenance` and `com.apple.macl` on
   a shipped file (inside the DMG or a ZIP) block unless the policy lists them
@@ -329,16 +337,20 @@ python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder
   [--lane candidate|stable|manual] [--appcast present|absent] \
   [--seal-from <folder>] [--markers-fd <n> | --markers-store <file>] \
   [--response-fd <n>] [--state <folder>] [--stage attest-1|attest-2] \
-  [--machine-name-fd <n>]
+  [--machine-name-fd <n>] [--run-id <id>]
 ```
 
 Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
 `attest` (the attestation subjects, SBOM and checksums; `--stage attest-1`
 or `--stage attest-2` is required), `upload`, `publish`, `dispatch` and
-`logs` (every text file under `--root`; an empty folder or file is
-`incomplete`; the admitted runner name, when the policy accepts the
-machine-name field, comes from `--machine-name-fd <n>`, never argv). `dispatch` reads the
+`logs` (one job's complete logs, every text file under `--root`; an empty
+folder or file is `incomplete`, and so is a set without the job's
+"Set up job" `Machine name` field or without its last line,
+`Cleaning up orphan processes`; a second `Machine name` field anywhere in the
+set is a finding; the admitted runner name, when the policy accepts the
+machine-name field, comes from `--machine-name-fd <n>`, never argv;
+`--run-id` admits that run's release-host work folder, see Matching). `dispatch` reads the
 workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
 `OTTTO_DISPATCH_ARTIFACT_BASE_URL`, `OTTTO_DISPATCH_RELEASE_NOTES`,
 `OTTTO_DISPATCH_RELEASE_MODE`, `OTTTO_DISPATCH_OPERATOR_APPROVAL` and
@@ -357,8 +369,9 @@ a regular file, has more than one hard link or is over the size limit is
 
 The temporary app ZIP must hold exactly the checked app tree: every member's
 type, mode and bytes match it, a directory entry has no data and the tree's
-mode, and the app that `ditto -x -k` extracts from the sealed ZIP verifies
-natively (deep, strict, Developer ID, pinned leaf) and has the same files.
+mode, and the only links are Sparkle's version links. Only then does
+`ditto -x -k` extract the sealed ZIP, and the extracted app must verify
+natively (deep, strict, Developer ID, pinned leaf) and have the same files.
 The DMG must be a single-segment, unencrypted UDZO image whose native
 metadata (`hdiutil imageinfo`) shows a GUID partition map with one APFS
 partition. The gate reads its raw file, attaches it without mounting,
@@ -430,7 +443,9 @@ immutable: run ID, run attempt, lane, `policy_sha256` and `markers_sha256`.
 Every later scan with `--state` (and `check-record` before signing) first
 requires that record to equal this attempt's run, attempt, lane, policy and
 list; otherwise it exits 2 before scanning, so the next consumer never runs.
-In `enforce` mode the record is required.
+In `enforce` mode the record is required. `check-record` inside the release
+workflow, or with a state folder that holds a baseline, requires the policy
+and the attempt's run, attempt and lane (a blank policy exits 2).
 
 Each stage writes one record under a fixed name (`stage-dispatch.json`,
 `stage-unsigned.json`, `stage-notary-<role>.json`, `stage-attest-1.json`,
@@ -453,10 +468,7 @@ design and is scanned again at each later stage.
 
 - The dispatch input check runs right after the policy step and before any
   step that could print an input; it reads the inputs from the event file,
-  not its environment, and policy messages name no input value. Host-path
-  variables (`OTTTO_STABLE_CANDIDATE_RC_EVIDENCE`,
-  `OTTTO_MANUAL_SIGNING_KEYCHAIN`) are set only on the step that reads them,
-  not in the job environment every step prints. A
+  not its environment, and policy messages name no input value. A
   caller that dispatches the workflow runs the same `dispatch` profile on the
   exact input values first.
 - `register-masks` also checks the secret-backed tool selectors before any
@@ -469,18 +481,38 @@ design and is scanned again at each later stage.
   `<step>: failed (exit N)`). The notary helper prints only `notary:` lines
   with a fixed archive label and Apple's submission ID and status, each
   checked as a typed field, plus the gate's fixed diagnostics.
-- The app root reaches `macos_package.sh` through `OTTTO_MACOS_APP_ROOT`,
-  and the manual lane's keychain through a fixed link in the gate's neutral
-  work folder, not through argv.
+- The app root reaches `macos_package.sh` through `OTTTO_MACOS_APP_ROOT`.
+  Git and Swift run inside the app checkout with relative operands, and
+  signing reads a copy of the committed entitlements from a temporary folder,
+  so no child tool gets the checkout path as an operand. The one exception is
+  the compiler's prefix map, which must name the checkout to remove it from
+  the binaries (SwiftPM passes the compiler absolute source paths itself).
+- The final attestation check runs `macos_attestation_bind.sh --verify-only`
+  on the sealed final set; nothing is rewritten after the final seal.
 - Not covered here: the checkout and runner setup run before the mask step
-  (they print public repository facts and the runner's own setup fields, which
-  the `logs` profile checks); build tools started by `macos_package.sh` get
-  host paths on their own argv on the runner (never in the log); the pinned
-  attestation action writes its bundle path under `RUNNER_TEMP` to a step
-  output and a runner file (that root is a masked runner literal and must be
-  neutral). That the Actions runner registers each mask and omits the
-  `::add-mask::` command echo is proven only by a real release candidate's log
-  scan.
+  (they print public repository facts, the release host's neutral work folder
+  and the runner's own setup fields, which the `logs` profile checks); the
+  pinned attestation action writes its bundle path under `RUNNER_TEMP` to a
+  step output and a runner file (inside the same neutral work folder). That
+  the Actions runner registers each mask and omits the `::add-mask::` command
+  echo is proven only by a real release candidate's log scan.
+
+### Release host runner
+
+The signing job runs only on the release host's per-run runner:
+
+- Its work folder is `/opt/ottto-release/runners/<run id>/_work` (`RUNNER_TEMP`
+  is `<work>/_temp`, the workspace `<work>/<repo>/<repo>`). The first step
+  checks this before checkout and stops otherwise; the `logs` profile with
+  `--run-id <run id>` admits exactly that folder.
+- Checkout runs with `HOME` set to an empty folder under `RUNNER_TEMP`, so it
+  copies no account Git configuration and names no home path.
+- Host paths come from the runner's own environment, never from workflow
+  variables (a step's environment is printed): `OTTTO_MACOS_APP_ROOT` (the app
+  source), `OTTTO_STABLE_CANDIDATE_RC_EVIDENCE` (the redacted RC evidence file,
+  stable releases) and `OTTTO_MANUAL_SIGNING_KEYCHAIN` (the manual lane's
+  keychain). The workflow reads the evidence by shell redirection and links
+  the keychain from the environment, so neither path reaches an argv.
 
 ## Verify Stable Candidate RC
 

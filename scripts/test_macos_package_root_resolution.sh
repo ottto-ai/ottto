@@ -133,6 +133,15 @@ git -C "$root_app" commit -qm "fixture"
 package_expect_failure checkout-root-app "macOS app root must be a subdirectory of its Git checkout" \
   --app-root "$root_app" --version 0.1.0-dev --channel dev
 
+# [behaviour] Child tools get no app checkout path as an operand: git and
+# swift run inside the checkout, and signing reads a neutral entitlements copy.
+# shellcheck disable=SC2016 # literal variable names
+if grep -Eq 'git -C "\$MAC_APP|--package-path "\$MAC_APP|--entitlements "\$MAC_APP|_resources "\$MAC_APP_GIT_ROOT"|_pin "\$MAC_APP_GIT_ROOT"' \
+  "$ROOT/scripts/macos_package.sh"; then
+  echo "Package script must not pass the app checkout path to a child tool" >&2
+  exit 1
+fi
+
 # [behaviour] The packager records no private repository identity or path.
 if grep -Eq 'OTTTO_MACOS_APP_SOURCE_REPOSITORY|mac_app_source_path|git_subtree' "$ROOT/scripts/macos_package.sh"; then
   echo "Package script must not record a private repository identity or path" >&2

@@ -93,6 +93,18 @@ require_grep 'name: ottto-macos-\$\{\{ inputs\.channel \}\}-\$\{\{ inputs\.versi
 deny_grep 'subject-checksums: dist/macos|sbom-path: dist/macos' 'attestations must read sealed copies'
 # shellcheck disable=SC2016 # These assertions match literal variables.
 deny_grep '--keychain "\$OTTTO_MANUAL_SIGNING_KEYCHAIN"' 'tools get a neutral keychain link, not the keychain path'
+# Host paths come from the release runner's environment, never a printed step
+# environment, and reach no command's argv.
+deny_grep 'vars\.OTTTO_(STABLE_CANDIDATE_RC_EVIDENCE|MANUAL_SIGNING_KEYCHAIN)' 'host paths are not workflow variables'
+# shellcheck disable=SC2016
+deny_grep '(cp|ln -s) "\$OTTTO_(STABLE_CANDIDATE_RC_EVIDENCE|MANUAL_SIGNING_KEYCHAIN)"' 'host paths stay off argv'
+# shellcheck disable=SC2016
+require_grep 'cat < "\$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" > dist/macos/stable-candidate-rc-qa\.json' 'RC evidence read by redirection'
+require_grep 'HOME: \$\{\{ runner\.temp \}\}/checkout-home' 'checkout copies no account Git config'
+# The final attestation check reads the frozen final set and writes nothing.
+require_grep '--verify-only' 'read-only final attestation check'
+# shellcheck disable=SC2016
+require_grep '--manifest "\$OTTTO_PRIVACY_WORK/attest-2/release-manifest\.json"' 'final check reads the sealed manifest'
 
 # Optional, verification-only GitHub Release mirror.
 require_grep 'github_release_mirror:' 'github_release_mirror input'
@@ -134,10 +146,18 @@ if not (0 <= record < first_checksums < first_sign):
 steps = re.split(r"\n      - name: ", workflow)
 names = [step.split("\n", 1)[0] for step in steps[1:]]
 bodies = dict(zip(names, steps[1:]))
-if names[:4] != ["Checkout", "Load release privacy policy", "Check dispatch inputs for private strings",
-                 "Enforce dispatch policy"]:
-    print("The privacy policy load, then the dispatch input check, must come first after checkout",
-          file=sys.stderr)
+if names[:5] != ["Check neutral runner paths", "Checkout", "Load release privacy policy",
+                 "Check dispatch inputs for private strings", "Enforce dispatch policy"]:
+    print("The runner path check, checkout, the privacy policy load, then the dispatch input check must "
+          "come first", file=sys.stderr)
+    sys.exit(1)
+if "uses:" in bodies["Check neutral runner paths"] or "${{" in bodies["Check neutral runner paths"]:
+    print("The runner path check runs before checkout and reads only the runner's own variables", file=sys.stderr)
+    sys.exit(1)
+verify = bodies["Verify final attestations and manifest binding"]
+if "--verify-only" not in verify or "dist/macos/release-manifest.json" in verify.split("release gate")[0] \
+        or "--subject-checksums dist/macos" in verify:
+    print("The final attestation check must read the sealed final set only", file=sys.stderr)
     sys.exit(1)
 # The runner prints a step's environment first: the dispatch check reads the
 # event file, and host-path variables are not in the job environment.
@@ -223,6 +243,43 @@ for line in lines[run + 1 :]:
     body.append(line[10:])
 Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
 PY
+
+# [behaviour] Run the runner path check against neutral and other work folders.
+python3 - "$WORKFLOW" "$policy_dir/paths.sh" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = lines.index("      - name: Check neutral runner paths")
+run = next(i for i in range(start, len(lines)) if lines[i] == "        run: |")
+body = []
+for line in lines[run + 1 :]:
+    if line.strip() and not line.startswith(" " * 10):
+        break
+    body.append(line[10:])
+Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
+PY
+run_paths() {  # <run id> <runner temp> <workspace>
+  env -i PATH="$PATH" GITHUB_RUN_ID="$1" GITHUB_REPOSITORY=owner/repo RUNNER_TEMP="$2" GITHUB_WORKSPACE="$3" \
+    bash "$policy_dir/paths.sh" >"$policy_dir/out" 2>&1
+}
+neutral=/opt/ottto-release/runners/123/_work
+run_paths 123 "$neutral/_temp" "$neutral/repo/repo" || { echo "Neutral runner paths were refused" >&2; exit 1; }
+for case in "124|$neutral/_temp|$neutral/repo/repo" "123|$neutral/tmp|$neutral/repo/repo" \
+  "123|$neutral/_temp|$neutral/other/repo" "123|/srv/runner/_work/_temp|/srv/runner/_work/repo/repo" \
+  "0|/opt/ottto-release/runners/0/_work/_temp|/opt/ottto-release/runners/0/_work/repo/repo"; do
+  IFS='|' read -r id temp workspace <<<"$case"
+  if run_paths "$id" "$temp" "$workspace"; then
+    echo "Runner paths outside the neutral work folder were accepted: $case" >&2
+    exit 1
+  fi
+  if grep -Fq -- "$temp" "$policy_dir/out"; then
+    echo "The runner path check printed a path" >&2
+    exit 1
+  fi
+done
 
 # run_policy <ref> <channel> <version>: no app source identity is set.
 run_policy() {
