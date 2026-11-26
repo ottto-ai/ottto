@@ -1051,6 +1051,9 @@ class LogScan(unittest.TestCase):
             (job_logs(tmp, host, whole=(SETUP_LOG % host).replace("name: Release job", "name: Other")
                       + BUILD_LOG + END_LOG), "log_attempt"),
             (job_logs(tmp, host, record=lambda r: dict(r, runner_name="runner-2")), "log_attempt"),
+            # The "Set up job" file names another runner than the whole log and the record.
+            (job_logs(tmp, host, setup=(SETUP_LOG % host).replace("'runner-1'", "'runner-2'"),
+                      whole=SETUP_LOG % host + BUILD_LOG + END_LOG), "log_attempt"),
             (job_logs(tmp, host, layout="whole", system=SYSTEM_LOG.replace("runner: runner-1", "runner: runner-2")),
              "log_attempt"),
             (job_logs(tmp, host, layout="whole", system="2025-12-31T23:59:58.5000000Z Requested labels: x\n",

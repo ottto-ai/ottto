@@ -2399,11 +2399,12 @@ def ends_job(lines):
     return bool(body) and JOB_END_LINE.fullmatch(body[-1]) is not None
 
 
-def check_log_attempt(record, whole, setup_end, step_logs, system):
+def check_log_attempt(record, whole, setup_end, step_logs, setup_step, system):
     """The logs belong to the record's run attempt: every timestamped line lies between the
     job's creation and completion, the whole-job log starts when the job started and ends
     after its "Complete job" step started, it names the record's job, and every runner name
-    the logs state is the record's runner. Attempts of one job do not overlap: an earlier
+    the logs state (the whole log's and the "Set up job" file's setup lines, system.txt) is the
+    record's runner. Attempts of one job do not overlap: an earlier
     attempt's logs end before this attempt was created, a later one's start after it ended.
     Times tell them apart only for a job that runs longer than twice the clock slack, so a
     shorter job is incomplete."""
@@ -2429,7 +2430,8 @@ def check_log_attempt(record, whole, setup_end, step_logs, system):
         raise Incomplete("log_attempt")
     if JOB_NAME_LINE.fullmatch(whole[setup_end]).group("value") != record["name"]:
         raise Incomplete("log_attempt")
-    runners = [m.group("value") for m in (RUNNER_NAME_LINE.fullmatch(line) for line in whole[:setup_end]) if m]
+    runners = [m.group("value") for m in (RUNNER_NAME_LINE.fullmatch(line) for line in whole[:setup_end] + setup_step)
+               if m]
     runners += [m.group("value") for m in (SYSTEM_RUNNER_LINE.fullmatch(line) for line in system) if m]
     if not runners or any(name != record["runner_name"] for name in runners):
         raise Incomplete("log_attempt")
@@ -2478,7 +2480,8 @@ def scan_logs(gate, root, policy, expected_name, run_id, run_attempt, job_record
     ends = [ends_job(whole)] + [ends_job(lines) for rel, _label, lines in logs if rel == end_step]
     if not all(ends) or not fields["whole"] or (step_rels and not fields["step"]):
         raise Incomplete("log_partial")
-    check_log_attempt(record, whole, setup_end, [lines for _r, _l, lines in logs[1:-1]], logs[-1][2])
+    setup_lines = [line for rel, _label, lines in logs if rel == setup_step for line in lines]
+    check_log_attempt(record, whole, setup_end, [lines for _r, _l, lines in logs[1:-1]], setup_lines, logs[-1][2])
     values = {match.group("value") for kind in ("whole", "step") for _l, _i, _n, match in fields[kind]}
     if any(len(fields[kind]) != count for kind, count in expected_fields.items()) or fields["other"] \
             or len(values) != 1:
