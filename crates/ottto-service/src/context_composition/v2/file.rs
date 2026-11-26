@@ -450,6 +450,7 @@ fn parse_head(source: Source, path: &Path, offset: u64, lines: &[String]) -> Par
             state.session = identity.session.into();
             state.agent_author = identity.agent_author;
             state.cwd = identity.cwd.map(Into::into);
+            state.agent_path = identity.agent_path.map(Into::into);
             state.copied = identity.copied;
             if offset > 0 && state.copied == super::checkpoint::CopiedMode::UntilTrigger {
                 // Read from the middle: the trigger turn is behind us.

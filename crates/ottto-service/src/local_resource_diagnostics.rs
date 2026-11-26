@@ -401,6 +401,19 @@ pub(crate) fn codex_compression_carry_unproven(reason: CodexCompressionUnproven)
     });
 }
 
+// Codex prelude facts staged since the last flush: version 1, version 2.
+process_static!(fn with_codex_start_fact: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]);
+
+/// One staged Codex prelude fact; `sealed` is version 2, a start a later
+/// build counted. A rollback below the first build that reads version 2
+/// would hold those files, so this sizes that set.
+pub(crate) fn codex_start_fact(sealed: bool) {
+    with_codex_start_fact(|counts| {
+        let _ =
+            counts[usize::from(sealed)].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
 /// Counts only: inventory header reads decode every `.zst` once per walk, so
 /// `codex_zst_refused_flush` reports them as one per-walk row.
 pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
@@ -441,6 +454,15 @@ pub(crate) fn codex_zst_refused_flush() {
             .filter(|(_, count)| *count != 0)
             .collect()
     });
+    let facts: [u64; 2] =
+        with_codex_start_fact(|counts| std::array::from_fn(|i| counts[i].swap(0, Relaxed)));
+    if facts != [0, 0] {
+        traversal_point(
+            "codex_start_fact",
+            "codex",
+            &BTreeMap::from([("v1", facts[0]), ("v2", facts[1])]),
+        );
+    }
     if !unproven.is_empty() {
         traversal_point(
             "codex_compression_carry_unproven",

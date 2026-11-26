@@ -583,6 +583,86 @@ fn codex_goldens_match_v1_and_any_split() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// [behaviour] A message another agent sent this Codex thread is input: its
+/// plain text counts as a prompt written by an agent (request 1's while that
+/// request is open), it never starts a request, and an encrypted block adds
+/// nothing. A message this thread wrote to another agent, and the older
+/// record with no sender or addressee, still mark a response. The own agent
+/// path survives a checkpoint.
+#[test]
+fn a_codex_agent_message_to_this_thread_is_input() {
+    use crate::composition_kinds::Part;
+    let dir = scratch("composition-v2-codex-agent-message");
+    let meta = json!({"type":"session_meta","payload":{"id":"worker","agent_path":"/root/w"}});
+    let user = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}});
+    let call = json!({"type":"response_item","payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"{}"}});
+    let output = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"OUT"}});
+    let message = |author: &str, recipient: &str, text: &str| json!({"type":"response_item","payload":{"type":"agent_message","author":author,"recipient":recipient,"content":[{"type":"input_text","text":text},{"type":"encrypted_content","encrypted_content":"QUJDREVGR0hJSktMTU5PUA=="}]}});
+    let inbound = message("/root", "/root/w", "PARENTMSGX");
+    let outbound = message("/root/w", "/root", "");
+    let undirected =
+        json!({"type":"response_item","payload":{"type":"agent_message","content":[]}});
+    let read = |name: &str, records: &[Value]| {
+        let path = dir.join(format!("{name}.jsonl"));
+        write_records(&path, records);
+        assert_split_parity(Reading::default, Source::Codex, &[&path]);
+        read_whole(Source::Codex, &[&path])
+    };
+    let part = |reading: &Reading, part: Part| -> u64 {
+        reading
+            .agg
+            .all_parts
+            .iter()
+            .filter(|(slot, _)| slot.part == part)
+            .map(|(_, bucket)| bucket.tokens)
+            .sum()
+    };
+    let residency = |reading: &Reading| -> u64 {
+        reading
+            .agg
+            .days
+            .values()
+            .map(|bucket| bucket.residency)
+            .sum()
+    };
+    let opening = user("opening prompt");
+    let base = [meta.clone(), opening.clone(), call.clone(), output.clone()];
+    let with = |middle: &[Value], last: &Value| {
+        let mut records = base.to_vec();
+        records.extend_from_slice(middle);
+        records.push(last.clone());
+        records
+    };
+    let sent = read("sent", &with(std::slice::from_ref(&inbound), &outbound));
+    let without = read("without", &with(&[], &outbound));
+    assert_eq!(part(&sent, Part::ByAgent), tokens_for("PARENTMSGX"));
+    assert_eq!(part(&without, Part::ByAgent), 0);
+    assert_eq!(
+        residency(&sent) - residency(&without),
+        tokens_for("PARENTMSGX"),
+        "the message is resident at the one response after it, and starts none"
+    );
+    let older = read("older", &with(std::slice::from_ref(&inbound), &undirected));
+    assert_eq!(residency(&older), residency(&sent), "both mark a response");
+    let unanswered = read(
+        "unanswered",
+        &with(std::slice::from_ref(&inbound), &inbound),
+    );
+    assert!(
+        residency(&unanswered) < residency(&sent),
+        "an inbound message never marks a response"
+    );
+    // Before the first response the message is request 1's, and request 1
+    // stays open for the prompt after it.
+    let first = read("first", &[meta, inbound, opening, call, output]);
+    assert_eq!(
+        part(&first, Part::StartNotMeasured),
+        tokens_for("PARENTMSGX") + tokens_for("opening prompt")
+    );
+    assert_eq!(part(&first, Part::ByYou), 0);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn claude_copied_records_count_once_in_either_order() {
     let dir = scratch("composition-v2-claude-copies");
@@ -3712,8 +3792,9 @@ fn request_one_boundary_does_not_allocate_large_skipped_prelude_text() {
         json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":large}]}}),
     ] {
         let bytes = serde_json::to_vec(&row).unwrap();
-        let (closed, stats) =
-            crate::retry_allocation_probe::measure(|| super::codex::request1_input_closed(&bytes));
+        let (closed, stats) = crate::retry_allocation_probe::measure(|| {
+            super::codex::request1_input_closed(&bytes, None)
+        });
         assert!(!closed);
         assert!(
             stats.requested_peak < 128 * 1024,

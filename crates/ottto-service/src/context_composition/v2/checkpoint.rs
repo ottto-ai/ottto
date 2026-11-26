@@ -562,6 +562,9 @@ pub(super) struct ParseState {
     pub(super) start_measured: bool,
     pub(super) compactions: crate::snapshots::CompositionCompactions,
     pub(super) cwd: Option<Box<str>>,
+    /// Codex: this thread's own agent path, fixed from the first
+    /// `session_meta`, so a message it sends another agent stays its output.
+    pub(super) agent_path: Option<Box<str>>,
 }
 
 impl ParseState {
@@ -661,6 +664,8 @@ pub(super) struct StoredParse {
     #[serde(skip_serializing_if = "crate::snapshots::CompositionCompactions::is_empty")]
     compactions: crate::snapshots::CompositionCompactions,
     cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_path: Option<String>,
 }
 
 impl StoredParse {
@@ -672,6 +677,7 @@ impl StoredParse {
             agent_author: self.agent_author,
             request1_closed: true,
             cwd: self.cwd.as_deref().map(Into::into),
+            agent_path: self.agent_path.as_deref().map(Into::into),
             copied: self.copied,
             ..ParseState::default()
         }
@@ -695,6 +701,7 @@ impl StoredParse {
         160 + self.compactions.accounted_bytes()
             + self.session.len()
             + self.cwd.as_ref().map_or(0, String::len)
+            + self.agent_path.as_ref().map_or(0, String::len)
             + self.open.len() * 40
             + self
                 .open_calls
@@ -784,6 +791,7 @@ impl StoredParse {
             request1_closed: state.request1_closed,
             compactions: state.compactions.clone(),
             cwd: state.cwd.as_deref().map(str::to_string),
+            agent_path: state.agent_path.as_deref().map(str::to_string),
         }
     }
 
@@ -855,6 +863,7 @@ impl StoredParse {
             start_measured: false,
             compactions: self.compactions,
             cwd: self.cwd.map(Into::into),
+            agent_path: self.agent_path.map(Into::into),
         })
     }
 }

@@ -33,6 +33,8 @@ pub(super) struct HeadIdentity {
     pub(super) copied: CopiedMode,
     pub(super) agent_author: bool,
     pub(super) cwd: Option<String>,
+    /// This thread's own agent path, when the session has one.
+    pub(super) agent_path: Option<String>,
 }
 
 pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
@@ -102,6 +104,7 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
             copied,
             agent_author: is_subagent || thread_source == Some("agent_created_thread"),
             cwd: meta.cwd.str().map(Cow::into_owned),
+            agent_path: meta.agent_path.str().map(Cow::into_owned),
         };
     }
     HeadIdentity {
@@ -113,13 +116,16 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
         copied: CopiedMode::Own,
         agent_author: false,
         cwd: None,
+        agent_path: None,
     }
 }
 
 /// Ask the shared prelude parser only about rows that can close input.
 /// Developer/world-state text can be large; borrowed views avoid building
 /// a Value tree for content the prefix path will intentionally skip.
-pub(super) fn request1_input_closed(line: &[u8]) -> bool {
+/// `agent_path` is this thread's own agent path: a message another agent
+/// sent it is input and leaves request 1 open.
+pub(super) fn request1_input_closed(line: &[u8], agent_path: Option<&str>) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
     };
@@ -141,7 +147,7 @@ pub(super) fn request1_input_closed(line: &[u8]) -> bool {
             let payload_type = payload.kind.str();
             let payload_type = payload_type.as_deref().unwrap_or("");
             if payload_type == "agent_message" {
-                return true;
+                return agent_message(&payload, agent_path) != AgentMessage::Inbound;
             }
             serde_json::json!({"type":kind,"payload":{"type":payload_type,"role":payload.role.str()}})
         }
@@ -173,7 +179,7 @@ pub(super) fn request1_input_closed(line: &[u8]) -> bool {
 /// Handle one Codex line.
 pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8]) {
     if !state.request1_closed && out.kinds == KindsVersion::V2 {
-        state.request1_closed = request1_input_closed(line);
+        state.request1_closed = request1_input_closed(line, state.agent_path.as_deref());
     }
     if codex_never_counted(line) {
         out.stats.prefix_skipped += 1;
@@ -268,6 +274,37 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
             // Copied turns were requests of the session that wrote them.
             if !copied {
                 out.request(state);
+            }
+        }
+        "agent_message"
+            if out.kinds == KindsVersion::V2
+                && agent_message(&payload, state.agent_path.as_deref())
+                    == AgentMessage::Inbound =>
+        {
+            // Another agent's message to this thread is input to its next
+            // request, never a response of its own.
+            let (chars, images) = agent_message_chars_and_images(payload.content);
+            if chars > 0 {
+                if let Verdict::Count { kind, part } = kinds::codex_agent_message(&ctx) {
+                    let slot = Slot::plain(kind, part);
+                    out.record(
+                        state,
+                        day,
+                        slot,
+                        tokens_for_chars(chars),
+                        0,
+                        None,
+                        ts_secs,
+                        copied,
+                    );
+                }
+            }
+            if images > 0 {
+                if let Verdict::Count { kind, part } = kinds::image(&ctx, None) {
+                    let slot = Slot::plain(kind, part);
+                    let tokens = images * IMAGE_NOMINAL_TOKENS;
+                    out.record(state, day, slot, tokens, images, None, ts_secs, copied);
+                }
             }
         }
         "agent_message" => {
@@ -405,6 +442,61 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         }
     }
     let _ = owned;
+}
+
+/// Which way an `agent_message` record goes. One with a sender or addressee
+/// is a message between agents: it is this thread's own output only when this
+/// thread wrote it to another agent, and otherwise input another agent sent
+/// it (a thread with no agent path of its own, the root, receives). One with
+/// neither is the older record of the model's own reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentMessage {
+    Undirected,
+    Inbound,
+    Outbound,
+}
+
+pub(super) fn agent_message(payload: &CodexPayload, agent_path: Option<&str>) -> AgentMessage {
+    let author = payload.author.str();
+    let recipient = payload.recipient.str();
+    if author.is_none() && recipient.is_none() {
+        return AgentMessage::Undirected;
+    }
+    match agent_path {
+        Some(own) if author.as_deref() == Some(own) && recipient.as_deref() != Some(own) => {
+            AgentMessage::Outbound
+        }
+        _ => AgentMessage::Inbound,
+    }
+}
+
+/// The plain text and images of an agent message's content blocks. An
+/// encrypted block has no readable size and is not counted.
+fn agent_message_chars_and_images(content: Raw) -> (usize, u64) {
+    let Some(blocks) = content.elements() else {
+        return (0, 0);
+    };
+    let mut joined = Joined::default();
+    let mut images = 0u64;
+    for block in blocks {
+        let Some(block_text) = block.text() else {
+            continue;
+        };
+        let block_owned: Option<String>;
+        let Some(view) = decode_view!(block_text, block_owned, BlockView) else {
+            continue;
+        };
+        match view.kind.str().as_deref() {
+            Some("input_text" | "text" | "output_text") => {
+                if let Some(text) = view.text.str() {
+                    joined.push(&text);
+                }
+            }
+            Some("input_image" | "image") => images += 1,
+            _ => {}
+        }
+    }
+    (joined.chars(), images)
 }
 
 fn message(
