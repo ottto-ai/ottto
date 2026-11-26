@@ -399,13 +399,13 @@ pub use wire::{
     SNAPSHOT_QUARANTINE_CONTRACT_VERSION, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
 };
 
+pub(crate) use discovery::traversal::state::begin_source_pass;
 #[cfg(test)]
 use discovery::traversal::state::SettledScanResidue;
 #[cfg(test)]
 pub(crate) use discovery::traversal::state::{
     begin_continuation_read_ranges_for_test, take_continuation_read_ranges_for_test,
 };
-pub(crate) use discovery::traversal::state::begin_source_pass;
 pub(crate) use discovery::traversal::state::{
     CodexContinuationEvidence, ReasonReofferCooldown, TailDiscovery, UploadAckRetirementHandoff,
 };
