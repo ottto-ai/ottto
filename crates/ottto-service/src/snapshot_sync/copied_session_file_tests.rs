@@ -2059,6 +2059,27 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
             ready(&c, &carrier_scanner(&settled), settled, 100, true)
         });
         quiet.finish();
+        // Control: the same settle and quiet pass on a never-held corpus.
+        let (control, control_index, control_holder, _) = forced_carrier_corpus();
+        let control_scanner = carrier_scanner(&control_index);
+        let mut first = control.raw(
+            &control_scanner,
+            control_index.clone(),
+            100,
+            true,
+            &[control_holder],
+        );
+        first.enrich(&control);
+        let mut control_quiet = with_scan_clock(retry_at + 60, || {
+            let settled = settle(&control, &control_index, first, &mut e2_progress());
+            ready(&control, &carrier_scanner(&settled), settled, 100, true)
+        });
+        control_quiet.finish();
+        assert_eq!(
+            body(&quiet, THIRD).is_some(),
+            body(&control_quiet, THIRD).is_some(),
+            "after recovery the quiet pass matches a never-held corpus"
+        );
         assert!(body(&quiet, THIRD).is_none());
     });
 }
