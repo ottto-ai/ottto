@@ -2234,6 +2234,8 @@ pub(super) fn finish_sync_source(
             return Ok(());
         }
         Ok(ResumableUploadResult::Disabled(disabled_reason)) => {
+            // No scan success follows to retire a paced request.
+            continuation::drop_paced_request(source);
             report_status_with_fresh_relay_token(
                 client,
                 device,

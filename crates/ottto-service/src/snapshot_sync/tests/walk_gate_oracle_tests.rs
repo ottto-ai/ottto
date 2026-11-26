@@ -695,9 +695,11 @@ fn window_zero_policy_stop_clears_the_armed_record() {
             prepare_now(&mut home).unwrap().is_none(),
             "{row}: window 0 stops the pass"
         );
+        // The request itself, not its deadline: the hint's scan directive
+        // can hide the deadline while the request stands.
         assert_eq!(
-            with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten(),
-            None,
+            with_source_cadence(source, |cadence| cadence.paced_first_import()),
+            Some(false),
             "{row}: the stop drops the paced request"
         );
         assert!(status_count(&server) > statuses, "{row}: the tombstone");
