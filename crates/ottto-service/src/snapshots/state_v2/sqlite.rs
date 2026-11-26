@@ -55,6 +55,14 @@ fn sample_pager_writes(conn: &Connection, counter: Event) {
 const MMAP_BYTES: i64 = 2_147_418_112;
 const CACHE_KIB: i64 = -8192;
 const BUSY: Duration = Duration::from_millis(100);
+/// How long `lock_owner` waits for a just-released owner. A unit-test binary
+/// spawns processes from other tests' threads at any moment, and each spawn
+/// can hold a copy of the released descriptor until its exec, so tests wait
+/// longer than the daemon, which keeps `BUSY`.
+#[cfg(not(test))]
+const OWNER_RELEASE_WAIT: Duration = BUSY;
+#[cfg(test)]
+const OWNER_RELEASE_WAIT: Duration = Duration::from_secs(2);
 const PAGE_HEADERS: usize = 128;
 const JOURNAL_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
 const _: () = assert!(
@@ -426,12 +434,13 @@ fn lock_owner(path: &Path) -> Result<File> {
     private_file(&path)?;
     // A flock belongs to the open file description, which a concurrent fork
     // shares until the child execs. A just-released owner can therefore look
-    // busy for a moment; keep retrying for about BUSY before reporting it.
+    // busy for a moment; keep retrying for about OWNER_RELEASE_WAIT before
+    // reporting it.
     let started = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         ensure!(
             io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
-                && started.elapsed() < BUSY,
+                && started.elapsed() < OWNER_RELEASE_WAIT,
             "state_v2_exclusive_owner_busy"
         );
         std::thread::sleep(Duration::from_millis(2));
