@@ -1140,6 +1140,33 @@ fn record_collection_complete(source: SnapshotSource, at: &str) {
     });
 }
 
+/// What the end of one finish reads and never changes: fixed values of the
+/// preparation and the caller's handles, borrowed once the pass has its outcome.
+#[derive(Clone, Copy)]
+struct FinishEnv<'a> {
+    source: SnapshotSource,
+    client: &'a super::SnapshotApiClient,
+    device: &'a LocalDeviceBinding,
+    device_secret: &'a str,
+    machine_id: &'a str,
+    support_dir: &'a Path,
+    index_path: &'a Path,
+    activity_hint: &'a crate::snapshot_client::ActivityHintResponse,
+    receipt_window_days: u64,
+}
+
+/// The pass's settled facts at the end of a finish, read by each step there.
+#[derive(Clone, Copy)]
+struct PassEnd<'a> {
+    deferred_entity_count: Option<usize>,
+    resolved_permanent_rejections: bool,
+    permanent_refusals: PermanentRefusalCounts,
+    upload_fully_settled: bool,
+    isolated_only: bool,
+    accepted: u64,
+    terminal_scan_started_at: &'a str,
+}
+
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
@@ -2433,6 +2460,26 @@ pub(super) fn finish_sync_source(
     {
         eprintln!("local state maintenance deferred for {}", source.api_slug());
     }
+    let env = FinishEnv {
+        source,
+        client,
+        device,
+        device_secret,
+        machine_id,
+        support_dir,
+        index_path: &index_path,
+        activity_hint: &activity_hint,
+        receipt_window_days,
+    };
+    let end = PassEnd {
+        deferred_entity_count,
+        resolved_permanent_rejections,
+        permanent_refusals,
+        upload_fully_settled,
+        isolated_only,
+        accepted,
+        terminal_scan_started_at,
+    };
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass durably
     // committed its accepted siblings and each held entity waits on its own
@@ -2594,6 +2641,49 @@ pub(super) fn finish_sync_source(
         daemon.transcript_cache.retained_heap_bytes(&index)
     });
 
+    report_and_arm(
+        &env,
+        &upload_progress,
+        &index,
+        &scan_result,
+        walk_idle_pass,
+        end,
+    )
+}
+
+/// The terminal receipt and what follows it. Attempts the refusal receipt
+/// without changing the refusal outcome on a send error; a failed success
+/// receipt is returned before the walk gate is armed.
+fn report_and_arm(
+    env: &FinishEnv<'_>,
+    upload_progress: &SnapshotUploadProgress,
+    index: &ScanIndex,
+    scan_result: &SourceScanResult,
+    walk_idle_pass: Option<(crate::snapshots::walk_idle::Pass, bool)>,
+    end: PassEnd<'_>,
+) -> Result<()> {
+    let FinishEnv {
+        source,
+        client,
+        device,
+        device_secret,
+        machine_id,
+        support_dir,
+        index_path,
+        activity_hint,
+        receipt_window_days,
+        ..
+    } = *env;
+    let PassEnd {
+        deferred_entity_count,
+        resolved_permanent_rejections,
+        permanent_refusals,
+        upload_fully_settled,
+        isolated_only,
+        accepted,
+        terminal_scan_started_at,
+        ..
+    } = end;
     if let Some(count) = deferred_entity_count {
         let state = refused_entity_state(
             resolved_permanent_rejections,
@@ -2613,7 +2703,7 @@ pub(super) fn finish_sync_source(
             support_dir,
             source,
             if scan_result.census_complete {
-                TerminalManifestSource::CompleteCensus(&index)
+                TerminalManifestSource::CompleteCensus(index)
             } else {
                 TerminalManifestSource::Withdraw
             },
@@ -2621,8 +2711,8 @@ pub(super) fn finish_sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-                    .with_snapshot_terminal_counts(&index),
+                counts: SyncCounts::from_scan_result(scan_result, accepted, receipt_window_days)
+                    .with_snapshot_terminal_counts(index),
                 state,
             },
         );
@@ -2634,18 +2724,18 @@ pub(super) fn finish_sync_source(
                 source.api_slug()
             );
         } else if !resolved_permanent_rejections {
-            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "entity_deferred");
+            crate::snapshots::walk_idle::report_retired_unarmed(source, index, "entity_deferred");
             return Err(snapshot_entity_deferred(count));
         }
-        crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "entity_refused");
+        crate::snapshots::walk_idle::report_retired_unarmed(source, index, "entity_refused");
         // Permanent refusals remain disclosed after the durable save; a
         // reporting failure does not change the resolved transport outcome.
         return Ok(());
     } else {
         // This walk's loss blocks arming; standing terminal holds do not.
-        let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-            .with_snapshot_terminal_counts(&index);
-        let loss_free = !counts.has_walk_loss(&index);
+        let counts = SyncCounts::from_scan_result(scan_result, accepted, receipt_window_days)
+            .with_snapshot_terminal_counts(index);
+        let loss_free = !counts.has_walk_loss(index);
         let terminal_window_days = report_status_with_fresh_relay_token(
             client,
             device,
@@ -2653,7 +2743,7 @@ pub(super) fn finish_sync_source(
             support_dir,
             source,
             if scan_result.census_complete {
-                TerminalManifestSource::CompleteCensus(&index)
+                TerminalManifestSource::CompleteCensus(index)
             } else {
                 TerminalManifestSource::Withdraw
             },
@@ -2666,13 +2756,13 @@ pub(super) fn finish_sync_source(
             },
         )
         .inspect_err(|_| {
-            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "receipt_failed");
+            crate::snapshots::walk_idle::report_retired_unarmed(source, index, "receipt_failed");
         })?;
         if terminal_window_days == 0 {
             // The receipt went out as a tombstone: the server holds no census
             // for a record to stand for, so the next pass at a real window walks.
             crate::snapshots::walk_idle::clear(source, "window_zero");
-            crate::snapshots::walk_idle::report_retired_unarmed(source, &index, "window_zero");
+            crate::snapshots::walk_idle::report_retired_unarmed(source, index, "window_zero");
         } else if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
             let now = crate::scan_clock::utc_seconds();
             let outside = cycle_owed_nothing
@@ -2680,17 +2770,17 @@ pub(super) fn finish_sync_source(
                 && upload_fully_settled
                 && super::prepare::upload_owes_nothing(
                     source,
-                    &upload_progress,
+                    upload_progress,
                     support_dir,
-                    &activity_hint,
-                    &index,
+                    activity_hint,
+                    index,
                     now,
                 );
             crate::snapshots::walk_idle::arm_after_finish(
                 pass,
-                &index,
-                &index_path,
-                &scan_result,
+                index,
+                index_path,
+                scan_result,
                 outside,
             );
         }
