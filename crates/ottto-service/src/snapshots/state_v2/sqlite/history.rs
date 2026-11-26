@@ -18,7 +18,7 @@
 use super::super::VALUE_BYTES;
 use super::{
     linked_engine, lock_owner, pragmas, private_file, private_parent, same_object, sidecar,
-    Checkpoint,
+    Checkpoint, BUSY,
 };
 use anyhow::{bail, ensure, Result};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
@@ -165,7 +165,7 @@ impl Store {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         linked_engine()?;
         private_parent(path)?;
-        let owner_lock = lock_owner(path)?;
+        let owner_lock = lock_owner(path, BUSY)?;
         let created = match fs::symlink_metadata(path) {
             Ok(_) => false,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
