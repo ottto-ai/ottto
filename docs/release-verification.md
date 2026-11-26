@@ -178,6 +178,183 @@ attestations) are desirable for this mirror, but are not a hard verification gat
 unless the feature is enabled on the repository. Record the release immutability
 state as informational evidence rather than requiring it.
 
+## Release Privacy Gate
+
+`scripts/macos_privacy_gate.py` (Python 3 standard library, run with
+`python3 -I`) checks every file the stable release workflow sends out. It
+looks for the release owner's private strings (a marker list), for strings
+taken from the build machine (home folder, user and full name, host names,
+runner name, work and temp folders) and for home, temp and runner paths in
+general. A release stops before any bytes leave the build machine for Apple
+notarization, GitHub attestations or the Actions artifact upload. A publisher
+that copies the workflow's files to the CDN runs the same gate on the exact
+bytes it is about to upload.
+
+The gate prints fixed lines only: stage, role, finding class, error code and
+counts. It never prints a marker, an excerpt, a file name it did not expect,
+a raw path or tool output.
+
+### Policy value
+
+The `macos-stable-release` environment holds one variable,
+`OTTTO_RELEASE_PRIVACY_POLICY`, a JSON object:
+
+```json
+{"version":1,"mode":"enforce","advisory_xattrs":["macl","provenance"],"leaf_sha256":["<64 lowercase hex>"],"markers_sha256":"<64 lowercase hex>","accept_runner_machine_name_line":false}
+```
+
+| Key | Rule |
+|---|---|
+| `version` | The integer `1`. |
+| `mode` | `enforce` (the workflow and publishers accept only this) or `rehearsal` (local exercises; never with outbound credentials). |
+| `advisory_xattrs` | A subset of `macl` and `provenance`. A listed attribute's presence on a shipped file is counted but does not stop the release. Any marker in any attribute name or value still blocks. |
+| `leaf_sha256` | One or two distinct SHA-256 digests of the Developer ID leaf certificate (DER). Every signature the gate trusts must chain to Apple's Developer ID root and end in one of these leaves. Two entries cover a certificate rotation; both release lanes use the same list. |
+| `markers_sha256` | The marker list digest (below). |
+| `accept_runner_machine_name_line` | Optional, default `false`. When `true`, the runner log line `Machine name: '…'` is counted as `host_runner_line` instead of blocking. Everything else in a log still blocks. |
+
+Duplicate keys, unknown keys, wrong types and missing required keys are
+refused. The canonical form is the object with every key (including the
+default), sorted keys, sorted arrays, compact separators and ASCII escapes;
+`policy_sha256` is the SHA-256 of those bytes.
+
+### Marker list
+
+The marker list is UTF-8 text of at most 48 KiB with LF or CRLF line ends
+(not mixed, no bare CR). The workflow reads it from the environment secret
+`OTTTO_PRIVACY_MARKERS`; a local copy must be a regular file owned by the
+user with mode `0600`.
+
+- The first line is `id:` and 32 lowercase hex digits (a random salt).
+- Blank lines and lines starting with `#` are ignored.
+- Every other line is one literal of 4 to 256 characters with no control
+  characters and no leading or trailing space. A line that starts with
+  `<word>:` is tagged; the only tags are `owner:` (a legal name that may appear
+  in the shipped license files), `signer:` (a name that is public through the
+  Developer ID certificate) and `owner+signer:` (both). Other lines are plain
+  private literals. At least one literal is required.
+- Two literals that are equal after Unicode case folding and NFC are refused.
+
+`markers_sha256` is the SHA-256 of the UTF-8 bytes of the `id:` line and
+then every literal line, in file order with its tag as written, each followed
+by LF. Host-derived strings are not part of it.
+`python3 -I scripts/macos_privacy_gate.py markers --store <file>` prints that
+digest and counts, never a literal.
+
+### Matching
+
+- Each literal is searched in UTF-8, UTF-16LE and UTF-16BE at every byte
+  offset, in its NFC, NFD and Unicode case-folded forms, ignoring ASCII case.
+  Every literal is matched on its own, including overlapping matches.
+- JSON keys and values, property list keys, strings and data, XML text and
+  attributes, HTML entities in the license page and percent escapes in URL
+  fields are decoded and searched again after case folding and NFC.
+- A home folder (`/Users/<name>` other than `/Users/Shared`, `/home/<name>`),
+  a per-user temp folder (`/var/folders/…`) or a runner work folder
+  (`/_work/`, `actions-runner`) blocks wherever it appears.
+- File and folder names, symbolic link targets and extended attribute names
+  and values are searched too. `com.apple.provenance` and `com.apple.macl` on
+  a shipped file (inside the DMG or a ZIP) block unless the policy lists them
+  as advisory; other attributes are allowed only where the role expects them.
+- `owner:` and `owner+signer:` literals inside the four approved license
+  files are not reported: `LICENSE`, `NOTICE` and `LICENSE-THIRD-PARTY.html`
+  with the bytes of the public source commit, and `LICENSE-Sparkle.txt` with
+  its recorded SHA-256, at `Ottto.app/Contents/Resources/` or a binary ZIP's
+  root. Every other marker in those files still blocks.
+- `signer:` and `owner+signer:` literals are not reported in signed bytes
+  whose signature the gate verified (code signature, Developer ID chain and
+  pinned leaf): signed Mach-O files, the signed DMG file and its decoded disk,
+  and the CMS manifest signature. They are searched everywhere else, including
+  the decoded manifest, mounted files, names and attributes. So the owner's
+  name inside signed bytes is not flagged; it is public through `NOTICE` and
+  every signature. A legal name that appears in the license files must be
+  tagged `owner+signer:`, because the decoded disk has no per-file exception.
+
+### Roles and lanes
+
+Every file has a fixed role and name; anything else in a scanned folder is a
+finding.
+
+| Role | File |
+|---|---|
+| `app_dmg` | `Ottto-macos-arm64.dmg` |
+| `cli_zip` | `ottto-macos-arm64.zip` |
+| `service_zip` | `ottto-service-macos-arm64.zip` |
+| `sbom` | `ottto-local-platform-sbom.cdx.json` |
+| `launch_smoke` | `packaged-app-launch-smoke.json` |
+| `manifest` | `release-manifest.json` |
+| `manifest_sig` | `release-manifest.json.sig` |
+| `checksums` | `subject.checksums.txt` |
+| `installer` | `install-macos.sh` |
+| `formula` | `homebrew/ottto.rb` |
+| `rc_evidence` | `stable-candidate-rc-qa.json` |
+| `clean_machine_evidence` | `stable-clean-machine-qa.json` |
+| `appcast` | `appcast.xml` |
+| `privacy_receipt` | `privacy-receipt.json` |
+
+| Lane | Workflow upload (`upload` profile) | Publisher (`publish` profile) |
+|---|---|---|
+| `candidate` | `app_dmg`, `cli_zip`, `service_zip`, `sbom`, `launch_smoke`, `manifest`, `manifest_sig`, `checksums`, `privacy_receipt` | the upload set without `privacy_receipt`; `appcast` optional |
+| `stable` | candidate set plus `installer`, `formula`, `rc_evidence` | the upload set without `privacy_receipt`, plus `clean_machine_evidence` and `appcast` |
+| `manual` | candidate set plus `installer`, `formula` | the upload set without `privacy_receipt`; `appcast`, `rc_evidence` and `clean_machine_evidence` are refused |
+
+`python3 -I scripts/macos_privacy_gate.py roles --profile <profile> --lane <lane>`
+prints the role table for a lane as JSON.
+
+### Scan command and response
+
+```sh
+python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder> \
+  [--lane candidate|stable|manual] [--appcast present|absent] \
+  [--seal-from <folder>] [--markers-fd <n> | --markers-store <file>] \
+  [--response-fd <n>] [--state <folder>]
+```
+
+Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
+`notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
+`attest` (the attestation subjects, SBOM and checksums), `upload`, `publish`,
+`dispatch` (the workflow inputs) and `logs`. The policy comes from
+`OTTTO_RELEASE_PRIVACY_POLICY`; the markers from a file descriptor, a local
+store, or, only inside the release workflow, `OTTTO_PRIVACY_MARKERS`.
+With `--seal-from`, the gate copies the role files into the new `--root`
+folder, scans the copies and makes the folder and files immutable
+(`uchg`); consumers read only the sealed copies.
+
+The response is one JSON object, written to `--response-fd` (or standard
+output) and nothing else:
+
+```json
+{"schema":"ottto.release-privacy-scan","schema_version":1,"profile":"publish","lane":"stable",
+ "verdict":"clean","policy_sha256":"<hex>","markers_sha256":"<hex>",
+ "roles":[{"role":"app_dmg","path":"Ottto-macos-arm64.dmg","size":123,"sha256":"<hex>"}],
+ "findings":{"private":0},"advisory_xattrs":{"macl":0,"provenance":0},"incomplete":0}
+```
+
+`roles` has exactly one row per expected role, sorted by role. `verdict` is
+`clean`, `blocked` (at least one finding) or `incomplete` (a file could not be
+fully checked). A consumer accepts a scan only when the exit status is 0, the
+response is the only output on its descriptor, `verdict` is `clean`, both
+digests equal its own policy and marker digests, and every row's size and
+SHA-256 equal the bytes it is about to send.
+
+| Exit | Meaning |
+|---|---|
+| 0 | `clean`: nothing found, everything covered. |
+| 1 | `blocked`: at least one finding. |
+| 2 | Usage, policy or marker list error; no scan ran. |
+| 3 | `incomplete`: an unsupported, unreadable or over-limit input. |
+
+### Receipt
+
+The workflow's upload carries `privacy-receipt.json`
+(`"schema": "ottto.release-privacy-receipt"`, `schema_version` 1) with the
+workflow path, run ID and attempt, source commit, app source commit, lane,
+version, `policy_sha256`, `markers_sha256`, the verdict of every gate stage,
+the advisory attribute counts on shipped files and one row (role, path, size,
+SHA-256) per uploaded file other than the receipt. The Actions artifact is
+named `ottto-macos-<channel>-<version>-attempt-<n>`. A publisher accepts only
+a receipt from that exact run attempt whose digests equal its own policy and
+marker digests.
+
 ## Verify Stable Candidate RC
 
 Before a stable public release, the same commit must first pass internal
