@@ -2053,8 +2053,11 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
             actual,
             portable_carrier_bodies(&expected.scan.snapshots, &healthy.base)
         );
-        let settled = settle(&c, &index, recovered, &mut e2_progress());
-        let mut quiet = ready(&c, &carrier_scanner(&settled), settled, 100, true);
+        // The quiet pass keeps the recovery's clock: time never runs backwards.
+        let mut quiet = with_scan_clock(retry_at + 60, || {
+            let settled = settle(&c, &index, recovered, &mut e2_progress());
+            ready(&c, &carrier_scanner(&settled), settled, 100, true)
+        });
         quiet.finish();
         assert!(body(&quiet, THIRD).is_none());
     });
