@@ -32,6 +32,11 @@ HOME_ROOT = "/" + "Us" + "ers/"
 TEMP_ROOT = "/var/" + "fold" + "ers/"
 
 
+def read_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
 def store(*lines):
     return ("\n".join((ID_LINE,) + lines) + "\n").encode("utf-8")
 
@@ -216,10 +221,12 @@ class Matching(unittest.TestCase):
 
     def test_legal_file_needs_the_exact_bytes(self):
         notice = ("Copyright " + OWNER + "\n").encode()
-        for content, expected in ((notice, {}), (notice + b"x", {"owner": 1}),
-                                  (notice + PRIVATE.encode(), {"private": 1})):
+        # Changed bytes lose the exception; approved bytes still report every non-owner marker.
+        with_private = notice + PRIVATE.encode()
+        for content, approved, expected in ((notice, notice, {}), (notice + b"x", notice, {"owner": 1}),
+                                            (with_private, with_private, {"private": 1})):
             gate = make_gate(PRIVATE, "owner:" + OWNER)
-            gate.legal_hashes = {"NOTICE": hashlib.sha256(notice).hexdigest()}
+            gate.legal_hashes = {"NOTICE": hashlib.sha256(approved).hexdigest()}
             gate.scan_member("Contents/Resources/NOTICE", content, "role", "k", None, "NOTICE")
             self.assertEqual(set(gate.findings), set(expected))
 
@@ -257,7 +264,7 @@ class Formats(unittest.TestCase):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             for name, data in (("ottto", executable or macho(payload=b"signed")),) + tuple(
-                    (n, open(os.path.join(ROOT, n), "rb").read()) for n in g.legal_names(archive=True)) + extra:
+                    (n, read_bytes(os.path.join(ROOT, n))) for n in g.legal_names(archive=True)) + extra:
                 info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = (0o100755 if name == "ottto" else 0o100644) << 16
@@ -495,7 +502,7 @@ class CommandLine(unittest.TestCase):
         self.assertTrue(lines and all(line.startswith("::add-mask::") for line in lines))
         self.assertIn("::add-mask::per%25cent value", lines)
         self.assertNotIn(ID_LINE[3:].encode(), result.stdout)
-        work = open(env_file).read().strip().split("=", 1)[1]
+        work = read_bytes(env_file).decode().strip().split("=", 1)[1]
         self.assertTrue(os.path.isdir(work))
         os.rmdir(work)
 
