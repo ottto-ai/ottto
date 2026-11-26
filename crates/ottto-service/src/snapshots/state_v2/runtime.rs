@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+mod baseline;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Hold {
@@ -137,6 +139,8 @@ struct RouteState {
     current: Option<Arc<Runtime>>,
     // Logical row commitments, consumed by the next save or discarded at idle.
     save_digests: Option<kinds::Baseline>,
+    // Keep the save proof across session reopens of the same store.
+    saved_in_process: Option<Identity>,
     page_limit: usize,
     requested_page: usize,
     save_hold: Option<Hold>,
@@ -274,6 +278,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                     runtimes: Vec::new(),
                     current: None,
                     save_digests: None,
+                    saved_in_process: None,
                     page_limit: 250,
                     requested_page: 250,
                     save_hold: None,
@@ -766,6 +771,9 @@ pub(in super::super) fn save_locked(
                 state.tail = stage;
             }
             let digests = saved?;
+            if state.saved_in_process.as_ref() != Some(&id) {
+                state.saved_in_process = Some(id);
+            }
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
             // A claim-only save keeps its carrier links for decide; row
@@ -1218,6 +1226,9 @@ pub(in super::super) fn idle(path: &Path, index: &ScanIndex, quiet: bool) -> Res
             pair.is_some_and(|(identity, _)| identity == session.identity),
             Hold::ForeignBinding
         );
+        if state.saved_in_process.as_ref() == Some(&session.identity) {
+            baseline::truncate(path);
+        }
         telemetry::baseline(path);
         // This hook is between sync cycles even when that cycle saved rows.
         erasure_inventory(path)?;
@@ -1256,8 +1267,8 @@ fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
     Ok(())
 }
 
-/// Inventory only: the baseline's explicit single-file erasure exception and
-/// the H/N/L-only restart cache are not covered by a DB VACUUM claim.
+/// Inventory only: report remaining baseline bytes and the H/N/L-only restart
+/// cache separately from DB VACUUM.
 fn erasure_inventory(path: &Path) -> Result<()> {
     let artifacts = fence::ARTIFACTS
         .iter()

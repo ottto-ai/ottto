@@ -1666,6 +1666,101 @@ fn bound_v1_load_without_support_adopts_native_custody_before_saving() {
     assert!(published(&f.path).unwrap());
 }
 
+/// A published and saved route clears old baseline bytes while retaining rollback evidence.
+#[test]
+fn saved_published_route_truncates_old_baseline_and_keeps_custody() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+    fs::write(&f.path, &bytes).unwrap();
+    let mut index = ScanIndex::load(&f.path).unwrap();
+    let baseline = fence::sibling(&f.path, ".v1-readonly");
+    let shards = fence::sibling(&f.path, ".v1-readonly.shards");
+    fs::create_dir(&shards).unwrap();
+    fs::write(shards.join("synthetic-shard"), b"shard").unwrap();
+    let old =
+        std::time::SystemTime::now() - telemetry::BASELINE_RETENTION - Duration::from_secs(60);
+    fs::File::open(&baseline)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    index.save(&f.path).unwrap();
+    idle(&f.path, &index, false).unwrap();
+    assert_eq!(fs::metadata(&baseline).unwrap().len(), 0);
+    assert_eq!(
+        fs::metadata(&baseline).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+    assert!(fs::read_dir(&shards).unwrap().next().is_none());
+    assert_eq!(
+        telemetry::take_thread_event_for_test("baseline_truncated"),
+        Some(serde_json::json!({"files": 1, "bytes": bytes.len() + 5}))
+    );
+    assert_eq!(
+        telemetry::take_thread_event_for_test("baseline_inventory"),
+        Some(serde_json::json!({"count": 1, "bytes": 0, "bounded": false}))
+    );
+
+    fs::File::open(&baseline)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    fs::write(shards.join("remaining-shard"), b"shard").unwrap();
+    idle(&f.path, &index, false).unwrap();
+    assert!(fs::read_dir(&shards).unwrap().next().is_none());
+    assert_eq!(
+        telemetry::take_thread_event_for_test("baseline_truncated"),
+        Some(serde_json::json!({"files": 0, "bytes": 5}))
+    );
+    assert_eq!(
+        telemetry::take_thread_event_for_test("baseline_14day_escalation_alarm"),
+        Some(serde_json::json!(false))
+    );
+
+    let generation = index.generation;
+    drop(index);
+    cold_close_for_test(&f.path).unwrap();
+    assert_eq!(ScanIndex::load(&f.path).unwrap().generation, generation);
+    cold_close_for_test(&f.path).unwrap();
+    fs::rename(&f.path, f.support.join("saved-fence")).unwrap();
+    fs::rename(
+        fence::sibling(&f.path, ".v2.sqlite"),
+        f.support.join("saved-store"),
+    )
+    .unwrap();
+    let error = ScanIndex::load(&f.path).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
+    assert_eq!(fs::metadata(&baseline).unwrap().len(), 0);
+}
+
+/// Young baselines and routes without a save in this process keep their bytes.
+#[test]
+fn baseline_cleanup_requires_age_and_a_process_save() {
+    for saved in [false, true] {
+        let f = Fixture::new();
+        let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
+        fs::write(&f.path, &bytes).unwrap();
+        let mut index = ScanIndex::load(&f.path).unwrap();
+        let baseline = fence::sibling(&f.path, ".v1-readonly");
+        if saved {
+            index.save(&f.path).unwrap();
+        } else {
+            let old = std::time::SystemTime::now()
+                - telemetry::BASELINE_RETENTION
+                - Duration::from_secs(60);
+            fs::File::open(&baseline)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        idle(&f.path, &index, false).unwrap();
+        assert_eq!(fs::read(&baseline).unwrap(), bytes);
+        assert!(telemetry::take_thread_event_for_test("baseline_truncated").is_none());
+    }
+}
+
 /// [format] Legacy refusal debt survives exact decoding and ordinary save removes it on native and imported stores.
 #[test]
 fn retired_file_size_debt_clears_through_normal_save_and_reopen() {

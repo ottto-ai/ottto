@@ -624,6 +624,18 @@ refusals retain the existing support blocker. Successful authenticated adoption
 clears it. Quarantine and user Repair use the same verified publisher at G=0;
 Repair keeps its identity and accepted-debt carry, witness and cooldown ordering.
 
+Between cycles, a published route with an open store and a committed save in
+this process truncates its v1 baseline to zero bytes once the baseline mtime is
+at least 14 days old. It clears the preserved shard files and keeps the shard
+directory. The remaining names still prove prior history. Only unpublished
+import recovery reads the baseline's bytes.
+
+The startup sweep truncates ordinary scan-index and upload-progress quarantine
+copies to zero bytes after seven days, measured from the newest name or file
+timestamp. It checks the checkpoint lock, writer liveness, ownership and file
+identity before writing. The names still prove prior history and carry the
+rebuild cooldown timestamps.
+
 Snapshot audits start from an empty in-memory graph, finish the traversal in
 memory and aggregate every page. Each invocation reports the complete selected
 source again; the report schema is unchanged. Audit state directories retain

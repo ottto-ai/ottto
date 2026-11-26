@@ -569,6 +569,21 @@ pub(crate) use tests::codex_archive_tests::{
 mod tests;
 
 #[cfg(test)]
+pub(crate) fn claude_quarantine_history_for_test(index_path: &Path) -> bool {
+    let destination = "a".repeat(64);
+    let progress = SnapshotUploadProgress::new(
+        destination.clone(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    prepare::claude_destination_history_here(
+        &crate::backfill::BackfillState::default(),
+        &destination,
+        &progress,
+        index_path,
+    )
+}
+
+#[cfg(test)]
 #[path = "snapshot_sync/tests/exact_body_ack_tests.rs"]
 mod exact_body_ack_tests;
 
