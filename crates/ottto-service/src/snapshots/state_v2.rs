@@ -661,8 +661,14 @@ pub(crate) use import::{with_carrier_head_error_for_test, with_carrier_store_err
 
 #[cfg(test)]
 pub(crate) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+    replace_tail_head_bytes_for_test(index, key, &[0]);
+}
+
+/// Replace only the persisted head. The fixture reloads the index afterward.
+#[cfg(test)]
+pub(crate) fn replace_tail_head_bytes_for_test(index: &ScanIndex, key: &str, head: &[u8]) {
     seed_tail_head_for_test(index, |tx| {
-        tail::put_head_for_test(tx, key.as_bytes(), &[0])
+        tail::put_head_for_test(tx, key.as_bytes(), head)
     });
 }
 

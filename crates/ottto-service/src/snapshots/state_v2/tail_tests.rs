@@ -96,6 +96,7 @@ fn progress_row() -> crate::snapshots::ScanIndexEntry {
 }
 
 /// A reset from an older revision keeps the committed head, reduction and debt rows.
+/// With no changed index rows for that file, the rest of the save needs no reload.
 #[test]
 fn reset_refuses_a_newer_committed_revision() {
     let f = Fixture::new();
@@ -117,6 +118,8 @@ fn reset_refuses_a_newer_committed_revision() {
         ..staged(b"older", &[(Collection::Responses, 0, b"older page")])
     };
     stage_tail(&f.path, FILE, reset).unwrap();
+    index.files.insert(SIBLING.into(), progress_row());
+    stage_tail(&f.path, SIBLING, staged(b"sibling", &[])).unwrap();
     telemetry::take_thread_event_for_test("tail_reset_newer_refused");
     save_with(&f.path, &mut index).unwrap();
 
@@ -124,11 +127,16 @@ fn reset_refuses_a_newer_committed_revision() {
         telemetry::take_thread_event_for_test("tail_reset_newer_refused"),
         Some(serde_json::json!(1))
     );
-    assert_eq!(tail_set_aside(&index, FILE).unwrap().unwrap().attempts, 1);
+    assert!(stage_empty(&f.path));
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    let marker = tail_set_aside(&index, FILE).unwrap().unwrap();
+    assert_eq!((marker.cause, marker.attempts), (SetAsideCause::Row, 1));
     assert_eq!(
         ["tail.head", "tail.page.responses", "tail.revision"].map(|kind| rows(&index, kind, FILE)),
         before
     );
+    assert!(index.files.contains_key(SIBLING));
+    assert_eq!(read(&index, SIBLING).unwrap().0.unwrap().body, b"sibling");
 }
 
 /// [behaviour] Heads, pages and fragments roundtrip; only changed rows move, and

@@ -1765,7 +1765,7 @@ pub(super) fn apply(
                 Ok(())
             })?;
             if result.is_err() {
-                applied.rolled_back += u64::from(owns_closure);
+                applied.rolled_back += u64::from(!closure.is_empty());
                 rows.revert(closure);
                 failed = Some(SetAsideCause::Row);
             }

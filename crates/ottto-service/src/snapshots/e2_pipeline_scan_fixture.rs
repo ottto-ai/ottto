@@ -1565,7 +1565,6 @@ pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
     };
     // Ordinary stages keep the committed collection metadata and pages.
     match damage {
-        "future" => staged.revision += 1,
         "corrupt" => staged.head = vec![0],
         _ => panic!("unknown fixture damage"),
     }

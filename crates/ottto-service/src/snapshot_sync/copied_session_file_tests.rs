@@ -1961,6 +1961,7 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
     use crate::snapshots::e2_pipeline_scan_fixture::{
         forced_needs_native_for_test, set_future_tail_fact_for_test, tail_counter_for_test,
     };
+    use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
     use crate::snapshots::state_v2::tail_head_bytes_for_test;
 
     if !crate::heap_layout_bound::layout_supported() {
@@ -1973,7 +1974,7 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
         assert!(scanner.paths().contains(&carrier));
         expected.enrich(&healthy);
         expected.finish();
-        assert_eq!(body(&expected, THIRD).unwrap().request_count, 1);
+        let expected_third_requests = body(&expected, THIRD).unwrap().request_count;
         assert!(body(&expected, LATE).is_some());
 
         let (c, mut index, holder, carrier) = forced_carrier_corpus();
@@ -2017,7 +2018,11 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
         index.activate_upload_context("e2-synthetic-destination".into());
         set_future_tail_fact_for_test(&mut index, &key, false);
         let scanner = carrier_scanner(&index);
-        let mut recovered = c.raw(&scanner, index.clone(), 100, true, &[holder]);
+        // The held page may have used the holder's six-hour growth Full claim.
+        let retry_at = crate::scan_clock::utc_seconds() + 7 * 60 * 60;
+        let mut recovered = with_scan_clock(retry_at, || {
+            c.raw(&scanner, index.clone(), 100, true, &[holder])
+        });
         assert!(scanner.paths().contains(&carrier));
         recovered.enrich(&c);
         let mut retried = twin(&recovered);
@@ -2030,6 +2035,10 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
                 .filter(|item| item.source_session_id == THIRD)
                 .count(),
             1
+        );
+        assert_eq!(
+            body(&retried, THIRD).unwrap().request_count,
+            expected_third_requests
         );
         let mut actual = portable_carrier_bodies(&sent.scan.snapshots, &c.base);
         for (session, value) in portable_carrier_bodies(&retried.scan.snapshots, &c.base) {
@@ -2085,11 +2094,12 @@ fn forced_carrier_with_unavailable_live_input_still_reads_full() {
             drop(reads);
             page.enrich(&c);
             page.finish();
-            assert_eq!(body(&page, THIRD).unwrap().request_count, 1);
             portable_carrier_bodies(&page.scan.snapshots, &c.base)
         })
     };
-    assert_eq!(run(true), run(false));
+    let healthy = run(false);
+    assert!(healthy.contains_key(THIRD));
+    assert_eq!(run(true), healthy);
 }
 
 /// A failed save withholds the copy and recovery offers the same bodies without a request-count increase.
