@@ -484,7 +484,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   session facts (title, first prompt, workspace, opening settings; Codex also stores its agent
   label and prelude) among them: no transcript byte is
   read back for content. A refusal is a counted Full; only a newer build's
-  head holds. An equal-size mtime move at or before the indexed read's nonzero ctime can
+  head holds. The Codex prelude fact is written as v1; a v2 fact (v1 followed by one
+  length-prefixed extension) is read too, its extension skipped, so a later build that
+  writes it can roll back to this one without a hold or a Full. An equal-size mtime move at or before the indexed read's nonzero ctime can
   restore from that read's certificate when size and stored mtime bind it to the entry,
   births are known and equal, and both bounded sample digests match. This removes a
   whole-file read for retention touches; ordinary later writes still read Full. A first

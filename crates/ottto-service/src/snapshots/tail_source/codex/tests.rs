@@ -776,6 +776,51 @@ fn codex_content_loads_back_from_its_session_facts() {
     );
 }
 
+/// [format] The Codex prelude fact is written as v1, and this build also
+/// reads v2: the v1 fields followed by one length-prefixed extension, which
+/// it skips. A v2 fact restores the same prelude as its v1 part, empty or
+/// not, so a later build that writes v2 can roll back to this one with
+/// nothing held and nothing read again. A v2 fact without its extension, or
+/// with bytes after it, is corrupt; a newer version is incompatible.
+#[test]
+fn a_codex_prelude_fact_v2_restores_its_v1_part() {
+    let (reduction, certificate) = parse(&lines(3));
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+    let page = (Collection::SessionFacts, 5);
+    let v1 = staged.pages[&page].clone();
+    assert_eq!(v1[..2], [5, 1], "kind 5, written as version 1");
+    let prelude = |acc: &SnapshotAccumulator| {
+        Enc::count_write(usize::MAX, |e| acc.session_start.put_codex_prelude_fact(e)).unwrap()
+    };
+    let stored = prelude(&loaded(&staged));
+    assert_eq!(stored, v1[2..], "v1 loads back to its own bytes");
+    let with = |version: u8, tail: &[u8]| {
+        let mut staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+        let mut bytes = vec![5, version];
+        bytes.extend_from_slice(&v1[2..]);
+        bytes.extend_from_slice(tail);
+        staged.pages.insert(page, bytes);
+        staged
+    };
+    for (label, extension) in [("empty", &[0][..]), ("filled", &[3, 9, 8, 7][..])] {
+        let v2 = with(2, extension);
+        assert_eq!(cause(&v2), None, "{label}: a v2 fact loads");
+        assert_eq!(prelude(&loaded(&v2)), stored, "{label}: the v1 part");
+    }
+    for (label, tail) in [
+        ("no extension", &[][..]),
+        ("short", &[4, 1][..]),
+        ("trailing", &[1, 1, 0][..]),
+    ] {
+        assert_eq!(
+            cause(&with(2, tail)),
+            Some(ReconstructCause::Corrupt),
+            "{label}"
+        );
+    }
+    assert_eq!(cause(&with(3, &[0])), Some(ReconstructCause::INCOMPATIBLE));
+}
+
 fn marker_line(minute: usize) -> serde_json::Value {
     json!({"type":"compacted","timestamp":at(minute)})
 }

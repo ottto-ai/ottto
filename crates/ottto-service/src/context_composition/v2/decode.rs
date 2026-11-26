@@ -251,6 +251,11 @@ pub(super) struct CodexPayload<'a> {
     pub(super) cwd: Raw<'a>,
     #[serde(borrow)]
     pub(super) trigger_turn: Raw<'a>,
+    /// An `agent_message`'s sender and addressee, agent paths.
+    #[serde(borrow)]
+    pub(super) author: Raw<'a>,
+    #[serde(borrow)]
+    pub(super) recipient: Raw<'a>,
 }
 
 /// The fields of a `session_meta` payload the reader needs.
@@ -273,6 +278,9 @@ pub(super) struct SessionMetaView<'a> {
     pub(super) subagent_history_start_ordinal: Raw<'a>,
     #[serde(borrow)]
     pub(super) cwd: Raw<'a>,
+    /// This thread's own agent path (multi-agent sessions only).
+    #[serde(borrow)]
+    pub(super) agent_path: Raw<'a>,
 }
 
 /// An `item_completed` item (only the item types the reader passes on).
