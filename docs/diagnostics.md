@@ -1774,8 +1774,9 @@ nothing. A finish that retires a walk emits one `walk_gate` point with `arm`:
 `armed`, or `not:<why>` (`unsettled`, `upload`, `telemetry_unread`,
 `owes:<kind>`, `no_start`, `key:<input>` for an input that moved during the
 walk, or `generation`; a retiring finish that exits before arming reports
-`entity_deferred`, `entity_refused` or `receipt_failed`). Counts and enum
-names only.
+`entity_deferred`, `entity_refused` or `receipt_failed`; one whose terminal
+receipt read a zero window reports `window_zero` and clears the record).
+Counts and enum names only.
 
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher
