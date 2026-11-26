@@ -414,7 +414,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      MONEY_EQUIVALENCE_BASE: ${{ inputs.money_equivalence_base }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
         with:
@@ -426,6 +425,8 @@ jobs:
       - name: Compare identical synthetic inputs
         env:
           GH_TOKEN: ${{ github.token }}
+          # Empty selects the fork point; the script prints the resolved base.
+          MONEY_EQUIVALENCE_BASE: ${{ inputs.money_equivalence_base }}
         run: python3 scripts/money_equivalence.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
