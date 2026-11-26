@@ -765,6 +765,8 @@ pub(super) fn prepare_sync_source_inner(
         // The tombstone withdraws the server's census, which the armed
         // walk record stood for: the next pass at a real window walks.
         crate::snapshots::walk_idle::clear(source, "window_zero");
+        // No pass retires a paced request while the window stays 0.
+        continuation::drop_paced_request(source);
         withdraw_and_report_policy_stop(
             client,
             device,

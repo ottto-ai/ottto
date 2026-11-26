@@ -957,7 +957,7 @@ pub(super) fn after_ordinary_codex_page(
 
 /// A failed source pass leaves no paced request or cursor continuation.
 pub(super) fn after_ordinary_source_failure(source: SnapshotSource) {
-    with_source_cadence(source, SourceCadence::clear_continuation);
+    drop_paced_request(source);
     if source == SnapshotSource::Codex {
         clear(&mut CodexCadence, &TICKET);
     }
@@ -976,12 +976,21 @@ pub(super) fn settle_cycle(
     }
 }
 
+/// A source with no pass to retire its paced request (paused, ungranted, or
+/// stopped by a window-0 tombstone) drops it. Kept, its past deadline would
+/// end every cycle wait at once.
+pub(super) fn drop_paced_request(source: SnapshotSource) {
+    with_source_cadence(source, SourceCadence::clear_continuation);
+}
+
 /// Settles the continuation when an ordinary cycle ends ([`settle_cycle`]).
 /// Created right after `SNAPSHOT_SYNC_LOCK` is taken, so it drops, and settles,
 /// before the lock is released on every return path, including `?`.
 #[derive(Default)]
 pub(super) struct CycleSettlement {
     succeeded_with_codex: bool,
+    /// The sources this cycle collects; none until the cycle knows them.
+    collecting: Vec<SnapshotSource>,
 }
 
 impl CycleSettlement {
@@ -989,10 +998,21 @@ impl CycleSettlement {
     pub(super) fn succeeded(&mut self, codex_granted: bool) {
         self.succeeded_with_codex = codex_granted;
     }
+
+    /// The cycle collects `sources`; every other source's paced request
+    /// drops when it ends.
+    pub(super) fn collecting(&mut self, sources: &[SnapshotSource]) {
+        self.collecting = sources.to_vec();
+    }
 }
 
 impl Drop for CycleSettlement {
     fn drop(&mut self) {
+        for source in super::SNAPSHOT_SOURCES {
+            if !self.collecting.contains(&source) {
+                drop_paced_request(source);
+            }
+        }
         settle_cycle(&mut CodexCadence, &TICKET, self.succeeded_with_codex);
     }
 }

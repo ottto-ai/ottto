@@ -2958,3 +2958,87 @@ fn destination_change_requests_paced_scan_only_when_first_import_is_owed() {
     super::super::clear_source_upload_deadlines_for_test();
     super::super::clear_cadence_state_for_test();
 }
+
+/// [behaviour] A source the cycle does not collect (paused, ungranted, or every
+/// source when the cycle fails before it knows them) drops its paced request
+/// when the cycle ends. Kept, its past deadline would make every wait
+/// `Wake::Ordinary(0)`: a busy loop until a restart or a resume.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn uncollected_sources_drop_paced_requests_so_the_cycle_waits() {
+    use super::super::paced_scan_due;
+    struct CycleLoop {
+        seconds: u64,
+        waits: Vec<Duration>,
+    }
+    impl LoopHost for CycleLoop {
+        fn now(&mut self) -> Instant {
+            crate::scan_clock::with_clock(self.seconds, crate::scan_clock::now)
+        }
+        fn wait(&mut self, wait: Duration) -> bool {
+            self.waits.push(wait);
+            self.seconds += wait.as_secs();
+            false
+        }
+        fn pending(&mut self) -> Option<(Instant, Duration)> {
+            None
+        }
+        fn paced_due(&mut self) -> Option<Instant> {
+            crate::scan_clock::with_clock(self.seconds, paced_scan_due)
+        }
+        fn page(&mut self, _: Instant) -> Outcome {
+            panic!("an ordinary wait must not run a cursor page")
+        }
+    }
+    let _saved = OwnedCadences::install();
+    let cycles: [&[SnapshotSource]; 3] = [
+        &[],
+        &[SnapshotSource::Codex],
+        &[SnapshotSource::ClaudeCode, SnapshotSource::Pi],
+    ];
+    for collecting in cycles {
+        super::super::clear_cadence_state_for_test();
+        super::super::clear_source_upload_deadlines_for_test();
+        let mut host = CycleLoop {
+            seconds: 1000,
+            waits: Vec::new(),
+        };
+        let start = host.now();
+        let due = start + Duration::from_secs(30);
+        for source in ROTATION {
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(start, 1);
+                assert!(cadence.request_paced_scan(
+                    start,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(30),
+                        idle_per_work: 0,
+                    },
+                    false,
+                ));
+            });
+        }
+        let mut cycle = CycleSettlement::default();
+        cycle.collecting(collecting);
+        drop(cycle);
+        for source in ROTATION {
+            assert_eq!(
+                with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten(),
+                collecting.contains(&source).then_some(due),
+                "{source:?} after a cycle collecting {collecting:?}"
+            );
+        }
+        // Past every dropped deadline, the cycle waits its full interval.
+        host.seconds += 60;
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        let expected = if collecting.is_empty() {
+            SNAPSHOT_SYNC_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        assert_eq!(host.waits, [expected], "after {collecting:?}");
+    }
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+}
