@@ -2203,11 +2203,12 @@ past its length after the last drain (scans stalled; nothing is refused or
 dropped for size). Rows a drain could not move set that length, so a refused
 backlog never drains on each request. A drain first renames the journal to a
 new numbered `prev` file (`claude-code-relay-journal.prev.<n>.jsonl`), with no
-copy and no fsync, and keeps each `prev` file until a drain at least a minute
+copy, and keeps each `prev` file until a drain at least a minute
 after its own rows reached their per-session files, so rows keep an on-disk
 copy until those writes have been written back. That drain removes it, also
 with an empty journal, so frequent drains never grow a `prev` file and an idle
-one lives about one scan interval. The first drain after a start replays every
+one lives about one scan interval. While an earlier `prev` file is still kept, a
+drain syncs the new one before it answers again. The first drain after a start replays every
 `prev` file, oldest first (the single `claude-code-relay-journal.prev.jsonl` an
 earlier release kept comes first), then the journal.
 Readers read only the per-session files, after a drain. A replay or a crash

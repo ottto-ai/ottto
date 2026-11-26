@@ -10,7 +10,8 @@
 //! journal to a new numbered `prev` file and keeps each `prev` file until a
 //! drain at least a minute after its own rows reached their per-session files,
 //! so rows keep an on-disk copy until those writes have long been written back
-//! (no fsync of those writes, and no copy or fsync of the journal). That later
+//! (no fsync of those writes, and no copy of the journal; a new `prev` file is
+//! synced while an earlier one is still kept, as the old copy was). That later
 //! drain removes it, also with an empty journal, so a `prev` file never
 //! outlives retention and frequent drains never grow one. The first drain in a
 //! process replays every `prev` file, oldest first (the single `prev` an
@@ -272,6 +273,9 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
     state.len_after_drain = current.len() as u64;
     let mut input = Vec::new();
     let mut new_prev = Vec::new();
+    // While an earlier `prev` file is kept, its rows reached their files less
+    // than a minute ago: the new one is synced, as the copy into `prev` was.
+    let sync_new;
     if let Some(prev) = &mut state.prev {
         // These rows reached their per-session files at least a minute ago; a
         // later replay must not recreate files retention removed.
@@ -291,6 +295,7 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
         if current.is_empty() {
             return Ok(());
         }
+        sync_new = !prev.is_empty();
     } else {
         // Not replayed yet in this process: every `prev` file, oldest first,
         // then the journal.
@@ -298,6 +303,7 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
         if found.is_empty() && current.is_empty() {
             return Ok(());
         }
+        sync_new = !found.is_empty();
         for (number, path) in found {
             let mut bytes = fs::read(&path).context("read previous Claude relay journal")?;
             if ends_inside_row(&bytes) == Some(true) {
@@ -315,6 +321,18 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
         let path = prev_path(support_dir, number);
         fs::rename(&journal, &path).context("rotate Claude relay journal")?;
         state.next_prev = number + 1;
+        if sync_new {
+            let synced = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.sync_data());
+            if synced.is_err() {
+                // Untracked, it would never be replayed: replay every `prev`
+                // file at the next drain.
+                state.prev = None;
+            }
+            synced.context("sync previous Claude relay journal")?;
+        }
         new_prev.push(path);
     }
     input.extend_from_slice(&current);
