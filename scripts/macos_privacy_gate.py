@@ -704,7 +704,7 @@ def zip_members(data):
     if disk or cd_disk or here != total or eocd + 22 + comment != len(data) or 0xFFFF in (here, total) \
             or 0xFFFFFFFF in (cd_size, cd_offset) or cd_offset + cd_size != eocd or total > MAX_ENTRIES:
         raise Incomplete("zip_eocd")
-    members, position, records, names = [], cd_offset, [], set()
+    members, position, records, names, inflated = [], cd_offset, [], set(), 0
     for _ in range(total):
         if data[position:position + 4] != b"PK\x01\x02" or position + 46 > eocd:
             raise Incomplete("zip_central")
@@ -720,6 +720,9 @@ def zip_members(data):
         if position > eocd or start_disk or flags & ~0x0808 or method not in (0, 8) \
                 or 0xFFFFFFFF in (csize, usize, local) or usize > MAX_MEMBER:
             raise Incomplete("zip_central")
+        inflated += usize  # every member is held in memory: bound the total before inflating any
+        if inflated > MAX_FILE:
+            raise Incomplete("size_limit")
         try:
             name = raw_name.decode("utf-8")
         except UnicodeDecodeError:
@@ -1195,11 +1198,19 @@ class Gate:
         """The temporary app ZIP: exactly the checked, verified app tree."""
         inventory = {}
         tree_ok = self.verified_signature(expect_app, role, deep=True)
-        self.walk_tree(expect_app, role, False, None, app_link_ok, "Contents/Resources/", inventory)
+        leaf_cache = {}
+
+        def tree_signed(rel, _data=None):
+            if not tree_ok:
+                return False
+            if rel not in leaf_cache:
+                leaf_cache[rel] = self.verified_signature(os.path.join(expect_app, rel), role)
+            return leaf_cache[rel]
+
+        self.walk_tree(expect_app, role, False, tree_signed, app_link_ok, "Contents/Resources/", inventory)
         members = zip_members(data)
         actual = {}
         intervals = []
-        leaf_cache = {}
         for name, mode, stored, content in members:
             if not name.startswith("Ottto.app/") or "/._" in "/" + name or name.startswith("__MACOSX"):
                 self.finding(role, "structure", "zip_members")
@@ -1217,11 +1228,7 @@ class Gate:
             actual[rel] = ("f", stat.S_IMODE(mode), sha256(content))
 
             def signed_ok(r, d, _rel=rel):
-                if not tree_ok or inventory.get(_rel, (None,))[-1] != sha256(d):
-                    return False
-                if _rel not in leaf_cache:
-                    leaf_cache[_rel] = self.verified_signature(os.path.join(expect_app, _rel), role)
-                return leaf_cache[_rel]
+                return inventory.get(_rel, (None,))[-1] == sha256(d) and tree_signed(_rel)
 
             legal_name = rel.rsplit("/", 1)[-1] if rel.startswith("Contents/Resources/") and rel.count("/") == 2 else None
             self.scan_member(rel, content, role, rep_key, signed_ok, legal_name)

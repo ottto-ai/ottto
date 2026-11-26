@@ -291,6 +291,32 @@ class Formats(unittest.TestCase):
         owner_only = self.binary_zip(executable=macho(payload=OWNER.encode()), method=zipfile.ZIP_STORED)
         self.assertEqual(set(self.scan_zip(owner_only, "owner:" + OWNER).findings), {"owner"})
 
+    def test_zip_total_inflated_size_is_bounded(self):
+        data = self.binary_zip()
+        saved, g.MAX_FILE = g.MAX_FILE, 64
+        try:
+            with self.assertRaisesRegex(g.Incomplete, "size_limit"):
+                g.zip_members(data)
+        finally:
+            g.MAX_FILE = saved
+
+    def test_app_zip_omits_signer_only_in_verified_source_tree(self):
+        top = tempfile.mkdtemp(dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
+        self.addCleanup(shutil.rmtree, top)
+        app = os.path.join(top, "Ottto.app")
+        helper = os.path.join(app, "Contents", "Helpers", "ottto")
+        os.makedirs(os.path.dirname(helper))
+        with open(helper, "wb") as handle:
+            handle.write(macho(payload=SIGNER.encode()))
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.write(helper, "Ottto.app/Contents/Helpers/ottto")
+        for verified, expected in ((True, set()), (False, {"owner+signer"})):
+            gate = make_gate("owner+signer:" + SIGNER)
+            gate.verified_signature = lambda *_args, _v=verified, **_kw: _v
+            gate.scan_app_zip(buffer.getvalue(), "app_zip", app)
+            self.assertEqual(set(gate.findings), expected, gate.diagnostics)
+
     def test_cms_structure(self):
         self.assertEqual(g.cms_signer_certificate(cms()), certificate(b"\x08", ISSUER))
         for blob in (cms(signer_count=2), cms(trailing=b"\0")):
