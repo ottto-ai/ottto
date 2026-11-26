@@ -739,21 +739,38 @@ class ReceiptAndContract(unittest.TestCase):
         gate.scan_bytes(SIGNER.encode("utf-8"), rep(signed=True))
         self.assertEqual(gate.findings, {"host": 1})
 
-    def host_strings(self, name, full_name, home="/" + "Us" + "ers/synthetic-home"):
-        """host_literals() for a synthetic account on a machine with no host names set."""
+    def host_strings(self, name, full_name, home="/" + "Us" + "ers/synthetic-home", hostname="localhost",
+                     runner=None):
+        """host_literals() for a synthetic account on a machine with no other host names set."""
         saved = (g.pwd.getpwuid, g.socket.gethostname, g.run_tool)
         entry = argparse.Namespace(pw_name=name, pw_gecos=full_name + ",,,", pw_dir=home)
         no_value = argparse.Namespace(returncode=1, stdout=b"", stderr=b"not set")
         g.pwd.getpwuid = lambda _uid: entry
-        g.socket.gethostname = lambda: "localhost"
+        g.socket.gethostname = lambda: hostname
         g.run_tool = lambda *_a, **_k: no_value
         try:
-            with patched_env({"USER": name, "LOGNAME": name, "HOME": home, "RUNNER_NAME": None,
+            with patched_env({"USER": name, "LOGNAME": name, "HOME": home, "RUNNER_NAME": runner,
                               "GITHUB_WORKSPACE": None, "RUNNER_TEMP": None, "RUNNER_WORKSPACE": None,
                               "RUNNER_TOOL_CACHE": None, "TMPDIR": None}):
                 return g.host_literals()
         finally:
             g.pwd.getpwuid, g.socket.gethostname, g.run_tool = saved
+
+    def test_runner_name_equal_to_the_host_name_keeps_its_class(self):
+        host = "synthetic-host"
+        found = self.host_strings("synthetic-account", "Synthetic Person", hostname=host, runner=host)
+        self.assertEqual(sorted(m.cls for m in found if m.value == host), ["host", "runner"])
+        listed, digest = g.parse_markers(store(PRIVATE))
+        policy = g.Policy(policy_text(digest, accept_runner_machine_name_line=True))
+        gate = g.Gate(policy, listed + found, "logs")
+        args = job_logs(self.tmp, host)
+        g.scan_logs(gate, args[4], policy, host, "4242", "1", args[-1])
+        self.assertEqual(set(gate.findings), {"runner"}, gate.diagnostics)
+        # Without the runner name only the host-name literal matches, and the admitted name passes.
+        found = self.host_strings("synthetic-account", "Synthetic Person", hostname=host)
+        gate = g.Gate(policy, listed + found, "logs")
+        g.scan_logs(gate, args[4], policy, host, "4242", "1", args[-1])
+        self.assertEqual(gate.verdict(), "clean", gate.diagnostics)
 
     def test_neutral_release_account_names_are_not_markers(self):
         # The installer text the stable lane generates (the generator's heredoc body).

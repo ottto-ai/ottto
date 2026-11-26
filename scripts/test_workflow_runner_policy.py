@@ -10,8 +10,10 @@ standard YAML library) and checked:
   runner variable (vars.OTTTO_MACOS_STABLE_RUNNER_LABELS): not as a literal label, not in a
   list or group/labels form, not as an expression default, not through the job's matrix, and
   not through a local reusable workflow it calls. Labels and expressions are compared
-  case-insensitively, as GitHub matches them. Such a job's runs-on and matrix also read no
-  repository variable or event payload, whose value could name those labels.
+  case-insensitively, as GitHub matches them. Such a job's runs-on reads no expression
+  context but matrix, and its matrix none at all: a variable, input, event payload or job
+  output could name those labels. It calls no reusable workflow from another repository,
+  whose runners this check cannot read.
 - The stable release workflow's trigger set is exactly workflow_dispatch.
 
 Synthetic workflow fixtures prove each rule fails closed.
@@ -19,6 +21,7 @@ Synthetic workflow fixtures prove each rule fails closed.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,8 +33,10 @@ STABLE = WORKFLOWS + "/macos-stable-release.yml"
 RELEASE_LABELS = ("ottto-signing-mac", "ottto-release-bootstrap")
 RUNNER_VARIABLE = "ottto_macos_stable_runner_labels"
 GUARDED_EVENTS = {"pull_request", "pull_request_target", "merge_group"}
-# Expression sources whose value a workflow file does not fix.
-OPEN_SOURCES = ("vars.", "github.event")
+# A context read inside ${{ }}: a name followed by "." or "[" (functions take "(").
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+CONTEXT = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_-]*)\s*[.\[]")
+STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
 
 class PolicyError(Exception):
@@ -96,10 +101,15 @@ def job_problems(docs, path, name, job, chain=()):
                     problems.append("%s: %s names the release label %s" % (where, field, label))
             if RUNNER_VARIABLE in lowered:
                 problems.append("%s: %s reads the stable runner variable" % (where, field))
-            elif "${{" in text and any(source in lowered for source in OPEN_SOURCES):
-                problems.append("%s: %s reads a repository variable or event payload" % (where, field))
+                continue
+            allowed = {"matrix"} if field == "runs-on" else set()
+            for expression in EXPRESSION.findall(lowered):
+                for context in sorted(set(CONTEXT.findall(STRING_LITERAL.sub("''", expression))) - allowed):
+                    problems.append("%s: %s reads %s, whose value this check cannot resolve" % (where, field, context))
     uses = job.get("uses")
-    if isinstance(uses, str) and uses.startswith("./"):
+    if isinstance(uses, str) and not uses.startswith("./"):
+        problems.append("%s: calls a reusable workflow from another repository" % where)
+    elif isinstance(uses, str):
         target = uses[2:].split("@", 1)[0]
         called = docs.get(target)
         if any(step.split(":", 1)[0] == target for step in chain + ("%s:%s" % (path, name),)):
@@ -194,12 +204,27 @@ def fixture_cases():
          {other: pr("pull_request", "    strategy:\n      matrix:\n        runner: [ubuntu-24.04, ottto-signing-mac]\n"
                                     "    runs-on: ${{ matrix.runner }}\n")},
          "strategy names the release label ottto-signing-mac"),
+        ("matrix runner names", {other: pr("pull_request", "    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n"
+                                                         "    runs-on: ${{ matrix.os }}\n")}, None),
         ("other repository variable",
-         {other: pr("pull_request", "    runs-on: ${{ vars.FIXTURE_RUNNER }}\n")},
-         "reads a repository variable or event payload"),
+         {other: pr("pull_request", "    runs-on: ${{ vars.FIXTURE_RUNNER }}\n")}, "runs-on reads vars"),
         ("event payload",
-         {other: pr("pull_request", "    runs-on: ${{ github.event.pull_request.title }}\n")},
-         "reads a repository variable or event payload"),
+         {other: pr("pull_request", "    runs-on: ${{ github.event.pull_request.title }}\n")}, "runs-on reads github"),
+        ("job output",
+         {other: pr("pull_request", "    runs-on: ${{ fromJSON(needs.pick.outputs.runner) }}\n")}, "runs-on reads needs"),
+        ("matrix from an expression",
+         {other: pr("pull_request", "    strategy:\n      matrix:\n        os: ${{ fromJSON(vars.FIXTURE) }}\n"
+                                    "    runs-on: ${{ matrix.os }}\n")}, "strategy reads vars"),
+        ("label passed to a local reusable workflow",
+         {other: "on: pull_request\njobs:\n  call:\n    uses: ./" + WORKFLOWS + "/called.yml\n"
+                 "    with:\n      runner: ottto-signing-mac\n",
+          WORKFLOWS + "/called.yml": "on:\n  workflow_call:\n    inputs:\n      runner:\n        type: string\n"
+                                     "jobs:\n  run:\n    runs-on: ${{ inputs.runner }}\n    steps:\n"
+                                     "      - run: echo ok\n"},
+         "runs-on reads inputs"),
+        ("remote reusable workflow",
+         {other: "on: pull_request\njobs:\n  call:\n    uses: example/other/.github/workflows/x.yml@v1\n"},
+         "another repository"),
         ("quoted on key",
          {other: '"on": pull_request\njobs:\n  check:\n    runs-on: [ottto-signing-mac]\n'},
          "names the release label ottto-signing-mac"),

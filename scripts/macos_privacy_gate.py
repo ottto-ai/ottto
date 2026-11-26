@@ -388,10 +388,12 @@ def host_literals():
     for var in ("GITHUB_WORKSPACE", "RUNNER_TEMP", "RUNNER_WORKSPACE", "RUNNER_TOOL_CACHE", "TMPDIR"):
         add("runner", os.environ.get(var), path=True)
     # The full name keeps its own entry: another machine string with the same value stays an
-    # independent literal with no omissions.
+    # independent literal with no omissions. Each class keeps its own entry too, so a runner
+    # name equal to the host name is still a runner literal (the logs profile exempts only the
+    # host-name class).
     unique, seen = [], set()
     for marker in found:
-        key = (norm(marker.value), marker.full_name)
+        key = (norm(marker.value), marker.cls, marker.full_name)
         if key not in seen:
             seen.add(key)
             unique.append(marker)
