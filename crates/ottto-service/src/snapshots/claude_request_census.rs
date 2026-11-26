@@ -5,7 +5,8 @@
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
 //! upload input. This module only produces, persists and measures records; no
-//! fence, coverage, posture or upload decision reads them. A record lives
+//! fence, coverage, posture or upload decision reads them. An
+//! identity-incomplete hold also queues one verifying re-read of its file. A record lives
 //! while its file is indexed (or is held-new custody) and leaves only with
 //! the file, at a positive-absence exit. No age, budget or pressure retires
 //! or refuses one. The narrowed
@@ -342,7 +343,8 @@ impl ClaudeRequestCensusRecord {
     }
 
     /// An unverified identity-incomplete record holds its root until a
-    /// Full read verifies its source (delay, never cancel).
+    /// Full read verifies its source (delay, never cancel). A quiet file gets
+    /// that read once per revision: [`take_hold_rereads`] queues it.
     pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
@@ -1951,6 +1953,111 @@ pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
             && !record.can_bind_recomposed_body()
             && !record.verified_reusable_twin()
     })
+}
+
+/// Whether `key`'s record holds its root until a Full read verifies it. Such
+/// a re-read never continues from stored state: a re-fold cannot verify.
+pub(super) fn holds_for_verifying_read(index: &ScanIndex, key: &str) -> bool {
+    index
+        .claude_request_census
+        .get(key)
+        .is_some_and(ClaudeRequestCensusRecord::identity_incomplete_hold)
+}
+
+/// The most held keys the re-read pacing remembers.
+const HOLD_REREAD_KEYS: usize = 4_096;
+
+// Identity-incomplete holds this process queued a verifying re-read for:
+// index key -> (the record's revision, when it was queued). RAM only, so a
+// restart may queue a held revision once more.
+crate::local_resource_diagnostics::process_static!(fn with_queued_hold_rereads:
+    std::sync::Mutex<BTreeMap<String, ([u8; 32], u64)>> =
+        std::sync::Mutex::new(BTreeMap::new()));
+
+/// The keys whose identity-incomplete hold owes one verifying re-read now,
+/// each marked queued. A key qualifies when its record holds its root, its
+/// index entry is at the record's revision (an entry already cleared for a
+/// re-read does not match), it has no account hold (that path owns its
+/// retry), and this process has queued neither this revision nor, within
+/// `LISTING_OWED_PACE_SECONDS`, another revision of the key. At the memory
+/// bound, older marks are dropped first; a key that still finds no room
+/// waits for a later page.
+pub(super) fn take_hold_rereads(index: &ScanIndex, now: u64) -> Vec<String> {
+    let held = index
+        .claude_request_census
+        .records()
+        .filter(|(key, record)| {
+            record.identity_incomplete_hold()
+                && !index
+                    .claude_account_deferred_holds
+                    .contains_key(key.as_str())
+                && index.files.get(key.as_str()).is_some_and(|entry| {
+                    fingerprint_matches(record, &entry.source_file_fingerprint)
+                })
+        })
+        .map(|(key, record)| (key, record.source_file_fingerprint))
+        .collect::<Vec<_>>();
+    if held.is_empty() {
+        return Vec::new();
+    }
+    with_queued_hold_rereads(|queued| {
+        let mut queued = queued.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut taken = Vec::new();
+        for (key, revision) in held {
+            if let Some((queued_revision, at)) = queued.get(key.as_str()) {
+                if *queued_revision == revision
+                    || now < at.saturating_add(super::LISTING_OWED_PACE_SECONDS)
+                {
+                    continue;
+                }
+            }
+            if queued.len() >= HOLD_REREAD_KEYS && !queued.contains_key(key.as_str()) {
+                queued
+                    .retain(|_, (_, at)| now < at.saturating_add(super::LISTING_OWED_PACE_SECONDS));
+                if queued.len() >= HOLD_REREAD_KEYS {
+                    break;
+                }
+            }
+            queued.insert(key.clone(), (revision, now));
+            taken.push(key.clone());
+        }
+        taken
+    })
+}
+
+impl super::SourceScanResult {
+    /// Queue one counted re-read for each identity-incomplete hold that owes
+    /// it ([`take_hold_rereads`]), before upload/save, through the same
+    /// explicit-reparse witness a released account hold uses: the entry's
+    /// source fingerprint is cleared and the file is hinted. The re-read
+    /// reads Full ([`holds_for_verifying_read`]); a loss-free one clears the
+    /// hold. It grants no credit itself.
+    pub(crate) fn queue_identity_hold_rereads(
+        &self,
+        index: &mut ScanIndex,
+        roots: &[std::path::PathBuf],
+        backfill_window_days: u64,
+    ) {
+        let keys = take_hold_rereads(index, super::sampled_scan::now_seconds());
+        if keys.is_empty() {
+            return;
+        }
+        for key in &keys {
+            if let Some(entry) = index.files.get_mut(key) {
+                entry.source_file_fingerprint.clear();
+            }
+        }
+        let hints = keys
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        self.enqueue_claude_discovery_hints(index, roots, backfill_window_days, &hints);
+        crate::local_resource_diagnostics::traversal_point(
+            "claude_identity_hold_reread",
+            "claude_code",
+            &serde_json::json!({"queued": keys.len()}),
+        );
+    }
 }
 
 /// A parse that reaches no record after a failed finish leaves the key without

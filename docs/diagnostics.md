@@ -1030,8 +1030,16 @@ The effect is a withheld memo Skip until binding or a real change, never a wrong
 
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
-available), and `resolved` (a parse bound the account). A held account
-is retired only after two consecutive rooted NotFound observations at least
+available), and `resolved` (a parse bound the account). A hold a parse
+releases on a page clears that entry's source fingerprint and queues it for one
+re-read before upload and save, because no stored copy discharges its debt;
+`sampled_audit_account_release{retry_queued}` counts those queued re-reads. The
+same pre-save step queues one re-read for an unverified identity-incomplete
+census record at its entry's current revision, which otherwise holds its root
+until a Full read: once per revision per process, and at most once per file per
+six hours. That re-read reads Full, never from stored state, and a loss-free one
+releases the root. `claude_identity_hold_reread{queued}` counts them. A
+held account is retired only after two consecutive rooted NotFound observations at least
 600 seconds apart under the same validated parent, after a later directory
 walk has started and completed (details below). Elapsed witness time uses
 RAM-only monotonic `Instant`, independently of wall-clock corrections; an earlier

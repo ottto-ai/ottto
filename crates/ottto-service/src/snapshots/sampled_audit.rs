@@ -193,6 +193,50 @@ pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
     }
 }
 
+impl SourceScanResult {
+    /// Queue a discoverable retry for a released account hold's acquisition
+    /// before upload/save: no stored copy discharges its debt.
+    pub(crate) fn preserve_released_account_holds(
+        &self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        roots: &[PathBuf],
+        backfill_window_days: u64,
+    ) {
+        let mut queued = 0_u64;
+        for (key, _) in self.completed_parses() {
+            if !previous.claude_account_deferred_holds.contains_key(key)
+                || index.claude_account_deferred_holds.contains_key(key)
+                || !index.files.contains_key(key)
+            {
+                continue;
+            }
+            // This existing explicit-reparse witness survives traversal resets
+            // and ages. It never labels a Full or grants credit.
+            index
+                .files
+                .get_mut(key)
+                .expect("current parsed entry")
+                .source_file_fingerprint
+                .clear();
+            self.enqueue_claude_discovery_hints(
+                index,
+                roots,
+                backfill_window_days,
+                &[PathBuf::from(key)],
+            );
+            queued += 1;
+        }
+        if queued > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "sampled_audit_account_release",
+                "claude_code",
+                &serde_json::json!({"retry_queued": queued}),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

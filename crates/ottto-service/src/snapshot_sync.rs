@@ -110,6 +110,8 @@ pub(crate) fn counted_poison_entries() -> Option<(usize, usize)> {
     status::counted_poison_entries()
 }
 #[cfg(test)]
+pub(crate) use self::finish::accept_account_release_for_test;
+#[cfg(test)]
 pub(crate) use self::finish::accept_request_contributions_for_test;
 #[cfg(test)]
 pub(crate) use self::finish::ack_current_again_quarantines_for_test;
@@ -117,11 +119,13 @@ pub(crate) use self::finish::ack_current_again_quarantines_for_test;
 use self::finish::apply_backfill_cutoff_with_claude_corrections;
 use self::finish::cached_source_manifest;
 #[cfg(test)]
+pub(crate) use self::finish::checkpoint_account_release_for_test;
+#[cfg(test)]
 pub(crate) use self::finish::checkpoint_page_for_test;
 #[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index;
 #[cfg(test)]
-use self::finish::checkpoint_partial_snapshot_index_with_drains;
+use self::finish::checkpoint_partial_snapshot_index_with_hold_release;
 #[cfg(test)]
 pub(crate) use self::finish::checkpoint_unselected_for_test;
 #[cfg(test)]
@@ -150,6 +154,8 @@ use self::finish::settle_upload_corrections_after_selection;
 #[cfg(test)]
 use self::finish::upload_settled_without_account_holds;
 use self::finish::withdraw_source_manifest;
+#[cfg(test)]
+use self::finish::AccountHoldRelease;
 #[cfg(test)]
 use self::finish::LocalHoldSettlement;
 #[cfg(test)]

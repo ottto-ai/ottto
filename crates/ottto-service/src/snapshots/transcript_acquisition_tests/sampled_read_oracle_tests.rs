@@ -1,6 +1,6 @@
 //! Sampled reads without the hourly audit: an older build's tags, growth after
-//! a first read, a vanished formerly tagged file, and the hold-only absence
-//! inventory that shares the absence proof.
+//! a first read, a quiet census hold's one verifying re-read, and the hold-only
+//! absence inventory that shares the absence proof.
 use super::*;
 
 /// [money] An entry an older build left with a complete sampled tag grows
@@ -52,6 +52,95 @@ fn a_tagged_first_read_then_growth_tails_and_equals_cold_full() {
         }
         sampled_scan::set_test_now(None);
     }
+}
+
+/// [money] An identity-incomplete, unverified census record on a quiet file,
+/// as a complete non-Full read leaves it, holds its root while the file stays
+/// unread. The pre-save queue re-arms it once per revision; the next page
+/// reads it Full exactly once, which releases the root with the cold Full's
+/// body; later pages queue nothing and read nothing.
+#[test]
+fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = ScanFixture::new(source);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let roots = [fixture.root.clone()];
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let (mut index, first, modes) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "account-a",
+    );
+    assert_eq!(modes, (1, 0, 0), "first read");
+    let key = local_index_key(&fixture.file.0);
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    claude_request_census::record_claude_request_census(
+        &mut index,
+        claude_request_census::ClaudeRequestCensusParse {
+            path: &fixture.file.0,
+            index_key: &key,
+            source_file_fingerprint: &fingerprint,
+            census_window_end: NOW,
+            complete: true,
+            lossy: false,
+            source_verified: false,
+            continued_source: false,
+            itemless_request_hashes: vec![claude_request_census::claude_request_hash("request-0")],
+            opened_birth: None,
+            modified_unix_seconds: 0,
+        },
+        &[],
+    );
+    let held = |index: &ScanIndex| claude_request_census::holds_for_verifying_read(index, &key);
+    assert!(held(&index), "precondition: the record holds its root");
+    let (unread, _, modes) = production_scan(
+        &fixture,
+        source,
+        index.clone(),
+        Some(cache.clone()),
+        "account-a",
+    );
+    assert_eq!(modes, (0, 0, 0), "a quiet file is not read on its own");
+    assert!(held(&unread), "so its root stays held");
+
+    let held_index = index.clone();
+    first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    assert!(
+        index.files[&key].source_file_fingerprint.is_empty(),
+        "the queue re-arms the entry"
+    );
+    let mut again = held_index;
+    first.queue_identity_hold_rereads(&mut again, &roots, BACKFILL_WINDOW_DAYS);
+    assert_eq!(
+        again.files[&key].source_file_fingerprint, fingerprint,
+        "once per revision"
+    );
+
+    let (mut index, reread, modes) =
+        production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+    assert_eq!(modes, (1, 0, 0), "exactly one counted Full re-read");
+    assert!(!held(&index), "the loss-free Full releases the root");
+    let (_, cold, _) = production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
+    assert_eq!(
+        production_body(source, reread),
+        production_body(source, cold),
+        "the re-read's body equals the cold Full's"
+    );
+
+    let settled = index.files[&key].source_file_fingerprint.clone();
+    assert!(!settled.is_empty());
+    first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    assert_eq!(
+        index.files[&key].source_file_fingerprint, settled,
+        "nothing is owed after the release"
+    );
+    let (_, _, modes) = production_scan(&fixture, source, index, Some(cache), "account-a");
+    assert_eq!(modes, (0, 0, 0), "then quiet");
 }
 
 /// [behaviour] Hold-only removal requires stable rooted absence twice.

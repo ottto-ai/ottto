@@ -74,7 +74,8 @@ pub(in crate::snapshots) fn late_evidence(reason: CandidateParseReason) -> bool 
 /// file does.
 ///
 /// A late-evidence re-fold needs complete stored state: a set-aside file
-/// reads natively instead. A body waiting on a server retry re-folds: it is
+/// reads natively instead, and so does a re-armed file whose census record
+/// holds its root, since only a Full read verifies it. A body waiting on a server retry re-folds: it is
 /// the same body a native read sends. Whatever the selection, a file whose
 /// session owes a head-CAS answer that can ride an upload never continues
 /// from stored state; the load refuses it ([`conflict_owed`]) once the head
@@ -101,6 +102,12 @@ pub(in crate::snapshots) fn reuses_stored(
                 disposition.parser_generation == JSONL_TERMINAL_DISPOSITION_GENERATION
             }),
         Some(CandidateParseReason::NewFile) => held_new,
+        // A queued re-read of an identity-incomplete hold must verify it.
+        Some(CandidateParseReason::Rearmed)
+            if crate::snapshots::claude_request_census::holds_for_verifying_read(index, key) =>
+        {
+            false
+        }
         Some(reason) => late_evidence(reason) && !set_aside(index, key),
     }
 }

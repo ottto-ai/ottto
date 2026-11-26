@@ -958,6 +958,73 @@ fn unknown_input_creates_no_false_credit_or_new_debt() {
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_index);
 }
 
+/// A released account hold re-reads once: the release clears the entry's
+/// source fingerprint and queues it, after the cache heads are bound, on both
+/// the settled finish and the upload-error partial checkpoint. Neither touches
+/// an unrelated queued copy, and the retry survives a restart.
+#[test]
+fn account_hold_release_waits_for_cache_heads_and_selected_settlement() {
+    for partial in [false, true] {
+        let (fixture, mut index, mut scan, mut previous) =
+            selected_fixture_from(SelectionFixture::with_rearmed_b(false));
+        let copy = queued_prior_key(&index, &previous);
+        let key = local_index_key(&fixture.paths[2]);
+        let entry = index.files[&key].clone();
+        previous.files.insert(key.clone(), entry.clone());
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), index.file_snapshot_fingerprints[&key].clone());
+        previous
+            .claude_account_deferred_holds
+            .insert(key.clone(), entry.source_file_fingerprint.clone());
+        index
+            .claude_account_deferred_holds
+            .insert(key.clone(), entry.source_file_fingerprint.clone());
+        let selected = if partial {
+            let progress = fixture._scratch.join("released-progress.json");
+            crate::snapshot_sync::checkpoint_account_release_for_test(
+                index,
+                &previous,
+                &mut scan,
+                &fixture.roots,
+                (&fixture.index_path, &progress),
+            )
+            .unwrap()
+        } else {
+            let mut selected = crate::snapshot_sync::accept_account_release_for_test(
+                index,
+                &previous,
+                &mut scan,
+                &fixture.roots,
+            );
+            selected.save_fixture(&fixture.index_path).unwrap();
+            selected
+        };
+        assert!(!selected.claude_account_deferred_holds.contains_key(&key));
+        assert!(selected.files[&key].source_file_fingerprint.is_empty());
+        assert_eq!(
+            serde_json::to_value(&selected.files[&copy]).unwrap(),
+            serde_json::to_value(&previous.files[&copy]).unwrap()
+        );
+        assert_eq!(
+            selected.file_snapshot_fingerprints[&copy],
+            previous.file_snapshot_fingerprints[&copy]
+        );
+        let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+        assert!(restarted.files[&key].source_file_fingerprint.is_empty());
+        assert!(restarted
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|candidate| local_index_key(&candidate.path) == key));
+        if partial {
+            assert!(restarted.bounded_sweep_had_unsettled_upload());
+        }
+    }
+}
+
 #[test]
 fn completed_census_drops_finished_traversal_with_empty_diagnostic_causes() {
     let fixture = BodyFixture::new();
