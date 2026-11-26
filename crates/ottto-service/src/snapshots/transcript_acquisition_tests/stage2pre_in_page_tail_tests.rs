@@ -43,7 +43,7 @@ const AUDIT_DUE: usize = 1;
 #[derive(Clone, Debug, Default)]
 struct Seen {
     modes: (usize, usize, usize),
-    full_reasons: [usize; 11],
+    full_reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
     unreadable: usize,
     causes: [u64; 8],
 }

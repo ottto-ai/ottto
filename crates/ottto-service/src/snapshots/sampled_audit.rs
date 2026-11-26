@@ -1410,7 +1410,8 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
 
 /// Identity has already been checked by open_and_identify and ReadPlan.
 /// Rewrites/shrinks keep their own counted cause; a missing reusable checkpoint
-/// takes the existing Full only after a durable six-hour claim.
+/// (or a census-verify read, which declines one) takes the existing Full only
+/// after a durable six-hour claim.
 pub(super) fn growth_read_admitted(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
@@ -1466,6 +1467,7 @@ pub(super) fn growth_read_admitted_at(
             FullReason::StateMissing
                 | FullReason::InvalidCheckpoint
                 | FullReason::UnsupportedIdentity
+                | FullReason::CensusVerify
         )
     ) {
         return match claim_growth_full(index, &key, now) {

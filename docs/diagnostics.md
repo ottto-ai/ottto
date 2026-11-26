@@ -244,9 +244,12 @@ and upload. A capped/partial page is still a completed page.
 When sampling is present, `page_events` records existing full-read reasons as a
 sparse map of closed snake_case keys (`state_missing`, `audit_due`,
 `clock_changed`, `scope_changed`, `invalid_checkpoint`, `replaced`, `shrunk`,
-`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`).
-Their sum equals `full_selections`; `audit_due` is retained for older records
-and is always zero now. It also records `priority_full_replays`. A nonzero-only
+`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`,
+`census_verify`). Their sum equals `full_selections`; `audit_due` is retained
+for older records and is always zero now. `census_verify` is the queued re-read
+of a file whose unverified identity-incomplete census record holds its root
+(see `claude_identity_hold_reread` below): it reads Full, never from stored
+state, so it can verify the record. It also records `priority_full_replays`. A nonzero-only
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
@@ -1036,9 +1039,18 @@ re-read before upload and save, because no stored copy discharges its debt;
 `sampled_audit_account_release{retry_queued}` counts those queued re-reads. The
 same pre-save step queues one re-read for an unverified identity-incomplete
 census record at its entry's current revision, which otherwise holds its root
-until a Full read: once per revision per process, and at most once per file per
-six hours. That re-read reads Full, never from stored state, and a loss-free one
-releases the root. `claude_identity_hold_reread{queued}` counts them. A
+until a Full read. The attempt is keyed on the file's state as its index entry
+records it (length, modification time and birth; the re-arm itself changes none
+of these): one attempt per unchanged file per process, and a changed file is
+attempted again no sooner than six hours after its last attempt. Attempts are
+remembered in RAM only, for at most 4,096 files, so a restart allows one more
+attempt per file. The re-read reads Full as `census_verify`, and a loss-free one
+releases the root. `claude_identity_hold_reread{queued,waiting}` counts the
+queued re-reads and the owed ones that found the attempt memory full and wait
+for a later page. When an attempt's read finishes on the same file state and
+leaves the record unverified (a parse that is never loss-free), the root stays
+held, `census_identity_hold_unverifiable{files}` counts it once, and the file
+is not read again until it changes. A
 held account is retired only after two consecutive rooted NotFound observations at least
 600 seconds apart under the same validated parent, after a later directory
 walk has started and completed (details below). Elapsed witness time uses

@@ -782,7 +782,7 @@ fn page_steps(
 struct Selections {
     modes: Modes,
     unchanged: usize,
-    full_reasons: [usize; 11],
+    full_reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
 }
 
 /// `page_steps` that also reports `Selections`.
@@ -2179,7 +2179,12 @@ fn certify_job(
     now: &mut u64,
     page_number: &mut u64,
     append_mid_read: bool,
-) -> (ScanIndex, u64, u64, [usize; 11]) {
+) -> (
+    ScanIndex,
+    u64,
+    u64,
+    [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
+) {
     certify_job_with(fixture, cache, index, clock, now, page_number, |fixture| {
         if append_mid_read {
             fixture.append(SESSION, &token_line(41));
@@ -2197,7 +2202,12 @@ fn certify_job_with(
     now: &mut u64,
     page_number: &mut u64,
     mid_read: impl FnOnce(&ScanRoot),
-) -> (ScanIndex, u64, u64, [usize; 11]) {
+) -> (
+    ScanIndex,
+    u64,
+    u64,
+    [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
+) {
     let mut mid_read = Some(mid_read);
     let step = 1_800;
     let certified = counter(cache, |c| c.jobs_certified);

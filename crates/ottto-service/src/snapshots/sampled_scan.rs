@@ -185,7 +185,7 @@ pub(super) struct Context {
     /// Of `native_bytes`, a Full read's; the rest is Tail.
     pub(super) full_native_bytes: u64,
     pub(super) sample_bytes: u64,
-    pub(super) full_reasons: [usize; 11],
+    pub(super) full_reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
     pub(super) priority_replays: usize,
     /// Same-size files whose moved mtime a write generation count proved a
     /// touch: continued from stored state instead of a Full.
@@ -287,7 +287,7 @@ impl OwnedSourceScan {
                 native_bytes: 0,
                 full_native_bytes: 0,
                 sample_bytes: 0,
-                full_reasons: [0; 11],
+                full_reasons: [0; crate::transcript_acquisition::FULL_REASON_COUNT],
                 priority_replays: 0,
                 same_size_touch_proven: 0,
                 codex_side_only_reselect: 0,

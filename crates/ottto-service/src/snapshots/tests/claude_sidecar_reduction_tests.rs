@@ -121,7 +121,7 @@ struct Run {
     index: ScanIndex,
     result: SourceScanResult,
     modes: (usize, usize, usize),
-    reasons: [usize; 11],
+    reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
     native_bytes: u64,
 }
 fn raw_scan(
@@ -188,14 +188,20 @@ fn raw_scan_at(
             injected = true;
             after_start(&mut scan);
         }
-        let (modes, reasons, native_bytes) =
-            scan.sampling.as_ref().map_or(((0, 0, 0), [0; 11], 0), |c| {
+        let (modes, reasons, native_bytes) = scan.sampling.as_ref().map_or(
+            (
+                (0, 0, 0),
+                [0; crate::transcript_acquisition::FULL_REASON_COUNT],
+                0,
+            ),
+            |c| {
                 (
                     (c.full_files, c.tail_files, c.unchanged_files),
                     c.full_reasons,
                     c.native_bytes,
                 )
-            });
+            },
+        );
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete { index, scan, .. } => {

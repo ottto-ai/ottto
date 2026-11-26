@@ -516,8 +516,13 @@ impl OwnedSourceScan {
                     {
                         tail_source::counters::bump(self.source, "tail_bootstrap_full", "new_file");
                     }
+                    // A re-armed read of a held census record reads Full under
+                    // its own reason (`reuses_stored` declined the stored state).
                     #[cfg(unix)]
-                    let mut tail_proven_full = None;
+                    let mut tail_proven_full = (allow_sample
+                        && parse_reason == Some(CandidateParseReason::Rearmed)
+                        && claude_request_census::holds_for_verifying_read(&self.index, &key))
+                    .then_some(crate::transcript_acquisition::FullReason::CensusVerify);
                     #[cfg(unix)]
                     let retained = match tail_load {
                         Some(route) => {

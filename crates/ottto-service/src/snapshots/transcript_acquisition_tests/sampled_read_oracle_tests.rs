@@ -54,11 +54,60 @@ fn a_tagged_first_read_then_growth_tails_and_equals_cold_full() {
     }
 }
 
+/// Writes the record a complete, non-Full, itemless parse of the entry's
+/// current revision leaves: identity-incomplete and unverified, so it holds
+/// its root.
+fn seed_identity_incomplete_hold(index: &mut ScanIndex, path: &std::path::Path) {
+    let key = local_index_key(path);
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    claude_request_census::record_claude_request_census(
+        index,
+        claude_request_census::ClaudeRequestCensusParse {
+            path,
+            index_key: &key,
+            source_file_fingerprint: &fingerprint,
+            census_window_end: NOW,
+            complete: true,
+            lossy: false,
+            source_verified: false,
+            continued_source: false,
+            itemless_request_hashes: vec![claude_request_census::claude_request_hash("request-0")],
+            opened_birth: None,
+            modified_unix_seconds: 0,
+        },
+        &[],
+    );
+    assert!(
+        claude_request_census::holds_for_verifying_read(index, &key),
+        "precondition: the record holds its root"
+    );
+}
+
+/// The Full reasons a captured page's `native_collection_page` record names.
+fn page_full_reasons(records: &[Value]) -> Value {
+    records
+        .iter()
+        .find(|record| record["stage"] == "native_collection_page")
+        .map_or(Value::Null, |record| {
+            record["counts"]["sampled_acquisition"]["page_events"]["full_reasons"].clone()
+        })
+}
+
+/// The counts of every captured point named `stage`.
+fn point_counts(records: &[Value], stage: &str) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|record| record["stage"] == stage)
+        .map(|record| record["counts"].clone())
+        .collect()
+}
+
 /// [money] An identity-incomplete, unverified census record on a quiet file,
 /// as a complete non-Full read leaves it, holds its root while the file stays
-/// unread. The pre-save queue re-arms it once per revision; the next page
-/// reads it Full exactly once, which releases the root with the cold Full's
-/// body; later pages queue nothing and read nothing.
+/// unread. The pre-save queue re-arms it once for the file's state; the next
+/// page reads it Full exactly once, counted as `census_verify`, which releases
+/// the root with the cold Full's body; later pages queue nothing and read
+/// nothing, and nothing is counted unverifiable.
 #[test]
 fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -78,26 +127,8 @@ fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
     );
     assert_eq!(modes, (1, 0, 0), "first read");
     let key = local_index_key(&fixture.file.0);
-    let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    claude_request_census::record_claude_request_census(
-        &mut index,
-        claude_request_census::ClaudeRequestCensusParse {
-            path: &fixture.file.0,
-            index_key: &key,
-            source_file_fingerprint: &fingerprint,
-            census_window_end: NOW,
-            complete: true,
-            lossy: false,
-            source_verified: false,
-            continued_source: false,
-            itemless_request_hashes: vec![claude_request_census::claude_request_hash("request-0")],
-            opened_birth: None,
-            modified_unix_seconds: 0,
-        },
-        &[],
-    );
+    seed_identity_incomplete_hold(&mut index, &fixture.file.0);
     let held = |index: &ScanIndex| claude_request_census::holds_for_verifying_read(index, &key);
-    assert!(held(&index), "precondition: the record holds its root");
     let (unread, _, modes) = production_scan(
         &fixture,
         source,
@@ -108,22 +139,23 @@ fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
     assert_eq!(modes, (0, 0, 0), "a quiet file is not read on its own");
     assert!(held(&unread), "so its root stays held");
 
-    let held_index = index.clone();
-    first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    let ((), records) = crate::local_resource_diagnostics::capture(|| {
+        first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    });
     assert!(
         index.files[&key].source_file_fingerprint.is_empty(),
         "the queue re-arms the entry"
     );
-    let mut again = held_index;
-    first.queue_identity_hold_rereads(&mut again, &roots, BACKFILL_WINDOW_DAYS);
     assert_eq!(
-        again.files[&key].source_file_fingerprint, fingerprint,
-        "once per revision"
+        point_counts(&records, "claude_identity_hold_reread"),
+        [json!({"queued": 1, "waiting": 0})]
     );
 
-    let (mut index, reread, modes) =
-        production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+    let ((mut index, reread, modes), records) = crate::local_resource_diagnostics::capture(|| {
+        production_scan(&fixture, source, index, Some(cache.clone()), "account-a")
+    });
     assert_eq!(modes, (1, 0, 0), "exactly one counted Full re-read");
+    assert_eq!(page_full_reasons(&records), json!({"census_verify": 1}));
     assert!(!held(&index), "the loss-free Full releases the root");
     let (_, cold, _) = production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
     assert_eq!(
@@ -134,13 +166,133 @@ fn a_quiet_identity_incomplete_hold_reads_full_once_and_releases_its_root() {
 
     let settled = index.files[&key].source_file_fingerprint.clone();
     assert!(!settled.is_empty());
-    first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    let ((), records) = crate::local_resource_diagnostics::capture(|| {
+        first.queue_identity_hold_rereads(&mut index, &roots, BACKFILL_WINDOW_DAYS);
+    });
     assert_eq!(
         index.files[&key].source_file_fingerprint, settled,
         "nothing is owed after the release"
     );
+    assert!(point_counts(&records, "claude_identity_hold_reread").is_empty());
+    assert!(point_counts(&records, "census_identity_hold_unverifiable").is_empty());
     let (_, _, modes) = production_scan(&fixture, source, index, Some(cache), "account-a");
     assert_eq!(modes, (0, 0, 0), "then quiet");
+}
+
+/// [money] A held file whose parse is never loss-free (a malformed line) is
+/// attempted once per file state, never on a timer. Its one `census_verify`
+/// Full finishes with the record still unverified, so the root stays held;
+/// the next pre-save step counts it once as `census_identity_hold_unverifiable`.
+/// Two more pages and a clock six hours on queue nothing and read nothing,
+/// even with the record held again at the same state. An append changes the
+/// file's state, which allows exactly one new attempt.
+///
+/// A lossy parse writes a `Lossy` record, not an identity-incomplete one; the
+/// hold is seeded again after each read to stand for a parse that stays
+/// identity-incomplete and unverified, which is what the guard must stop.
+#[test]
+fn an_unverifiable_identity_hold_reads_full_once_per_file_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = ScanFixture::new(source);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let roots = [fixture.root.clone()];
+    let append_raw = |bytes: &[u8]| {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.file.0)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    };
+    append_raw(b"{malformed\n");
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let (mut index, first, modes) = production_scan(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(cache.clone()),
+        "account-a",
+    );
+    assert_eq!(modes, (1, 0, 0), "first read");
+    let key = local_index_key(&fixture.file.0);
+    seed_identity_incomplete_hold(&mut index, &fixture.file.0);
+    let queue = |index: &mut ScanIndex| {
+        crate::local_resource_diagnostics::capture(|| {
+            first.queue_identity_hold_rereads(index, &roots, BACKFILL_WINDOW_DAYS);
+        })
+        .1
+    };
+
+    let records = queue(&mut index);
+    assert_eq!(
+        point_counts(&records, "claude_identity_hold_reread"),
+        [json!({"queued": 1, "waiting": 0})]
+    );
+    let ((mut index, _, modes), records) = crate::local_resource_diagnostics::capture(|| {
+        production_scan(&fixture, source, index, Some(cache.clone()), "account-a")
+    });
+    assert_eq!(modes, (1, 0, 0), "one Full re-read");
+    assert_eq!(page_full_reasons(&records), json!({"census_verify": 1}));
+    let record = index
+        .claude_request_census_for_test()
+        .record_for_test(&key)
+        .unwrap();
+    assert!(
+        record.unverified_for_test(),
+        "the lossy Full leaves it unverified"
+    );
+    let records = queue(&mut index);
+    assert_eq!(
+        point_counts(&records, "census_identity_hold_unverifiable"),
+        [json!({"files": 1})]
+    );
+    assert!(point_counts(&records, "claude_identity_hold_reread").is_empty());
+
+    let start = sampled_scan::now_seconds();
+    for (pass, now) in [
+        (0, start),
+        (1, start),
+        (2, start + crate::snapshots::LISTING_OWED_PACE_SECONDS),
+    ] {
+        sampled_scan::set_test_now(Some(now));
+        seed_identity_incomplete_hold(&mut index, &fixture.file.0);
+        let fingerprint = index.files[&key].source_file_fingerprint.clone();
+        let records = queue(&mut index);
+        assert!(
+            point_counts(&records, "claude_identity_hold_reread").is_empty(),
+            "pass {pass}: no new attempt on the same file state"
+        );
+        assert!(
+            point_counts(&records, "census_identity_hold_unverifiable").is_empty(),
+            "pass {pass}: counted once"
+        );
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+        let (next, _, modes) =
+            production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+        assert_eq!(modes, (0, 0, 0), "pass {pass}: no Full");
+        index = next;
+    }
+
+    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+    let (next, _, _) = production_scan(&fixture, source, index, Some(cache.clone()), "account-a");
+    index = next;
+    seed_identity_incomplete_hold(&mut index, &fixture.file.0);
+    let records = queue(&mut index);
+    assert_eq!(
+        point_counts(&records, "claude_identity_hold_reread"),
+        [json!({"queued": 1, "waiting": 0})],
+        "a changed file allows one new attempt"
+    );
+    let ((_, _, modes), records) = crate::local_resource_diagnostics::capture(|| {
+        production_scan(&fixture, source, index, Some(cache), "account-a")
+    });
+    assert_eq!(modes, (1, 0, 0), "its one Full");
+    assert_eq!(page_full_reasons(&records), json!({"census_verify": 1}));
+    sampled_scan::set_test_now(None);
 }
 
 /// [behaviour] Hold-only removal requires stable rooted absence twice.

@@ -850,7 +850,7 @@ pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
     pub(crate) acquisitions: Mutex<Vec<Acquisition>>,
-    full_reasons: Mutex<[usize; 11]>,
+    full_reasons: Mutex<[usize; crate::transcript_acquisition::FULL_REASON_COUNT]>,
     touches_proven: Mutex<usize>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
@@ -919,7 +919,7 @@ impl E2ScanFixture {
         *self.attribution.lock().unwrap() = attribution;
     }
 
-    pub(crate) fn full_reasons(&self) -> [usize; 11] {
+    pub(crate) fn full_reasons(&self) -> [usize; crate::transcript_acquisition::FULL_REASON_COUNT] {
         *self.full_reasons.lock().unwrap()
     }
 
@@ -1133,7 +1133,12 @@ impl E2ScanFixture {
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |s| {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
-            let reasons = scan.sampling.as_ref().map_or([0; 11], |s| s.full_reasons);
+            let reasons = scan
+                .sampling
+                .as_ref()
+                .map_or([0; crate::transcript_acquisition::FULL_REASON_COUNT], |s| {
+                    s.full_reasons
+                });
             let touches = scan
                 .sampling
                 .as_ref()

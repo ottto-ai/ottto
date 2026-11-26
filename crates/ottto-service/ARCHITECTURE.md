@@ -540,8 +540,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full credit or upload acceptance. An
-  unverified one, which holds its root, gets one queued Full re-read per revision before save
-  (paced per file, RAM only); a loss-free Full releases the root.
+  unverified one, which holds its root, gets one queued Full re-read (`census_verify`) per
+  file state before save (RAM only; a changed file waits six hours after its last attempt); a
+  loss-free Full releases the root, and one that stays unverified is counted, not retried.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

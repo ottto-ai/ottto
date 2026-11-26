@@ -2729,7 +2729,7 @@ pub(crate) struct PageEvents {
 }
 /// Reuse the existing counters; serialize only nonzero closed reason keys.
 #[derive(Debug)]
-pub(crate) struct FullReasons(pub(crate) [usize; 11]);
+pub(crate) struct FullReasons(pub(crate) [usize; crate::transcript_acquisition::FULL_REASON_COUNT]);
 impl Serialize for FullReasons {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use crate::transcript_acquisition::FullReason::*;
@@ -2746,6 +2746,7 @@ impl Serialize for FullReasons {
             (HeadChanged, "head_changed"),
             (BoundaryChanged, "boundary_changed"),
             (UnsupportedIdentity, "unsupported_identity"),
+            (CensusVerify, "census_verify"),
         ] {
             let count = self.0[reason.slot()];
             if count != 0 {
@@ -3290,7 +3291,10 @@ mod tests {
             page_events: PageEvents {
                 full_cause: Default::default(),
                 full_by_parse_reason: Default::default(),
-                full_reasons: FullReasons([usize::MAX / 11; 11]),
+                full_reasons: {
+                    use crate::transcript_acquisition::FULL_REASON_COUNT;
+                    FullReasons([usize::MAX / FULL_REASON_COUNT; FULL_REASON_COUNT])
+                },
                 priority_full_replays: usize::MAX,
             },
             codex_cursor: Some(Box::new(max_codex_cursor_counts())),

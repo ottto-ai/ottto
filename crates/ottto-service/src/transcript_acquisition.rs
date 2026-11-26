@@ -952,7 +952,13 @@ pub(crate) enum FullReason {
     HeadChanged,
     BoundaryChanged,
     UnsupportedIdentity,
+    /// A re-armed read of a file whose identity-incomplete census record holds
+    /// its root: it reads Full, never from stored state, so it can verify it.
+    CensusVerify,
 }
+
+/// The number of `FullReason` slots (`FullReason::slot`).
+pub(crate) const FULL_REASON_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -975,6 +981,7 @@ crate::durable_tail_codec::durable_enum!(FullReason {
     8 => HeadChanged,
     9 => BoundaryChanged,
     10 => UnsupportedIdentity,
+    11 => CensusVerify,
 });
 
 impl FullReason {
@@ -991,6 +998,7 @@ impl FullReason {
             Self::HeadChanged => 8,
             Self::BoundaryChanged => 9,
             Self::UnsupportedIdentity => 10,
+            Self::CensusVerify => 11,
         }
     }
 }
