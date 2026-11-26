@@ -1175,6 +1175,7 @@ pub(super) fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         index,
         accepted_identity_buckets,
         &page.content_held,
+        &scan_result.newer_build_held,
     )
     .apply(index);
     // Footprint window of the whole stage, once per page; each chunk's read,
@@ -1717,7 +1718,10 @@ pub(super) fn apply_claude_local_evidence_chunk(
         },
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
-        &page.content_held,
+        crate::snapshots::claude_request_money::e2::PageCopyHolds {
+            content: &page.content_held,
+            newer_build: &scan_result.newer_build_held,
+        },
         page.contribution_locations,
     );
     if !trace_discard_unfolded.is_empty() {

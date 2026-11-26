@@ -1565,11 +1565,42 @@ pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
     };
     // Ordinary stages keep the committed collection metadata and pages.
     match damage {
-        "future" => staged.revision += 1,
         "corrupt" => staged.head = vec![0],
         _ => panic!("unknown fixture damage"),
     }
     state_v2::stage_tail(&route, key, staged).unwrap();
+}
+
+/// Add or remove one unrecognized fact slot without changing the carrier's head payload.
+pub(crate) fn set_future_tail_fact_for_test(index: &mut ScanIndex, key: &str, present: bool) {
+    let route = route_of(index).unwrap();
+    let head = state_v2::load_head(index, key, u32::MAX).unwrap().unwrap();
+    let collection = state_v2::Collection::SessionFacts;
+    let slot = (collection, 16);
+    let mut meta = head.table[&collection].meta;
+    let mut staged = state_v2::StagedFile {
+        revision: head.revision,
+        head: head.body,
+        write_generation: head.write_generation,
+        ..Default::default()
+    };
+    if present {
+        meta.elements += 1;
+        staged.pages.insert(slot, vec![16, 1]);
+    } else {
+        meta.elements -= 1;
+        staged.obsolete.insert(slot);
+    }
+    staged.collections.insert(collection, meta);
+    state_v2::stage_tail(&route, key, staged).unwrap();
+    index.save_fixture(&route).unwrap();
+}
+
+/// The next stored load of this path reaches admission with a live input missing.
+pub(crate) fn unavailable_tail_live_once_for_test(path: &Path) {
+    tail_source::load::UNAVAILABLE_LIVE_ONCE.with(|target| {
+        assert!(target.replace(Some(path.to_owned())).is_none());
+    });
 }
 
 /// The acquisition gate, exposed without widening its production visibility.
