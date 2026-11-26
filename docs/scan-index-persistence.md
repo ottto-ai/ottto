@@ -239,19 +239,22 @@ no promise that forcibly running an unsupported pre-N binary is intercepted by
 its installer. The intact original-path manifest remains an additional strict
 schema refusal for 0.1.201; it is not the supported downgrade path.
 
-A release that raises the writer capability or catalogue layout is checked
-against the previous release's real source before it is published. The
-dispatch-only `Previous release carry` workflow
+The `Previous release carry` workflow
 (`.github/workflows/previous-release-carry.yml`, script
-`scripts/previous_release_carry.py`) does the following:
+`scripts/previous_release_carry.py`) checks a release candidate against the
+previous release's real source with test probes appended.
 
-- The candidate writes a progress-row store and a telemetry-only store.
-- The previous release's source, with only two read probes appended, must
-  refuse each store as newer without changing a row.
-- The candidate then reads back exactly what it wrote.
+- When the release raises the writer capability, the previous release must
+  refuse the candidate's progress-row and telemetry-only stores without
+  changing a row. The candidate then reads back exactly what it wrote.
+- For every release, the candidate commits Tail heads and session facts
+  and appends to a transcript. If the previous release can open the store,
+  its scan must collect a fresh transcript and hold each newer-format Tail
+  file untouched, even when that file has grown. The candidate then resumes
+  the preserved checkpoints.
 
-Dispatch it with `target=<candidate sha>` and `previous=<previous release's
-source sha>`.
+Dispatch it for each release candidate with `target=<candidate sha>` and
+`previous=<previous release's source sha>`.
 
 A metadata-only legacy copy is rejected as the primary protection. An absent or
 renamed original file becomes a fresh index in the old loader. Corrupt JSON can
