@@ -189,7 +189,7 @@ pub(super) fn checked_challenge(
     let payload = decode_base64url(payload_b64)?;
     let facts = serde_json::from_slice::<DeviceWriteFacts>(&payload).ok()?;
     let lifetime = request.max_lifetime();
-    (crate::hex::is_uuid(challenge_id)
+    (ottto_protocol::cloud_uuid(challenge_id)
         && facts.v == DEVICE_WRITE_VERSION
         && facts.challenge_id == challenge_id
         && facts.run_id == run_id

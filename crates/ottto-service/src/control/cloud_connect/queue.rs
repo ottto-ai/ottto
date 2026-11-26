@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 
 /// A queued request wakes the app unless a hello arrived this recently.
 const HELLO_FRESH_FOR: Duration = Duration::from_secs(3);
+const APPROVAL_TAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_WAKE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// An answered or expired request stays this long past its expiry for its caller to collect.
@@ -96,6 +97,7 @@ struct QueuedRequest {
     kind: SignKind,
     payload: Vec<u8>,
     expires_at: i64,
+    queued_at: Instant,
     taken_by: Option<u64>,
     outcome: Option<SignOutcome>,
 }
@@ -108,7 +110,7 @@ impl SignQueue {
     }
 
     /// Queues `payload` for the app to sign until `expires_at` (Unix seconds). One request per
-    /// approval id: queuing the same approval again returns the live request, and a new approval
+    /// approval id: queuing the same approval again returns the retained request, and a new approval
     /// for the same attempt supersedes the old one.
     pub(super) fn enqueue(
         &self,
@@ -126,8 +128,7 @@ impl SignQueue {
         } = &kind
         {
             if let Some(live) = state.requests.iter().find(|request| {
-                request.outcome.is_none()
-                    && matches!(&request.kind, SignKind::Approval { approval_id: live, .. } if live == approval_id)
+                matches!(&request.kind, SignKind::Approval { approval_id: live, .. } if live == approval_id)
             }) {
                 return Ok(Queued {
                     request_id: live.id.clone(),
@@ -153,6 +154,7 @@ impl SignQueue {
             kind,
             payload,
             expires_at,
+            queued_at: Instant::now(),
             taken_by: None,
             outcome: None,
         });
@@ -196,6 +198,28 @@ impl SignQueue {
                 )
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+        }
+    }
+
+    /// Retains a native answer for readback and identical R5 retries.
+    pub(super) fn approval_outcome(&self, request_id: &str) -> Option<SignOutcome> {
+        let mut state = self.lock();
+        let request = state.requests.iter_mut().find(|request| {
+            request.id == request_id && matches!(request.kind, SignKind::Approval { .. })
+        })?;
+        if request.taken_by.is_none() && request.queued_at.elapsed() >= APPROVAL_TAKE_TIMEOUT {
+            request.outcome.get_or_insert(SignOutcome::AppUnavailable);
+        }
+        request.outcome.clone()
+    }
+
+    /// Retires the attempt's native approvals once the server no longer offers one.
+    pub(super) fn cancel_attempt(&self, attempt_id: &str) {
+        for request in &mut self.lock().requests {
+            if matches!(&request.kind, SignKind::Approval { attempt_id: id, .. } if id == attempt_id)
+            {
+                request.outcome = Some(SignOutcome::Superseded);
+            }
         }
     }
 
@@ -280,6 +304,7 @@ impl SignQueue {
             .filter(|request| request.taken_by == Some(connection) && request.outcome.is_none())
         {
             request.taken_by = None;
+            request.queued_at = Instant::now();
         }
     }
 }
@@ -324,7 +349,10 @@ pub(super) fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueState, HELLO_FRESH_FOR, MIN_WAKE_INTERVAL};
+    use super::{
+        unix_now, QueueState, SignKind, SignQueue, APPROVAL_TAKE_TIMEOUT, HELLO_FRESH_FOR,
+        MIN_WAKE_INTERVAL,
+    };
     use std::time::{Duration, Instant};
 
     /// [behaviour] A wake is reserved once per interval, and a more recent hello suppresses it.
@@ -343,5 +371,24 @@ mod tests {
         assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR - one_ms));
         assert!(state.reserve_wake(hello + HELLO_FRESH_FOR));
         assert!(!state.reserve_wake(hello + HELLO_FRESH_FOR));
+    }
+    #[test]
+    fn released_approval_gets_a_new_window_to_reconnect() {
+        let queue = SignQueue::default();
+        let request = queue
+            .enqueue(
+                SignKind::Approval {
+                    attempt_id: "attempt".into(),
+                    approval_id: "approval".into(),
+                },
+                vec![0],
+                unix_now() + 60,
+            )
+            .unwrap();
+        queue.lock().requests[0].queued_at = Instant::now() - APPROVAL_TAKE_TIMEOUT;
+        assert_eq!(queue.poll(1)[0].request_id, request.request_id);
+        queue.release(1);
+        assert!(queue.approval_outcome(&request.request_id).is_none());
+        assert_eq!(queue.poll(2)[0].request_id, request.request_id);
     }
 }
