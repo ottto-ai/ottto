@@ -13,8 +13,8 @@
 
 use super::shell::{classify_shell, is_script_flag, join_to, ShellClass, ShellSegment, SHELLS};
 use super::{
-    is_memory_path, Author, CallClass, CallShare, ContentLabel, InnerItem, Kind, LineCtx, Part,
-    Request1, SkipReason, ToolKey, Verdict,
+    is_memory_path, split_mcp_name, Author, CallClass, CallShare, ContentLabel, InnerItem, Kind,
+    LineCtx, Part, Request1, SkipReason, ToolKey, Verdict,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -194,15 +194,6 @@ fn server_call(server: &str, tool: &str) -> CallClass {
         ToolKey::new(&format!("{server}/{tool}")),
         vec![server_share(server, tool, server_part(server, tool))],
     )
-}
-
-/// `mcp__<server>__<tool>` -> (server, tool).
-fn split_mcp_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("mcp__")?;
-    match rest.split_once("__") {
-        Some((server, tool)) => Some((server, tool)),
-        None => Some((rest, "")),
-    }
 }
 
 // -------------------------------------------------------------------------

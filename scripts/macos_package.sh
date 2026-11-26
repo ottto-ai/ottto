@@ -10,6 +10,8 @@ source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 source "$SCRIPT_DIR/macos_companion_entitlements.sh"
 # shellcheck source=scripts/macos_license_notices.sh
 source "$SCRIPT_DIR/macos_license_notices.sh"
+# shellcheck source=scripts/macos_release_archive.sh
+source "$SCRIPT_DIR/macos_release_archive.sh"
 # shellcheck source=scripts/macos_app_binary.sh
 source "$SCRIPT_DIR/macos_app_binary.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
@@ -18,7 +20,6 @@ if [[ -z "$ROOT" ]]; then
 fi
 MAC_APP_ROOT=""
 MAC_APP_SOURCE_PIN=""
-MAC_APP_SOURCE_REPOSITORY="${OTTTO_MACOS_APP_SOURCE_REPOSITORY:-}"
 
 VERSION="0.1.0-dev"
 CHANNEL="dev"
@@ -35,8 +36,8 @@ usage() {
 Usage: macos_package.sh [options]
 
 Options:
-  --app-root <path>          Required. The tools/ottto-macos-app Swift package
-                             root inside its clean Git checkout.
+  --app-root <path>          Required. The app's Swift package root: a tracked,
+                             clean subdirectory of its Git checkout.
   --app-source-commit <sha>  40-hex commit the app checkout must be at.
                              Required for stable-candidate and stable;
                              dev and preview default to the checkout HEAD.
@@ -52,12 +53,13 @@ Options:
   -h, --help                Show help.
 
 Environment:
-  OTTTO_MACOS_APP_SOURCE_REPOSITORY
-                             Required app source identity in owner/name form.
-                             Recorded as given; the caller validates the source.
   OTTTO_MACOS_DSYM_DIR       Private folder for the Companion dSYM and the
                              build tool logs. Required for stable-candidate and
                              stable; never printed or uploaded.
+
+The release manifest records the app source as private_source material: its
+commit and tree, with no repository name or path. The caller proves that the
+checkout is the canonical app source before packaging.
 USAGE
 }
 
@@ -123,7 +125,7 @@ case "$CHANNEL" in
     ;;
 esac
 if [[ -z "$MAC_APP_ROOT" ]]; then
-  echo "--app-root is required: pass the tools/ottto-macos-app Swift package root" >&2
+  echo "--app-root is required: pass the app's Swift package root" >&2
   exit 2
 fi
 if [[ -n "$MAC_APP_SOURCE_PIN" && ! "$MAC_APP_SOURCE_PIN" =~ ^[0-9a-f]{40}$ ]]; then
@@ -135,10 +137,6 @@ if [[ ( "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ) && -z "$MAC
   exit 2
 fi
 
-if [[ ! "$MAC_APP_SOURCE_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  echo "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" >&2
-  exit 2
-fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -225,8 +223,8 @@ case "$MAC_APP_ROOT/" in
     exit 2
     ;;
 esac
-if [[ "$MAC_APP_SOURCE_PATH" != "tools/ottto-macos-app" ]]; then
-  echo "macOS app root must be the tracked tools/ottto-macos-app subtree" >&2
+if [[ "$MAC_APP_ROOT" == "$MAC_APP_GIT_ROOT" || -z "$MAC_APP_SOURCE_PATH" ]]; then
+  echo "macOS app root must be a subdirectory of its Git checkout, not the checkout root" >&2
   exit 2
 fi
 # The caller validates source ownership before handing off the app checkout.
@@ -246,7 +244,12 @@ if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_SOURCE_PIN" ]]; then
   echo "macOS app source checkout is at $MAC_APP_SOURCE_COMMIT, not --app-source-commit $MAC_APP_SOURCE_PIN" >&2
   exit 2
 fi
-MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH")"
+MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse --verify --quiet "$MAC_APP_SOURCE_COMMIT:$MAC_APP_SOURCE_PATH" || true)"
+if [[ ! "$MAC_APP_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || \
+  [[ "$(git -C "$MAC_APP_GIT_ROOT" cat-file -t "$MAC_APP_SOURCE_TREE" 2>/dev/null || true)" != "tree" ]]; then
+  echo "macOS app root must be a tracked directory at the app source commit" >&2
+  exit 2
+fi
 COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"
 # Bind the signed plist to the verified private commit, not the index.
 COMPANION_ENTITLEMENTS_BLOB="$(git -C "$MAC_APP_GIT_ROOT" rev-parse --verify --quiet "HEAD:$MAC_APP_SOURCE_PATH/Companion.entitlements.plist" || true)"
@@ -598,6 +601,7 @@ ottto_macos_keep_dsym "$APP_MACOS/Ottto" "$VERSION"
 LAUNCH_SMOKE_EVIDENCE="$OUTPUT_DIR/packaged-app-launch-smoke.json"
 "$ROOT/scripts/macos_launch_smoke.sh" \
   --app "$APP_BUNDLE" \
+  --manifest-dir "$OUTPUT_DIR" \
   --wait-seconds "${OTTTO_MACOS_LAUNCH_SMOKE_WAIT_SECONDS:-10}" \
   --output "$LAUNCH_SMOKE_EVIDENCE"
 
@@ -620,8 +624,8 @@ DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"
   trap 'rm -rf "$ZIP_STAGE_ROOT"' EXIT
   ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto" "$ZIP_STAGE_ROOT/cli"
   ottto_stage_license_archive "$ROOT" "$OUTPUT_DIR/ottto-service" "$ZIP_STAGE_ROOT/daemon"
-  ditto -c -k "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
-  ditto -c -k "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
+  ottto_release_zip "$ZIP_STAGE_ROOT/cli" "$CLI_ZIP"
+  ottto_release_zip "$ZIP_STAGE_ROOT/daemon" "$DAEMON_ZIP"
 )
 SBOM_PATH="$OUTPUT_DIR/ottto-local-platform-sbom.cdx.json"
 # The SBOM describes the Apple Silicon build and the validated Sparkle pin.
@@ -673,9 +677,7 @@ jq -n \
   --arg channel "$CHANNEL" \
   --arg commit "$COMMIT" \
   --arg source_commit "$SOURCE_COMMIT" \
-  --arg mac_app_source_repository "$MAC_APP_SOURCE_REPOSITORY" \
   --arg mac_app_source_commit "$MAC_APP_SOURCE_COMMIT" \
-  --arg mac_app_source_path "$MAC_APP_SOURCE_PATH" \
   --arg mac_app_source_tree "$MAC_APP_SOURCE_TREE" \
   --arg generated_at "$GENERATED_AT" \
   --arg release_notes "$RELEASE_NOTES" \
@@ -684,19 +686,15 @@ jq -n \
   --arg rollback_immutable_prefix "$ARTIFACT_BASE_URL" \
   --arg rollback_latest_manifest_url "$LATEST_MANIFEST_URL" \
   --arg arch "$ARCH" \
-  --arg app_path "$APP_DMG" \
   --arg app_url "$ARTIFACT_BASE_URL/$(basename "$APP_DMG")" \
-  --arg app_verification_path "$APP_BUNDLE" \
+  --arg app_verification_path "$(basename "$APP_BUNDLE")" \
   --arg app_sha "$APP_SHA" \
-  --arg cli_path "$OUTPUT_DIR/ottto" \
-  --arg cli_zip "$CLI_ZIP" \
+  --arg cli_path "ottto" \
   --arg cli_url "$ARTIFACT_BASE_URL/$(basename "$CLI_ZIP")" \
   --arg cli_sha "$CLI_SHA" \
-  --arg daemon_path "$OUTPUT_DIR/ottto-service" \
-  --arg daemon_zip "$DAEMON_ZIP" \
+  --arg daemon_path "ottto-service" \
   --arg daemon_url "$ARTIFACT_BASE_URL/$(basename "$DAEMON_ZIP")" \
   --arg daemon_sha "$DAEMON_SHA" \
-  --arg sbom_path "$SBOM_PATH" \
   --arg sbom_url "$ARTIFACT_BASE_URL/$(basename "$SBOM_PATH")" \
   --arg sbom_sha "$SBOM_SHA" \
   --arg app_file "$(basename "$APP_DMG")" \
@@ -709,7 +707,7 @@ jq -n \
   --arg verified_installer_latest_url "$RELEASE_CHANNEL_URL_ROOT/latest/install-macos.sh" \
   --arg repository "${OTTTO_RELEASE_REPOSITORY:-ottto-ai/ottto}" \
   --arg signer_workflow "${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/macos-stable-release.yml}" \
-  --arg launch_smoke_path "$LAUNCH_SMOKE_EVIDENCE" \
+  --arg launch_smoke_path "$(basename "$LAUNCH_SMOKE_EVIDENCE")" \
   --argjson supported_install_owners "$SUPPORTED_INSTALL_OWNERS_JSON" \
   --argjson signed "$SIGNED" \
   --argjson notarized "$NOTARIZED" \
@@ -761,10 +759,10 @@ jq -n \
           commit: $source_commit
         },
         {
-          kind: "git_subtree",
-          repository: $mac_app_source_repository,
+          kind: "private_source",
+          name: "ottto-macos-app",
+          visibility: "private",
           commit: $mac_app_source_commit,
-          path: $mac_app_source_path,
           tree: $mac_app_source_tree,
           clean: true
         }
@@ -778,18 +776,18 @@ jq -n \
         subjects: [$app_file, $cli_file, $daemon_file, $manifest_file, $sbom_file],
         attested: false,
         verified: false,
-        verification_command: ("gh attestation verify " + $app_path + " -R " + $repository)
+        verification_command: ("gh attestation verify ./" + $app_file + " -R " + $repository)
       },
       sbom: {
         format: "cyclonedx-json",
         spec_version: "1.7",
         predicate_type: "https://cyclonedx.org/bom",
-        path: $sbom_path,
+        path: $sbom_file,
         url: $sbom_url,
         sha256: $sbom_sha,
         attested: false,
         verified: false,
-        verification_command: ("gh attestation verify " + $app_path + " -R " + $repository + " --predicate-type https://cyclonedx.org/bom")
+        verification_command: ("gh attestation verify ./" + $app_file + " -R " + $repository + " --predicate-type https://cyclonedx.org/bom")
       }
     },
     quality_gates: ({
@@ -823,7 +821,7 @@ jq -n \
         kind: "macos_app",
         platform: "macos",
         arch: $arch,
-        path: $app_path,
+        path: $app_file,
         url: $app_url,
         verification_path: $app_verification_path,
         sha256: $app_sha,
@@ -836,7 +834,7 @@ jq -n \
         kind: "cli",
         platform: "macos",
         arch: $arch,
-        path: $cli_zip,
+        path: $cli_file,
         url: $cli_url,
         verification_path: $cli_path,
         sha256: $cli_sha,
@@ -849,7 +847,7 @@ jq -n \
         kind: "daemon",
         platform: "macos",
         arch: $arch,
-        path: $daemon_zip,
+        path: $daemon_file,
         url: $daemon_url,
         verification_path: $daemon_path,
         sha256: $daemon_sha,

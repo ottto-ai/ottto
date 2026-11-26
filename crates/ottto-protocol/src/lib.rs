@@ -6381,7 +6381,7 @@ mod tests {
     }
 
     #[test]
-    fn w3_multi_anchor_backend_fixture_and_leaf_manifest_match_typed_wire() {
+    fn multi_anchor_backend_fixture_and_leaf_manifest_match_typed_wire() {
         let snapshots = vec![
             w3_multi_anchor_snapshot(
                 "1111111111111111111111111111111111111111111111111111111111111111",

@@ -379,7 +379,9 @@ impl LocalDaemon {
 
         Ok(DiagnosticsBundle {
             bundle_id: diagnostics_bundle_id(&status.generated_at),
-            machine_id: status.machine.machine_id.clone(),
+            // Stable local ids appear only as placeholders (docs/diagnostics.md),
+            // the same text `ottto_core::redact_key_value` gives a machine id.
+            machine_id: "[machine_id]".to_string(),
             created_at: status.generated_at.clone(),
             upload: diagnostics_local_only_upload_report(),
             redaction: diagnostics_redaction_report(),
@@ -506,13 +508,20 @@ fn diagnostics_redaction_report() -> RedactionReport {
             RedactionCategory::RawPrompt,
             RedactionCategory::CommandOutput,
         ],
-        redacted_fields: vec![
-            "installation.launch_agent_path".to_string(),
-            "security.auth_header".to_string(),
-        ],
+        redacted_fields: [
+            "account_id",
+            "device_id",
+            "installation_id",
+            "machine_id",
+            "org_id",
+            "user_id",
+            "installation.launch_agent_path",
+            "security.auth_header",
+        ]
+        .map(String::from)
+        .to_vec(),
         preserved_fields: vec![
             "bundle_id".to_string(),
-            "machine_id".to_string(),
             "created_at".to_string(),
             "runtime.daemon_state".to_string(),
             "runtime.daemon_running".to_string(),

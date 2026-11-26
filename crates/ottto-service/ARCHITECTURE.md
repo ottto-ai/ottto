@@ -36,9 +36,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
   it reads, uploads and saves nothing and sends no status receipt: the walk's receipt and manifest
   stand, and check-in beats (sent with no scan start while a record is armed) keep them fresh.
-  Anything else walks as before: any failure, an account switch, a restart or another writer's
-  save. A due sampled audit waits for the next walk, at the latest the backstop. A pass that took
-  a hint clears the record before any fallible step, so a failed pass is followed by a walk. An
+  Anything else walks as before: any failure, an account switch, a restart, another writer's
+  save, or a policy stop (collection disabled or a zero backfill window, which withdraws the
+  server's census). A due sampled audit waits for the next walk, at the latest the backstop. A
+  pass that took a hint clears the record before any fallible step, so a failed pass is
+  followed by a walk. An
   idle pass never emits a body. A watcher overflow, a dropped-event rescan (FSEvents
   MustScanSubDirs with its user or kernel drop flags) or a watcher re-create requests a listing,
   so that pass walks. Limit: a change the watcher misses silently, with no event and no drop
@@ -46,6 +48,22 @@ file-system hint / periodic listing → select file → read new bytes from save
   Back-to-back walks narrow that window to about one walk but do not close it.
   Desktop store-only edits to idle sessions (rename, archive, removal) do not wake the gate:
   their titles, lineage and placement can show up to `WALK_GAP` late. Amounts are unaffected.
+  Codex home side files (`state_5.sqlite`, `thread_history_1.sqlite`, `session_index.jsonl`,
+  `config.toml`) are not gate inputs either: a change to them neither wakes a settled Codex
+  source nor keeps a walk from arming. A walk uses the side facts current at that pass (reused
+  from cache while the files are unchanged) for each rollout it reaches. A side-only change to an
+  unchanged rollout is applied when the next eligible walk reaches that file: during use the next
+  rollout change, otherwise the remaining backstop gap plus pass lag plus the time to reach the
+  file. A rollout with a held created thread is owed work, so its source keeps walking. The
+  existing shortcuts still apply: a certified unchanged head compares only its reduction binding
+  (created thread, spawn family, identity conflict), so a title-only or extent-only change on it
+  waits for the file's next read; an accepted legacy rollout and an unowed compressed archive with
+  no reduction head reuse their stored decision. A side fact that changes and changes back before
+  that walk is never applied, and a rollout that leaves the backfill window or is deleted in the
+  wait is not read again. The freshness alarm ages unread transcript content; it carries no age
+  for a side-only change. `codex_side_only_reselect` and `codex_side_only_first_binding` count
+  selection decisions on unchanged rollouts whose stored head binding no longer matches; a held
+  created thread re-read because its hold memo's side facts moved is not counted there.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
@@ -119,6 +137,12 @@ file-system hint / periodic listing → select file → read new bytes from save
   A new rollout seen before its first complete header fails that page once.
   A proven compression or same-object move commits the old and new graph closures
   and Tail keys together during preparation; RAM adopts the destination after COMMIT.
+  A compression is proven only when the archive's zstd frame header records the
+  plaintext length the predecessor's head read, that read ended on a sealed line,
+  and the predecessor retains no growth. Any other archive (another length, which
+  holds turns appended after the last read, or no recorded length) is read once
+  as a new file, the absent predecessor retires, and the local
+  `codex_compression_carry_unproven` row counts the reason.
   A refused carry holds only its predecessor's proven owner and counts as inventory debt.
   A rollout moved while a reader owns it waits for a later pass.
 - **Codex revert groups.** Same-home revert files with one native session id can
@@ -499,8 +523,11 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   worktrees keep the shared common-directory identity. Explicit non-Git and unknown folders can
   carry a sanitized directory basename under the workspace-label upload policy; labels never
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
-  write v2, and other fact kinds stay v1. Older readers hold v2 facts as future state rather than
-  reconstructing them. No historical sessions are selected just to enrich metadata.
+  write v2. OpeningSettings has its own v2: the v1 payload followed by the request-1 MCP schema
+  count, written only when that count is present (a measured zero included); without it the
+  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact as
+  future state: a per-file hold that keeps the checkpoint, loses no data and re-reads nothing
+  until a compatible build returns. No historical sessions are selected just to enrich metadata.
 - Claude Desktop store discovery reads ordinary directories at any depth, retaining
   symlink rejection and the per-scan entry budget. Its identity census token enters a
   session fingerprint only when that session carries original Desktop identity evidence.
@@ -1060,6 +1087,12 @@ advances the observed transition high-water marks even across a long polling gap
 Accepted Claude request holders are recorded per source/session slot and contributor location.
 Only an exact body ACK replaces a slot's counted, nonzero request hashes, including an empty set.
 Copy removals consult those hashes before local ownership and census evidence.
+An unreadable Claude Tail carrier leaves its saved removal groups in place.
+A page that needs that carrier's proof withholds the copy through the request-owned hold.
+A committed carrier head that stays unreadable for two saves is set aside for one counted
+re-read. A newer-format head stays held. `claude_carrier_unknown` is recorded at reconcile
+and again per page, so it can count a key more than once per pass.
+Once the head can be read, a confirmed loss runs the ordinary copy correction.
 Rows survive refusal, temporary census loss, historical replay and bounded rebuilds.
 A destination change clears them; positive deletion prunes only hashes no stored copy names.
 The rows confer no upload receipt authority. State layout 8 stores each slot separately;

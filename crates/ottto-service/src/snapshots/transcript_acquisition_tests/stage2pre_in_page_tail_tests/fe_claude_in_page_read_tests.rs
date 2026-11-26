@@ -270,7 +270,7 @@ fn grown_full() -> Grown {
 ///
 /// Growth stops at the frozen extent; it is never an `OpenRead` failure.
 #[test]
-fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
+fn fe_claude_append_during_full_read_publishes_sealed_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -315,7 +315,7 @@ fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
 ///
 /// Red on main: the stable-source failure (one `OpenRead`), and the taken copy is dropped.
 #[test]
-fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_debt() {
+fn fe_claude_prime_append_during_tail_read_publishes_prefix_and_restages_debt() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -349,7 +349,7 @@ fn fe_claude_sp1c_prime_append_during_tail_read_publishes_prefix_and_restages_de
 /// Red on main: the row's newline lies past the frozen length, so the reader
 /// fails the stable-source check (one `OpenRead`).
 #[test]
-fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
+fn fe_claude_partial_row_at_frozen_grown_is_absent_now_present_next() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -385,7 +385,7 @@ fn fe_claude_sp2a_partial_row_at_frozen_grown_is_absent_now_present_next() {
 /// byte-identical: body == Full parse, unsealed, no copy,
 /// nothing unreadable.
 #[test]
-fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
+fn fe_claude_quiescent_unterminated_tail_keeps_main_output() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -404,7 +404,7 @@ fn fe_claude_sp2b_quiescent_unterminated_tail_keeps_main_output() {
 /// Full (GREEN): the same unterminated last row read by a Claude
 /// in-page `Full` keeps main's output: nothing unreadable, body == Full parse.
 #[test]
-fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
+fn fe_claude_quiescent_unterminated_full_keeps_main_output() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -430,7 +430,7 @@ fn fe_claude_sp2b_quiescent_unterminated_full_keeps_main_output() {
 /// Red on main: no in-page limit is set; the reader passes frozen and fails
 /// the stable-source check (one `OpenRead`), so the EOF hook never sees this read.
 #[test]
-fn fe_claude_sp2c_large_prefix_tail_stops_at_frozen_with_relative_limit() {
+fn fe_claude_large_prefix_tail_stops_at_frozen_with_relative_limit() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -473,7 +473,7 @@ fn fe_claude_sp2c_large_prefix_tail_stops_at_frozen_with_relative_limit() {
 /// Red on main: revalidation sees the grown identity (length, ctime, last
 /// 4 KiB) and refuses the page as one `ScopeObject`.
 #[test]
-fn fe_claude_spd2c_append_after_full_reader_eof_takes_grown_route() {
+fn fe_claude_append_after_full_reader_eof_takes_grown_route() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -501,7 +501,7 @@ fn fe_claude_spd2c_append_after_full_reader_eof_takes_grown_route() {
 ///
 /// Red on main: one `ScopeObject` at revalidation.
 #[test]
-fn fe_claude_spd2c_append_after_tail_reader_eof_takes_grown_route() {
+fn fe_claude_append_after_tail_reader_eof_takes_grown_route() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -603,7 +603,7 @@ fn replaced_page(
 /// publishes the cold-read body once; a second refusal in the walk is main's
 /// `ScopeObject` and keeps the census red.
 #[test]
-fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
+fn fe_claude_replace_during_tail_not_grown_is_scope_object() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -817,7 +817,7 @@ fn changed_reopen_shares_growth_retry(source: SnapshotSource) {
 /// Not grown, so main's strict reopen refuses; nothing published, and the
 /// file takes its one same-walk retry.
 #[test]
-fn fe_claude_sp4_truncate_during_tail_keeps_main_failure() {
+fn fe_claude_truncate_during_tail_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -838,7 +838,7 @@ fn fe_claude_sp4_truncate_during_tail_keeps_main_failure() {
 /// past frozen before completion. The grown-prefix traversal check fails, so main's
 /// strict reopen refuses and the file takes its one same-walk retry.
 #[test]
-fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
+fn fe_claude_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -874,7 +874,7 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
 /// rewritten past frozen with a different head. Main's revalidation and the grown-prefix
 /// head sample both refuse as `ScopeObject`; nothing published.
 #[test]
-fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
+fn fe_claude_regrow_after_reader_passes_frozen_with_new_head_refuses() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -896,7 +896,7 @@ fn fe_claude_sp5b_regrow_after_reader_passes_frozen_with_new_head_refuses() {
 /// rewritten to exactly frozen with a different head. Not grown, so main's
 /// strict reopen refuses and the file takes its one same-walk retry.
 #[test]
-fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
+fn fe_claude_rewrite_to_exactly_frozen_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -923,7 +923,7 @@ fn fe_claude_sp5c_rewrite_to_exactly_frozen_keeps_main_failure() {
 /// Red on main: revalidation sees the grown identity and refuses the page as
 /// one `ScopeObject`.
 #[test]
-fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
+fn fe_claude_residual_sample_preserving_rewrite_after_read_is_accepted() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1010,7 +1010,7 @@ fn claude_lossy_baseline() -> Baseline {
 
 /// Bad physical rows no longer block a quiescent Tail's valid siblings.
 #[test]
-fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
+fn fe_claude_bad_record_tail_keeps_valid_siblings() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1052,7 +1052,7 @@ fn fe_claude_sp7a_bad_record_tail_keeps_valid_siblings() {
 /// A grown Tail publishes the same sealed prefix with a bad physical row;
 /// the post-open append stays owed, with no retained copy or audit credit.
 #[test]
-fn fe_claude_sp7b_bad_record_grown_tail_keeps_valid_prefix() {
+fn fe_claude_bad_record_grown_tail_keeps_valid_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1074,7 +1074,7 @@ fn fe_claude_sp7b_bad_record_grown_tail_keeps_valid_prefix() {
 /// An overdue checkpoint still Tails the append without Full-audit credit.
 /// In-page grown-prefix deadline handling remains a separate concern.
 #[test]
-fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
+fn fe_claude_overdue_checkpoint_tails_and_keeps_debt_staged() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1100,7 +1100,7 @@ fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
 /// Claude, Codex and Pi share frozen extents for ordinary Full and Tail reads.
 /// Their next pass includes the append, with cold-read body parity.
 #[test]
-fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
+fn fe_claude_codex_in_page_full_with_append_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1280,7 +1280,7 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
 /// source-verified request-census record of its requests, and a quiescent `Tail` (which
 /// owes its audit) writes an unverified one.
 #[test]
-fn fe_claude_d1_control_quiescent_full_verified_tail_unverified() {
+fn fe_claude_control_quiescent_full_verified_tail_unverified() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1315,7 +1315,7 @@ fn fe_claude_d1_control_quiescent_full_verified_tail_unverified() {
 ///
 /// Red on main: the stable-source failure (one `OpenRead`); main invalidates the record.
 #[test]
-fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
+fn fe_claude_source_prefix_record_is_unverified_and_replaced_next_read() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1408,7 +1408,7 @@ fn fe_claude_prefix_cannot_admit_explicit_or_file_birth_posture() {
 /// Growth after the genuine-EOF apply must not certify the row it
 /// applied outside the last newline. No new reader/acquisition state needed.
 #[test]
-fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
+fn fe_claude_growth_after_applied_fragment_keeps_strict_identity() {
     let fixture = Fixture::new(CLAUDE);
     let mut bytes = row_bytes(CLAUDE, 0..2);
     assert_eq!(bytes.pop(), Some(b'\n'));
@@ -1682,7 +1682,7 @@ fn fe_claude_finalizer_response_loss_keeps_valid_grown_prefix() {
 /// An ineligible Full still has a ReadPlan, but the extent limit never froze its reader.
 /// Growth after its native EOF must not enter the optional prefix route.
 #[test]
-fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
+fn fe_claude_full_without_admission_keeps_strict_completion() {
     let fixture = Fixture::new(CLAUDE);
     append_raw(&fixture.0, &row_bytes(CLAUDE, 0..2));
     let (mut parser, _, scope) = native_parser(&fixture, CLAUDE);
@@ -1697,7 +1697,7 @@ fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
 
 /// Persistence must preserve the exclusion even without a census record and after key drift.
 #[test]
-fn fe_claude_prefix_provenance_round_trips_without_d1() {
+fn fe_claude_prefix_provenance_round_trips_without() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1804,7 +1804,7 @@ fn fe_claude_prefix_then_grown_tail_does_not_clear_provenance() {
 /// completion, so a prefix still ends `p` from a clean, replay-reset or
 /// legacy prior entry, and stays excluded.
 #[test]
-fn fe_g1_grown_prefix_still_marks_prefix_after_ordinary_record() {
+fn fe_grown_prefix_still_marks_prefix_after_ordinary_record() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1853,7 +1853,7 @@ fn fe_g1_grown_prefix_still_marks_prefix_after_ordinary_record() {
 /// recomposed body. An identity-incomplete record keeps its root excluded
 /// until a Full audit verifies it.
 #[test]
-fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
+fn fe_identity_incomplete_record_cannot_bind_recomposed_body() {
     use crate::snapshots::claude_request_census::{
         ClaudeRequestCensusRecord, ClaudeRequestCensusShape as Shape,
     };

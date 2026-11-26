@@ -3,11 +3,67 @@
 //! is independent: compression never certifies a replacement plaintext inode.
 use super::sampled_scan::codex_cursor::OpenStamp;
 use super::*;
+use crate::local_resource_diagnostics::CodexCompressionUnproven;
 use anyhow::{ensure, Context};
 
 fn absent(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
+
+/// The plaintext length a compressed rollout's zstd frame header records
+/// (`Frame_Content_Size`), from its first bytes only. Codex compresses an
+/// unchanged cold rollout and records its length; `None` when the header
+/// records none or cannot be read.
+fn compressed_content_length(file: &File) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    // ZSTD_FRAMEHEADERSIZE_MAX: the longest frame header.
+    let mut header = [0u8; 18];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read_at(&mut header[filled..], filled as u64) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    zstd::zstd_safe::get_frame_content_size(&header[..filled])
+        .ok()
+        .flatten()
+}
+
+/// Why a compressed successor may not take its predecessor's head without a
+/// read, or `None` when it may. Proof needs the archive to record exactly the
+/// plaintext length the head's certificate read, that read to end on a sealed
+/// line, and the predecessor to retain no growth; anything else (turns
+/// appended after the last read, an archive that records no length, a final
+/// line read unterminated) reads the archive as a new file. A metadata-only
+/// head or an unreadable certificate keeps the existing path.
+fn compression_unproven(
+    index: &ScanIndex,
+    from: &str,
+    head: &state_v2::TailHead,
+    archive: &File,
+) -> Option<CodexCompressionUnproven> {
+    if head.metadata_only {
+        return None;
+    }
+    if index.v2().growth_retention.contains_key(from) {
+        return Some(CodexCompressionUnproven::Growth);
+    }
+    let Some(recorded) = compressed_content_length(archive) else {
+        return Some(CodexCompressionUnproven::NoLength);
+    };
+    let certificate = tail_source::certified_certificate(&head.body).ok()?;
+    if certificate.length != recorded {
+        Some(CodexCompressionUnproven::Length)
+    } else if certificate.sealed_offset != certificate.length {
+        Some(CodexCompressionUnproven::Unsealed)
+    } else {
+        None
+    }
+}
+
 pub(super) fn physical_matches(head: &state_v2::TailHead, metadata: &fs::Metadata) -> bool {
     // A header refresh must never make newly appended bytes look applied.
     // Its inventory stamp is seeded only at the logical checkpoint or carry;
@@ -41,12 +97,16 @@ impl ScanIndex {
 
     /// Physical equality refines the ordinary decision without replacing its
     /// audit, evidence, exact-body/context or sidecar dependency authority.
+    /// `side_moved` is set when the rollout is physically unchanged but its
+    /// stored reduction binding differs from the current side facts: true when
+    /// the head stored no binding at all, false otherwise.
     pub(super) fn codex_unchanged_decision(
         &self,
         candidate: &mut CandidateFile,
         metadata: &CodexTitleMetadata,
         now: u64,
         body_witness_adoption: bool,
+        side_moved: &mut Option<bool>,
     ) -> Result<Option<(File, CandidateDecision, Option<CandidateParseReason>)>> {
         let key = local_index_key(&candidate.path);
         let file = open_candidate_beneath_root(candidate)?;
@@ -58,11 +118,11 @@ impl ScanIndex {
             Some((true, head)) => {
                 let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))
                     .filter(|value| !value.is_empty());
-                if tail_source::codex::header_facts(head.revision, &head.body)
+                let stored = tail_source::codex::header_facts(head.revision, &head.body)
                     .map_err(|_| anyhow::anyhow!("codex_carry_certificate"))?
-                    .0
-                    != binding
-                {
+                    .0;
+                if stored != binding {
+                    *side_moved = Some(stored.is_none());
                     return Ok(None);
                 }
             }
@@ -229,10 +289,28 @@ impl ScanIndex {
                 && candidate.path.as_os_str() == compressed_name.as_os_str()
                 && old_path.parent() == candidate.path.parent();
             let head = state_v2::load_head(self, &from, revision)?;
+            // A compression over an uncertified head stays refused below.
+            if compression
+                && head.as_ref().is_none_or(|head| {
+                    head.metadata_only || tail_source::certified_certificate(&head.body).is_err()
+                })
+            {
+                crate::local_resource_diagnostics::codex_compression_carry_unproven(
+                    CodexCompressionUnproven::Uncertified,
+                );
+            }
             ensure!(!compression || head.is_some(), "codex_carry_certificate");
             let Some(head) = head else {
                 continue;
             };
+            // Not proven: the archive reads as a new file (a counted Full)
+            // and the absent predecessor retires as any vanished rollout.
+            if compression {
+                if let Some(reason) = compression_unproven(self, &from, &head, &file) {
+                    crate::local_resource_diagnostics::codex_compression_carry_unproven(reason);
+                    continue;
+                }
+            }
             let job = tail_source::job_for_carry(&head, &metadata, compression);
             // A settled metadata-only head can prove job custody by file
             // identity. Outstanding revisions keep the existing owner hold.
@@ -360,4 +438,17 @@ impl ScanIndex {
         }
         Ok(true)
     }
+}
+
+/// Codex's archive of `plain`: one zstd frame that records the plaintext
+/// length, as the provider writes it (`set_pledged_src_size`).
+#[cfg(test)]
+pub(in crate::snapshots) fn codex_archive_bytes(plain: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder
+        .set_pledged_src_size(Some(plain.len() as u64))
+        .unwrap();
+    encoder.write_all(plain).unwrap();
+    encoder.finish().unwrap()
 }

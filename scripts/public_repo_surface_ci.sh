@@ -312,8 +312,10 @@ run_step M "test macOS Companion entitlement policy" bash scripts/test_macos_com
 run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step B "test macOS license notices" bash scripts/test_macos_license_notices.sh
 run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
+run_step M "test macOS release archives" bash scripts/test_macos_release_archive.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
+run_step B "test macOS notarization artifact selection" bash scripts/test_macos_notarize_filter.sh
 run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
 run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
 run_step P "test release evidence placeholders" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_evidence_placeholders.py
@@ -321,6 +323,7 @@ run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gat
 run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
 run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
 run_step B "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh
+run_step B "test stable QA summary" bash scripts/test_macos_stable_qa_summary.sh
 run_step B "test Homebrew formula generator" bash scripts/test_homebrew_formula.sh
 run_step B "test hosted native installer generator" bash scripts/test_hosted_native_installer.sh
 run_step B "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh

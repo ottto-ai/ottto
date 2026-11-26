@@ -219,7 +219,7 @@ fn uninstall_leaves_unpublished_routes_to_existing_cleanup() {
 }
 /// [format] f5 missing v1 garbled fences never authenticate final db.
 #[test]
-fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
+fn missing_v1_garbled_fences_never_authenticate_final_db() {
     for root in [
         None,
         Some(b"{\"schema_version\":3}".as_slice()),
@@ -248,7 +248,7 @@ fn f5_missing_v1_garbled_fences_never_authenticate_final_db() {
 }
 /// [format] f7 publication failures keep latch and artifacts and restart recovers.
 #[test]
-fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
+fn publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
     // Reconstruct the actual on-disk crash states, without process-global failpoints.
     for point in ["before_fence_rename", "before_db_rename", "after_db_rename"] {
         let f = Fixture::new();
@@ -288,7 +288,7 @@ fn f7_publication_failures_keep_latch_and_artifacts_and_restart_recovers() {
 /// [format] f7 a load with no support dir saves a published route through the
 /// one semantic save and published custody without semantic rows holds.
 #[test]
-fn f7_published_route_saves_natively_and_unmapped_custody_holds() {
+fn published_route_saves_natively_and_unmapped_custody_holds() {
     let f = Fixture::new();
     f.published();
     let mut index = load_with(&f.path, false).unwrap().unwrap();

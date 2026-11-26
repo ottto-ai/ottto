@@ -333,7 +333,7 @@ fn assert_refused(result: &SourceScanResult, seen: &Seen, cause: usize, id: &str
 /// its sealed prefix uncertified and drops the copy. Codex in-page reads are
 /// independent; FE changes the formerly pinned Claude "acquisition exceeds stable source" failure.
 #[test]
-fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
+fn claude_in_page_tail_with_append_publishes_uncertified_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

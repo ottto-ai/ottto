@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFLIGHT="$ROOT/scripts/macos_stable_preflight.sh"
 HELPER_GENERATOR="$ROOT/scripts/hosted_native_installer.sh"
@@ -67,17 +65,18 @@ jq -n \
     update_lifecycle: {
       launch_provenance: "launchservices_bundle",
       user_update_actions: 1,
-      homebrew_service_reached_target: true,
-      lower_gui_remained_running_after_homebrew_update: true,
+      starting_service_owner: "app_bundle",
+      service_restarted_on_target_version: true,
       sparkle_terminated_old_process: true,
       sparkle_relaunched_target_bundle: true,
       process_id_changed: true,
+      final_service_owner: "app_bundle",
       manual_process_termination: false,
       manual_app_launch: false,
       account_continuity_verified: true,
       source_continuity_verified: true,
-      diagnostics_via_homebrew_socket: true,
-      verify_via_homebrew_socket: true,
+      diagnostics_via_app_service_socket: true,
+      verify_via_app_service_socket: true,
       owner_prefix_protocol_schema_version_converged: true
     },
     checks: {
@@ -96,8 +95,8 @@ jq -n \
       verify_codex: "passed",
       diagnostics_redaction: "passed",
       update_check: "passed",
-      mixed_owner_app_version_truth: "passed",
-      mixed_owner_sparkle_autonomous_lifecycle: "passed",
+      app_owner_version_truth: "passed",
+      app_owner_sparkle_autonomous_lifecycle: "passed",
       rollback_notes: "passed",
       stable_formula_static: "passed",
       stable_hosted_installer_static: "passed"
@@ -112,14 +111,14 @@ write_manifest() {
 
   jq -n \
     --arg channel "$channel" \
-    --arg artifact "$artifact" \
-    --arg sbom "$sbom" \
+    --arg artifact "$(basename "$artifact")" \
+    --arg sbom "$(basename "$sbom")" \
     --arg app_url "$app_url" \
     --arg sha "$sha256" \
     --arg sbom_sha "$sbom_sha" \
     --arg rollback_immutable_prefix "https://install.ottto.net/ottto-local-platform/releases/$channel/0.1.0" \
     --arg rollback_latest_manifest_url "https://install.ottto.net/ottto-local-platform/releases/$channel/latest/release-manifest.json" \
-    --arg candidate_rc_evidence "$candidate_rc_evidence" \
+    --arg candidate_rc_evidence "$(basename "$candidate_rc_evidence")" \
     --arg candidate_sha "$candidate_sha" \
     '{
       schema_version: 1,
@@ -164,10 +163,10 @@ write_manifest() {
             commit: "abcdef123456abcdef123456abcdef123456abcd"
           },
           {
-            kind: "git_subtree",
-            repository: "example-org/example-app",
+            kind: "private_source",
+            name: "ottto-macos-app",
+            visibility: "private",
             commit: "123456abcdef123456abcdef123456abcdef1234",
-            path: "tools/ottto-macos-app",
             tree: "fedcba654321fedcba654321fedcba654321fedc",
             clean: true
           }
@@ -186,7 +185,7 @@ write_manifest() {
           ],
           attested: true,
           verified: true,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto"
+          verification_command: "gh attestation verify ./ottto -R ottto-ai/ottto"
         },
         sbom: {
           format: "cyclonedx-json",
@@ -197,7 +196,7 @@ write_manifest() {
           sha256: $sbom_sha,
           attested: true,
           verified: true,
-          verification_command: "gh attestation verify Ottto-macos-arm64.dmg -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
+          verification_command: "gh attestation verify ./ottto -R ottto-ai/ottto --predicate-type https://cyclonedx.org/bom"
         }
       },
       quality_gates: {
@@ -390,7 +389,7 @@ fi
 bad_candidate_rc_runtime="$TMP_DIR/stable-candidate-rc-bad-runtime-qa.json"
 jq '.local_platform.protocol_version = 11' "$candidate_rc_evidence" > "$bad_candidate_rc_runtime"
 bad_candidate_rc_runtime_manifest="$TMP_DIR/stable-candidate-rc-bad-runtime-manifest.json"
-jq --arg evidence "$bad_candidate_rc_runtime" \
+jq --arg evidence "$(basename "$bad_candidate_rc_runtime")" \
   '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
   "$stable_manifest" > "$bad_candidate_rc_runtime_manifest"
 if "$PREFLIGHT" --manifest "$bad_candidate_rc_runtime_manifest" --dry-run >/dev/null 2>&1; then
@@ -403,7 +402,7 @@ jq '.update_lifecycle.manual_app_launch = true' \
   "$candidate_rc_evidence" > "$manual_candidate_rc_lifecycle"
 manual_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-manual-lifecycle-manifest.json"
 jq \
-  --arg evidence "$manual_candidate_rc_lifecycle" \
+  --arg evidence "$(basename "$manual_candidate_rc_lifecycle")" \
   '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
   "$stable_manifest" > "$manual_candidate_rc_lifecycle_manifest"
 if "$PREFLIGHT" --manifest "$manual_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
@@ -416,11 +415,24 @@ jq '.update_lifecycle.user_update_actions = true' \
   "$candidate_rc_evidence" > "$wrong_type_candidate_rc_lifecycle"
 wrong_type_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-wrong-type-lifecycle-manifest.json"
 jq \
-  --arg evidence "$wrong_type_candidate_rc_lifecycle" \
+  --arg evidence "$(basename "$wrong_type_candidate_rc_lifecycle")" \
   '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
   "$stable_manifest" > "$wrong_type_candidate_rc_lifecycle_manifest"
 if "$PREFLIGHT" --manifest "$wrong_type_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
   echo "Expected boolean update-action count to fail stable preflight" >&2
+  exit 1
+fi
+
+homebrew_owner_candidate_rc_lifecycle="$TMP_DIR/stable-candidate-rc-homebrew-owner-lifecycle-qa.json"
+jq '.update_lifecycle.starting_service_owner = "homebrew"' \
+  "$candidate_rc_evidence" > "$homebrew_owner_candidate_rc_lifecycle"
+homebrew_owner_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-homebrew-owner-lifecycle-manifest.json"
+jq \
+  --arg evidence "$homebrew_owner_candidate_rc_lifecycle" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$homebrew_owner_candidate_rc_lifecycle_manifest"
+if "$PREFLIGHT" --manifest "$homebrew_owner_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected update evidence from a Homebrew-owned service to fail stable preflight" >&2
   exit 1
 fi
 
@@ -439,13 +451,54 @@ if "$PREFLIGHT" --manifest "$commit_mismatch_manifest" --dry-run >/dev/null 2>&1
 fi
 
 app_commit_mismatch_manifest="$TMP_DIR/stable-candidate-rc-app-commit-mismatch-manifest.json"
-jq '(.supply_chain.materials[] | select(.kind == "git_subtree") | .commit) = "999999abcdef123456abcdef123456abcdef1234"' \
+jq '(.supply_chain.materials[] | select(.kind == "private_source") | .commit) = "999999abcdef123456abcdef123456abcdef1234"' \
   "$stable_manifest" > "$app_commit_mismatch_manifest"
 if "$PREFLIGHT" --manifest "$app_commit_mismatch_manifest" --dry-run >"$TMP_DIR/app-commit-mismatch.out" 2>&1; then
   echo "Expected stable-candidate RC app source commit mismatch to fail stable preflight" >&2
   exit 1
 fi
 grep -q "stable manifest release identity (version, commit, app source commit)" "$TMP_DIR/app-commit-mismatch.out"
+
+# Evidence and artifacts resolve beside the manifest only: a host path, a
+# legacy app material shape, or an artifact symlink is refused.
+host_path_evidence_manifest="$TMP_DIR/host-path-evidence-manifest.json"
+jq --arg evidence "$candidate_rc_evidence" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$host_path_evidence_manifest"
+if "$PREFLIGHT" --manifest "$host_path_evidence_manifest" --dry-run >"$TMP_DIR/host-path-evidence.out" 2>&1; then
+  echo "Expected a host-path RC evidence reference to fail stable preflight" >&2
+  exit 1
+fi
+grep -q "evidence reference must be a release filename beside the manifest" "$TMP_DIR/host-path-evidence.out"
+if grep -Fq "$candidate_rc_evidence" "$TMP_DIR/host-path-evidence.out"; then
+  echo "Stable preflight printed the rejected evidence path" >&2
+  exit 1
+fi
+
+legacy_material_manifest="$TMP_DIR/legacy-material-manifest.json"
+jq '.supply_chain.materials[1] |= (.kind = "git_subtree" | .repository = "example-org/example-app" | del(.name, .visibility))' \
+  "$stable_manifest" > "$legacy_material_manifest"
+if "$PREFLIGHT" --manifest "$legacy_material_manifest" --dry-run >"$TMP_DIR/legacy-material.out" 2>&1; then
+  echo "Expected a legacy app material to fail stable preflight" >&2
+  exit 1
+fi
+grep -q "must record exactly one app source commit" "$TMP_DIR/legacy-material.out"
+
+ln -s ottto "$TMP_DIR/ottto-link"
+symlink_artifact_manifest="$TMP_DIR/symlink-artifact-manifest.json"
+jq '.artifacts[1].path = "ottto-link"' "$stable_manifest" > "$symlink_artifact_manifest"
+if "$PREFLIGHT" --manifest "$symlink_artifact_manifest" --dry-run >"$TMP_DIR/symlink-artifact.out" 2>&1; then
+  echo "Expected a symlinked artifact to fail stable preflight" >&2
+  exit 1
+fi
+grep -q "path must name a release file beside the manifest" "$TMP_DIR/symlink-artifact.out"
+
+# A moved release folder checked from another directory still passes.
+moved="$TMP_DIR/moved release"
+mkdir -p "$moved"
+cp "$artifact" "$sbom" "$candidate_rc_evidence" "$TMP_DIR/install-macos.sh" "$moved/"
+cp "$stable_manifest" "$moved/release-manifest.json"
+(cd "$ROOT" && "$PREFLIGHT" --manifest "$moved/release-manifest.json" --dry-run >/dev/null)
 
 bad_sha_manifest="$TMP_DIR/bad-sha-manifest.json"
 write_manifest \

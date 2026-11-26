@@ -373,6 +373,34 @@ const CODEX_ZST_PEAK: usize = 4;
 // included), then the `CODEX_ZST_INPUT_KEYS` totals.
 process_static!(fn with_codex_zst_headers: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7]);
 
+/// Why a Codex compression did not carry its predecessor's head; each such
+/// archive is read once as a new file. Counts only, keyed by
+/// `CODEX_COMPRESSION_UNPROVEN_KEYS`; `codex_zst_refused_flush` reports the
+/// nonzero ones once per pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexCompressionUnproven {
+    /// The archive records another plaintext length than the head read.
+    Length = 0,
+    /// The predecessor still retains growth.
+    Growth = 1,
+    /// The archive records no plaintext length.
+    NoLength = 2,
+    /// The head read up to an unterminated final line.
+    Unsealed = 3,
+    /// The predecessor has no certified head; the carry stays refused and
+    /// holds the archive, so this counts once per pass while it holds.
+    Uncertified = 4,
+}
+const CODEX_COMPRESSION_UNPROVEN_KEYS: [&str; 5] =
+    ["length", "growth", "no_length", "unsealed", "uncertified"];
+process_static!(fn with_codex_compression_unproven: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5]);
+
+pub(crate) fn codex_compression_carry_unproven(reason: CodexCompressionUnproven) {
+    with_codex_compression_unproven(|counts| {
+        let _ = counts[reason as usize].try_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    });
+}
+
 /// Counts only: inventory header reads decode every `.zst` once per walk, so
 /// `codex_zst_refused_flush` reports them as one per-walk row.
 pub(crate) fn codex_zst_input_header(counts: [u64; 6]) {
@@ -405,6 +433,20 @@ pub(crate) fn codex_zst_refused_flush() {
             .zip(headers)
             .collect();
         traversal_point("codex_zst_input_headers", "codex", &counts);
+    }
+    let unproven: BTreeMap<&str, u64> = with_codex_compression_unproven(|counts| {
+        CODEX_COMPRESSION_UNPROVEN_KEYS
+            .into_iter()
+            .zip(counts.iter().map(|count| count.swap(0, Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect()
+    });
+    if !unproven.is_empty() {
+        traversal_point(
+            "codex_compression_carry_unproven",
+            "codex",
+            &BTreeMap::from([("codex_compression_carry_unproven", unproven)]),
+        );
     }
     let counts = with_codex_zst_refused(|refused| {
         let counts: BTreeMap<CodexZstCause, u64> = CODEX_ZST_ALL

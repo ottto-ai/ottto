@@ -31,8 +31,8 @@ fn transcript(home: &OracleHome) -> PathBuf {
     }
 }
 
-/// New usage that no hint announces. Codex gains a second thread, which
-/// also moves its state store, so Codex wakes on its own stamps.
+/// New usage that no hint announces. Codex gains a second thread (a new
+/// rollout and its state rows); its home side files are not gate inputs.
 fn change(home: &OracleHome) {
     let at = "2026-11-01T07:03:00Z";
     let line = match home.source {
@@ -303,13 +303,9 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         request_listing_all(ListingTrigger::Overflow);
         let cycle = pass(&mut home, &server, &recording, STEP);
         expect(cycle, true, &mut cycles);
-        // An unannounced change waits for the backstop. Codex's state store
-        // moved too, which wakes it at once; it then idles to the backstop.
+        // An unannounced change waits for the backstop, Codex's moved state
+        // store included.
         change(&home);
-        if source == SnapshotSource::Codex {
-            let cycle = pass(&mut home, &server, &recording, STEP);
-            expect(cycle, true, &mut cycles);
-        }
         let mut since_walk = 0;
         loop {
             since_walk += STEP;
@@ -398,6 +394,328 @@ fn walk_gate_lifecycle_codex_on_a_moving_clock() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn walk_gate_lifecycle_pi_on_a_moving_clock() {
     walk_gate_lifecycle_moving(SnapshotSource::Pi, "w12_pi", "w12_pi_today");
+}
+
+/// Writes one spawn edge into the Codex home's state store. The rollouts
+/// stay byte-identical.
+fn add_spawn_edge(home: &OracleHome, parent: &str, child: &str) {
+    let state = roots(home)[0].parent().unwrap().join("state_5.sqlite");
+    rusqlite::Connection::open(state)
+        .unwrap()
+        .execute(
+            "INSERT INTO thread_spawn_edges VALUES (?1,?2)",
+            [parent, child],
+        )
+        .unwrap();
+}
+
+/// Moves a thread's thread-history extent by `lag` bytes and ordinals behind
+/// what the fixture wrote (0 catches it up again). The rollout is untouched.
+fn set_extent_lag(home: &OracleHome, thread: &str, lag: i64) {
+    let history = roots(home)[0]
+        .parent()
+        .unwrap()
+        .join("thread_history_1.sqlite");
+    let rows = std::fs::read_to_string(roots(home)[0].join(format!("rollout-{thread}.jsonl")))
+        .unwrap()
+        .lines()
+        .count() as i64;
+    let length = std::fs::metadata(roots(home)[0].join(format!("rollout-{thread}.jsonl")))
+        .unwrap()
+        .len() as i64;
+    rusqlite::Connection::open(history)
+        .unwrap()
+        .execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1,next_rollout_ordinal=?2 WHERE thread_id=?3",
+            rusqlite::params![length - lag, rows - lag, thread],
+        )
+        .unwrap();
+}
+
+/// The exact accepted heads (normalized bodies after each exact ACK) and,
+/// per pass after the side change, whether the changed thread's own accepted
+/// body moved and that pass's side-only reselect counts.
+struct SideOnlyRun {
+    lifecycle: Lifecycle,
+    accepted: BTreeMap<String, Value>,
+    passes: Vec<(bool, [u64; 2])>,
+}
+
+/// complete -> a spawn edge binds a created thread whose rollout never
+/// changes -> passes to the backstop. With `gated` false every pass walks
+/// (today's back-to-back walks over the same timeline).
+fn codex_side_only_lifecycle(row: &'static str, gated: bool) -> SideOnlyRun {
+    let source = SnapshotSource::Codex;
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    install_created_thread(&home, false, SECOND_CODEX_THREAD, false);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        if !gated {
+            crate::snapshot_watcher::cover_paths_for_test(None);
+        }
+        let mut cycles = settle(&mut home, &server, &recording);
+        let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
+        let mut seen = Seen::now(source, &server);
+        let mut accepted = BTreeMap::new();
+        for cycle in &cycles {
+            schedule_accepts(source, cycle, &mut accepted);
+        }
+        let before = accepted.get(IDENTITY_PIPELINE_ROOT).cloned();
+        assert!(before.is_some(), "{row}: the thread has an accepted body");
+        let rollout = std::fs::read(transcript(&home)).unwrap();
+        add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+        let mut applied = Vec::new();
+        let mut since_walk = 0;
+        loop {
+            since_walk += STEP;
+            let backstop = since_walk >= WALK_GAP;
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            let walk = backstop || !gated;
+            expect_pass(source, row, &cycle, walk, &server, &mut seen);
+            walks += usize::from(walk);
+            schedule_accepts(source, &cycle, &mut accepted);
+            let took = accepted.get(IDENTITY_PIPELINE_ROOT) != before.as_ref();
+            applied.push((took, cycle.side_only));
+            cycles.push(cycle);
+            if backstop {
+                break;
+            }
+        }
+        assert_eq!(
+            std::fs::read(transcript(&home)).unwrap(),
+            rollout,
+            "{row}: the rollout never changed"
+        );
+        SideOnlyRun {
+            lifecycle: Lifecycle::of(&server, &cycles, walks),
+            accepted,
+            passes: applied,
+        }
+    })
+}
+
+/// A spawn edge for a created thread on an unchanged rollout wakes nothing:
+/// the backstop walk applies it to that thread's accepted body, counted, and
+/// every exact accepted body equals back-to-back walks over the same timeline.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_side_only_change_waits_for_the_backstop_walk() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let row = "w20_codex_side";
+    let gated = codex_side_only_lifecycle(row, true);
+    let today = codex_side_only_lifecycle("w20_codex_side_today", false);
+    let (rested, walked_each) = (&gated.passes, &today.passes);
+    assert!(walked_each[0].0, "{row}: the next walk applies the edge");
+    let ((backstop, counted), rests) = rested.split_last().unwrap();
+    assert!(
+        rests
+            .iter()
+            .all(|&(took, counts)| !took && counts == [0, 0]),
+        "{row}: a rest applies and reads nothing"
+    );
+    assert!(*backstop, "{row}: the backstop walk applies the edge");
+    assert!(
+        counted[0] >= 1,
+        "{row}: the reselect is counted: {counted:?}"
+    );
+    assert_eq!(counted[1], 0, "{row}: {counted:?}");
+    assert_eq!(walked_each[0].1, *counted, "{row}: on either schedule");
+    assert!(
+        gated.lifecycle.walks < today.lifecycle.walks,
+        "{row}: the edge woke no walk"
+    );
+    gated.lifecycle.assert_matches(&today.lifecycle, row);
+    assert_eq!(
+        gated.accepted, today.accepted,
+        "{row}: the same exact accepted bodies"
+    );
+}
+
+/// A pass that walked to completion or left a walk in progress (an idle
+/// pass does neither).
+fn walking(cycle: &Cycle) -> bool {
+    walked(cycle) || !walk_idle::idle_finish(&cycle.index)
+}
+
+/// A created thread held while its thread-history extent lags its rollout:
+/// passes before and after the extent catches up (no rollout change). Also
+/// returns, per pass after the catch-up, whether the thread's own accepted
+/// body moved and that pass's side-only reselect counts.
+fn codex_held_thread_lifecycle(row: &'static str, gated: bool) -> SideOnlyRun {
+    let source = SnapshotSource::Codex;
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    install_created_thread(&home, false, SECOND_CODEX_THREAD, false);
+    add_spawn_edge(&home, SECOND_CODEX_THREAD, IDENTITY_PIPELINE_ROOT);
+    set_extent_lag(&home, IDENTITY_PIPELINE_ROOT, 1);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        if !gated {
+            crate::snapshot_watcher::cover_paths_for_test(None);
+        }
+        let mut cycles = Vec::new();
+        let mut accepted = BTreeMap::new();
+        for _ in 0..3 {
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            assert!(cycle.finish.is_ok(), "{row}: {:?}", cycle.finish);
+            assert!(
+                walking(&cycle),
+                "{row}: a held source walks: {}",
+                cycle.gate
+            );
+            assert_eq!(
+                walk_idle::armed_for_test(source),
+                None,
+                "{row}: a held thread is owed, so the source never rests"
+            );
+            schedule_accepts(source, &cycle, &mut accepted);
+            cycles.push(cycle);
+        }
+        let before = accepted.get(IDENTITY_PIPELINE_ROOT).cloned();
+        let rollout = std::fs::read(transcript(&home)).unwrap();
+        set_extent_lag(&home, IDENTITY_PIPELINE_ROOT, 0);
+        let mut applied = Vec::new();
+        for _ in 0..2 {
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            assert!(cycle.finish.is_ok(), "{row}: {:?}", cycle.finish);
+            schedule_accepts(source, &cycle, &mut accepted);
+            let took = accepted.get(IDENTITY_PIPELINE_ROOT) != before.as_ref();
+            applied.push((took, cycle.side_only));
+            cycles.push(cycle);
+        }
+        assert!(
+            walking(&cycles[3]),
+            "{row}: the pass after the catch-up walks: {}",
+            cycles[3].gate
+        );
+        assert_eq!(
+            std::fs::read(transcript(&home)).unwrap(),
+            rollout,
+            "{row}: the rollout never changed"
+        );
+        let walks = cycles.iter().filter(|cycle| walking(cycle)).count();
+        SideOnlyRun {
+            lifecycle: Lifecycle::of(&server, &cycles, walks),
+            accepted,
+            passes: applied,
+        }
+    })
+}
+
+/// A held created thread keeps its source walking, so its thread-history
+/// extent catching up (no rollout change) is cured by the next walk: the
+/// thread's own accepted body moves, the side-only counters stay zero (a
+/// hold-memo miss is an ordinary re-read), and every exact accepted body
+/// equals back-to-back walks. Home side files are not gate inputs, but a
+/// hold never rests to wait for them.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_held_thread_extent_catch_up_is_cured_by_the_next_walk() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let row = "w22_codex_extent";
+    let gated = codex_held_thread_lifecycle(row, true);
+    let today = codex_held_thread_lifecycle("w22_codex_extent_today", false);
+    assert!(gated.passes[0].0, "{row}: the next walk cures the hold");
+    assert_eq!(gated.passes, today.passes, "{row}");
+    assert!(
+        gated.passes.iter().all(|(_, counts)| *counts == [0, 0]),
+        "{row}: {:?}",
+        gated.passes
+    );
+    gated.lifecycle.assert_matches(&today.lifecycle, row);
+    assert_eq!(
+        gated.accepted, today.accepted,
+        "{row}: the same exact accepted bodies"
+    );
+}
+
+/// A window-0 policy stop withdraws the server's census, so it clears an
+/// armed record: back at the same window (identical hint bytes) the next
+/// pass walks and republishes the manifest instead of resting on it.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn window_zero_policy_stop_clears_the_armed_record() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Pi;
+    let row = "w23_window_zero";
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        assert!(walk_idle::armed_for_test(source).is_some(), "{row}");
+        let statuses = status_count(&server);
+        let window = std::sync::atomic::Ordering::SeqCst;
+        server.window_days.store(0, window);
+        walk_idle::age_for_test(source, STEP);
+        assert!(
+            prepare_once(&mut home).unwrap().is_none(),
+            "{row}: window 0 stops the pass"
+        );
+        assert!(status_count(&server) > statuses, "{row}: the tombstone");
+        assert_eq!(
+            walk_idle::armed_for_test(source),
+            None,
+            "{row}: the stop clears the record"
+        );
+        server.window_days.store(183, window);
+        let mut seen = Seen::now(source, &server);
+        let back = pass(&mut home, &server, &recording, STEP);
+        expect_pass(source, row, &back, true, &server, &mut seen);
+    });
+}
+
+/// An unreadable Codex state store still walks an armed source: home side
+/// files left the gate key, the scan's census health check did not.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_unreadable_state_store_walks_an_armed_source() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w21_codex_health";
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        assert!(walk_idle::armed_for_test(source).is_some());
+        let state = roots(&home)[0].parent().unwrap().join("state_5.sqlite");
+        std::fs::write(state, b"not a state store").unwrap();
+        let cycle = pass(&mut home, &server, &recording, STEP);
+        assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+        assert!(walking(&cycle), "the pass walked: {}", cycle.gate);
+        assert!(
+            walk_idle::armed_for_test(source).is_none(),
+            "and did not re-arm: {}",
+            cycle.gate
+        );
+    });
 }
 
 /// Settles `home` under the simulated watcher, with one idle pass behind it.

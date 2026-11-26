@@ -145,7 +145,8 @@ pub(super) fn save(
     next: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<kinds::Baseline> {
-    let carried = {
+    use super::super::claude_request_money::e2::record_carrier_repairs;
+    let mut carried = {
         let mut tx = db.begin(TxnMode::Read)?;
         kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
         kinds_files::merge_growth_cas(&mut tx, next)?;
@@ -157,7 +158,7 @@ pub(super) fn save(
                 session_links(&mut tx, keys, previous.generation, cx.tail.as_ref())
             })
         } else {
-            BTreeMap::new()
+            Carriers::default()
         }
     };
     super::super::sampled_audit::prune_growth_retention(
@@ -165,7 +166,25 @@ pub(super) fn save(
         super::super::sampled_scan::now_seconds(),
     );
     next.prune_request_contributions();
-    let mut saved = kinds::save_graph(db, identity, previous, next, cx)?;
+    let due = carried.due_repairs();
+    for key in &due {
+        cx.tail
+            .get_or_insert_with(Default::default)
+            .set_aside(key, tail::SetAsideCause::Row);
+    }
+    let mut saved = match kinds::save_graph(db, identity, previous, next, cx) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // A retry must still see the committed head as unknown.
+            if let Some(stage) = &mut cx.tail {
+                for key in due {
+                    stage.clear_set_aside(key);
+                }
+            }
+            return Err(error);
+        }
+    };
+    record_carrier_repairs(due.len());
     next.deleted_holders.clear();
     saved.copy_ownership.1 = carried;
     Ok(saved)
@@ -182,31 +201,109 @@ pub(super) fn baseline(
         .seed(&mut |keys| session_links(&mut tx, keys, index.generation, None));
     Ok(baseline)
 }
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CARRIER_HEAD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_carrier_head_error_for_test<T>(key: &str, run: impl FnOnce() -> T) -> T {
+    FAIL_CARRIER_HEAD.with(|fault| assert!(fault.replace(Some(key.to_owned())).is_none()));
+    let result = run();
+    FAIL_CARRIER_HEAD.with(|fault| assert!(fault.take().is_none(), "carrier was not read"));
+    result
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CARRIER_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every committed carrier read inside `run` fails as the store would, not as
+/// one head would.
+#[cfg(test)]
+pub(crate) fn with_carrier_store_error_for_test<T>(run: impl FnOnce() -> T) -> T {
+    FAIL_CARRIER_STORE.with(|fault| assert!(!fault.replace(true)));
+    let result = run();
+    FAIL_CARRIER_STORE.with(|fault| fault.set(false));
+    result
+}
+
 pub(super) fn session_links(
     tx: &mut dyn Transaction,
     keys: &[&str],
     generation: u64,
     stage: Option<&tail::TailStage>,
-) -> Links {
+) -> Carriers {
     use super::super::tail_source::{self, claude::Claude, TailSource};
     use tail::EffectiveHead;
-    keys.iter()
-        .filter_map(|&key| {
-            let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
-                EffectiveHead::Removed => None,
-                EffectiveHead::Staged(revision, head) => {
-                    tail_source::claude_head_session(revision, &head)
+    // Only `Unreadable`, a failure of this one committed head, may lead to a
+    // repair read. A store error is not about the head and never does.
+    enum Unknown {
+        Future,
+        Staged,
+        Store,
+        Unreadable,
+    }
+    let mut carriers = Carriers::default();
+    let mut load = |key: &str| {
+        #[cfg(test)]
+        if FAIL_CARRIER_HEAD.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            if fault.as_deref() != Some(key) {
+                return false;
+            }
+            fault.take();
+            true
+        }) {
+            return Err(Unknown::Unreadable);
+        }
+        #[cfg(test)]
+        if FAIL_CARRIER_STORE.with(std::cell::Cell::get) {
+            return Err(Unknown::Store);
+        }
+        // load_head also reports a higher reduction revision as Hold::Future.
+        tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation).map_err(
+            |error| {
+                if error.downcast_ref::<Hold>() == Some(&Hold::Future) {
+                    Unknown::Future
+                } else if error.is::<tail::UnreadableHead>() {
+                    Unknown::Unreadable
+                } else {
+                    Unknown::Store
                 }
-                EffectiveHead::Committed => {
-                    tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation)
-                        .ok()
-                        .flatten()
-                        .and_then(|h| tail_source::claude_head_session(h.revision, &h.body))
+            },
+        )
+    };
+    for &key in keys {
+        let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
+            EffectiveHead::Removed => Ok(None),
+            EffectiveHead::Staged(revision, head) => {
+                tail_source::claude_head_session(revision, &head).map_err(|_| Unknown::Staged)
+            }
+            EffectiveHead::Committed => load(key).and_then(|head| match head {
+                Some(head) if !head.metadata_only => {
+                    tail_source::claude_head_session(head.revision, &head.body)
+                        .map_err(|_| Unknown::Unreadable)
                 }
-            }?;
-            Some((key.to_owned(), session))
-        })
-        .collect()
+                _ => Ok(None),
+            }),
+        };
+        match session {
+            Ok(Some(session)) => {
+                carriers.links.insert(key.to_owned(), session);
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                carriers.unknown.insert(key.to_owned());
+                if matches!(reason, Unknown::Unreadable) {
+                    carriers.unreadable.insert(key.to_owned());
+                }
+            }
+        }
+    }
+    carriers
 }
 
 fn identity(tx: &mut dyn Transaction) -> Result<Identity> {
@@ -1460,7 +1557,7 @@ mod application_cases {
 
     /// [format] f7 baseline failures remain unpublished and keep original authority.
     #[test]
-    fn f7_baseline_failures_remain_unpublished_and_keep_original_authority() {
+    fn baseline_failures_remain_unpublished_and_keep_original_authority() {
         for blocked in [".v1-readonly", ".v1-readonly.shards"] {
             let c = Corpus::new();
             c.sharded();
@@ -1530,7 +1627,7 @@ mod application_cases {
     }
     /// [format] f4 original unbound authority repair preserves freeze raw bytes and provenance.
     #[test]
-    fn f4_original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
+    fn original_unbound_authority_repair_preserves_freeze_raw_bytes_and_provenance() {
         let c = Corpus::new();
         let mut seed = ScanIndex::default();
         seed.insert_retry_pending_claude_authority_for_test("family");

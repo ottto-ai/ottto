@@ -97,6 +97,8 @@ fn seeded() -> SnapshotItem {
     item.attribution_facts = vec![fact];
     item.session_start = Some(Box::new(session_start::SnapshotSessionStart {
         start_config_fingerprint: Some(NAME.to_string()),
+        start_chars_tools: Some(40),
+        start_chars_mcp_schemas: Some(30),
         ..session_start::SnapshotSessionStart::default()
     }));
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
@@ -148,6 +150,10 @@ fn names_off_merges_mcp_names_and_keeps_totals_and_provider_vocabulary() {
                 .start_config_fingerprint,
             None
         );
+        // A number with no names: it travels with names off.
+        let start = item.session_start.as_ref().unwrap();
+        assert_eq!(start.start_chars_tools, Some(40));
+        assert_eq!(start.start_chars_mcp_schemas, Some(30));
         if policy.session_attribution_enabled {
             assert_eq!(item.attribution_facts[0].value, "custom");
         }

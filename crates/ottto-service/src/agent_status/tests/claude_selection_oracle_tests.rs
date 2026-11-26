@@ -282,7 +282,7 @@ mod money_equivalence_tests {
 
     /// [money] Default-only selection and the complete local/upload boundary.
     #[test]
-    fn s01_default_only_full_row() {
+    fn default_only_full_row() {
         let candidates = vec![candidate("default", "account-a", "org-x", 4, 12)];
         let inputs = candidate_inputs(&candidates);
         let selected = select_claude_snapshot_candidates(&candidates, &BTreeMap::new());
@@ -307,7 +307,7 @@ mod money_equivalence_tests {
 
     /// [money] Equal meter quality uses the lexical registered anchor.
     #[test]
-    fn s02_lexical_anchor() {
+    fn lexical_anchor() {
         let candidates = vec![
             candidate("default", "account-a", "org-x", 4, 12),
             candidate("claude_slot_b", "account-a", "org-x", 4, 12),
@@ -326,7 +326,7 @@ mod money_equivalence_tests {
 
     /// [money] A working weak-meter anchor beats a dead complete-meter login.
     #[test]
-    fn s03_health_first_canonical() {
+    fn health_first_canonical() {
         let mut live = status("account-a", "org-x", "fresh");
         live.access_expires_at = Some("2099-01-01T00:00:00Z".to_string());
         let mut dead = status("account-a", "org-x", "needs_login");
@@ -358,7 +358,7 @@ mod money_equivalence_tests {
 
     /// [money] A better default carries only its exact anchor's closed receipt.
     #[test]
-    fn s04_better_default_closed_receipt() {
+    fn better_default_closed_receipt() {
         let mut anchor = status("account-a", "org-x", "needs_login");
         anchor.quota_check_diagnostics = vec![serde_json::from_value(json!({
             "code":"claude_slot_worker_needs_login","severity":"warning",
@@ -405,7 +405,7 @@ mod money_equivalence_tests {
 
     /// [money] Neither shared account nor shared organization merges exact pairs.
     #[test]
-    fn s05_three_exact_pairs() {
+    fn three_exact_pairs() {
         let candidates = vec![
             candidate("claude_slot_a", "account-a", "org-x", 4, 12),
             candidate("claude_slot_b", "account-a", "org-y", 4, 23),
@@ -424,7 +424,7 @@ mod money_equivalence_tests {
 
     /// [money] Unknown registry ownership withholds a winner without substituting a degraded row.
     #[test]
-    fn s06_unknown_registry_withholds() {
+    fn unknown_registry_withholds() {
         let states = BTreeMap::from([(
             "claude_slot_a".to_string(),
             status("account-a", "org-x", "provider_unavailable"),
@@ -483,7 +483,7 @@ mod money_equivalence_tests {
 
     /// [money] Failure bounds and known removal differ from an unreadable registry.
     #[test]
-    fn s07_failure_bound_and_ownership() {
+    fn failure_bound_and_ownership() {
         let now = Instant::now();
         let previous = BTreeMap::from([(
             "claude_slot_a".to_string(),
@@ -513,7 +513,7 @@ mod money_equivalence_tests {
 
     /// [money] Candidate exact and organization-less claims survive owned siblings.
     #[test]
-    fn s08_plan_composition() {
+    fn plan_composition() {
         let mut c = candidate("default", "account-a", "org-x", 4, 12);
         c.snapshot.plan_observations = vec![
             plan("account-a", Some("org-x")),
@@ -567,7 +567,7 @@ mod money_equivalence_tests {
     /// [money] A deferred default serves exact cached meters with their original clocks.
     #[test]
     #[serial]
-    fn s09_deferred_cache_absent_stale_fresh() {
+    fn deferred_cache_absent_stale_fresh() {
         let guard = OAuthGuard::new("deferred");
         let caller = ClaudeOAuthUsageCaller::DefaultDeferredToSlot;
         for (variant, observed) in [
@@ -644,7 +644,7 @@ mod money_equivalence_tests {
     /// [money] Each managed-anchor deferral precondition is independently necessary.
     #[test]
     #[serial]
-    fn s10_deferral_exclusions() {
+    fn deferral_exclusions() {
         let _guard = OAuthGuard::new("deferral-exclusions");
         use ottto_protocol::ClaudeConfigSlotRelationshipV1 as Relationship;
         let base = single_caller_slot(
@@ -720,7 +720,7 @@ mod money_equivalence_tests {
     /// [money] Exact-pair attempt exclusion and the existing caller-run state boundaries.
     #[test]
     #[serial]
-    fn s11_attempt_and_caller_runs() {
+    fn attempt_and_caller_runs() {
         let _guard = OAuthGuard::new("attempts");
         let first = try_claude_oauth_collection_attempt("account-a", "org-x").unwrap();
         let contended = try_claude_oauth_collection_attempt("account-a", "org-x").is_none();
@@ -784,7 +784,7 @@ mod money_equivalence_tests {
 
     /// [money] Full equal payloads collide by registered home count, not distinct pair count.
     #[test]
-    fn s13_collision_home_count() {
+    fn collision_home_count() {
         for (variant, candidates, expected) in [
             (
                 "one_registered",
@@ -845,7 +845,7 @@ mod money_equivalence_tests {
 
     /// [money] Retained stale collisions clear both meter vectors and every availability flag.
     #[test]
-    fn s14_stale_collision_quarantine() {
+    fn stale_collision_quarantine() {
         let current = candidate("claude_slot_b", "account-b", "org-y", 4, 12);
         let stale = json!({"state":"provider_unavailable","account_identifier_hash":"account-a","organization_identifier_hash":"org-x",
             "observed_at":CAPTURED,"last_full_quota_read_at":"2026-08-05T01:00:00Z","has_account_windows":true,
@@ -880,7 +880,7 @@ mod money_equivalence_tests {
     /// [money] Another caller's success preserves this caller's exact auth hold.
     #[test]
     #[serial]
-    fn s12_independent_auth_holds() {
+    fn independent_auth_holds() {
         let _guard = OAuthGuard::new("caller-holds");
         let caller = ClaudeOAuthUsageCaller::Default;
         let diagnostics = record_claude_oauth_usage_auth_failure(
@@ -934,7 +934,7 @@ mod money_equivalence_tests {
     /// [money] Real HTTP error arms retain meters and distinguish caller and binding holds.
     #[test]
     #[serial]
-    fn s12_error_responses_keep_exact_cached_readings() {
+    fn error_responses_keep_exact_cached_readings() {
         use std::sync::atomic::Ordering::SeqCst;
         let diagnostic = |code: &str, message: &str| {
             json!({
@@ -1039,7 +1039,7 @@ mod money_equivalence_tests {
 
     /// [money] Source completeness and exact statusLine conversion use existing seams.
     #[test]
-    fn s17_source_completeness_inputs() {
+    fn source_completeness_inputs() {
         let body = json!({"five_hour":null,"seven_day":null,"limits":[{"kind":"weekly_sonnet","group":"weekly","scope":{"model":"sonnet"}}]});
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
@@ -1085,7 +1085,7 @@ mod money_equivalence_tests {
 
     /// [money] Percentage replacement preserves complete identity, money and period coverage.
     #[test]
-    fn s18_exact_statusline_replacement() {
+    fn exact_statusline_replacement() {
         for variant in [
             "newer",
             "older",
@@ -1202,7 +1202,7 @@ mod money_equivalence_tests {
 
     /// [money] Carrier and setup choose actual eligible rows before later append boundaries.
     #[test]
-    fn s21_carrier_setup_degraded_desktop() {
+    fn carrier_setup_degraded_desktop() {
         let a = candidate("claude_slot_b", "account-a", "org-x", 4, 12).snapshot;
         let b = candidate("claude_slot_a", "account-b", "org-y", 4, 23).snapshot;
         let uploads = vec![a.clone(), b.clone()];
@@ -1274,7 +1274,7 @@ mod money_equivalence_tests {
     /// [money] Existing collection, observation and upload limits retain exact omission outcomes.
     #[test]
     #[serial]
-    fn s24_existing_boundaries() {
+    fn existing_boundaries() {
         let _guard = OAuthGuard::new("boundaries");
         use ottto_protocol::ClaudeConfigSlotRelationshipV1 as Relationship;
         let descriptors = (0..11)
@@ -1381,7 +1381,7 @@ mod money_equivalence_tests {
 
     /// [money] Config-dir ownership differs from current session-store acceptance.
     #[test]
-    fn s19_attribution_methods() {
+    fn attribution_methods() {
         for (variant, sample, method, current, expected) in [
             ("same_config", "account-a", "config_dir", "account-a", None),
             (

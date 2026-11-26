@@ -20,10 +20,13 @@ pub(in crate::snapshots) mod load;
 pub(in crate::snapshots) mod pi;
 pub(in crate::snapshots) mod seam;
 
-pub(in crate::snapshots) fn claude_head_session(revision: u32, head: &[u8]) -> Option<String> {
+pub(in crate::snapshots) fn claude_head_session(
+    revision: u32,
+    head: &[u8],
+) -> Result<Option<String>, ReconstructCause> {
     let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    claude::Claude::decode_head(revision, head, &mut acc).ok()?;
-    acc.source_session_id
+    claude::Claude::decode_head(revision, head, &mut acc)?;
+    Ok(acc.source_session_id)
 }
 /// Every source's Tail codec: `$s` names the source's codec type inside
 /// `$arm`. A source joins by adding its arm here, never through its
@@ -833,9 +836,11 @@ fn read_shared_page(
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. An unknown kind or version holds its file
 /// as future state. Workspace accepts path-only v1 and v2 with a Git or non-Git
-/// binding independently of the other v1 facts; the head reduction revision
-/// stays unchanged. Kinds are shared by every codec; a kind its source never
-/// sets is never stored (the Codex agent label and prelude on Claude).
+/// binding independently of the other v1 facts, and opening settings accepts
+/// v1 and v2, which appends the request-1 MCP schema count; the head
+/// reduction revision stays unchanged. Kinds are shared by every codec; a kind
+/// its source never sets is never stored (the Codex agent label and prelude on
+/// Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact {
     Title = 0,
@@ -857,6 +862,7 @@ const FACTS: [Fact; 6] = [
 ];
 const FACT_VERSION: u64 = 1;
 const WORKSPACE_BINDING_VERSION: u64 = 2;
+const OPENING_MCP_SCHEMAS_VERSION: u64 = 2;
 
 crate::durable_tail_codec::durable_struct!(RepositoryIdentity {
     U repository_hash: Option<String>,
@@ -882,11 +888,12 @@ impl Fact {
 
     fn put(self, acc: &SnapshotAccumulator, e: &mut Enc<'_>) -> Result<(), Refuse> {
         e.varint(self as u64)?;
-        let bound_workspace = self == Self::Workspace && acc.repository_binding.is_some();
-        e.varint(if bound_workspace {
-            WORKSPACE_BINDING_VERSION
-        } else {
-            FACT_VERSION
+        e.varint(match self {
+            Self::Workspace if acc.repository_binding.is_some() => WORKSPACE_BINDING_VERSION,
+            Self::OpeningSettings if acc.session_start.has_mcp_schemas() => {
+                OPENING_MCP_SCHEMAS_VERSION
+            }
+            _ => FACT_VERSION,
         })?;
         match self {
             Self::Title => acc.title.put(e),
@@ -934,6 +941,7 @@ impl Fact {
         let version = d.varint()?;
         if version != FACT_VERSION
             && !(fact == Self::Workspace && version == WORKSPACE_BINDING_VERSION)
+            && !(fact == Self::OpeningSettings && version == OPENING_MCP_SCHEMAS_VERSION)
         {
             return Err(ReconstructCause::INCOMPATIBLE);
         }
@@ -951,7 +959,10 @@ impl Fact {
                     None
                 };
             }
-            Self::OpeningSettings => into.session_start.take_opening_fact(&mut d)?,
+            Self::OpeningSettings => {
+                let mcp_schemas = version == OPENING_MCP_SCHEMAS_VERSION;
+                into.session_start.take_opening_fact(&mut d, mcp_schemas)?
+            }
             Self::AgentLabel => into.codex_agent_label = <Option<String> as Durable>::take(&mut d)?,
             Self::CodexPrelude => into.session_start.take_codex_prelude_fact(&mut d)?,
         }

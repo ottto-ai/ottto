@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OTTTO_MACOS_APP_SOURCE_REPOSITORY="example-org/example-app"
-
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/macos_sparkle_bundle_version.sh
 source "$ROOT/scripts/macos_sparkle_bundle_version.sh"
@@ -35,7 +33,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 TMP_DIR="$(cd "$TMP_DIR" && pwd -P)"
 
 repo="$TMP_DIR/public-ottto"
-app_root="$TMP_DIR/ottto-macos-app"
+app_root="$TMP_DIR/SampleApp"
 mock_bin="$TMP_DIR/bin"
 apple_tools="$TMP_DIR/apple-tools"
 output_dir="$TMP_DIR/output"
@@ -59,6 +57,7 @@ cp "$ROOT/scripts/macos_companion_entitlements.sh" "$repo/scripts/macos_companio
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
+cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
 # shellcheck source=scripts/macos_license_notices.sh
 source "$ROOT/scripts/macos_license_notices.sh"
 sparkle_license="licenses/Sparkle-$OTTTO_SPARKLE_LICENSE_VERSION-LICENSE"
@@ -114,20 +113,26 @@ cat > "$repo/scripts/macos_launch_smoke.sh" <<'SMOKE'
 set -euo pipefail
 app=""
 output=""
+manifest_dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app) app="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
+    --manifest-dir) manifest_dir="$2"; shift 2 ;;
     --wait-seconds) shift 2 ;;
     *) exit 2 ;;
   esac
 done
+# Packaged evidence must be written for the release folder.
+[[ -n "$manifest_dir" && "$(dirname "$app")" == "$manifest_dir" && "$(dirname "$output")" == "$manifest_dir" ]] || exit 3
 info_plist="$app/Contents/Info.plist"
 jq -n \
+  --arg app_path "$(basename "$app")" \
   --arg bundle_version "$(plutil -extract CFBundleVersion raw -o - "$info_plist")" \
   --arg bundle_short_version "$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")" \
   '{
     status: "passed",
+    app_path: $app_path,
     checked_at: "2026-07-23T00:00:00Z",
     wait_seconds: 1,
     bundle_id: "net.ottto.Companion",
@@ -163,20 +168,32 @@ jq -n --arg version "$version" --arg sparkle_version "$sparkle_version" \
 SBOM
 chmod +x "$repo/scripts/cyclonedx_sbom.sh"
 
+# Archive calls are logged with their time zone; the last two arguments are
+# always the input and the output.
+export fixture_ditto_archive_log="$TMP_DIR/ditto-archive.log"
 cat > "$mock_bin/ditto" <<'DITTO'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "-c" && "${2:-}" == "-k" && -d "$3" ]]; then
-  if [[ "${fixture_fail_daemon_zip:-}" == "true" && "$3" == */daemon ]]; then
-    echo "Fixture daemon zip creation failed" >&2
-    exit 1
+if [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
+  printf 'TZ=%s %s\n' "${TZ:-}" "$*" >> "$fixture_ditto_archive_log"
+  src=""
+  dst=""
+  for arg in "$@"; do
+    src="$dst"
+    dst="$arg"
+  done
+  if [[ -d "$src" ]]; then
+    if [[ "${fixture_fail_daemon_zip:-}" == "true" && "$src" == */daemon ]]; then
+      echo "Fixture daemon zip creation failed" >&2
+      exit 1
+    fi
+    # A folder "zip" lists its entries with their hashes.
+    (cd "$src" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
+      printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
+    done) > "$dst"
+  else
+    cp "$src" "$dst"
   fi
-  # A folder "zip" lists its entries with their hashes.
-  (cd "$3" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r entry; do
-    printf '%s %s\n' "$(shasum -a 256 "$entry" | awk '{print $1}')" "${entry#./}"
-  done) > "$4"
-elif [[ "${1:-}" == "-c" && "${2:-}" == "-k" ]]; then
-  cp "$3" "$4"
 else
   cp -R "$1" "$2"
 fi
@@ -343,18 +360,20 @@ git -C "$repo" config user.email "sparkle-version-test@example.invalid"
 git -C "$repo" config user.name "Sparkle Version Test"
 git -C "$repo" add .
 git -C "$repo" commit -qm "fixture"
-private_repo="$TMP_DIR/private-repo"
-mkdir -p "$private_repo/tools"
-mv "$app_root" "$private_repo/tools/ottto-macos-app"
-app_root="$private_repo/tools/ottto-macos-app"
+# The app package is any tracked subdirectory of its checkout; the packager
+# records only its commit and tree.
+private_repo="$TMP_DIR/app-checkout"
+mkdir -p "$private_repo/inputs"
+mv "$app_root" "$private_repo/inputs/SampleApp"
+app_root="$private_repo/inputs/SampleApp"
 git -C "$private_repo" init -q
 git -C "$private_repo" config user.email "sparkle-version-test@example.invalid"
 git -C "$private_repo" config user.name "Sparkle Version Test"
-# No origin remote is needed: the caller supplies the repository identity.
+# No origin remote is needed: the record names no repository.
 git -C "$private_repo" add .
 git -C "$private_repo" commit -qm "app fixture"
 private_commit="$(git -C "$private_repo" rev-parse HEAD)"
-private_tree="$(git -C "$private_repo" rev-parse HEAD:tools/ottto-macos-app)"
+private_tree="$(git -C "$private_repo" rev-parse HEAD:inputs/SampleApp)"
 # The packager must never call gh: any call is logged and fails.
 gh_calls="$TMP_DIR/gh.calls"
 cat > "$mock_bin/gh" <<GH
@@ -395,13 +414,6 @@ package_expect_failure invalid-pin "--app-source-commit must be a 40-hex" \
   --app-root "$app_root" --app-source-commit "${private_commit:0:12}"
 package_expect_failure pin-mismatch "not --app-source-commit" \
   --app-root "$app_root" --app-source-commit "$(printf '0%.0s' {1..40})"
-
-# [behaviour] Repository identity is explicit and accepts only owner/name form.
-for repository in "" "https://github.com/example-org/example-app" "evil.invalid/example-org/example-app"; do
-  OTTTO_MACOS_APP_SOURCE_REPOSITORY="$repository" \
-    package_expect_failure invalid-repository "OTTTO_MACOS_APP_SOURCE_REPOSITORY is required in owner/name form" \
-      --app-root "$app_root" --app-source-commit "$private_commit"
-done
 
 # [behaviour] Stable channels refuse reused build outputs and a missing
 # private dSYM folder before anything is built.
@@ -454,6 +466,16 @@ if [[ -e "$gh_calls" ]]; then
   cat "$gh_calls" >&2
   exit 1
 fi
+
+# [behaviour] Both published zips are written in UTC without resource forks or
+# extended attributes.
+for zip_name in "ottto-macos-" "ottto-service-macos-"; do
+  if ! grep -Eq "^TZ=UTC -c -k --norsrc --noextattr .* $output_dir/${zip_name}[a-z0-9_]+\.zip\$" "$fixture_ditto_archive_log"; then
+    echo "Published zip ${zip_name}* must be archived with TZ=UTC --norsrc --noextattr" >&2
+    cat "$fixture_ditto_archive_log" >&2
+    exit 1
+  fi
+done
 
 # [behaviour] The signed app carries the four license notices, and each binary
 # zip holds exactly its executable plus three notices at its root.
@@ -559,15 +581,34 @@ if ! jq -e \
       commit: $public_commit
     }
     and .supply_chain.materials[1] == {
-      kind: "git_subtree",
-      repository: "example-org/example-app",
+      kind: "private_source",
+      name: "ottto-macos-app",
+      visibility: "private",
       commit: $private_commit,
-      path: "tools/ottto-macos-app",
       tree: $private_tree,
       clean: true
     }
   ' "$output_dir/release-manifest.json" >/dev/null; then
   echo "Release manifest did not bind the exact public and private app Git materials" >&2
+  exit 1
+fi
+# [behaviour] Every local file reference is a filename beside the manifest and
+# no string carries a build-host path.
+if ! jq -e --arg tmp "$TMP_DIR" '
+  ([.artifacts[] | .verification_path] == ["Ottto.app", "ottto", "ottto-service"])
+  and ([.artifacts[] | .path] | all(test("^[A-Za-z0-9_][A-Za-z0-9_.+-]*$")))
+  and .supply_chain.sbom.path == "ottto-local-platform-sbom.cdx.json"
+  and .quality_gates.packaged_app_launch.evidence_path == "packaged-app-launch-smoke.json"
+  and (.supply_chain.slsa_build.verification_command | startswith("gh attestation verify ./Ottto-macos-"))
+  and (.supply_chain.sbom.verification_command | startswith("gh attestation verify ./Ottto-macos-"))
+  and ([.. | strings | select(contains($tmp) or startswith("/"))] | length == 0)
+' "$output_dir/release-manifest.json" >/dev/null; then
+  echo "Release manifest must name local files by filename, never by build-host path" >&2
+  jq '[.. | strings | select(startswith("/"))]' "$output_dir/release-manifest.json" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.app_path' "$output_dir/packaged-app-launch-smoke.json")" != "Ottto.app" ]]; then
+  echo "Packaged launch evidence must name the app by its release filename" >&2
   exit 1
 fi
 # [behaviour] Swift compiled in a new folder outside the app checkout, which

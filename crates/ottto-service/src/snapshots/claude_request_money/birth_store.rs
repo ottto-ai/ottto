@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn money_rule_marks_persist_in_a_cmb5_trailer_only_once_marked() {
+    fn money_rule_marks_persist_in_a_trailer_only_once_marked() {
         let wire = |store: &BirthStore| {
             let text = serde_json::to_value(store).unwrap();
             URL_SAFE_NO_PAD.decode(text.as_str().unwrap()).unwrap()
@@ -801,7 +801,7 @@ mod tests {
     /// [format] A CMB3 identity decodes to the compact object witness and
     /// survives a CMB4 round trip.
     #[test]
-    fn cmb3_identity_decodes_to_the_compact_object_witness() {
+    fn identity_decodes_to_the_compact_object_witness() {
         let mut restored: BirthStore = serde_json::from_value(serde_json::json!(
             URL_SAFE_NO_PAD.encode(legacy_bytes(b"CMB3", Some((1, 10, 2))))
         ))
@@ -1053,7 +1053,7 @@ mod tests {
         crate::snapshots::state_v2::close_removed_routes_for_test();
     }
     #[test]
-    fn m4_size_memory_and_wire_receipt() {
+    fn size_memory_and_wire_receipt() {
         // Production records every parsed path with its opened identity
         // (record_opened), so every path carries one here too.
         let mut births = BirthStore::default();

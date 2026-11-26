@@ -265,7 +265,7 @@ mod money_equivalence_tests {
     /// that reading without a request.
     #[test]
     #[serial]
-    fn s01_default_due_success() {
+    fn default_due_success() {
         let collection = Collection::new("s01-due", vec![Ok(body(12, 34))]);
         let default = ClaudeOAuthUsageCaller::Default;
         let steps = [
@@ -298,7 +298,7 @@ mod money_equivalence_tests {
     /// reading is served without a request; at it the read is made.
     #[test]
     #[serial]
-    fn s01_due_boundary() {
+    fn due_boundary() {
         let collection = Collection::new("s01-due-boundary", vec![Ok(body(13, 35))]);
         let seed = stored(
             T - 3000,
@@ -333,7 +333,7 @@ mod money_equivalence_tests {
     /// away is sent; at exactly the 60-second margin it is never sent.
     #[test]
     #[serial]
-    fn s01_expiry_boundary() {
+    fn expiry_boundary() {
         let collection = Collection::new("s01-expiry-boundary", vec![Ok(body(12, 34))]);
         let expiry = "2026-08-05T01:01:00Z";
         let ay = ("account-a", "org-y");
@@ -367,7 +367,7 @@ mod money_equivalence_tests {
     /// pair's files overwritten or shared by a later pair fail the row.
     #[test]
     #[serial]
-    fn s05_pair_callers() {
+    fn pair_callers() {
         let collection = Collection::new(
             "s05-pairs",
             vec![Ok(body(12, 34)), Ok(body(23, 45)), Ok(body(45, 56))],
@@ -432,7 +432,7 @@ mod money_equivalence_tests {
     /// then serves that exact reading and makes none.
     #[test]
     #[serial]
-    fn s09_managed_due_then_deferred() {
+    fn managed_due_then_deferred() {
         let collection = Collection::new("s09-managed", vec![Ok(body(12, 34))]);
         let managed = slot("claude_slot_a");
         let deferred = ClaudeOAuthUsageCaller::DefaultDeferredToSlot;
@@ -475,7 +475,7 @@ mod money_equivalence_tests {
     /// and the default then serves the slot's reading without a request.
     #[test]
     #[serial]
-    fn s12_auth_then_other_success() {
+    fn auth_then_other_success() {
         let collection = Collection::new("s12-auth-other", vec![Err(401), Ok(body(12, 34))]);
         let default = ClaudeOAuthUsageCaller::Default;
         let other = slot("claude_slot_b");
@@ -544,7 +544,7 @@ mod money_equivalence_tests {
     /// registered caller serves that reading without a second request.
     #[test]
     #[serial]
-    fn s12_reverse_success_then_cache() {
+    fn reverse_success_then_cache() {
         let collection = Collection::new("s12-reverse", vec![Ok(body(12, 34))]);
         let default = ClaudeOAuthUsageCaller::Default;
         let other = slot("claude_slot_b");
@@ -579,7 +579,7 @@ mod money_equivalence_tests {
     /// upkeep consent, and a saved-only status read with consent.
     #[test]
     #[serial]
-    fn s26_pass_gates_make_no_request() {
+    fn pass_gates_make_no_request() {
         let default = ClaudeOAuthUsageCaller::Default;
         for (variant, consent, saved_only, expected) in [
             (
@@ -623,7 +623,7 @@ mod money_equivalence_tests {
     /// spacing is anchored at the pass start, not at the request clock.
     #[test]
     #[serial]
-    fn s26_consented_pass_anchor() {
+    fn consented_pass_anchor() {
         let collection = Collection::new("s26-consented", vec![Ok(body(12, 34))]);
         choose_upkeep_consent(true);
         let default = ClaudeOAuthUsageCaller::Default;

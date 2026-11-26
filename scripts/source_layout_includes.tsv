@@ -5,8 +5,8 @@ crates/ottto-service/src/snapshots.rs	include	snapshots/account_pending_retentio
 crates/ottto-service/src/snapshots.rs	include	snapshots/load_containment.rs
 crates/ottto-service/src/snapshots.rs	path	snapshots/claude_request_money/birth_store.rs
 crates/ottto-service/src/snapshots/account_pending_retention_tests.rs	include	account_pending_decoder_0_1_201.rs
-crates/ottto-service/src/snapshots/tests/census_p2_kept_tests.rs	include	provider_envelope_experiment_tests.rs
-crates/ottto-service/src/snapshots/tests/census_p2_kept_tests.rs	include	witness_reconstruct_scope_tests.rs
+crates/ottto-service/src/snapshots/tests/census_held_key_tests.rs	include	provider_envelope_experiment_tests.rs
+crates/ottto-service/src/snapshots/tests/census_held_key_tests.rs	include	witness_reconstruct_scope_tests.rs
 crates/ottto-service/src/snapshots/claude_copy_prefix_reread/tests.rs	path	proof_recovery_tests.rs
 crates/ottto-service/src/snapshots/tests/claude_request_identity_tests.rs	include	claude_request_identity_window_tests.rs
 crates/ottto-service/src/snapshots/claude_request_money/e2.rs	path	e2_activity_clock_tests.rs
@@ -42,7 +42,7 @@ crates/ottto-service/src/snapshots/tail_source/load.rs	path	settlement_tests.rs
 crates/ottto-service/src/snapshots/tail_source/seam.rs	path	transition_tests.rs
 crates/ottto-service/src/snapshots/tail_source/settlement_tests.rs	path	oracle_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	tests/authority_proof_correction_tests.rs
-crates/ottto-service/src/snapshots/tests.rs	include	tests/census_p2_kept_tests.rs
+crates/ottto-service/src/snapshots/tests.rs	include	tests/census_held_key_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	tests/checkpoint_main_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	tests/claude_cache_gate_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	tests/claude_census_money_invariant_tests.rs

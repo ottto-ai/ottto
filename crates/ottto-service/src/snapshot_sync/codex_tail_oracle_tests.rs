@@ -89,7 +89,7 @@ fn a_quiet_codex_restart_on_its_route_reads_zero_bytes() {
 
     let restart = E2ScanFixture::default();
     let ((_, scan, modes), consumed) = fixture::observe_consumed(|| page(&c, &restart, prior));
-    // The quiet-restart equivalent of the Claude route's row (`s2_oracle_tests`):
+    // The quiet-restart equivalent of the Claude route's row (`claude_tail_oracle_tests`):
     // a restart may open a file to check its identity (the anchor read the
     // opened-object witness is), but reads no Full, consumes no transcript
     // byte and emits no body.

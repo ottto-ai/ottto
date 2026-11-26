@@ -426,7 +426,7 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let compressed = original.with_extension("jsonl.zst");
         fs::write(
             &compressed,
-            zstd::stream::encode_all(&bytes[..], 1).unwrap(),
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&bytes),
         )
         .unwrap();
         let new_key = local_index_key(&compressed);
@@ -538,7 +538,7 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let current = fs::read(&original).unwrap();
         fs::write(
             &compressed,
-            zstd::stream::encode_all(&current[..], 1).unwrap(),
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&current),
         )
         .unwrap();
         fs::remove_file(&original).unwrap();
@@ -600,6 +600,158 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
             "no regranted Full after aged listing"
         );
         assert_eq!(cache.cursor_reserved(), 0);
+    }
+}
+
+/// The reason counts on this pass's `codex_compression_carry_unproven` row.
+fn unproven(logs: &[Value]) -> Value {
+    logs.iter()
+        .find(|row| row["stage"] == "codex_compression_carry_unproven")
+        .map_or(Value::Null, |row| {
+            row["counts"]["codex_compression_carry_unproven"].clone()
+        })
+}
+
+/// [money] A Codex compression carries its predecessor's head only when the
+/// archive records exactly the length the head read and that read ended on a
+/// sealed line. A read that stopped mid-line leaves no certified head, so the
+/// archive is held as before. Otherwise the archive is read once as a new file: turns
+/// appended before compression count, the session's emitted or carried body,
+/// placement and Codex evidence equal a cold Full's, the next pass in the
+/// same process is quiet,
+/// and only the archive stays indexed. Two accounts, a side call and an
+/// evidence gap stay in the corpus.
+#[test]
+fn compression_carries_only_a_proven_complete_read() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // (case, records its length, grown after the read, read ends unterminated, reason)
+    for (case, recorded, grown, unsealed, reason) in [
+        ("unchanged", true, false, false, None),
+        ("grown", true, true, false, Some("length")),
+        ("no length", false, false, false, Some("no_length")),
+        ("no length, grown", false, true, false, Some("no_length")),
+        ("unsealed", true, false, true, None),
+    ] {
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let original = c.path(MAIN);
+        if unsealed {
+            // Codex stopped mid-line at the read and never finished it; a
+            // complete final line without its newline still seals.
+            let line = turn(3);
+            append(&original, &line[..line.len() / 2]);
+        }
+        let (_session, prior) = c.publish();
+        let (working, first, _, _, _) = page(&c, prior.clone(), Arc::default());
+        let (index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+        assert_eq!(posts.len(), 1, "{case}");
+        let first_route = route(&index, &first, posts);
+        if grown {
+            // Appended while this daemon did not read, then compressed.
+            append(&original, &turn(3));
+        }
+        let plain = fs::read(&original).unwrap();
+        let archive = if recorded {
+            crate::snapshots::codex_rollout_carry::codex_archive_bytes(&plain)
+        } else {
+            // An archive whose frame header records no plaintext length.
+            let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+            encoder.include_contentsize(false).unwrap();
+            encoder.write_all(&plain).unwrap();
+            encoder.finish().unwrap()
+        };
+        let compressed = original.with_extension("jsonl.zst");
+        fs::write(&compressed, archive).unwrap();
+        fs::remove_file(&original).unwrap();
+        let (old_key, new_key) = (local_index_key(&original), local_index_key(&compressed));
+        let before = index.clone();
+        // One process-lifetime cache, as the daemon keeps across passes.
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (working, scan, _, _, logs) = page(&c, index, cache.clone());
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        if unsealed {
+            // A read that stopped mid-line leaves no certified head to carry:
+            // the existing refused-carry path holds the archive and the old
+            // entry, with no read, upload or money change, counted each pass
+            // it holds and never a read storm.
+            let mut index = index;
+            for pass in [0, 1] {
+                let pass_logs = if pass == 0 {
+                    logs.clone()
+                } else {
+                    let before = index.clone();
+                    let (working, scan, _, _, logs) = page(&c, index, cache.clone());
+                    let (next, posts) =
+                        working.checkpoint_with_captured_posts(&scan, &before, "accept");
+                    assert!(scan.snapshots.is_empty() && posts.is_empty(), "{case} {pass}");
+                    index = next;
+                    logs
+                };
+                assert_eq!(full_decodes(&pass_logs), 0, "{case} {pass}");
+                assert_eq!(unproven(&pass_logs), json!({"uncertified": 1}), "{case} {pass}");
+                assert!(index.files.contains_key(&old_key), "{case} {pass}");
+                assert!(!index.files.contains_key(&new_key), "{case} {pass}");
+            }
+            assert!(scan.snapshots.is_empty() && posts.is_empty(), "{case}");
+            continue;
+        }
+        let Some(reason) = reason else {
+            assert_eq!(full_decodes(&logs), 0, "{case}: carried without a decode");
+            assert!(scan.snapshots.is_empty(), "{case}");
+            assert!(posts.is_empty(), "{case}");
+            assert_eq!(unproven(&logs), Value::Null, "{case}");
+            assert!(!index.files.contains_key(&old_key), "{case}");
+            assert!(index.files.contains_key(&new_key), "{case}");
+            continue;
+        };
+        let state = (
+            index.files.contains_key(&old_key),
+            index.files.contains_key(&new_key),
+            scan.snapshots.len(),
+            posts.len(),
+        );
+        assert_eq!(
+            unproven(&logs),
+            json!({reason: 1}),
+            "{case}: (old indexed, new indexed, items, posts) = {state:?}"
+        );
+        assert_eq!(full_decodes(&logs), 1, "{case}: the archive is read once");
+        assert!(!grown || !posts.is_empty(), "{case}: the grown body is sent");
+        let expected = if !posts.is_empty() {
+            let mut warm = route(&index, &scan, posts);
+            if grown {
+                assert_ne!(
+                    warm.snapshots[MAIN], first_route.snapshots[MAIN],
+                    "{case}: the appended turn changes the body"
+                );
+            }
+            let mut carried = first_route.accepted.clone();
+            carried.extend(warm.accepted.clone());
+            warm.accepted = carried;
+            // Only MAIN's file changed; the other sessions are not read again.
+            let (_, mut cold, _, _, _) = page(&c, ScanIndex::default(), Arc::default());
+            cold.snapshots.retain(|item| item.source_session_id == MAIN);
+            money_oracle::assert_carried_equivalent(&emitted(&index, &cold), &warm);
+            warm
+        } else {
+            // The re-read rebuilds exactly the accepted body: nothing to send.
+            let item = scan.snapshots.iter().find(|item| item.source_session_id == MAIN);
+            assert!(
+                item.is_some_and(|item| index
+                    .accepted_snapshot_fingerprints
+                    .contains(&item.snapshot_fingerprint)),
+                "{case}: the re-read body is the accepted one"
+            );
+            first_route
+        };
+        let (index, _) = assert_quiet_on(&c, index, &expected, cache);
+        assert!(!index.files.contains_key(&old_key), "{case}: the predecessor retired");
+        assert!(index.files.contains_key(&new_key), "{case}");
     }
 }
 
