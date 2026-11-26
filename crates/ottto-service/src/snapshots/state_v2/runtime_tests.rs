@@ -2318,6 +2318,258 @@ mod progress_rows {
     }
 }
 
+#[cfg(unix)]
+mod per_file_carry {
+    use super::{fs, published, with_session_db, Path, PathBuf, ScanIndex};
+    use crate::durable_tail_codec::Dec;
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use crate::snapshots::state_v2::{self, Collection};
+    use crate::snapshots::tail_source::{self, claude::Claude, TailSource};
+    use crate::snapshots::{
+        finalize_scan_after_policy, local_index_key, SnapshotAccumulator, SnapshotSource,
+    };
+    use crate::transcript_acquisition::ReadMode;
+    use serde::{Deserialize, Serialize};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+    const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
+    const RICH: &str = "1a73d9c4-7dc4-46e9-9fd1-5e369bfcc8a1";
+    const PLAIN: &str = "8e270c85-999e-4e70-b1e3-02d6df537ff2";
+    const CONTROL: &str = "ad65fab4-adc6-4cc1-8cc2-787e94ecf8c3";
+
+    #[derive(Deserialize, Serialize)]
+    struct Manifest {
+        index_path: PathBuf,
+        corpus_root: PathBuf,
+        support: PathBuf,
+        tail_keys: Vec<String>,
+        control_key: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    struct Format {
+        revision: u32,
+        facts: BTreeMap<u64, u64>,
+    }
+
+    fn carry_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("OTTTO_PER_FILE_CARRY_DIR").expect("the carry harness"))
+            .canonicalize()
+            .unwrap()
+    }
+
+    fn transcript(root: &Path, session: &str) -> PathBuf {
+        root.join(format!("{session}.jsonl"))
+    }
+
+    fn timestamp() -> String {
+        (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .unwrap()
+    }
+
+    fn response(session: &str, request: u32) -> Value {
+        json!({
+            "type": "assistant", "sessionId": session, "timestamp": timestamp(),
+            "requestId": format!("req-{session}-{request}"),
+            "message": {"id": format!("msg-{session}-{request}"), "role": "assistant",
+                "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 20, "output_tokens": 10}}
+        })
+    }
+
+    fn write_transcript(root: &Path, session: &str, workspace: Option<&Path>) {
+        let mut file = fs::File::create(transcript(root, session)).unwrap();
+        let mut user = json!({
+            "type": "user", "sessionId": session, "timestamp": timestamp(), "version": "2.1.300",
+            "message": {"role": "user", "content": format!("Review synthetic session {session}.")}
+        });
+        if let Some(workspace) = workspace {
+            user["cwd"] = json!(workspace);
+            user["customTitle"] = json!("Synthetic carry session");
+        }
+        writeln!(file, "{user}").unwrap();
+        if workspace.is_some() {
+            // Request one records the full MCP tool schema in opening settings.
+            for line in [
+                json!({"type": "api-request-shape", "shapeHash": "opening", "shape": {
+                    "system": [{"type": "text", "text": "Synthetic instructions."}],
+                    "tools": [{"name": "mcp__docs__search", "input_schema": {"type": "object"}}]
+                }}),
+                json!({"type": "api-request", "shapeHash": "opening", "tail": []}),
+            ] {
+                writeln!(file, "{line}").unwrap();
+            }
+        }
+        writeln!(file, "{}", response(session, 1)).unwrap();
+    }
+
+    fn append(path: &Path, request: u32) {
+        let session = path.file_stem().unwrap().to_str().unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{}", response(session, request)).unwrap();
+    }
+
+    fn scan_and_save(scanner: &E2ScanFixture, manifest: &Manifest, index: ScanIndex) -> ScanIndex {
+        scanner.begin_pass(SOURCE, &manifest.support, &manifest.index_path);
+        let (mut index, mut scan, _) = scanner.scan(
+            std::slice::from_ref(&manifest.corpus_root),
+            &manifest.support,
+            index,
+            32,
+            true,
+            &BTreeMap::new(),
+            &[],
+        );
+        finalize_scan_after_policy(SOURCE, &mut scan, &mut index);
+        index.save(&manifest.index_path).unwrap();
+        index
+    }
+
+    fn stored_format(index: &ScanIndex, key: &str) -> Format {
+        let head = state_v2::load_head(index, key, Claude::REDUCTION_REVISION)
+            .unwrap()
+            .expect("committed Claude Tail head");
+        assert!(!head.metadata_only);
+        let mut accumulator = SnapshotAccumulator::new(SOURCE);
+        Claude::decode_head(head.revision, &head.body, &mut accumulator).unwrap();
+        let mut facts = BTreeMap::new();
+        state_v2::load_tail(index, key, &head, |collection, page, bytes| {
+            Claude::decode_page(collection, page, &bytes, &mut accumulator).unwrap();
+            if collection == Collection::SessionFacts {
+                let mut fact = Dec::new(&bytes);
+                assert_eq!(fact.varint().unwrap(), page);
+                facts.insert(page, fact.varint().unwrap());
+            }
+            Ok(())
+        })
+        .unwrap();
+        Format {
+            revision: head.revision,
+            facts,
+        }
+    }
+
+    #[test]
+    #[ignore = "run by the historical carry harness"]
+    fn write_per_file_carry_fixture() {
+        let dir = carry_dir();
+        let support = dir.join("support");
+        let parent = support.join("snapshots/destinations").join("a".repeat(64));
+        fs::create_dir_all(&parent).unwrap();
+        let corpus_root = dir.join("projects");
+        fs::create_dir(&corpus_root).unwrap();
+        let workspace = dir.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let rich = transcript(&corpus_root, RICH);
+        let rich_key = local_index_key(&rich);
+        let manifest = Manifest {
+            index_path: parent.join("claude_code-test-scan-index.json"),
+            tail_keys: vec![
+                rich_key.clone(),
+                local_index_key(&transcript(&corpus_root, PLAIN)),
+            ],
+            control_key: local_index_key(&transcript(&corpus_root, CONTROL)),
+            corpus_root,
+            support,
+        };
+        write_transcript(&manifest.corpus_root, RICH, Some(&workspace));
+        write_transcript(&manifest.corpus_root, PLAIN, None);
+        let index =
+            ScanIndex::load_for_snapshot_source(&manifest.index_path, SOURCE, &manifest.support)
+                .unwrap();
+        assert!(published(&manifest.index_path).unwrap());
+        let index = scan_and_save(&E2ScanFixture::clocked_collection(), &manifest, index);
+        let formats: BTreeMap<_, _> = manifest
+            .tail_keys
+            .iter()
+            .map(|key| (key, stored_format(&index, key)))
+            .collect();
+        // Title, first prompt, workspace, and opening settings. Opening settings
+        // must carry at least v2 so the fixture exercises the request-1 MCP fact.
+        let facts = &formats[&rich_key].facts;
+        assert!((0..=3).all(|kind| facts.contains_key(&kind)), "{facts:?}");
+        assert!(facts[&3] >= 2, "missing request-1 MCP fact");
+        with_session_db(&index, |db| db.clean_checkpoint().unwrap());
+
+        append(&rich, 2);
+        // A fresh file proves collection can progress even if both seeded
+        // heads use a newer reduction revision.
+        write_transcript(&manifest.corpus_root, CONTROL, None);
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("formats.json"),
+            serde_json::to_vec(&formats).unwrap(),
+        )
+        .unwrap();
+        println!("PER_FILE_CARRY_FIXTURE_WRITTEN");
+    }
+
+    #[test]
+    #[ignore = "run by the historical carry harness"]
+    fn verify_per_file_carry_reupgrade() {
+        let dir = carry_dir();
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        let formats: BTreeMap<String, Format> =
+            serde_json::from_slice(&fs::read(dir.join("formats.json")).unwrap()).unwrap();
+        let held: Vec<String> =
+            serde_json::from_slice(&fs::read(dir.join("held.json")).unwrap()).unwrap();
+        let index = ScanIndex::load(&manifest.index_path).unwrap();
+        let mut continuations = BTreeMap::new();
+        for key in held {
+            assert_eq!(
+                stored_format(&index, &key),
+                formats[&key],
+                "Claude Tail format changed during downgrade"
+            );
+            let offset = tail_source::committed_sealed_offset(SOURCE, &index, &key)
+                .expect("target reads the committed Claude Tail checkpoint");
+            continuations.insert(key, Some(offset));
+        }
+        if continuations.is_empty() {
+            continuations.insert(manifest.tail_keys[0].clone(), None);
+        }
+        // Select even a quiet held file so this pass must continue its Tail.
+        for key in continuations.keys() {
+            append(Path::new(key), 3);
+        }
+        let scanner = E2ScanFixture::clocked_collection();
+        let index = scan_and_save(&scanner, &manifest, index);
+        assert!(
+            index.files.contains_key(&manifest.control_key),
+            "control file was not collected"
+        );
+        let acquisitions = scanner.acquisitions.lock().unwrap();
+        for (key, offset) in continuations {
+            let path = Path::new(&key);
+            if let Some(offset) = offset {
+                assert!(
+                    acquisitions.iter().any(|read| {
+                        read.path == path
+                            && matches!(read.mode, ReadMode::Tail)
+                            && read.start == offset
+                    }),
+                    "target did not resume the held Claude Tail checkpoint"
+                );
+            }
+            assert_eq!(
+                tail_source::committed_sealed_offset(SOURCE, &index, &key),
+                Some(fs::metadata(path).unwrap().len()),
+                "target did not commit the appended suffix"
+            );
+        }
+        println!("PER_FILE_CARRY_REUPGRADE_VERIFIED");
+    }
+}
+
 /// A previous layout gains empty membership without changing delivery proof.
 #[test]
 fn layout_seven_upgrade_preserves_delivery_proof_and_persists_exact_request_ack() {

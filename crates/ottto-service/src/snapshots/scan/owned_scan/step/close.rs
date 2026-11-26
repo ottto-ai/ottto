@@ -749,6 +749,7 @@ impl OwnedSourceScan {
             census_residue_index_key_count,
             census_residue_archived_rollout_count,
             snapshots: self.snapshots,
+            newer_build_held: self.newer_build_held,
             pending_finalization: self.pending_finalization,
             claude_request_census_shadow,
             continuation_ticket: self.continuation_ticket,

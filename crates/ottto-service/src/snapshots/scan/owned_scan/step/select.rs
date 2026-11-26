@@ -365,6 +365,22 @@ impl OwnedSourceScan {
         let mut file_sampling = None;
         let mut retained_offset = None;
         let mut tail_restore = "bypass";
+        let key = local_index_key(&candidate.path);
+        let forced_family = self
+            .claude_twin_schedule
+            .forced(&self.forced_claude_family_reparses, &candidate.path)
+            .is_some()
+            || claude_index_path_family_member(&candidate.path).is_some_and(|(root, _)| {
+                self.index
+                    .claude_usage_authority_quarantine
+                    .contains_key(&root)
+            });
+        let forced_twin = forced_family
+            && self
+                .index
+                .claude_request_census
+                .get(&key)
+                .is_some_and(|r| r.is_twin());
         // Counted once the page actually reads the file: a fence
         // or deferral below does not inflate the read diagnostics.
         let mut planned_mode = None;
@@ -373,7 +389,6 @@ impl OwnedSourceScan {
             .as_mut()
             .filter(|_| !parser.reader.reader.is_compressed())
         {
-            let key = local_index_key(&candidate.path);
             // Every source's continuation is its committed Tail. A route
             // that cannot be read now holds the file for its next
             // selection.
@@ -467,17 +482,6 @@ impl OwnedSourceScan {
                         .observe(protected_entry.is_some());
                     let protected =
                         protected_entry.is_some_and(ScanIndexEntry::codex_history_is_protected);
-                    let forced_family = self
-                        .claude_twin_schedule
-                        .forced(&self.forced_claude_family_reparses, &candidate.path)
-                        .is_some()
-                        || claude_index_path_family_member(&candidate.path).is_some_and(
-                            |(root, _)| {
-                                self.index
-                                    .claude_usage_authority_quarantine
-                                    .contains_key(&root)
-                            },
-                        );
                     // Audit population/deadlines never gate ordinary
                     // restore. The legacy prefix/proof paths retain their
                     // own rules. A same-process `e2`-held read may
@@ -490,13 +494,7 @@ impl OwnedSourceScan {
                                 &self.index,
                                 &key,
                             ));
-                    let forced_twin = forced_family
-                        && !forced_native
-                        && self
-                            .index
-                            .claude_request_census
-                            .get(&key)
-                            .is_some_and(|r| r.is_twin());
+                    let forced_twin = forced_twin && !forced_native;
                     // A pulled twin must finish on its holder's page. Native
                     // acquisition avoids both cap pacing and unfunded completion.
                     let mut allow_sample = (self.index.files.contains_key(&key)
@@ -579,7 +577,9 @@ impl OwnedSourceScan {
                                     (Some(retained), debt)
                                 }
                                 // A pulled twin falls back to this page's native read.
-                                tail_source::load::Load::Held(_) if forced_twin => {
+                                tail_source::load::Load::Held(
+                                    tail_source::load::HoldKind::LiveUnavailable,
+                                ) if forced_twin => {
                                     tail_restore = "miss";
                                     #[cfg(test)]
                                     twin_diagnostics::event(&candidate.path, || {
@@ -596,17 +596,12 @@ impl OwnedSourceScan {
                                 tail_source::load::Load::Held(hold) => {
                                     #[cfg(test)]
                                     twin_diagnostics::event(&candidate.path, || {
-                                        "defer pre-acquisition Held forced_twin=false residue=true"
-                                            .into()
+                                        format!("defer pre-acquisition Held forced_twin={forced_twin} residue=true")
                                     });
                                     match hold {
                                         tail_source::load::HoldKind::NewerBuild => {
-                                            tail_source::counters::bump(
-                                                self.source,
-                                                "tail_held",
-                                                "newer_build",
-                                            );
-                                            self.census.ownership_incomplete_file_count += 1;
+                                            self.hold_newer_tail(key, forced_family);
+                                            return;
                                         }
                                         tail_source::load::HoldKind::LiveUnavailable => {
                                             tail_source::counters::bump(
@@ -787,7 +782,7 @@ impl OwnedSourceScan {
                         });
                     planned_mode = Some((mode, audit_due));
                     file_sampling = Some(sampled_scan::Active {
-                        key,
+                        key: key.clone(),
                         scope,
                         mode,
                         audit_due,
@@ -851,7 +846,7 @@ impl OwnedSourceScan {
                     sampled_scan::configure_tier_replay(&mut parser, &candidate, &self.index);
                     planned_mode = Some((mode, None));
                     file_sampling = Some(sampled_scan::Active {
-                        key,
+                        key: key.clone(),
                         scope,
                         mode,
                         audit_due: None,
@@ -882,17 +877,18 @@ impl OwnedSourceScan {
         }
         if planned_mode.is_none_or(|(mode, _)| {
             matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
-        }) && tail_source::seed_full_job_template(
+        }) && let Err(error) = tail_source::seed_full_job_template(
             &self.index,
             &candidate,
             &[],
             &mut parser.accumulator,
-        )
-        .is_err()
-        {
+        ) {
             tail_source::counters::bump(self.source, "tail_db_loads", "held");
-            self.residue_index_keys
-                .insert(local_index_key(&candidate.path));
+            if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::Future) {
+                self.hold_newer_tail(key, forced_family);
+            } else {
+                self.residue_index_keys.insert(key);
+            }
             return;
         }
         // Every physical Full/Tail acquisition stops at its opening extent,
@@ -993,6 +989,28 @@ impl OwnedSourceScan {
             delivery.arm();
         }
         *active_file = Some(active);
+    }
+
+    /// A file held for a newer build. Any forced family member, twin or
+    /// native, is unknown for copy ownership on this page: its stored state
+    /// is never a holder or carrier here.
+    fn hold_newer_tail(&mut self, key: String, forced_family: bool) {
+        tail_source::counters::bump(self.source, "tail_held", "newer_build");
+        self.census.ownership_incomplete_file_count += 1;
+        if forced_family {
+            let twin = self
+                .index
+                .claude_request_census
+                .get(&key)
+                .is_some_and(|record| record.is_twin());
+            tail_source::counters::bump(
+                self.source,
+                "tail_held_newer_build",
+                if twin { "forced_twin" } else { "forced_native" },
+            );
+            self.newer_build_held.insert(key.clone());
+        }
+        self.residue_index_keys.insert(key);
     }
 
     /// Pull the live copy holders of a dequeued Claude twin or main into

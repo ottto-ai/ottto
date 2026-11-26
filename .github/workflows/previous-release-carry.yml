@@ -1,21 +1,22 @@
 name: Previous release carry
 
-# Rollback check for a release that raises the store's rollback floor: the
-# previous release, built from its own source, must refuse a store the target
-# commit wrote without changing a row, and the target must then read back what
-# it wrote. Dispatch it on the release candidate:
+# Rollback check against the previous release's source. On a writer-capability
+# raise, the previous release must refuse the target's stores without changing
+# a row. On every release, it must hold newer-format Tail files untouched while
+# collecting other files if it can open the store. The target then reads back
+# the protected state. Dispatch it on the release candidate:
 #   gh workflow run previous-release-carry.yml -f target=<candidate sha>
 # `previous` defaults to the repository's first commit, the source of the last
 # release published before this repository's history began; pass the previous
 # release's commit once a release from this history exists.
-# A pull request that changes this workflow or its script runs it once on the
-# pull request's head. Linux hosted only.
+# A pull request that changes this workflow or its script runs it once on
+# the pull request's head. Linux hosted only.
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: Full SHA of the commit whose store the previous release must refuse (empty = the dispatched ref)
+        description: Full SHA of the release candidate (empty = the dispatched ref)
         required: false
         default: ""
       previous:

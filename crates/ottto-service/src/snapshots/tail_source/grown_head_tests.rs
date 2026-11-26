@@ -280,6 +280,8 @@ fn claude_layout() -> String {
         .replace("I request_index: Option<NonZeroU64>;", "")
         // Stored in the opening-settings fact (v2), never in a head.
         .replace("I mcp_schemas: Option<u64>;", "")
+        // Stored in the Codex prelude fact (v2), never in a head.
+        .replace("I codex_sealed_start: Option<SealedCodexStart>;", "")
         // A live Desktop marker, set per scan and never stored.
         .replace("I claude_desktop_scheduled_task: bool;", "")
 }
@@ -294,11 +296,13 @@ fn codex_layout() -> String {
     <(usize, usize, bool)>::shape(&mut s);
     super::super::shape_fields(&mut s);
     super::super::codex::shape_layout(&mut s);
-    // A live Claude Desktop marker, and the request-1 MCP schema count kept
-    // in the opening-settings fact: neither stores bytes in any head.
+    // A live Claude Desktop marker, the request-1 MCP schema count kept in
+    // the opening-settings fact and a sealed Codex start kept in the prelude
+    // fact: none stores bytes in any head.
     s.text()
         .replace("I claude_desktop_scheduled_task: bool;", "")
         .replace("I mcp_schemas: Option<u64>;", "")
+        .replace("I codex_sealed_start: Option<SealedCodexStart>;", "")
 }
 
 // Revision 2 appends the counted-requests trailer extension.
