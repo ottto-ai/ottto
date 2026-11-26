@@ -46,8 +46,8 @@ impl ScanIndexEntry {
             .as_deref()
             .is_some_and(|version| version.starts_with(UNVERIFIED_STEM))
     }
-    /// FE writes every prefix tag under the sampled stem, and replay keeps stem
-    /// entries, so only a stem can carry a prefix. A stem fails closed unless
+    /// FE writes every prefix tag under the sampled stem, and replay keeps
+    /// prefix-tagged entries, so only a stem can carry a prefix. A stem fails closed unless
     /// it decodes as a v2 c tag; None and legacy identities are not prefixes.
     pub(super) fn has_prefix_provenance(&self) -> bool {
         self.has_sampled_tag()

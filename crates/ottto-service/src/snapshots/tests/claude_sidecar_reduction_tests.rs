@@ -413,6 +413,7 @@ fn seed_predecessor_from(
 }
 // Both branches execute the real scanner. Unsupported CI verifies Full fallback;
 // only the separately compiler-bound supported run verifies actual reuse.
+#[track_caller]
 fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
         reuse
@@ -691,7 +692,7 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
 
 /// [behaviour] A cached context survives telemetry-only cycles: the Tail's
 /// verification time stays, and an older build's complete tag on the entry is
-/// dropped without a Full.
+/// dropped without any read.
 #[test]
 fn cached_context_survives_telemetry_only_cycles() {
     let f = Fixture::new(1);
@@ -719,13 +720,15 @@ fn cached_context_survives_telemetry_only_cycles() {
         continuation(SOURCE, &cache, &prior, &key).map(|c| c.last_full_verified()),
         old_full
     );
-    // An older build's complete tag, long past its deadline.
+    // An older build's complete tag, long past its deadline: a tagged entry is
+    // not an owed revision and no audit selects it, so the unchanged file is
+    // not read at all (the old `1` here was the audit's quiet re-check).
     let mut tagged = prior;
     tagged.files.get_mut(&key).unwrap().scan_identity_version = Some(format!(
         "{LOCAL_SCAN_INDEX_IDENTITY_VERSION}+sampled_unverified:v2:1:c"
     ));
     let upgraded = raw_scan(&f, tagged, Some(cache.clone()), |_| {});
-    assert_layout_mode(upgraded.modes, (0, 0, 1));
+    assert_layout_mode(upgraded.modes, (0, 0, 0));
     assert_eq!(
         upgraded.reasons[FullReason::AuditDue.slot()],
         0,

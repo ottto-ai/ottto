@@ -2515,10 +2515,8 @@ fn cursor_job_past_the_old_audit_deadline_continues_and_equals_cold_full() {
     clock.set(now);
     let fixture = ScanRoot::new(40);
     let key = local_index_key(&fixture.file(SESSION));
-    let cold_cache = Arc::new(SharedCache::default());
-    let (cold_index, cold) = page(&fixture, ScanIndex::default(), Some(cold_cache));
     let cache = Arc::new(SharedCache::default());
-    with_test_limits(2048, 8192, 64, || {
+    let (index, published, published_page) = with_test_limits(2048, 8192, 64, || {
         let mut index = ScanIndex::default();
         let mut published = None;
         let mut opened = None;
@@ -2539,13 +2537,14 @@ fn cursor_job_past_the_old_audit_deadline_continues_and_equals_cold_full() {
                 opened = Some(now);
             }
             if counter(&cache, |c| c.jobs_certified) == 1 {
-                published = Some(scan);
+                published = Some((scan, page_number));
                 break;
             }
             assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
             now += 1_800;
         }
-        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        let (published, published_page) =
+            published.unwrap_or_else(|| panic!("{}", counters(&cache)));
         let opened = opened.expect("a cursor job opened");
         assert!(now >= opened + 3_600, "the job ran past the old deadline");
         assert_eq!(counter(&cache, |c| c.jobs_started), 1, "no restart");
@@ -2556,11 +2555,21 @@ fn cursor_job_past_the_old_audit_deadline_continues_and_equals_cold_full() {
         assert_eq!(complete.verified_unix_seconds, now);
         assert_eq!(complete.audit_debt_unix_seconds, None);
         assert!(!index.files[&key].has_sampled_tag());
-        money_oracle::assert_equivalent(
-            &scan_money(SnapshotSource::Codex, &cold_index, &cold),
-            &scan_money(SnapshotSource::Codex, &index, &published),
-        );
+        (index, published, published_page)
     });
+    // The cold Full of the same bytes, collected at the publishing page's
+    // time, so only the read path differs.
+    let (cold_index, cold, _) = page_at(
+        &fixture,
+        ScanIndex::default(),
+        Some(Arc::new(SharedCache::default())),
+        "cursor-fixture",
+        &collected_at(published_page),
+    );
+    money_oracle::assert_equivalent(
+        &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+        &scan_money(SnapshotSource::Codex, &index, &published),
+    );
 }
 
 /// A tail-mode cursor job whose genuine-EOF

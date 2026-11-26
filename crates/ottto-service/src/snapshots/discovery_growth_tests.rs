@@ -622,7 +622,17 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                 &sampled_scan::transition_fixture::scan_money(source, &next, &scan),
             );
         }
-        assert!(!next.files[&key].has_sampled_tag());
+        if pass == 0 {
+            assert!(!next.files[&key].has_sampled_tag());
+        } else {
+            // Unchanged and past the window, the file owes nothing: the walk
+            // does not observe it, and the clean generation's reconciliation
+            // prunes its entry, as for any aged file. Nothing re-reads it.
+            assert!(
+                !next.files.contains_key(&key),
+                "pass {pass}: the aged, untagged entry is pruned"
+            );
+        }
         index = next;
     }
     // Metadata-only change: the certified prefix still names the observed EOF,
