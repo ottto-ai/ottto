@@ -971,6 +971,110 @@ fn parse_codex_activity_fixture(name: &str, lines: &[Value]) -> SnapshotItem {
     item
 }
 
+/// [regress] Paginated Codex history writes `item_completed` items instead of
+/// the end events legacy history writes. Both spellings of one session give
+/// the same activity summary and tool usage: an MCP call made directly (its
+/// namespaced call and its completion) and one made from code mode (the
+/// completion only) count once each, a repeated completion counts nothing,
+/// and a patch, a web search and a started subagent count as before.
+#[test]
+fn codex_paginated_items_count_like_legacy_end_events() {
+    let at = |s: u32| format!("2026-10-12T06:00:{s:02}Z");
+    let line = |s: u32, kind: &str, payload: Value| json!({"timestamp": at(s), "type": kind, "payload": payload});
+    let event = |s: u32, payload: Value| line(s, "event_msg", payload);
+    let item = |s: u32, item: Value| event(s, json!({"type": "item_completed", "item": item}));
+    let call = line(
+        1,
+        "response_item",
+        json!({"type":"function_call","name":"search","namespace":"mcp__docs","call_id":"direct","arguments":"{}"}),
+    );
+    let output = line(
+        3,
+        "response_item",
+        json!({"type":"function_call_output","call_id":"direct","output":"private output"}),
+    );
+    let diff = "--- a/src/private.rs\n+++ b/src/private.rs\n-old\n+new\n+more\n";
+    let changes = json!({"src/private.rs": {"type": "update", "unified_diff": diff}});
+    let header =
+        json!({"timestamp":at(0),"type":"session_meta","payload":{"id":"paginated-session"}});
+    let usage = event(
+        9,
+        json!({"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2},"model":"gpt-5.6"}}),
+    );
+    let legacy = [
+        header.clone(),
+        call.clone(),
+        event(
+            2,
+            json!({"type":"mcp_tool_call_end","call_id":"direct","invocation":{"server":"docs","tool":"search"}}),
+        ),
+        output.clone(),
+        event(
+            4,
+            json!({"type":"mcp_tool_call_end","call_id":"code","invocation":{"server":"browser","tool":"open"}}),
+        ),
+        event(5, json!({"type":"patch_apply_end","changes":changes})),
+        event(6, json!({"type":"web_search_end"})),
+        event(7, json!({"type":"sub_agent_activity","kind":"started"})),
+        usage.clone(),
+    ];
+    let paginated = [
+        header,
+        call,
+        item(
+            2,
+            json!({"type":"McpToolCall","id":"direct","server":"docs","tool":"search","arguments":{},"status":"completed"}),
+        ),
+        output,
+        item(
+            4,
+            json!({"type":"McpToolCall","id":"code","server":"browser","tool":"open","arguments":{},"status":"completed"}),
+        ),
+        item(
+            4,
+            json!({"type":"McpToolCall","id":"code","server":"browser","tool":"open","arguments":{},"status":"completed"}),
+        ),
+        item(
+            5,
+            json!({"type":"FileChange","id":"patch","changes":changes,"status":"completed"}),
+        ),
+        item(
+            6,
+            json!({"type":"Extension","id":"web","kind":"web.search"}),
+        ),
+        item(
+            7,
+            json!({"type":"SubAgentActivity","id":"agent","kind":"started"}),
+        ),
+        item(
+            8,
+            json!({"type":"SubAgentActivity","id":"agent","kind":"completed"}),
+        ),
+        usage,
+    ];
+    let legacy = parse_codex_activity_fixture("codex-legacy-end-events", &legacy);
+    let paginated = parse_codex_activity_fixture("codex-paginated-items", &paginated);
+    let summary = paginated
+        .activity_summary
+        .as_ref()
+        .expect("activity summary");
+    assert_eq!(summary.mcp_calls, 2);
+    assert_eq!(summary.patch_operations, 1);
+    assert_eq!(summary.changed_files, 1);
+    assert_eq!((summary.lines_added, summary.lines_deleted), (2, 1));
+    assert_eq!(summary.web_searches, 1);
+    assert_eq!(summary.subagent_spawns, 1);
+    assert_eq!(
+        serde_json::to_value(&paginated.activity_summary).unwrap(),
+        serde_json::to_value(&legacy.activity_summary).unwrap(),
+        "same summary as the legacy spelling"
+    );
+    assert_eq!(paginated.tool_usage, legacy.tool_usage);
+    let wire = serde_json::to_string(&paginated).expect("serialize snapshot item");
+    assert!(!wire.contains("src/private.rs"));
+    assert!(!wire.contains("private output"));
+}
+
 #[test]
 fn codex_namespaced_mcp_calls_keep_their_explicit_server_once() {
     let call = |call_id: &str, name: &str, namespace: Option<&str>| {
