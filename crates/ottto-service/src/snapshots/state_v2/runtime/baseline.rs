@@ -2,7 +2,7 @@
 
 use super::{fence, telemetry};
 use crate::snapshots::scan_index_persistence::{open_at, unlink_at, visit_storage_directory};
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata, Permissions};

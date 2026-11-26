@@ -196,7 +196,7 @@ fn parse_nanos(value: &str) -> Option<u128> {
     {
         return None;
     }
-    value.parse::<u64>().ok()
+    value.parse::<u128>().ok()
 }
 
 fn is_destination_name(name: &str) -> bool {
