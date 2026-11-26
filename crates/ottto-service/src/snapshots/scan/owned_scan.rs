@@ -169,8 +169,9 @@ impl ClaudeTwinSchedule {
     }
 }
 
-/// What Claude twin scheduling and forced family pull-in read from the page.
-/// Nothing here changes while they run.
+/// The page inputs and shared state Claude twin scheduling and forced family
+/// pull-in use. The twin-group cell is filled at most once per page, and the
+/// growth probe records what discovery observes.
 struct FamilyFacts<'a> {
     source: SnapshotSource,
     census_unix_seconds: Option<u64>,
@@ -183,6 +184,8 @@ struct FamilyFacts<'a> {
     /// `e2`: the page's path-twin groups, built at most once per page and
     /// shared with twin staging and the parse-time birth context.
     twin_groups: &'a std::cell::OnceCell<claude_history_upgrade::ClaudeTwinGroups>,
+    /// Attaches a candidate's title metadata and effort sidecars.
+    prepare: &'a dyn Fn(&mut CandidateFile),
 }
 
 impl FamilyFacts<'_> {
@@ -237,7 +240,7 @@ fn schedule_claude_twins(
         })
         .filter_map(|(candidate, root, member, homes)| {
             let mut twin = candidate.clone();
-            prepare_candidate_context(&mut twin);
+            (facts.prepare)(&mut twin);
             // A seed: its own Parse decision, or `None` when unidentified.
             let seed = open_and_identify_scan_candidate_at(
                 facts.source,
@@ -309,9 +312,9 @@ fn schedule_claude_twins(
     schedule
 }
 
-/// Pulls every member of a `forced` family and every scheduled root home
-/// this page has not identified yet onto the page, out of the walk's
-/// pending queue; returns the pending entries it took.
+/// Takes every member of a `forced` family and every scheduled root home this
+/// page has not identified yet out of the walk's pending queue and tries to
+/// admit each onto the page; returns the pending entries it removed.
 fn pull_in_forced_families(
     facts: &FamilyFacts<'_>,
     index: &mut ScanIndex,
@@ -381,7 +384,7 @@ fn pull_in_forced_families(
         ) else {
             continue;
         };
-        prepare_candidate_context(&mut candidate);
+        (facts.prepare)(&mut candidate);
         if let Some(opened) = open_and_identify_scan_candidate_at(
             facts.source,
             candidate,
@@ -1463,6 +1466,7 @@ impl OwnedSourceScan {
             discovery_growth: &resource_probe.discovery_growth,
             membership_authoritative: claude_family_membership_is_authoritative,
             twin_groups: &claude_twin_groups,
+            prepare: &prepare_candidate_context,
         };
         let claude_twin_schedule = if source == SnapshotSource::ClaudeCode {
             schedule_claude_twins(
