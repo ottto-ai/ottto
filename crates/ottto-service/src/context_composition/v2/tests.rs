@@ -633,7 +633,7 @@ fn a_codex_agent_message_to_this_thread_is_input() {
         records.push(last.clone());
         records
     };
-    let sent = read("sent", &with(&[inbound.clone()], &outbound));
+    let sent = read("sent", &with(std::slice::from_ref(&inbound), &outbound));
     let without = read("without", &with(&[], &outbound));
     assert_eq!(part(&sent, Part::ByAgent), tokens_for("PARENTMSGX"));
     assert_eq!(part(&without, Part::ByAgent), 0);
@@ -642,9 +642,12 @@ fn a_codex_agent_message_to_this_thread_is_input() {
         tokens_for("PARENTMSGX"),
         "the message is resident at the one response after it, and starts none"
     );
-    let older = read("older", &with(&[inbound.clone()], &undirected));
+    let older = read("older", &with(std::slice::from_ref(&inbound), &undirected));
     assert_eq!(residency(&older), residency(&sent), "both mark a response");
-    let unanswered = read("unanswered", &with(&[inbound.clone()], &inbound));
+    let unanswered = read(
+        "unanswered",
+        &with(std::slice::from_ref(&inbound), &inbound),
+    );
     assert!(
         residency(&unanswered) < residency(&sent),
         "an inbound message never marks a response"
