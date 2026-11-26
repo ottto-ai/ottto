@@ -55,10 +55,11 @@ fn sample_pager_writes(conn: &Connection, counter: Event) {
 const MMAP_BYTES: i64 = 2_147_418_112;
 const CACHE_KIB: i64 = -8192;
 const BUSY: Duration = Duration::from_millis(100);
-/// How long `lock_owner` waits for a just-released owner. A unit-test binary
+/// How long a store open waits for a just-released owner. A unit-test binary
 /// spawns processes from other tests' threads at any moment, and each spawn
 /// can hold a copy of the released descriptor until its exec, so tests wait
-/// longer than the daemon, which keeps `BUSY`.
+/// longer than the daemon, which keeps `BUSY`. The upload history never
+/// waits longer than `BUSY`: a held history must not slow an upload.
 #[cfg(not(test))]
 const OWNER_RELEASE_WAIT: Duration = BUSY;
 #[cfg(test)]
@@ -416,7 +417,7 @@ impl Drop for Txn<'_> {
 // Import and published paths share one stable sidecar; never unlink it during
 // retry cleanup or lock SQLite's DB/WAL/SHM inodes. CheckpointLock serializes
 // publication/reopen and explicit erasure outside this connection's lifetime.
-fn lock_owner(path: &Path) -> Result<File> {
+fn lock_owner(path: &Path, wait: Duration) -> Result<File> {
     let db = if path.extension().is_some_and(|ext| ext == "import") {
         path.with_extension("")
     } else {
@@ -434,13 +435,12 @@ fn lock_owner(path: &Path) -> Result<File> {
     private_file(&path)?;
     // A flock belongs to the open file description, which a concurrent fork
     // shares until the child execs. A just-released owner can therefore look
-    // busy for a moment; keep retrying for about OWNER_RELEASE_WAIT before
-    // reporting it.
+    // busy for a moment; keep retrying for about `wait` before reporting it.
     let started = Instant::now();
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         ensure!(
             io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
-                && started.elapsed() < OWNER_RELEASE_WAIT,
+                && started.elapsed() < wait,
             "state_v2_exclusive_owner_busy"
         );
         std::thread::sleep(Duration::from_millis(2));
@@ -631,7 +631,7 @@ impl Sqlite {
             "state_v2_import_path"
         );
         private_parent(path)?;
-        let owner_lock = lock_owner(path)?;
+        let owner_lock = lock_owner(path, OWNER_RELEASE_WAIT)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -786,7 +786,7 @@ impl Sqlite {
             }
         }
         private_parent(path)?;
-        let owner_lock = lock_owner(path)?;
+        let owner_lock = lock_owner(path, OWNER_RELEASE_WAIT)?;
         let (conn, file) = Self::open_locked(path, identity, None, false)?;
         super::telemetry::event("schema_layout", &"four_tables");
         let mut store = Self::fresh(conn, path, false, file, owner_lock);
