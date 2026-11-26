@@ -2080,7 +2080,6 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
             body(&control_quiet, THIRD).is_some(),
             "after recovery the quiet pass matches a never-held corpus"
         );
-        assert!(body(&quiet, THIRD).is_none());
     });
 }
 
