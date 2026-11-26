@@ -311,6 +311,13 @@ def run_tool(name, argv, cwd=None, inp=None, check=False):
 GENERIC_VALUES = {"localhost", "localhost.localdomain"}
 
 
+def with_host_literals(markers):
+    """Marker list plus this host's strings. A host string equal to a listed literal (NFC, casefold)
+    is dropped: the listed literal keeps its own class and scoped omissions and still covers it."""
+    listed = {norm(m.value) for m in markers}
+    return markers + [m for m in host_literals() if norm(m.value) not in listed]
+
+
 def host_literals():
     """Strings of this machine and job: user, home, full name, host and runner names, work roots."""
     found = []
@@ -1440,16 +1447,30 @@ def legal_names(archive=False):
 
 
 def approved_legal_hashes():
-    """Exact approved bytes: the public source commit's license files and the pinned Sparkle license."""
+    """Exact approved bytes: the public source commit's license files and the pinned Sparkle license.
+
+    In a git checkout the committed blobs are read (a build cannot change them); in an exported
+    tree (git archive) the files themselves. A missing file stops the scan."""
     hashes = {}
     legal_names()
+    in_checkout = os.path.exists(os.path.join(ROOT, ".git"))
     for name in _legal_cache["archive"]:
-        result = run_tool("git", ["cat-file", "blob", "HEAD:" + name], cwd=ROOT)
-        if result.returncode == 0:
-            hashes[name] = sha256(result.stdout)
+        if in_checkout:
+            result = run_tool("git", ["cat-file", "blob", "HEAD:" + name], cwd=ROOT)
+            if result.returncode != 0:
+                raise Incomplete("legal_files")
+            data = result.stdout
+        else:
+            try:
+                with open(os.path.join(ROOT, name), "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                raise Incomplete("legal_files")
+        hashes[name] = sha256(data)
     sparkle = [n for n in _legal_cache["app"] if n not in _legal_cache["archive"]]
-    if len(sparkle) == 1 and HEX64.match(_legal_cache["sparkle"]):
-        hashes[sparkle[0]] = _legal_cache["sparkle"]
+    if len(sparkle) != 1 or not HEX64.match(_legal_cache["sparkle"]):
+        raise Incomplete("legal_files")
+    hashes[sparkle[0]] = _legal_cache["sparkle"]
     return hashes
 
 
@@ -1567,14 +1588,46 @@ def check_frozen(root, policy):
                 raise Incomplete("not_frozen")
 
 
+NOTARY_ROLES = ("app_notary_zip", "app_dmg", "cli_zip", "service_zip")
+
+
+def lane_stages(lane):
+    """Gate stages one workflow attempt must pass, in order, before its upload."""
+    stages = ["dispatch", "unsigned"] + ["notary:" + r for r in NOTARY_ROLES]
+    if lane != "manual":
+        stages += ["attest-1", "attest-2"]
+    return stages + ["upload"]
+
+
+def recorded_stages(args, gate):
+    """Stage name -> verdict from this attempt's state; every record clean and on this policy and list."""
+    stages, attest = {}, 0
+    for name in sorted(os.listdir(args.state)) if args.state else []:
+        if not (name.startswith("stage-") and name.endswith(".json")):
+            continue
+        with open(os.path.join(args.state, name), encoding="utf-8") as handle:
+            record = json.load(handle)
+        profile = record.get("profile")
+        if profile == "notary" and len(record.get("roles", [])) == 1:
+            stage = "notary:" + record["roles"][0]
+        elif profile == "attest":
+            attest += 1
+            stage = "attest-%d" % attest
+        else:
+            stage = profile
+        if stage in stages or record.get("verdict") != "clean" \
+                or record.get("policy_sha256") != gate.policy.sha256 \
+                or record.get("markers_sha256") != args.markers_digest:
+            raise Incomplete("receipt_stages")
+        stages[stage] = "clean"
+    stages["upload"] = gate.verdict()
+    if sorted(stages) != sorted(lane_stages(args.lane)) or set(stages.values()) != {"clean"}:
+        raise Incomplete("receipt_stages")
+    return stages
+
+
 def make_receipt(args, gate, rows, root):
-    stages = []
-    state = args.state
-    if state:
-        for name in sorted(os.listdir(state)):
-            if name.startswith("stage-") and name.endswith(".json"):
-                with open(os.path.join(state, name), encoding="utf-8") as handle:
-                    stages.append(json.load(handle))
+    stages = recorded_stages(args, gate)
     with open(os.path.join(root, ROLE_FILES["manifest"]), "rb") as handle:
         manifest = json.loads(handle.read().decode("utf-8"), object_pairs_hook=no_duplicate_keys)
     materials = manifest.get("supply_chain", {}).get("materials", [])
@@ -1582,17 +1635,18 @@ def make_receipt(args, gate, rows, root):
     public_source = [m.get("commit") for m in materials if m.get("kind") == "git_repository"]
     app_commit = os.environ.get("OTTTO_MACOS_APP_SOURCE_COMMIT", "")
     source = os.environ.get("GITHUB_SHA", "")
+    run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
     if not re.fullmatch(r"[0-9a-f]{40}", app_commit) or app_source != [app_commit] \
             or not re.fullmatch(r"[0-9a-f]{40}", source) or public_source != [source] \
-            or not str(manifest.get("version", "")):
+            or not isinstance(manifest.get("version"), str) or not manifest["version"] \
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or not re.fullmatch(r"[1-9][0-9]{0,4}", attempt):
         raise Incomplete("receipt_inputs")
     return {
         "schema": "ottto.release-privacy-receipt", "schema_version": 1, "workflow": WORKFLOW,
-        "run_id": os.environ.get("GITHUB_RUN_ID", ""), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        "run_id": int(run_id), "run_attempt": int(attempt),
         "source_commit": source, "app_source_commit": app_commit, "lane": args.lane,
         "version": manifest["version"], "policy_sha256": gate.policy.sha256, "markers_sha256": args.markers_digest,
-        "stages": [{"profile": s["profile"], "roles": s["roles"], "verdict": s["verdict"]} for s in stages],
-        "shipped_xattr_presence": gate.advisory, "files": rows,
+        "stages": stages, "advisory_xattrs": gate.advisory, "files": rows,
     }
 
 
@@ -1615,7 +1669,7 @@ def command_scan(args):
     if args.host_literals == "off" and policy.mode == "enforce":
         raise GateError("host_literals_required")
     if args.host_literals != "off":
-        markers = markers + host_literals()
+        markers = with_host_literals(markers)
     scratch = args.scratch or os.environ.get("OTTTO_PRIVACY_WORK") or (
         "/private/tmp" if os.path.isdir("/private/tmp") else None)
     gate = Gate(policy, markers, args.profile)
@@ -1853,7 +1907,7 @@ def command_register_masks(_args):
     if digest != policy.markers_sha256:
         raise GateError("markers_digest_mismatch")
     values = set()
-    for marker in markers + host_literals():
+    for marker in with_host_literals(markers):
         value = marker.value
         for form in (value, value.casefold(), value.lower(), value.upper()):
             values.add(unicodedata.normalize("NFC", form))
@@ -1862,7 +1916,7 @@ def command_register_masks(_args):
         sys.stdout.write("::add-mask::%s\n" % mask_escape(value))
     sys.stdout.flush()
     work = tempfile.mkdtemp(prefix="ottto-privacy.", dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
-    probe = Gate(policy, markers + host_literals(), "probe")
+    probe = Gate(policy, with_host_literals(markers), "probe")
     probe.scan_text(work, Representation("work", "work"), 0)
     if probe.findings:
         raise GateError("scratch_not_neutral")

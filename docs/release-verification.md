@@ -257,9 +257,11 @@ digest and counts, never a literal.
   as advisory; other attributes are allowed only where the role expects them.
 - `owner:` and `owner+signer:` literals inside the four approved license
   files are not reported: `LICENSE`, `NOTICE` and `LICENSE-THIRD-PARTY.html`
-  with the bytes of the public source commit, and `LICENSE-Sparkle.txt` with
-  its recorded SHA-256, at `Ottto.app/Contents/Resources/` or a binary ZIP's
-  root. Every other marker in those files still blocks.
+  with the bytes of the public source commit (the committed blobs in a git
+  checkout, the files themselves in an exported tree; a missing file stops
+  the scan as `incomplete`), and `LICENSE-Sparkle.txt` with its recorded
+  SHA-256, at `Ottto.app/Contents/Resources/` or a binary ZIP's root. Every
+  other marker in those files still blocks.
 - `signer:` and `owner+signer:` literals are not reported in signed bytes
   whose signature the gate verified (code signature, Developer ID chain and
   pinned leaf): signed Mach-O files, the signed DMG file and its decoded disk,
@@ -268,6 +270,10 @@ digest and counts, never a literal.
   name inside signed bytes is not flagged; it is public through `NOTICE` and
   every signature. A legal name that appears in the license files must be
   tagged `owner+signer:`, because the decoded disk has no per-file exception.
+- A string the gate reads from the build machine (user, full name, host)
+  that equals a listed literal (NFC, case-folded) is covered by that listed
+  literal and its tag; other machine strings are searched as their own
+  literals with no omissions.
 
 ### Roles and lanes
 
@@ -351,14 +357,30 @@ SHA-256 equal the bytes it is about to send.
 
 ### Receipt
 
-The workflow's upload carries `privacy-receipt.json`
-(`"schema": "ottto.release-privacy-receipt"`, `schema_version` 1) with the
-workflow path, run ID and attempt, source commit, app source commit, lane,
-version, `policy_sha256`, `markers_sha256`, the verdict of every gate stage,
-the advisory attribute counts on shipped files and one row (role, path, size,
-SHA-256) per uploaded file other than the receipt. The Actions artifact is
-named `ottto-macos-<channel>-<version>-attempt-<n>`. A publisher accepts only
-a receipt from that exact run attempt whose digests equal its own policy and
+The workflow's upload carries `privacy-receipt.json`, one JSON object:
+
+| Key | Value |
+|---|---|
+| `schema`, `schema_version` | `"ottto.release-privacy-receipt"`, `1` |
+| `workflow` | `".github/workflows/macos-stable-release.yml"` |
+| `run_id`, `run_attempt` | integers |
+| `source_commit`, `app_source_commit` | 40 lowercase hex; equal to the manifest's `git_repository` and `private_source` materials |
+| `lane` | `candidate`, `stable` or `manual` |
+| `version` | the manifest version |
+| `policy_sha256`, `markers_sha256` | the attempt's digests |
+| `stages` | stage name → `"clean"`, exactly the lane's stages (below) |
+| `advisory_xattrs` | advisory attribute counts on shipped files |
+| `files` | one `{role, path, size, sha256}` row per uploaded file other than the receipt, sorted by role |
+
+Stages: `dispatch`, `unsigned`, `notary:app_notary_zip`, `notary:app_dmg`,
+`notary:cli_zip`, `notary:service_zip`, then `attest-1` and `attest-2` for
+`candidate` and `stable` (the `manual` lane makes no attestations), then
+`upload`. The gate writes the receipt only when every recorded stage is
+clean and was scanned with the attempt's policy and marker digests, and the
+set of stages is exactly the lane's; otherwise the upload stage is
+`incomplete`. The Actions artifact is named
+`ottto-macos-<channel>-<version>-attempt-<n>`. A publisher accepts only a
+receipt from that exact run attempt whose digests equal its own policy and
 marker digests.
 
 ## Verify Stable Candidate RC

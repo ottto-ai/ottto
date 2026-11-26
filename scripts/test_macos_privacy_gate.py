@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for scripts/macos_privacy_gate.py. Synthetic markers and fixtures only."""
 
+import argparse
 import hashlib
 import importlib.util
 import io
@@ -322,6 +323,99 @@ class Formats(unittest.TestCase):
         for blob in (cms(signer_count=2), cms(trailing=b"\0")):
             with self.assertRaises(g.Incomplete):
                 g.cms_signer_certificate(blob)
+
+
+class ReceiptAndContract(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir="/private/tmp" if os.path.isdir("/private/tmp") else None)
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def state(self, gate, digest, lane, verdicts=None):
+        state = os.path.join(self.tmp, "state-" + lane)
+        os.mkdir(state)
+        records = [("dispatch", [])] + [("unsigned", ["app_bundle"])] + [("notary", [r]) for r in g.NOTARY_ROLES]
+        if lane != "manual":
+            records += [("attest", ["app_dmg"]), ("attest", ["app_dmg"])]
+        for index, (profile, roles) in enumerate(records):
+            record = {"profile": profile, "roles": roles, "verdict": (verdicts or {}).get(index, "clean"),
+                      "policy_sha256": gate.policy.sha256, "markers_sha256": digest}
+            with open(os.path.join(state, "stage-%02d-%s.json" % (index, profile)), "w") as handle:
+                json.dump(record, handle)
+        return state
+
+    def test_receipt_stages_and_types(self):
+        gate = make_gate(PRIVATE)
+        digest = gate.policy.markers_sha256
+        for lane in g.LANES:
+            args = argparse.Namespace(state=self.state(gate, digest, lane), lane=lane, markers_digest=digest)
+            self.assertEqual(sorted(g.recorded_stages(args, gate)), sorted(g.lane_stages(lane)))
+        manifest = os.path.join(self.tmp, g.ROLE_FILES["manifest"])
+        with open(manifest, "w") as handle:
+            json.dump({"version": "1.2.3-rc1", "supply_chain": {"materials": [
+                {"kind": "private_source", "commit": "b" * 40}, {"kind": "git_repository", "commit": "c" * 40}]}},
+                handle)
+        environment = {"OTTTO_MACOS_APP_SOURCE_COMMIT": "b" * 40, "GITHUB_SHA": "c" * 40,
+                       "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "2"}
+        saved = {k: os.environ.get(k) for k in environment}
+        os.environ.update(environment)
+        try:
+            receipt = g.make_receipt(args, gate, [], self.tmp)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual((receipt["run_id"], receipt["run_attempt"], receipt["lane"]), (123456, 2, args.lane))
+        self.assertEqual(set(receipt["stages"].values()), {"clean"})
+        self.assertIn("notary:app_notary_zip", receipt["stages"])
+
+    def test_receipt_refuses_missing_blocked_or_foreign_stages(self):
+        gate = make_gate(PRIVATE)
+        digest = gate.policy.markers_sha256
+        state = self.state(gate, digest, "stable")
+        os.remove(os.path.join(state, "stage-07-attest.json"))
+        cases = [argparse.Namespace(state=state, lane="stable", markers_digest=digest),
+                 argparse.Namespace(state=self.state(gate, digest, "candidate", {2: "blocked"}), lane="candidate",
+                                    markers_digest=digest),
+                 argparse.Namespace(state=self.state(gate, digest, "manual"), lane="manual",
+                                    markers_digest="d" * 64)]
+        for args in cases:
+            with self.assertRaisesRegex(g.Incomplete, "receipt_stages"):
+                g.recorded_stages(args, gate)
+
+    def test_host_alias_of_listed_literal_keeps_listed_class(self):
+        markers, _ = g.parse_markers(store("owner+signer:" + SIGNER))
+        saved = g.host_literals
+        g.host_literals = lambda: [g.Marker(SIGNER.upper(), "user"), g.Marker("synthetic-account", "user")]
+        try:
+            combined = g.with_host_literals(markers)
+        finally:
+            g.host_literals = saved
+        self.assertEqual([(m.value, m.cls) for m in combined],
+                         [(SIGNER, "owner+signer"), ("synthetic-account", "user")])
+
+    def test_legal_bytes_from_exported_tree(self):
+        export = os.path.join(self.tmp, "export")
+        os.makedirs(os.path.join(export, "scripts"))
+        shutil.copy(os.path.join(ROOT, "scripts", "macos_license_notices.sh"), os.path.join(export, "scripts"))
+        names = g.legal_names(archive=True)
+        for name in names:
+            shutil.copy(os.path.join(ROOT, name), os.path.join(export, name))
+        saved_root, saved_cache = g.ROOT, dict(g._legal_cache)
+        g.ROOT = export
+        g._legal_cache.clear()
+        try:
+            hashes = g.approved_legal_hashes()
+            with open(os.path.join(ROOT, "NOTICE"), "rb") as handle:
+                self.assertEqual(hashes["NOTICE"], g.sha256(handle.read()))
+            os.remove(os.path.join(export, "NOTICE"))
+            with self.assertRaisesRegex(g.Incomplete, "legal_files"):
+                g.approved_legal_hashes()
+        finally:
+            g.ROOT = saved_root
+            g._legal_cache.clear()
+            g._legal_cache.update(saved_cache)
 
 
 class CommandLine(unittest.TestCase):
