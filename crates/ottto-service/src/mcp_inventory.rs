@@ -249,7 +249,8 @@ const CLAUDE_TOOL_SEARCH_AUTO_DEFAULT_PCT: u8 = 10;
 ///
 /// `mode` is `always_on` (every schema is sent every session), `on_demand`
 /// (deferred: Claude Code sends only tool names and server instructions,
-/// Codex code mode sends nothing, until the model looks a tool up) or
+/// Codex code mode sends only each server's deferred namespace row, its name
+/// with a description when it has one, until the model looks a tool up) or
 /// `unknown`. `basis` is a closed reason the backend explains to the user:
 ///
 /// * `client_default` — the client's default for its version.
