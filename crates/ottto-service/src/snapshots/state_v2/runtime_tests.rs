@@ -587,11 +587,14 @@ mod hydrate_parity {
     fn attach_raw(index: &mut ScanIndex, field: &str, key: &str, raw: &str) {
         // Reuse the v1 hold codec to derive its platform-specific bookkeeping
         // charge rather than duplicating the private HeldRaw layout in a fixture.
-        let probe =
-            lenient_decode::read_bounded(
+        let probe = lenient_decode::read(
+            std::io::Cursor::new(
                 br#"{"files":{"probe":{"size_bytes":[]}},"accepted_snapshot_fingerprint_ledger_version":2}"#,
-            )
-            .unwrap();
+            ),
+            "cas",
+            "unattributed",
+        )
+        .unwrap();
         let (_, _, bytes, _, charge) = probe.decode_holds.v2_entries().next().unwrap();
         let overhead =
             charge - bytes.len() as u64 - serde_json::to_vec("probe").unwrap().len() as u64;
@@ -669,16 +672,11 @@ mod hydrate_parity {
         let since = unix_now();
         // Exercise the shared API with the stage used by both ordinary and
         // claim-only CAS. SAVE owns installing its current-snapshot caller.
-        for bounded in [false, true] {
-            let expected = if bounded {
-                lenient_decode::read_bounded(bytes).unwrap()
-            } else {
-                lenient_decode::read(std::io::Cursor::new(bytes), "cas", "claude_code").unwrap()
-            };
-            let mut current = mapped.clone();
-            lenient_decode::post_decode_hydrated(&mut current, "cas", "claude_code").unwrap();
-            assert_graph(&settled(expected, since), &settled(current, since));
-        }
+        let expected =
+            lenient_decode::read(std::io::Cursor::new(bytes), "cas", "claude_code").unwrap();
+        let mut current = mapped.clone();
+        lenient_decode::post_decode_hydrated(&mut current, "cas", "claude_code").unwrap();
+        assert_graph(&settled(expected, since), &settled(current, since));
         let f = Fixture::new();
         let v1 = f.support.join("v1-index.json");
         fs::write(&v1, bytes).unwrap();
@@ -989,7 +987,12 @@ mod hydrate_parity {
                 "family",
             );
             let unbound_bytes = unbound_bytes.replace(&compact_raw, &raw);
-            let held = lenient_decode::read_bounded(unbound_bytes.as_bytes()).unwrap();
+            let held = lenient_decode::read(
+                std::io::Cursor::new(unbound_bytes.as_bytes()),
+                "cas",
+                "unattributed",
+            )
+            .unwrap();
             let (_, _, raw_bytes, owner, charge) = held
                 .decode_holds
                 .v2_entries()

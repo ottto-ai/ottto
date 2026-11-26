@@ -169,6 +169,234 @@ impl ClaudeTwinSchedule {
     }
 }
 
+/// The page inputs and shared state Claude twin scheduling and forced family
+/// pull-in use. The twin-group cell is filled at most once per page, and the
+/// growth probe records what discovery observes.
+struct FamilyFacts<'a> {
+    source: SnapshotSource,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    audit_now: u64,
+    discovery_growth: &'a crate::snapshots::discovery_growth::Page,
+    /// The walk saw every directory and file, so its observed keys are the
+    /// whole family membership.
+    membership_authoritative: bool,
+    /// `e2`: the page's path-twin groups, built at most once per page and
+    /// shared with twin staging and the parse-time birth context.
+    twin_groups: &'a std::cell::OnceCell<claude_history_upgrade::ClaudeTwinGroups>,
+    /// Attaches a candidate's title metadata and effort sidecars.
+    prepare: &'a dyn Fn(&mut CandidateFile),
+}
+
+impl FamilyFacts<'_> {
+    fn window<'b>(&'b self, index: &'b ScanIndex) -> CandidateWindow<'b> {
+        CandidateWindow {
+            census_unix_seconds: self.census_unix_seconds,
+            backfill_window_days: self.backfill_window_days,
+            retention: discovery_retention!(index, self.discovery_growth),
+            growth: sampled_audit::growth_active(index).then_some(&index.v2().growth_retention),
+        }
+    }
+}
+
+/// Path-twin co-scheduling for a Claude page: which roots a read twin
+/// forces whole (added to `forced`), which root homes read together, and
+/// which paced twins wait with their debt instead of staying on the page.
+fn schedule_claude_twins(
+    facts: &FamilyFacts<'_>,
+    index: &mut ScanIndex,
+    census: &mut ScanCensus,
+    identified_candidates: &mut Vec<CandidateFile>,
+    forced: &mut BTreeSet<String>,
+) -> ClaudeTwinSchedule {
+    let mut schedule = ClaudeTwinSchedule::default();
+    let twin_groups = facts.twin_groups.get_or_init(|| {
+        // A page file not known yet (a new copy) keeps its member's
+        // single known path as its twin.
+        let page_members = identified_candidates
+            .iter()
+            .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
+            .map(|(_, member)| member)
+            .collect::<BTreeSet<_>>();
+        claude_history_upgrade::claude_path_twin_groups(index, &page_members)
+    });
+    // Only a twin this page reads pulls its family in: every walk meets
+    // each settled twin too, and pulling its family then re-read the
+    // family on every walk (observed: 8 files and one upload batch per
+    // walk). Outside the authority preflight a candidate still carries
+    // its sidecar digest in the scan fingerprint slot, so each twin is
+    // identified on a copy first: one more open per twin candidate. A
+    // twin that cannot be identified pulls its family in, as before.
+    // A twin whose growth Full is paced would only be deferred, so it
+    // neither pulls its family nor stays on the page alone (where its
+    // known twin would hold it as `absent_twin`); it waits with its debt.
+    let growth_now = sampled_scan::now_seconds();
+    let (paced_twins, read_twins): (Vec<_>, Vec<_>) = identified_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let (root, member) = claude_index_path_family_member(&candidate.path)?;
+            let homes = claude_history_upgrade::path_twins(twin_groups, &member)?;
+            Some((candidate, root, member, homes))
+        })
+        .filter_map(|(candidate, root, member, homes)| {
+            let mut twin = candidate.clone();
+            (facts.prepare)(&mut twin);
+            // A seed: its own Parse decision, or `None` when unidentified.
+            let seed = open_and_identify_scan_candidate_at(
+                facts.source,
+                twin,
+                &mut ScanCensus::default(),
+                facts.window(index),
+            )
+            .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, facts.audit_now));
+            seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
+                .then_some((
+                    candidate.path.as_path(),
+                    root,
+                    member,
+                    homes,
+                    seed.map(|(_, reason)| reason),
+                ))
+        })
+        .partition(|(path, ..)| {
+            sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
+        });
+    // An identified seed of the root itself, whose other homes are
+    // unchanged and verified, reads just the root's homes: a root with
+    // one home reads only itself too. Any other seed of that root (a
+    // child, an unidentified twin, a changed or unverified other home)
+    // forces the whole family, and so does any other forced cause.
+    let settled = |key: &String| {
+        let path = Path::new(key);
+        std::fs::metadata(path).is_ok_and(|meta| index.listing_unchanged(path, &meta))
+    };
+    let mut scoped = BTreeMap::new();
+    let mut seeds = Vec::new();
+    for (path, root, member, homes, seed) in read_twins {
+        let own = local_index_key(path);
+        let root_member = member == root;
+        let narrow = seed.is_some()
+            && root_member
+            && homes.iter().all(|(key, _)| *key == own || settled(key));
+        scoped.entry(root).or_insert((true, homes)).0 &= narrow;
+        seeds.push((seed, root_member));
+    }
+    let (scoped, roots): (Vec<_>, Vec<_>) = scoped.into_iter().partition(|(_, (n, _))| *n);
+    for (root, _) in &roots {
+        if forced.insert(root.clone()) {
+            schedule.family_roots.insert(root.clone());
+        }
+    }
+    let scoped = scoped
+        .into_iter()
+        .filter(|(root, _)| !forced.contains(root))
+        .map(|(_, (_, homes))| homes)
+        .collect::<Vec<_>>();
+    crate::local_resource_diagnostics::forced_family_seeds(seeds, roots.len(), scoped.len());
+    schedule.root_homes = scoped
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let paced_twins = paced_twins
+        .into_iter()
+        .map(|(path, ..)| path.to_path_buf())
+        .collect::<BTreeSet<_>>();
+    identified_candidates.retain(|candidate| {
+        let paced = paced_twins.contains(&candidate.path);
+        if paced {
+            sampled_audit::defer_growth_read(index, census, candidate);
+        }
+        !paced
+    });
+    schedule
+}
+
+/// Takes every member of a `forced` family and every scheduled root home this
+/// page has not identified yet out of the walk's pending queue and tries to
+/// admit each onto the page; returns the pending entries it removed.
+fn pull_in_forced_families(
+    facts: &FamilyFacts<'_>,
+    index: &mut ScanIndex,
+    census: &mut ScanCensus,
+    identified_candidates: &mut Vec<CandidateFile>,
+    forced: &BTreeSet<String>,
+    schedule: &ClaudeTwinSchedule,
+) -> Vec<ScanTraversalPath> {
+    let mut forced_pending_entries = Vec::new();
+    if forced.is_empty() && schedule.root_homes.is_empty() {
+        return forced_pending_entries;
+    }
+    let already_identified = identified_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<BTreeSet<_>>();
+    let family_index_keys = if facts.membership_authoritative {
+        index
+            .traversal
+            .as_ref()
+            .map(|traversal| (*traversal.observed_index_keys).clone())
+            .unwrap_or_default()
+    } else {
+        index.files.keys().cloned().collect()
+    };
+    let scan_roots = index
+        .traversal
+        .as_ref()
+        .map(|traversal| traversal.scan_roots.clone())
+        .unwrap_or_default();
+    let missing_family_paths = claude_history_upgrade::claude_read_closure(
+        std::iter::empty::<&Path>(),
+        &family_index_keys,
+        facts.twin_groups.get_or_init(Default::default),
+        forced,
+    )
+    .into_iter()
+    .inspect(|_| crate::local_resource_diagnostics::forced_family_member_pulled())
+    .chain(schedule.root_homes.iter().map(PathBuf::from))
+    .filter(|path| !already_identified.contains(&local_index_key(path)))
+    .collect::<BTreeSet<_>>();
+    if let Some(traversal) = index.traversal.as_mut() {
+        traversal.pending_candidates.retain(|pending| {
+            if missing_family_paths.contains(&pending.path) {
+                forced_pending_entries.push(pending.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let move_sources = index.held_move_sources();
+    for path in missing_family_paths {
+        let mut candidate_discovery = CandidateDiscovery {
+            index,
+            sources: std::borrow::Cow::Borrowed(&move_sources),
+            growth: Some(facts.discovery_growth),
+        };
+        let Some(mut candidate) = forced_index_candidate(
+            facts.source,
+            &scan_roots,
+            (path, true),
+            census,
+            facts.census_unix_seconds,
+            facts.backfill_window_days,
+            &mut candidate_discovery,
+        ) else {
+            continue;
+        };
+        (facts.prepare)(&mut candidate);
+        if let Some(opened) = open_and_identify_scan_candidate_at(
+            facts.source,
+            candidate,
+            census,
+            facts.window(index),
+        ) {
+            identified_candidates.push(opened.0);
+        }
+    }
+    forced_pending_entries
+}
+
 pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) resource_probe: crate::local_resource_diagnostics::Probe,
     pub(in crate::snapshots) sampling: Option<sampled_scan::Context>,
@@ -1231,201 +1459,36 @@ impl OwnedSourceScan {
                 }
             }
         }
-        let mut forced_pending_entries = Vec::new();
-        let mut claude_twin_schedule = ClaudeTwinSchedule::default();
-        // `e2`: the page's path-twin groups, built at most once per page and
-        // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
-        if source == SnapshotSource::ClaudeCode {
-            let twin_groups = claude_twin_groups.get_or_init(|| {
-                // A page file not known yet (a new copy) keeps its member's
-                // single known path as its twin.
-                let page_members = identified_candidates
-                    .iter()
-                    .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
-                    .map(|(_, member)| member)
-                    .collect::<BTreeSet<_>>();
-                claude_history_upgrade::claude_path_twin_groups(index, &page_members)
-            });
-            // Only a twin this page reads pulls its family in: every walk meets
-            // each settled twin too, and pulling its family then re-read the
-            // family on every walk (observed: 8 files and one upload batch per
-            // walk). Outside the authority preflight a candidate still carries
-            // its sidecar digest in the scan fingerprint slot, so each twin is
-            // identified on a copy first: one more open per twin candidate. A
-            // twin that cannot be identified pulls its family in, as before.
-            // A twin whose growth Full is paced would only be deferred, so it
-            // neither pulls its family nor stays on the page alone (where its
-            // known twin would hold it as `absent_twin`); it waits with its debt.
-            let growth_now = sampled_scan::now_seconds();
-            let (paced_twins, read_twins): (Vec<_>, Vec<_>) = identified_candidates
-                .iter()
-                .filter_map(|candidate| {
-                    let (root, member) = claude_index_path_family_member(&candidate.path)?;
-                    let homes = claude_history_upgrade::path_twins(twin_groups, &member)?;
-                    Some((candidate, root, member, homes))
-                })
-                .filter_map(|(candidate, root, member, homes)| {
-                    let mut twin = candidate.clone();
-                    prepare_candidate_context(&mut twin);
-                    // A seed: its own Parse decision, or `None` when unidentified.
-                    let seed = open_and_identify_scan_candidate_at(
-                        source,
-                        twin,
-                        &mut ScanCensus::default(),
-                        CandidateWindow {
-                            census_unix_seconds,
-                            backfill_window_days,
-                            retention: discovery_retention!(
-                                index,
-                                &resource_probe.discovery_growth
-                            ),
-                            growth: sampled_audit::growth_active(index)
-                                .then_some(&index.v2().growth_retention),
-                        },
-                    )
-                    .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, audit_now));
-                    seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
-                        .then_some((
-                            candidate.path.as_path(),
-                            root,
-                            member,
-                            homes,
-                            seed.map(|(_, reason)| reason),
-                        ))
-                })
-                .partition(|(path, ..)| {
-                    sampled_audit::growth_full_paced(index, &local_index_key(path), growth_now)
-                });
-            // An identified seed of the root itself, whose other homes are
-            // unchanged and verified, reads just the root's homes: a root with
-            // one home reads only itself too. Any other seed of that root (a
-            // child, an unidentified twin, a changed or unverified other home)
-            // forces the whole family, and so does any other forced cause.
-            let settled = |key: &String| {
-                let path = Path::new(key);
-                std::fs::metadata(path).is_ok_and(|meta| index.listing_unchanged(path, &meta))
-            };
-            let mut scoped = BTreeMap::new();
-            let mut seeds = Vec::new();
-            for (path, root, member, homes, seed) in read_twins {
-                let own = local_index_key(path);
-                let root_member = member == root;
-                let narrow = seed.is_some()
-                    && root_member
-                    && homes.iter().all(|(key, _)| *key == own || settled(key));
-                scoped.entry(root).or_insert((true, homes)).0 &= narrow;
-                seeds.push((seed, root_member));
-            }
-            let (scoped, roots): (Vec<_>, Vec<_>) = scoped.into_iter().partition(|(_, (n, _))| *n);
-            for (root, _) in &roots {
-                if forced_claude_family_reparses.insert(root.clone()) {
-                    claude_twin_schedule.family_roots.insert(root.clone());
-                }
-            }
-            let scoped = scoped
-                .into_iter()
-                .filter(|(root, _)| !forced_claude_family_reparses.contains(root))
-                .map(|(_, (_, homes))| homes)
-                .collect::<Vec<_>>();
-            crate::local_resource_diagnostics::forced_family_seeds(
-                seeds,
-                roots.len(),
-                scoped.len(),
-            );
-            claude_twin_schedule.root_homes = scoped
-                .into_iter()
-                .flatten()
-                .map(|(key, _)| key.clone())
-                .collect();
-            let paced_twins = paced_twins
-                .into_iter()
-                .map(|(path, ..)| path.to_path_buf())
-                .collect::<BTreeSet<_>>();
-            identified_candidates.retain(|candidate| {
-                let paced = paced_twins.contains(&candidate.path);
-                if paced {
-                    sampled_audit::defer_growth_read(index, &mut census, candidate);
-                }
-                !paced
-            });
-        }
-        if !forced_claude_family_reparses.is_empty() || !claude_twin_schedule.root_homes.is_empty()
-        {
-            let already_identified = identified_candidates
-                .iter()
-                .map(|candidate| local_index_key(&candidate.path))
-                .collect::<BTreeSet<_>>();
-            let family_index_keys = if claude_family_membership_is_authoritative {
-                index
-                    .traversal
-                    .as_ref()
-                    .map(|traversal| (*traversal.observed_index_keys).clone())
-                    .unwrap_or_default()
-            } else {
-                index.files.keys().cloned().collect()
-            };
-            let scan_roots = index
-                .traversal
-                .as_ref()
-                .map(|traversal| traversal.scan_roots.clone())
-                .unwrap_or_default();
-            let missing_family_paths = claude_history_upgrade::claude_read_closure(
-                std::iter::empty::<&Path>(),
-                &family_index_keys,
-                claude_twin_groups.get_or_init(Default::default),
-                &forced_claude_family_reparses,
+        let facts = FamilyFacts {
+            source,
+            census_unix_seconds,
+            backfill_window_days,
+            audit_now,
+            discovery_growth: &resource_probe.discovery_growth,
+            membership_authoritative: claude_family_membership_is_authoritative,
+            twin_groups: &claude_twin_groups,
+            prepare: &prepare_candidate_context,
+        };
+        let claude_twin_schedule = if source == SnapshotSource::ClaudeCode {
+            schedule_claude_twins(
+                &facts,
+                index,
+                &mut census,
+                &mut identified_candidates,
+                &mut forced_claude_family_reparses,
             )
-            .into_iter()
-            .inspect(|_| crate::local_resource_diagnostics::forced_family_member_pulled())
-            .chain(claude_twin_schedule.root_homes.iter().map(PathBuf::from))
-            .filter(|path| !already_identified.contains(&local_index_key(path)))
-            .collect::<BTreeSet<_>>();
-            if let Some(traversal) = index.traversal.as_mut() {
-                traversal.pending_candidates.retain(|pending| {
-                    if missing_family_paths.contains(&pending.path) {
-                        forced_pending_entries.push(pending.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            let move_sources = index.held_move_sources();
-            for path in missing_family_paths {
-                let mut candidate_discovery = CandidateDiscovery {
-                    index,
-                    sources: std::borrow::Cow::Borrowed(&move_sources),
-                    growth: Some(&resource_probe.discovery_growth),
-                };
-                let Some(mut candidate) = forced_index_candidate(
-                    source,
-                    &scan_roots,
-                    (path, true),
-                    &mut census,
-                    census_unix_seconds,
-                    backfill_window_days,
-                    &mut candidate_discovery,
-                ) else {
-                    continue;
-                };
-                prepare_candidate_context(&mut candidate);
-                if let Some(opened) = open_and_identify_scan_candidate_at(
-                    source,
-                    candidate,
-                    &mut census,
-                    CandidateWindow {
-                        census_unix_seconds,
-                        backfill_window_days,
-                        retention: discovery_retention!(index, &resource_probe.discovery_growth),
-                        growth: sampled_audit::growth_active(index)
-                            .then_some(&index.v2().growth_retention),
-                    },
-                ) {
-                    identified_candidates.push(opened.0);
-                }
-            }
-        }
+        } else {
+            ClaudeTwinSchedule::default()
+        };
+        let forced_pending_entries = pull_in_forced_families(
+            &facts,
+            index,
+            &mut census,
+            &mut identified_candidates,
+            &forced_claude_family_reparses,
+            &claude_twin_schedule,
+        );
 
         // Only pure context debt moves behind ordinary work. Preserve relative
         // order of all authority, recovery, new and changed family members.

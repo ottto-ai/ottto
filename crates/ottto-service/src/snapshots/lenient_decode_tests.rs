@@ -8,7 +8,7 @@ fn write_decoder_fixture(index: &ScanIndex, path: &Path) {
 }
 
 fn read_decoder_fixture(path: &Path) -> Result<ScanIndex> {
-    read_scan_index_representation(path, "load", "unattributed", None)
+    read_scan_index_representation(path, "load", "unattributed")
 }
 
 fn fixture() -> ScanIndex {
@@ -471,8 +471,7 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
     let mut index = fixture();
     write_decoder_fixture(&index, &path);
     let mut value = serde_json::to_value(&index).unwrap();
-    value["unknown_large_shape"] =
-        Value::Array(vec![Value::Null; crate::snapshot_retry::STATE_NODES]);
+    value["unknown_large_shape"] = Value::Array(vec![Value::Null; 8_192]);
     let bytes = serde_json::to_vec(&value).unwrap();
     e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(index.save(&path).is_err());
@@ -1526,8 +1525,7 @@ fn retired_desktop_census_witness_decodes_and_drops() {
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-        for decoded in [native, streaming, bounded] {
+        for decoded in [native, streaming] {
             assert!(decoded.decode_holds.is_empty(), "{field}");
             assert_eq!(serde_json::to_value(&decoded).unwrap(), current, "{field}");
         }
@@ -1580,8 +1578,7 @@ fn retired_codex_state_only_fields_decode_and_drop() {
     let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
     let streaming =
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-    let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-    for decoded in [native, streaming, bounded] {
+    for decoded in [native, streaming] {
         assert!(decoded.decode_holds.is_empty());
         assert_eq!(serde_json::to_value(&decoded).unwrap(), current);
     }
@@ -1650,8 +1647,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
             let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
             let streaming =
                 lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-            let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-            for decoded in [native, streaming, bounded] {
+            for decoded in [native, streaming] {
                 assert!(decoded.decode_holds.is_empty());
                 assert_sibling(&decoded);
                 assert_eq!(
@@ -1755,8 +1751,7 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-        for decoded in [native, streaming, bounded] {
+        for decoded in [native, streaming] {
             assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
         }
     }
@@ -1786,8 +1781,7 @@ fn growth_retention_keeps_existing_positional_index_slots() {
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-        for decoded in [native, streaming, bounded] {
+        for decoded in [native, streaming] {
             assert!(decoded.v2.is_none());
             assert_eq!(serde_json::to_value(decoded).unwrap(), current);
         }
@@ -1830,8 +1824,7 @@ fn copy_removals_keep_existing_positional_index_slots() {
         let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
         let streaming =
             lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-        let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-        for decoded in [native, streaming, bounded] {
+        for decoded in [native, streaming] {
             assert_eq!(serde_json::to_value(decoded).unwrap(), *expected);
         }
     }
@@ -2129,7 +2122,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
 /// Every reader shares fail-closed scalar repairs. An intact cutoff
 /// must not hide a damaged move hold after this destination bootstraps.
 #[test]
-fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
+fn history_gate_damage_is_local_through_load_and_cas_reader() {
     for bad in [
         serde_json::json!("damaged"),
         serde_json::json!(-1),
@@ -2139,65 +2132,60 @@ fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
         serde_json::json!(null),
     ] {
         for damage_cutoff in [false, true] {
-            for bounded in [false, true] {
-                let scratch = crate::test_scratch::ScratchDir::new("history-gate-cas");
-                let path = scratch.join("index.json");
-                let mut working = fixture();
-                working.claude_history_gate_loaded = true;
-                working.claude_history_cutoff_unix_seconds = Some(1);
-                write_decoder_fixture(&working, &path);
-                let mut value = serde_json::to_value(&working).unwrap();
-                value["claude_history_move_not_full"] = bad.clone();
-                value["claude_history_move_released"] = bad.clone();
-                if damage_cutoff {
-                    value["claude_history_cutoff_unix_seconds"] = bad.clone();
-                    value["claude_history_gate_loaded"] = bad.clone();
-                }
-                let bytes = serde_json::to_vec(&value).unwrap();
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-                let loaded = read_decoder_fixture(&path).unwrap();
-                // Inspect CAS decode results as well as the real save APIs:
-                // a later overwrite must not conceal missing normalization.
-                let current = if bounded {
-                    claude_request_census::decode_bounded_index(&bytes).unwrap()
-                } else {
-                    lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
-                        .unwrap()
-                };
-                for mut index in [loaded.clone(), current] {
-                    assert_sibling(&index);
-                    assert!(index.claude_history_move_not_full);
-                    assert!(!index.claude_history_move_released);
-                    if damage_cutoff {
-                        assert_eq!(index.claude_history_cutoff_unix_seconds, None);
-                        assert!(!index.claude_history_gate_loaded);
-                    } else {
-                        assert_eq!(index.claude_history_cutoff_unix_seconds, Some(1));
-                        assert!(index.claude_history_gate_loaded);
-                    }
-                    index.note_claude_history_cutoff(PriorHistory::Here, false, false);
-                    assert!(index.claude_history_gate_loaded);
-                    assert!(index.claude_history_cutoff_unix_seconds.is_some());
-                    assert_eq!(index.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
-                }
-                assert_eq!(fs::read(&path).unwrap(), bytes);
-                assert_eq!(corrupt_count(scratch.as_ref()), 0);
-                let mut working = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-                working.save(&path).unwrap();
-                let mut restarted = ScanIndex::load(&path).unwrap();
-                assert_sibling(&restarted);
-                assert_eq!(restarted.generation, working.generation);
-                restarted.note_claude_history_cutoff(PriorHistory::Here, false, false);
-                assert_eq!(
-                    restarted.claude_no_list_policy,
-                    NoListPolicy::HoldMoveNotFull
-                );
-                restarted.note_claude_history_cutoff(PriorHistory::Here, true, false);
-                assert_eq!(restarted.claude_no_list_policy, NoListPolicy::Pace);
-                assert!(!restarted.claude_history_move_not_full);
-                assert!(restarted.claude_history_move_released);
-                assert_eq!(corrupt_count(scratch.as_ref()), 0);
+            let scratch = crate::test_scratch::ScratchDir::new("history-gate-cas");
+            let path = scratch.join("index.json");
+            let mut working = fixture();
+            working.claude_history_gate_loaded = true;
+            working.claude_history_cutoff_unix_seconds = Some(1);
+            write_decoder_fixture(&working, &path);
+            let mut value = serde_json::to_value(&working).unwrap();
+            value["claude_history_move_not_full"] = bad.clone();
+            value["claude_history_move_released"] = bad.clone();
+            if damage_cutoff {
+                value["claude_history_cutoff_unix_seconds"] = bad.clone();
+                value["claude_history_gate_loaded"] = bad.clone();
             }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+            let loaded = read_decoder_fixture(&path).unwrap();
+            // Inspect CAS decode results as well as the real save APIs:
+            // a later overwrite must not conceal missing normalization.
+            let current =
+                lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
+                    .unwrap();
+            for mut index in [loaded.clone(), current] {
+                assert_sibling(&index);
+                assert!(index.claude_history_move_not_full);
+                assert!(!index.claude_history_move_released);
+                if damage_cutoff {
+                    assert_eq!(index.claude_history_cutoff_unix_seconds, None);
+                    assert!(!index.claude_history_gate_loaded);
+                } else {
+                    assert_eq!(index.claude_history_cutoff_unix_seconds, Some(1));
+                    assert!(index.claude_history_gate_loaded);
+                }
+                index.note_claude_history_cutoff(PriorHistory::Here, false, false);
+                assert!(index.claude_history_gate_loaded);
+                assert!(index.claude_history_cutoff_unix_seconds.is_some());
+                assert_eq!(index.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(corrupt_count(scratch.as_ref()), 0);
+            let mut working = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+            working.save(&path).unwrap();
+            let mut restarted = ScanIndex::load(&path).unwrap();
+            assert_sibling(&restarted);
+            assert_eq!(restarted.generation, working.generation);
+            restarted.note_claude_history_cutoff(PriorHistory::Here, false, false);
+            assert_eq!(
+                restarted.claude_no_list_policy,
+                NoListPolicy::HoldMoveNotFull
+            );
+            restarted.note_claude_history_cutoff(PriorHistory::Here, true, false);
+            assert_eq!(restarted.claude_no_list_policy, NoListPolicy::Pace);
+            assert!(!restarted.claude_history_move_not_full);
+            assert!(restarted.claude_history_move_released);
+            assert_eq!(corrupt_count(scratch.as_ref()), 0);
         }
     }
 }
@@ -3600,7 +3588,7 @@ fn retired_codex_field(field: &str) -> bool {
     )
 }
 
-/// [format] Retired fields consume old values in native, bounded and streaming
+/// [format] Retired fields consume old values in native and streaming
 /// decoders, without admitting damage in neighboring live controls.
 #[test]
 fn retired_codex_fields_decode_and_drop() {
@@ -3621,8 +3609,7 @@ fn retired_codex_fields_decode_and_drop() {
             let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
             let streaming =
                 lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
-            let bounded = lenient_decode::read_bounded(&bytes).unwrap();
-            for decoded in [native, streaming, bounded] {
+            for decoded in [native, streaming] {
                 assert!(decoded.decode_holds.is_empty());
                 assert_eq!(serde_json::to_value(decoded).unwrap(), current);
             }

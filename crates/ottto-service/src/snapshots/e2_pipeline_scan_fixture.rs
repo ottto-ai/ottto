@@ -229,7 +229,7 @@ pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_
 
 /// Decoder-only inspection does not adopt the mapper's input as live custody.
 pub(crate) fn read_legacy_for_test(path: &Path) -> ScanIndex {
-    read_scan_index_representation(path, "load", "unattributed", None).unwrap()
+    read_scan_index_representation(path, "load", "unattributed").unwrap()
 }
 
 /// Inventory refusals preserve their original input and expose support action.
