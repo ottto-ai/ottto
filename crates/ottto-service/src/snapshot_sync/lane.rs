@@ -470,6 +470,7 @@ pub(super) fn sync_once(
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
+    continuation_cycle.collecting(&enabled_sources);
     for source in enabled_sources.iter().copied() {
         start_collection_health(source);
     }

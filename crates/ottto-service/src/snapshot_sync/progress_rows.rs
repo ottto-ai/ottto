@@ -792,7 +792,12 @@ impl SnapshotUploadProgress {
     }
 
     pub(super) fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_with_read_limit(path, None)
+        if self.rows.is_none() {
+            return Err(crate::snapshots::state_v2::Hold::ReloadRequired.into());
+        }
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+        self.save_rows(path)
     }
 
     /// The concurrent-writer stamp of every progress write: the on-disk stamp
@@ -811,32 +816,10 @@ impl SnapshotUploadProgress {
         (self.schema_version, self.generation, namespace)
     }
 
-    pub(super) fn save_with_read_limit(
-        &mut self,
-        path: &Path,
-        _read_limit: Option<usize>,
-    ) -> Result<()> {
-        if self.rows.is_none() {
-            return Err(crate::snapshots::state_v2::Hold::ReloadRequired.into());
-        }
-        self.accepted_body_contexts
-            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
-        self.save_rows(path)
-    }
-
     /// Fixture persistence is explicit; native owners still use the real saver.
     #[cfg(test)]
     pub(super) fn save_fixture(&mut self, path: &Path) -> Result<()> {
-        self.save_legacy_fixture(path, None)
-    }
-
-    #[cfg(test)]
-    pub(super) fn save_fixture_with_read_limit(
-        &mut self,
-        path: &Path,
-        cap: Option<usize>,
-    ) -> Result<()> {
-        self.save_legacy_fixture(path, cap)
+        self.save_legacy_fixture(path)
     }
 
     #[cfg(test)]
@@ -855,11 +838,7 @@ impl SnapshotUploadProgress {
 
     /// Explicit old-release input export for decoder and ACK-import fixtures.
     #[cfg(test)]
-    pub(super) fn save_legacy_fixture(
-        &mut self,
-        path: &Path,
-        read_limit: Option<usize>,
-    ) -> Result<()> {
+    pub(super) fn save_legacy_fixture(&mut self, path: &Path) -> Result<()> {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         if self.rows.is_some() {
@@ -871,17 +850,10 @@ impl SnapshotUploadProgress {
         let _lock = SnapshotProgressLock::acquire(path)?;
         let mut unchanged = false;
         if path.exists() {
-            let bytes = match read_limit {
-                Some(cap) => crate::snapshot_retry::read_state(path, cap),
-                None => std::fs::read(path),
-            }
-            .context("read current snapshot upload progress")?;
-            let current: SnapshotUploadProgressCas = if read_limit.is_some() {
-                crate::snapshot_retry::decode_state(&bytes)
-            } else {
-                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
-            }
-            .context("parse current snapshot upload progress for compare-and-swap")?;
+            let bytes = std::fs::read(path).context("read current snapshot upload progress")?;
+            let current: SnapshotUploadProgressCas = serde_json::from_slice(&bytes)
+                .map_err(anyhow::Error::from)
+                .context("parse current snapshot upload progress for compare-and-swap")?;
             let namespace = current.destination_namespace_hash.as_str();
             if !self.same_writer((current.schema_version, current.generation, namespace)) {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));

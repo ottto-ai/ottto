@@ -1,0 +1,16 @@
+# Upstream Sparkle per-architecture LC_UUIDs (Sparkle-for-Swift-Package-Manager.zip,
+# macos-arm64_x86_64 slice). The release privacy gate requires exactly these
+# Mach-O files in Ottto.app/Contents/Frameworks/Sparkle.framework. The version
+# must equal OTTTO_SPARKLE_LICENSE_VERSION in scripts/macos_license_notices.sh;
+# update both with the app's Package.resolved in one change.
+# version	path	arch	uuid
+2.9.2	Versions/B/Sparkle	arm64	D1037BFC-3E22-3CB7-A7F9-021555F2F660
+2.9.2	Versions/B/Sparkle	x86_64	99DB49B8-AD0F-3D44-A15B-910F3E3B1A04
+2.9.2	Versions/B/Autoupdate	arm64	2167D38E-B328-3E31-BA7A-561E60DDE15C
+2.9.2	Versions/B/Autoupdate	x86_64	7F472671-F750-3088-B423-55F227AF89D5
+2.9.2	Versions/B/Updater.app/Contents/MacOS/Updater	arm64	F88A5299-F6D8-3415-985D-E205ED6337B5
+2.9.2	Versions/B/Updater.app/Contents/MacOS/Updater	x86_64	9672682C-2838-3A80-996E-5DF9B69833BC
+2.9.2	Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader	arm64	E861856D-71FD-385B-830F-092813AEDBEA
+2.9.2	Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader	x86_64	290A49E4-C9BE-3251-A93E-1558675241F1
+2.9.2	Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer	arm64	F564C67F-4105-387F-8C25-F57A6319994E
+2.9.2	Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer	x86_64	0556A132-CBDE-36C2-A6DF-31A48194EFC0

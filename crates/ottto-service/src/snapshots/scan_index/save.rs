@@ -6,38 +6,23 @@ use crate::snapshots::*;
 
 impl ScanIndex {
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, false)
-    }
-    pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        self.save_internal(path, Some(cap), false)
+        self.save_internal(path, false)
     }
     /// A save while the caller holds the source's progress owner, which a
     /// routed save never takes itself: owner, then CheckpointLock.
     pub(crate) fn save_with_progress_owner(
         &mut self,
         path: &Path,
-        read_limit: Option<usize>,
         _owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
-        if !state_v2::state_v2_growth_retention_active(self) {
-            return match read_limit {
-                Some(cap) => self.save_with_read_limit(path, cap),
-                None => self.save(path),
-            };
-        }
-        self.save_internal(path, read_limit, false)
+        self.save(path)
     }
     /// Test-only since growth claims commit their rows directly.
     #[cfg(test)]
     pub(in crate::snapshots) fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
-        self.save_internal(path, None, true)
+        self.save_internal(path, true)
     }
-    fn save_internal(
-        &mut self,
-        path: &Path,
-        _read_limit: Option<usize>,
-        claim_only: bool,
-    ) -> Result<()> {
+    fn save_internal(&mut self, path: &Path, claim_only: bool) -> Result<()> {
         let _save_window = state_v2::state_v2_growth_retention_active(self)
             .then(|| state_v2::telemetry::Window::begin("save"))
             .flatten();

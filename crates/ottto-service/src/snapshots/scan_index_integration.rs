@@ -30,9 +30,8 @@ pub(super) fn read_scan_index_representation(
     path: &Path,
     stage: &str,
     source: &'static str,
-    cap: Option<usize>,
 ) -> Result<ScanIndex> {
-    read_representation(path, stage, source, cap, false)
+    read_representation(path, stage, source, false)
 }
 
 /// Administrative metadata inspection: no daemon recovery or filesystem writes.
@@ -41,23 +40,17 @@ pub(super) fn read_scan_index_representation_read_only(
     stage: &str,
     source: &'static str,
 ) -> Result<ScanIndex> {
-    read_representation(path, stage, source, None, true)
+    read_representation(path, stage, source, true)
 }
 
 fn read_representation(
     path: &Path,
     stage: &str,
     source: &'static str,
-    cap: Option<usize>,
     read_only: bool,
 ) -> Result<ScanIndex> {
     let Some(binding) = scan_index_storage_binding(path) else {
-        return match cap {
-            Some(cap) => claude_request_census::decode_bounded_index(
-                &crate::snapshot_retry::read_state(path, cap)?,
-            ),
-            None => lenient_decode::read_file(File::open(path)?, stage, source).map_err(Into::into),
-        };
+        return lenient_decode::read_file(File::open(path)?, stage, source).map_err(Into::into);
     };
     let store =
         scan_index_persistence::LockedStore::new(path, binding.clone(), lenient_decode::FIELDS)?;
@@ -72,44 +65,15 @@ fn read_representation(
             return Err(anyhow::anyhow!("scan_index_root_disappeared"));
         }
         scan_index_persistence::Opened::Legacy(file, root) => {
-            let index = match cap {
-                Some(cap) => {
-                    if file.metadata()?.len() > cap as u64 {
-                        return Err(anyhow::anyhow!("scan_index_read_limit"));
-                    }
-                    let mut bytes = Vec::new();
-                    std::io::Read::take(file, cap as u64 + 1).read_to_end(&mut bytes)?;
-                    if bytes.len() > cap {
-                        return Err(anyhow::anyhow!("scan_index_read_limit"));
-                    }
-                    claude_request_census::decode_bounded_index(&bytes)?
-                }
-                None => lenient_decode::read_file(file, stage, source)?,
-            };
-            (index, root)
+            (lenient_decode::read_file(file, stage, source)?, root)
         }
         scan_index_persistence::Opened::Partial(partial, root) => (
-            lenient_decode::read_partial_persistence(partial, stage, source, cap)?,
+            lenient_decode::read_partial_persistence(partial, stage, source)?,
             root,
         ),
-        scan_index_persistence::Opened::Sharded(mut reader, root) => {
-            // Keep the existing bounded CAS node/depth/census admission. The
-            // bounded branch may materialize only its ALREADY admitted byte cap.
-            let index = if let Some(cap) = cap {
-                if reader.seek(std::io::SeekFrom::End(0))? > cap as u64 {
-                    return Err(anyhow::anyhow!("scan_index_read_limit"));
-                }
-                reader.seek(std::io::SeekFrom::Start(0))?;
-                let mut bytes = Vec::new();
-                std::io::Read::take(reader, cap as u64 + 1).read_to_end(&mut bytes)?;
-                if bytes.len() > cap {
-                    return Err(anyhow::anyhow!("scan_index_read_limit"));
-                }
-                claude_request_census::decode_bounded_index(&bytes)
-            } else {
-                lenient_decode::read(BufReader::new(reader), stage, source).map_err(Into::into)
-            }
-            .map_err(storage_decode_error)?;
+        scan_index_persistence::Opened::Sharded(reader, root) => {
+            let index = lenient_decode::read(BufReader::new(reader), stage, source)
+                .map_err(|error| storage_decode_error(error.into()))?;
             (index, root)
         }
     };

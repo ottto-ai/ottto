@@ -386,6 +386,9 @@ impl OwnedSourceScan {
                         "defer pre-acquisition tail_route_error residue=true".into()
                     });
                     tail_source::counters::bump(self.source, "tail_db_loads", "held");
+                    // A retryable loss: the census stays red and the walk retries.
+                    self.census
+                        .record_unreadable_file(UnreadableCause::OpenRead, &candidate.path);
                     self.residue_index_keys.insert(key.clone());
                     return;
                 }
@@ -576,7 +579,7 @@ impl OwnedSourceScan {
                                     (Some(retained), debt)
                                 }
                                 // A pulled twin falls back to this page's native read.
-                                tail_source::load::Load::Held if forced_twin => {
+                                tail_source::load::Load::Held(_) if forced_twin => {
                                     tail_restore = "miss";
                                     #[cfg(test)]
                                     twin_diagnostics::event(&candidate.path, || {
@@ -585,13 +588,38 @@ impl OwnedSourceScan {
                                     allow_sample = false;
                                     (None, debt)
                                 }
-                                // A newer build's head: untouched, held as residue.
-                                tail_source::load::Load::Held => {
+                                // Untouched, held as residue. A newer build's
+                                // state cannot progress here: non-progressing
+                                // residue, terminal once the walk settles. A
+                                // live input missing now is a retryable loss:
+                                // the census stays red and the walk retries.
+                                tail_source::load::Load::Held(hold) => {
                                     #[cfg(test)]
                                     twin_diagnostics::event(&candidate.path, || {
                                         "defer pre-acquisition Held forced_twin=false residue=true"
                                             .into()
                                     });
+                                    match hold {
+                                        tail_source::load::HoldKind::NewerBuild => {
+                                            tail_source::counters::bump(
+                                                self.source,
+                                                "tail_held",
+                                                "newer_build",
+                                            );
+                                            self.census.ownership_incomplete_file_count += 1;
+                                        }
+                                        tail_source::load::HoldKind::LiveUnavailable => {
+                                            tail_source::counters::bump(
+                                                self.source,
+                                                "tail_held",
+                                                "live_unavailable",
+                                            );
+                                            self.census.record_unreadable_file(
+                                                UnreadableCause::OpenRead,
+                                                &candidate.path,
+                                            );
+                                        }
+                                    }
                                     self.residue_index_keys.insert(key.clone());
                                     return;
                                 }

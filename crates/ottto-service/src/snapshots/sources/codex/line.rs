@@ -566,66 +566,28 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     ) {
         match string_at(value, &["payload", "type"]).as_deref() {
             Some("patch_apply_end") => {
-                accumulator.activity_patch_operations += 1;
-                if let Some(changes) =
-                    raw_value_at(value, &["payload", "changes"]).and_then(Value::as_object)
-                {
-                    for (path, change) in changes {
-                        accumulator
-                            .activity_changed_file_hashes
-                            .insert(sha256_hex(&["ottto-activity-changed-file:v1", path]));
-                        if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
-                            for line in diff.lines() {
-                                if line.starts_with('+') && !line.starts_with("+++") {
-                                    accumulator.activity_lines_added += 1;
-                                } else if line.starts_with('-') && !line.starts_with("---") {
-                                    accumulator.activity_lines_deleted += 1;
-                                }
-                            }
-                        }
-                    }
-                }
+                note_codex_patch(accumulator, raw_value_at(value, &["payload", "changes"]));
             }
             Some("web_search_end") => accumulator.activity_web_searches += 1,
-            Some("mcp_tool_call_end") => {
-                let call_id = string_at(value, &["payload", "call_id"]);
-                let prior = call_id
-                    .as_ref()
-                    .and_then(|call_id| accumulator.activity_mcp_call_ids.get(call_id).copied());
-                // `Some(true)`: a repeated completion event for a counted call.
-                if prior != Some(true) {
-                    if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value)
-                    {
-                        accumulator.note_capability_call(
-                            timestamp.as_deref(),
-                            capability_id,
-                            raw_origin,
-                        );
-                    }
-                    if let Some(call_id) = &call_id {
-                        accumulator.codex_dictionary_slots.open_calls.note(call_id);
-                        accumulator
-                            .activity_mcp_call_ids
-                            .insert(call_id.clone(), true);
-                    }
-                }
-                // `Some(false)`: the namespaced function_call already counted it.
-                if prior.is_none() {
-                    if let Some(call_id) = &call_id {
-                        accumulator.reclassify_activity_call_as_mcp(call_id);
-                    }
-                    accumulator.activity_mcp_calls += 1;
-                    let server = string_at(value, &["payload", "app_name"])
-                        .or_else(|| string_at(value, &["payload", "invocation", "server"]));
-                    let tool = string_at(value, &["payload", "action_name"])
-                        .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
-                    if let (Some(server), Some(tool)) = (server, tool) {
-                        accumulator.note_activity_mcp_tool(&server, &tool);
-                    }
-                }
-            }
+            Some("mcp_tool_call_end") => note_codex_mcp_completion(
+                accumulator,
+                timestamp.as_deref(),
+                string_at(value, &["payload", "call_id"]),
+                codex_tool_surface_capability(value),
+                string_at(value, &["payload", "app_name"])
+                    .or_else(|| string_at(value, &["payload", "invocation", "server"])),
+                string_at(value, &["payload", "action_name"])
+                    .or_else(|| string_at(value, &["payload", "invocation", "tool"])),
+            ),
             Some("sub_agent_activity") if string_eq_at(value, &["payload", "kind"], "started") => {
                 accumulator.activity_subagent_spawns += 1;
+            }
+            // Paginated history records these completions as items in place
+            // of the end events above, which it no longer writes.
+            Some("item_completed") => {
+                if let Some(item) = raw_value_at(value, &["payload", "item"]) {
+                    note_codex_completed_item(accumulator, timestamp.as_deref(), item);
+                }
             }
             _ => {}
         }
@@ -676,10 +638,110 @@ fn codex_namespaced_mcp_tool(value: &Value, name: &str) -> Option<(String, Strin
     .then(|| (server.to_string(), tool.to_string()))
 }
 
+/// One applied patch: its changed files and the `+`/`-` lines of each
+/// update's unified diff.
+fn note_codex_patch(accumulator: &mut SnapshotAccumulator, changes: Option<&Value>) {
+    accumulator.activity_patch_operations += 1;
+    let Some(changes) = changes.and_then(Value::as_object) else {
+        return;
+    };
+    for (path, change) in changes {
+        accumulator
+            .activity_changed_file_hashes
+            .insert(sha256_hex(&["ottto-activity-changed-file:v1", path]));
+        if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
+            for line in diff.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    accumulator.activity_lines_added += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    accumulator.activity_lines_deleted += 1;
+                }
+            }
+        }
+    }
+}
+
+/// One completed MCP call, counted once whichever of its namespaced
+/// `function_call` and its completion comes first.
+fn note_codex_mcp_completion(
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    call_id: Option<String>,
+    capability: Option<(&'static str, &'static str)>,
+    server: Option<String>,
+    tool: Option<String>,
+) {
+    let prior = call_id
+        .as_ref()
+        .and_then(|call_id| accumulator.activity_mcp_call_ids.get(call_id).copied());
+    // `Some(true)`: a repeated completion for a counted call.
+    if prior != Some(true) {
+        if let Some((capability_id, raw_origin)) = capability {
+            accumulator.note_capability_call(timestamp, capability_id, raw_origin);
+        }
+        if let Some(call_id) = &call_id {
+            accumulator.codex_dictionary_slots.open_calls.note(call_id);
+            accumulator
+                .activity_mcp_call_ids
+                .insert(call_id.clone(), true);
+        }
+    }
+    // `Some(false)`: the namespaced function_call already counted it.
+    if prior.is_none() {
+        if let Some(call_id) = &call_id {
+            accumulator.reclassify_activity_call_as_mcp(call_id);
+        }
+        accumulator.activity_mcp_calls += 1;
+        if let (Some(server), Some(tool)) = (server, tool) {
+            accumulator.note_activity_mcp_tool(&server, &tool);
+        }
+    }
+}
+
+/// A paginated `item_completed` item that replaces a legacy end event: an MCP
+/// call (`McpToolCall`), a patch (`FileChange`), a web search (`WebSearch`, or
+/// the `web.search` extension) or a started subagent. Legacy history keeps
+/// none of these items, so nothing is counted twice.
+fn note_codex_completed_item(
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    item: &Value,
+) {
+    let text = |key: &str| item.get(key).and_then(Value::as_str);
+    match text("type") {
+        Some("McpToolCall") => note_codex_mcp_completion(
+            accumulator,
+            timestamp,
+            text("id").map(str::to_owned),
+            item.pointer("/result/_meta")
+                .and_then(codex_tool_surface_from_meta),
+            text("appName")
+                .or_else(|| text("server"))
+                .map(str::to_owned),
+            text("actionName")
+                .or_else(|| text("tool"))
+                .map(str::to_owned),
+        ),
+        Some("FileChange") => note_codex_patch(accumulator, item.get("changes")),
+        Some("WebSearch") => accumulator.activity_web_searches += 1,
+        Some("Extension") if text("kind") == Some("web.search") => {
+            accumulator.activity_web_searches += 1;
+        }
+        Some("SubAgentActivity") if text("kind") == Some("started") => {
+            accumulator.activity_subagent_spawns += 1;
+        }
+        _ => {}
+    }
+}
+
 fn codex_tool_surface_capability(value: &Value) -> Option<(&'static str, &'static str)> {
-    let meta = value
+    value
         .pointer("/payload/result/Ok/_meta")
-        .or_else(|| value.pointer("/result/Ok/_meta"))?;
+        .or_else(|| value.pointer("/result/Ok/_meta"))
+        .and_then(codex_tool_surface_from_meta)
+}
+
+fn codex_tool_surface_from_meta(meta: &Value) -> Option<(&'static str, &'static str)> {
     let surface = meta.get("codex/toolSurface")?;
     match (
         surface.get("kind").and_then(Value::as_str),

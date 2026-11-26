@@ -709,7 +709,8 @@ they reset at process start and never decide anything.
 
 | Counter | Unit / meaning |
 |---|---|
-| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits and census stays red), `sidecar_binding` (Codex only: a head whose stored sidecar binding differs from the live one; a counted reconstruct, not a failure), `error`. Counters only: no traversal point repeats them. |
+| `tail_db_loads{outcome}` | One per load: `hit`, `miss`, `held` (a newer build's head, a session fact of a kind or version this build does not know, or a live input not available now; the file waits, see `tail_held`), `sidecar_binding` (Codex only: a head whose stored sidecar binding differs from the live one; a counted reconstruct, not a failure), `error`. Counters only: no traversal point repeats them. |
+| `tail_held{kind}` | One per held file: `newer_build` (a newer build's head or fact; the walk counts it as ownership-incomplete residue, red until the walk settles, then terminal and disclosed) or `live_unavailable` (Codex: a live input missing now; counted as an `open_read` unreadable, so the census stays red, the walk retries and the walk gate does not arm). A Tail database route that cannot be read counts `tail_db_loads{held}` and the same `open_read` unreadable. Counters only. |
 | `tail_db_load_bytes{head,page}` | Head and page bytes a hit read from the database. |
 | `tail_reconstruct{cause}`, `tail_reconstruct_bytes{cause}` | Exact files and transcript bytes read Full because stored state could not be reused: `no_head`, `unreadable`, `corrupt`, `incompatible` (a capture mode, page geometry or revision this build does not read so), `incomplete`, `identity`, `key_epoch`, and the Codex replays `group_replay` (a group read from its first member) and `tier_prefix_replay` (a file with a protected receipt read from its start). `key_epoch` (the head's keyed fields were made under another attribution key) is an explicit action and a replay is no load outcome: neither is in `tail_reconstruct_after_head`. Attribution toggled on or off is no key change: the head is reused with its context digest scrubbed (counted in `claude_context_digest_scrubs`), never read Full. |
 | `tail_reconstruct_after_head{cause}` | The same, only where a head had been read, without explicit actions; the release gate. |
@@ -1774,8 +1775,9 @@ nothing. A finish that retires a walk emits one `walk_gate` point with `arm`:
 `armed`, or `not:<why>` (`unsettled`, `upload`, `telemetry_unread`,
 `owes:<kind>`, `no_start`, `key:<input>` for an input that moved during the
 walk, or `generation`; a retiring finish that exits before arming reports
-`entity_deferred`, `entity_refused` or `receipt_failed`). Counts and enum
-names only.
+`entity_deferred`, `entity_refused` or `receipt_failed`; one whose terminal
+receipt read a zero window reports `window_zero` and clears the record).
+Counts and enum names only.
 
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher

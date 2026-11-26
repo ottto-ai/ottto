@@ -909,6 +909,29 @@ class UseBindingTests(unittest.TestCase):
                 base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
                 self.fails(base, head, 'use added beside an item-level macro call:')
 
+    def test_std_thread_local_process_static_and_durable_struct_calls_allow_new_explicit_bindings(self):
+        # `std::thread_local!` is `thread_local!`; `process_static!` expands to one fn holding its static;
+        # `durable_struct!` expands only to `$crate::durable_tail_codec` trait impls.
+        for macro in ('std::thread_local! { static FLAG: u8 = 0; }\n',
+                      'crate::local_resource_diagnostics::process_static!(fn with_count: u8 = 0);\n',
+                      'crate::durable_tail_codec::durable_struct!(Holder { N value: u64 });\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.passes(base, head)
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::*;\n')
+                self.fails(base, head, 'new glob import:')
+
+    def test_unlisted_codec_and_diagnostics_macros_and_aliases_still_reject_new_explicit_bindings(self):
+        # Only the exact listed paths are trusted: a bare or aliased spelling, or another macro of the same
+        # module, still guards an added binding.
+        for macro in ('process_static!(fn with_count: u8 = 0);\n',
+                      'durable_struct!(Holder { N value: u64 });\n',
+                      'crate::durable_tail_codec::durable_field!(verify N, d, u64);\n',
+                      'crate::local_resource_diagnostics::codex_cursor_events!(fields);\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.fails(base, head, 'use added beside an item-level macro call:')
+
     def test_macro_calls_inside_an_impl_block_allow_new_explicit_bindings(self):
         # An impl body holds only associated items, so a call there cannot expand to a module-level `use`.
         method = 'macro_rules! method {\n    () => {\n        fn m(&self) {}\n    };\n}\n'

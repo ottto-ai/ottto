@@ -186,7 +186,6 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
             &index_path,
             &progress_path,
             || Ok(()),
-            None,
             Some(crate::snapshots::UnsettledUploadCause::UploadError),
             None,
             Default::default(),

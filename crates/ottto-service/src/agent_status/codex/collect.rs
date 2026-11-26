@@ -100,9 +100,9 @@ use crate::agent_status::Value;
 use crate::agent_status::CLAUDE_CLI_META;
 use crate::agent_status::CODEX_CLI_META;
 use crate::agent_status::CODEX_CLI_NOT_FOUND_FOR_PROBE;
-use crate::agent_status::CODEX_NO_ACCOUNT_FAILURE_PREFIX;
 use crate::agent_status::COMMAND_TIMEOUT;
 use crate::agent_status::MAX_AVAILABLE_MODELS;
+use crate::agent_status::{CODEX_LOGIN_REJECTED_FAILURE_PREFIX, CODEX_NO_ACCOUNT_FAILURE_PREFIX};
 
 // One failure latch per read stage, never per account or slot.
 pub(in crate::agent_status) fn note_codex_scope_read(
@@ -1025,11 +1025,13 @@ pub(in crate::agent_status) fn collect_codex_status_for_home(
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
+            // A served reading never carries a rejected login: that read failed.
             apply_codex_dead_login(
                 &mut snapshot,
                 codex_home,
                 home_trust,
                 usage.provider_account_absent,
+                false,
             );
             let identity_hashes = usage
                 .identity
@@ -1136,6 +1138,9 @@ pub(in crate::agent_status) fn collect_codex_status_for_home(
                 codex_home,
                 home_trust,
                 failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+                failure
+                    .message
+                    .starts_with(CODEX_LOGIN_REJECTED_FAILURE_PREFIX),
             );
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(
@@ -1195,22 +1200,27 @@ pub(in crate::agent_status) fn collect_codex_status_for_home(
     (snapshot, strong_identity, workspace_targets)
 }
 
-/// A managed home with an auth file whose provider read named no account
-/// (`account: null`) or rejected the login (`auth_rejected`), which Codex
-/// answers after a refresh failed for good, needs a new sign-in: not merely
-/// unconfirmed. Only an Ottto slot's home, which the probe reads regularly
-/// (each read lets Codex refresh its login when due); the default home's
-/// lapsed login is another case. Changes the status cause only.
+/// A home with an auth file whose login is dead needs a new sign-in, not
+/// merely unconfirmed. For an Ottto slot's home, which the probe reads
+/// regularly (each read lets Codex refresh its login when due), a provider
+/// read that named no account (`account: null`) or rejected the login is
+/// dead. For the user's own default home only a refused refresh is
+/// (`login_rejected`: "sign in again" on either read). A 401, which Codex
+/// also answers when a refresh failed for a transient reason, and
+/// `account: null` leave it as it was.
+/// Changes the status cause only.
 pub(in crate::agent_status) fn apply_codex_dead_login(
     snapshot: &mut AgentStatusSnapshot,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
     provider_account_absent: bool,
+    login_rejected: bool,
 ) {
-    if !provider_account_absent
-        || home_trust != CodexHomeTrust::Managed
-        || ottto_core::codex_auth_file_mark(codex_home).is_none()
-    {
+    let dead = match home_trust {
+        CodexHomeTrust::Managed => provider_account_absent || login_rejected,
+        CodexHomeTrust::ProviderDefault => login_rejected,
+    };
+    if !dead || ottto_core::codex_auth_file_mark(codex_home).is_none() {
         return;
     }
     snapshot.status = AgentStatusState::AuthRequired;
@@ -1226,7 +1236,14 @@ pub(in crate::agent_status) fn apply_codex_dead_login(
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "codex_account_needs_login",
             AgentDiagnosticSeverity::Warning,
-            "Codex must be signed in again for this durable connection.",
+            match home_trust {
+                CodexHomeTrust::Managed => {
+                    "Codex must be signed in again for this durable connection."
+                }
+                CodexHomeTrust::ProviderDefault => {
+                    "Codex asked to sign in again: run `codex login` to keep its limits current."
+                }
+            },
         ));
     }
 }

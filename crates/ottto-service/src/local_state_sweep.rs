@@ -6,7 +6,7 @@
 //! canonical checkpoint's `<base>.lock` sibling:
 //!
 //! - `<base>.json.<pid>.tmp`: `ScanIndex::save_internal` under
-//!   `CheckpointLock`, and `SnapshotUploadProgress::save_with_read_limit`
+//!   `CheckpointLock`, and `SnapshotUploadProgress::save`
 //!   under `SnapshotProgressLock`.
 //! - `<base>.tmp.<pid>.<nanos>.json`: the terminal status journal writer,
 //!   under `SnapshotProgressLock`.

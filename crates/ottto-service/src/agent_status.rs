@@ -837,6 +837,13 @@ static CLAUDE_CLI_META: OnceLock<Mutex<CliFacts<PathBuf, (), 1>>> = OnceLock::ne
 /// reading came back. A prefix keeps the stage, kind and code
 /// parsing of [`codex_probe_failure_stage_and_kind`] intact.
 const CODEX_NO_ACCOUNT_FAILURE_PREFIX: &str = "The provider named no signed-in user. ";
+/// [`CODEX_NO_ACCOUNT_FAILURE_PREFIX`] when Codex refused the login's refresh
+/// with "sign in again" (on the account read or the limits read), not merely
+/// named no account or answered 401: the user's own default login needs a new
+/// sign-in too. It starts with the no-account prefix, so every check of
+/// that prefix keeps its meaning.
+const CODEX_LOGIN_REJECTED_FAILURE_PREFIX: &str =
+    "The provider named no signed-in user. Codex asked to sign in again. ";
 
 /// `slot_owned_bindings` names exact account+organization bindings that a
 /// registered managed slot has proved it reads (see

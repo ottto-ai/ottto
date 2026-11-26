@@ -226,7 +226,6 @@ fn checkpoint(
         index_path,
         &progress_path,
         || Ok(()),
-        None,
         cause,
         None,
         Default::default(),

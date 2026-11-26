@@ -1006,6 +1006,7 @@ pub(super) fn refresh_terminal_manifest(
     Ok(())
 }
 
+/// Sends the terminal receipt; returns the window it carried (0: a tombstone).
 pub(super) fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -1014,7 +1015,7 @@ pub(super) fn report_status_with_fresh_relay_token(
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
-) -> Result<()> {
+) -> Result<u64> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     // This is the single terminal report boundary. Every terminal outcome
     // reacquires its width here, after scanning/uploading and immediately
@@ -1060,7 +1061,7 @@ pub(super) fn report_status_with_fresh_relay_token(
             line.0
         );
     }
-    Ok(())
+    Ok(receipt_window_days)
 }
 
 /// Last reported status log line per source slot.
@@ -1098,7 +1099,8 @@ pub(super) fn withdraw_and_report_policy_stop(
         source,
         TerminalManifestSource::Withdraw,
         status,
-    )
+    )?;
+    Ok(())
 }
 
 /// Post a non-terminal collector check-in receipt.

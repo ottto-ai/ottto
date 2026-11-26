@@ -369,6 +369,131 @@ fn a_codex_restart_continues_with_the_cold_body_across_two_restarts() {
     );
 }
 
+/// One paginated turn's completed items after the fixture's turns: an MCP
+/// call made directly (its namespaced call, completion item and output), one
+/// made from code mode (completion item only), a patch, a web search and a
+/// started subagent.
+fn paginated_items(turn: usize) -> String {
+    let at = |second: usize| format!("2026-10-18T12:{turn:02}:{second:02}Z");
+    let line = |second: usize, kind: &str, payload: Value| {
+        serde_json::json!({"timestamp": at(second), "type": kind, "payload": payload}).to_string()
+    };
+    let item = |second: usize, item: Value| {
+        line(
+            second,
+            "event_msg",
+            serde_json::json!({"type": "item_completed", "item": item}),
+        )
+    };
+    let direct = format!("direct-{turn}");
+    [
+        line(
+            1,
+            "response_item",
+            serde_json::json!({"type": "function_call", "name": "search",
+                "namespace": "mcp__docs", "call_id": direct, "arguments": "{}"}),
+        ),
+        item(
+            2,
+            serde_json::json!({"type": "McpToolCall", "id": direct, "server": "docs",
+                "tool": "search", "arguments": {}, "status": "completed"}),
+        ),
+        line(
+            3,
+            "response_item",
+            serde_json::json!({"type": "function_call_output", "call_id": direct, "output": "ok"}),
+        ),
+        item(
+            4,
+            serde_json::json!({"type": "McpToolCall", "id": format!("code-{turn}"),
+                "server": "browser", "tool": "open", "arguments": {}, "status": "completed"}),
+        ),
+        item(
+            5,
+            serde_json::json!({"type": "FileChange", "id": format!("patch-{turn}"),
+                "changes": {"src/a.rs": {"type": "update",
+                    "unified_diff": "--- a\n+++ b\n-old\n+new\n"}}, "status": "completed"}),
+        ),
+        item(
+            6,
+            serde_json::json!({"type": "Extension", "id": format!("web-{turn}"), "kind": "web.search"}),
+        ),
+        item(
+            7,
+            serde_json::json!({"type": "SubAgentActivity", "id": format!("agent-{turn}"), "kind": "started"}),
+        ),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// [money] Paginated `item_completed` activity read by Tail, and after a
+/// database restart, equals the native cold Full of the same file, appends
+/// included; a quiet restart reads no byte. The items change activity only:
+/// the money fields equal those of the same file without them.
+#[test]
+fn a_codex_paginated_tail_continues_with_the_cold_body() {
+    let mut route = route_for(Source::Codex);
+    let path = route.dir.join(Codex::name());
+    let base = codex_lines(4);
+    rewrite(&path, &base);
+    let without_items = cold_items(&path);
+    std::fs::write(&path, base.join("\n") + "\n" + &paginated_items(0)).unwrap();
+    let (tail, native) = complete::<Codex>(&route, &path, None, |_| {});
+    let key = tail.key.clone();
+    assert!(tail.publish(&native));
+    route.save(false);
+
+    let (parser, _, mode) = stored_read(&route, &path, &key);
+    assert!(matches!(mode, ReadMode::Unchanged));
+    assert_eq!(parser.reader.consumed_bytes(), 0);
+
+    for turn in [1, 2] {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(paginated_items(turn).as_bytes()).unwrap();
+        let (parser, _, mode) = stored_read(&route, &path, &key);
+        assert!(matches!(mode, ReadMode::Tail), "turn {turn}");
+        let cold = cold_items(&path);
+        assert_eq!(
+            test_finish_items(parser, &path, SnapshotSource::Codex),
+            cold,
+            "turn {turn}"
+        );
+        let (parser, base, _) = stored_read(&route, &path, &key);
+        let (tail, native) = finish::<Codex>(&route, &path, parser, Some(base), |_| {});
+        assert!(tail.publish(&native));
+        route.save(false);
+    }
+    let cold = cold_items(&path);
+    let (item, plain) = (&cold["items"][0], &without_items["items"][0]);
+    let (summary, before) = (&item["activity_summary"], &plain["activity_summary"]);
+    let added = |field: &str| summary[field].as_u64().unwrap() - before[field].as_u64().unwrap();
+    assert_eq!(
+        [
+            "mcp_calls",
+            "patch_operations",
+            "web_searches",
+            "subagent_spawns"
+        ]
+        .map(added),
+        [6, 3, 3, 3],
+        "three turns of items, each call counted once"
+    );
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "reasoning_output_tokens",
+        "request_count",
+    ] {
+        assert_eq!(item[field], plain[field], "{field}");
+    }
+    assert_eq!(cold["money"], without_items["money"]);
+}
+
 /// [behaviour] A slot collection that shrinks deletes its vanished pages and the
 /// head still loads after a collection's contents are retired.
 #[test]
@@ -799,7 +924,10 @@ fn a_future_codex_head_holds_without_a_smaller_reemit() {
     staged.revision = Codex::REDUCTION_REVISION + 1;
     state_v2::stage_tail(&route.path, &key, staged).unwrap();
     route.save(false);
-    assert!(matches!(load_at::<Codex>(&route, &path, &key), Load::Held));
+    assert!(matches!(
+        load_at::<Codex>(&route, &path, &key),
+        Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
+    ));
     let mut held = codex_emitted(Mode::Restart, &route.index, &[]);
     held.accepted = prior.accepted.clone();
     money_oracle::assert_no_smaller_reemit(
