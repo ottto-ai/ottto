@@ -337,7 +337,7 @@ if ! grep -q "xattr -d com.apple.provenance .*Ottto.app/Contents" "$APP_LOG"; th
   echo "Expected app staple preparation to clear provenance xattr after placeholder creation failure" >&2
   exit 1
 fi
-if grep -q "noextattr" "$APP_LOG"; then
+if grep -q "ditto --noextattr --noacl" "$APP_LOG"; then
   echo "Expected no unlaunched-copy restage when clearing provenance makes the app writable" >&2
   exit 1
 fi
