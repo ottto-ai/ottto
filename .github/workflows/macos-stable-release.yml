@@ -81,6 +81,10 @@ jobs:
       OTTTO_RELEASE_SOURCE_REF: ${{ github.ref }}
       OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
       OTTTO_MANUAL_SIGNING_KEYCHAIN: ${{ vars.OTTTO_MANUAL_SIGNING_KEYCHAIN || '' }}
+      # Release privacy gate (docs/release-verification.md). The policy is not
+      # secret; the marker list secret goes only to the gate steps.
+      OTTTO_RELEASE_PRIVACY_POLICY: ${{ vars.OTTTO_RELEASE_PRIVACY_POLICY }}
+      OTTTO_RELEASE_LANE: ${{ inputs.channel == 'stable-candidate' && 'candidate' || (inputs.release_mode == 'manual-no-sparkle' && 'manual' || 'stable') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
@@ -88,6 +92,14 @@ jobs:
           persist-credentials: false
           # Full history for the first-parent check on main.
           fetch-depth: 0
+
+      # First trusted step: check the policy and the marker list digest, mask
+      # every marker and host string in later log output, and create the
+      # neutral work folder (OTTTO_PRIVACY_WORK) for sealed copies.
+      - name: Load release privacy policy
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+        run: python3 -I scripts/macos_privacy_gate.py register-masks
 
       - name: Enforce dispatch policy
         env:
@@ -175,6 +187,18 @@ jobs:
               ;;
           esac
 
+      - name: Check dispatch inputs for private strings
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+          OTTTO_DISPATCH_VERSION: ${{ inputs.version }}
+          OTTTO_DISPATCH_CHANNEL: ${{ inputs.channel }}
+          OTTTO_DISPATCH_ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          OTTTO_DISPATCH_RELEASE_NOTES: ${{ inputs.release_notes }}
+          OTTTO_DISPATCH_RELEASE_MODE: ${{ inputs.release_mode }}
+          OTTTO_DISPATCH_OPERATOR_APPROVAL: ${{ inputs.operator_approval }}
+          OTTTO_DISPATCH_PUBLISH_INTENT: ${{ inputs.publish_intent }}
+        run: python3 -I scripts/macos_privacy_gate.py scan --profile dispatch --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
+
       - name: Verify release source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -202,6 +226,28 @@ jobs:
           security find-identity -v -p codesigning | grep -F "$OTTTO_MACOS_CODESIGN_IDENTITY" >/dev/null
           xcrun notarytool history --keychain-profile "$OTTTO_NOTARY_PROFILE" >/dev/null
 
+      - name: Prepare unsigned macOS artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          scripts/macos_package.sh \
+            --stage prepare \
+            --app-root "${OTTTO_MACOS_APP_ROOT:?}" \
+            --app-source-commit "$OTTTO_MACOS_APP_SOURCE_COMMIT" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --artifact-base-url "$ARTIFACT_BASE_URL" \
+            --release-notes "$RELEASE_NOTES"
+
+      - name: Check unsigned artifacts for private strings
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+        run: python3 -I scripts/macos_privacy_gate.py scan --profile unsigned --root dist/macos --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
+
       - name: Package signed macOS artifacts
         env:
           VERSION: ${{ inputs.version }}
@@ -211,6 +257,8 @@ jobs:
         run: |
           set -euo pipefail
           scripts/macos_package.sh \
+            --stage finish \
+            --privacy-state "$OTTTO_PRIVACY_WORK/state" \
             --app-root "${OTTTO_MACOS_APP_ROOT:?}" \
             --app-source-commit "$OTTTO_MACOS_APP_SOURCE_COMMIT" \
             --version "$VERSION" \
@@ -218,7 +266,11 @@ jobs:
             --artifact-base-url "$ARTIFACT_BASE_URL" \
             --release-notes "$RELEASE_NOTES"
 
+      # The notarization helper seals and checks each of the four archives
+      # (app ZIP, rebuilt DMG, CLI ZIP, service ZIP) before it submits it.
       - name: Notarize and staple artifacts
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
         run: |
           set -euo pipefail
           scripts/macos_notarize.sh \
@@ -330,18 +382,25 @@ jobs:
             shasum -a 256 "${subjects[@]}" > subject.checksums.txt
           )
 
+      # Attestations read only the sealed, checked copies.
+      - name: Seal first attestation subjects
+        if: inputs.release_mode == 'standard'
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+        run: python3 -I scripts/macos_privacy_gate.py scan --profile attest --lane "$OTTTO_RELEASE_LANE" --seal-from dist/macos --root "$OTTTO_PRIVACY_WORK/attest-1" --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
+
       - name: Create provenance attestation
         if: inputs.release_mode == 'standard'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: dist/macos/subject.checksums.txt
+          subject-checksums: ${{ env.OTTTO_PRIVACY_WORK }}/attest-1/subject.checksums.txt
 
       - name: Create SBOM attestation
         if: inputs.release_mode == 'standard'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: dist/macos/subject.checksums.txt
-          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+          subject-checksums: ${{ env.OTTTO_PRIVACY_WORK }}/attest-1/subject.checksums.txt
+          sbom-path: ${{ env.OTTTO_PRIVACY_WORK }}/attest-1/ottto-local-platform-sbom.cdx.json
 
       - name: Bind verified attestation metadata
         if: inputs.release_mode == 'standard'
@@ -374,18 +433,24 @@ jobs:
             shasum -a 256 "${subjects[@]}" > subject.checksums.txt
           )
 
+      - name: Seal final attestation subjects
+        if: inputs.release_mode == 'standard'
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+        run: python3 -I scripts/macos_privacy_gate.py scan --profile attest --lane "$OTTTO_RELEASE_LANE" --seal-from dist/macos --root "$OTTTO_PRIVACY_WORK/attest-2" --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
+
       - name: Create final provenance attestation
         if: inputs.release_mode == 'standard'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: dist/macos/subject.checksums.txt
+          subject-checksums: ${{ env.OTTTO_PRIVACY_WORK }}/attest-2/subject.checksums.txt
 
       - name: Create final SBOM attestation
         if: inputs.release_mode == 'standard'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-checksums: dist/macos/subject.checksums.txt
-          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+          subject-checksums: ${{ env.OTTTO_PRIVACY_WORK }}/attest-2/subject.checksums.txt
+          sbom-path: ${{ env.OTTTO_PRIVACY_WORK }}/attest-2/ottto-local-platform-sbom.cdx.json
 
       - name: Verify final attestations and manifest binding
         if: inputs.release_mode == 'standard'
@@ -439,28 +504,24 @@ jobs:
             --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
             --keychain-profile "$OTTTO_NOTARY_PROFILE"
 
+      # Seal the lane's exact upload set, check it and add the privacy
+      # receipt; the uploader reads only the sealed folder.
+      - name: Seal upload set
+        env:
+          OTTTO_PRIVACY_MARKERS: ${{ secrets.OTTTO_PRIVACY_MARKERS }}
+        run: python3 -I scripts/macos_privacy_gate.py scan --profile upload --lane "$OTTTO_RELEASE_LANE" --seal-from dist/macos --root "$OTTTO_PRIVACY_WORK/upload" --state "$OTTTO_PRIVACY_WORK/state" >/dev/null
+
       - name: Upload release workflow artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}
+          name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}-attempt-${{ github.run_attempt }}
           if-no-files-found: error
           # These are manual-download build outputs only; CDN publication is separate
           # and manual, so artifacts need only a short window to be fetched. Keep stable
           # builds long enough for the operator to publish; expire throwaway candidates fast.
           # Prevents the org's 0.5 GB free Actions/Packages storage from filling up.
           retention-days: ${{ inputs.channel == 'stable' && 7 || 1 }}
-          path: |
-            dist/macos/Ottto-macos-*.dmg
-            dist/macos/ottto-macos-*.zip
-            dist/macos/ottto-service-macos-*.zip
-            dist/macos/ottto-local-platform-sbom.cdx.json
-            dist/macos/packaged-app-launch-smoke.json
-            dist/macos/stable-candidate-rc-qa.json
-            dist/macos/release-manifest.json
-            dist/macos/release-manifest.json.sig
-            dist/macos/subject.checksums.txt
-            dist/macos/install-macos.sh
-            dist/macos/homebrew/ottto.rb
+          path: ${{ env.OTTTO_PRIVACY_WORK }}/upload/
 
       # Disabled: this step would publish the runner's build before the
       # operator's release-folder privacy check. Re-enable it only together
@@ -494,3 +555,15 @@ jobs:
             dist/macos/release-manifest.json \
             dist/macos/release-manifest.json.sig \
             dist/macos/subject.checksums.txt
+
+      - name: Remove sealed release copies
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${OTTTO_PRIVACY_WORK:-}" && -d "$OTTTO_PRIVACY_WORK" ]]; then
+            chflags -R nouchg "$OTTTO_PRIVACY_WORK"
+            rm -rf "$OTTTO_PRIVACY_WORK"
+          fi
+          if [[ -d dist/macos ]]; then
+            chflags -R nouchg dist/macos
+          fi

@@ -312,7 +312,13 @@ python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder
 Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
 `attest` (the attestation subjects, SBOM and checksums), `upload`, `publish`,
-`dispatch` (the workflow inputs) and `logs`. The policy comes from
+`dispatch` and `logs` (every text file under `--root`). `dispatch` reads the
+workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
+`OTTTO_DISPATCH_ARTIFACT_BASE_URL`, `OTTTO_DISPATCH_RELEASE_NOTES`,
+`OTTTO_DISPATCH_RELEASE_MODE`, `OTTTO_DISPATCH_OPERATOR_APPROVAL` and
+`OTTTO_DISPATCH_PUBLISH_INTENT`, so a caller can check them before it
+dispatches; the artifact base URL must be exactly
+`https://install.ottto.net/ottto-local-platform/releases/<channel>/<version>`. The policy comes from
 `OTTTO_RELEASE_PRIVACY_POLICY`; the markers from a file descriptor, a local
 store, or, only inside the release workflow, `OTTTO_PRIVACY_MARKERS`.
 With `--seal-from`, the gate copies the role files into the new `--root`

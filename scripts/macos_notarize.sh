@@ -84,6 +84,25 @@ if [[ ! -f "$MANIFEST" ]]; then
   exit 1
 fi
 
+# Release privacy gate. In the release workflow, or whenever a privacy policy
+# is set, each archive is copied into a sealed folder, checked there, and only
+# the sealed copy goes to notarytool. The marker list stays in this shell
+# (never exported); only the gate reads it, through a pipe of its own.
+PRIVACY_GATE="false"
+if [[ -n "${OTTTO_RELEASE_PRIVACY_POLICY:-}" || "${GITHUB_WORKFLOW_REF:-}" == */.github/workflows/macos-stable-release.yml@* ]]; then
+  PRIVACY_GATE="true"
+fi
+PRIVACY_MARKERS="${OTTTO_PRIVACY_MARKERS-}"
+unset OTTTO_PRIVACY_MARKERS
+PRIVACY_SEALED=""
+PRIVACY_SEALS=0
+if [[ "$PRIVACY_GATE" == "true" && "$VALIDATE_ONLY" != "true" ]]; then
+  if [[ -z "$PRIVACY_MARKERS" && -z "${OTTTO_PRIVACY_MARKERS_STORE:-}" ]] || [[ -z "${OTTTO_PRIVACY_WORK:-}" ]]; then
+    echo "The release privacy gate needs the marker list and OTTTO_PRIVACY_WORK" >&2
+    exit 2
+  fi
+fi
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Required command not found: $1" >&2
@@ -102,6 +121,43 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+# privacy_seal <role> <source-folder> [gate options]
+# Seals the role's fixed file from the folder and checks it; sets
+# PRIVACY_SEALED to the sealed copy. Any finding or gap stops the release.
+privacy_seal() {
+  local role="$1" source="$2" rc=0
+  shift 2
+  PRIVACY_SEALS=$((PRIVACY_SEALS + 1))
+  PRIVACY_SEALED="$OTTTO_PRIVACY_WORK/notary-$PRIVACY_SEALS-$role"
+  local -a gate=(python3 -I "$SCRIPT_DIR/macos_privacy_gate.py" scan --profile notary --role "$role"
+    --seal-from "$source" --root "$PRIVACY_SEALED" --state "$OTTTO_PRIVACY_WORK/state" "$@")
+  if [[ -n "$PRIVACY_MARKERS" ]]; then
+    "${gate[@]}" --markers-fd 3 3< <(printf '%s' "$PRIVACY_MARKERS") >/dev/null || rc=$?
+  else
+    "${gate[@]}" --markers-store "$OTTTO_PRIVACY_MARKERS_STORE" >/dev/null || rc=$?
+  fi
+  if [[ "$rc" != 0 ]]; then
+    echo "Release privacy gate refused $role (exit $rc); nothing was sent to Apple." >&2
+    exit 1
+  fi
+  case "$role" in
+    app_notary_zip) PRIVACY_SEALED="$PRIVACY_SEALED/ottto-app-notary.zip" ;;
+    app_dmg) PRIVACY_SEALED="$PRIVACY_SEALED/Ottto-macos-arm64.dmg" ;;
+    cli_zip) PRIVACY_SEALED="$PRIVACY_SEALED/ottto-macos-arm64.zip" ;;
+    service_zip) PRIVACY_SEALED="$PRIVACY_SEALED/ottto-service-macos-arm64.zip" ;;
+  esac
+}
+
+# notary_role <artifact-kind> <archive>: the gate role, only for the fixed name.
+notary_role() {
+  case "$1:$(basename "$2")" in
+    macos_app:Ottto-macos-arm64.dmg) printf 'app_dmg' ;;
+    cli:ottto-macos-arm64.zip) printf 'cli_zip' ;;
+    daemon:ottto-service-macos-arm64.zip) printf 'service_zip' ;;
+    *) return 1 ;;
+  esac
+}
+
 stapler_retry() {
   local action="$1"
   local target="$2"
@@ -113,17 +169,17 @@ stapler_retry() {
   local sleep_seconds="${OTTTO_STAPLER_RETRY_SECONDS:-20}"
 
   for attempt in $(seq 1 "$max_attempts"); do
-    if xcrun stapler "$action" "$target"; then
+    if xcrun stapler "$action" "$target" >/dev/null 2>&1; then
       return 0
     fi
     if [[ "$attempt" -eq "$max_attempts" ]]; then
       break
     fi
-    echo "stapler $action failed for $target; retrying in ${sleep_seconds}s ($attempt/$max_attempts)." >&2
+    echo "stapler $action failed for $(basename "$target"); retrying in ${sleep_seconds}s ($attempt/$max_attempts)." >&2
     sleep "$sleep_seconds"
   done
 
-  echo "stapler $action failed for $target after $max_attempts attempt(s)." >&2
+  echo "stapler $action failed for $(basename "$target") after $max_attempts attempt(s)." >&2
   return 1
 }
 
@@ -286,8 +342,12 @@ notary_submit() {
     return 2
   fi
 
-  if ! run_with_timeout "$process_timeout_seconds" "${submit_args[@]}"; then
-    echo "notarytool failed or exceeded the ${process_timeout_seconds}s whole-process timeout: $archive" >&2
+  # Print only Apple's submission id and status lines, never paths.
+  local output rc=0
+  output="$(run_with_timeout "$process_timeout_seconds" "${submit_args[@]}" 2>&1)" || rc=$?
+  grep -E '^[[:space:]]*(id|status):' <<<"$output" || true
+  if [[ "$rc" != 0 ]]; then
+    echo "notarytool failed or exceeded the ${process_timeout_seconds}s whole-process timeout: $(basename "$archive")" >&2
     return 1
   fi
 }
@@ -422,14 +482,31 @@ while IFS= read -r artifact; do
     exit 1
   fi
 
-  codesign --verify --strict --verbose=2 "$verification_path" >/dev/null
+  if ! codesign --verify --strict --verbose=2 "$verification_path" >/dev/null 2>&1; then
+    echo "Code signature does not verify for $name" >&2
+    exit 1
+  fi
+  role=""
+  if [[ "$PRIVACY_GATE" == "true" && "$VALIDATE_ONLY" != "true" ]] && ! role="$(notary_role "$kind" "$path")"; then
+    echo "Artifact $name is not one of the release privacy gate's fixed archives" >&2
+    exit 1
+  fi
 
   if [[ "$kind" == "macos_app" ]]; then
     if [[ "$VALIDATE_ONLY" != "true" ]]; then
-      app_notary_zip="$(mktemp_zip_path ottto-app-notary)"
-      ditto -c -k --keepParent "$verification_path" "$app_notary_zip"
-      notary_submit "$app_notary_zip"
-      rm -f "$app_notary_zip"
+      # The app ZIP carries no resource forks or extended attributes.
+      if [[ "$PRIVACY_GATE" == "true" ]]; then
+        app_zip_dir="$(mktemp -d "$OTTTO_PRIVACY_WORK/app-zip.XXXXXX")"
+        ditto -c -k --keepParent --norsrc --noextattr "$verification_path" "$app_zip_dir/ottto-app-notary.zip"
+        privacy_seal app_notary_zip "$app_zip_dir" --expect-app "$verification_path"
+        notary_submit "$PRIVACY_SEALED"
+        rm -rf "$app_zip_dir"
+      else
+        app_notary_zip="$(mktemp_zip_path ottto-app-notary)"
+        ditto -c -k --keepParent --norsrc --noextattr "$verification_path" "$app_notary_zip"
+        notary_submit "$app_notary_zip"
+        rm -f "$app_notary_zip"
+      fi
       prepare_app_staple_target "$verification_path"
       stapler_retry staple "$verification_path"
       stapler_retry validate "$verification_path"
@@ -437,17 +514,30 @@ while IFS= read -r artifact; do
       # shipped DMG carries an app whose copied-out updater passes Gatekeeper offline.
       staple_nested_sparkle "$verification_path"
       rebuild_dmg_from_app "$verification_path" "$path"
-      notary_submit "$path"
+      if [[ "$PRIVACY_GATE" == "true" ]]; then
+        privacy_seal "$role" "$manifest_dir"
+        notary_submit "$PRIVACY_SEALED"
+      else
+        notary_submit "$path"
+      fi
     fi
     stapler_retry staple "$path"
     stapler_retry validate "$path"
     stapler_retry staple "$verification_path"
     stapler_retry validate "$verification_path"
   elif [[ "$VALIDATE_ONLY" != "true" ]]; then
-    notary_submit "$path"
+    if [[ "$PRIVACY_GATE" == "true" ]]; then
+      privacy_seal "$role" "$manifest_dir"
+      notary_submit "$PRIVACY_SEALED"
+    else
+      notary_submit "$path"
+    fi
   fi
 
-  spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null
+  if ! spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null 2>&1; then
+    echo "Gatekeeper assessment failed for $name" >&2
+    exit 1
+  fi
   sha256="$(sha256_file "$path")"
   jq \
     --argjson index "$index" \

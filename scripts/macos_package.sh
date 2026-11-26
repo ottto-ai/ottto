@@ -27,6 +27,8 @@ OUTPUT_DIR="$ROOT/dist/macos"
 SIGN_IDENTITY="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
 NOTARIZED="false"
 SKIP_BUILD="false"
+PACKAGE_STAGE="all"
+PRIVACY_STATE=""
 ARTIFACT_BASE_URL=""
 MIN_SUPPORTED_VERSION="${OTTTO_MIN_SUPPORTED_VERSION:-0.1.0}"
 RELEASE_NOTES="${OTTTO_RELEASE_NOTES:-}"
@@ -50,6 +52,14 @@ Options:
   --notarized               Mark artifacts notarized after external notarization.
   --skip-build              Reuse existing release build outputs (dev and
                              preview only).
+  --stage <stage>           all (default), prepare or finish; stable channels
+                             only for prepare and finish. prepare stops before
+                             signing and makes the unsigned app and binaries
+                             immutable for the release privacy gate; finish
+                             signs exactly those files.
+  --privacy-state <folder>  With --stage finish: the privacy gate's state
+                             folder. Its clean unsigned record must match the
+                             prepared files.
   -h, --help                Show help.
 
 Environment:
@@ -105,6 +115,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_BUILD="true"
       shift
       ;;
+    --stage)
+      PACKAGE_STAGE="${2:?--stage requires a value}"
+      shift 2
+      ;;
+    --privacy-state)
+      PRIVACY_STATE="${2:?--privacy-state requires a value}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -124,6 +142,23 @@ case "$CHANNEL" in
     exit 2
     ;;
 esac
+case "$PACKAGE_STAGE" in
+  all) ;;
+  prepare|finish)
+    if [[ "$CHANNEL" != "stable-candidate" && "$CHANNEL" != "stable" ]]; then
+      echo "--stage prepare and finish are for stable-candidate and stable channels" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "--stage must be all, prepare, or finish" >&2
+    exit 2
+    ;;
+esac
+if [[ "$PACKAGE_STAGE" == "finish" && -z "$PRIVACY_STATE" ]]; then
+  echo "--stage finish requires --privacy-state" >&2
+  exit 2
+fi
 if [[ -z "$MAC_APP_ROOT" ]]; then
   echo "--app-root is required: pass the app's Swift package root" >&2
   exit 2
@@ -291,7 +326,7 @@ else
   SWIFT_SCRATCH_MAP=(-Xswiftc -file-prefix-map -Xswiftc "$SWIFT_SCRATCH_PATH=.build")
 fi
 
-if [[ "$SKIP_BUILD" != "true" ]]; then
+if [[ "$SKIP_BUILD" != "true" && "$PACKAGE_STAGE" != "finish" ]]; then
   # Compilers record source paths (panic locations, debug maps). Map the build
   # Mac's folders to neutral prefixes so shipped binaries do not carry them.
   (
@@ -313,6 +348,16 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     -Xlinker -oso_prefix -Xlinker "$SWIFT_OSO_PREFIX/"
 fi
 
+APP_BUNDLE="$OUTPUT_DIR/Ottto.app"
+APP_CONTENTS="$APP_BUNDLE/Contents"
+APP_MACOS="$APP_CONTENTS/MacOS"
+APP_HELPERS="$APP_CONTENTS/Helpers"
+APP_RESOURCES="$APP_CONTENTS/Resources"
+APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
+APP_LAUNCH_AGENTS="$APP_CONTENTS/Library/LaunchAgents"
+# Unsigned assembly. --stage finish skips it and signs the files --stage
+# prepare left behind (see "end of the unsigned assembly" below).
+if [[ "$PACKAGE_STAGE" != "finish" ]]; then
 SWIFT_BUILD_DIR="$SWIFT_SCRATCH_PATH/release"
 APP_EXECUTABLE="$SWIFT_BUILD_DIR/Ottto"
 CLI_BINARY="$ROOT/target/release/ottto"
@@ -349,16 +394,12 @@ if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
   exit 1
 fi
 
+# A cancelled prepared run leaves immutable files behind.
+if [[ -e "$OUTPUT_DIR" ]]; then
+  chflags -R nouchg "$OUTPUT_DIR" 2>/dev/null || true
+fi
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
-
-APP_BUNDLE="$OUTPUT_DIR/Ottto.app"
-APP_CONTENTS="$APP_BUNDLE/Contents"
-APP_MACOS="$APP_CONTENTS/MacOS"
-APP_HELPERS="$APP_CONTENTS/Helpers"
-APP_RESOURCES="$APP_CONTENTS/Resources"
-APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
-APP_LAUNCH_AGENTS="$APP_CONTENTS/Library/LaunchAgents"
 
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES" "$APP_FRAMEWORKS" "$APP_LAUNCH_AGENTS"
 cp "$APP_EXECUTABLE" "$APP_MACOS/Ottto"
@@ -519,6 +560,7 @@ cat > "$APP_LAUNCH_AGENTS/net.ottto.locald.plist" <<PLIST
 PLIST
 
 plutil -lint "$APP_LAUNCH_AGENTS/net.ottto.locald.plist" >/dev/null
+fi # end of the unsigned assembly
 
 SIGNED="false"
 if [[ -n "$SIGN_IDENTITY" ]]; then
@@ -570,13 +612,34 @@ sign_sparkle() {
 
 # Add the runpath so the embedded Sparkle.framework resolves at launch. Must run
 # before the main executable is signed (a later install_name_tool voids it).
-if ! otool -l "$APP_MACOS/Ottto" | grep -q "@executable_path/../Frameworks"; then
+if [[ "$PACKAGE_STAGE" != "finish" ]] && ! otool -l "$APP_MACOS/Ottto" | grep -q "@executable_path/../Frameworks"; then
   install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_MACOS/Ottto"
+fi
+
+# --stage finish: the prepared files must still be the ones the privacy gate
+# found clean. Only then are they made writable again for signing.
+if [[ "$PACKAGE_STAGE" == "finish" ]]; then
+  sparkle_pin="$(ottto_macos_sparkle_pin "$MAC_APP_GIT_ROOT" "$MAC_APP_SOURCE_COMMIT" "$MAC_APP_SOURCE_PATH")" || exit 2
+  sparkle_version="$(jq -r '.version' <<< "$sparkle_pin")"
+  sparkle_revision="$(jq -r '.revision' <<< "$sparkle_pin")"
+  ottto_check_sparkle_license_pin "$sparkle_version" "$sparkle_revision" "$APP_FRAMEWORKS/Sparkle.framework" || exit 2
+  if ! python3 -I "$ROOT/scripts/macos_privacy_gate.py" check-record --state "$PRIVACY_STATE" --root "$OUTPUT_DIR"; then
+    echo "The prepared files are not the ones the privacy gate checked" >&2
+    exit 1
+  fi
+  chflags -R nouchg "$APP_BUNDLE" "$OUTPUT_DIR/ottto" "$OUTPUT_DIR/ottto-service"
 fi
 
 # Resources are final before signing: the listed Companion files and the
 # license files.
 ottto_macos_check_app_resources "$APP_RESOURCES"
+if [[ "$PACKAGE_STAGE" == "prepare" ]]; then
+  # The dSYM UUID does not change when the app is signed.
+  ottto_macos_keep_dsym "$APP_MACOS/Ottto" "$VERSION"
+  chflags -R uchg "$APP_BUNDLE" "$OUTPUT_DIR/ottto" "$OUTPUT_DIR/ottto-service"
+  echo "Prepared the unsigned app and binaries; sign them with --stage finish after the privacy gate"
+  exit 0
+fi
 sign_code "$APP_HELPERS/ottto"
 sign_code "$APP_HELPERS/ottto-service"
 sign_companion "$APP_MACOS/Ottto"
@@ -597,6 +660,13 @@ for helper in "$APP_HELPERS/ottto" "$APP_HELPERS/ottto-service" "$OUTPUT_DIR/ott
 done
 ottto_macos_check_no_stabs "$APP_MACOS/Ottto"
 ottto_macos_keep_dsym "$APP_MACOS/Ottto" "$VERSION"
+if [[ "$PACKAGE_STAGE" == "finish" && -n "${OTTTO_MACOS_DSYM_DIR:-}" ]]; then
+  app_uuid="$(ottto_macos_dsym_uuid "$APP_MACOS/Ottto")" || app_uuid=""
+  if [[ -z "$app_uuid" || ! -d "$OTTTO_MACOS_DSYM_DIR/Ottto-$VERSION-$app_uuid.dSYM" ]]; then
+    echo "The Companion dSYM kept by --stage prepare does not match the signed app" >&2
+    exit 1
+  fi
+fi
 
 LAUNCH_SMOKE_EVIDENCE="$OUTPUT_DIR/packaged-app-launch-smoke.json"
 "$ROOT/scripts/macos_launch_smoke.sh" \

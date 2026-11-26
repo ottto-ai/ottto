@@ -72,8 +72,24 @@ require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature ste
 require_grep 'scripts/macos_stable_preflight\.sh' 'stable preflight step'
 require_grep '--record-sha256' 'install-macos.sh SHA-256 recorded in the stable manifest'
 require_grep '--require-installer-sha256' 'new stable releases require the installer helper SHA-256'
-require_grep 'dist/macos/packaged-app-launch-smoke\.json' 'packaged launch smoke evidence upload'
-require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evidence upload'
+require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evidence bound into the release folder'
+
+# Release privacy gate: every outbound step reads sealed, checked copies.
+require_grep 'OTTTO_RELEASE_PRIVACY_POLICY: \$\{\{ vars\.OTTTO_RELEASE_PRIVACY_POLICY \}\}' 'privacy policy from the release environment'
+require_grep 'macos_privacy_gate\.py register-masks' 'privacy policy load and log masks'
+require_grep 'macos_privacy_gate\.py scan --profile dispatch' 'dispatch input check'
+require_grep '--stage prepare' 'unsigned prepare stage'
+require_grep 'macos_privacy_gate\.py scan --profile unsigned' 'unsigned artifact check before signing'
+require_grep '--stage finish' 'signing finish stage'
+# shellcheck disable=SC2016 # These assertions match literal variables.
+require_grep 'scan --profile attest .*--root "\$OTTTO_PRIVACY_WORK/attest-1"' 'first attestation subjects sealed'
+# shellcheck disable=SC2016
+require_grep 'scan --profile attest .*--root "\$OTTTO_PRIVACY_WORK/attest-2"' 'final attestation subjects sealed'
+# shellcheck disable=SC2016
+require_grep 'scan --profile upload .*--root "\$OTTTO_PRIVACY_WORK/upload"' 'upload set sealed'
+require_grep 'path: \$\{\{ env\.OTTTO_PRIVACY_WORK \}\}/upload/$' 'uploader reads only the sealed upload folder'
+require_grep 'name: ottto-macos-\$\{\{ inputs\.channel \}\}-\$\{\{ inputs\.version \}\}-attempt-\$\{\{ github\.run_attempt \}\}' 'artifact name carries the run attempt'
+deny_grep 'subject-checksums: dist/macos|sbom-path: dist/macos' 'attestations must read sealed copies'
 
 # Optional, verification-only GitHub Release mirror.
 require_grep 'github_release_mirror:' 'github_release_mirror input'
@@ -111,6 +127,37 @@ if not (0 <= record < first_checksums < first_sign):
         "install-macos.sh SHA-256 must be recorded before attestation checksums and manifest signing",
         file=sys.stderr,
     )
+    sys.exit(1)
+steps = re.split(r"\n      - name: ", workflow)
+names = [step.split("\n", 1)[0] for step in steps[1:]]
+bodies = dict(zip(names, steps[1:]))
+if names[:2] != ["Checkout", "Load release privacy policy"]:
+    print("The privacy policy load must be the first step after checkout", file=sys.stderr)
+    sys.exit(1)
+for name, body in bodies.items():
+    if "secrets.OTTTO_PRIVACY_MARKERS" in body and not (
+        "macos_privacy_gate.py" in body or "scripts/macos_notarize.sh" in body
+    ):
+        print(f"Only gate steps may receive the marker list: {name}", file=sys.stderr)
+        sys.exit(1)
+job_env = workflow.split("    steps:", 1)[0]
+if "OTTTO_PRIVACY_MARKERS" in job_env:
+    print("The marker list must not be in the job environment", file=sys.stderr)
+    sys.exit(1)
+order = [
+    ("Check dispatch inputs for private strings", "Prepare unsigned macOS artifacts"),
+    ("Prepare unsigned macOS artifacts", "Check unsigned artifacts for private strings"),
+    ("Check unsigned artifacts for private strings", "Package signed macOS artifacts"),
+    ("Seal first attestation subjects", "Create provenance attestation"),
+    ("Seal final attestation subjects", "Create final provenance attestation"),
+    ("Seal upload set", "Upload release workflow artifacts"),
+]
+for before, after in order:
+    if before not in names or after not in names or names.index(before) > names.index(after):
+        print(f"Workflow step {before!r} must run before {after!r}", file=sys.stderr)
+        sys.exit(1)
+if names[-1] != "Remove sealed release copies" or "if: always()" not in bodies[names[-1]]:
+    print("Sealed copies must be removed in a final always() step", file=sys.stderr)
     sys.exit(1)
 in_run = False
 for number, line in enumerate(workflow.splitlines(), 1):
