@@ -694,13 +694,13 @@ pub(crate) fn tail_head_bytes_for_test(index: &ScanIndex, key: &str) -> Vec<u8> 
 pub(crate) fn tail_head_reduction_for_test(
     index: &ScanIndex,
     key: &str,
-) -> (u32, Vec<u8>, Vec<(Collection, u64)>) {
+) -> (u32, Vec<u8>, Vec<(String, u64)>) {
     let head = load_head(index, key, u32::MAX).unwrap().unwrap();
     let table = head
         .table
         .iter()
         .filter(|(collection, _)| **collection != Collection::Revisions)
-        .map(|(collection, entry)| (*collection, entry.pages))
+        .map(|(collection, entry)| (format!("{collection:?}"), entry.pages))
         .collect();
     (head.revision, head.body, table)
 }
