@@ -130,10 +130,10 @@ pub(super) fn prev_bytes(support_dir: &Path) -> Option<u64> {
 
 /// The `prev` files this process keeps, for a test to age them.
 #[cfg(test)]
-pub(super) fn tracked_prev_for_test(
-    handles: &mut AppendHandles,
+pub(super) fn tracked_prev_for_test<'a>(
+    handles: &'a mut AppendHandles,
     support_dir: &Path,
-) -> &mut VecDeque<(PathBuf, Instant)> {
+) -> &'a mut VecDeque<(PathBuf, Instant)> {
     let state = handles.journals.get_mut(support_dir).unwrap();
     state.prev.as_mut().unwrap()
 }
