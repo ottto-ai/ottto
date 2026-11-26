@@ -163,7 +163,7 @@ for name, body in bodies.items():
     if "if: false" in body:
         continue
     for line in body.splitlines():
-        if quiet.search(line) and "macos_quiet_step.sh" not in line:
+        if quiet.search(line) and "macos_quiet_step.sh" not in line and not line.strip().startswith("#"):
             print(f"{name}: release tool output must go through macos_quiet_step.sh", file=sys.stderr)
             sys.exit(1)
 for name, body in bodies.items():
