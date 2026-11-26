@@ -295,6 +295,8 @@ enum UnreadableIo {
     PermissionDenied,
     UnexpectedEof,
     InvalidData,
+    /// A refused decoder admission: transient, retried, never a gone file.
+    WouldBlock,
     Other,
 }
 impl From<std::io::ErrorKind> for UnreadableIo {
@@ -304,6 +306,7 @@ impl From<std::io::ErrorKind> for UnreadableIo {
             std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
             std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
             std::io::ErrorKind::InvalidData => Self::InvalidData,
+            std::io::ErrorKind::WouldBlock => Self::WouldBlock,
             _ => Self::Other,
         }
     }
@@ -1218,14 +1221,18 @@ mod tests {
         causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &gone);
         let slow = std::io::Error::from(std::io::ErrorKind::TimedOut);
         causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &slow);
-        assert_eq!(causes.counts[UnreadableCause::OpenRead as usize], 2);
+        let refused = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        causes.record_io_sampled(UnreadableCause::OpenRead, 1, Some((path, &key)), &refused);
+        assert_eq!(causes.counts[UnreadableCause::OpenRead as usize], 3);
         let kept = causes.samples.0[UnreadableCause::OpenRead as usize];
         assert_eq!(kept[0].unwrap().io, Some(UnreadableIo::NotFound));
         assert_eq!(kept[1].unwrap().io, Some(UnreadableIo::Other));
+        assert_eq!(kept[2].unwrap().io, Some(UnreadableIo::WouldBlock));
         assert_eq!(kept[0].unwrap().file, kept[1].unwrap().file);
         let text = serde_json::to_string(&causes).unwrap();
         assert!(text.contains(r#""io":"not_found""#), "{text}");
         assert!(text.contains(r#""io":"other""#), "{text}");
+        assert!(text.contains(r#""io":"would_block""#), "{text}");
         for forbidden in ["/Users", "private", "credential", ".codex", "sessions"] {
             assert!(!text.contains(forbidden), "{forbidden}");
         }
