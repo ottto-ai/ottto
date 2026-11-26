@@ -968,6 +968,7 @@ pub(crate) enum ReadMode {
     Unchanged,
 }
 
+// New codes must never be written to a stored field: an older reader fails on an unknown code.
 #[cfg(unix)]
 crate::durable_tail_codec::durable_enum!(FullReason {
     0 => StateMissing,

@@ -405,6 +405,7 @@ use discovery::traversal::state::SettledScanResidue;
 pub(crate) use discovery::traversal::state::{
     begin_continuation_read_ranges_for_test, take_continuation_read_ranges_for_test,
 };
+pub(crate) use discovery::traversal::state::begin_source_pass;
 pub(crate) use discovery::traversal::state::{
     CodexContinuationEvidence, ReasonReofferCooldown, TailDiscovery, UploadAckRetirementHandoff,
 };

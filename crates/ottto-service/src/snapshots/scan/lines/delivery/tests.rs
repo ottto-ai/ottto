@@ -1605,7 +1605,7 @@ fn grown_indexed_file_is_read_after_sleep_then_ages_after_commit() {
     let length = fs::metadata(&path).unwrap().len();
     assert!(length > committed.files[&key].size_bytes);
     // No in-process pacing or hold witness is needed: only the committed index.
-    let (mut caught_up, result, recorder) = page(committed, 8);
+    let (caught_up, result, recorder) = page(committed, 8);
     let modes = recorder
         .events()
         .into_iter()

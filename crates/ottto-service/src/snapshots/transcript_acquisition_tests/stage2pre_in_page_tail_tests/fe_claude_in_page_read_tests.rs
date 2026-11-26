@@ -841,7 +841,7 @@ fn fe_claude_residual_sample_preserving_rewrite_after_read_is_accepted() {
     regrown.extend(row_bytes(CLAUDE, 60..62));
     let frozen_body = full_body(&base.fixture, CLAUDE);
     let path = base.path.clone();
-    let ((mut index, tail, seen), at_eof) = with_eof_hook(
+    let ((index, tail, seen), at_eof) = with_eof_hook(
         &base.path,
         move |_| {
             truncate(&path, edited_row as u64);

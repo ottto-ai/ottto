@@ -542,7 +542,8 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   request identities, complete-negative evidence, Full credit or upload acceptance. An
   unverified one, which holds its root, gets one queued Full re-read (`census_verify`) per
   file state before save (RAM only; a changed file waits six hours after its last attempt); a
-  loss-free Full releases the root, and one that stays unverified is counted, not retried.
+  loss-free Full releases the root, and one that stays unverified is not retried. Each attempt
+  is counted by outcome in the `census_hold_release_full` process totals on the local census line.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

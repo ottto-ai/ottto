@@ -164,7 +164,7 @@ impl OwnedSourceScan {
             // Count-only attribution of why Claude files were selected
             // on this page. No path, session, or identifier is named.
             eprintln!(
-                "local snapshot census claude parse reasons: {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={}",
+                "local snapshot census claude parse reasons: {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={}{}",
                 census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &self.census.parse_reasons),
                 self.census.claude_compaction_unlinked_parent_count,
                 self.history_upgrade.denied_for(&[
@@ -193,6 +193,7 @@ impl OwnedSourceScan {
                 self.history_upgrade.family_closure_root_absent_excluded,
                 claude_request_census::identity_incomplete_hold_totals().0,
                 claude_request_census::identity_incomplete_hold_totals().1,
+                claude_request_census::census_hold_release_full_fields(),
             );
             if self.history_upgrade.family_closure_root_absent_excluded > 0 {
                 crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(

@@ -2006,18 +2006,85 @@ struct HoldAttempt {
 crate::local_resource_diagnostics::process_static!(fn with_hold_attempts:
     std::sync::Mutex<BTreeMap<String, HoldAttempt>> = std::sync::Mutex::new(BTreeMap::new()));
 
+/// The `census_hold_release_full` outcomes of the verifying re-reads, as
+/// process totals on the existing local census line. Diagnostics only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HoldReleaseFull {
+    /// Re-reads queued, one per held file state.
+    pub(super) attempted: u64,
+    /// Attempts whose read finished on the same file state with the record
+    /// verified: the root is no longer held.
+    pub(super) verified: u64,
+    /// Attempts whose read finished on the same file state and left the
+    /// record unverified: counted once, kept held, and not retried until the
+    /// file changes.
+    pub(super) unverifiable: u64,
+    /// Owed, but the attempt memory is full of files it must remember: they
+    /// wait for a later page.
+    pub(super) waiting: u64,
+}
+
+impl HoldReleaseFull {
+    fn outcomes(self) -> [(&'static str, u64); 4] {
+        [
+            ("attempted", self.attempted),
+            ("verified", self.verified),
+            ("unverifiable", self.unverifiable),
+            ("waiting", self.waiting),
+        ]
+    }
+}
+
+const NO_HOLD_RELEASE_FULL: HoldReleaseFull = HoldReleaseFull {
+    attempted: 0,
+    verified: 0,
+    unverifiable: 0,
+    waiting: 0,
+};
+
+crate::local_resource_diagnostics::process_static!(fn with_hold_release_full:
+    std::sync::Mutex<HoldReleaseFull> = std::sync::Mutex::new(NO_HOLD_RELEASE_FULL));
+
+/// This process's `census_hold_release_full` totals (test-thread local in
+/// unit tests).
+pub(super) fn census_hold_release_full_totals() -> HoldReleaseFull {
+    with_hold_release_full(|totals| {
+        *totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    })
+}
+
+/// The nonzero totals as ` census_hold_release_full{outcome="<name>"}=<count>`
+/// fields for the local census line; empty while all are zero.
+pub(super) fn census_hold_release_full_fields() -> String {
+    census_hold_release_full_totals()
+        .outcomes()
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!(" census_hold_release_full{{outcome=\"{name}\"}}={count}"))
+        .collect()
+}
+
+fn add_hold_release_full(counts: HoldReleaseFull) {
+    with_hold_release_full(|totals| {
+        let mut totals = totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        totals.attempted = totals.attempted.saturating_add(counts.attempted);
+        totals.verified = totals.verified.saturating_add(counts.verified);
+        totals.unverifiable = totals.unverifiable.saturating_add(counts.unverifiable);
+        totals.waiting = totals.waiting.saturating_add(counts.waiting);
+    });
+}
+
 /// One pre-save decision over the identity-incomplete holds.
 #[derive(Debug, Default)]
 pub(super) struct HoldRereads {
     /// Keys owed one verifying re-read now, each marked attempted.
     pub(super) queued: Vec<String>,
-    /// Owed, but the attempt memory is full of files it must remember: they
-    /// wait for a later page.
-    pub(super) waiting: u64,
-    /// Attempts whose read finished on the same file state and left the
-    /// record unverified: counted once, kept held, and not retried until the
-    /// file changes.
-    pub(super) unverifiable: u64,
+    /// This decision's outcome counts; `attempted` is `queued.len()`.
+    pub(super) counts: HoldReleaseFull,
 }
 
 /// Judges finished attempts, then picks the holds owed a re-read. An attempt
@@ -2055,8 +2122,12 @@ pub(super) fn take_hold_rereads(index: &ScanIndex, now: u64) -> HoldRereads {
                 continue;
             };
             attempt.judged = true;
-            if record.current_derivation() && record.unverified && record.not_twin_or_retired() {
-                out.unverifiable += 1;
+            if record.current_derivation() && record.not_twin_or_retired() {
+                if record.unverified {
+                    out.counts.unverifiable += 1;
+                } else {
+                    out.counts.verified += 1;
+                }
             }
         }
         for (key, record) in index.claude_request_census.records() {
@@ -2089,7 +2160,7 @@ pub(super) fn take_hold_rereads(index: &ScanIndex, now: u64) -> HoldRereads {
                             .is_some_and(|entry| FileStamp::of(entry) == attempt.stamp)
                 });
                 if attempts.len() >= HOLD_REREAD_KEYS {
-                    out.waiting += 1;
+                    out.counts.waiting += 1;
                     continue;
                 }
             }
@@ -2103,6 +2174,7 @@ pub(super) fn take_hold_rereads(index: &ScanIndex, now: u64) -> HoldRereads {
             );
             out.queued.push(key.clone());
         }
+        out.counts.attempted = out.queued.len() as u64;
         out
     })
 }
@@ -2113,7 +2185,8 @@ impl super::SourceScanResult {
     /// explicit-reparse witness a released account hold uses: the entry's
     /// source fingerprint is cleared and the file is hinted. The re-read
     /// reads Full as `census_verify` ([`holds_for_verifying_read`]); a
-    /// loss-free one clears the hold. It grants no credit itself.
+    /// loss-free one clears the hold. It grants no credit itself; its
+    /// outcomes add to the `census_hold_release_full` totals.
     pub(crate) fn queue_identity_hold_rereads(
         &self,
         index: &mut ScanIndex,
@@ -2121,14 +2194,8 @@ impl super::SourceScanResult {
         backfill_window_days: u64,
     ) {
         let rereads = take_hold_rereads(index, super::sampled_scan::now_seconds());
-        if rereads.unverifiable > 0 {
-            crate::local_resource_diagnostics::traversal_point(
-                "census_identity_hold_unverifiable",
-                "claude_code",
-                &serde_json::json!({"files": rereads.unverifiable}),
-            );
-        }
-        if rereads.queued.is_empty() && rereads.waiting == 0 {
+        add_hold_release_full(rereads.counts);
+        if rereads.queued.is_empty() {
             return;
         }
         for key in &rereads.queued {
@@ -2136,19 +2203,12 @@ impl super::SourceScanResult {
                 entry.source_file_fingerprint.clear();
             }
         }
-        if !rereads.queued.is_empty() {
-            let hints = rereads
-                .queued
-                .iter()
-                .map(std::path::PathBuf::from)
-                .collect::<Vec<_>>();
-            self.enqueue_claude_discovery_hints(index, roots, backfill_window_days, &hints);
-        }
-        crate::local_resource_diagnostics::traversal_point(
-            "claude_identity_hold_reread",
-            "claude_code",
-            &serde_json::json!({"queued": rereads.queued.len(), "waiting": rereads.waiting}),
-        );
+        let hints = rereads
+            .queued
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        self.enqueue_claude_discovery_hints(index, roots, backfill_window_days, &hints);
     }
 }
 

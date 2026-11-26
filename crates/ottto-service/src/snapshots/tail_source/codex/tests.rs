@@ -845,6 +845,31 @@ fn codex_zero_counted_requests_round_trip_as_known() {
     assert_reencodes(&reduction, &certificate, &staged);
 }
 
+/// [format] The retired parent-proof refusal, the only stored field whose type
+/// can hold a `FullReason`, is written as `None`: the trailer read back from a
+/// staged head carries no refusal and no proof, so no `FullReason` code reaches
+/// stored bytes.
+#[test]
+fn a_staged_head_trailer_writes_no_parent_proof_refusal() {
+    let (reduction, certificate) = parse(&lines(12));
+    let staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+    let (_, (), trailer, _) = super::super::decode_envelope::<Codex, _, _>(
+        staged.revision,
+        &staged.head,
+        |_| Ok(()),
+        |d| {
+            let trailer = Trailer::take(d)?;
+            (staged.revision >= 2)
+                .then(|| CountedTrailer::take(d))
+                .transpose()?;
+            Ok(trailer)
+        },
+    )
+    .expect("the staged head decodes");
+    assert!(trailer.codex_parent_proof_refusal.is_none());
+    assert!(trailer.codex_parent_proof_used.is_none());
+}
+
 /// [behaviour] A released revision-1 head (real 0.1.261 writer bytes) holds
 /// no counted curve: it decodes to unknown, a Tail continuation does not
 /// invent one, and it round-trips through revision 2 still unknown. Only a

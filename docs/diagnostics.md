@@ -248,8 +248,8 @@ sparse map of closed snake_case keys (`state_missing`, `audit_due`,
 `census_verify`). Their sum equals `full_selections`; `audit_due` is retained
 for older records and is always zero now. `census_verify` is the queued re-read
 of a file whose unverified identity-incomplete census record holds its root
-(see `claude_identity_hold_reread` below): it reads Full, never from stored
-state, so it can verify the record. It also records `priority_full_replays`. A nonzero-only
+(its outcomes are `census_hold_release_full` below): it reads Full, never from
+stored state, so it can verify the record. It also records `priority_full_replays`. A nonzero-only
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
@@ -1045,12 +1045,20 @@ of these): one attempt per unchanged file per process, and a changed file is
 attempted again no sooner than six hours after its last attempt. Attempts are
 remembered in RAM only, for at most 4,096 files, so a restart allows one more
 attempt per file. The re-read reads Full as `census_verify`, and a loss-free one
-releases the root. `claude_identity_hold_reread{queued,waiting}` counts the
-queued re-reads and the owed ones that found the attempt memory full and wait
-for a later page. When an attempt's read finishes on the same file state and
+releases the root. When an attempt's read finishes on the same file state and
 leaves the record unverified (a parse that is never loss-free), the root stays
-held, `census_identity_hold_unverifiable{files}` counts it once, and the file
-is not read again until it changes. A
+held and the file is not read again until it changes.
+`census_hold_release_full{outcome}` counts these attempts as process totals on
+the existing `local snapshot census claude parse reasons` stderr line, after
+`identity_incomplete_holds_cleared_process_total`, one
+` census_hold_release_full{outcome="<name>"}=<count>` field per nonzero
+outcome: `attempted` (a re-read was queued), `verified` (its read finished on
+the same file state with the record verified, so the root is released),
+`unverifiable` (it finished with the record still unverified; counted once per
+file state) and `waiting` (owed, but the attempt memory was full of files it
+must remember, so it waits for a later page). A read's outcome is counted at
+the next pre-save step, so it shows on a later line; the line prints only on a
+page with one of its other reasons. Counts only, no path or id. A
 held account is retired only after two consecutive rooted NotFound observations at least
 600 seconds apart under the same validated parent, after a later directory
 walk has started and completed (details below). Elapsed witness time uses
