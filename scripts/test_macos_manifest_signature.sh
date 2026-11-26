@@ -89,15 +89,18 @@ case "$sub" in
     exit 0
     ;;
   x509)
-    input=""
+    input=""; der=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         -in) input="${2:?}"; shift 2 ;;
         -noout|-subject) shift ;;
+        -outform) der="${2:?}"; shift 2 ;;
         *) echo "unexpected openssl x509 option: $1" >&2; exit 2 ;;
       esac
     done
     test -n "$input"
+    # The "DER" of the fake certificate is its SIGNER= line.
+    if [[ "$der" == DER ]]; then cat "$input"; exit 0; fi
     id="$(sed -n 's/^SIGNER=//p' "$input")"
     printf 'subject= /UID=TEAM/CN=%s/OU=TEAM/O=Org/C=US\n' "$id"
     exit 0
@@ -141,6 +144,21 @@ if "$SIGNER" verify \
   --signature "$signature" \
   --identity "Developer ID Application: Evil Example (EVILTEAM)" >/dev/null 2>&1; then
   echo "Expected signature verification to fail for the wrong Developer ID signer" >&2
+  exit 1
+fi
+
+# Leaf pin: the actual signer's certificate digest replaces the keychain identity.
+good_leaf="$(printf 'SIGNER=%s\n' "Developer ID Application: Ottto Inc (TEAMID1234)" | shasum -a 256 | awk '{print $1}')"
+"$SIGNER" verify \
+  --manifest "$manifest" \
+  --signature "$signature" \
+  --leaf-sha256 "$(printf '%064d' 0)" \
+  --leaf-sha256 "$good_leaf" >/dev/null
+if "$SIGNER" verify \
+  --manifest "$manifest" \
+  --signature "$signature" \
+  --leaf-sha256 "$(printf '%064d' 0)" >/dev/null 2>&1; then
+  echo "Expected signature verification to fail for an unpinned signer certificate" >&2
   exit 1
 fi
 
