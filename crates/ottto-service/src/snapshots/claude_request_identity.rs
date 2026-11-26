@@ -1230,7 +1230,7 @@ fn apply_grouped_with_accepted(
             || over_cap.contains(&OverCap::EvidenceEntries)
         {
             item.claude_account_withheld_reason =
-                Some(super::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS);
+                Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS);
         }
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         return Ok(Tagged::Held);
@@ -2864,7 +2864,7 @@ struct Carry<'o> {
     first: Option<Arc<AuthorityKey>>,
     /// Gaps before the first seed; the first `closed` were cut off by a block.
     /// 8 bytes per request, at most 512 KiB (native 65,536 cap).
-    pending: Vec<&'o mut super::ClaudeTranscriptUsageOccurrence>,
+    pending: Vec<&'o mut crate::snapshots::ClaudeTranscriptUsageOccurrence>,
     closed: usize,
     counts: CarryCounts,
 }
@@ -2974,7 +2974,7 @@ impl Carry<'_> {
     fn finish(
         mut self,
         keys: &mut Vec<Arc<AuthorityKey>>,
-        mut place: impl FnMut(&mut super::ClaudeTranscriptUsageOccurrence, AccountPartition),
+        mut place: impl FnMut(&mut crate::snapshots::ClaudeTranscriptUsageOccurrence, AccountPartition),
     ) -> CarryCounts {
         let backward = self
             .first
@@ -3259,7 +3259,7 @@ impl RequestAccounts {
 /// A family whose strict sidecar read failed this page inherits nothing: its
 /// requests stay Unknown.
 pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
-    use super::claude_request_money::e2::{place_request_identity, IdentityCaller};
+    use crate::snapshots::claude_request_money::e2::{place_request_identity, IdentityCaller};
     for item in items {
         let Some(mut fold) = item.claude_money.take() else {
             continue;
@@ -3273,7 +3273,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             item.claude_money = Some(fold);
             continue;
         }
-        let root = super::claude_snapshot_family_root_ref(item);
+        let root = crate::snapshots::claude_snapshot_family_root_ref(item);
         if evidence.unhealthy_roots.contains(root) {
             // The classifier refuses every request here (IncompleteEvidence).
             // A retained, creator, start or earlier-request account is not
@@ -3284,7 +3284,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             accounts.unhealthy_no_fallback = true;
             // A discard keeps the trace-discard account hold: nothing to admit.
             accounts.unhealthy_cleared_account = (!evidence.trace_discarded_roots.contains(root))
-                .then(|| super::exact_session_account_hash(item))
+                .then(|| crate::snapshots::exact_session_account_hash(item))
                 .flatten();
             accounts.starting = None;
             accounts.fallback = None;
@@ -3294,7 +3294,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             // Emission carries the account owner's uniform row login to rows
             // that bypass final identity grouping (non-subscription or mixed
             // billing). That login came from this unreadable pair too.
-            if super::set_claude_account_hash(item, None) {
+            if crate::snapshots::set_claude_account_hash(item, None) {
                 item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             }
             continue;
@@ -3308,12 +3308,12 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             && item.claude_org_markers.is_none()
             && item.claude_usage_request_ids.iter().all(|request| {
                 !evidence.invalid_logins.contains(&(
-                    super::claude_snapshot_family_root_ref(item),
+                    crate::snapshots::claude_snapshot_family_root_ref(item),
                     request.as_str(),
                 ))
             })
         {
-            if let Some(login) = super::exact_session_account_hash(item) {
+            if let Some(login) = crate::snapshots::exact_session_account_hash(item) {
                 let key = Some(Arc::new(AuthorityKey {
                     login: Some(login),
                     org: None,
@@ -3368,7 +3368,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 continue;
             }
             let sequence = occurrence.sequence;
-            let root = super::claude_snapshot_family_root_ref(item);
+            let root = crate::snapshots::claude_snapshot_family_root_ref(item);
             let telemetry = evidence
                 .requests
                 .get(&(root, request.as_str()))
@@ -3559,8 +3559,8 @@ pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex
         {
             continue;
         }
-        let root = super::claude_snapshot_family_root_ref(item);
-        let key = super::sha256_hex(&["session_owner:v1", machine, root]);
+        let root = crate::snapshots::claude_snapshot_family_root_ref(item);
+        let key = crate::snapshots::sha256_hex(&["session_owner:v1", machine, root]);
         let retained = index
             .session_account_bindings
             .get(&key)
@@ -3624,7 +3624,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         let first = item
             .source_started_at
             .as_deref()
-            .and_then(super::rfc3339_unix_nanos)
+            .and_then(crate::snapshots::rfc3339_unix_nanos)
             .unwrap_or(i128::MAX);
         let candidate = Root {
             first,
@@ -3684,7 +3684,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         }
     }
     for item in items {
-        let root = super::claude_snapshot_family_root_ref(item).to_owned();
+        let root = crate::snapshots::claude_snapshot_family_root_ref(item).to_owned();
         let Some(fold) = item.claude_money.as_deref_mut() else {
             continue;
         };
@@ -4358,7 +4358,7 @@ fn transcript_identity<'k>(facts: &RequestFacts<'k>) -> Option<IdentityRef<'k>> 
 
 // --- Desktop store inventory digest -----------------------------------------
 
-pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
+pub(in crate::snapshots) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
     let mut digest = sha2::Sha256::new();
     for dir in store_dirs {
         digest.update(dir.to_string_lossy().as_bytes());
@@ -4370,15 +4370,15 @@ pub(super) fn inventory_digest(store_dirs: &BTreeSet<PathBuf>) -> String {
 // --- Scan integration -----------------------------------------------------
 
 /// One counted request as today's row builder placed it.
-pub(super) struct Request<'r> {
-    pub(super) request_id: &'r str,
+pub(in crate::snapshots) struct Request<'r> {
+    pub(in crate::snapshots) request_id: &'r str,
     /// (response sequence, original event clock) of the owned transcript
     /// occurrence; `None` for an auxiliary telemetry-only request.
-    pub(super) occurrence: Option<(u64, bool)>,
-    pub(super) timestamp: &'r str,
-    pub(super) bucket_start: &'r str,
-    pub(super) row_key: &'r RowKey,
-    pub(super) usage: &'r UsageTotals,
+    pub(in crate::snapshots) occurrence: Option<(u64, bool)>,
+    pub(in crate::snapshots) timestamp: &'r str,
+    pub(in crate::snapshots) bucket_start: &'r str,
+    pub(in crate::snapshots) row_key: &'r RowKey,
+    pub(in crate::snapshots) usage: &'r UsageTotals,
 }
 
 #[derive(Clone, Copy)]
@@ -4444,7 +4444,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         self
     }
 
-    pub(super) fn add(&mut self, item: &SnapshotItem, request: Request<'_>) {
+    pub(in crate::snapshots) fn add(&mut self, item: &SnapshotItem, request: Request<'_>) {
         let transcript_member = item.claude_usage_request_ids.contains(request.request_id);
         if transcript_member != request.occurrence.is_some()
             || self.excluded.is_some_and(|excluded| {
@@ -4531,7 +4531,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
     fn note_desktop_activity(
         activity: &mut crate::desktop_recent::RecentActivity,
         item: &SnapshotItem,
-        original: Option<&super::SessionAccountEvidence>,
+        original: Option<&crate::snapshots::SessionAccountEvidence>,
         request: ActivityRequest<'_>,
         identity: IdentityRef<'_>,
     ) {
@@ -4561,7 +4561,8 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 _ => return,
             },
             None if keeps_markerless_account(item)
-                && super::exact_session_account_hash(item).as_deref() == Some(account) =>
+                && crate::snapshots::exact_session_account_hash(item).as_deref()
+                    == Some(account) =>
             {
                 let Some(org) = owner
                     .provider_workspace_hash
@@ -4743,7 +4744,7 @@ pub(crate) fn apply_scan_page(
 /// projection where path twins can overwrite one another's creator evidence.
 #[derive(Default)]
 pub(crate) struct RequestOwnedOriginals(
-    BTreeMap<(String, Option<String>), Option<super::SessionAccountEvidence>>,
+    BTreeMap<(String, Option<String>), Option<crate::snapshots::SessionAccountEvidence>>,
 );
 
 pub(crate) fn capture_request_owned_originals(items: &[SnapshotItem]) -> RequestOwnedOriginals {
@@ -4834,7 +4835,7 @@ pub(crate) fn publish_request_owned_activity(
         return;
     }
     for item in items {
-        if !super::claude_history_upgrade::is_request_owned_literal(item) {
+        if !crate::snapshots::claude_history_upgrade::is_request_owned_literal(item) {
             continue;
         }
         #[cfg(not(test))]
@@ -4886,7 +4887,7 @@ fn request_occurrence_facts<'a>(
 pub(crate) fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
-    original: Option<&super::SessionAccountEvidence>,
+    original: Option<&crate::snapshots::SessionAccountEvidence>,
 ) -> crate::desktop_recent::RecentActivity {
     let Some(fold) = item.claude_money.as_deref() else {
         return Default::default();
@@ -4925,7 +4926,7 @@ pub(crate) fn collect_request_owned_activity(
 
 fn keeps_markerless_account(item: &SnapshotItem) -> bool {
     item.claude_org_markers.is_none()
-        && super::exact_session_account_hash(item).is_some()
+        && crate::snapshots::exact_session_account_hash(item).is_some()
         && item.claude_money.as_deref().is_some_and(|fold| {
             let mut partitions = fold.entity.grains.keys().map(|(_, _, account)| account);
             let first = partitions.next();
@@ -4953,7 +4954,7 @@ fn tag_item(
     let miss = evidence
         .accepted_buckets
         .map_or(accepted::UnknownCause::NoKey, AcceptedBuckets::miss_cause);
-    if super::claude_history_upgrade::is_request_owned_literal(item) {
+    if crate::snapshots::claude_history_upgrade::is_request_owned_literal(item) {
         if item
             .model_usage
             .iter()
