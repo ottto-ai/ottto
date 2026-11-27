@@ -494,7 +494,8 @@ pub(super) fn update_state_from_manifest(
     install_owner: InstallOwner,
 ) -> UpdateState {
     if let Some(reason) = release_manifest_metadata_error(&manifest) {
-        let download_url = app_download_url(&manifest);
+        // Never offer a download link from metadata that failed validation.
+        let download_url = None;
         let release_notes = normalized_release_notes(manifest.release_notes.as_deref());
         return UpdateState {
             current_version,
@@ -676,11 +677,9 @@ fn release_manifest_metadata_error(manifest: &ReleaseManifest) -> Option<String>
         "{}/",
         manifest.rollback.immutable_prefix.trim_end_matches('/')
     );
-    if manifest
-        .artifacts
-        .iter()
-        .any(|artifact| !artifact.url.starts_with(&immutable_prefix))
-    {
+    if manifest.artifacts.iter().any(|artifact| {
+        !artifact.url.starts_with(&immutable_prefix) || !valid_update_manifest_url(&artifact.url)
+    }) {
         return Some(
             "release manifest artifact URL is outside rollback immutable_prefix".to_string(),
         );
@@ -688,11 +687,37 @@ fn release_manifest_metadata_error(manifest: &ReleaseManifest) -> Option<String>
     None
 }
 
+/// Release metadata may point only at the Ottto install host over HTTPS, or,
+/// when a developer set `OTTTO_RELEASE_MANIFEST_URL`, at that URL's origin.
 fn valid_update_manifest_url(url: &str) -> bool {
-    url.starts_with("https://")
-        || url.starts_with("http://localhost")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://[::1]")
+    let developer_override = std::env::var("OTTTO_RELEASE_MANIFEST_URL").ok();
+    trusted_release_url(url, developer_override.as_deref())
+}
+
+const RELEASE_ORIGIN: &str = "https://install.ottto.net";
+
+pub(super) fn trusted_release_url(url: &str, developer_override: Option<&str>) -> bool {
+    let Some(origin) = release_url_origin(url) else {
+        return false;
+    };
+    origin.eq_ignore_ascii_case(RELEASE_ORIGIN)
+        || developer_override
+            .and_then(release_url_origin)
+            .is_some_and(|allowed| origin.eq_ignore_ascii_case(allowed))
+}
+
+/// `scheme://authority` of an http(s) URL. `None` for any other scheme, an
+/// empty authority, or one with user info or a backslash.
+fn release_url_origin(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_len];
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    Some(&url[..url.len() - rest.len() + authority_len])
 }
 
 fn update_route_for_owner(

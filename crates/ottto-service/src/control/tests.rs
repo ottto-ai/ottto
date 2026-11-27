@@ -7672,6 +7672,69 @@ fn release_manifest_deserialization_requires_update_and_rollback_metadata() {
 }
 
 #[test]
+fn release_urls_must_be_on_the_install_host() {
+    for url in [
+        "https://install.ottto.net/ottto-local-platform/releases/dev/latest",
+        "https://INSTALL.ottto.net/a",
+        "https://install.ottto.net",
+    ] {
+        assert!(trusted_release_url(url, None), "{url}");
+    }
+    for url in [
+        "http://install.ottto.net/a",
+        "https://install.ottto.net.example/a",
+        "https://install.ottto.net@example.com/a",
+        "https://install.ottto.net\\@example.com/a",
+        "https://example.com/install.ottto.net/a",
+        "https://install.ottto.net:8443/a",
+        "http://localhost/a",
+        "http://localhost.example/a",
+        "http://127.0.0.1:8080/a",
+        "ftp://install.ottto.net/a",
+        "",
+    ] {
+        assert!(!trusted_release_url(url, None), "{url}");
+    }
+    let developer = Some("http://127.0.0.1:8080/manifest.json");
+    assert!(trusted_release_url(
+        "http://127.0.0.1:8080/releases/a",
+        developer
+    ));
+    assert!(!trusted_release_url(
+        "http://127.0.0.1:9090/releases/a",
+        developer
+    ));
+    assert!(!trusted_release_url(
+        "http://127.0.0.1:8080.example/a",
+        developer
+    ));
+}
+
+#[test]
+fn update_state_offers_no_download_from_a_manifest_on_another_host() {
+    let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
+    manifest.rollback.immutable_prefix =
+        "https://downloads.example/releases/dev/latest".to_string();
+    manifest.artifacts[0].url =
+        "https://downloads.example/releases/dev/latest/Ottto-macos-universal.dmg".to_string();
+    let state = update_state_from_manifest(
+        manifest,
+        "0.1.0".to_string(),
+        ReleaseChannel::Dev,
+        Some("2026-05-20T00:00:00Z".to_string()),
+        Some("deadbeef".to_string()),
+        InstallOwner::Homebrew,
+    );
+
+    assert_eq!(state.status, UpdateStatus::Unknown);
+    assert_eq!(state.download_url, None);
+    assert_eq!(
+        state.reason.as_deref(),
+        Some("release manifest has invalid rollback immutable_prefix")
+    );
+}
+
+#[test]
 fn update_state_soft_warns_for_supported_outdated_homebrew_install() {
     let state = update_state_from_manifest(
         release_manifest_for_update("0.2.0", Some("0.1.0"), None),

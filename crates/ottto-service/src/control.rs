@@ -820,6 +820,8 @@ use status::source_from_slug;
 use status::source_slug;
 use status::status_for;
 #[cfg(test)]
+use status::trusted_release_url;
+#[cfg(test)]
 use status::update_state_from_manifest;
 #[cfg(test)]
 use status::upload_agent_status_snapshots_in_background;
