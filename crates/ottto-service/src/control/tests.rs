@@ -4973,10 +4973,13 @@ fn request_base_must_match_the_saved_binding() {
     assert!(require_request_base_matches_binding(Some("  "), binding).is_ok());
     assert!(require_request_base_matches_binding(Some("https://api.ottto.net/"), binding).is_ok());
     assert!(
-        require_request_base_matches_binding(Some("https://ottto.net/backend"), binding).is_err()
+        require_request_base_matches_binding(Some("https://ottto.net/backend"), binding).is_ok()
+    );
+    assert!(
+        require_request_base_matches_binding(Some("https://staging.invalid"), binding).is_err()
     );
     assert!(require_request_base_matches_binding(Some("http://127.0.0.1:10"), binding).is_err());
-    assert!(require_request_base_matches_binding(Some("https://ottto.net/backend"), None).is_ok());
+    assert!(require_request_base_matches_binding(Some("https://staging.invalid"), None).is_ok());
 }
 
 #[test]

@@ -73,23 +73,15 @@ pub(in crate::control) fn setup_run(
     require_authorized_local_client(daemon, authorization)?;
     let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
-    crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
-    // A fresh claim on a Mac that is not connected may name another backend
-    // (it replaces the binding without sending its credentials); anything
-    // else uses the saved binding's backend.
-    let fresh_claim = status.account.state != LocalAccountState::Connected
-        && claim_code
+    // Any saved binding pins the backend, before anything is retried or sent.
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        connection
             .as_ref()
-            .is_some_and(|code| !code.trim().is_empty());
-    if !fresh_claim {
-        require_request_base_matches_binding(
-            api_base_url.as_deref(),
-            connection
-                .as_ref()
-                .map(|binding| binding.api_base_url.as_str()),
-        )?;
-    }
+            .map(|binding| binding.api_base_url.as_str()),
+    )?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()
