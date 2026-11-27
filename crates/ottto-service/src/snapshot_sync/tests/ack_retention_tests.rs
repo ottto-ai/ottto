@@ -1978,9 +1978,22 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
         "/src/snapshot_sync/finish.rs"
     ))
     .expect("snapshot_sync finish source");
-    let production = &parent[..parent
+    // The finish module's production text: the parent before its tests, then
+    // every child file of `finish/`, so a move into a child keeps the pins.
+    let mut production = parent[..parent
         .find("\n#[cfg(test)]\nmod tests {")
-        .unwrap_or(parent.len())];
+        .unwrap_or(parent.len())]
+        .to_owned();
+    let children = concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync/finish");
+    if let Ok(entries) = std::fs::read_dir(children) {
+        let mut paths: Vec<_> = entries
+            .map(|entry| entry.expect("finish child").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            production.push_str(&std::fs::read_to_string(&path).expect("finish child source"));
+        }
+    }
     assert!(
         module.contains("pub(super) struct AckRetirementPlan(BTreeSet<String>);"),
         "the plan field stays private to ack_retention"
