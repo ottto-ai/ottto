@@ -9,7 +9,7 @@ use crate::control::{
     confirm_device_credential_preparation, current_rfc3339_timestamp, default_support_dir,
     device_credential_request_authority, disconnect_setup_run_with_refresh, fs,
     generate_control_token, inspect_device_credential_preparation, io, json,
-    load_device_release_proof, pending_credential_owner, prior_device_credential_for_registration,
+    load_device_release_proof, pending_credential_owner, prior_device_credential_for_backend,
     publish_owner_snapshot_history, reattach_required_state, redact_inline,
     relay_token_request_payload, release_device_without_setup_run,
     request_snapshot_sync_after_device_registration, require_authorized_local_client,
@@ -2718,6 +2718,7 @@ pub(in crate::control) fn complete_setup_claim(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
+    let claim_base = api_url("");
     // Snapshot established file + Keychain authority under the identity
     // lifecycle fence. Network I/O runs without the mutex, while the
     // reservation prevents legitimate local writers from rotating authority.
@@ -2727,7 +2728,7 @@ pub(in crate::control) fn complete_setup_claim(
             Some(reservation) => reservation.validate_locked()?,
             None => require_identity_mutation_reservation(None)?,
         }
-        prior_device_credential_for_registration()?
+        prior_device_credential_for_backend(&claim_base)?
     };
     let request_authority = device_credential_request_authority(
         "setup_claim",
@@ -2782,7 +2783,7 @@ pub(in crate::control) fn complete_setup_claim(
             Some(reservation) => reservation.validate_locked()?,
             None => require_identity_mutation_reservation(None)?,
         }
-        let current = prior_device_credential_for_registration()?;
+        let current = prior_device_credential_for_backend(&claim_base)?;
         if !same_prior_device_authority(prior_device_credential.as_ref(), current.as_ref()) {
             return Err(LocalApiError::StatePoisoned);
         }

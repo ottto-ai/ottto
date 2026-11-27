@@ -287,6 +287,7 @@ use backend_http::require_request_base_matches_binding;
 #[cfg(test)]
 use backend_http::safe_backend_body_excerpt;
 use backend_http::safe_backend_endpoint;
+use backend_http::same_backend;
 use backend_http::staging_pair;
 pub(crate) use backend_http::terminal_refresh_rejection;
 use backend_http::validated_api_base_url;
@@ -647,9 +648,13 @@ use setup::claims::credentials::pending_credential_owner;
 #[cfg(test)]
 use setup::claims::credentials::pending_owner_snapshot_key;
 use setup::claims::credentials::prepare_telemetry_device_registration;
+use setup::claims::credentials::prior_device_credential_for_backend;
+#[cfg(test)]
 use setup::claims::credentials::prior_device_credential_for_registration;
 #[cfg(test)]
 use setup::claims::credentials::prior_device_credential_with_stores;
+#[cfg(test)]
+use setup::claims::credentials::prior_issued_by;
 use setup::claims::credentials::publish_owner_snapshot_history;
 use setup::claims::credentials::record_install_session_event;
 pub(crate) use setup::claims::credentials::refresh_setup_run_token_for_persisted_connection;

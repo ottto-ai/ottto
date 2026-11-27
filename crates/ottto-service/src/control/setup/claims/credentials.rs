@@ -17,6 +17,7 @@ use crate::control::lock_setup_run_binding;
 use crate::control::operating_system_slug;
 use crate::control::registration_history_choice_error;
 use crate::control::remember_revocation_receipt;
+use crate::control::same_backend;
 use crate::control::secret_sha256;
 use crate::control::setup_run_binding_matches;
 use crate::control::source_slug;
@@ -591,7 +592,7 @@ pub(in crate::control) fn prepare_telemetry_device_registration(
         api_base_url,
         "/api/v1/telemetry/devices/registration-preparations",
     );
-    let prior = prior_device_credential_for_registration()?;
+    let prior = prior_device_credential_for_backend(api_base_url)?;
     let request_authority = device_credential_request_authority(
         "register",
         &install_session.install_session_id,
@@ -1173,6 +1174,38 @@ pub(in crate::control) struct PriorDeviceCredential {
     pub(in crate::control) owner: Option<LocalCredentialOwner>,
     /// The namespace its local snapshot history lives under.
     pub(in crate::control) snapshot_namespace: String,
+}
+
+/// The prior device credential, only when `api_base_url` names the backend
+/// that issued it, so its secret never goes to another backend. A credential
+/// with no recorded owner (older installs, and the registration flow) is
+/// treated as issued by the backend of this Mac's saved connection, or, with
+/// none saved, by this daemon's configured backend: production unless a
+/// developer set `OTTTO_API_BASE_URL`.
+pub(in crate::control) fn prior_device_credential_for_backend(
+    api_base_url: &str,
+) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
+    let bound_base = FileConnectionStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .map(|connection| connection.api_base_url);
+    Ok(prior_device_credential_for_registration()?
+        .filter(|prior| prior_issued_by(prior, api_base_url, bound_base.as_deref())))
+}
+
+pub(in crate::control) fn prior_issued_by(
+    prior: &PriorDeviceCredential,
+    api_base_url: &str,
+    bound_base: Option<&str>,
+) -> bool {
+    match prior.owner.as_ref() {
+        Some(owner) => same_backend(&owner.api_base_url, api_base_url),
+        None => match bound_base {
+            Some(bound_base) => same_backend(bound_base, api_base_url),
+            None => same_backend(&ottto_core::default_connection_api_base_url(), api_base_url),
+        },
+    }
 }
 
 pub(in crate::control) fn prior_device_credential_for_registration(
