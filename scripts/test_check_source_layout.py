@@ -109,6 +109,38 @@ class LayoutTests(unittest.TestCase):
             self.assertIn('size: snapshots/wire/frame.rs: 31 lines, over its ceiling of 30 in '
                           'scripts/source_layout_limits.tsv', found)
 
+    def test_a_row_may_rise_only_to_what_the_base_already_holds(self):
+        frame, wire = f'{SRC}/snapshots/wire/frame.rs', f'{SRC}/snapshots/wire.rs'
+        rows = lambda *pairs: '# path\tmax_lines\n' + ''.join(f'{p}\t{n}\n' for p, n in pairs)
+        # The base is past its own row (frame.rs 21 > 15) and has an unlisted file over the limit (wire.rs 13).
+        self.write({frame: '//! Big.\n' + 'fn f() {}\n' * 20,
+                    wire: '//! Wire.\n\nmod frame;\n' + 'fn w() {}\n' * 10,
+                    'scripts/source_layout_limits.tsv': rows((frame, 15))})
+        with mock.patch.object(layout, 'MAX_LINES', 10), mock.patch.object(layout, 'NOTE_LINES', 5):
+            base = self.commit()
+            status, found, _ = self.findings('--enforce', 'size', '--base', base)
+            self.assertEqual(status, 1)
+            self.assertIn(f'size: snapshots/wire/frame.rs: 21 lines, over its ceiling of 15 in '
+                          'scripts/source_layout_limits.tsv', found)
+            # Recording the base's own lengths passes.
+            self.write({'scripts/source_layout_limits.tsv': rows((frame, 21), (wire, 13))})
+            status, found, out = self.findings('--enforce', 'size', '--base', base)
+            self.assertEqual((status, found), (0, []), out)
+            # Anything past the base's length is a rise.
+            self.write({'scripts/source_layout_limits.tsv': rows((frame, 22), (wire, 13))})
+            _, found, _ = self.findings('--enforce', 'size', '--base', base)
+            self.assertIn('size: snapshots/wire/frame.rs: ceiling rose from 21 to 22', found)
+            self.write({'scripts/source_layout_limits.tsv': rows((frame, 21), (wire, 14))})
+            _, found, _ = self.findings('--enforce', 'size', '--base', base)
+            self.assertIn('size: snapshots/wire.rs: ceiling rose from 13 to 14', found)
+            # A file under the limit at the base cannot grow past it by adding a row.
+            sqlite = f'{SRC}/snapshots/state_v2/sqlite.rs'
+            self.write({sqlite: '//! SQLite.\n' + 'fn s() {}\n' * 11,
+                        'scripts/source_layout_limits.tsv': rows((frame, 21), (wire, 13), (sqlite, 12))})
+            status, found, _ = self.findings('--enforce', 'size', '--base', base)
+            self.assertEqual(status, 1)
+            self.assertIn('size: scripts/source_layout_limits.tsv: ceilings total 46, up from 34 at base', found)
+
     def test_tree_rules(self):
         self.write({
             f'{SRC}/snapshots/stray.rs': '//! Stray.\n',
