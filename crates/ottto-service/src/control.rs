@@ -634,6 +634,9 @@ use setup::claims::credentials::device_credential_request_authority;
 use setup::claims::credentials::device_release_proof;
 use setup::claims::credentials::disconnect_setup_run_with_refresh;
 use setup::claims::credentials::emit_setup_run_fast_verification_marker_with_refresh_mut;
+#[cfg(test)]
+pub(crate) use setup::claims::credentials::idle_credential_answer_from;
+pub(crate) use setup::claims::credentials::idle_device_credential_answer;
 use setup::claims::credentials::inspect_device_credential_preparation;
 use setup::claims::credentials::load_device_release_proof;
 #[cfg(test)]
@@ -671,6 +674,7 @@ use setup::claims::credentials::validate_device_credential_preparation;
 use setup::claims::credentials::validate_owner_snapshot_selection;
 use setup::claims::credentials::wait_for_setup_run_verification_with_refresh_mut_timeout;
 use setup::claims::credentials::wait_for_verification_with_refresh_mut;
+pub(crate) use setup::claims::credentials::IdleCredentialAnswer;
 use setup::claims::credentials::PriorDeviceCredential;
 #[cfg(test)]
 use setup::claims::credentials::SetupRunConnectionStore;

@@ -48,6 +48,7 @@ use crate::control::SourceKind;
 use crate::control::SourceVerificationResult;
 use crate::control::SourceVerificationStatus;
 use crate::control::SystemTime;
+use crate::control::TerminalRefreshRejection;
 use crate::control::UpdateGate;
 use crate::control::UpdateState;
 use crate::control::UpdateStatus;
@@ -235,24 +236,23 @@ fn observe_setup_run_read<T>(
 /// this Mac that Ottto disconnected it. The heartbeat thread calls this every
 /// `IDLE_CREDENTIAL_CHECK_INTERVAL` while no app is enabled.
 ///
-/// The check is the setup-run refresh: one POST of this Mac's device id and
-/// device secret, with no source, usage or local data, and the answer's new
-/// setup-run token is saved as on any refresh. Only an authoritative answer is
-/// recorded, the same way as for agent reads: a terminal answer marks the setup
-/// run rejected (a refused device credential then reads reconnect-required in
-/// `account` and `status`), a success clears an earlier rejection, and a
-/// deleted account still goes to the account-not-found path. Network,
-/// timeout and other backend failures say nothing and change nothing.
+/// The check is one read-only `GET /api/v1/telemetry/devices/{id}/status` with
+/// this Mac's device id and secret: no source, usage or local data, nothing
+/// written on either side, no token. Only an authoritative answer is recorded,
+/// the same way as for agent reads: a refused credential marks the setup run
+/// rejected with a refused device (`account` and `status` then read
+/// reconnect-required), and a usable one clears an earlier rejection. No
+/// answer (network, 429, 5xx, an older server without the route) changes
+/// nothing.
 pub(crate) fn probe_idle_device_credential(daemon: &LocalDaemon) {
-    probe_idle_device_credential_with(daemon, |api_base_url, binding| {
-        refresh_setup_run_token_via_device_secret(api_base_url, binding).map(|_| ())
-    });
+    probe_idle_device_credential_with(daemon, crate::control::idle_device_credential_answer);
 }
 
 pub(crate) fn probe_idle_device_credential_with(
     daemon: &LocalDaemon,
-    refresh: impl FnOnce(&str, &LocalConnectionBinding) -> Result<(), LocalApiError>,
+    check: impl FnOnce(&str) -> crate::control::IdleCredentialAnswer,
 ) {
+    use crate::control::IdleCredentialAnswer;
     let connected = daemon
         .status_for_trusted_client()
         .is_ok_and(|status| status.account.state == LocalAccountState::Connected);
@@ -262,21 +262,17 @@ pub(crate) fn probe_idle_device_credential_with(
     let Ok(Some(start)) = daemon.setup_run_read_start() else {
         return;
     };
-    let Ok(api_base_url) = validated_api_base_url(Some(start.binding.api_base_url.as_str())) else {
-        return;
-    };
-    match refresh(&api_base_url, &start.binding) {
-        Ok(()) => {
+    match check(&start.binding.api_base_url) {
+        IdleCredentialAnswer::Usable => {
             let _ = daemon.record_setup_run_read_accepted(&start);
         }
-        Err(error) if crate::control::backend_error_indicates_account_gone(&error) => {
-            let _ = daemon.mark_account_not_found();
+        IdleCredentialAnswer::Refused => {
+            let _ = daemon.record_setup_run_read_rejected(
+                &start.binding,
+                TerminalRefreshRejection::DeviceRejected,
+            );
         }
-        Err(error) => {
-            if let Some(rejection) = terminal_refresh_rejection(&error) {
-                let _ = daemon.record_setup_run_read_rejected(&start.binding, rejection);
-            }
-        }
+        IdleCredentialAnswer::NoProof => {}
     }
 }
 

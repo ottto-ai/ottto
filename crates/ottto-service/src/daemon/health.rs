@@ -1290,27 +1290,33 @@ fn local_health_blockers_for_status(
             ));
         }
     }
-    if account.state == LocalHealthAccountState::Connected {
-        if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
-            let (code, clear_condition) = match current.rejection {
-                TerminalRefreshRejection::SetupRunEnded => (
-                    "setup_run_rejected",
-                    "run `ottto login` to reconnect this Mac and restore agent reads",
-                ),
-                TerminalRefreshRejection::DeviceRejected => (
-                    "device_credential_rejected",
-                    "Ottto refused this Mac's device credential; run `ottto login` to reconnect this Mac",
-                ),
-            };
-            blockers.push(blocker(
-                code,
-                LocalHealthSeverity::Warning,
-                "setup",
-                LocalHealthAuthority::Backend,
-                &current.observed_at,
-                clear_condition,
-            ));
-        }
+    // A refused device credential turns the account reconnect-required; keep
+    // its specific blocker next to the generic one.
+    if let Some(current) =
+        latest_setup_run_read_rejection(&status.local_health_events).filter(|current| {
+            account.state == LocalHealthAccountState::Connected
+                || (account.state == LocalHealthAccountState::ReconnectRequired
+                    && current.rejection == TerminalRefreshRejection::DeviceRejected)
+        })
+    {
+        let (code, clear_condition) = match current.rejection {
+            TerminalRefreshRejection::SetupRunEnded => (
+                "setup_run_rejected",
+                "run `ottto login` to reconnect this Mac and restore agent reads",
+            ),
+            TerminalRefreshRejection::DeviceRejected => (
+                "device_credential_rejected",
+                "Ottto refused this Mac's device credential; run `ottto login` to reconnect this Mac",
+            ),
+        };
+        blockers.push(blocker(
+            code,
+            LocalHealthSeverity::Warning,
+            "setup",
+            LocalHealthAuthority::Backend,
+            &current.observed_at,
+            clear_condition,
+        ));
     }
     if matches!(
         account.state,

@@ -85,6 +85,67 @@ pub(in crate::control) fn supported_pending_credential_schema(version: u16) -> b
     )
 }
 
+/// What Ottto said about this Mac's device credential on the read-only status
+/// route (`GET /api/v1/telemetry/devices/{id}/status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleCredentialAnswer {
+    /// `active` or `expired`: the credential still works (an expired
+    /// registration revives on the next relay-token or refresh).
+    Usable,
+    /// `revoked`, or a 401 `device_credential_refused` for this Mac's own
+    /// stored secret: Ottto no longer accepts this Mac until it signs in.
+    Refused,
+    /// No answer that proves anything: no stored credential, an untrusted
+    /// base, a transport failure, 429, 5xx, or 404/405 from a server without
+    /// the route.
+    NoProof,
+}
+
+/// One read-only status check with this Mac's device id and secret. Sends no
+/// source, usage or local data, writes nothing locally and mints nothing.
+pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentialAnswer {
+    let Ok(api_base_url) = validated_api_base_url(Some(api_base_url)) else {
+        return IdleCredentialAnswer::NoProof;
+    };
+    if crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err() {
+        return IdleCredentialAnswer::NoProof;
+    }
+    let Ok(Some(device)) = FileDeviceStore::default().load() else {
+        return IdleCredentialAnswer::NoProof;
+    };
+    let Ok(device_secret) = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).load()
+    else {
+        return IdleCredentialAnswer::NoProof;
+    };
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!("/api/v1/telemetry/devices/{}/status", device.device_id),
+    );
+    idle_credential_answer_from(backend_get_json::<serde_json::Value>(
+        &url,
+        &[("X-Ottto-Device-Secret", device_secret.as_str())],
+    ))
+}
+
+pub(crate) fn idle_credential_answer_from(
+    result: Result<serde_json::Value, LocalApiError>,
+) -> IdleCredentialAnswer {
+    match result {
+        Ok(body) => match body.get("status").and_then(serde_json::Value::as_str) {
+            Some("active" | "expired") => IdleCredentialAnswer::Usable,
+            Some("revoked") => IdleCredentialAnswer::Refused,
+            _ => IdleCredentialAnswer::NoProof,
+        },
+        Err(LocalApiError::Backend(details))
+            if details.status == Some(401)
+                && details.reason_code.as_deref() == Some("device_credential_refused") =>
+        {
+            IdleCredentialAnswer::Refused
+        }
+        Err(_) => IdleCredentialAnswer::NoProof,
+    }
+}
+
 /// Load the active device id and secret together. The server rejects one
 /// without the other, so a missing or unreadable half yields no proof.
 pub(in crate::control) fn load_device_release_proof() -> Option<DeviceReleaseProof> {
