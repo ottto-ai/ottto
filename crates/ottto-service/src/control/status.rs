@@ -191,18 +191,18 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
 }
 
 /// Run one setup-run agent read and record whether Ottto still accepts this
-/// Mac's setup run, so local status stops reporting a rejected run as
-/// complete. Only an authoritative terminal answer from the device-secret
-/// refresh counts (`terminal_refresh_rejection`): every read path propagates
-/// that refresh error unchanged, so it is the read's final error. A read 401,
-/// a 401 retried after a successful refresh, an unrecognized refresh detail,
-/// and network, timeout or other backend failures say nothing about the run
-/// and leave the recorded state unchanged. A successful read clears it.
-/// Reads run concurrently with setup and sign-in, so the outcome is recorded
-/// against exactly the binding this read used, and dropped by the daemon if
-/// that binding has since been replaced. Reads of one binding also run
-/// concurrently with each other, so a success clears only the rejection that
-/// was already recorded when this read started, never a newer one.
+/// Mac's setup run, so local status stops reporting an ended run as complete.
+/// Only an authoritative "run ended" answer from the device-secret refresh
+/// counts (`terminal_refresh_rejection`): every read path propagates that
+/// refresh error unchanged, so it is the read's final error. A read 401, a 401
+/// retried after a successful refresh, a refused device credential, an
+/// unrecognized refresh detail, and network, timeout or other backend failures
+/// leave the recorded state unchanged: a read never decides whether Ottto
+/// accepts the device credential (the idle check and uploads do). A successful
+/// read clears an ended run only when it read the very run it started with: a
+/// refresh that moved it to another run proves nothing about the first one.
+/// Reads run concurrently with setup, sign-in and each other, so the outcome is
+/// ordered by when the read started and dropped once its binding is replaced.
 fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -210,78 +210,154 @@ fn observe_setup_run_read<T>(
     read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
     let (api_base_url, start) = setup_run_agent_read_binding(daemon, authorization, command)?;
+    let mut run_read = None;
     let result =
         setup_run_token_for_connection(&api_base_url, &start.binding).and_then(|credentials| {
+            run_read = Some(credentials.connection.clone());
             read(
                 &api_base_url,
                 &credentials.connection,
                 &credentials.setup_run_token,
             )
         });
+    let read_start_run = read_was_of_start_run(&start.binding, run_read.as_ref());
     match &result {
-        Ok(_) => {
+        Ok(_) if read_start_run => {
             let _ = daemon.record_setup_run_read_accepted(&start);
         }
-        Err(error) => {
-            if let Some(rejection) = terminal_refresh_rejection(error) {
-                let _ = daemon.record_setup_run_read_rejected(&start.binding, rejection);
-            }
+        Err(error)
+            if read_start_run
+                && terminal_refresh_rejection(error)
+                    == Some(TerminalRefreshRejection::SetupRunEnded) =>
+        {
+            let _ = daemon.record_setup_run_ended(&start.binding);
         }
+        _ => {}
     }
     result
 }
 
-/// The device credential check for a Mac with no enabled app. Uploads and
-/// local-health passes need an app's relay token, so without one nothing tells
-/// this Mac that Ottto disconnected it. The heartbeat thread calls this every
-/// `IDLE_CREDENTIAL_CHECK_INTERVAL` while no app is enabled, and after the
-/// Mac wakes from sleep.
+/// Whether a read's outcome speaks for the setup run it started with: it read
+/// that run, or it failed while refreshing that run's token.
+fn read_was_of_start_run(
+    start: &LocalConnectionBinding,
+    run_read: Option<&LocalConnectionBinding>,
+) -> bool {
+    run_read.is_none_or(|run| {
+        run.setup_run_id == start.setup_run_id && run.api_base_url == start.api_base_url
+    })
+}
+
+#[cfg(test)]
+mod read_run_tests {
+    use super::read_was_of_start_run;
+    use crate::control::LocalConnectionBinding;
+
+    #[test]
+    fn a_read_moved_to_another_run_proves_nothing_about_the_first() {
+        let run = |setup_run_id: &str| LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: None,
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        };
+        let start = run("run_1");
+        assert!(read_was_of_start_run(&start, Some(&start)));
+        // Only the token expiry changes on a same-run refresh.
+        let refreshed = LocalConnectionBinding {
+            setup_run_token_expires_at: "2026-05-05T11:00:00Z".to_string(),
+            ..start.clone()
+        };
+        assert!(read_was_of_start_run(&start, Some(&refreshed)));
+        // The refresh of the start run itself failed.
+        assert!(read_was_of_start_run(&start, None));
+        // A refresh rebound the read to the latest run.
+        assert!(!read_was_of_start_run(&start, Some(&run("run_2"))));
+    }
+}
+
+/// What one pass of the idle credential check did, for its scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleCredentialCheck {
+    /// Nothing was sent: no connected account or setup run, an untrusted
+    /// base, an identity change in progress, or no readable credential.
+    Skipped,
+    /// Ottto said whether it accepts the credential, and the answer was
+    /// recorded.
+    Answered,
+    /// No usable answer, or one that no longer described the active
+    /// credential when it arrived.
+    Transient,
+    /// Ottto asked to slow down.
+    Throttled { retry_after: Option<Duration> },
+    /// This server has no status route.
+    NoRoute,
+}
+
+/// The device credential check for a Mac with no heartbeat source. Uploads
+/// need an app's relay token, so without one nothing tells this Mac that Ottto
+/// disconnected it. The local-health thread schedules it.
 ///
 /// The check is one read-only `GET /api/v1/telemetry/devices/{id}/status` with
-/// this Mac's device id and secret: no source, usage or local data, nothing
-/// written on either side, no token. Only an authoritative answer is recorded,
-/// the same way as for agent reads: a refused credential marks the setup run
-/// rejected with a refused device (`account` and `status` then read
-/// reconnect-required), and a usable one clears an earlier device refusal
-/// (never a "setup run ended" rejection, which the device answer can't
-/// prove anything about). No
-/// answer (network, 429, 5xx, an older server without the route) changes
-/// nothing.
-/// Returns the answer when the check ran, `None` when it was skipped.
-pub(crate) fn probe_idle_device_credential(
-    daemon: &LocalDaemon,
-) -> Option<crate::control::IdleCredentialAnswer> {
-    probe_idle_device_credential_with(daemon, crate::control::idle_device_credential_answer)
+/// this Mac's device id and secret: no source, usage or local data, no token,
+/// nothing written on Ottto's side. The answer is recorded only in this Mac's
+/// in-memory local health, and only while the credential that was sent is
+/// still the active one: a refused credential makes `account` and `status`
+/// read reconnect-required, and a usable one clears that. It never changes
+/// what is recorded about the setup run.
+pub(crate) fn probe_idle_device_credential(daemon: &LocalDaemon) -> IdleCredentialCheck {
+    probe_idle_device_credential_with(daemon, crate::control::idle_credential_probe)
 }
 
 pub(crate) fn probe_idle_device_credential_with(
     daemon: &LocalDaemon,
-    check: impl FnOnce(&str) -> crate::control::IdleCredentialAnswer,
-) -> Option<crate::control::IdleCredentialAnswer> {
-    use crate::control::IdleCredentialAnswer;
-    let connected = daemon
-        .status_for_trusted_client()
-        .is_ok_and(|status| status.account.state == LocalAccountState::Connected);
-    if !connected {
-        return None;
-    }
-    let Ok(Some(start)) = daemon.setup_run_read_start() else {
-        return None;
+    probe: impl FnOnce(&str, &str) -> crate::control::IdleProbeAnswer,
+) -> IdleCredentialCheck {
+    use crate::control::IdleProbeAnswer;
+    let Ok(Some(binding)) = daemon.connected_setup_run() else {
+        return IdleCredentialCheck::Skipped;
     };
-    let answer = check(&start.binding.api_base_url);
-    match answer {
-        IdleCredentialAnswer::Usable => {
-            let _ = daemon.record_device_credential_accepted(&start);
-        }
-        IdleCredentialAnswer::Refused => {
-            let _ = daemon.record_setup_run_read_rejected(
-                &start.binding,
-                TerminalRefreshRejection::DeviceRejected,
-            );
-        }
-        IdleCredentialAnswer::NoProof => {}
+    let Ok(api_base_url) = validated_api_base_url(Some(binding.api_base_url.as_str())) else {
+        return IdleCredentialCheck::Skipped;
+    };
+    if crate::control::identity_mutation_in_progress() {
+        return IdleCredentialCheck::Skipped;
     }
-    Some(answer)
+    let Ok(authority) = crate::control::capture_credential_authority() else {
+        return IdleCredentialCheck::Skipped;
+    };
+    let device_id = authority.device.device_id.as_str();
+    if device_id.is_empty()
+        || !device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return IdleCredentialCheck::Skipped;
+    }
+    let Ok(start) =
+        daemon.start_credential_observation(authority.epoch, authority.connection.clone())
+    else {
+        return IdleCredentialCheck::Skipped;
+    };
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!("/api/v1/telemetry/devices/{device_id}/status"),
+    );
+    let refused = match probe(&url, &authority.secret) {
+        IdleProbeAnswer::Usable => false,
+        IdleProbeAnswer::Refused => true,
+        IdleProbeAnswer::Throttled { retry_after } => {
+            return IdleCredentialCheck::Throttled { retry_after }
+        }
+        IdleProbeAnswer::NoRoute => return IdleCredentialCheck::NoRoute,
+        IdleProbeAnswer::NoProof => return IdleCredentialCheck::Transient,
+    };
+    if daemon.settle_device_credential_answer(&start, refused) {
+        IdleCredentialCheck::Answered
+    } else {
+        IdleCredentialCheck::Transient
+    }
 }
 
 /// `ottto cloud status`: read-only connector status through the setup-run

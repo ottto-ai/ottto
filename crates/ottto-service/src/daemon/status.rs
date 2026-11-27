@@ -191,6 +191,7 @@ pub(crate) fn status_from_state_with_relay_finding(
     state: &mut DaemonState,
     relay_finding: Option<StableMessage>,
 ) -> DaemonStatus {
+    crate::retire_stale_credential_heads(state);
     let mut status = empty_status(state.machine.clone(), current_rfc3339_timestamp());
     status.account = state.account.clone();
     // Legacy builds could start a second browser claim over a fully bound

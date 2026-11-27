@@ -18,9 +18,7 @@ fn local_health_retention_preserves_heads_and_sequences_through_key_replacement(
     for cycle in 0..2 {
         daemon.record_local_health_upload_succeeded().unwrap();
         track(&daemon.state().unwrap());
-        daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
-            .unwrap();
+        daemon.record_setup_run_ended(&run).unwrap();
         track(&daemon.state().unwrap());
         daemon
             .record_setup_run_read_accepted(&read_start(&daemon))
@@ -72,18 +70,14 @@ fn local_health_retention_preserves_heads_and_sequences_through_key_replacement(
     track(&daemon.state().unwrap());
     // An earlier rejection was evicted by recovery. Its successful read
     // cannot clear a newer rejection, even after unrelated keys churn.
-    daemon
-        .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
-        .unwrap();
+    daemon.record_setup_run_ended(&run).unwrap();
     track(&daemon.state().unwrap());
     let stale = read_start(&daemon);
     daemon
         .record_setup_run_read_accepted(&read_start(&daemon))
         .unwrap();
     track(&daemon.state().unwrap());
-    daemon
-        .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
-        .unwrap();
+    daemon.record_setup_run_ended(&run).unwrap();
     track(&daemon.state().unwrap());
     daemon
         .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)

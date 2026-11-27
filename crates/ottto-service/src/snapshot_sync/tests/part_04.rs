@@ -91,8 +91,7 @@ fn local_health_refresh_hold_stays_on_the_binding_its_requests_used() {
     let pass = || {
         let error = upload_local_health_projection_reporting(
             &client,
-            &device,
-            "device-secret",
+            &crate::control::capture_credential_authority().expect("capture credential"),
             SnapshotSource::Codex,
             "otm_test",
             &daemon,
@@ -124,6 +123,40 @@ fn local_health_refresh_hold_stays_on_the_binding_its_requests_used() {
 
     clear_setup_run_refresh_hold();
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// [regress] A settled upload changes only the refresh hold of the binding
+/// its pass used: a hold another setup run or credential set meanwhile is
+/// neither cleared nor overwritten.
+#[test]
+#[serial]
+fn upload_hold_changes_touch_only_their_own_binding() {
+    use super::telemetry_only::clear_setup_run_refresh_hold_for;
+    use super::telemetry_only::note_setup_run_refresh_failed;
+    use super::telemetry_only::setup_run_refresh_hold;
+    let held = || {
+        setup_run_refresh_hold()
+            .lock()
+            .expect("hold")
+            .map(|hold| (hold.binding, hold.until.is_none()))
+    };
+    let ours = [1u8; 32];
+    let theirs = [2u8; 32];
+    clear_setup_run_refresh_hold();
+    note_setup_run_refresh_failed(&theirs, true);
+    note_setup_run_refresh_failed(&ours, false);
+    assert_eq!(
+        held(),
+        Some((theirs, true)),
+        "a late failure keeps the newer hold"
+    );
+    clear_setup_run_refresh_hold_for(&ours);
+    assert_eq!(held(), Some((theirs, true)), "a late success keeps it too");
+    clear_setup_run_refresh_hold_for(&theirs);
+    assert_eq!(held(), None);
+    note_setup_run_refresh_failed(&ours, false);
+    assert_eq!(held(), Some((ours, false)));
+    clear_setup_run_refresh_hold();
 }
 
 #[test]

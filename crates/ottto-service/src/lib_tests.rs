@@ -5,7 +5,6 @@ mod tests {
     //! Loaded by the crate root under the existing `tests` module.
 
     use super::*;
-    use crate::control::TerminalRefreshRejection;
     use ottto_core::source_state_file_name;
     use ottto_core::FileSourceStateStore;
     use ottto_core::LocalConnectionBinding;
@@ -1560,10 +1559,10 @@ mod tests {
         .is_none());
 
         daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&run)
             .expect("record rejected read");
         daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&run)
             .expect("record repeated rejected read");
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(
@@ -1615,17 +1614,44 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "setup_run_rejected"));
+    }
 
-        // A refused device credential does not say the run ended: never
-        // `expired`, the device is inactive, and the blocker says so.
+    /// Settle a device-credential answer for the active credential, as the
+    /// idle check does after its request.
+    fn settle_device(daemon: &LocalDaemon, refused: bool) -> bool {
+        let start = daemon
+            .start_credential_observation(crate::control::device_credential_epoch(), None)
+            .expect("start");
+        daemon.settle_device_credential_answer(&start, refused)
+    }
+
+    fn health(daemon: &LocalDaemon) -> ottto_protocol::LocalMachineHealthV1 {
         daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
-            .expect("record device rejection");
-        let device_rejected = daemon
             .status(TOKEN)
             .expect("status")
             .canonical_health
-            .expect("canonical health");
+            .expect("canonical health")
+    }
+
+    fn has_blocker(health: &ottto_protocol::LocalMachineHealthV1, code: &str) -> bool {
+        health.blockers.iter().any(|blocker| blocker.code == code)
+    }
+
+    #[test]
+    #[serial]
+    fn a_refused_device_credential_reads_reconnect_required_and_never_expired() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+        // A fresh daemon (or one just restarted) knows nothing about the
+        // credential: it shows the saved state.
+        assert_eq!(
+            health(&daemon).account.state,
+            LocalHealthAccountState::Connected
+        );
+        assert!(settle_device(&daemon, true));
+        let device_rejected = health(&daemon);
         // Nothing this Mac sends is accepted any more, so the account reads
         // reconnect-required, as after a rejected local-health upload.
         assert_eq!(
@@ -1650,14 +1676,8 @@ mod tests {
             device_rejected.account.device_state,
             LocalDeviceState::Inactive
         );
-        assert!(device_rejected
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "device_credential_rejected"));
-        assert!(!device_rejected
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "setup_run_rejected"));
+        assert!(has_blocker(&device_rejected, "device_credential_rejected"));
+        assert!(!has_blocker(&device_rejected, "setup_run_rejected"));
         let reported =
             serde_json::to_string(&(&device_rejected.account, &device_rejected.blockers))
                 .expect("serialize health");
@@ -1665,181 +1685,418 @@ mod tests {
             !reported.to_ascii_lowercase().contains("expired"),
             "{reported}"
         );
-
-        // A later ended-run answer for the same binding is a new transition.
-        daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
-            .expect("record ended run");
-        let ended = daemon
-            .status(TOKEN)
-            .expect("status")
-            .canonical_health
-            .expect("canonical health");
-        assert_eq!(ended.account.setup_run_state, LocalSetupRunState::Rejected);
-        assert_eq!(
-            ended.account.setup_token_state,
-            LocalSetupTokenState::Expired
-        );
-        assert!(!ended
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "device_credential_rejected"));
-    }
-
-    fn status_route_error(status: Option<u16>, reason_code: Option<&str>) -> LocalApiError {
-        LocalApiError::Backend(BackendErrorDetails {
-            kind: if status.is_some() {
-                BackendErrorKind::Rejected
-            } else {
-                BackendErrorKind::Unreachable
-            },
-            endpoint: "https://api.ottto.net/api/v1/telemetry/devices/device_1/status".to_string(),
-            status,
-            body_excerpt: None,
-            reason_code: reason_code.map(str::to_string),
-        })
-    }
-
-    fn setup_run_read_events(daemon: &LocalDaemon) -> usize {
-        daemon
-            .status(TOKEN)
-            .expect("status")
-            .local_health_events
-            .iter()
-            .filter(|event| event.event_type.starts_with("SetupRunRead"))
-            .count()
-    }
-
-    #[test]
-    fn idle_credential_answer_reads_only_authoritative_status_answers() {
-        use crate::control::idle_credential_answer_from as answer;
-        use crate::control::IdleCredentialAnswer::{NoProof, Refused, Usable};
-        let body = |status: &str| Ok(serde_json::json!({ "status": status }));
-        assert_eq!(answer(body("active")), Usable);
-        assert_eq!(answer(body("expired")), Usable);
-        assert_eq!(answer(body("revoked")), Refused);
-        assert_eq!(answer(body("something_new")), NoProof);
-        assert_eq!(answer(Ok(serde_json::json!({}))), NoProof);
-        assert_eq!(
-            answer(Err(status_route_error(
-                Some(401),
-                Some("device_credential_refused")
-            ))),
-            Refused
-        );
-        for error in [
-            status_route_error(Some(401), None),
-            status_route_error(Some(401), Some("something_else")),
-            status_route_error(Some(404), None),
-            status_route_error(Some(405), None),
-            status_route_error(Some(429), None),
-            status_route_error(Some(503), None),
-            status_route_error(None, None),
-            LocalApiError::IdentityMutationInProgress,
-        ] {
-            assert_eq!(answer(Err(error)), NoProof);
-        }
-    }
-
-    #[test]
-    fn idle_credential_check_reports_a_disconnected_mac_and_its_recovery() {
-        use crate::control::IdleCredentialAnswer::{Refused, Usable};
-        let run = read_binding("run_1");
-        let daemon = daemon()
-            .with_account(account("user_1", "ron@example.com"))
-            .with_connection(Some(run.clone()));
-
-        let mut checked_base = None;
-        crate::control::probe_idle_device_credential_with(&daemon, |base| {
-            checked_base = Some(base.to_string());
-            Refused
-        });
-        assert_eq!(checked_base.as_deref(), Some("https://api.ottto.net"));
-        let status = daemon.status(TOKEN).expect("status");
-        let health = status.canonical_health.as_ref().expect("health");
-        assert_eq!(
-            health.account.state,
-            LocalHealthAccountState::ReconnectRequired
-        );
-        assert!(health
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "device_credential_rejected"));
-        let effective = effective_account_binding(&status);
-        assert_eq!(effective.state, LocalAccountState::Error);
-        assert_eq!(
-            effective.message.map(|message| message.code).as_deref(),
-            Some("reconnect_required")
-        );
+        assert!(daemon
+            .connected_setup_run_needs_reconnect()
+            .expect("needs reconnect"));
         assert_eq!(
             daemon.status(TOKEN).expect("status").account.state,
             LocalAccountState::Connected,
             "the saved binding is unchanged; only the reported account changes"
         );
 
-        // The next check that Ottto answers as usable clears it.
-        crate::control::probe_idle_device_credential_with(&daemon, |_| Usable);
-        let recovered = daemon.status(TOKEN).expect("status");
+        // An ended run is a separate fact: kept as a Warning under the
+        // refusal, and shown alone once Ottto accepts the device again.
+        daemon
+            .record_setup_run_ended(&run)
+            .expect("record ended run");
+        let both = health(&daemon);
         assert_eq!(
-            effective_account_binding(&recovered).state,
-            LocalAccountState::Connected
+            both.account.state,
+            LocalHealthAccountState::ReconnectRequired
         );
-        assert!(latest_setup_run_read_rejection(&recovered.local_health_events).is_none());
+        assert!(has_blocker(&both, "device_credential_rejected"));
+        assert!(has_blocker(&both, "setup_run_rejected"));
+        assert!(settle_device(&daemon, false));
+        let ended = health(&daemon);
+        assert_eq!(ended.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(ended.account.setup_run_state, LocalSetupRunState::Rejected);
+        assert_eq!(
+            ended.account.setup_token_state,
+            LocalSetupTokenState::Expired
+        );
+        assert!(!has_blocker(&ended, "device_credential_rejected"));
+        assert!(has_blocker(&ended, "setup_run_rejected"));
     }
 
     #[test]
+    #[serial]
+    fn device_answers_apply_in_the_order_their_requests_started() {
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(read_binding("run_1")));
+        let start = |daemon: &LocalDaemon| {
+            daemon
+                .start_credential_observation(crate::control::device_credential_epoch(), None)
+                .expect("start")
+        };
+        let refused = |daemon: &LocalDaemon| {
+            latest_device_credential_refusal(
+                &daemon.status(TOKEN).expect("status").local_health_events,
+            )
+            .is_some()
+        };
+        assert!(daemon
+            .status(TOKEN)
+            .expect("status")
+            .local_health_events
+            .is_empty());
+
+        // A delayed usable answer loses to a newer refusal of the same kind
+        // as the one already shown: the newer answer still moves the order.
+        assert!(settle_device(&daemon, true));
+        let delayed_usable = start(&daemon);
+        let newer_refusal = start(&daemon);
+        assert!(daemon.settle_device_credential_answer(&newer_refusal, true));
+        assert!(!daemon.settle_device_credential_answer(&delayed_usable, false));
+        assert!(refused(&daemon));
+
+        // A delayed refusal loses to a newer usable answer.
+        let delayed_refusal = start(&daemon);
+        let newer_usable = start(&daemon);
+        assert!(daemon.settle_device_credential_answer(&newer_usable, false));
+        assert!(!daemon.settle_device_credential_answer(&delayed_refusal, true));
+        assert!(!refused(&daemon));
+        assert_eq!(
+            health(&daemon).account.state,
+            LocalHealthAccountState::Connected
+        );
+
+        // Reads never decide the device fact: a refusal that started before a
+        // read succeeded (with a cached token or after a refresh) still
+        // applies.
+        let idle = start(&daemon);
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .expect("read accepted");
+        assert!(daemon.settle_device_credential_answer(&idle, true));
+        assert!(refused(&daemon));
+
+        // A sign-in starts over: the refusal is cleared, and answers that
+        // started before it are dropped.
+        let before_sign_in = start(&daemon);
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_new", "nonce_new"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_new",
+                "nonce_new",
+                account("user_1", "ron@example.com"),
+                "run_2".to_string(),
+                "2026-11-04T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete auth");
+        assert!(!refused(&daemon));
+        assert!(!daemon.settle_device_credential_answer(&before_sign_in, true));
+        assert!(!refused(&daemon));
+        assert!(settle_device(&daemon, true), "a new answer still counts");
+    }
+
+    #[test]
+    #[serial]
+    fn an_ended_run_and_a_device_refusal_settle_independently_in_either_order() {
+        for idle_first in [true, false] {
+            let run = read_binding("run_1");
+            let daemon = daemon()
+                .with_account(account("user_1", "ron@example.com"))
+                .with_connection(Some(run.clone()));
+            daemon.record_setup_run_ended(&run).expect("run ended");
+            assert!(settle_device(&daemon, true));
+            // A read and an idle check start after both answers; their
+            // results arrive in either order.
+            let read = read_start(&daemon);
+            let idle = daemon
+                .start_credential_observation(crate::control::device_credential_epoch(), None)
+                .expect("start");
+            let settle_read = || {
+                daemon
+                    .record_setup_run_read_accepted(&read)
+                    .expect("read accepted")
+            };
+            if idle_first {
+                assert!(daemon.settle_device_credential_answer(&idle, false));
+                settle_read();
+            } else {
+                settle_read();
+                assert!(daemon.settle_device_credential_answer(&idle, false));
+            }
+            let recovered = health(&daemon);
+            assert_eq!(recovered.account.state, LocalHealthAccountState::Connected);
+            assert_eq!(
+                recovered.account.setup_run_state,
+                LocalSetupRunState::Complete
+            );
+            assert!(!has_blocker(&recovered, "setup_run_rejected"));
+            assert!(!has_blocker(&recovered, "device_credential_rejected"));
+        }
+    }
+
+    #[test]
+    #[serial]
     fn a_usable_device_answer_never_clears_an_ended_setup_run() {
         let run = read_binding("run_1");
         let daemon = daemon()
             .with_account(account("user_1", "ron@example.com"))
             .with_connection(Some(run.clone()));
         daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&run)
             .expect("record ended run");
-
-        crate::control::probe_idle_device_credential_with(&daemon, |_| {
-            crate::control::IdleCredentialAnswer::Usable
-        });
-
+        // Ended, then refused, then usable: the ended run stays recorded.
+        assert!(settle_device(&daemon, true));
+        assert!(settle_device(&daemon, false));
         let status = daemon.status(TOKEN).expect("status");
         assert!(latest_setup_run_read_rejection(&status.local_health_events).is_some());
         let health = status.canonical_health.as_ref().expect("health");
-        assert!(health
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "setup_run_rejected"));
+        assert!(has_blocker(health, "setup_run_rejected"));
+        assert!(daemon
+            .connected_setup_run_needs_reconnect()
+            .expect("needs reconnect"));
+    }
 
-        // A device refusal on top of the ended run, then a usable answer,
-        // still leaves the ended run recorded.
-        crate::control::probe_idle_device_credential_with(&daemon, |_| {
-            crate::control::IdleCredentialAnswer::Refused
+    /// Answer each request on a loopback port with the next of `responses`
+    /// (status line, extra headers, body), one connection each; `before`
+    /// runs with the response index before each answer is written.
+    fn loopback_backend(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+        before: impl Fn(usize) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, (status, headers, body)) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read request");
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let length = text[..head_end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + length {
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_string());
+                before(index);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+            requests
         });
-        crate::control::probe_idle_device_credential_with(&daemon, |_| {
-            crate::control::IdleCredentialAnswer::Usable
-        });
-        let status = daemon.status(TOKEN).expect("status");
-        assert!(latest_setup_run_read_rejection(&status.local_health_events).is_some());
-        assert!(status
-            .canonical_health
-            .as_ref()
-            .expect("health")
-            .blockers
-            .iter()
-            .any(|blocker| blocker.code == "setup_run_rejected"));
+        (base, server)
     }
 
     #[test]
-    fn idle_credential_check_ignores_answers_that_prove_nothing() {
+    fn idle_probe_reads_only_authoritative_status_answers() {
+        use crate::control::IdleProbeAnswer::{NoProof, NoRoute, Refused, Throttled, Usable};
+        const JSON: &str = "Content-Type: application/json\r\n";
+        let cases: Vec<(
+            &'static str,
+            &'static str,
+            &'static str,
+            crate::control::IdleProbeAnswer,
+        )> = vec![
+            ("200 OK", JSON, r#"{"status":"active"}"#, Usable),
+            ("200 OK", JSON, r#"{"status":"expired"}"#, Usable),
+            ("200 OK", JSON, r#"{"status":"revoked"}"#, Refused),
+            ("200 OK", JSON, r#"{"status":"something_new"}"#, NoProof),
+            (
+                "200 OK",
+                "Content-Type: text/html\r\n",
+                "<html>sign in</html>",
+                NoProof,
+            ),
+            (
+                "401 Unauthorized",
+                JSON,
+                r#"{"detail":{"code":"device_credential_refused"}}"#,
+                Refused,
+            ),
+            (
+                "401 Unauthorized",
+                JSON,
+                r#"{"detail":"Not authenticated"}"#,
+                NoProof,
+            ),
+            (
+                "302 Found",
+                "Location: https://elsewhere.example/status\r\n",
+                "",
+                NoProof,
+            ),
+            ("404 Not Found", JSON, r#"{"detail":"Not Found"}"#, NoRoute),
+            ("405 Method Not Allowed", JSON, "{}", NoRoute),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 900\r\n",
+                "{}",
+                Throttled {
+                    retry_after: Some(std::time::Duration::from_secs(900)),
+                },
+            ),
+            (
+                "503 Service Unavailable",
+                "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n",
+                "{}",
+                Throttled { retry_after: None },
+            ),
+        ];
+        let expected = cases.iter().map(|case| case.3).collect::<Vec<_>>();
+        let (base, server) = loopback_backend(
+            cases
+                .iter()
+                .map(|(status, headers, body, _)| (*status, *headers, *body))
+                .collect(),
+            |_| {},
+        );
+        let url = format!("{base}/api/v1/telemetry/devices/device_1/status");
+        for expected in expected {
+            assert_eq!(
+                crate::control::idle_credential_probe(&url, "device-secret"),
+                expected
+            );
+        }
+        let requests = server.join().expect("backend");
+        assert!(requests.iter().all(|request| {
+            request.starts_with("GET /api/v1/telemetry/devices/device_1/status ")
+                && request
+                    .to_ascii_lowercase()
+                    .contains("x-ottto-device-secret: device-secret")
+        }));
+        // Nothing went to the redirect target.
+        assert_eq!(requests.len(), 12);
+    }
+
+    /// A connected daemon with a device credential and setup run in scratch
+    /// stores.
+    struct IdleCheckFixture {
+        daemon: LocalDaemon,
+        device: LocalDeviceBinding,
+        run: LocalConnectionBinding,
+        _guards: [TestEnvVar; 2],
+        _support: test_scratch::ScratchDir,
+    }
+
+    fn idle_check_fixture(name: &str) -> IdleCheckFixture {
+        let support = test_scratch::ScratchDir::new(name);
+        let guards = [
+            TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+            TestEnvVar::set(
+                ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV,
+                &support.join("secrets"),
+            ),
+        ];
+        let device = LocalDeviceBinding {
+            device_id: "device_1".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: Vec::new(),
+        };
+        crate::control::persist_relay_device_credentials(&device, "device-secret")
+            .expect("save credential");
         let run = read_binding("run_1");
+        ottto_core::FileConnectionStore::default()
+            .save(&run)
+            .expect("save connection");
         let daemon = daemon()
             .with_account(account("user_1", "ron@example.com"))
-            .with_connection(Some(run));
-        crate::control::probe_idle_device_credential_with(&daemon, |_| {
-            crate::control::IdleCredentialAnswer::NoProof
-        });
-        assert_eq!(setup_run_read_events(&daemon), 0);
-        let status = daemon.status(TOKEN).expect("status");
-        assert_eq!(status.account.state, LocalAccountState::Connected);
+            .with_connection(Some(run.clone()));
+        IdleCheckFixture {
+            daemon,
+            device,
+            run,
+            _guards: guards,
+            _support: support,
+        }
+    }
+
+    fn device_refused(daemon: &LocalDaemon) -> bool {
+        latest_device_credential_refusal(&daemon.status(TOKEN).expect("status").local_health_events)
+            .is_some()
+    }
+
+    #[test]
+    #[serial]
+    fn idle_check_reports_a_disconnected_mac_and_its_recovery() {
+        use crate::control::IdleCredentialCheck::Answered;
+        use crate::control::IdleProbeAnswer::{Refused, Usable};
+        let fixture = idle_check_fixture("idle-check-refused");
+        let mut sent = None;
+        let outcome =
+            crate::control::probe_idle_device_credential_with(&fixture.daemon, |url, secret| {
+                sent = Some((url.to_string(), secret.to_string()));
+                Refused
+            });
+        assert_eq!(outcome, Answered);
+        assert_eq!(
+            sent,
+            Some((
+                "https://api.ottto.net/api/v1/telemetry/devices/device_1/status".to_string(),
+                "device-secret".to_string()
+            ))
+        );
+        let refused = health(&fixture.daemon);
+        assert_eq!(
+            refused.account.state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+        assert!(has_blocker(&refused, "device_credential_rejected"));
+
+        let outcome =
+            crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, _| Usable);
+        assert_eq!(outcome, Answered);
+        assert_eq!(
+            effective_account_binding(&fixture.daemon.status(TOKEN).expect("status")).state,
+            LocalAccountState::Connected
+        );
+        assert!(!device_refused(&fixture.daemon));
+    }
+
+    #[test]
+    #[serial]
+    fn idle_check_records_nothing_without_proof() {
+        use crate::control::IdleCredentialCheck;
+        use crate::control::IdleProbeAnswer;
+        let fixture = idle_check_fixture("idle-check-no-proof");
+        let retry_after = Some(std::time::Duration::from_secs(30));
+        for (answer, outcome) in [
+            (IdleProbeAnswer::NoProof, IdleCredentialCheck::Transient),
+            (IdleProbeAnswer::NoRoute, IdleCredentialCheck::NoRoute),
+            (
+                IdleProbeAnswer::Throttled { retry_after },
+                IdleCredentialCheck::Throttled { retry_after },
+            ),
+        ] {
+            assert_eq!(
+                crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, _| answer),
+                outcome
+            );
+        }
+        let status = fixture.daemon.status(TOKEN).expect("status");
+        assert!(status
+            .local_health_events
+            .iter()
+            .all(|event| !event.event_type.starts_with("DeviceCredential")));
         assert_eq!(
             effective_account_binding(&status).state,
             LocalAccountState::Connected
@@ -1847,14 +2104,257 @@ mod tests {
     }
 
     #[test]
-    fn idle_credential_check_needs_a_connected_account() {
-        let daemon = daemon().with_connection(Some(read_binding("run_1")));
+    #[serial]
+    fn idle_check_needs_a_connected_account_and_a_credential() {
+        use crate::control::IdleCredentialCheck::Skipped;
+        let fixture = idle_check_fixture("idle-check-skipped");
         let mut called = false;
-        crate::control::probe_idle_device_credential_with(&daemon, |_| {
-            called = true;
-            crate::control::IdleCredentialAnswer::Usable
+        let not_connected = daemon().with_connection(Some(fixture.run.clone()));
+        assert_eq!(
+            crate::control::probe_idle_device_credential_with(&not_connected, |_, _| {
+                called = true;
+                crate::control::IdleProbeAnswer::Usable
+            }),
+            Skipped
+        );
+        ottto_core::FileDeviceStore::default()
+            .reset()
+            .expect("remove device");
+        assert_eq!(
+            crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, _| {
+                called = true;
+                crate::control::IdleProbeAnswer::Usable
+            }),
+            Skipped
+        );
+        assert!(
+            !called,
+            "nothing is sent without a connected account and credential"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn idle_answer_for_a_credential_replaced_in_flight_is_dropped() {
+        use crate::control::IdleCredentialCheck::{Answered, Transient};
+        use crate::control::IdleProbeAnswer::Refused;
+        let fixture = idle_check_fixture("idle-check-replaced");
+        // A promotion or sign-in writes the credential after the request
+        // left and before its answer is recorded.
+        let outcome = crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, _| {
+            crate::control::persist_relay_device_credentials(&fixture.device, "rotated")
+                .expect("rotate credential");
+            Refused
         });
-        assert!(!called, "no check without a connected account");
+        assert_eq!(outcome, Transient);
+        assert!(!device_refused(&fixture.daemon));
+
+        // A promotion that timed out after confirmation leaves its journal:
+        // nothing is recorded until it is finished.
+        let candidate = "candidate-secret";
+        let journal = ottto_core::PendingDeviceCredentialPreparation {
+            schema_version: 2,
+            capability: "device_credential_prepare_confirm_v1".into(),
+            preparation_id: "preparation-idle-check".into(),
+            api_base_url: "https://api.ottto.net".into(),
+            expires_at: "2026-08-01T00:00:00Z".into(),
+            credential_generation: 4,
+            secret_commitment_sha256: crate::control::secret_sha256(candidate),
+            request_authority: None,
+            device: fixture.device.clone(),
+            confirmation_authorized: true,
+            preconfirm_guards_passed: true,
+            claim_commit: None,
+            confirmed_at: Some("2026-07-31T20:00:00Z".into()),
+        };
+        let outcome = crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, _| {
+            ottto_core::FilePendingDeviceCredentialStore::default()
+                .save(&journal)
+                .expect("journal");
+            Refused
+        });
+        assert_eq!(outcome, Transient);
+        assert!(!device_refused(&fixture.daemon));
+        ottto_core::FilePendingDeviceCredentialStore::default()
+            .reset()
+            .expect("clear journal");
+
+        // The next check sends the new credential and counts.
+        let mut sent_secret = None;
+        let outcome =
+            crate::control::probe_idle_device_credential_with(&fixture.daemon, |_, secret| {
+                sent_secret = Some(secret.to_string());
+                Refused
+            });
+        assert_eq!(outcome, Answered);
+        assert_eq!(sent_secret.as_deref(), Some("rotated"));
+        assert!(device_refused(&fixture.daemon));
+    }
+
+    #[test]
+    #[serial]
+    fn a_credential_write_retires_device_and_upload_answers_but_keeps_the_run() {
+        let fixture = idle_check_fixture("idle-check-retire");
+        fixture
+            .daemon
+            .record_setup_run_ended(&fixture.run)
+            .expect("run ended");
+        assert!(settle_device(&fixture.daemon, true));
+        let upload = fixture
+            .daemon
+            .start_credential_observation(
+                crate::control::device_credential_epoch(),
+                Some(fixture.run.clone()),
+            )
+            .expect("start upload");
+        assert!(fixture.daemon.settle_local_health_upload(
+            &upload,
+            Err(LocalHealthUploadFailureKind::AuthRejected),
+            false,
+            || {}
+        ));
+        assert_eq!(
+            health(&fixture.daemon).account.state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+
+        // First-app promotion (or startup recovery) writes the credential; no
+        // upload has to follow for the stale answers to go.
+        crate::control::persist_relay_device_credentials(&fixture.device, "promoted")
+            .expect("promote");
+        let status = fixture.daemon.status(TOKEN).expect("status");
+        assert!(latest_device_credential_refusal(&status.local_health_events).is_none());
+        assert!(latest_local_health_upload_in(&status.local_health_events).is_none());
+        assert!(latest_setup_run_read_rejection(&status.local_health_events).is_some());
+        let retired = status.canonical_health.expect("health");
+        assert_eq!(retired.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(
+            retired.account.setup_run_state,
+            LocalSetupRunState::Rejected
+        );
+        assert!(!has_blocker(&retired, "device_credential_rejected"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_accepted_upload_proves_the_device_credential() {
+        let fixture = idle_check_fixture("idle-check-upload-proof");
+        assert!(settle_device(&fixture.daemon, true));
+        let upload = fixture
+            .daemon
+            .start_credential_observation(
+                crate::control::device_credential_epoch(),
+                Some(fixture.run.clone()),
+            )
+            .expect("start upload");
+        assert!(fixture
+            .daemon
+            .settle_local_health_upload(&upload, Ok(()), false, || {}));
+        assert!(!device_refused(&fixture.daemon));
+        assert_eq!(
+            health(&fixture.daemon).account.state,
+            LocalHealthAccountState::Connected
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_late_upload_result_for_a_replaced_binding_changes_nothing() {
+        let fixture = idle_check_fixture("idle-check-late-upload");
+        let start = |fixture: &IdleCheckFixture| {
+            fixture
+                .daemon
+                .start_credential_observation(
+                    crate::control::device_credential_epoch(),
+                    Some(fixture.run.clone()),
+                )
+                .expect("start upload")
+        };
+        let held = std::cell::Cell::new(false);
+
+        // A run-only rebind while the upload was in flight.
+        let success = start(&fixture);
+        let failure = start(&fixture);
+        ottto_core::FileConnectionStore::default()
+            .save(&read_binding("run_2"))
+            .expect("rebind");
+        assert!(!fixture
+            .daemon
+            .settle_local_health_upload(&success, Ok(()), false, || held.set(true)));
+        assert!(!fixture.daemon.settle_local_health_upload(
+            &failure,
+            Err(LocalHealthUploadFailureKind::AuthRejected),
+            true,
+            || held.set(true)
+        ));
+        ottto_core::FileConnectionStore::default()
+            .save(&fixture.run)
+            .expect("restore run");
+
+        // A sign-in that wrote new credentials while the upload was in flight.
+        let stale = start(&fixture);
+        crate::control::persist_relay_device_credentials(&fixture.device, "signed-in")
+            .expect("sign in");
+        assert!(!fixture.daemon.settle_local_health_upload(
+            &stale,
+            Err(LocalHealthUploadFailureKind::AuthRejected),
+            true,
+            || held.set(true)
+        ));
+
+        assert!(!held.get(), "no hold change for a dropped result");
+        let status = fixture.daemon.status(TOKEN).expect("status");
+        assert!(latest_local_health_upload_in(&status.local_health_events).is_none());
+        assert_eq!(status.account.state, LocalAccountState::Connected);
+        assert_ne!(
+            status
+                .account
+                .message
+                .map(|message| message.code)
+                .as_deref(),
+            Some(ACCOUNT_NOT_FOUND_MESSAGE_CODE),
+            "a stale refresh answer never marks the account gone"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_refresh_minted_with_a_replaced_credential_is_not_saved() {
+        let fixture = idle_check_fixture("idle-check-refresh-epoch");
+        let device = fixture.device.clone();
+        let (base, server) = loopback_backend(
+            vec![(
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                r#"{"setup_run_token":"otsr_minted","expires_at":"2026-05-05T11:00:00Z"}"#,
+            )],
+            move |_| {
+                // A same-run promotion commits while the refresh is in flight.
+                crate::control::persist_relay_device_credentials(&device, "promoted")
+                    .expect("promote");
+            },
+        );
+        let run = LocalConnectionBinding {
+            api_base_url: base,
+            ..fixture.run.clone()
+        };
+        ottto_core::FileConnectionStore::default()
+            .save(&run)
+            .expect("save loopback run");
+        let result = crate::control::refresh_setup_run_token_for_persisted_connection();
+        server.join().expect("backend");
+        assert_eq!(result, Err(LocalApiError::IdentityMutationInProgress));
+        assert!(crate::control::terminal_refresh_rejection(
+            &LocalApiError::IdentityMutationInProgress
+        )
+        .is_none());
+        assert!(
+            ottto_core::ControlTokenStore::load(&ottto_core::KeychainSecretStore::new(
+                ottto_core::OTTTO_SETUP_RUN_TOKEN_ACCOUNT
+            ))
+            .is_err(),
+            "the minted token is dropped"
+        );
     }
 
     #[test]
@@ -1888,10 +2388,7 @@ mod tests {
         let slow_read = read_start(&daemon);
         let rejected_read = read_start(&daemon);
         daemon
-            .record_setup_run_read_rejected(
-                &rejected_read.binding,
-                TerminalRefreshRejection::SetupRunEnded,
-            )
+            .record_setup_run_ended(&rejected_read.binding)
             .expect("record rejected read");
         daemon
             .record_setup_run_read_accepted(&slow_read)
@@ -1911,24 +2408,12 @@ mod tests {
         // The run is rejected again with the same kind. A read that started
         // during the earlier rejection describes that one, not this one.
         daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&run)
             .expect("record second rejection");
         daemon
             .record_setup_run_read_accepted(&started_while_rejected)
             .expect("late success from the earlier rejection");
         assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
-        assert_eq!(recoveries(&daemon), 0);
-
-        // A different terminal answer recorded after a read started is also
-        // newer than that read.
-        let before_device_rejection = read_start(&daemon);
-        daemon
-            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
-            .expect("record device rejection");
-        daemon
-            .record_setup_run_read_accepted(&before_device_rejection)
-            .expect("late success before the device rejection");
-        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Unknown);
         assert_eq!(recoveries(&daemon), 0);
 
         daemon
@@ -1965,7 +2450,7 @@ mod tests {
             .with_connection(Some(old_run.clone()));
 
         daemon
-            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&old_run)
             .expect("record rejected read");
         daemon
             .bind_setup_run_for_authorized_client(old_run.clone())
@@ -1982,7 +2467,7 @@ mod tests {
             "a replacement run is not the rejected run"
         );
         daemon
-            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&old_run)
             .expect("late outcome from a read of the old run");
         assert!(
             !rejected(&daemon),
@@ -1990,7 +2475,7 @@ mod tests {
         );
 
         daemon
-            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&new_run)
             .expect("record rejected read");
         assert!(rejected(&daemon));
         assert!(daemon
@@ -2002,7 +2487,7 @@ mod tests {
             .bind_setup_run_for_authorized_client(new_run.clone())
             .expect("bind run again");
         daemon
-            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
+            .record_setup_run_ended(&new_run)
             .expect("record rejected read");
         daemon
             .reset_account_for_authorized_client()

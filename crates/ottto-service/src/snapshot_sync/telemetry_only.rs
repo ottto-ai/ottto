@@ -371,44 +371,105 @@ impl std::fmt::Display for NoHeartbeatSource {
 
 impl std::error::Error for NoHeartbeatSource {}
 
+/// What one off-pass local-health pass did, for the idle credential check.
+pub(crate) enum LocalHealthPass {
+    /// Stopped before looking for a heartbeat source: no readable credential,
+    /// a credential change in progress, or no machine identity.
+    PreSource(anyhow::Error),
+    /// No heartbeat source: no app is enabled.
+    NoSource,
+    /// A heartbeat source was found and the upload ran, with this result.
+    SourceRan(Result<()>),
+}
+
 pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
+    match local_health_pass(daemon) {
+        LocalHealthPass::PreSource(error) => Err(error),
+        LocalHealthPass::NoSource => Err(anyhow::Error::new(NoHeartbeatSource)),
+        LocalHealthPass::SourceRan(result) => result,
+    }
+}
+
+pub(crate) fn local_health_pass(daemon: &LocalDaemon) -> LocalHealthPass {
     let _stage = StageWindow::begin("unknown", "offpass_local_health");
-    let (device, device_secret) = load_snapshot_device_credentials()?;
-    let Some(machine_id) = snapshot_machine_id(&device)? else {
-        return Err(anyhow!("machine identity is missing"));
+    let authority = match crate::control::capture_credential_authority() {
+        Ok(authority) => authority,
+        Err(error) => return LocalHealthPass::PreSource(error),
     };
-    let Some(source) = heartbeat_source(&device) else {
-        return Err(anyhow::Error::new(NoHeartbeatSource));
+    let machine_id = match snapshot_machine_id(&authority.device) {
+        Ok(Some(machine_id)) => machine_id,
+        Ok(None) => return LocalHealthPass::PreSource(anyhow!("machine identity is missing")),
+        Err(error) => return LocalHealthPass::PreSource(error),
     };
-    let client = SnapshotApiClient::new(snapshot_api_base_url()?);
-    upload_local_health_projection_reporting(
+    let Some(source) = heartbeat_source(&authority.device) else {
+        return LocalHealthPass::NoSource;
+    };
+    let client = match snapshot_api_base_url() {
+        Ok(base) => SnapshotApiClient::new(base),
+        Err(error) => return LocalHealthPass::PreSource(error),
+    };
+    LocalHealthPass::SourceRan(upload_local_health_projection_reporting(
         &client,
-        &device,
-        &device_secret,
+        &authority,
         source,
         &machine_id,
         daemon,
-    )
+    ))
 }
 
+/// How one settled upload attempt changes the refresh hold of the binding the
+/// pass used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshHoldChange {
+    Keep,
+    ClearIfHeld,
+    NoteFailure { terminal: bool },
+}
+
+/// Settle one upload attempt with the daemon: the head, the device fact, the
+/// account-gone mark and the hold change all apply together, or none does.
+fn settle_local_health_upload_attempt(
+    daemon: &LocalDaemon,
+    start: &crate::CredentialObservationStart,
+    outcome: Result<(), LocalHealthUploadFailureKind>,
+    account_gone: bool,
+    binding: &[u8; 32],
+    hold: RefreshHoldChange,
+) {
+    daemon.settle_local_health_upload(start, outcome, account_gone, || match hold {
+        RefreshHoldChange::Keep => {}
+        RefreshHoldChange::ClearIfHeld => clear_setup_run_refresh_hold_for(binding),
+        RefreshHoldChange::NoteFailure { terminal } => {
+            note_setup_run_refresh_failed(binding, terminal)
+        }
+    });
+}
+
+/// One local-health upload with exactly the captured credential. Every
+/// attempt settles once against what it captured: a sign-in, promotion,
+/// reset or setup-run change that happened while it was in flight drops its
+/// result, including any hold or account change.
 pub(super) fn upload_local_health_projection_reporting(
     client: &SnapshotApiClient,
-    device: &LocalDeviceBinding,
-    device_secret: &str,
+    authority: &crate::control::CredentialAuthority,
     source: SnapshotSource,
     machine_id: &str,
     daemon: &LocalDaemon,
 ) -> Result<()> {
-    // The binding this pass's requests are for, captured before any of them.
-    // A failure is recorded against it, never against a setup run attached
-    // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret, source)?;
+    let device = &authority.device;
+    let device_secret = authority.secret.as_str();
+    // The binding this pass's requests are for, from the captured credential
+    // and setup run. Holds are set and cleared only for it.
+    let binding = setup_run_refresh_binding(authority, source)?;
     let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
         return Err(anyhow::Error::new(held));
     }
+    let start = daemon
+        .start_credential_observation(authority.epoch, authority.connection.clone())
+        .map_err(|error| anyhow!("read local health state failed: {error}"))?;
     match upload_local_health_projection_with(
         client,
         device,
@@ -418,8 +479,14 @@ pub(super) fn upload_local_health_projection_reporting(
         daemon,
     ) {
         Ok(()) => {
-            clear_setup_run_refresh_hold();
-            let _ = daemon.record_local_health_upload_succeeded();
+            settle_local_health_upload_attempt(
+                daemon,
+                &start,
+                Ok(()),
+                false,
+                &binding,
+                RefreshHoldChange::ClearIfHeld,
+            );
             Ok(())
         }
         Err(error)
@@ -434,14 +501,16 @@ pub(super) fn upload_local_health_projection_reporting(
                 // unbound-equivalent `account_not_found` state so the next
                 // sign-in (by any user) is a fresh first claim instead of a
                 // reset-required dead end.
-                if crate::control::backend_error_indicates_account_gone(&refresh_error) {
-                    let _ = daemon.mark_account_not_found();
-                }
-                let _ = daemon
-                    .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
-                note_setup_run_refresh_failed(
+                settle_local_health_upload_attempt(
+                    daemon,
+                    &start,
+                    Err(LocalHealthUploadFailureKind::AuthRejected),
+                    crate::control::backend_error_indicates_account_gone(&refresh_error),
                     &binding,
-                    crate::control::terminal_refresh_rejection(&refresh_error).is_some(),
+                    RefreshHoldChange::NoteFailure {
+                        terminal: crate::control::terminal_refresh_rejection(&refresh_error)
+                            .is_some(),
+                    },
                 );
                 return Err(error.context(format!(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
@@ -451,6 +520,16 @@ pub(super) fn upload_local_health_projection_reporting(
                 relay_binding,
                 client.relay_auth_binding(device, device_secret, source),
             );
+            // The retry is a new attempt: the refresh may have persisted a
+            // rebound setup run. If the credential changed meanwhile, the next
+            // pass captures it afresh instead.
+            let retry_start = crate::control::persisted_connection_for_epoch(authority.epoch)
+                .map(|connection| daemon.start_credential_observation(authority.epoch, connection));
+            let Some(Ok(retry_start)) = retry_start else {
+                return Err(
+                    error.context("the device credential changed during the setup-run refresh")
+                );
+            };
             match upload_local_health_projection_with(
                 client,
                 device,
@@ -460,24 +539,43 @@ pub(super) fn upload_local_health_projection_reporting(
                 daemon,
             ) {
                 Ok(()) => {
-                    clear_setup_run_refresh_hold();
-                    let _ = daemon.record_local_health_upload_succeeded();
+                    settle_local_health_upload_attempt(
+                        daemon,
+                        &retry_start,
+                        Ok(()),
+                        false,
+                        &binding,
+                        RefreshHoldChange::ClearIfHeld,
+                    );
                     Ok(())
                 }
                 Err(retry_error) => {
-                    if local_health_upload_should_refresh_setup_run(&retry_error) {
-                        note_setup_run_refresh_failed(&binding, false);
-                    }
-                    let _ = daemon.record_local_health_upload_failed(
-                        local_health_upload_failure_kind(&retry_error),
+                    let hold = if local_health_upload_should_refresh_setup_run(&retry_error) {
+                        RefreshHoldChange::NoteFailure { terminal: false }
+                    } else {
+                        RefreshHoldChange::Keep
+                    };
+                    settle_local_health_upload_attempt(
+                        daemon,
+                        &retry_start,
+                        Err(local_health_upload_failure_kind(&retry_error)),
+                        false,
+                        &binding,
+                        hold,
                     );
                     Err(retry_error)
                 }
             }
         }
         Err(error) => {
-            let _ =
-                daemon.record_local_health_upload_failed(local_health_upload_failure_kind(&error));
+            settle_local_health_upload_attempt(
+                daemon,
+                &start,
+                Err(local_health_upload_failure_kind(&error)),
+                false,
+                &binding,
+                RefreshHoldChange::Keep,
+            );
             Err(error)
         }
     }
@@ -534,22 +632,21 @@ pub(super) fn setup_run_refresh_hold() -> &'static Mutex<Option<SetupRunRefreshH
 /// Digest of what a reattach or credential change replaces: the device id and
 /// secret, and the persisted setup run and API base. Kept in memory only.
 pub(super) fn setup_run_refresh_binding(
-    device: &LocalDeviceBinding,
-    device_secret: &str,
+    authority: &crate::control::CredentialAuthority,
     source: SnapshotSource,
 ) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
-    digest.update(device.device_id.as_bytes());
+    digest.update(authority.device.device_id.as_bytes());
     digest.update(b"\0");
-    digest.update(device_secret.as_bytes());
+    digest.update(authority.secret.as_bytes());
     digest.update(crate::relay_auth::binding_key(
         &snapshot_api_base_url()?,
-        device,
-        device_secret,
+        &authority.device,
+        &authority.secret,
         source.api_slug(),
     ));
-    if let Some(connection) = FileConnectionStore::default().load().ok().flatten() {
+    if let Some(connection) = authority.connection.as_ref() {
         digest.update(b"\0");
         digest.update(connection.setup_run_id.as_bytes());
         digest.update(b"\0");
@@ -613,8 +710,13 @@ pub(super) fn setup_run_refresh_hold_for(binding: &[u8; 32]) -> Option<LocalHeal
     setup_run_refresh_hold_at(&mut hold, binding, Instant::now())
 }
 
+/// Record a failed refresh for `binding`, unless a hold for another binding
+/// was set meanwhile: that one describes a newer setup run or credential.
 pub(super) fn note_setup_run_refresh_failed(binding: &[u8; 32], terminal: bool) {
     if let Ok(mut hold) = setup_run_refresh_hold().lock() {
+        if hold.is_some_and(|current| &current.binding != binding) {
+            return;
+        }
         match note_setup_run_refresh_failed_at(&mut hold, binding, Instant::now(), terminal) {
             Some(wait) => eprintln!(
                 "local health setup-run refresh rejected; next attempt in {}s",
@@ -636,6 +738,15 @@ pub(crate) fn reset_relay_authorization_backoff() {
 pub(super) fn clear_setup_run_refresh_hold() {
     if let Ok(mut hold) = setup_run_refresh_hold().lock() {
         *hold = None;
+    }
+}
+
+/// An accepted upload releases only the hold of the binding it used.
+pub(super) fn clear_setup_run_refresh_hold_for(binding: &[u8; 32]) {
+    if let Ok(mut hold) = setup_run_refresh_hold().lock() {
+        if hold.is_some_and(|current| &current.binding == binding) {
+            *hold = None;
+        }
     }
 }
 

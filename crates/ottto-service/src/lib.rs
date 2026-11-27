@@ -99,9 +99,12 @@ pub use ottto_core::state_dir_lock;
 mod daemon;
 mod source_health;
 
+use daemon::health::clear_credential_observations;
 use daemon::health::clear_local_health_upload_auth_rejection;
 use daemon::health::clear_setup_run_read_rejection;
 pub use daemon::health::current_rfc3339_timestamp;
+#[cfg(test)]
+use daemon::health::latest_device_credential_refusal;
 #[cfg(test)]
 pub(crate) use daemon::health::latest_local_health_upload;
 #[cfg(test)]
@@ -116,15 +119,17 @@ use daemon::health::push_local_health_event;
 pub use daemon::health::refresh_canonical_local_health;
 use daemon::health::refresh_canonical_local_health_with_started_at;
 use daemon::health::retain_latest_local_health_events;
+use daemon::health::retire_stale_credential_heads;
 #[cfg(test)]
 use daemon::health::runtime_heartbeat_for_status;
 #[cfg(test)]
 use daemon::health::runtime_identity_for_status_with_installed_app_version;
-use daemon::health::setup_run_read_revision;
 pub(crate) use daemon::health::text_indicates_usage_limited;
+pub(crate) use daemon::health::CredentialObservationStart;
 #[cfg(test)]
 use daemon::health::LatestLocalHealthUpload;
 pub use daemon::health::LocalHealthUploadFailureKind;
+pub(crate) use daemon::health::ObservationOrder;
 pub(crate) use daemon::health::SetupRunReadStart;
 use daemon::repair::config_backup_metadata;
 pub use daemon::repair::diagnostics_local_only_upload_report;

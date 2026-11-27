@@ -63,6 +63,94 @@ pub(crate) fn identity_mutation_in_progress() -> bool {
     IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire) != 0
 }
 
+/// Counts writes to this Mac's active device credential (the device binding
+/// file and its Keychain secret) in this process. Every writer bumps it under
+/// the identity lifecycle lock before its first write, and readers capture it
+/// under the same lock together with the pair, so an unchanged epoch means
+/// the captured pair is still the active one.
+static DEVICE_CREDENTIAL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn device_credential_epoch() -> u64 {
+    DEVICE_CREDENTIAL_EPOCH.load(Ordering::Acquire)
+}
+
+fn bump_device_credential_epoch_locked() {
+    debug_assert!(
+        SETUP_RUN_BINDING_LOCK.try_lock().is_err(),
+        "device credential writers hold the identity lifecycle lock"
+    );
+    DEVICE_CREDENTIAL_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The active device credential and the persisted setup run, read together
+/// with the credential epoch under the identity lifecycle lock. Requests that
+/// prove something about the credential send exactly this pair, and their
+/// answers count only while the epoch is unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct CredentialAuthority {
+    pub(crate) epoch: u64,
+    pub(crate) device: LocalDeviceBinding,
+    pub(crate) secret: String,
+    pub(crate) connection: Option<LocalConnectionBinding>,
+}
+
+/// Capture the active credential with the same reads and errors as
+/// `load_snapshot_device_credentials` (a confirmed but unpromoted credential
+/// refuses), plus the persisted setup run and the epoch.
+pub(crate) fn capture_credential_authority() -> anyhow::Result<CredentialAuthority> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials()?;
+    Ok(CredentialAuthority {
+        epoch: device_credential_epoch(),
+        device,
+        secret,
+        connection: FileConnectionStore::default().load().ok().flatten(),
+    })
+}
+
+/// The persisted setup run, re-read under the identity lifecycle lock, while
+/// the credential captured at `epoch` is still the active one.
+pub(crate) fn persisted_connection_for_epoch(epoch: u64) -> Option<Option<LocalConnectionBinding>> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    (device_credential_epoch() == epoch)
+        .then(|| FileConnectionStore::default().load().ok().flatten())
+}
+
+/// Run `commit` under the identity lifecycle lock only while no identity
+/// mutation is reserved or half promoted, the credential captured at `epoch`
+/// is still the active one and, when `connection` is given, the persisted
+/// setup run (id and API base) is still the captured one. `None` when the
+/// answer no longer describes this Mac's credential and must be dropped.
+/// Lock order: identity lifecycle, then whatever `commit` takes.
+pub(crate) fn commit_if_credential_current<R>(
+    epoch: u64,
+    connection: Option<&Option<LocalConnectionBinding>>,
+    commit: impl FnOnce() -> R,
+) -> Option<R> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    if identity_mutation_in_progress()
+        || crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        || device_credential_epoch() != epoch
+    {
+        return None;
+    }
+    if let Some(expected) = connection {
+        let persisted = FileConnectionStore::default().load().ok()?;
+        let same_run = match (persisted.as_ref(), expected.as_ref()) {
+            (None, None) => true,
+            (Some(persisted), Some(expected)) => {
+                persisted.setup_run_id == expected.setup_run_id
+                    && persisted.api_base_url == expected.api_base_url
+            }
+            _ => false,
+        };
+        if !same_run {
+            return None;
+        }
+    }
+    Some(commit())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::control) struct LocalIdentityAuthoritySnapshot {
     pub(in crate::control) account: LocalAccountBinding,
@@ -1119,7 +1207,7 @@ pub(in crate::control) fn relay_device_credentials_from_claim_completion(
 }
 
 #[cfg(test)]
-pub(in crate::control) fn persist_relay_device_credentials(
+pub(crate) fn persist_relay_device_credentials(
     device: &LocalDeviceBinding,
     device_secret: &str,
 ) -> Result<(), LocalApiError> {
@@ -1149,6 +1237,7 @@ fn persist_relay_device_credentials_locked(
         // are transiently unavailable.
         None => None,
     };
+    bump_device_credential_epoch_locked();
     secret_store.save(device_secret).or_state_poisoned()?;
     if device_store.save(device).is_ok() {
         return Ok(());
@@ -1504,6 +1593,7 @@ pub(in crate::control) fn write_and_verify_active_device_credential(
         },
     };
 
+    bump_device_credential_epoch_locked();
     active_secret_store
         .save(candidate_secret)
         .or_state_poisoned()?;
@@ -1891,6 +1981,7 @@ fn save_relay_device_binding_locked(
     reservation: Option<&IdentityMutationReservation>,
 ) -> Result<(), LocalApiError> {
     require_identity_mutation_reservation(reservation)?;
+    bump_device_credential_epoch_locked();
     FileDeviceStore::default().save(device).or_state_poisoned()
 }
 
@@ -2124,6 +2215,8 @@ fn reset_local_account_files_locked(
     reservation: Option<&IdentityMutationReservation>,
 ) -> Result<(), LocalApiError> {
     require_identity_mutation_reservation(reservation)?;
+    // Callers delete the active Keychain secret next, under the same lock.
+    bump_device_credential_epoch_locked();
     FileAccountStore::default().reset().or_state_poisoned()?;
     FileConnectionStore::default().reset().or_state_poisoned()?;
     FileDeviceStore::default().reset().or_state_poisoned()?;

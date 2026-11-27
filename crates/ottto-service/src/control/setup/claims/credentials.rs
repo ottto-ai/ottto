@@ -85,83 +85,79 @@ pub(in crate::control) fn supported_pending_credential_schema(version: u16) -> b
     )
 }
 
-/// What Ottto said about this Mac's device credential on the read-only status
-/// route (`GET /api/v1/telemetry/devices/{id}/status`).
+/// What the read-only device status route
+/// (`GET /api/v1/telemetry/devices/{id}/status`) answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IdleCredentialAnswer {
-    /// `active` or `expired`: the credential still works (an expired
+pub(crate) enum IdleProbeAnswer {
+    /// 200 `active` or `expired`: the credential still works (an expired
     /// registration revives on the next relay-token or refresh).
     Usable,
-    /// `revoked`, or a 401 `device_credential_refused` for this Mac's own
-    /// stored secret: Ottto no longer accepts this Mac until it signs in.
+    /// 200 `revoked`, or 401 `device_credential_refused`: Ottto no longer
+    /// accepts this Mac until it signs in.
     Refused,
-    /// No answer that proves anything: no stored credential, an untrusted
-    /// base, a transport failure, 429, 5xx, or 404/405 from a server without
-    /// the route.
+    /// 429 or 5xx: Ottto asked to slow down, with its `Retry-After` in
+    /// seconds when it sent one.
+    Throttled {
+        retry_after: Option<std::time::Duration>,
+    },
+    /// 404 or 405: this server has no such route.
+    NoRoute,
+    /// Anything else (transport failure, timeout, a redirect, another status
+    /// or body): no proof either way.
     NoProof,
 }
 
-/// One read-only status check with this Mac's device id and secret. Sends no
-/// source, usage or local data, writes nothing locally and mints nothing.
-pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentialAnswer {
-    let Ok(api_base_url) = validated_api_base_url(Some(api_base_url)) else {
-        return IdleCredentialAnswer::NoProof;
-    };
-    if crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
-        || crate::control::identity_mutation_in_progress()
-    {
-        return IdleCredentialAnswer::NoProof;
-    }
-    let Ok(Some(device)) = FileDeviceStore::default().load() else {
-        return IdleCredentialAnswer::NoProof;
-    };
-    let Ok(device_secret) = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).load()
-    else {
-        return IdleCredentialAnswer::NoProof;
-    };
-    let url = api_url_with_base(
-        &api_base_url,
-        &format!("/api/v1/telemetry/devices/{}/status", device.device_id),
-    );
-    let answer = idle_credential_answer_from(backend_get_json::<serde_json::Value>(
-        &url,
-        &[("X-Ottto-Device-Secret", device_secret.as_str())],
-    ));
-    // A refusal speaks only for the credential that was sent. If a sign-in or
-    // credential promotion replaced it meanwhile, the answer proves nothing.
-    if answer == IdleCredentialAnswer::Refused {
-        let still_sent = FileDeviceStore::default()
-            .load()
-            .ok()
-            .flatten()
-            .is_some_and(|current| current.device_id == device.device_id)
-            && KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-                .load()
-                .is_ok_and(|current| current == device_secret)
-            && !crate::control::identity_mutation_in_progress();
-        if !still_sent {
-            return IdleCredentialAnswer::NoProof;
+/// One read-only status request with this Mac's device secret. Sends no
+/// source, usage or local data, mints nothing and never follows a redirect
+/// (the agent would forward the secret header). The caller validates the base
+/// and the device id that make up `url`.
+pub(crate) fn idle_credential_probe(url: &str, device_secret: &str) -> IdleProbeAnswer {
+    let response = crate::retry_tls::credential_agent()
+        .get(url)
+        .set("Accept", "application/json")
+        .set("X-Ottto-Device-Secret", device_secret)
+        .timeout(BACKEND_REQUEST_TIMEOUT)
+        .call();
+    match response {
+        Ok(response) if response.status() == 200 => {
+            let status = response
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|body| body.get("status")?.as_str().map(str::to_string));
+            match status.as_deref() {
+                Some("active" | "expired") => IdleProbeAnswer::Usable,
+                Some("revoked") => IdleProbeAnswer::Refused,
+                _ => IdleProbeAnswer::NoProof,
+            }
         }
-    }
-    answer
-}
-
-pub(crate) fn idle_credential_answer_from(
-    result: Result<serde_json::Value, LocalApiError>,
-) -> IdleCredentialAnswer {
-    match result {
-        Ok(body) => match body.get("status").and_then(serde_json::Value::as_str) {
-            Some("active" | "expired") => IdleCredentialAnswer::Usable,
-            Some("revoked") => IdleCredentialAnswer::Refused,
-            _ => IdleCredentialAnswer::NoProof,
+        Ok(_) => IdleProbeAnswer::NoProof,
+        Err(ureq::Error::Status(status, response)) => match status {
+            401 => {
+                let code = response
+                    .into_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| {
+                        body.get("detail")?
+                            .get("code")?
+                            .as_str()
+                            .map(str::to_string)
+                    });
+                if code.as_deref() == Some("device_credential_refused") {
+                    IdleProbeAnswer::Refused
+                } else {
+                    IdleProbeAnswer::NoProof
+                }
+            }
+            404 | 405 => IdleProbeAnswer::NoRoute,
+            429 | 500..=599 => IdleProbeAnswer::Throttled {
+                retry_after: response
+                    .header("Retry-After")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs),
+            },
+            _ => IdleProbeAnswer::NoProof,
         },
-        Err(LocalApiError::Backend(details))
-            if details.status == Some(401)
-                && details.reason_code.as_deref() == Some("device_credential_refused") =>
-        {
-            IdleCredentialAnswer::Refused
-        }
-        Err(_) => IdleCredentialAnswer::NoProof,
+        Err(_) => IdleProbeAnswer::NoProof,
     }
 }
 
@@ -288,13 +284,23 @@ pub(in crate::control) fn refresh_setup_run_token_checked(
     let api_base_url = api_base_url.as_str();
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
-    let device = FileDeviceStore::default()
-        .load()
-        .or_state_poisoned()?
-        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-        .load()
-        .map_err(|_| LocalApiError::SetupRunConnectionMissing)?;
+    // The pair is read with the credential epoch under the identity lifecycle
+    // lock, so the commit below can tell whether it was replaced meanwhile.
+    let (epoch, device, device_secret) = {
+        let _binding_lock = lock_setup_run_binding();
+        let device = FileDeviceStore::default()
+            .load()
+            .or_state_poisoned()?
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(|_| LocalApiError::SetupRunConnectionMissing)?;
+        (
+            crate::control::device_credential_epoch(),
+            device,
+            device_secret,
+        )
+    };
 
     let url = api_url_with_base(
         api_base_url,
@@ -321,6 +327,11 @@ pub(in crate::control) fn refresh_setup_run_token_checked(
     refreshed.setup_run_token_expires_at = response.expires_at.clone();
     let committed = {
         let _binding_lock = lock_setup_run_binding();
+        // A token minted with a credential that was replaced while the request
+        // was in flight is dropped; the next read refreshes again.
+        if crate::control::device_credential_epoch() != epoch {
+            return Err(LocalApiError::IdentityMutationInProgress);
+        }
         commit_refreshed_setup_run_binding_locked(
             connection,
             &refreshed,

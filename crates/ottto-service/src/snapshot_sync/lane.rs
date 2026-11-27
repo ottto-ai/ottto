@@ -19,8 +19,8 @@ use super::report_checkin_status_with_fresh_relay_token;
 use super::rfc3339_after_minutes;
 use super::safe_error;
 
+use super::local_health_pass;
 use super::start_collection_health;
-use super::upload_local_health_projection_now;
 use super::upload_local_health_projection_reporting;
 use super::with_source_cadence;
 use super::BTreeMap;
@@ -30,8 +30,8 @@ use super::FileMachineStore;
 use super::Instant;
 use super::LocalDaemon;
 use super::LocalDeviceBinding;
+use super::LocalHealthPass;
 use super::Mutex;
-use super::NoHeartbeatSource;
 use super::Path;
 use super::Result;
 use super::ScanIndex;
@@ -297,39 +297,36 @@ pub(super) fn local_cadence_phase_offset(interval: Duration) -> Duration {
     }
 }
 
-/// How often a Mac with no enabled app checks its device credential with
-/// Ottto. The check rides the local-health pass (every
-/// `LOCAL_HEALTH_PROJECTION_INTERVAL`); this only spaces it out, so there is no
-/// timer of its own.
+/// How often a Mac with no heartbeat source checks its device credential
+/// with Ottto, in awake time. The check rides the local-health pass (every
+/// `LOCAL_HEALTH_PROJECTION_INTERVAL`); there is no timer of its own.
 pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// After a check that got no answer (the network is often not back right
-/// after a wake), the next try comes this much later instead of an hour.
-pub(super) const IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER: Duration = Duration::from_secs(5 * 60);
+/// After a check without an answer (the network is often not back right after
+/// a wake), up to [`IDLE_CREDENTIAL_SOON_RETRIES`] retries this much later,
+/// then hourly again.
+pub(super) const IDLE_CREDENTIAL_SOON_RETRY: Duration = Duration::from_secs(5 * 60);
 
-/// What the hourly gate counts from after a check at `now`: `now`, or, when
-/// the check got no answer, a point that makes the next check due after
-/// [`IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER`].
-pub(super) fn idle_credential_check_anchor(now: Instant, answered: bool) -> Instant {
-    if answered {
-        return now;
-    }
-    now.checked_sub(IDLE_CREDENTIAL_CHECK_INTERVAL - IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER)
-        .unwrap_or(now)
-}
+pub(super) const IDLE_CREDENTIAL_SOON_RETRIES: u8 = 2;
+
+/// Waits after Ottto asks to slow down (429, 5xx), before jitter; the last
+/// one repeats.
+pub(super) const IDLE_CREDENTIAL_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+];
+
+/// The longest `Retry-After` honoured at a time; a server still refusing then
+/// answers 429 again.
+pub(super) const IDLE_CREDENTIAL_RETRY_AFTER_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Quiet mode for a server without the status route (404, 405).
+pub(super) const IDLE_CREDENTIAL_NO_ROUTE_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The wall clock moved this much more than the monotonic clock between two
 /// passes: the Mac slept (the monotonic clock stops during sleep on macOS).
 pub(super) const WAKE_GAP: Duration = Duration::from_secs(2 * 60);
-
-/// Whether this pass runs the idle credential check: the first pass with no
-/// enabled app, the first pass after the Mac wakes, then once per
-/// [`IDLE_CREDENTIAL_CHECK_INTERVAL`] of awake time. A wake needs at least
-/// [`WAKE_GAP`] of sleep, so a lid that opens and closes can't storm.
-pub(super) fn idle_credential_check_due(last: Option<Instant>, now: Instant, woke: bool) -> bool {
-    woke || last
-        .is_none_or(|last| now.saturating_duration_since(last) >= IDLE_CREDENTIAL_CHECK_INTERVAL)
-}
 
 /// Whether the Mac slept between two passes, from how much further the wall
 /// clock moved than the monotonic one. A wall clock set back never counts.
@@ -340,38 +337,154 @@ pub(super) fn woke_between(previous: (Instant, SystemTime), now: (Instant, Syste
         .is_ok_and(|wall| wall.saturating_sub(awake) >= WAKE_GAP)
 }
 
+/// `duration` scaled by a random factor in [0.8, 1.2], so Macs that woke
+/// together spread their checks.
+pub(super) fn jittered(duration: Duration) -> Duration {
+    let mut bytes = [0u8; 4];
+    let unit = match getrandom::fill(&mut bytes) {
+        Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
+        Err(_) => 0.5,
+    };
+    duration.mul_f64(0.8 + 0.4 * unit)
+}
+
+/// When the idle credential check runs: once the local-health thread starts,
+/// once per awake [`IDLE_CREDENTIAL_CHECK_INTERVAL`], after a detected wake
+/// and after a credential write, never before `not_before` (a server throttle
+/// or quiet mode). Only an attempt that sent a request consumes a wake, and
+/// only a recorded answer counts as answered. `Instant` stops during sleep, so
+/// every wait lasts at least as long in wall time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IdleCredentialSchedule {
+    pub(super) due: Instant,
+    pub(super) not_before: Instant,
+    pub(super) wake_pending: bool,
+    pub(super) soon_left: u8,
+    pub(super) backoff_step: u8,
+    pub(super) seen_epoch: u64,
+}
+
+impl IdleCredentialSchedule {
+    pub(super) fn new(now: Instant, epoch: u64) -> Self {
+        Self {
+            due: now,
+            not_before: now,
+            wake_pending: false,
+            soon_left: IDLE_CREDENTIAL_SOON_RETRIES,
+            backoff_step: 0,
+            seen_epoch: epoch,
+        }
+    }
+
+    /// Start of a pass: a detected wake, and a credential write since the
+    /// last pass, make the check due (still after `not_before`).
+    pub(super) fn observe(&mut self, now: Instant, woke: bool, epoch: u64) {
+        if woke {
+            self.wake_pending = true;
+        }
+        if epoch != self.seen_epoch {
+            self.seen_epoch = epoch;
+            self.due = now;
+            self.soon_left = IDLE_CREDENTIAL_SOON_RETRIES;
+        }
+    }
+
+    /// A heartbeat source ran, so uploads prove the credential now. If the
+    /// Mac loses its source again, it checks at once.
+    pub(super) fn heartbeat_ran(&mut self, now: Instant) {
+        self.due = now;
+        self.wake_pending = false;
+    }
+
+    pub(super) fn should_check(&self, now: Instant) -> bool {
+        now >= self.not_before && (self.wake_pending || now >= self.due)
+    }
+
+    pub(super) fn record(
+        &mut self,
+        now: Instant,
+        outcome: crate::control::IdleCredentialCheck,
+        jitter: impl Fn(Duration) -> Duration,
+    ) {
+        use crate::control::IdleCredentialCheck;
+        match outcome {
+            IdleCredentialCheck::Skipped => {}
+            IdleCredentialCheck::Answered => {
+                self.due = now + IDLE_CREDENTIAL_CHECK_INTERVAL;
+                self.wake_pending = false;
+                self.soon_left = IDLE_CREDENTIAL_SOON_RETRIES;
+                self.backoff_step = 0;
+            }
+            IdleCredentialCheck::Transient => {
+                self.wake_pending = false;
+                if self.soon_left > 0 {
+                    self.soon_left -= 1;
+                    self.due = now + IDLE_CREDENTIAL_SOON_RETRY;
+                } else {
+                    self.due = now + IDLE_CREDENTIAL_CHECK_INTERVAL;
+                }
+            }
+            IdleCredentialCheck::Throttled { retry_after } => {
+                let server_floor = retry_after
+                    .unwrap_or(Duration::ZERO)
+                    .min(IDLE_CREDENTIAL_RETRY_AFTER_CAP);
+                let step = IDLE_CREDENTIAL_BACKOFF[usize::from(self.backoff_step)];
+                self.not_before = now + server_floor.max(jitter(step));
+                self.due = self.not_before;
+                self.backoff_step = (self.backoff_step + 1).min(2);
+                self.wake_pending = false;
+            }
+            IdleCredentialCheck::NoRoute => {
+                self.not_before = now + jitter(IDLE_CREDENTIAL_NO_ROUTE_WAIT);
+                self.due = self.not_before;
+                self.backoff_step = 0;
+                self.wake_pending = false;
+            }
+        }
+    }
+}
+
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-local-health-sync".to_string())
         .spawn(move || {
-            let mut last_idle_credential_check: Option<Instant> = None;
+            let mut idle_check = IdleCredentialSchedule::new(
+                Instant::now(),
+                crate::control::device_credential_epoch(),
+            );
             let mut last_pass: Option<(Instant, SystemTime)> = None;
             loop {
                 let this_pass = (Instant::now(), SystemTime::now());
                 let woke = last_pass.is_some_and(|previous| woke_between(previous, this_pass));
                 last_pass = Some(this_pass);
-                match upload_local_health_projection_now(&daemon) {
-                    // No app is enabled, so no local-health upload checks this
-                    // Mac's credential. Check it on its own, spaced out.
-                    Err(error) if error.downcast_ref::<NoHeartbeatSource>().is_some() => {
+                idle_check.observe(this_pass.0, woke, crate::control::device_credential_epoch());
+                let error = match local_health_pass(&daemon) {
+                    LocalHealthPass::SourceRan(result) => {
+                        idle_check.heartbeat_ran(Instant::now());
+                        result.err()
+                    }
+                    // No upload checks this Mac's credential: check it on its
+                    // own. A pass that stopped early usually also stops the
+                    // check's own capture, which then keeps the wake.
+                    pass @ (LocalHealthPass::NoSource | LocalHealthPass::PreSource(_)) => {
                         let now = Instant::now();
-                        if idle_credential_check_due(last_idle_credential_check, now, woke) {
-                            let answer = crate::control::probe_idle_device_credential(&daemon);
-                            let answered =
-                                answer != Some(crate::control::IdleCredentialAnswer::NoProof);
-                            last_idle_credential_check =
-                                Some(idle_credential_check_anchor(now, answered));
+                        if idle_check.should_check(now) {
+                            let outcome = crate::control::probe_idle_device_credential(&daemon);
+                            idle_check.record(Instant::now(), outcome, jittered);
+                        }
+                        match pass {
+                            LocalHealthPass::PreSource(error) => Some(error),
+                            _ => None,
                         }
                     }
-                    Err(error) => {
-                        if !local_health_upload_can_wait_quietly(&error) {
-                            eprintln!(
-                                "local health projection upload skipped: {}",
-                                safe_error(&error)
-                            );
-                        }
+                };
+                if let Some(error) = error {
+                    if !local_health_upload_can_wait_quietly(&error) {
+                        eprintln!(
+                            "local health projection upload skipped: {}",
+                            safe_error(&error)
+                        );
                     }
-                    Ok(()) => {}
                 }
                 crate::control::reconcile_setup_scan_in_background(&daemon);
                 std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
@@ -525,7 +638,10 @@ pub(super) fn sync_once(
     drain_relay_journal(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
-    let (device, device_secret) = load_snapshot_device_credentials()?;
+    // The cycle's credential, captured with its epoch so the heartbeat's
+    // answer is recorded only while it is still the active one.
+    let authority = crate::control::capture_credential_authority()?;
+    let (device, device_secret) = (authority.device.clone(), authority.secret.clone());
     daemon
         .record_source_grants(&device)
         .map_err(|_| anyhow!("source grants unavailable"))?;
@@ -536,7 +652,7 @@ pub(super) fn sync_once(
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
-    let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
+    let enabled_sources = cycle_heartbeat(&client, &authority, &machine_id, daemon);
     continuation_cycle.collecting(&enabled_sources);
     for source in enabled_sources.iter().copied() {
         start_collection_health(source);
@@ -605,20 +721,15 @@ pub(super) fn sync_once(
 /// reply carries stops that source in this same cycle.
 pub(super) fn cycle_heartbeat(
     client: &SnapshotApiClient,
-    device: &LocalDeviceBinding,
-    device_secret: &str,
+    authority: &crate::control::CredentialAuthority,
     machine_id: &str,
     daemon: &LocalDaemon,
 ) -> Vec<SnapshotSource> {
+    let device = &authority.device;
     if let Some(source) = heartbeat_source(device) {
-        if let Err(error) = upload_local_health_projection_reporting(
-            client,
-            device,
-            device_secret,
-            source,
-            machine_id,
-            daemon,
-        ) {
+        if let Err(error) =
+            upload_local_health_projection_reporting(client, authority, source, machine_id, daemon)
+        {
             eprintln!(
                 "local health projection upload skipped: {}",
                 safe_error(&error)
@@ -1479,58 +1590,184 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod idle_credential_check_tests {
-    use super::idle_credential_check_anchor;
-    use super::idle_credential_check_due;
+    use super::jittered;
     use super::woke_between;
     use super::Duration;
+    use super::IdleCredentialSchedule;
     use super::Instant;
     use super::SystemTime;
     use super::IDLE_CREDENTIAL_CHECK_INTERVAL;
-    use super::IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER;
+    use super::IDLE_CREDENTIAL_NO_ROUTE_WAIT;
+    use super::IDLE_CREDENTIAL_SOON_RETRY;
     use super::WAKE_GAP;
+    use crate::control::IdleCredentialCheck::{Answered, NoRoute, Skipped, Throttled, Transient};
 
-    #[test]
-    fn idle_credential_check_runs_first_then_hourly_and_on_wake() {
-        assert_eq!(IDLE_CREDENTIAL_CHECK_INTERVAL, Duration::from_secs(60 * 60));
-        let start = Instant::now();
-        assert!(idle_credential_check_due(None, start, false));
-        assert!(!idle_credential_check_due(Some(start), start, false));
-        assert!(!idle_credential_check_due(
-            Some(start),
-            start + IDLE_CREDENTIAL_CHECK_INTERVAL - Duration::from_secs(1),
-            false
-        ));
-        assert!(idle_credential_check_due(
-            Some(start),
-            start + IDLE_CREDENTIAL_CHECK_INTERVAL,
-            false
-        ));
-        // A wake checks at once.
-        assert!(idle_credential_check_due(Some(start), start, true));
-        // A clock that reads earlier than the last check never fires early.
-        assert!(!idle_credential_check_due(
-            Some(start + Duration::from_secs(5)),
-            start,
-            false
-        ));
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn exact(duration: Duration) -> Duration {
+        duration
     }
 
     #[test]
-    fn a_check_with_no_answer_retries_after_minutes_not_an_hour() {
-        let start = Instant::now() + IDLE_CREDENTIAL_CHECK_INTERVAL;
-        let answered = idle_credential_check_anchor(start, true);
-        assert_eq!(answered, start);
-        let unanswered = idle_credential_check_anchor(start, false);
-        assert!(!idle_credential_check_due(
-            Some(unanswered),
-            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER - Duration::from_secs(1),
-            false
-        ));
-        assert!(idle_credential_check_due(
-            Some(unanswered),
-            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER,
-            false
-        ));
+    fn checks_at_start_then_hourly_after_an_answer() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        assert!(schedule.should_check(start));
+        schedule.record(start, Answered, exact);
+        assert!(!schedule.should_check(start + IDLE_CREDENTIAL_CHECK_INTERVAL - SECOND));
+        assert!(schedule.should_check(start + IDLE_CREDENTIAL_CHECK_INTERVAL));
+    }
+
+    #[test]
+    fn a_wake_checks_at_once_and_only_a_sent_request_consumes_it() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        schedule.record(start, Answered, exact);
+        let later = start + Duration::from_secs(60);
+        assert!(!schedule.should_check(later));
+        schedule.observe(later, true, 7);
+        assert!(schedule.should_check(later));
+        // Nothing was sent (no credential yet, or an identity change in
+        // progress): the wake stays for the next pass.
+        schedule.record(later, Skipped, exact);
+        assert!(schedule.should_check(later + SECOND));
+        schedule.record(later, Answered, exact);
+        assert!(!schedule.should_check(later + SECOND));
+    }
+
+    #[test]
+    fn a_heartbeat_source_takes_over_and_its_loss_checks_at_once() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        schedule.record(start, Answered, exact);
+        schedule.observe(start + SECOND, true, 7);
+        let ran = start + Duration::from_secs(60);
+        schedule.heartbeat_ran(ran);
+        assert!(!schedule.wake_pending, "uploads prove the credential now");
+        assert!(schedule.should_check(ran + SECOND));
+    }
+
+    #[test]
+    fn a_credential_write_rearms_the_check_but_keeps_the_server_floor() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        schedule.record(start, Answered, exact);
+        schedule.record(start, Transient, exact);
+        let later = start + Duration::from_secs(60);
+        schedule.observe(later, false, 8);
+        assert!(schedule.should_check(later));
+        assert_eq!(schedule.soon_left, 2);
+
+        let mut throttled = IdleCredentialSchedule::new(start, 7);
+        throttled.record(
+            start,
+            Throttled {
+                retry_after: Some(Duration::from_secs(900)),
+            },
+            exact,
+        );
+        throttled.observe(later, true, 8);
+        assert!(
+            !throttled.should_check(later),
+            "a write never beats the server floor"
+        );
+        assert!(throttled.should_check(start + Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn no_answer_retries_twice_soon_then_hourly() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        let mut now = start;
+        for _ in 0..2 {
+            schedule.record(now, Transient, exact);
+            assert!(!schedule.should_check(now + IDLE_CREDENTIAL_SOON_RETRY - SECOND));
+            now += IDLE_CREDENTIAL_SOON_RETRY;
+            assert!(schedule.should_check(now));
+        }
+        schedule.record(now, Transient, exact);
+        assert!(!schedule.should_check(now + IDLE_CREDENTIAL_CHECK_INTERVAL - SECOND));
+        assert!(schedule.should_check(now + IDLE_CREDENTIAL_CHECK_INTERVAL));
+        // An answer restores the soon retries.
+        schedule.record(now, Answered, exact);
+        assert_eq!(schedule.soon_left, 2);
+    }
+
+    #[test]
+    fn retry_after_is_a_floor_that_jitter_never_shortens() {
+        let start = Instant::now();
+        for factor in [0.8, 1.0, 1.2] {
+            let mut schedule = IdleCredentialSchedule::new(start, 7);
+            schedule.observe(start, true, 7);
+            schedule.record(
+                start,
+                Throttled {
+                    retry_after: Some(Duration::from_secs(900)),
+                },
+                |step: Duration| step.mul_f64(factor),
+            );
+            assert!(schedule.not_before >= start + Duration::from_secs(900));
+            // A wake is only a hint: it waits for the floor too.
+            schedule.observe(start + Duration::from_secs(600), true, 7);
+            assert!(!schedule.should_check(start + Duration::from_secs(600)));
+        }
+        for _ in 0..64 {
+            let mut schedule = IdleCredentialSchedule::new(start, 7);
+            schedule.record(
+                start,
+                Throttled {
+                    retry_after: Some(Duration::from_secs(900)),
+                },
+                jittered,
+            );
+            assert!(schedule.not_before >= start + Duration::from_secs(900));
+        }
+    }
+
+    #[test]
+    fn throttling_backs_off_and_caps_retry_after() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        for minutes in [5, 15, 60, 60] {
+            schedule.record(start, Throttled { retry_after: None }, exact);
+            assert_eq!(
+                schedule.not_before,
+                start + Duration::from_secs(minutes * 60)
+            );
+        }
+        schedule.record(
+            start,
+            Throttled {
+                retry_after: Some(Duration::from_secs(48 * 60 * 60)),
+            },
+            exact,
+        );
+        assert_eq!(
+            schedule.not_before,
+            start + Duration::from_secs(6 * 60 * 60)
+        );
+        schedule.record(start, Answered, exact);
+        assert_eq!(schedule.backoff_step, 0);
+    }
+
+    #[test]
+    fn a_server_without_the_route_is_left_alone_for_hours() {
+        let start = Instant::now();
+        let mut schedule = IdleCredentialSchedule::new(start, 7);
+        schedule.record(start, NoRoute, jittered);
+        assert!(schedule.not_before >= start + IDLE_CREDENTIAL_NO_ROUTE_WAIT.mul_f64(0.8));
+        assert!(schedule.not_before <= start + IDLE_CREDENTIAL_NO_ROUTE_WAIT.mul_f64(1.2));
+        let later = start + Duration::from_secs(60 * 60);
+        schedule.observe(later, true, 7);
+        assert!(!schedule.should_check(later), "a wake waits too");
+    }
+
+    #[test]
+    fn jitter_stays_within_a_fifth() {
+        for _ in 0..64 {
+            let value = jittered(Duration::from_secs(1000));
+            assert!(value >= Duration::from_secs(800) && value <= Duration::from_secs(1200));
+        }
     }
 
     #[test]
