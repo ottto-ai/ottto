@@ -3352,8 +3352,7 @@ fn carried_ack_clock_scalars_bound_malformed_spans_across_load_carry_and_save() 
         );
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let recovered =
-            lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code")
-                .unwrap();
+            lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code").unwrap();
         assert_eq!(serde_json::to_value(&recovered).unwrap().get(field), None);
         assert_eq!(
             recovered.accepted_snapshot_fingerprints,
