@@ -281,6 +281,7 @@ use backend_http::control_token_validation_base_url;
 use backend_http::form_url_encode;
 pub(crate) use backend_http::is_production_api_base_url;
 use backend_http::reattach_required_state;
+use backend_http::require_request_base_matches_binding;
 #[cfg(test)]
 use backend_http::safe_backend_body_excerpt;
 use backend_http::safe_backend_endpoint;

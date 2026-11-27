@@ -4,6 +4,7 @@ use crate::control::api_url_with_base;
 use crate::control::backend_post_json;
 use crate::control::current_rfc3339_timestamp;
 use crate::control::diagnostics_local_only_upload_report;
+use crate::control::require_request_base_matches_binding;
 use crate::control::status_for;
 use crate::control::to_value;
 use crate::control::validated_api_base_url;
@@ -58,6 +59,12 @@ pub(super) fn diagnostics_collect(
     })?;
     validate_diagnostics_upload_approval(&approval)?;
     let upload_authorization = diagnostics_upload_authorization(daemon, authorization, &approval)?;
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        upload_authorization
+            .connection_api_base_url()
+            .map(String::as_str),
+    )?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         upload_authorization
             .connection_api_base_url()

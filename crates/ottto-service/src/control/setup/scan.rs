@@ -22,6 +22,7 @@ use crate::control::refresh_setup_run_token_via_device_secret;
 use crate::control::request_snapshot_sync_after_device_registration;
 use crate::control::request_snapshot_sync_after_setup_actions;
 use crate::control::require_authorized_local_client;
+use crate::control::require_request_base_matches_binding;
 use crate::control::rfc3339_after_minutes;
 use crate::control::setup_result_from_detail;
 use crate::control::setup_run_request_with_refresh_mut;
@@ -74,6 +75,21 @@ pub(in crate::control) fn setup_run(
     let status = status_for(daemon, authorization)?;
     crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
+    // A fresh claim on a Mac that is not connected may name another backend
+    // (it replaces the binding without sending its credentials); anything
+    // else uses the saved binding's backend.
+    let fresh_claim = status.account.state != LocalAccountState::Connected
+        && claim_code
+            .as_ref()
+            .is_some_and(|code| !code.trim().is_empty());
+    if !fresh_claim {
+        require_request_base_matches_binding(
+            api_base_url.as_deref(),
+            connection
+                .as_ref()
+                .map(|binding| binding.api_base_url.as_str()),
+        )?;
+    }
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()
@@ -346,6 +362,12 @@ pub(in crate::control) fn setup_answer(
         daemon.clear_tracking_confirmation(&source)?;
     }
     let mut connection = daemon.connection_for_authorized_client()?;
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        connection
+            .as_ref()
+            .map(|binding| binding.api_base_url.as_str()),
+    )?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()

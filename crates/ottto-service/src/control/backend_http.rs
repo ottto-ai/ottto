@@ -455,6 +455,26 @@ fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
     None
 }
 
+/// A request may name only the backend this Mac's saved setup-run binding
+/// uses, so the binding's credentials never go to another one. Connecting to a
+/// different backend starts with a sign-out (or, on a Mac that is not
+/// connected, a fresh browser claim, which replaces the binding).
+pub(super) fn require_request_base_matches_binding(
+    requested: Option<&str>,
+    binding_base: Option<&str>,
+) -> Result<(), LocalApiError> {
+    let normalize = |value: &str| value.trim().trim_end_matches('/').to_string();
+    match (requested.map(normalize).filter(|value| !value.is_empty()), binding_base) {
+        (Some(requested), Some(binding)) if requested != normalize(binding) => {
+            Err(LocalApiError::InvalidRequest(
+                "This Mac is already connected to an Ottto backend. Sign out first to connect it to another one."
+                    .to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn validated_api_base_url(raw: Option<&str>) -> Result<String, LocalApiError> {
     let env_value = std::env::var("OTTTO_API_BASE_URL").ok();
     let value = raw
