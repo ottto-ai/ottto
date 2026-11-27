@@ -56,6 +56,13 @@ Ottto account and organization ids, versions, states, codes, timestamps and
 short status messages; command output in those messages has local paths
 removed.
 
+A connected Mac with no enabled app sends no health reports. Instead it checks
+its sign-in with Ottto every 15 minutes. That check sends only this Mac's device
+id and device secret to the setup-run refresh endpoint, and saves the new
+setup-run token it gets back. It sends no source, usage or local data. If Ottto
+refuses the device, `ottto account` and `ottto status` report that the Mac needs
+to reconnect.
+
 ## The Mac App
 
 The Ottto Mac app is a client of `ottto-service`: usage collection and uploads

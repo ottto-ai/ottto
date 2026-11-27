@@ -806,6 +806,9 @@ use status::install_variant_conflict;
 use status::install_variant_conflict_in;
 use status::local_lifecycle_home;
 use status::operating_system_slug;
+pub(crate) use status::probe_idle_device_credential;
+#[cfg(test)]
+pub(crate) use status::probe_idle_device_credential_with;
 use status::refresh_agent_status_for;
 use status::request_explicit_quota_refresh;
 use status::rfc3339_after_minutes;

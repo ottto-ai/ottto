@@ -1626,9 +1626,17 @@ mod tests {
             .expect("status")
             .canonical_health
             .expect("canonical health");
+        // Nothing this Mac sends is accepted any more, so the account reads
+        // reconnect-required, as after a rejected local-health upload.
         assert_eq!(
             device_rejected.account.state,
-            LocalHealthAccountState::Connected
+            LocalHealthAccountState::ReconnectRequired
+        );
+        let effective = effective_account_binding(&daemon.status(TOKEN).expect("status"));
+        assert_eq!(effective.state, LocalAccountState::Error);
+        assert_eq!(
+            effective.message.map(|message| message.code).as_deref(),
+            Some("reconnect_required")
         );
         assert_eq!(
             device_rejected.account.setup_run_state,
@@ -1676,6 +1684,133 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "device_credential_rejected"));
+    }
+
+    fn refresh_error(status: Option<u16>, detail: &str) -> LocalApiError {
+        LocalApiError::Backend(BackendErrorDetails {
+            kind: if status.is_some() {
+                BackendErrorKind::Rejected
+            } else {
+                BackendErrorKind::Unreachable
+            },
+            endpoint: "https://api.ottto.net/api/v1/setup-runs/run_1/local-client/refresh"
+                .to_string(),
+            status,
+            body_excerpt: Some(format!(r#"{{"detail":"{detail}"}}"#)),
+            reason_code: None,
+        })
+    }
+
+    fn setup_run_read_events(daemon: &LocalDaemon) -> usize {
+        daemon
+            .status(TOKEN)
+            .expect("status")
+            .local_health_events
+            .iter()
+            .filter(|event| event.event_type.starts_with("SetupRunRead"))
+            .count()
+    }
+
+    #[test]
+    fn idle_credential_check_reports_a_disconnected_mac_and_its_recovery() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+
+        let mut refreshed_with = None;
+        crate::control::probe_idle_device_credential_with(&daemon, |base, binding| {
+            refreshed_with = Some((base.to_string(), binding.setup_run_id.clone()));
+            Err(refresh_error(Some(401), "Telemetry device is not active"))
+        });
+        assert_eq!(
+            refreshed_with,
+            Some(("https://api.ottto.net".to_string(), "run_1".to_string()))
+        );
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .canonical_health
+                .as_ref()
+                .expect("health")
+                .account
+                .state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+        let effective = effective_account_binding(&status);
+        assert_eq!(effective.state, LocalAccountState::Error);
+        assert_eq!(
+            effective.message.map(|message| message.code).as_deref(),
+            Some("reconnect_required")
+        );
+        assert_eq!(
+            daemon.status(TOKEN).expect("status").account.state,
+            LocalAccountState::Connected,
+            "the saved binding is unchanged; only the reported account changes"
+        );
+
+        // The next check that Ottto accepts clears it.
+        crate::control::probe_idle_device_credential_with(&daemon, |_, _| Ok(()));
+        let recovered = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            effective_account_binding(&recovered).state,
+            LocalAccountState::Connected
+        );
+        assert!(latest_setup_run_read_rejection(&recovered.local_health_events).is_none());
+    }
+
+    #[test]
+    fn idle_credential_check_ignores_answers_that_prove_nothing() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run));
+        for error in [
+            refresh_error(None, "connection refused"),
+            refresh_error(Some(503), "Service Unavailable"),
+            refresh_error(Some(401), "Setup run companion token expired"),
+            LocalApiError::IdentityMutationInProgress,
+        ] {
+            crate::control::probe_idle_device_credential_with(&daemon, |_, _| Err(error));
+        }
+        assert_eq!(setup_run_read_events(&daemon), 0);
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.account.state, LocalAccountState::Connected);
+        assert_eq!(
+            effective_account_binding(&status).state,
+            LocalAccountState::Connected
+        );
+    }
+
+    #[test]
+    fn idle_credential_check_keeps_the_deleted_account_path_separate() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run));
+        crate::control::probe_idle_device_credential_with(&daemon, |_, _| {
+            Err(refresh_error(Some(401), "account_not_found"))
+        });
+        assert_eq!(
+            setup_run_read_events(&daemon),
+            0,
+            "a deleted account is not recorded as a refused device"
+        );
+        assert_eq!(
+            daemon.status(TOKEN).expect("status").account.state,
+            LocalAccountState::Error
+        );
+    }
+
+    #[test]
+    fn idle_credential_check_needs_a_connected_account() {
+        let daemon = daemon().with_connection(Some(read_binding("run_1")));
+        let mut called = false;
+        crate::control::probe_idle_device_credential_with(&daemon, |_, _| {
+            called = true;
+            Ok(())
+        });
+        assert!(!called, "no check without a connected account");
     }
 
     #[test]

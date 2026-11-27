@@ -31,6 +31,7 @@ use super::Instant;
 use super::LocalDaemon;
 use super::LocalDeviceBinding;
 use super::Mutex;
+use super::NoHeartbeatSource;
 use super::Path;
 use super::Result;
 use super::ScanIndex;
@@ -295,20 +296,47 @@ pub(super) fn local_cadence_phase_offset(interval: Duration) -> Duration {
     }
 }
 
+/// How often a Mac with no enabled app checks its device credential with
+/// Ottto. The check rides the local-health pass (every
+/// `LOCAL_HEALTH_PROJECTION_INTERVAL`); this only spaces it out, so there is no
+/// timer of its own.
+pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Whether this pass runs the idle credential check: the first pass with no
+/// enabled app, then once per [`IDLE_CREDENTIAL_CHECK_INTERVAL`].
+pub(super) fn idle_credential_check_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= IDLE_CREDENTIAL_CHECK_INTERVAL)
+}
+
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-local-health-sync".to_string())
-        .spawn(move || loop {
-            if let Err(error) = upload_local_health_projection_now(&daemon) {
-                if !local_health_upload_can_wait_quietly(&error) {
-                    eprintln!(
-                        "local health projection upload skipped: {}",
-                        safe_error(&error)
-                    );
+        .spawn(move || {
+            let mut last_idle_credential_check: Option<Instant> = None;
+            loop {
+                match upload_local_health_projection_now(&daemon) {
+                    // No app is enabled, so no local-health upload checks this
+                    // Mac's credential. Check it on its own, spaced out.
+                    Err(error) if error.downcast_ref::<NoHeartbeatSource>().is_some() => {
+                        let now = Instant::now();
+                        if idle_credential_check_due(last_idle_credential_check, now) {
+                            last_idle_credential_check = Some(now);
+                            crate::control::probe_idle_device_credential(&daemon);
+                        }
+                    }
+                    Err(error) => {
+                        if !local_health_upload_can_wait_quietly(&error) {
+                            eprintln!(
+                                "local health projection upload skipped: {}",
+                                safe_error(&error)
+                            );
+                        }
+                    }
+                    Ok(()) => {}
                 }
+                crate::control::reconcile_setup_scan_in_background(&daemon);
+                std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
             }
-            crate::control::reconcile_setup_scan_in_background(&daemon);
-            std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
     Ok(())
@@ -1408,4 +1436,32 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("HOME is not set"))
+}
+
+#[cfg(test)]
+mod idle_credential_check_tests {
+    use super::idle_credential_check_due;
+    use super::Duration;
+    use super::Instant;
+    use super::IDLE_CREDENTIAL_CHECK_INTERVAL;
+
+    #[test]
+    fn idle_credential_check_runs_first_then_once_per_interval() {
+        let start = Instant::now();
+        assert!(idle_credential_check_due(None, start));
+        assert!(!idle_credential_check_due(Some(start), start));
+        assert!(!idle_credential_check_due(
+            Some(start),
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(idle_credential_check_due(
+            Some(start),
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL
+        ));
+        // A clock that reads earlier than the last check never fires early.
+        assert!(!idle_credential_check_due(
+            Some(start + Duration::from_secs(5)),
+            start
+        ));
+    }
 }

@@ -872,6 +872,10 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             setup_token_state = LocalSetupTokenState::Expired;
         }
         Some(TerminalRefreshRejection::DeviceRejected) => {
+            // Ottto refused this Mac's device credential: nothing it sends is
+            // accepted until it signs in again, the same answer as a rejected
+            // local-health upload. `account` and `status` then say so.
+            state = LocalHealthAccountState::ReconnectRequired;
             setup_run_state = LocalSetupRunState::Unknown;
             setup_token_state = LocalSetupTokenState::RefreshRequired;
         }

@@ -230,6 +230,56 @@ fn observe_setup_run_read<T>(
     result
 }
 
+/// The device credential check for a Mac with no enabled app. Uploads and
+/// local-health passes need an app's relay token, so without one nothing tells
+/// this Mac that Ottto disconnected it. The heartbeat thread calls this every
+/// `IDLE_CREDENTIAL_CHECK_INTERVAL` while no app is enabled.
+///
+/// The check is the setup-run refresh: one POST of this Mac's device id and
+/// device secret, with no source, usage or local data, and the answer's new
+/// setup-run token is saved as on any refresh. Only an authoritative answer is
+/// recorded, the same way as for agent reads: a terminal answer marks the setup
+/// run rejected (a refused device credential then reads reconnect-required in
+/// `account` and `status`), a success clears an earlier rejection, and a
+/// deleted account still goes to the account-not-found path. Network,
+/// timeout and other backend failures say nothing and change nothing.
+pub(crate) fn probe_idle_device_credential(daemon: &LocalDaemon) {
+    probe_idle_device_credential_with(daemon, |api_base_url, binding| {
+        refresh_setup_run_token_via_device_secret(api_base_url, binding).map(|_| ())
+    });
+}
+
+pub(crate) fn probe_idle_device_credential_with(
+    daemon: &LocalDaemon,
+    refresh: impl FnOnce(&str, &LocalConnectionBinding) -> Result<(), LocalApiError>,
+) {
+    let connected = daemon
+        .status_for_trusted_client()
+        .is_ok_and(|status| status.account.state == LocalAccountState::Connected);
+    if !connected {
+        return;
+    }
+    let Ok(Some(start)) = daemon.setup_run_read_start() else {
+        return;
+    };
+    let Ok(api_base_url) = validated_api_base_url(Some(start.binding.api_base_url.as_str())) else {
+        return;
+    };
+    match refresh(&api_base_url, &start.binding) {
+        Ok(()) => {
+            let _ = daemon.record_setup_run_read_accepted(&start);
+        }
+        Err(error) if crate::control::backend_error_indicates_account_gone(&error) => {
+            let _ = daemon.mark_account_not_found();
+        }
+        Err(error) => {
+            if let Some(rejection) = terminal_refresh_rejection(&error) {
+                let _ = daemon.record_setup_run_read_rejected(&start.binding, rejection);
+            }
+        }
+    }
+}
+
 /// `ottto cloud status`: read-only connector status through the setup-run
 /// bridge, plus whether this service serves the Mac app's signer. Attempt-specific status and
 /// Bedrock setup use the cloud-connect control commands.
