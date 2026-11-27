@@ -6,7 +6,6 @@ MANIFEST=""
 SIGNATURE=""
 IDENTITY="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
 KEYCHAIN=""
-LEAF_PINS=()
 
 usage() {
   cat <<'USAGE'
@@ -20,10 +19,6 @@ Options:
   --signature <path>  Signature path. Default: <manifest>.sig
   --identity <name>   Expected Developer ID Application identity for signing and verification.
   --keychain <path>   Optional keychain used by security cms/find-certificate.
-  --leaf-sha256 <hex> verify only: accept the signature when the actual
-                      signer's certificate (DER) has this SHA-256, instead of
-                      matching --identity in a keychain. Needs no signing
-                      identity on the machine. May be given twice (rotation).
   -h, --help          Show help.
 USAGE
 }
@@ -49,10 +44,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keychain)
       KEYCHAIN="${2:?--keychain requires a value}"
-      shift 2
-      ;;
-    --leaf-sha256)
-      LEAF_PINS+=("${2:?--leaf-sha256 requires a value}")
       shift 2
       ;;
     -h|--help)
@@ -93,7 +84,6 @@ require_command() {
 require_command cmp
 require_command security
 require_command openssl
-require_command shasum
 
 security_common_args=(cms)
 security_find_args=(find-certificate)
@@ -127,26 +117,14 @@ if [[ ! -f "$SIGNATURE" ]]; then
   exit 1
 fi
 
-if [[ "${#LEAF_PINS[@]}" -gt 2 ]]; then
-  echo "At most two --leaf-sha256 pins" >&2
-  exit 2
-fi
-for pin in ${LEAF_PINS[@]+"${LEAF_PINS[@]}"}; do
-  if [[ ! "$pin" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "--leaf-sha256 must be 64 lowercase hex digits" >&2
-    exit 2
-  fi
-done
-if [[ "${#LEAF_PINS[@]}" -eq 0 ]]; then
-  validate_developer_id_identity
-fi
+validate_developer_id_identity
 
 signer_details="$(mktemp)"
 signer_cert="$(mktemp)"
 decoded="$(mktemp)"
 trap 'rm -f "$signer_details" "$signer_cert" "$decoded"' EXIT
 
-if [[ "${#LEAF_PINS[@]}" -eq 0 ]] && ! security "${security_find_args[@]}" -c "$IDENTITY" -p >/dev/null; then
+if ! security "${security_find_args[@]}" -c "$IDENTITY" -p >/dev/null; then
   echo "Expected Developer ID identity was not found in the keychain: $IDENTITY" >&2
   exit 1
 fi
@@ -166,19 +144,7 @@ if ! openssl cms -verify -inform DER -in "$SIGNATURE" -noverify -signer "$signer
   echo "Failed to extract a CMS signer certificate from signature: $SIGNATURE" >&2
   exit 1
 fi
-if [[ "${#LEAF_PINS[@]}" -gt 0 ]]; then
-  signer_sha="$(openssl x509 -in "$signer_cert" -outform DER 2>/dev/null | shasum -a 256 | awk '{print $1}')"
-  pinned="false"
-  for pin in "${LEAF_PINS[@]}"; do
-    if [[ "$signer_sha" == "$pin" ]]; then
-      pinned="true"
-    fi
-  done
-  if [[ "$pinned" != "true" ]]; then
-    echo "CMS signer certificate is not a pinned Developer ID leaf" >&2
-    exit 1
-  fi
-elif ! openssl x509 -in "$signer_cert" -noout -subject 2>/dev/null | grep -Fq "$IDENTITY"; then
+if ! openssl x509 -in "$signer_cert" -noout -subject 2>/dev/null | grep -Fq "$IDENTITY"; then
   echo "CMS signature was not signed by expected identity: $IDENTITY" >&2
   exit 1
 fi

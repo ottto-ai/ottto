@@ -21,12 +21,6 @@ ottto_app_license_resource_names() {
   printf '%s\n' LICENSE NOTICE LICENSE-THIRD-PARTY.html LICENSE-Sparkle.txt
 }
 
-# The exact license file names at the root of each binary zip, one per line:
-# the app names without Sparkle's license.
-ottto_archive_license_names() {
-  printf '%s\n' LICENSE NOTICE LICENSE-THIRD-PARTY.html
-}
-
 # ottto_macos_sparkle_pin <git-root> <commit> <app-source-path>
 # Prints the Sparkle pin state ({"revision", "version"}) from Package.resolved
 # as committed at <commit>, not from a working copy that could differ.
@@ -84,7 +78,7 @@ ottto_copy_rust_license_notices() {
   local root="$1"
   local destination="$2"
   local name
-  for name in $(ottto_archive_license_names); do
+  for name in LICENSE NOTICE LICENSE-THIRD-PARTY.html; do
     ottto_license_copy "$root/$name" "$destination/$name" || return 1
   done
 }

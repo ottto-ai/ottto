@@ -337,7 +337,7 @@ if ! grep -q "xattr -d com.apple.provenance .*Ottto.app/Contents" "$APP_LOG"; th
   echo "Expected app staple preparation to clear provenance xattr after placeholder creation failure" >&2
   exit 1
 fi
-if grep -q "ditto --noextattr --noacl" "$APP_LOG"; then
+if grep -q "noextattr" "$APP_LOG"; then
   echo "Expected no unlaunched-copy restage when clearing provenance makes the app writable" >&2
   exit 1
 fi
@@ -484,53 +484,5 @@ if [[ "$(jq -r '.artifacts[1].notarized' "$VALIDATE_ONLY_MANIFEST")" != "false" 
   echo "Expected unselected CLI artifact to remain not notarized" >&2
   exit 1
 fi
-
-# With a privacy policy set, each archive is sealed and checked first. An
-# archive the gate refuses never reaches notarytool, and the gate's output
-# never names a marker.
-GATE_WORK="$TMP_DIR/privacy-work"
-mkdir -m 700 "$GATE_WORK"
-GATE_MARKERS="$(printf 'id:%s\nsynthetic-marker-value\n' 0123456789abcdef0123456789abcdef)"
-GATE_MARKERS_SHA="$(printf '%s\n' "$GATE_MARKERS" | shasum -a 256 | awk '{print $1}')"
-GATE_LEAF="$(printf '%064d' 0)"
-GATE_POLICY="{\"version\":1,\"mode\":\"rehearsal\",\"advisory_xattrs\":[],\"leaf_sha256\":[\"$GATE_LEAF\"],\"markers_sha256\":\"$GATE_MARKERS_SHA\"}"
-GATE_MANIFEST="$TMP_DIR/gate-manifest.json"
-GATE_LOG="$TMP_DIR/gate.log"
-write_manifest "$GATE_MANIFEST"
-if OTTTO_NOTARIZE_TEST_LOG="$GATE_LOG" \
-  OTTTO_RELEASE_PRIVACY_POLICY="$GATE_POLICY" \
-  OTTTO_PRIVACY_MARKERS="$GATE_MARKERS" \
-  OTTTO_PRIVACY_WORK="$GATE_WORK" \
-  PATH="$FAKE_BIN:$PATH" \
-  "$NOTARIZE" \
-    --manifest "$GATE_MANIFEST" \
-    --keychain-profile TEST_PROFILE \
-    --artifact-kind cli >"$TMP_DIR/gate.out" 2>&1; then
-  echo "Expected the privacy gate to refuse a malformed CLI ZIP" >&2
-  exit 1
-fi
-if grep -q "notarytool submit" "$GATE_LOG" 2>/dev/null; then
-  echo "A refused archive reached notarytool" >&2
-  exit 1
-fi
-grep -Fq "Release privacy gate refused cli_zip" "$TMP_DIR/gate.out" || {
-  echo "Notarize did not report the privacy gate refusal" >&2
-  exit 1
-}
-if grep -Fq "synthetic-marker-value" "$TMP_DIR/gate.out"; then
-  echo "The privacy gate output named a marker" >&2
-  exit 1
-fi
-if OTTTO_NOTARIZE_TEST_LOG="$GATE_LOG" \
-  OTTTO_RELEASE_PRIVACY_POLICY="$GATE_POLICY" \
-  PATH="$FAKE_BIN:$PATH" \
-  "$NOTARIZE" \
-    --manifest "$GATE_MANIFEST" \
-    --keychain-profile TEST_PROFILE \
-    --artifact-kind cli >/dev/null 2>&1; then
-  echo "Expected notarize to refuse a privacy policy without a marker list" >&2
-  exit 1
-fi
-chflags -R nouchg "$GATE_WORK" 2>/dev/null || true
 
 echo "macos_notarize artifact filter tests passed"

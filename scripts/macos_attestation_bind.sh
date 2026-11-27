@@ -9,7 +9,6 @@ SOURCE_REF="${OTTTO_RELEASE_SOURCE_REF:-}"
 SOURCE_DIGEST="${OTTTO_RELEASE_SOURCE_DIGEST:-}"
 SLSA_ATTESTATION_URL=""
 SBOM_ATTESTATION_URL=""
-VERIFY_ONLY=false
 
 usage() {
   cat <<'USAGE'
@@ -27,9 +26,6 @@ Options:
   --source-digest <sha>            Expected source commit digest. Default: manifest commit
   --slsa-attestation-url <url>     Optional URL recorded on supply_chain.slsa_build.
   --sbom-attestation-url <url>     Optional URL recorded on supply_chain.sbom.
-  --verify-only                    Write nothing: verify the attestations and require the
-                                   manifest to already carry exactly these bound fields
-                                   (for a sealed, read-only release folder).
   -h, --help                      Show help.
 USAGE
 }
@@ -67,10 +63,6 @@ while [[ $# -gt 0 ]]; do
     --sbom-attestation-url)
       SBOM_ATTESTATION_URL="${2:?--sbom-attestation-url requires a value}"
       shift 2
-      ;;
-    --verify-only)
-      VERIFY_ONLY=true
-      shift
       ;;
     -h|--help)
       usage
@@ -261,12 +253,7 @@ quoted_source_ref="$(printf '%q' "$SOURCE_REF")"
 slsa_verification_command="gh attestation verify $first_subject_operand --repo $REPOSITORY --predicate-type $slsa_predicate_type --signer-workflow $signer_workflow_identity --source-ref $quoted_source_ref --source-digest $SOURCE_DIGEST --format json"
 sbom_verification_command="gh attestation verify $first_subject_operand --repo $REPOSITORY --predicate-type $sbom_predicate_type --signer-workflow $signer_workflow_identity --source-ref $quoted_source_ref --source-digest $SOURCE_DIGEST --format json"
 
-if [[ "$VERIFY_ONLY" == "true" ]]; then
-  # The sealed folder is read-only: the expected manifest goes to a temporary file elsewhere.
-  tmp_manifest="$(mktemp)"
-else
-  tmp_manifest="$(mktemp "$manifest_dir/release-manifest.attestation-bind.XXXXXX")"
-fi
+tmp_manifest="$(mktemp "$manifest_dir/release-manifest.attestation-bind.XXXXXX")"
 trap 'rm -f "$tmp_manifest"' EXIT
 
 # Releases are built on a self-hosted signing Mac, which SLSA counts as Build
@@ -318,18 +305,6 @@ jq \
 if ! jq empty "$tmp_manifest" >/dev/null; then
   echo "Generated manifest is invalid JSON" >&2
   exit 1
-fi
-
-if [[ "$VERIFY_ONLY" == "true" ]]; then
-  if ! jq -n -e --slurpfile current "$MANIFEST" --slurpfile expected "$tmp_manifest" \
-    '$current == $expected' >/dev/null; then
-    echo "Manifest does not carry the verified attestation binding" >&2
-    exit 1
-  fi
-  rm -f "$tmp_manifest"
-  trap - EXIT
-  echo "Verified GitHub attestations match the bound manifest"
-  exit 0
 fi
 
 mv "$tmp_manifest" "$MANIFEST"
