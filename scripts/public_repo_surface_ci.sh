@@ -255,16 +255,18 @@ file_move_check() {
   fi
 }
 
-# Existing files report only. Added files have hard rules (line ceiling, no
-# mod.rs, a module doc). The flat-directory ceilings are reported; add
-# `--enforce flat` to make them fail.
+# Size is enforced: a .rs file over 3,000 lines needs a row in
+# scripts/source_layout_limits.tsv and stays under it, and rows only fall.
+# Other rules report only for existing files. Added files have hard rules
+# (line ceiling, no mod.rs, a module doc). The flat-directory ceilings are
+# reported; add `--enforce flat` to make them fail.
 source_layout_report() {
   local base
   base="$(move_check_base)"
   if [[ -n "$base" ]]; then
-    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce-new --base "$base"
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce size --enforce-new --base "$base"
   else
-    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce size
   fi
 }
 

@@ -11,12 +11,18 @@ lines and warns over 1,500. An added file under crates/ottto-service/src/ also
 fails when it is named mod.rs or, for a production file, when it has no `//!`
 module doc. Exact (R100) renames are not added files; test files are excluded
 from the line ceiling and the module doc. Existing files stay report-only
-unless their rules are explicitly enforced with --enforce.
+unless their rules are explicitly enforced with --enforce (CI enforces size).
 
   size          a .rs file over 3,000 lines needs a row in
                 scripts/source_layout_limits.tsv and must stay under it. The
                 ceilings are a ratchet: against the base commit no row may rise
-                and their total may not rise. Over 1,500 lines is a note.
+                and their total may not rise. A row may rise only to what the
+                base already holds: its row, or its length there when that is
+                over 3,000 (a row that records an unenforced gap; with size
+                enforced, that length never passes the row). A file under
+                3,000 at the base cannot start a row; only a path that is new
+                at the base can (a split or a move, within the total). Over
+                1,500 lines is a note.
   tree          every .rs file is reachable by `mod` from the crate root; every
                 module directory has its `<dir>.rs`; no `mod.rs`; files other
                 than .rs only under tests/fixtures/ and
@@ -58,6 +64,7 @@ import argparse
 import os
 import posixpath
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,8 +173,15 @@ def module_depth(path: str) -> int:
     return max(0, len(inside(path).split("/")) - 2)
 
 
+def base_allowance(path: str, base_limits: dict[str, int], base_lines: dict[str, int]) -> int:
+    """The ceiling the base already holds for a path: its row, or its length there over MAX_LINES."""
+    lines = base_lines.get(path, 0)
+    return max(base_limits.get(path, 0), lines if lines > MAX_LINES else 0)
+
+
 def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits: dict[str, int] | None,
-               out: list[Finding], new_files: set[str] = frozenset()) -> None:
+               out: list[Finding], new_files: set[str] = frozenset(),
+               base_lines: dict[str, int] | None = None) -> None:
     for path in files:
         if not path.endswith(".rs"):
             continue
@@ -178,7 +192,9 @@ def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits
             elif lines > NOTE_LINES:
                 out.append(Finding("size", path, f"new file: {lines} lines, over {NOTE_LINES}",
                                    note=True, new_file=True))
-            continue
+            if path not in limits:
+                continue
+            # A row it brings along must already hold it, or the next change fails on it.
         ceiling = limits.get(path)
         if ceiling is not None:
             if lines > ceiling:
@@ -194,12 +210,20 @@ def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits
     for path in sorted(set(limits) - set(files)):
         out.append(Finding("size", path, f"row in {LIMITS} for a file that does not exist"))
     if base_limits is not None:
+        base_lines = base_lines or {}
+        allowed = {path: base_allowance(path, base_limits, base_lines) for path in set(limits) | set(base_limits)}
         for path, ceiling in sorted(limits.items()):
-            if path in base_limits and ceiling > base_limits[path]:
-                out.append(Finding("size", path, f"ceiling rose from {base_limits[path]} to {ceiling}"))
-        if sum(limits.values()) > sum(base_limits.values()):
+            if path in base_limits or allowed[path]:
+                if ceiling > allowed[path]:
+                    out.append(Finding("size", path, f"ceiling rose from {allowed[path]} to {ceiling}"))
+            elif path in base_lines:
+                # Existed at base under the limit: a row would let it grow past it. Only a path new
+                # at base (a split or a move, governed by the total) may start a row.
+                out.append(Finding("size", path, f"row of {ceiling} for a file of {base_lines[path]} lines "
+                                                 f"at base, under {MAX_LINES}"))
+        if sum(limits.values()) > sum(allowed.values()):
             out.append(Finding("size", LIMITS, f"ceilings total {sum(limits.values())}, "
-                                               f"up from {sum(base_limits.values())} at base"))
+                                               f"up from {sum(allowed.values())} at base"))
 
 
 def check_tree(root: Path, files: list[str], dirs: list[str], tree: rst.Tree, out: list[Finding],
@@ -403,6 +427,13 @@ def base_text(repo: Path, base: str, path: str) -> str | None:
         return None
 
 
+def base_line_count(repo: Path, base: str, path: str) -> int | None:
+    """Lines of a file at the base, counted on its bytes like line_count; None when absent."""
+    done = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{base}:{path}"],
+                          capture_output=True, check=False)
+    return line_count(done.stdout) if done.returncode == 0 else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=".", help="repository root (default: .)")
@@ -434,12 +465,18 @@ def main(argv: list[str] | None = None) -> int:
         limits = limits_table((root / LIMITS).read_text(encoding="utf-8"), LIMITS)
         allowed = read_table((root / INCLUDES).read_text(encoding="utf-8"), 3, INCLUDES)
         ceilings = limits_table((root / FLAT).read_text(encoding="utf-8"), FLAT)
-        base_limits = base_allowed = base_ceilings = None
+        base_limits = base_allowed = base_ceilings = base_lines = None
         if base:
             limits_then, allowed_then = base_text(root, base, LIMITS), base_text(root, base, INCLUDES)
             ceilings_then = base_text(root, base, FLAT)
             base_ceilings = limits_table(ceilings_then, f"{base}:{FLAT}") if ceilings_then is not None else None
             base_limits = limits_table(limits_then, f"{base}:{LIMITS}") if limits_then is not None else None
+            if base_limits is not None:
+                base_lines = {}
+                for path in sorted(set(limits) | set(base_limits)):
+                    lines = base_line_count(root, base, path)
+                    if lines is not None:
+                        base_lines[path] = lines
             base_allowed = read_table(allowed_then, 3, f"{base}:{INCLUDES}") if allowed_then is not None else None
         files, dirs = scope_files(root), scope_dirs(root)
         tree = rst.crate_tree(source, CRATE)
@@ -448,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         # A report never blocks a change; an enforced check does.
         return 2 if enforce or args.enforce_new else 0
     findings: list[Finding] = []
-    check_size(root, sorted(set(files) | new_files), limits, base_limits, findings, new_files)
+    check_size(root, sorted(set(files) | new_files), limits, base_limits, findings, new_files, base_lines)
     check_tree(root, files, dirs, tree, findings, added)
     check_budget(root, files, dirs, findings)
     check_path_include(link_rows(tree, files), allowed, base_allowed, findings)
