@@ -26,7 +26,8 @@ ci-run   Prints the id of the newest successful "Public CI" merge_group run
          successful. Fails when there is none.
 
 The repository is OTTTO_RELEASE_REPOSITORY (default ottto-ai/ottto). gh uses
-its usual GH_TOKEN or login.
+GH_TOKEN (the job token, in the release workflow). The fetch of main reads no
+global or system Git config.
 USAGE
 }
 
@@ -102,7 +103,10 @@ release() {
     fail "$tag message must carry exactly one 'App-Source-Commit: <40-hex>' trailer"
   app_commit="${BASH_REMATCH[1]}"
 
-  git fetch -q --no-tags "https://github.com/$REPOSITORY.git" refs/heads/main ||
+  # Public main, fetched anonymously: the host's global and system Git config
+  # (URL rewrites, credential helpers) and prompts play no part.
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    git -c credential.helper= fetch -q --no-tags "https://github.com/$REPOSITORY.git" refs/heads/main ||
     fail "could not fetch main"
   main_tip="$(git rev-parse FETCH_HEAD)"
   git rev-list --first-parent "$main_tip" | grep -xF "$GITHUB_SHA" >/dev/null ||

@@ -108,7 +108,14 @@ jobs:
           # Full history for the first-parent check on main.
           fetch-depth: 0
 
-      # First trusted step: check the policy and the marker list digest, check
+      # The first repository script, on every lane: later steps find a gh shim
+      # first on PATH that refuses to run without GH_TOKEN and gives gh an empty
+      # config folder and github.com, so no runner account login or other token
+      # can stand in for the job token (docs/release-verification.md).
+      - name: Isolate gh from runner logins
+        run: scripts/macos_release_gh_isolation.sh
+
+      # First privacy step: check the policy and the marker list digest, check
       # the secret-backed tool selectors (notary profile, signing identity),
       # mask every marker and host string in later log output, create the
       # neutral work folder (OTTTO_PRIVACY_WORK) and record this attempt's
@@ -437,6 +444,8 @@ jobs:
 
       - name: Bind verified attestation metadata
         if: inputs.release_mode == 'standard'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           scripts/macos_quiet_step.sh "attestation bind" scripts/macos_attestation_bind.sh \
@@ -488,6 +497,8 @@ jobs:
       # Read-only on the frozen final set: nothing is rewritten after its seal.
       - name: Verify final attestations and manifest binding
         if: inputs.release_mode == 'standard'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           scripts/macos_quiet_step.sh "attestation verify" scripts/macos_attestation_bind.sh \
