@@ -27,7 +27,13 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get update -qq
+        # Both packages come from Ubuntu's own archive. A third-party source on
+        # the runner image (for example packages.microsoft.com) that fails to
+        # refresh must not fail the job: apt still refreshes the other sources,
+        # and the install below fails if Ubuntu's lists are unusable.
+        if ! sudo apt-get update -qq; then
+          echo "::warning::apt-get update reported an error for at least one source; installing from the lists that refreshed"
+        fi
         sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
 
     # Credential-path checks reject group/world-writable ancestors such as
