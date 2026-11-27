@@ -1858,6 +1858,43 @@ fn test_pending_device_credential(
     }
 }
 
+#[test]
+fn prior_secret_goes_only_to_the_backend_that_issued_it() {
+    let prior = |owner_base: Option<&str>| PriorDeviceCredential {
+        machine_id: Some("machine_test".to_string()),
+        device_id: "device-prior".to_string(),
+        device_sources: vec!["codex".to_string()],
+        device_secret: "synthetic".to_string(),
+        owner: owner_base.map(|base| LocalCredentialOwner {
+            user_id: "user".to_string(),
+            organization_id: "org".to_string(),
+            api_base_url: base.to_string(),
+        }),
+        snapshot_namespace: "a".repeat(64),
+    };
+    let production = prior(Some("https://ottto.net/backend"));
+    assert!(prior_issued_by(&production, "https://api.ottto.net"));
+    assert!(prior_issued_by(&production, "https://ottto.net/backend/"));
+    assert!(!prior_issued_by(&production, "https://staging.example"));
+    assert!(!prior_issued_by(&production, "http://127.0.0.1:8000"));
+
+    let local = prior(Some("http://127.0.0.1:8000"));
+    assert!(prior_issued_by(&local, "http://127.0.0.1:8000/"));
+    assert!(!prior_issued_by(&local, "https://api.ottto.net"));
+
+    // No recorded owner: only the configured backend, production by default.
+    let _lock = lock_backend_test_env();
+    let _api_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+    let unknown = prior(None);
+    assert!(prior_issued_by(&unknown, "https://api.ottto.net"));
+    assert!(prior_issued_by(&unknown, "https://ottto.net/backend"));
+    assert!(!prior_issued_by(&unknown, "https://staging.example"));
+    assert!(!prior_issued_by(&unknown, "http://127.0.0.1:8000"));
+    let _developer = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://127.0.0.1:8000");
+    assert!(prior_issued_by(&unknown, "http://127.0.0.1:8000"));
+    assert!(!prior_issued_by(&unknown, "https://api.ottto.net"));
+}
+
 fn test_setup_claim_request_authority(
     prior_secret: &str,
 ) -> PendingDeviceCredentialRequestAuthority {

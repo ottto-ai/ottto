@@ -464,26 +464,33 @@ pub(super) fn require_request_base_matches_binding(
     requested: Option<&str>,
     binding_base: Option<&str>,
 ) -> Result<(), LocalApiError> {
-    // The production hosts are one backend.
-    let normalize = |value: &str| {
-        let value = value.trim().trim_end_matches('/');
-        if value == DEFAULT_API_BASE_URL
-            || value == DIRECT_API_BASE_URL
-            || value == LEGACY_API_BASE_URL
-        {
-            DEFAULT_API_BASE_URL.to_string()
-        } else {
-            value.to_string()
-        }
-    };
-    match (requested.map(normalize).filter(|value| !value.is_empty()), binding_base) {
-        (Some(requested), Some(binding)) if requested != normalize(binding) => {
+    match (
+        requested.map(backend_identity).filter(|value| !value.is_empty()),
+        binding_base,
+    ) {
+        (Some(requested), Some(binding)) if requested != backend_identity(binding) => {
             Err(LocalApiError::InvalidRequest(
                 "This request names a different Ottto backend than this Mac's saved connection. Sign out first to use another backend."
                     .to_string(),
             ))
         }
         _ => Ok(()),
+    }
+}
+
+/// Whether two API bases name the same Ottto backend.
+pub(super) fn same_backend(left: &str, right: &str) -> bool {
+    backend_identity(left) == backend_identity(right)
+}
+
+/// A base with its trailing slash removed; the production hosts are one backend.
+fn backend_identity(value: &str) -> String {
+    let value = value.trim().trim_end_matches('/');
+    if value == DEFAULT_API_BASE_URL || value == DIRECT_API_BASE_URL || value == LEGACY_API_BASE_URL
+    {
+        DEFAULT_API_BASE_URL.to_string()
+    } else {
+        value.to_string()
     }
 }
 

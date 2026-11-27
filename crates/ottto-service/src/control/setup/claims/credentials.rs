@@ -17,6 +17,7 @@ use crate::control::lock_setup_run_binding;
 use crate::control::operating_system_slug;
 use crate::control::registration_history_choice_error;
 use crate::control::remember_revocation_receipt;
+use crate::control::same_backend;
 use crate::control::secret_sha256;
 use crate::control::setup_run_binding_matches;
 use crate::control::source_slug;
@@ -591,7 +592,7 @@ pub(in crate::control) fn prepare_telemetry_device_registration(
         api_base_url,
         "/api/v1/telemetry/devices/registration-preparations",
     );
-    let prior = prior_device_credential_for_registration()?;
+    let prior = prior_device_credential_for_backend(api_base_url)?;
     let request_authority = device_credential_request_authority(
         "register",
         &install_session.install_session_id,
@@ -1173,6 +1174,27 @@ pub(in crate::control) struct PriorDeviceCredential {
     pub(in crate::control) owner: Option<LocalCredentialOwner>,
     /// The namespace its local snapshot history lives under.
     pub(in crate::control) snapshot_namespace: String,
+}
+
+/// The prior device credential, only when `api_base_url` names the backend
+/// that issued it, so its secret never goes to another backend. A credential
+/// with no recorded owner predates owner records; it was issued by this
+/// daemon's configured backend (production unless a developer set one).
+pub(in crate::control) fn prior_device_credential_for_backend(
+    api_base_url: &str,
+) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
+    Ok(prior_device_credential_for_registration()?
+        .filter(|prior| prior_issued_by(prior, api_base_url)))
+}
+
+pub(in crate::control) fn prior_issued_by(
+    prior: &PriorDeviceCredential,
+    api_base_url: &str,
+) -> bool {
+    match prior.owner.as_ref() {
+        Some(owner) => same_backend(&owner.api_base_url, api_base_url),
+        None => same_backend(&ottto_core::default_connection_api_base_url(), api_base_url),
+    }
 }
 
 pub(in crate::control) fn prior_device_credential_for_registration(
