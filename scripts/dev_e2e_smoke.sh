@@ -27,7 +27,9 @@ Options:
   --api-base-url <url>     Backend API base for claim attach. Default: OTTTO_API_BASE_URL or CLI default.
                            A plain-HTTP loopback base (http://localhost, 127.0.0.1 or [::1]) is
                            accepted only when ottto-service itself runs with OTTTO_API_BASE_URL
-                           set to the same value (for example via launchctl setenv).
+                           set to exactly the same host and port. `launchctl setenv` does not
+                           reach a running service: set it, then restart the service with
+                           `launchctl kickstart -k gui/$UID/<ottto-service label>`.
   --skip-app-launch        Validate the app bundle without opening it.
   -h, --help               Show help.
 USAGE

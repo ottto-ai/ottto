@@ -7299,6 +7299,29 @@ fn validated_api_base_url_rejects_loopback_lookalikes() {
 }
 
 #[test]
+#[serial]
+fn validated_api_base_url_needs_the_developer_env_for_plain_http() {
+    let _lock = lock_backend_test_env();
+    without_test_loopback_allowance(|| {
+        let _unset = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+        assert!(validated_api_base_url(Some("http://localhost:8765")).is_err());
+        assert!(validated_api_base_url(Some("http://127.0.0.1:8765")).is_err());
+        drop(_unset);
+        let _env = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8765");
+        assert_eq!(
+            validated_api_base_url(Some("http://localhost:8765/")).expect("developer base"),
+            "http://localhost:8765"
+        );
+        assert!(validated_api_base_url(Some("http://localhost:8766")).is_err());
+        assert!(validated_api_base_url(Some("http://127.0.0.1:8765")).is_err());
+        drop(_env);
+        let _lookalike =
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost.attacker.example");
+        assert!(control_token_validation_base_url(None).is_err());
+    });
+}
+
+#[test]
 fn validated_api_base_url_accepts_default_origin() {
     assert_eq!(
         validated_api_base_url(Some(DEFAULT_API_BASE_URL)).expect("valid"),

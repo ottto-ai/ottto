@@ -2085,7 +2085,7 @@ fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
         || value == LEGACY_API_BASE_URL
         || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"));
-    let exact_developer_override = crate::loopback_base::developer_loopback_base(
+    let exact_developer_override = crate::control::developer_loopback_base(
         value,
         std::env::var("OTTTO_API_BASE_URL").ok().as_deref(),
     );

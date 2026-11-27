@@ -280,6 +280,7 @@ use backend_http::cli_error_message;
 use backend_http::control_token_validation_base_url;
 use backend_http::form_url_encode;
 pub(crate) use backend_http::is_production_api_base_url;
+pub(crate) use backend_http::loopback_base::developer_loopback_base;
 use backend_http::reattach_required_state;
 #[cfg(test)]
 use backend_http::safe_backend_body_excerpt;
@@ -289,6 +290,8 @@ pub(crate) use backend_http::terminal_refresh_rejection;
 use backend_http::validated_api_base_url;
 #[cfg(test)]
 use backend_http::with_test_staging_pair;
+#[cfg(test)]
+use backend_http::without_test_loopback_allowance;
 pub(crate) use backend_http::TerminalRefreshRejection;
 #[cfg(test)]
 use backend_http::MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE;

@@ -48,7 +48,6 @@ mod local_resource_diagnostics;
 mod local_state_sweep;
 #[cfg(unix)]
 pub mod locked_state_dir;
-mod loopback_base;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;

@@ -35,7 +35,6 @@ pub(crate) fn loopback_http_base(value: &str) -> Option<String> {
     if !port.is_empty() {
         let digits = port.strip_prefix(':')?;
         if digits.is_empty()
-            || digits.len() > 5
             || !digits.bytes().all(|byte| byte.is_ascii_digit())
             || digits.parse::<u32>().ok()? > 65_535
         {
@@ -71,6 +70,8 @@ mod tests {
             ("http://[::1]:8080", "http://[::1]:8080"),
             ("http://LOCALHOST:8000", "http://localhost:8000"),
             ("http://LocalHost/api", "http://localhost/api"),
+            ("http://[::1]", "http://[::1]"),
+            ("http://localhost:08000", "http://localhost:08000"),
         ] {
             assert_eq!(
                 loopback_http_base(value).as_deref(),
@@ -100,6 +101,21 @@ mod tests {
             "HTTP://localhost",
             "http://",
             "http://evil.example",
+            "http://localhost\\@evil.example",
+            "http://%6cocalhost",
+            "http://local%68ost",
+            "http://localhost\t",
+            "http:// localhost",
+            "http://[::1%25en0]:8000",
+            "http://2130706433",
+            "http://0x7f.1",
+            "http://0x7f000001",
+            "http://127.1",
+            "http://localhost:+80",
+            "http://ｌｏｃａｌｈｏｓｔ",
+            "http://127.0.0.1.",
+            "http:/localhost",
+            "http:///localhost",
         ] {
             assert_eq!(loopback_http_base(value), None, "{value}");
         }
