@@ -94,7 +94,6 @@ pub(crate) use self::telemetry_only::agent_status_source_enabled;
 pub(crate) use self::telemetry_only::agent_status_source_enabled_in;
 #[cfg(test)]
 use self::telemetry_only::clear_setup_run_refresh_hold;
-use self::telemetry_only::local_health_pass;
 use self::telemetry_only::local_health_upload_can_wait_quietly;
 use self::telemetry_only::persist_machine_icon;
 #[cfg(test)]
@@ -103,8 +102,8 @@ pub(crate) use self::telemetry_only::reset_relay_authorization_backoff;
 pub use self::telemetry_only::upload_agent_status_snapshots;
 pub use self::telemetry_only::upload_local_health_projection_now;
 use self::telemetry_only::upload_local_health_projection_reporting;
-use self::telemetry_only::LocalHealthPass;
 use self::telemetry_only::LocalHealthRefreshHeld;
+use self::telemetry_only::NoHeartbeatSource;
 mod status;
 
 /// Rest-heap diagnostics: counted poison scopes and fingerprints, or None while busy.

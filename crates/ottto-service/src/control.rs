@@ -617,10 +617,8 @@ use setup::claims::auth_switch_account;
 pub(crate) use setup::claims::backend_error_indicates_account_gone;
 #[cfg(test)]
 use setup::claims::begin_durable_browser_claim;
-pub(crate) use setup::claims::capture_credential_authority;
 #[cfg(test)]
 use setup::claims::clear_local_release;
-pub(crate) use setup::claims::commit_if_credential_current;
 #[cfg(test)]
 use setup::claims::complete_pending_auth_claim;
 #[cfg(test)]
@@ -641,7 +639,9 @@ use setup::claims::credentials::device_credential_request_authority;
 use setup::claims::credentials::device_release_proof;
 use setup::claims::credentials::disconnect_setup_run_with_refresh;
 use setup::claims::credentials::emit_setup_run_fast_verification_marker_with_refresh_mut;
-pub(crate) use setup::claims::credentials::idle_credential_probe;
+#[cfg(test)]
+pub(crate) use setup::claims::credentials::idle_credential_answer_from;
+pub(crate) use setup::claims::credentials::idle_device_credential_answer;
 use setup::claims::credentials::inspect_device_credential_preparation;
 use setup::claims::credentials::load_device_release_proof;
 #[cfg(test)]
@@ -679,7 +679,7 @@ use setup::claims::credentials::validate_device_credential_preparation;
 use setup::claims::credentials::validate_owner_snapshot_selection;
 use setup::claims::credentials::wait_for_setup_run_verification_with_refresh_mut_timeout;
 use setup::claims::credentials::wait_for_verification_with_refresh_mut;
-pub(crate) use setup::claims::credentials::IdleProbeAnswer;
+pub(crate) use setup::claims::credentials::IdleCredentialAnswer;
 use setup::claims::credentials::PriorDeviceCredential;
 #[cfg(test)]
 use setup::claims::credentials::SetupRunConnectionStore;
@@ -687,7 +687,6 @@ use setup::claims::credentials::IDENTITY_CONTINUITY_CAPABILITY;
 use setup::claims::credentials::MACHINE_IDENTITY_CAPABILITY;
 #[cfg(test)]
 use setup::claims::credentials::OWNER_SNAPSHOT_MACHINE_FOR_TEST;
-pub(crate) use setup::claims::device_credential_epoch;
 #[cfg(test)]
 use setup::claims::finish_history_browser_claim_with_stores;
 #[cfg(test)]
@@ -711,8 +710,7 @@ use setup::claims::persist_history_browser_claim;
 #[cfg(test)]
 use setup::claims::persist_local_release_expected;
 #[cfg(test)]
-pub(crate) use setup::claims::persist_relay_device_credentials;
-pub(crate) use setup::claims::persisted_connection_for_epoch;
+use setup::claims::persist_relay_device_credentials;
 pub(crate) use setup::claims::promote_pending_device_credential_with_stores;
 pub use setup::claims::recover_pending_device_credential_at_startup;
 use setup::claims::registration_history_choice_account;
@@ -757,7 +755,6 @@ use setup::claims::validate_pending_prior_credential_binding;
 use setup::claims::write_and_verify_active_device_credential;
 #[cfg(test)]
 use setup::claims::ClaimRelayDeviceCredential;
-pub(crate) use setup::claims::CredentialAuthority;
 #[cfg(test)]
 use setup::claims::HistoryStores;
 #[cfg(test)]
@@ -839,7 +836,6 @@ use status::validate_cloud_status_source;
 use status::verification_result_should_refresh_agent_status;
 #[cfg(test)]
 use status::version_tuple;
-pub(crate) use status::IdleCredentialCheck;
 use status::TIMEZONE_OVERRIDE_UNSUPPORTED;
 
 // Direct API host (was the apex `ottto.net/backend` proxy, retired in the

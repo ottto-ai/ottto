@@ -5,7 +5,6 @@
 use crate::agent_status;
 use crate::agent_status_refresh;
 use crate::bound_user;
-use crate::clear_credential_observations;
 use crate::clear_local_health_upload_auth_rejection;
 use crate::clear_setup_run_read_rejection;
 use crate::codex_prelude_footprint;
@@ -14,11 +13,11 @@ use crate::load_source_state;
 use crate::otlp_relay;
 use crate::seed_registered_sources;
 use crate::session_launch;
+use crate::setup_run_read_revision;
 use crate::snapshot_sync;
 use crate::snapshots;
 use crate::source_slug;
 use crate::tracking_confirmation;
-use crate::ObservationOrder;
 use crate::SetupRunReadStart;
 use ottto_core::default_connection_api_base_url;
 use ottto_core::source_state_file_name;
@@ -188,9 +187,6 @@ pub(crate) struct DaemonState {
     /// `with_source_state_dir(default_sources_dir())`.
     pub(crate) source_state_dir: Option<PathBuf>,
     pub(crate) local_health_events: Vec<LocalHealthEventV1>,
-    /// In memory only: the order of setup-run, device-credential and upload
-    /// answers (`daemon::health`).
-    pub(crate) observation: ObservationOrder,
     pub(crate) command_ledger: Vec<LocalHealthCommandResultV1>,
     pub(crate) account: LocalAccountBinding,
     pub(crate) connection: Option<LocalConnectionBinding>,
@@ -451,7 +447,6 @@ impl LocalDaemon {
                 scan_index_health_revisions: [[0; 3]; 3],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
-                observation: ObservationOrder::default(),
                 command_ledger: Vec::new(),
                 account: LocalAccountBinding::not_connected(),
                 connection: None,
@@ -662,7 +657,7 @@ impl LocalDaemon {
             claim_code: Some(claim_code.to_string()),
             api_base_url: default_connection_api_base_url(),
         });
-        clear_credential_observations(&mut state);
+        clear_setup_run_read_rejection(&mut state);
         clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
@@ -806,7 +801,7 @@ impl LocalDaemon {
             claim_code: Some(claim_code.to_string()),
             api_base_url: default_connection_api_base_url(),
         });
-        clear_credential_observations(&mut state);
+        clear_setup_run_read_rejection(&mut state);
         clear_local_health_upload_auth_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
@@ -824,7 +819,18 @@ impl LocalDaemon {
     /// Idempotent; no-op when nothing is bound.
     pub fn mark_account_not_found(&self) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
-        mark_account_not_found_in(&mut state);
+        if state.account.state == LocalAccountState::NotConnected {
+            return Ok(());
+        }
+        if account_binding_is_account_not_found(&state.account) {
+            return Ok(());
+        }
+        state.account.state = LocalAccountState::Error;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = Some(StableMessage {
+            code: ACCOUNT_NOT_FOUND_MESSAGE_CODE.to_string(),
+            text: "The Ottto account this Mac was connected to no longer exists. Sign in to connect it to an account.".to_string(),
+        });
         Ok(())
     }
 
@@ -910,7 +916,7 @@ impl LocalDaemon {
         };
         state.account = LocalAccountBinding::not_connected();
         state.connection = None;
-        clear_credential_observations(&mut state);
+        clear_setup_run_read_rejection(&mut state);
         state.pending_auth = None;
         state.pending_switch = None;
         state.sources.clear();
@@ -965,8 +971,10 @@ impl LocalDaemon {
         Ok((connection, organization_id))
     }
 
-    /// The setup-run binding an agent read starts with, together with its
-    /// start ticket, both taken under one state lock.
+    /// The setup-run binding an agent read starts with, together with the
+    /// read-rejection revision it starts from. Both are captured under one
+    /// state lock, so the revision describes exactly what this binding's
+    /// reads had recorded when this read began.
     pub(crate) fn setup_run_read_start(&self) -> Result<Option<SetupRunReadStart>, LocalApiError> {
         let mut state = self.state()?;
         let Some(binding) = load_connection_into(&mut state, load_persisted_connection)? else {
@@ -974,20 +982,8 @@ impl LocalDaemon {
         };
         Ok(Some(SetupRunReadStart {
             binding,
-            ticket: state.next_observation_ticket(),
+            revision: setup_run_read_revision(&state.local_health_events),
         }))
-    }
-
-    /// The bound setup run while the saved account is connected, without a
-    /// status projection: the idle credential check's cheap gate.
-    pub(crate) fn connected_setup_run(
-        &self,
-    ) -> Result<Option<LocalConnectionBinding>, LocalApiError> {
-        let mut state = self.state()?;
-        if state.account.state != LocalAccountState::Connected {
-            return Ok(None);
-        }
-        load_connection_into(&mut state, load_persisted_connection)
     }
 
     pub fn bind_setup_run_for_authorized_client(
@@ -1065,21 +1061,6 @@ where
         }
     }
     Ok(state.connection.clone())
-}
-
-/// [`LocalDaemon::mark_account_not_found`] for a caller holding the state.
-pub(crate) fn mark_account_not_found_in(state: &mut DaemonState) {
-    if state.account.state == LocalAccountState::NotConnected
-        || account_binding_is_account_not_found(&state.account)
-    {
-        return;
-    }
-    state.account.state = LocalAccountState::Error;
-    state.account.last_refreshed_at = Some(state.now.clone());
-    state.account.message = Some(StableMessage {
-        code: ACCOUNT_NOT_FOUND_MESSAGE_CODE.to_string(),
-        text: "The Ottto account this Mac was connected to no longer exists. Sign in to connect it to an account.".to_string(),
-    });
 }
 
 fn setup_run_binding_matches(

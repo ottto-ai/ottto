@@ -84,7 +84,6 @@ use crate::control::SourceVerificationScope;
 use crate::control::SourceVerificationStatus;
 use crate::control::StableMessage;
 use crate::control::SystemTime;
-use crate::control::TerminalRefreshRejection;
 use crate::control::CLAUDE_OAUTH_REAUTH_REQUIRED_CODE;
 use crate::control::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT;
 use crate::control::PI_SESSION_CENSUS_FAILED_CODE;
@@ -659,19 +658,19 @@ fn verify_source_unchecked(
     Ok(result)
 }
 
-/// Record an authoritative "run ended" refresh answer met during Verify, the
+/// Record an authoritative terminal refresh answer met during Verify, the
 /// same way agent reads do (`observe_setup_run_read`), so local health stops
 /// reporting the dead run as complete and Sign-in may reconnect this Mac.
-/// Anything else, a refused device credential included, says nothing about
-/// the run and is ignored; an outcome for a since-replaced binding is dropped
-/// by the daemon.
+/// Anything other than a terminal refresh rejection says nothing about the
+/// run and is ignored; an outcome for a since-replaced binding is dropped by
+/// the daemon.
 fn record_verify_refresh_rejection(
     daemon: &LocalDaemon,
     binding: &LocalConnectionBinding,
     error: &LocalApiError,
 ) {
-    if terminal_refresh_rejection(error) == Some(TerminalRefreshRejection::SetupRunEnded) {
-        let _ = daemon.record_setup_run_ended(binding);
+    if let Some(rejection) = terminal_refresh_rejection(error) {
+        let _ = daemon.record_setup_run_read_rejected(binding, rejection);
     }
 }
 

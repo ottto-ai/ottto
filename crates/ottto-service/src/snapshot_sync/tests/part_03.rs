@@ -1774,7 +1774,8 @@ fn local_health_upload_refreshes_inactive_device_before_retry() {
         let client = SnapshotApiClient::new(api_base_url);
         let result = upload_local_health_projection_reporting(
             &client,
-            &crate::control::capture_credential_authority().expect("capture credential"),
+            &device,
+            "device-secret",
             SnapshotSource::Codex,
             "otm_test",
             &test_daemon("otm_test"),
@@ -1791,7 +1792,8 @@ fn local_health_upload_refreshes_inactive_device_before_retry() {
             ));
             let held = upload_local_health_projection_reporting(
                 &client,
-                &crate::control::capture_credential_authority().expect("capture credential"),
+                &device,
+                "device-secret",
                 SnapshotSource::Codex,
                 "otm_test",
                 &test_daemon("otm_test"),
@@ -1971,7 +1973,8 @@ fn cycle_heartbeat_off_skips_source_same_cycle() {
     assert_eq!(enabled_snapshot_sources(&backend.device).len(), 2);
     let sources = cycle_heartbeat(
         &SnapshotApiClient::new(backend.api_base_url.as_str()),
-        &crate::control::capture_credential_authority().expect("capture credential"),
+        &backend.device,
+        "device-secret",
         "otm_test",
         &test_daemon("otm_test"),
     );
@@ -2042,7 +2045,8 @@ fn local_health_upload_holds_after_rejected_refresh_until_the_binding_changes() 
     let pass = || {
         upload_local_health_projection_reporting(
             &client,
-            &crate::control::capture_credential_authority().expect("capture credential"),
+            &device,
+            "device-secret",
             SnapshotSource::Codex,
             "otm_test",
             &daemon,

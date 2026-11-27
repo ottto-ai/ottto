@@ -270,7 +270,6 @@ fn promote_without_claude(support: &Path) {
         claim_commit: None,
         confirmed_at: Some("2026-07-31T20:00:00Z".into()),
     };
-    let _identity_lifecycle_lock = crate::control::lock_setup_run_binding();
     crate::control::promote_pending_device_credential_with_stores(
         &pending,
         candidate,

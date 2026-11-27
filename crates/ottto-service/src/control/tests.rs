@@ -2212,17 +2212,14 @@ fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
             .expect("mark confirmed");
 
     assert_eq!(
-        {
-            let _identity_lifecycle_lock = lock_setup_run_binding();
-            promote_pending_device_credential_with_stores(
-                &confirmed,
-                &candidate,
-                &pending_store,
-                &pending_secret,
-                &device_store,
-                &active_secret,
-            )
-        },
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+            &device_store,
+            &active_secret,
+        ),
         Err(LocalApiError::StatePoisoned)
     );
     assert_eq!(
@@ -2244,18 +2241,15 @@ fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
     );
     fs::remove_file(&blocked_parent).expect("remove blocker");
     fs::create_dir(&blocked_parent).expect("create device parent");
-    let promoted = {
-        let _identity_lifecycle_lock = lock_setup_run_binding();
-        promote_pending_device_credential_with_stores(
-            &confirmed,
-            &candidate,
-            &pending_store,
-            &pending_secret,
-            &device_store,
-            &active_secret,
-        )
-    };
-    promoted.expect("retry promotion");
+    promote_pending_device_credential_with_stores(
+        &confirmed,
+        &candidate,
+        &pending_store,
+        &pending_secret,
+        &device_store,
+        &active_secret,
+    )
+    .expect("retry promotion");
 
     assert!(pending_store.load().expect("pending cleared").is_none());
     assert!(matches!(
@@ -2307,17 +2301,14 @@ fn confirmed_journal_rejects_a_replaced_candidate_secret_before_promotion() {
         .save(&replacement)
         .expect("replace staged secret");
     assert_eq!(
-        {
-            let _identity_lifecycle_lock = lock_setup_run_binding();
-            promote_pending_device_credential_with_stores(
-                &confirmed,
-                &replacement,
-                &pending_store,
-                &pending_secret,
-                &device_store,
-                &active_secret,
-            )
-        },
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &replacement,
+            &pending_store,
+            &pending_secret,
+            &device_store,
+            &active_secret,
+        ),
         Err(LocalApiError::StatePoisoned)
     );
     assert_eq!(
@@ -2403,17 +2394,14 @@ fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
     fs::write(&blocked_parent, b"not-a-directory").expect("create promotion blocker");
     let blocked_device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
     assert_eq!(
-        {
-            let _identity_lifecycle_lock = lock_setup_run_binding();
-            promote_pending_device_credential_with_stores(
-                &confirmed,
-                &candidate,
-                &pending_store,
-                &pending_secret,
-                &blocked_device_store,
-                &active_secret,
-            )
-        },
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+            &blocked_device_store,
+            &active_secret,
+        ),
         Err(LocalApiError::StatePoisoned)
     );
     assert_eq!(
@@ -2554,17 +2542,14 @@ fn unconfirmed_or_unauthorized_candidate_cannot_promote() {
     .expect("stage candidate");
 
     assert_eq!(
-        {
-            let _identity_lifecycle_lock = lock_setup_run_binding();
-            promote_pending_device_credential_with_stores(
-                &pending,
-                &candidate,
-                &pending_store,
-                &pending_secret,
-                &device_store,
-                &active_secret,
-            )
-        },
+        promote_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+            &device_store,
+            &active_secret,
+        ),
         Err(LocalApiError::StatePoisoned)
     );
     assert!(matches!(
@@ -17358,7 +17343,6 @@ fn relogin_crash_cuts_keep_the_journaled_namespace() {
         }
         if let Some(confirmed) = confirmed.as_ref().filter(|_| cut >= 4) {
             let devices = FileDeviceStore::default();
-            let _identity_lifecycle_lock = lock_setup_run_binding();
             write_and_verify_active_device_credential(
                 confirmed,
                 &candidate,
