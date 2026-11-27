@@ -42,6 +42,7 @@ use crate::control::require_authorized_local_client;
 use crate::control::require_identity_mutation_reservation;
 use crate::control::require_local_control_account;
 use crate::control::require_non_empty_field;
+use crate::control::require_request_base_matches_binding;
 use crate::control::reserve_identity_mutation;
 use crate::control::run_verify_source_action;
 use crate::control::set_source_marker;
@@ -339,8 +340,15 @@ pub(in crate::control) fn setup_action(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    let api_base_url = api_base_url.filter(|value| !value.trim().is_empty());
     let status = status_for(daemon, authorization)?;
     let mut connection = daemon.connection_for_authorized_client()?;
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        connection
+            .as_ref()
+            .map(|binding| binding.api_base_url.as_str()),
+    )?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()

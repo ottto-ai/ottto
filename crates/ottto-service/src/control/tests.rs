@@ -4907,6 +4907,83 @@ fn persisted_setup_settlement_skips_restart_refresh_and_is_backward_compatible()
 
 #[test]
 #[serial]
+fn setup_on_connected_daemon_keeps_its_backend() {
+    let _lock = lock_backend_test_env();
+    // No backend listens here: each refusal must come before any request.
+    let (root, _guards, daemon, _device) =
+        connected_binding_fixture("connected-keeps-backend", "http://127.0.0.1:9".to_string());
+    let authorization = RequestAuthorization::Token("token".to_string());
+    let other = Some("http://127.0.0.1:10".to_string());
+    for (claim_code, setup_run_id) in [
+        (Some("claim_other_backend".to_string()), None),
+        (None, Some("run_connected_setup".to_string())),
+        (None, None),
+    ] {
+        let error = setup_run(
+            &daemon,
+            &authorization,
+            Vec::new(),
+            claim_code,
+            setup_run_id,
+            other.clone(),
+        )
+        .expect_err("a connected Mac refuses another backend");
+        assert!(
+            matches!(&error, LocalApiError::InvalidRequest(message) if message.contains("Sign out first")),
+            "{error:?}"
+        );
+    }
+    for result in [
+        setup_answer(
+            &daemon,
+            &authorization,
+            SourceKind::Codex,
+            "confirm".to_string(),
+            other.clone(),
+        ),
+        setup_action(
+            &daemon,
+            &authorization,
+            SourceKind::Codex,
+            "verify_source".to_string(),
+            other.clone(),
+        ),
+    ] {
+        assert!(
+            matches!(&result, Err(LocalApiError::InvalidRequest(message)) if message.contains("Sign out first")),
+            "{result:?}"
+        );
+    }
+    let saved = FileConnectionStore::default()
+        .load()
+        .expect("load connection")
+        .expect("connection kept");
+    assert_eq!(saved.api_base_url, "http://127.0.0.1:9");
+    assert_eq!(
+        daemon.status("token").unwrap().account.state,
+        LocalAccountState::Connected
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn request_base_must_match_the_saved_binding() {
+    let binding = Some("https://api.ottto.net");
+    assert!(require_request_base_matches_binding(None, binding).is_ok());
+    assert!(require_request_base_matches_binding(Some("  "), binding).is_ok());
+    assert!(require_request_base_matches_binding(Some("https://api.ottto.net/"), binding).is_ok());
+    assert!(
+        require_request_base_matches_binding(Some("https://ottto.net/backend"), binding).is_ok()
+    );
+    assert!(
+        require_request_base_matches_binding(Some("https://staging.invalid"), binding).is_err()
+    );
+    assert!(require_request_base_matches_binding(Some("http://127.0.0.1:10"), binding).is_err());
+    assert!(require_request_base_matches_binding(Some("https://staging.invalid"), None).is_ok());
+}
+
+#[test]
+#[serial]
 fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
     let _lock = lock_backend_test_env();
     assert_setup_denies_unauthorized_callers_before_scan_lock();
