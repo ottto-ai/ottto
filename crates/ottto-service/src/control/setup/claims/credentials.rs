@@ -1178,8 +1178,9 @@ pub(in crate::control) struct PriorDeviceCredential {
 
 /// The prior device credential, only when `api_base_url` names the backend
 /// that issued it, so its secret never goes to another backend. A credential
-/// with no recorded owner predates owner records; it was issued by this
-/// daemon's configured backend (production unless a developer set one).
+/// with no recorded owner (older installs, and the registration flow) is
+/// treated as issued by this daemon's configured backend: production unless
+/// a developer set `OTTTO_API_BASE_URL`.
 pub(in crate::control) fn prior_device_credential_for_backend(
     api_base_url: &str,
 ) -> Result<Option<PriorDeviceCredential>, LocalApiError> {

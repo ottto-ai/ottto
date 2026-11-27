@@ -1859,6 +1859,7 @@ fn test_pending_device_credential(
 }
 
 #[test]
+#[serial]
 fn prior_secret_goes_only_to_the_backend_that_issued_it() {
     let prior = |owner_base: Option<&str>| PriorDeviceCredential {
         machine_id: Some("machine_test".to_string()),
@@ -5816,6 +5817,65 @@ fn account_binding_payloads_include_the_account_scope_discriminator() {
             Some(TEST_ACCOUNT_SCOPE)
         );
     }
+}
+
+#[test]
+#[serial]
+fn claim_completion_withholds_a_prior_credential_issued_by_another_backend() {
+    let support_root = telemetry_key_store_root("claim-other-backend-device");
+    let secret_root = telemetry_key_store_root("claim-other-backend-secret");
+    fs::create_dir_all(&secret_root).expect("secret root");
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+    FileDeviceStore::default()
+        .save_envelope(&LocalDeviceEnvelope {
+            device: LocalDeviceBinding {
+                device_id: "device_other_backend".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            continuity: DeviceCredentialContinuity {
+                owner: Some(LocalCredentialOwner {
+                    user_id: "user_other".to_string(),
+                    organization_id: "org_other".to_string(),
+                    api_base_url: "https://api.ottto.net".to_string(),
+                }),
+                snapshot_namespace: None,
+            },
+        })
+        .expect("persist relay device issued by production");
+    fs::write(
+        secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "prior-secret-other-backend",
+    )
+    .expect("persist relay secret fallback");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+    let address = listener.local_addr().expect("claim backend address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept claim complete");
+        let request = read_complete_http_request(&mut stream);
+        write_json_response(&mut stream, 200, "OK", "{}");
+        request
+    });
+    let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+    let claim = PendingAuthClaim {
+        claim_code: "claim_other_backend".to_string(),
+        claim_token: "token_other_backend".to_string(),
+        nonce: "nonce_other_backend".to_string(),
+        claim_url: "https://ottto.net/setup/claim?code=claim_other_backend".to_string(),
+        expires_at: "2026-05-05T09:30:00Z".to_string(),
+    };
+    let completion =
+        complete_setup_claim(&claim, &test_machine(), None).expect("complete setup claim");
+    let request = server.join().expect("claim server");
+    let body: serde_json::Value =
+        serde_json::from_str(http_request_body(&request)).expect("claim request json");
+
+    assert!(body.get("prior_device_secret").is_none(), "{body}");
+    assert!(body.get("relay_device_id").is_none(), "{body}");
+    assert!(completion.prior_device_credential.is_none());
 }
 
 #[test]
