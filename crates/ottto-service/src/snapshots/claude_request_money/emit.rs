@@ -271,13 +271,12 @@ pub(super) fn apply(
         super::super::sources::claude::census::usage_ledger::widen_last_activity(item, last);
     }
     // The session starts at its earliest file, whichever file carries the
-    // body: only ever earlier than the carrier's own start, never later.
+    // body: only ever earlier than the carrier's own start, never later, and
+    // a valid start always beats one that does not parse.
     if let Some(start) = span_start {
-        if item
-            .source_started_at
-            .as_deref()
-            .is_some_and(|current| super::super::timestamp_is_after(current, start))
-        {
+        if item.source_started_at.as_deref().map_or(true, |current| {
+            super::super::timestamp_is_before(start, current)
+        }) {
             item.source_started_at = Some(start.to_owned());
         }
     }
@@ -522,8 +521,11 @@ mod tests {
             Some(own)
         );
         assert_eq!(start(Some(own), None).as_deref(), Some(own));
-        // A carrier without a start is left as the files left it.
-        assert_eq!(start(None, Some(earlier)), None);
+        // A carrier without a start takes the earliest file's.
+        assert_eq!(start(None, Some(earlier)).as_deref(), Some(earlier));
+        assert_eq!(start(None, None), None);
+        // A start that does not parse never replaces a valid one.
+        assert_eq!(start(Some(own), Some("not-a-clock")).as_deref(), Some(own));
     }
 
     #[test]

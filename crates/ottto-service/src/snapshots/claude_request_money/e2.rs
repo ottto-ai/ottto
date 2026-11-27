@@ -2025,7 +2025,7 @@ pub(crate) fn finish_page_planned(
             }
             if let Some(clock) = item.source_started_at.as_deref() {
                 if start.as_deref().map_or(true, |current| {
-                    super::super::timestamp_is_after(current, clock)
+                    super::super::timestamp_is_before(clock, current)
                 }) {
                     *start = Some(clock.to_owned());
                 }
