@@ -192,7 +192,9 @@ def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits
             elif lines > NOTE_LINES:
                 out.append(Finding("size", path, f"new file: {lines} lines, over {NOTE_LINES}",
                                    note=True, new_file=True))
-            continue
+            if path not in limits:
+                continue
+            # A row it brings along must already hold it, or the next change fails on it.
         ceiling = limits.get(path)
         if ceiling is not None:
             if lines > ceiling:

@@ -389,6 +389,17 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn(f'{path}: new file: 3100 lines, over 3000', out)
 
+    def test_a_new_file_must_fit_the_row_it_brings(self):
+        base = self.commit()
+        path = f'{SRC}/snapshots/large.rs'
+        self.write({f'{SRC}/snapshots.rs': '//! Snapshots.\n\nmod large;\nmod state_v2;\nmod wire;\nmod tests;\n',
+                    path: '//! Module.\n' * 1200,
+                    'scripts/source_layout_limits.tsv': f'{path}\t1000\n'})
+        self.commit()
+        status, out = self.run_check('--enforce', 'size', '--enforce-new', '--base', base)
+        self.assertEqual(status, 1, out)
+        self.assertIn(f'size: {path}: 1200 lines, over its ceiling of 1000 in scripts/source_layout_limits.tsv', out)
+
     def test_existing_large_file_stays_report_only(self):
         path = f'{SRC}/snapshots/wire/frame.rs'
         self.write({path: '//! Module.\n' * 3100})
