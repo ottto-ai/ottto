@@ -22,6 +22,7 @@ use crate::control::refresh_setup_run_token_via_device_secret;
 use crate::control::request_snapshot_sync_after_device_registration;
 use crate::control::request_snapshot_sync_after_setup_actions;
 use crate::control::require_authorized_local_client;
+use crate::control::require_request_base_matches_binding;
 use crate::control::rfc3339_after_minutes;
 use crate::control::setup_result_from_detail;
 use crate::control::setup_run_request_with_refresh_mut;
@@ -70,10 +71,18 @@ pub(in crate::control) fn setup_run(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    let api_base_url = api_base_url.filter(|value| !value.trim().is_empty());
     let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
-    crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
+    // Any saved binding pins the backend, before anything is retried or sent.
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        connection
+            .as_ref()
+            .map(|binding| binding.api_base_url.as_str()),
+    )?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()
@@ -340,12 +349,19 @@ pub(in crate::control) fn setup_answer(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    let api_base_url = api_base_url.filter(|value| !value.trim().is_empty());
     // Before any connection or POST: collection stops even if the run is gone.
     if answer_type.trim() == "disable_source" {
         set_source_marker(crate::snapshot_sync::disable_snapshot_source, &source)?;
         daemon.clear_tracking_confirmation(&source)?;
     }
     let mut connection = daemon.connection_for_authorized_client()?;
+    require_request_base_matches_binding(
+        api_base_url.as_deref(),
+        connection
+            .as_ref()
+            .map(|binding| binding.api_base_url.as_str()),
+    )?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
             .as_ref()

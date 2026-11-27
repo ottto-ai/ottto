@@ -4907,6 +4907,83 @@ fn persisted_setup_settlement_skips_restart_refresh_and_is_backward_compatible()
 
 #[test]
 #[serial]
+fn setup_on_connected_daemon_keeps_its_backend() {
+    let _lock = lock_backend_test_env();
+    // No backend listens here: each refusal must come before any request.
+    let (root, _guards, daemon, _device) =
+        connected_binding_fixture("connected-keeps-backend", "http://127.0.0.1:9".to_string());
+    let authorization = RequestAuthorization::Token("token".to_string());
+    let other = Some("http://127.0.0.1:10".to_string());
+    for (claim_code, setup_run_id) in [
+        (Some("claim_other_backend".to_string()), None),
+        (None, Some("run_connected_setup".to_string())),
+        (None, None),
+    ] {
+        let error = setup_run(
+            &daemon,
+            &authorization,
+            Vec::new(),
+            claim_code,
+            setup_run_id,
+            other.clone(),
+        )
+        .expect_err("a connected Mac refuses another backend");
+        assert!(
+            matches!(&error, LocalApiError::InvalidRequest(message) if message.contains("Sign out first")),
+            "{error:?}"
+        );
+    }
+    for result in [
+        setup_answer(
+            &daemon,
+            &authorization,
+            SourceKind::Codex,
+            "confirm".to_string(),
+            other.clone(),
+        ),
+        setup_action(
+            &daemon,
+            &authorization,
+            SourceKind::Codex,
+            "verify_source".to_string(),
+            other.clone(),
+        ),
+    ] {
+        assert!(
+            matches!(&result, Err(LocalApiError::InvalidRequest(message)) if message.contains("Sign out first")),
+            "{result:?}"
+        );
+    }
+    let saved = FileConnectionStore::default()
+        .load()
+        .expect("load connection")
+        .expect("connection kept");
+    assert_eq!(saved.api_base_url, "http://127.0.0.1:9");
+    assert_eq!(
+        daemon.status("token").unwrap().account.state,
+        LocalAccountState::Connected
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn request_base_must_match_the_saved_binding() {
+    let binding = Some("https://api.ottto.net");
+    assert!(require_request_base_matches_binding(None, binding).is_ok());
+    assert!(require_request_base_matches_binding(Some("  "), binding).is_ok());
+    assert!(require_request_base_matches_binding(Some("https://api.ottto.net/"), binding).is_ok());
+    assert!(
+        require_request_base_matches_binding(Some("https://ottto.net/backend"), binding).is_ok()
+    );
+    assert!(
+        require_request_base_matches_binding(Some("https://staging.invalid"), binding).is_err()
+    );
+    assert!(require_request_base_matches_binding(Some("http://127.0.0.1:10"), binding).is_err());
+    assert!(require_request_base_matches_binding(Some("https://staging.invalid"), None).is_ok());
+}
+
+#[test]
+#[serial]
 fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
     let _lock = lock_backend_test_env();
     assert_setup_denies_unauthorized_callers_before_scan_lock();
@@ -7280,6 +7357,45 @@ fn raw_local_control_json_rejects_stale_protocol_version() {
 #[test]
 fn validated_api_base_url_rejects_untrusted_https_origin() {
     assert!(validated_api_base_url(Some("https://attacker.example")).is_err());
+}
+
+#[test]
+fn validated_api_base_url_rejects_loopback_lookalikes() {
+    // Only an exact loopback host is a loopback base.
+    for value in [
+        "http://localhost.attacker.example",
+        "http://localhost.attacker.example:8000",
+        "http://127.0.0.1.nip.io",
+        "http://localhost@evil.example",
+        "http://127.0.0.1:80@evil.example",
+        "http://localhost.",
+        "http://localhost-evil.example",
+    ] {
+        assert!(validated_api_base_url(Some(value)).is_err(), "{value}");
+    }
+}
+
+#[test]
+#[serial]
+fn validated_api_base_url_needs_the_developer_env_for_plain_http() {
+    let _lock = lock_backend_test_env();
+    without_test_loopback_allowance(|| {
+        let _unset = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+        assert!(validated_api_base_url(Some("http://localhost:8765")).is_err());
+        assert!(validated_api_base_url(Some("http://127.0.0.1:8765")).is_err());
+        drop(_unset);
+        let _env = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8765");
+        assert_eq!(
+            validated_api_base_url(Some("http://localhost:8765/")).expect("developer base"),
+            "http://localhost:8765"
+        );
+        assert!(validated_api_base_url(Some("http://localhost:8766")).is_err());
+        assert!(validated_api_base_url(Some("http://127.0.0.1:8765")).is_err());
+        drop(_env);
+        let _lookalike =
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost.attacker.example");
+        assert!(control_token_validation_base_url(None).is_err());
+    });
 }
 
 #[test]
