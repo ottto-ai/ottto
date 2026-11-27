@@ -107,7 +107,9 @@ pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentia
     let Ok(api_base_url) = validated_api_base_url(Some(api_base_url)) else {
         return IdleCredentialAnswer::NoProof;
     };
-    if crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err() {
+    if crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        || crate::control::identity_mutation_in_progress()
+    {
         return IdleCredentialAnswer::NoProof;
     }
     let Ok(Some(device)) = FileDeviceStore::default().load() else {
@@ -121,10 +123,27 @@ pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentia
         &api_base_url,
         &format!("/api/v1/telemetry/devices/{}/status", device.device_id),
     );
-    idle_credential_answer_from(backend_get_json::<serde_json::Value>(
+    let answer = idle_credential_answer_from(backend_get_json::<serde_json::Value>(
         &url,
         &[("X-Ottto-Device-Secret", device_secret.as_str())],
-    ))
+    ));
+    // A refusal speaks only for the credential that was sent. If a sign-in or
+    // credential promotion replaced it meanwhile, the answer proves nothing.
+    if answer == IdleCredentialAnswer::Refused {
+        let still_sent = FileDeviceStore::default()
+            .load()
+            .ok()
+            .flatten()
+            .is_some_and(|current| current.device_id == device.device_id)
+            && KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .is_ok_and(|current| current == device_secret)
+            && !crate::control::identity_mutation_in_progress();
+        if !still_sent {
+            return IdleCredentialAnswer::NoProof;
+        }
+    }
+    answer
 }
 
 pub(crate) fn idle_credential_answer_from(

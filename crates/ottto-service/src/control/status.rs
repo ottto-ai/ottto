@@ -247,25 +247,29 @@ fn observe_setup_run_read<T>(
 /// prove anything about). No
 /// answer (network, 429, 5xx, an older server without the route) changes
 /// nothing.
-pub(crate) fn probe_idle_device_credential(daemon: &LocalDaemon) {
-    probe_idle_device_credential_with(daemon, crate::control::idle_device_credential_answer);
+/// Returns the answer when the check ran, `None` when it was skipped.
+pub(crate) fn probe_idle_device_credential(
+    daemon: &LocalDaemon,
+) -> Option<crate::control::IdleCredentialAnswer> {
+    probe_idle_device_credential_with(daemon, crate::control::idle_device_credential_answer)
 }
 
 pub(crate) fn probe_idle_device_credential_with(
     daemon: &LocalDaemon,
     check: impl FnOnce(&str) -> crate::control::IdleCredentialAnswer,
-) {
+) -> Option<crate::control::IdleCredentialAnswer> {
     use crate::control::IdleCredentialAnswer;
     let connected = daemon
         .status_for_trusted_client()
         .is_ok_and(|status| status.account.state == LocalAccountState::Connected);
     if !connected {
-        return;
+        return None;
     }
     let Ok(Some(start)) = daemon.setup_run_read_start() else {
-        return;
+        return None;
     };
-    match check(&start.binding.api_base_url) {
+    let answer = check(&start.binding.api_base_url);
+    match answer {
         IdleCredentialAnswer::Usable => {
             let _ = daemon.record_device_credential_accepted(&start);
         }
@@ -277,6 +281,7 @@ pub(crate) fn probe_idle_device_credential_with(
         }
         IdleCredentialAnswer::NoProof => {}
     }
+    Some(answer)
 }
 
 /// `ottto cloud status`: read-only connector status through the setup-run

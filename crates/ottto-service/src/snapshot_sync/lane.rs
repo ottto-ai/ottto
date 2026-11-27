@@ -303,6 +303,21 @@ pub(super) fn local_cadence_phase_offset(interval: Duration) -> Duration {
 /// timer of its own.
 pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// After a check that got no answer (the network is often not back right
+/// after a wake), the next try comes this much later instead of an hour.
+pub(super) const IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER: Duration = Duration::from_secs(5 * 60);
+
+/// What the hourly gate counts from after a check at `now`: `now`, or, when
+/// the check got no answer, a point that makes the next check due after
+/// [`IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER`].
+pub(super) fn idle_credential_check_anchor(now: Instant, answered: bool) -> Instant {
+    if answered {
+        return now;
+    }
+    now.checked_sub(IDLE_CREDENTIAL_CHECK_INTERVAL - IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER)
+        .unwrap_or(now)
+}
+
 /// The wall clock moved this much more than the monotonic clock between two
 /// passes: the Mac slept (the monotonic clock stops during sleep on macOS).
 pub(super) const WAKE_GAP: Duration = Duration::from_secs(2 * 60);
@@ -341,8 +356,11 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                     Err(error) if error.downcast_ref::<NoHeartbeatSource>().is_some() => {
                         let now = Instant::now();
                         if idle_credential_check_due(last_idle_credential_check, now, woke) {
-                            last_idle_credential_check = Some(now);
-                            crate::control::probe_idle_device_credential(&daemon);
+                            let answer = crate::control::probe_idle_device_credential(&daemon);
+                            let answered =
+                                answer != Some(crate::control::IdleCredentialAnswer::NoProof);
+                            last_idle_credential_check =
+                                Some(idle_credential_check_anchor(now, answered));
                         }
                     }
                     Err(error) => {
@@ -1461,12 +1479,14 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod idle_credential_check_tests {
+    use super::idle_credential_check_anchor;
     use super::idle_credential_check_due;
     use super::woke_between;
     use super::Duration;
     use super::Instant;
     use super::SystemTime;
     use super::IDLE_CREDENTIAL_CHECK_INTERVAL;
+    use super::IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER;
     use super::WAKE_GAP;
 
     #[test]
@@ -1491,6 +1511,24 @@ mod idle_credential_check_tests {
         assert!(!idle_credential_check_due(
             Some(start + Duration::from_secs(5)),
             start,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_check_with_no_answer_retries_after_minutes_not_an_hour() {
+        let start = Instant::now() + IDLE_CREDENTIAL_CHECK_INTERVAL;
+        let answered = idle_credential_check_anchor(start, true);
+        assert_eq!(answered, start);
+        let unanswered = idle_credential_check_anchor(start, false);
+        assert!(!idle_credential_check_due(
+            Some(unanswered),
+            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER - Duration::from_secs(1),
+            false
+        ));
+        assert!(idle_credential_check_due(
+            Some(unanswered),
+            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER,
             false
         ));
     }
