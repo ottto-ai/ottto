@@ -1874,26 +1874,51 @@ fn prior_secret_goes_only_to_the_backend_that_issued_it() {
         snapshot_namespace: "a".repeat(64),
     };
     let production = prior(Some("https://ottto.net/backend"));
-    assert!(prior_issued_by(&production, "https://api.ottto.net"));
-    assert!(prior_issued_by(&production, "https://ottto.net/backend/"));
-    assert!(!prior_issued_by(&production, "https://staging.example"));
-    assert!(!prior_issued_by(&production, "http://127.0.0.1:8000"));
+    assert!(prior_issued_by(&production, "https://api.ottto.net", None));
+    assert!(prior_issued_by(
+        &production,
+        "https://ottto.net/backend/",
+        None
+    ));
+    assert!(!prior_issued_by(
+        &production,
+        "https://staging.example",
+        None
+    ));
+    assert!(!prior_issued_by(&production, "http://127.0.0.1:8000", None));
 
     let local = prior(Some("http://127.0.0.1:8000"));
-    assert!(prior_issued_by(&local, "http://127.0.0.1:8000/"));
-    assert!(!prior_issued_by(&local, "https://api.ottto.net"));
+    assert!(prior_issued_by(&local, "http://127.0.0.1:8000/", None));
+    assert!(!prior_issued_by(&local, "https://api.ottto.net", None));
 
     // No recorded owner: only the configured backend, production by default.
     let _lock = lock_backend_test_env();
     let _api_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
     let unknown = prior(None);
-    assert!(prior_issued_by(&unknown, "https://api.ottto.net"));
-    assert!(prior_issued_by(&unknown, "https://ottto.net/backend"));
-    assert!(!prior_issued_by(&unknown, "https://staging.example"));
-    assert!(!prior_issued_by(&unknown, "http://127.0.0.1:8000"));
+    assert!(prior_issued_by(&unknown, "https://api.ottto.net", None));
+    assert!(prior_issued_by(&unknown, "https://ottto.net/backend", None));
+    assert!(!prior_issued_by(&unknown, "https://staging.example", None));
+    assert!(!prior_issued_by(&unknown, "http://127.0.0.1:8000", None));
     let _developer = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://127.0.0.1:8000");
-    assert!(prior_issued_by(&unknown, "http://127.0.0.1:8000"));
-    assert!(!prior_issued_by(&unknown, "https://api.ottto.net"));
+    assert!(prior_issued_by(&unknown, "http://127.0.0.1:8000", None));
+    assert!(!prior_issued_by(&unknown, "https://api.ottto.net", None));
+    // With a saved connection, an owner-less credential goes only to its backend.
+    assert!(prior_issued_by(
+        &unknown,
+        "https://staging.example",
+        Some("https://staging.example/")
+    ));
+    assert!(!prior_issued_by(
+        &unknown,
+        "https://api.ottto.net",
+        Some("https://staging.example")
+    ));
+    // A recorded owner always wins over the saved connection.
+    assert!(!prior_issued_by(
+        &production,
+        "https://staging.example",
+        Some("https://staging.example")
+    ));
 }
 
 fn test_setup_claim_request_authority(

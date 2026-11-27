@@ -1179,22 +1179,32 @@ pub(in crate::control) struct PriorDeviceCredential {
 /// The prior device credential, only when `api_base_url` names the backend
 /// that issued it, so its secret never goes to another backend. A credential
 /// with no recorded owner (older installs, and the registration flow) is
-/// treated as issued by this daemon's configured backend: production unless
-/// a developer set `OTTTO_API_BASE_URL`.
+/// treated as issued by the backend of this Mac's saved connection, or, with
+/// none saved, by this daemon's configured backend: production unless a
+/// developer set `OTTTO_API_BASE_URL`.
 pub(in crate::control) fn prior_device_credential_for_backend(
     api_base_url: &str,
 ) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
+    let bound_base = FileConnectionStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .map(|connection| connection.api_base_url);
     Ok(prior_device_credential_for_registration()?
-        .filter(|prior| prior_issued_by(prior, api_base_url)))
+        .filter(|prior| prior_issued_by(prior, api_base_url, bound_base.as_deref())))
 }
 
 pub(in crate::control) fn prior_issued_by(
     prior: &PriorDeviceCredential,
     api_base_url: &str,
+    bound_base: Option<&str>,
 ) -> bool {
     match prior.owner.as_ref() {
         Some(owner) => same_backend(&owner.api_base_url, api_base_url),
-        None => same_backend(&ottto_core::default_connection_api_base_url(), api_base_url),
+        None => match bound_base {
+            Some(bound_base) => same_backend(bound_base, api_base_url),
+            None => same_backend(&ottto_core::default_connection_api_base_url(), api_base_url),
+        },
     }
 }
 
