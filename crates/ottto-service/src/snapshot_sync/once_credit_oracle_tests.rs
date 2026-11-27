@@ -263,7 +263,7 @@ impl OracleServer {
                         continue;
                     }
                     if answers.iter().any(|a| matches!(a, Answer::Shed)) {
-                        bounded_native_response(&mut stream, "503 Service Unavailable", "{}");
+                        loopback_response(&mut stream, "503 Service Unavailable", "{}");
                         continue;
                     }
                     if answers.iter().any(|a| matches!(a, Answer::Transient)) {
@@ -385,7 +385,7 @@ impl OracleServer {
                     } else {
                         "200 OK"
                     };
-                bounded_native_response(&mut stream, status, &response.to_string());
+                loopback_response(&mut stream, status, &response.to_string());
             }
         });
         Self {

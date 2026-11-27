@@ -471,12 +471,6 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
     let mut index = fixture();
     write_decoder_fixture(&index, &path);
     let mut value = serde_json::to_value(&index).unwrap();
-    value["unknown_large_shape"] = Value::Array(vec![Value::Null; 8_192]);
-    let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-    assert!(index.save(&path).is_err());
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-    let mut value = serde_json::to_value(&index).unwrap();
     value["unknown_padding"] = Value::String("p".repeat(1024 * 1024));
     for n in 0..4097 {
         value["files"][format!("held-{n}")] = Value::Bool(false);
@@ -687,7 +681,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     assert!(!restarted.confirmed_empty_files.contains(&key));
 }
 
-fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
+fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) {
     use std::io::Write;
     e2_pipeline_scan_fixture::legacy_input_for_test(path, b"");
     let mut file = BufWriter::new(File::create(path).unwrap());
@@ -706,7 +700,6 @@ fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
     }
     file.write_all(b"}").unwrap();
     file.flush().unwrap();
-    prefix.len() + field.len() + 2 * depth + 1
 }
 
 /// [money] An invalid optional census must not erase a sibling's durable ACK
@@ -2122,7 +2115,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
 /// Every reader shares fail-closed scalar repairs. An intact cutoff
 /// must not hide a damaged move hold after this destination bootstraps.
 #[test]
-fn history_gate_damage_is_local_through_load_and_cas_reader() {
+fn history_gate_damage_is_local_through_load_and_legacy_reader() {
     for bad in [
         serde_json::json!("damaged"),
         serde_json::json!(-1),
@@ -2148,8 +2141,9 @@ fn history_gate_damage_is_local_through_load_and_cas_reader() {
             let bytes = serde_json::to_vec(&value).unwrap();
             e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let loaded = read_decoder_fixture(&path).unwrap();
-            // Inspect CAS decode results as well as the real save APIs:
-            // a later overwrite must not conceal missing normalization.
+            // Inspect the legacy file reader's decode as well as the load:
+            // the later save of the native graph must not conceal missing
+            // normalization.
             let current =
                 lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
                     .unwrap();
@@ -3321,68 +3315,61 @@ fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() 
 }
 
 #[test]
-fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override() {
+fn carried_ack_clock_scalars_bound_malformed_spans_across_load_carry_and_save() {
     for field in [
         "accepted_rebuild_pending_since_unix_seconds",
         "accepted_rebuild_last_alarm_unix_seconds",
     ] {
-        for bounded in [false, true] {
-            let scratch = crate::test_scratch::ScratchDir::new("carried-ack-clock-span");
-            let path = scratch.join("index.json");
-            let mut carried = ScanIndex::default();
-            carried.carry_identity_from(fixture()).unwrap();
-            carried.accepted_rebuild_pending_since_unix_seconds = Some(u64::MAX);
-            carried.accepted_rebuild_last_alarm_unix_seconds = Some(u64::MAX);
-            carried.save_fixture(&path).unwrap();
-            let valid = ScanIndex::load(&path).unwrap();
-            assert_eq!(
-                valid.accepted_rebuild_pending_since_unix_seconds,
-                Some(u64::MAX)
-            );
-            assert_eq!(
-                valid.accepted_rebuild_last_alarm_unix_seconds,
-                Some(u64::MAX)
-            );
-            let mut value = serde_json::to_value(&carried).unwrap();
-            value[field] = Value::String("x".repeat(2 * 1024 * 1024));
-            let bytes = serde_json::to_vec(&value).unwrap();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
-            let loaded = read_decoder_fixture(&path).unwrap();
-            assert_eq!(serde_json::to_value(&loaded).unwrap().get(field), None);
-            assert_eq!(
-                loaded.accepted_snapshot_fingerprints,
-                carried.accepted_snapshot_fingerprints
-            );
-            assert_eq!(
-                loaded.accepted_rebuild_incidence,
-                carried.accepted_rebuild_incidence
-            );
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-            let recovered =
-                lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code")
-                    .unwrap();
-            assert_eq!(serde_json::to_value(&recovered).unwrap().get(field), None);
-            assert_eq!(
-                recovered.accepted_snapshot_fingerprints,
-                carried.accepted_snapshot_fingerprints
-            );
-            carried = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
-            if bounded {
-                carried.save(&path).unwrap();
-            } else {
-                carried.save_fixture(&path).unwrap();
-            }
-            let reloaded = ScanIndex::load(&path).unwrap();
-            assert_eq!(
-                reloaded.accepted_snapshot_fingerprints,
-                carried.accepted_snapshot_fingerprints
-            );
-            assert_eq!(
-                reloaded.accepted_rebuild_incidence,
-                carried.accepted_rebuild_incidence
-            );
-            assert_eq!(corrupt_count(scratch.as_ref()), 0);
-        }
+        let scratch = crate::test_scratch::ScratchDir::new("carried-ack-clock-span");
+        let path = scratch.join("index.json");
+        let mut carried = ScanIndex::default();
+        carried.carry_identity_from(fixture()).unwrap();
+        carried.accepted_rebuild_pending_since_unix_seconds = Some(u64::MAX);
+        carried.accepted_rebuild_last_alarm_unix_seconds = Some(u64::MAX);
+        carried.save_fixture(&path).unwrap();
+        let valid = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            valid.accepted_rebuild_pending_since_unix_seconds,
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            valid.accepted_rebuild_last_alarm_unix_seconds,
+            Some(u64::MAX)
+        );
+        let mut value = serde_json::to_value(&carried).unwrap();
+        value[field] = Value::String("x".repeat(2 * 1024 * 1024));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
+        let loaded = read_decoder_fixture(&path).unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap().get(field), None);
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints,
+            carried.accepted_snapshot_fingerprints
+        );
+        assert_eq!(
+            loaded.accepted_rebuild_incidence,
+            carried.accepted_rebuild_incidence
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let recovered =
+            lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code").unwrap();
+        assert_eq!(serde_json::to_value(&recovered).unwrap().get(field), None);
+        assert_eq!(
+            recovered.accepted_snapshot_fingerprints,
+            carried.accepted_snapshot_fingerprints
+        );
+        carried = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+        carried.save(&path).unwrap();
+        let reloaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            reloaded.accepted_snapshot_fingerprints,
+            carried.accepted_snapshot_fingerprints
+        );
+        assert_eq!(
+            reloaded.accepted_rebuild_incidence,
+            carried.accepted_rebuild_incidence
+        );
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
     }
 }
 

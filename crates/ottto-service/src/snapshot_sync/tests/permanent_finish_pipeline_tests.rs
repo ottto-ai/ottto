@@ -213,7 +213,7 @@ impl FinishServer {
                     let body = response.to_string();
                     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 } else {
-                    bounded_native_response(&mut stream, status, &response.to_string());
+                    loopback_response(&mut stream, status, &response.to_string());
                 }
             }
         });
@@ -1076,7 +1076,7 @@ impl AckScriptedServer {
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
                 if matches!(status, "200 OK" | "500 Internal Server Error") {
-                    bounded_native_response(&mut stream, status, &response.to_string());
+                    loopback_response(&mut stream, status, &response.to_string());
                 } else {
                     let body = response.to_string();
                     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
