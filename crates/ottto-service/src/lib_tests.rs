@@ -112,6 +112,19 @@ mod tests {
                 api_base_url: "https://synthetic.invalid".into(),
             })
             .unwrap();
+        assert!(
+            finding(daemon.status(TOKEN).unwrap()).is_some(),
+            "a binding that names an untrusted backend still needs a reconnect"
+        );
+        ottto_core::FileConnectionStore::default()
+            .save(&ottto_core::LocalConnectionBinding {
+                setup_run_id: "synthetic".into(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".into(),
+                machine_id: None,
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".into(),
+            })
+            .unwrap();
         assert!(finding(daemon.status(TOKEN).unwrap()).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }

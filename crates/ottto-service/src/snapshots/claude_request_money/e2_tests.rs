@@ -1168,8 +1168,8 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
 }
 
 /// [money] [regress] One body summed from two path twins keeps the latest
-/// last clock of either file, whichever carries it, and the carrier's own
-/// start. The span moves no total, hour or row. A side call later than every
+/// last clock and the earliest start of either file, whichever carries it.
+/// The span moves no total, hour or row. A side call later than every
 /// file's last record still ends the body at its clock.
 #[test]
 fn e2_summed_twins_keep_the_latest_file_clock_and_a_later_side_call_ends_them() {
@@ -1200,10 +1200,12 @@ fn e2_summed_twins_keep_the_latest_file_clock_and_a_later_side_call_ends_them() 
                 parse(&first, Some(t0()), &index, &lines),
                 parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
             ];
+            // The first file starts earlier than its copy.
+            let start = items[0].source_started_at.clone();
+            assert!(start.is_some() && start < items[1].source_started_at);
             if reverse {
                 items.reverse();
             }
-            let start = items[0].source_started_at.clone();
             let read = side.then(|| sidecar(&[row("r", 1, 10), row("o", 2, 20), row("s", 40, 5)]));
             let got = publish(items, read.as_ref(), TelemetryRead::Loaded, &index);
             assert_eq!(got.len(), 1);
@@ -1211,7 +1213,7 @@ fn e2_summed_twins_keep_the_latest_file_clock_and_a_later_side_call_ends_them() 
             assert_eq!(item.request_count, 2 + u64::from(side));
             assert_eq!(
                 item.source_started_at, start,
-                "the carrier keeps its own start"
+                "the body keeps the earliest start, whichever file carries it"
             );
             let last = if noted { tail.clone() } else { at(2) };
             let expected = if side {
