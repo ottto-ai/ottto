@@ -1,9 +1,7 @@
 //! Plain-HTTP loopback backend bases, for developer use only.
 //!
-//! A credential-bearing call may go over plain HTTP only to this Mac itself,
-//! and only when the developer configured that exact base for this daemon
-//! process. A prefix check (`starts_with("http://localhost")`) is not enough:
-//! it also accepts `http://localhost.attacker.example`.
+//! A plain-HTTP backend base must name this Mac exactly, and is used only when
+//! the developer configured that base for this daemon process.
 
 /// The normalized base when `value` is `http://` to exactly `localhost`,
 /// `127.0.0.1` or `[::1]` (any letter case), with an optional numeric port and

@@ -7284,8 +7284,7 @@ fn validated_api_base_url_rejects_untrusted_https_origin() {
 
 #[test]
 fn validated_api_base_url_rejects_loopback_lookalikes() {
-    // A prefix check let these through and could send a device secret off
-    // this Mac in cleartext.
+    // Only an exact loopback host is a loopback base.
     for value in [
         "http://localhost.attacker.example",
         "http://localhost.attacker.example:8000",
