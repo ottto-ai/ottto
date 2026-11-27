@@ -1411,7 +1411,7 @@ fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
     );
     bytes.push(b' ');
     fs::write(&path, &bytes).unwrap();
-    for env in [None, Some("https://fallback.invalid".to_owned())] {
+    for env in [None, Some("https://ottto.net/backend".to_owned())] {
         let mut client_created = false;
         let result = snapshot_api_base_url_from(store.load(), env).map(|base| {
             client_created = true;

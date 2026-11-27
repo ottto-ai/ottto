@@ -1024,7 +1024,9 @@ pub(super) fn snapshot_api_base_url_from(
     // Uploads carry this Mac's device credential, so they go only to a backend
     // the control path also trusts.
     if !crate::control::is_trusted_api_base_url(&api_base_url) {
-        return Err(anyhow!("upload destination is not a trusted Ottto backend"));
+        return Err(anyhow!(
+            "connection binding names an untrusted Ottto backend"
+        ));
     }
     Ok(api_base_url)
 }
