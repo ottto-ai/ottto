@@ -340,6 +340,7 @@ pub(in crate::control) fn setup_action(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
+    let api_base_url = api_base_url.filter(|value| !value.trim().is_empty());
     let status = status_for(daemon, authorization)?;
     let mut connection = daemon.connection_for_authorized_client()?;
     require_request_base_matches_binding(

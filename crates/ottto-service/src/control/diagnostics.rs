@@ -59,11 +59,14 @@ pub(super) fn diagnostics_collect(
     })?;
     validate_diagnostics_upload_approval(&approval)?;
     let upload_authorization = diagnostics_upload_authorization(daemon, authorization, &approval)?;
+    let api_base_url = api_base_url.filter(|value| !value.trim().is_empty());
+    // A bound Mac keeps its backend for every upload, support claims included.
     require_request_base_matches_binding(
         api_base_url.as_deref(),
-        upload_authorization
-            .connection_api_base_url()
-            .map(String::as_str),
+        daemon
+            .connection_for_authorized_client()?
+            .as_ref()
+            .map(|binding| binding.api_base_url.as_str()),
     )?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         upload_authorization
