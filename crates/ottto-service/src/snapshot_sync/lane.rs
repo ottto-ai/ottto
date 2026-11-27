@@ -307,6 +307,11 @@ pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(
 /// after a wake), the next try comes this much later instead of an hour.
 pub(super) const IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER: Duration = Duration::from_secs(5 * 60);
 
+/// Quick retries allowed after an answer or a wake; after that, a check that
+/// keeps getting no answer (an older server without the route, 429, 5xx, no
+/// network) waits the normal hour.
+pub(super) const IDLE_CREDENTIAL_SOON_RETRIES: u32 = 2;
+
 /// What the hourly gate counts from after a check at `now`: `now`, or, when
 /// the check got no answer, a point that makes the next check due after
 /// [`IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER`].
@@ -316,6 +321,19 @@ pub(super) fn idle_credential_check_anchor(now: Instant, answered: bool) -> Inst
     }
     now.checked_sub(IDLE_CREDENTIAL_CHECK_INTERVAL - IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER)
         .unwrap_or(now)
+}
+
+/// Whether a check that just ran should be retried soon: only when it got no
+/// answer and quick retries are left. An answer or a wake refills them.
+pub(super) fn next_idle_soon_retry(left: &mut u32, answered: bool, woke: bool) -> bool {
+    if answered || woke {
+        *left = IDLE_CREDENTIAL_SOON_RETRIES;
+    }
+    if answered || *left == 0 {
+        return false;
+    }
+    *left -= 1;
+    true
 }
 
 /// The wall clock moved this much more than the monotonic clock between two
@@ -344,6 +362,7 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-local-health-sync".to_string())
         .spawn(move || {
+            let mut soon_retries_left = IDLE_CREDENTIAL_SOON_RETRIES;
             let mut last_idle_credential_check: Option<Instant> = None;
             let mut last_pass: Option<(Instant, SystemTime)> = None;
             loop {
@@ -359,8 +378,10 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                             let answer = crate::control::probe_idle_device_credential(&daemon);
                             let answered =
                                 answer != Some(crate::control::IdleCredentialAnswer::NoProof);
+                            let soon_retry =
+                                next_idle_soon_retry(&mut soon_retries_left, answered, woke);
                             last_idle_credential_check =
-                                Some(idle_credential_check_anchor(now, answered));
+                                Some(idle_credential_check_anchor(now, !soon_retry));
                         }
                     }
                     Err(error) => {
@@ -1487,6 +1508,7 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 mod idle_credential_check_tests {
     use super::idle_credential_check_anchor;
     use super::idle_credential_check_due;
+    use super::next_idle_soon_retry;
     use super::woke_between;
     use super::Duration;
     use super::Instant;
@@ -1537,6 +1559,21 @@ mod idle_credential_check_tests {
             start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER,
             false
         ));
+    }
+
+    #[test]
+    fn quick_retries_are_capped_until_an_answer_or_a_wake() {
+        let mut left = super::IDLE_CREDENTIAL_SOON_RETRIES;
+        // An older server without the route keeps answering 404: two quick
+        // retries, then hourly.
+        assert!(next_idle_soon_retry(&mut left, false, false));
+        assert!(next_idle_soon_retry(&mut left, false, false));
+        assert!(!next_idle_soon_retry(&mut left, false, false));
+        assert!(!next_idle_soon_retry(&mut left, false, false));
+        // A wake refills them; an answer refills them and needs no retry.
+        assert!(next_idle_soon_retry(&mut left, false, true));
+        assert!(!next_idle_soon_retry(&mut left, true, false));
+        assert_eq!(left, super::IDLE_CREDENTIAL_SOON_RETRIES);
     }
 
     #[test]

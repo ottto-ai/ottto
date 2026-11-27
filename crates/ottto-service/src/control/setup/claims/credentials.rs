@@ -128,7 +128,9 @@ pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentia
         .flatten()
         .and_then(|connection| validated_api_base_url(Some(&connection.api_base_url)).ok())
         .is_some_and(|saved| saved == api_base_url);
-    if !same_backend {
+    // A sign-in that started after the first check saves its secret before
+    // its connection file; while one runs, send nothing.
+    if !same_backend || crate::control::identity_mutation_in_progress() {
         return IdleCredentialAnswer::NoProof;
     }
     let url = api_url_with_base(
