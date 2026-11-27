@@ -1173,7 +1173,6 @@ pub(super) fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     crate::snapshots::claude_request_money::e2::decide_page_copies_planned(
         &mut scan_result.snapshots,
         index,
-        accepted_identity_buckets,
         &page.content_held,
         &scan_result.newer_build_held,
     )

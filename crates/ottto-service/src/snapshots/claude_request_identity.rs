@@ -67,7 +67,7 @@ pub(crate) use accepted::bind_test_session_context_key;
 pub(crate) use accepted::digest_hex;
 pub(crate) use accepted::session_context_key_epoch;
 pub(crate) use accepted::{AcceptedBuckets, AcceptedSession, IdentityScope};
-pub(crate) use budget::Measurement as CapMeasurement;
+use budget::Measurement as CapMeasurement;
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 pub(crate) const E2_GROUPING: &str =
@@ -166,7 +166,7 @@ impl Drop for PreCutoverEvidenceForTest {
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 32;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 32;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
-/// Declared bound (W0 `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`):
+/// Declared bound (contract `bounds.total_parts`, `MAX_IDENTITY_PARTS_PER_ITEM`):
 /// the receiver's dense parts bound, serialized item bytes / 320, at this
 /// pass's item cap (2,048 at the default cap). The byte cap is the real
 /// limit; this stops construction early.
@@ -347,7 +347,7 @@ fn take_refusal_causes() -> BTreeMap<&'static str, u64> {
     })
 }
 
-/// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
+/// Owned form of `IdentityRef`, for tests and the builder oracle.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RequestIdentity {
@@ -1464,7 +1464,7 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
     .map_or(usize::MAX, |bytes| bytes.len().saturating_add(134))
 }
 
-// --- Canonical hash leaf (W0 `session_identity_leaf:v3`) ---------------------
+// --- Canonical hash leaf (`session_identity_leaf:v3`) ------------------------
 
 /// The conditional `request_identity` leaf of `usage_accounting`, present only
 /// under the new collector. Identities are dereferenced and parts sorted by
@@ -2435,7 +2435,8 @@ pub(crate) fn classify_ref<'k>(
 ) -> IdentityRef<'k> {
     use IdentityRef::{Missing, Refused, Tagged};
     if evidence.unhealthy_roots.contains(facts.root) {
-        // Unreadable stronger evidence never falls through (W0 CLS-refused-truncated).
+        // Unreadable stronger evidence never falls through: it is refused as
+        // incomplete, never classified from weaker evidence.
         return Refused(Refusal::IncompleteEvidence);
     }
     let row = match evidence.requests.get(&(facts.root, facts.request_id)) {

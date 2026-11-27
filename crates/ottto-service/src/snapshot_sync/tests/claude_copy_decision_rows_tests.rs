@@ -456,7 +456,7 @@ impl Rows {
         let mut next = index.clone();
         let holders = unobserved(|| {
             let (updates, holders) =
-                observe::capture_holders(|| e2::decide_page_copies(&mut items, index, None));
+                observe::capture_holders(|| e2::decide_page_copies(&mut items, index));
             updates.apply(&mut next);
             holders
         });

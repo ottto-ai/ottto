@@ -1,8 +1,7 @@
 //! `e2` request-owned Claude money from the native resolved-response fold.
 //! Native resolution owns counts; this module only decides copies, attaches
 //! reported telemetry cost and side calls, and emits one literal body per
-//! session. The upload gate is ON; DARK test arms never change an item, a
-//! scan identity, parser scope or body witness.
+//! session.
 //!
 //! Layout: `copies` (copy decisions and stored copy ownership) and
 //! `telemetry` (attach and side calls). This file keeps the fold state,
@@ -1895,16 +1894,8 @@ pub(crate) enum TelemetryRead {
     Failed,
 }
 
-/// DARK comparison happens after today's authoritative body fold. Only the
-/// explicit gate permits mutation; one summed entity is emitted per session
-/// (path twins sum). A failed telemetry read never yields a "complete"
-/// body; `hold_claude_history_for_unread_telemetry` keeps that page's owed history files owed.
-///
-/// Returns the sessions whose entity was withheld (held twin, uncertified,
-/// identity already tagged, overflow). Their items stay on the page
-/// unchanged so the caller holds them (`hold_request_owned`): a removed item
-/// would let the page settle its file without a body. Gate off: empty.
-/// Single-chunk callers (tests) plan the content-twin holds over `items`.
+/// `finish_page_planned` for a single-chunk page (tests): plans the
+/// content-twin holds over `items`.
 #[cfg(test)]
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
@@ -1940,8 +1931,17 @@ pub(crate) struct PageCopyHolds<'a> {
     pub(crate) newer_build: &'a BTreeSet<String>,
 }
 
-/// `finish_page` for one evidence chunk of a page whose content-twin holds
-/// were decided once over the whole page.
+/// Finishes one evidence chunk of a page whose content-twin holds were
+/// decided once over the whole page. Runs after today's authoritative body
+/// fold; one summed entity is emitted per session (path twins sum). A failed
+/// telemetry read never yields a "complete" body;
+/// `hold_claude_history_for_unread_telemetry` keeps that page's owed history
+/// files owed.
+///
+/// Returns the sessions whose entity was withheld (held twin, uncertified,
+/// identity already tagged, overflow). Their items stay on the page
+/// unchanged so the caller holds them (`hold_request_owned`): a removed item
+/// would let the page settle its file without a body.
 pub(crate) fn finish_page_planned(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,

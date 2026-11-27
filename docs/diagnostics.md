@@ -989,8 +989,6 @@ real account-hold classification, Completed restoration and two unchanged passes
 with zero extra body bytes, saved catch-up, and large-file aging in all three
 sources. Existing identity/anchor controls remain in
 `reread_trigger_content_tests::truncate_regrow_with_unchanged_samples_is_reread_by_mtime`,
-`transcript_acquisition::tests::head_and_old_boundary_edits_growing_file_reset_to_full`,
-`transcript_acquisition::tests::shrink_and_replacement_reset_even_with_identical_samples`,
 `fe_claude_truncate_then_regrow_after_short_eof_keeps_main_failure`,
 `fe_claude_regrow_after_reader_passes_frozen_with_new_head_refuses`,
 and the certificate restore tests in `transcript_acquisition`.

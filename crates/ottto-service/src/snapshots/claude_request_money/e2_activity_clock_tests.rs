@@ -71,7 +71,7 @@ fn body(name: &str, lines: &[Value], rows: &[ClaudeLocalOtelEvidence]) -> Snapsh
         twins: &Default::default(),
     }));
     let mut items = a.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
-    decide_page_copies(&mut items, &index, None);
+    decide_page_copies(&mut items, &index);
     let read = sidecar(name, rows);
     attach_page(&mut items, &read);
     let api = ClaudeLocalOtelLoadReport {
@@ -80,7 +80,7 @@ fn body(name: &str, lines: &[Value], rows: &[ClaudeLocalOtelEvidence]) -> Snapsh
     };
     let trace = ClaudeTraceOwnershipLoadReport::default();
     side_calls_page(&mut items, &api, &trace, &index, &mut Default::default());
-    decide_page_copies(&mut items, &index, None);
+    decide_page_copies(&mut items, &index);
     let (mut held, queued) = (Default::default(), Default::default());
     finish_page(
         &mut items,

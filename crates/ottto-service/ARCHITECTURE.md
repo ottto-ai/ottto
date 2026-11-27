@@ -792,7 +792,8 @@ except that a fn with an unchanged body may have a signature rustfmt re-wrapped 
 have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
 change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
 multiplicity; modules with moved items reject every added glob and every added explicit binding
-beside an item-level macro call; edits to listed validator files that anchor on moved code are
+beside an item-level macro call, except exact calls of the import-free macros the script lists and
+calls inside an `impl` block; edits to listed validator files that anchor on moved code are
 reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).

@@ -103,7 +103,7 @@ fn slack_tail_counts_once_at_the_earlier_home() {
         assert!(fold(&items[1]).twin_pending);
         assert_eq!(fold(&items[1]).own_requests, 1 + owned, "the tail is own");
         take_diag();
-        decide_page_copies(&mut items, &index, None);
+        decide_page_copies(&mut items, &index);
         let diag = take_diag();
         let z = fold(&items[1]);
         assert_eq!((z.entity.totals().1, z.entity.removed_requests), (owned, 3));
@@ -172,7 +172,7 @@ fn pre_cutoff_accepted_copy_counts_each_shared_request_once() {
         assert!(z.twin_pending, "{arm}: the twin pass decides it");
         assert_eq!(z.own_requests, 2, "{arm}: the tail and o1 are own");
         take_diag();
-        decide_page_copies(&mut items, &index, None);
+        decide_page_copies(&mut items, &index);
         let diag = take_diag();
         let z = fold(items.last().unwrap());
         assert!(!z.entity.held, "{arm}");
@@ -215,7 +215,7 @@ fn forked_first_line_is_removed_once() {
         parse_undecided(&root, Some(t0()), &index, &[line("r1", &at(1), 3), fork]),
     );
     take_diag();
-    decide_page_copies(&mut items, &index, None);
+    decide_page_copies(&mut items, &index);
     let diag = take_diag();
     let z = fold(&items[2]);
     assert_eq!((z.entity.totals().1, z.entity.removed_requests), (1, 2));
@@ -240,7 +240,7 @@ fn zero_usage_held_id_never_subtracts_an_own_response() {
         let (paths, index, mut items) = page(&held, &later);
         assert!(fold(&items[1]).twin_pending);
         take_diag();
-        decide_page_copies(&mut items, &index, None);
+        decide_page_copies(&mut items, &index);
         let diag = take_diag();
         let z = fold(&items[1]);
         assert_eq!(

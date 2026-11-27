@@ -21,7 +21,7 @@ fn copies() -> [Value; 2] {
 /// One page's copy decision over `lines`, as `decide_pass` makes it.
 fn pass(index: &mut ScanIndex, path: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
     let mut items = read_file(path, index, lines);
-    decide_page_copies(&mut items, index, None).apply(index);
+    decide_page_copies(&mut items, index).apply(index);
     items
 }
 /// (removed, counted, held, flagged) requests of the copy.

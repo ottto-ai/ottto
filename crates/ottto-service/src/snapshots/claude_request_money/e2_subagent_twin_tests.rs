@@ -44,7 +44,7 @@ fn ambiguous_copy_uses_restore_all() {
         )];
         assert!(!fold(&actual[0]).ambiguous.is_empty());
         assert!(!fold(&actual[0]).twin_pending);
-        decide_page_copies(&mut actual, &index, None);
+        decide_page_copies(&mut actual, &index);
         let decided = fold(&actual[0]);
         assert_eq!(decided.entity.totals(), fold(&control).entity.totals());
         assert_eq!(decided.entity.removed_requests, 0);
@@ -87,7 +87,7 @@ fn eligible_copy_without_a_holder_counts() {
         }
         items.push(parse_undecided(&z, Some(born), &index, &[request]));
         assert!(fold(items.last().unwrap()).twin_pending);
-        decide_page_copies(&mut items, &index, None);
+        decide_page_copies(&mut items, &index);
         let copy = fold(items.last().unwrap());
         assert_eq!(
             (

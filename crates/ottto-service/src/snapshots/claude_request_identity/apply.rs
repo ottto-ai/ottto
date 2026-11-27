@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// Tag `item` from materialized requests: the W0 builder oracle (tests only).
+/// Tag `item` from materialized requests: the builder oracle (tests only).
 #[cfg(test)]
 pub(crate) fn apply(
     item: &mut SnapshotItem,
@@ -532,7 +532,7 @@ pub(crate) const CURRENT_UNKNOWN: &str = "unknown";
 const LATEST_UNIDENTIFIED: &str = "latest_request_unidentified";
 const LATEST_CONFLICTING: &str = "conflicting_latest_requests";
 const ORDER_UNAVAILABLE: &str = "request_order_unavailable";
-pub(crate) const IDENTITY_WITHHELD: &str = "identity_withheld";
+const IDENTITY_WITHHELD: &str = "identity_withheld";
 
 /// (account, workspace, subscription), compared whole.
 type AccountTriple = (Option<String>, Option<String>, Option<String>);

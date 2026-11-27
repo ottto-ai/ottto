@@ -946,7 +946,6 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
     } else {
         match std::fs::read(progress_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(anyhow::Error::from)
                 .context("parse snapshot progress for partial checkpoint")?,
             Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
                 SnapshotUploadProgress::new(
@@ -1144,7 +1143,7 @@ fn record_collection_complete(source: SnapshotSource, at: &str) {
 #[derive(Clone, Copy)]
 struct FinishEnv<'a> {
     source: SnapshotSource,
-    client: &'a super::SnapshotApiClient,
+    client: &'a crate::snapshot_sync::SnapshotApiClient,
     device: &'a LocalDeviceBinding,
     device_secret: &'a str,
     machine_id: &'a str,
@@ -1488,8 +1487,8 @@ pub(super) fn finish_sync_source(
         );
     }
 
-    // Keep the full local scan available to active-session/context-posture
-    // consumers above, then remove only authority-demoting revisions at the
+    // Keep the full local scan available to the active-session and
+    // context-posture consumers in `fold_local_evidence`, then remove only authority-demoting revisions at the
     // network boundary. They are not backend poison and are not counted as
     // accepted/quarantined upload settlement.
     let local_holds = LocalHoldSettlement::classify(
@@ -2640,7 +2639,8 @@ fn settle_pass_and_markers(
     // committed its accepted siblings and each held entity waits on its own
     // quarantine clock, so it is not a source failure; the failure ladder is
     // for upload errors. The sweep marker is stamped only for settled scans,
-    // and the status below still reports the held entities.
+    // and the terminal receipt (`report_and_arm`) still reports the held
+    // entities.
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
@@ -2719,7 +2719,7 @@ fn settle_pass_and_markers(
             support_dir,
             source,
             upload_destination_namespace,
-            &super::enabled_snapshot_sources_in(device, support_dir),
+            &crate::snapshot_sync::enabled_snapshot_sources_in(device, support_dir),
         ) {
             // Every participant reads the next tier now; the final at background QoS.
             Ok(Some((wake, first_import))) => {
@@ -2869,7 +2869,7 @@ fn report_and_arm(
             upload_fully_settled,
         );
         // The uploader drained its frozen, scan-capped queue before returning
-        // `Deferred`, and the index above now owns both accepted siblings and
+        // `Deferred`, and the saved index now owns both accepted siblings and
         // entity quarantine. Surface the conflict only after those
         // facts are durable: returning earlier would recreate the per-source
         // starvation wedge, while reporting success would hide the backend's
@@ -2946,7 +2946,7 @@ fn report_and_arm(
             let outside = cycle_owed_nothing
                 && loss_free
                 && upload_fully_settled
-                && super::prepare::upload_owes_nothing(
+                && crate::snapshot_sync::prepare::upload_owes_nothing(
                     source,
                     upload_progress,
                     support_dir,
