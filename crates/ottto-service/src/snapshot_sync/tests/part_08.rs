@@ -143,7 +143,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
             let payload: serde_json::Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
             assert_eq!(payload["snapshots"].as_array().unwrap().len(), 2);
-            bounded_native_response(&mut stream, "200 OK", &ack);
+            loopback_response(&mut stream, "200 OK", &ack);
         });
         let mut progress = test_upload_progress();
         let mut accepted_count = 0;
@@ -375,7 +375,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
             "transport sends one common body"
         );
         assert_eq!(payload["snapshots"][0]["input_tokens"], 300);
-        bounded_native_response(&mut stream, "200 OK", &ack);
+        loopback_response(&mut stream, "200 OK", &ack);
         request
     });
     let mut progress = test_upload_progress();

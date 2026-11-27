@@ -1366,7 +1366,7 @@ fn endpoint_load_failure_during_scan_is_local_state() {
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
     let device = LocalDeviceBinding {
         sources: vec!["pi".into()],
-        ..bounded_native_device()
+        ..synthetic_device_binding()
     };
     FileDeviceStore::default().save(&device).unwrap();
     let daemon = test_daemon(&"a".repeat(64));
