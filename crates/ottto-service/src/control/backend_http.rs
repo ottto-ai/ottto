@@ -548,9 +548,19 @@ fn is_trusted_api_base_url(value: &str) -> bool {
         || value == DIRECT_API_BASE_URL
         || value == LEGACY_API_BASE_URL
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
-        || value.starts_with("http://localhost")
-        || value.starts_with("http://127.0.0.1")
+        || developer_loopback_allowed(value)
         || staging_pair().is_some_and(|(api, _)| value == api)
+}
+
+/// Plain HTTP only to this Mac, and only for the exact base the developer
+/// configured for this daemon process (`OTTTO_API_BASE_URL`); never a base
+/// that arrived in a request, a deep link or a saved connection. Unit-test
+/// builds also accept an exact loopback base, so mock backends keep working;
+/// `crate::loopback_base` tests the production rule.
+fn developer_loopback_allowed(value: &str) -> bool {
+    let developer_override = std::env::var("OTTTO_API_BASE_URL").ok();
+    crate::loopback_base::developer_loopback_base(value, developer_override.as_deref())
+        || (cfg!(test) && crate::loopback_base::loopback_http_base(value).is_some())
 }
 
 /// The one staging deployment a non-stable candidate build may trust, as `(API origin, web

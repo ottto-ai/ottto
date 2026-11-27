@@ -7283,6 +7283,23 @@ fn validated_api_base_url_rejects_untrusted_https_origin() {
 }
 
 #[test]
+fn validated_api_base_url_rejects_loopback_lookalikes() {
+    // A prefix check let these through and could send a device secret off
+    // this Mac in cleartext.
+    for value in [
+        "http://localhost.attacker.example",
+        "http://localhost.attacker.example:8000",
+        "http://127.0.0.1.nip.io",
+        "http://localhost@evil.example",
+        "http://127.0.0.1:80@evil.example",
+        "http://localhost.",
+        "http://localhost-evil.example",
+    ] {
+        assert!(validated_api_base_url(Some(value)).is_err(), "{value}");
+    }
+}
+
+#[test]
 fn validated_api_base_url_accepts_default_origin() {
     assert_eq!(
         validated_api_base_url(Some(DEFAULT_API_BASE_URL)).expect("valid"),

@@ -2085,29 +2085,14 @@ fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
         || value == LEGACY_API_BASE_URL
         || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"));
-    let exact_developer_override = std::env::var("OTTTO_API_BASE_URL")
-        .ok()
-        .map(|override_value| override_value.trim().trim_end_matches('/').to_string())
-        .is_some_and(|override_value| override_value == value && is_loopback_http_base(value));
+    let exact_developer_override = crate::loopback_base::developer_loopback_base(
+        value,
+        std::env::var("OTTTO_API_BASE_URL").ok().as_deref(),
+    );
     if !production && !exact_developer_override {
         return Err(anyhow!("cloud-session backend destination is untrusted"));
     }
     Ok(value.to_string())
-}
-
-fn is_loopback_http_base(value: &str) -> bool {
-    ["http://127.0.0.1", "http://localhost"]
-        .iter()
-        .any(|prefix| {
-            value.strip_prefix(prefix).is_some_and(|suffix| {
-                suffix.is_empty()
-                    || suffix.starts_with('/')
-                    || suffix.strip_prefix(':').is_some_and(|port_and_path| {
-                        let port = port_and_path.split('/').next().unwrap_or_default();
-                        !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-            })
-        })
 }
 
 /// The local inputs a composed slice reads before any network call.

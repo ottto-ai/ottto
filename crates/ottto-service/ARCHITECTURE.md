@@ -714,7 +714,8 @@ placement and the three flat lists; it does not measure visibility or imports.
   `collection_health`, `source_health`, `tracking_confirmation`, `snapshot_audit`.
 - **Local session views**: `active_sessions`, `detected_uses`, `desktop_recent`,
   `claude_desktop`, `claude_session_registrations`, `internal_session`.
-- **Small shared code**: `hex`, `canonical_json`.
+- **Small shared code**: `hex`, `canonical_json`, `loopback_base` (the plain-HTTP developer
+  backend rule).
 - **Test support** (compiled only for tests): `test_effects`, `test_isolation`, `test_scratch`,
   `retry_allocation_probe`, `retry_integrated_driver`, and the `*_tests.rs` files.
 
