@@ -119,6 +119,18 @@ pub(crate) fn idle_device_credential_answer(api_base_url: &str) -> IdleCredentia
     else {
         return IdleCredentialAnswer::NoProof;
     };
+    // The base came from the binding read before the credential was loaded. A
+    // sign-in to another backend in between must not send the new secret to
+    // the old one, so the saved connection must still name this backend.
+    let same_backend = FileConnectionStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .and_then(|connection| validated_api_base_url(Some(&connection.api_base_url)).ok())
+        .is_some_and(|saved| saved == api_base_url);
+    if !same_backend {
+        return IdleCredentialAnswer::NoProof;
+    }
     let url = api_url_with_base(
         &api_base_url,
         &format!("/api/v1/telemetry/devices/{}/status", device.device_id),
