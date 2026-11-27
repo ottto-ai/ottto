@@ -558,11 +558,28 @@ The signing job runs only on the release host's per-run runner:
   `--run-id <run id>` admits exactly that folder.
 - Checkout runs with `HOME` set to an empty folder under `RUNNER_TEMP`, so it
   copies no account Git configuration and names no home path.
-- `gh` reads only the job token. The first step points `GH_CONFIG_DIR` at an
-  empty folder under `RUNNER_TEMP`, and every step that runs `gh` (directly or
-  through a script) sets `GH_TOKEN: ${{ github.token }}`, so no runner account
-  login can stand in for a missing token
-  (`scripts/test_workflow_gh_token.py`, in the public surface checks).
+- `gh` runs only with the job token. Right after checkout, before any other
+  repository script, an unconditional step runs
+  `scripts/macos_release_gh_isolation.sh`. It makes a fresh folder under
+  `RUNNER_TEMP` (`mktemp -d`) with an empty `gh` config folder, and puts a `gh`
+  shim first on `PATH` for the later steps. The shim refuses to run, before `gh`
+  starts, unless `GH_TOKEN` is non-empty. It then drops `GITHUB_TOKEN` and the
+  enterprise tokens, forces `GH_HOST=github.com` and the empty config folder,
+  and runs the real `gh`. So no runner account login, keyring entry, other token
+  or inherited host can stand in for the job token, however a step or script
+  calls `gh`, except by a path to the binary. Every step that runs `gh` (the
+  release source check, the attestation bind and verify steps and the disabled
+  GitHub Release mirror) sets `GH_TOKEN: ${{ github.token }}`.
+- `scripts/test_workflow_gh_token.py` (public surface checks) keeps the stable
+  release workflow wired to the shim: the isolation step is plain and comes
+  first, the `gh` steps set the job token on the step and nothing clears it, no
+  step up to the last `gh` step changes `PATH`, `GITHUB_PATH`, `GH_CONFIG_DIR`
+  or `GH_HOST`, and no script the workflow reaches runs `gh` by a path. Finding
+  a `gh` call there is a heuristic. It is scoped to this workflow and backed by
+  a self-test that drops each step's token in memory. The shim is the
+  guarantee.
+- The release source check fetches public `main` with the host's global and
+  system Git config, credential helpers and prompts turned off.
 - Host paths come from the runner's own environment, never from workflow
   variables (a step's environment is printed): `OTTTO_MACOS_APP_ROOT` (the app
   source), `OTTTO_STABLE_CANDIDATE_RC_EVIDENCE` (the redacted RC evidence file,

@@ -97,10 +97,6 @@ jobs:
             echo "The job is not in the release host's neutral work folder." >&2
             exit 1
           fi
-          # gh reads only the job token, on every lane: an empty config folder means no
-          # host login can stand in for a missing GH_TOKEN on a step that calls gh.
-          mkdir -m 700 "$RUNNER_TEMP/gh-config"
-          printf 'GH_CONFIG_DIR=%s\nGH_PROMPT_DISABLED=1\n' "$RUNNER_TEMP/gh-config" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
@@ -112,7 +108,14 @@ jobs:
           # Full history for the first-parent check on main.
           fetch-depth: 0
 
-      # First trusted step: check the policy and the marker list digest, check
+      # The first repository script, on every lane: later steps find a gh shim
+      # first on PATH that refuses to run without GH_TOKEN and gives gh an empty
+      # config folder and github.com, so no runner account login or other token
+      # can stand in for the job token (docs/release-verification.md).
+      - name: Isolate gh from runner logins
+        run: scripts/macos_release_gh_isolation.sh
+
+      # First privacy step: check the policy and the marker list digest, check
       # the secret-backed tool selectors (notary profile, signing identity),
       # mask every marker and host string in later log output, create the
       # neutral work folder (OTTTO_PRIVACY_WORK) and record this attempt's

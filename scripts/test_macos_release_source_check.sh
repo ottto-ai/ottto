@@ -153,6 +153,21 @@ if ! grep -Fq -- "-f filter=latest" "$GH_MOCK_LOG"; then
   exit 1
 fi
 
+# [behaviour] The fetch of main ignores the host's global and system Git config:
+# a config that refuses every transport stops a plain fetch, not the check.
+host_config="$TMP_DIR/host.gitconfig"
+printf '[protocol]\n\tallow = never\n[credential]\n\thelper = !false\n' > "$host_config"
+if GIT_CONFIG_GLOBAL="$host_config" git -C "$work" fetch -q --no-tags \
+  "https://github.com/ottto-ai/ottto.git" refs/heads/main 2>/dev/null; then
+  echo "The host Git config fixture did not stop a plain fetch" >&2
+  exit 1
+fi
+if ! (export GIT_CONFIG_GLOBAL="$host_config" GIT_CONFIG_SYSTEM="$host_config"; run_check refs/tags/v0.1.2); then
+  echo "The release source check read the host's Git config" >&2
+  cat "$TMP_DIR/out" >&2
+  exit 1
+fi
+
 # [behaviour] ci-run alone prints the run id for the exact SHA.
 if [[ "$(bash "$CHECK" ci-run "$release_sha")" != "41" ]]; then
   echo "ci-run did not print the newest successful run id" >&2

@@ -148,10 +148,11 @@ if not (0 <= record < first_checksums < first_sign):
 steps = re.split(r"\n      - name: ", workflow)
 names = [step.split("\n", 1)[0] for step in steps[1:]]
 bodies = dict(zip(names, steps[1:]))
-if names[:5] != ["Check neutral runner paths", "Checkout", "Load release privacy policy",
-                 "Check dispatch inputs for private strings", "Enforce dispatch policy"]:
-    print("The runner path check, checkout, the privacy policy load, then the dispatch input check must "
-          "come first", file=sys.stderr)
+if names[:6] != ["Check neutral runner paths", "Checkout", "Isolate gh from runner logins",
+                 "Load release privacy policy", "Check dispatch inputs for private strings",
+                 "Enforce dispatch policy"]:
+    print("The runner path check, checkout, gh isolation, the privacy policy load, then the dispatch input "
+          "check must come first", file=sys.stderr)
     sys.exit(1)
 if "uses:" in bodies["Check neutral runner paths"] or "${{" in bodies["Check neutral runner paths"]:
     print("The runner path check runs before checkout and reads only the runner's own variables", file=sys.stderr)
