@@ -140,6 +140,21 @@ class LayoutTests(unittest.TestCase):
             status, found, _ = self.findings('--enforce', 'size', '--base', base)
             self.assertEqual(status, 1)
             self.assertIn('size: scripts/source_layout_limits.tsv: ceilings total 46, up from 34 at base', found)
+            # Even with another ceiling falling to keep the total down.
+            self.write({frame: '//! Small.\n' + 'fn f() {}\n' * 8,
+                        'scripts/source_layout_limits.tsv': rows((wire, 13), (sqlite, 12))})
+            status, found, _ = self.findings('--enforce', 'size', '--base', base)
+            self.assertEqual(status, 1)
+            self.assertEqual([f for f in found if f.startswith('size')],
+                             ['size: snapshots/state_v2/sqlite.rs: row of 12 for a file of 1 lines at base, under 10'])
+            # A path new at the base (a split or a move) may start a row within the total.
+            moved = f'{SRC}/snapshots/wire/frame_split.rs'
+            self.write({sqlite: '//! SQLite.\n',
+                        wire: '//! Wire.\n\nmod frame;\nmod frame_split;\n' + 'fn w() {}\n' * 9,
+                        moved: '//! Split.\n' + 'fn g() {}\n' * 12,
+                        'scripts/source_layout_limits.tsv': rows((wire, 13), (moved, 13))})
+            status, found, out = self.findings('--enforce', 'size', '--base', base)
+            self.assertEqual((status, [f for f in found if f.startswith('size')]), (0, []), out)
 
     def test_tree_rules(self):
         self.write({

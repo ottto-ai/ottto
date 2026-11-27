@@ -19,8 +19,10 @@ unless their rules are explicitly enforced with --enforce (CI enforces size).
                 and their total may not rise. A row may rise only to what the
                 base already holds: its row, or its length there when that is
                 over 3,000 (a row that records an unenforced gap; with size
-                enforced, that length never passes the row). Over 1,500 lines
-                is a note.
+                enforced, that length never passes the row). A file under
+                3,000 at the base cannot start a row; only a path that is new
+                at the base can (a split or a move, within the total). Over
+                1,500 lines is a note.
   tree          every .rs file is reachable by `mod` from the crate root; every
                 module directory has its `<dir>.rs`; no `mod.rs`; files other
                 than .rs only under tests/fixtures/ and
@@ -209,8 +211,14 @@ def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits
         base_lines = base_lines or {}
         allowed = {path: base_allowance(path, base_limits, base_lines) for path in set(limits) | set(base_limits)}
         for path, ceiling in sorted(limits.items()):
-            if (path in base_limits or allowed[path]) and ceiling > allowed[path]:
-                out.append(Finding("size", path, f"ceiling rose from {allowed[path]} to {ceiling}"))
+            if path in base_limits or allowed[path]:
+                if ceiling > allowed[path]:
+                    out.append(Finding("size", path, f"ceiling rose from {allowed[path]} to {ceiling}"))
+            elif path in base_lines:
+                # Existed at base under the limit: a row would let it grow past it. Only a path new
+                # at base (a split or a move, governed by the total) may start a row.
+                out.append(Finding("size", path, f"row of {ceiling} for a file of {base_lines[path]} lines "
+                                                 f"at base, under {MAX_LINES}"))
         if sum(limits.values()) > sum(allowed.values()):
             out.append(Finding("size", LIMITS, f"ceilings total {sum(limits.values())}, "
                                                f"up from {sum(allowed.values())} at base"))
