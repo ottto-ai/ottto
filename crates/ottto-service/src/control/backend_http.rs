@@ -1,5 +1,7 @@
 //! backend http for local control.
 
+pub(crate) mod loopback_base;
+
 use crate::control::backend_error_indicates_account_gone;
 use crate::control::json;
 use crate::control::redact_inline;
@@ -548,9 +550,43 @@ pub(crate) fn is_trusted_api_base_url(value: &str) -> bool {
         || value == DIRECT_API_BASE_URL
         || value == LEGACY_API_BASE_URL
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
-        || value.starts_with("http://localhost")
-        || value.starts_with("http://127.0.0.1")
+        || developer_loopback_allowed(value)
         || staging_pair().is_some_and(|(api, _)| value == api)
+}
+
+/// Plain HTTP only to this Mac, and only for the exact base the developer
+/// configured for this daemon process (`OTTTO_API_BASE_URL`); never a base
+/// that arrived in a request or a saved connection. Unit tests may also accept
+/// an exact loopback base so mock backends keep working; see
+/// [`without_test_loopback_allowance`] to test the production rule.
+fn developer_loopback_allowed(value: &str) -> bool {
+    let developer_override = std::env::var("OTTTO_API_BASE_URL").ok();
+    loopback_base::developer_loopback_base(value, developer_override.as_deref())
+        || (test_loopback_allowance() && loopback_base::loopback_http_base(value).is_some())
+}
+
+#[cfg(test)]
+fn test_loopback_allowance() -> bool {
+    TEST_LOOPBACK_ALLOWANCE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn test_loopback_allowance() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LOOPBACK_ALLOWANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `test` on this thread with the production loopback rule only.
+#[cfg(test)]
+pub(super) fn without_test_loopback_allowance<T>(test: impl FnOnce() -> T) -> T {
+    TEST_LOOPBACK_ALLOWANCE.with(|cell| cell.set(false));
+    let result = test();
+    TEST_LOOPBACK_ALLOWANCE.with(|cell| cell.set(true));
+    result
 }
 
 /// The one staging deployment a non-stable candidate build may trust, as `(API origin, web
