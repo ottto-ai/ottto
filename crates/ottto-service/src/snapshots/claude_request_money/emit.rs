@@ -83,6 +83,7 @@ pub(super) fn apply(
     item: &mut SnapshotItem,
     entity: &ClaudeEntityBody,
     span_last: Option<&str>,
+    span_start: Option<&str>,
 ) -> bool {
     if entity.held || !entity.certificate_ok {
         return false;
@@ -269,6 +270,17 @@ pub(super) fn apply(
     if let Some(last) = span_last {
         super::super::sources::claude::census::usage_ledger::widen_last_activity(item, last);
     }
+    // The session starts at its earliest file, whichever file carries the
+    // body: only ever earlier than the carrier's own start, never later.
+    if let Some(start) = span_start {
+        if item
+            .source_started_at
+            .as_deref()
+            .is_some_and(|current| super::super::timestamp_is_after(current, start))
+        {
+            item.source_started_at = Some(start.to_owned());
+        }
+    }
     let latest = entity
         .activity_nanos
         .max(i128::from(entity.activity_unix) * 1_000_000_000);
@@ -350,7 +362,7 @@ mod tests {
             );
         }
         entity.telemetry_owned_complete = false;
-        assert!(apply(&mut item, &entity, None));
+        assert!(apply(&mut item, &entity, None, None));
         assert_eq!(
             item.usage_accounting_contract.as_deref(),
             Some(REQUEST_OWNED_USAGE_CONTRACT)
@@ -418,30 +430,30 @@ mod tests {
     #[test]
     fn emission_keeps_uniform_account_and_refuses_tagged_identity() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
-        assert!(apply(&mut item, &one_grain(0), None));
+        assert!(apply(&mut item, &one_grain(0), None, None));
         super::super::super::set_session_account_hash(&mut item, Some("h"));
-        assert!(apply(&mut item, &one_grain(0), None));
+        assert!(apply(&mut item, &one_grain(0), None, None));
         assert!(!item.model_usage.is_empty());
         assert_eq!(exact_session_account_hash(&item).as_deref(), Some("h"));
         // Rows already tagged with evidence cannot be regrouped: refuse,
         // never wipe the tags.
         item.model_usage[0].evidence_ref = Some(0);
         let before = serde_json::to_vec(&item).unwrap();
-        assert!(!apply(&mut item, &one_grain(0), None));
+        assert!(!apply(&mut item, &one_grain(0), None, None));
         assert_eq!(serde_json::to_vec(&item).unwrap(), before);
     }
 
     #[test]
     fn resolver_conflicts_emit_nonzero_only_and_change_the_fingerprint() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
-        assert!(apply(&mut item, &one_grain(0), None));
+        assert!(apply(&mut item, &one_grain(0), None, None));
         assert_eq!(item.resolver_conflict_count, None);
         assert!(serde_json::to_value(&item)
             .unwrap()
             .get("resolver_conflict_count")
             .is_none());
         let clean = item.snapshot_fingerprint.clone();
-        assert!(apply(&mut item, &one_grain(2), None));
+        assert!(apply(&mut item, &one_grain(2), None, None));
         assert_eq!(item.resolver_conflict_count, Some(2));
         assert_eq!(
             serde_json::to_value(&item).unwrap()["resolver_conflict_count"],
@@ -461,7 +473,7 @@ mod tests {
             item.source_started_at = Some("2026-08-02T09:00:00Z".into());
             item.source_last_activity_at = Some(last.into());
             item.source_ended_at = None;
-            assert!(apply(&mut item, &entity, span_last));
+            assert!(apply(&mut item, &entity, span_last, None));
             assert_eq!(
                 item.source_started_at.as_deref(),
                 Some("2026-08-02T09:00:00Z"),
@@ -488,6 +500,33 @@ mod tests {
     }
 
     #[test]
+    fn the_start_spans_the_summed_files_and_only_moves_earlier() {
+        let own = "2026-08-02T09:00:00Z";
+        let start = |carrier: Option<&str>, span_start: Option<&str>| {
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
+            item.source_started_at = carrier.map(str::to_owned);
+            item.source_last_activity_at = Some("2026-08-02T10:00:00Z".into());
+            let last = item.source_last_activity_at.clone();
+            assert!(apply(&mut item, &one_grain(0), None, span_start));
+            // The start moves no last clock.
+            assert_eq!(item.source_last_activity_at, last);
+            item.source_started_at
+        };
+        // Another file's earlier first record is the body's start.
+        let earlier = "2026-08-02T08:59:50Z";
+        assert_eq!(start(Some(own), Some(earlier)).as_deref(), Some(earlier));
+        // A later or equal span start keeps the carrier's own.
+        assert_eq!(start(Some(own), Some(own)).as_deref(), Some(own));
+        assert_eq!(
+            start(Some(own), Some("2026-08-02T09:00:10Z")).as_deref(),
+            Some(own)
+        );
+        assert_eq!(start(Some(own), None).as_deref(), Some(own));
+        // A carrier without a start is left as the files left it.
+        assert_eq!(start(None, Some(earlier)), None);
+    }
+
+    #[test]
     fn refused_entity_keeps_its_clocks_whatever_the_span() {
         let held = ClaudeEntityBody {
             held: true,
@@ -500,7 +539,12 @@ mod tests {
         for entity in [held, uncertified] {
             let mut item = crate::snapshots::tests::sample_session_artifact_item();
             let before = serde_json::to_vec(&item).unwrap();
-            assert!(!apply(&mut item, &entity, Some("2026-08-02T23:00:00Z")));
+            assert!(!apply(
+                &mut item,
+                &entity,
+                Some("2026-08-02T23:00:00Z"),
+                Some("2026-08-01T00:00:00Z")
+            ));
             assert_eq!(serde_json::to_vec(&item).unwrap(), before);
         }
     }
@@ -513,7 +557,7 @@ mod tests {
             certificate_ok: false,
             ..Default::default()
         };
-        assert!(!apply(&mut item, &entity, None));
+        assert!(!apply(&mut item, &entity, None, None));
         assert_eq!(serde_json::to_vec(&item).unwrap(), before);
     }
 }

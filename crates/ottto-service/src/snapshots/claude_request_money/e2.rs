@@ -1997,8 +1997,9 @@ pub(crate) fn finish_page_planned(
     claude_request_identity::inherit_root_accounts(items, true);
 
     // Per session: whether every fold is a covered copy, and the latest last
-    // clock over its folds, which the emitted body keeps.
-    let mut drop_copies = BTreeMap::<String, (bool, Option<String>)>::new();
+    // clock and earliest start over its folds, which the emitted body keeps
+    // whichever file carries it.
+    let mut drop_copies = BTreeMap::<String, (bool, Option<String>, Option<String>)>::new();
     for item in items.iter() {
         if let Some(fold) = item.claude_money.as_deref() {
             let covered = fold.first_own.is_none()
@@ -2011,15 +2012,22 @@ pub(crate) fn finish_page_planned(
                         .observations(&item.source_session_id)
                         .any(|(location, _)| location != here)
                 });
-            let (covered_only, last) = drop_copies
+            let (covered_only, last, start) = drop_copies
                 .entry(item.source_session_id.clone())
-                .or_insert((true, None));
+                .or_insert((true, None, None));
             *covered_only &= covered;
             if let Some(clock) = item.source_last_activity_at.as_deref() {
                 if last.as_deref().map_or(true, |current| {
                     super::super::timestamp_is_after(clock, current)
                 }) {
                     *last = Some(clock.to_owned());
+                }
+            }
+            if let Some(clock) = item.source_started_at.as_deref() {
+                if start.as_deref().map_or(true, |current| {
+                    super::super::timestamp_is_after(current, clock)
+                }) {
+                    *start = Some(clock.to_owned());
                 }
             }
         }
@@ -2218,9 +2226,11 @@ pub(crate) fn finish_page_planned(
         if item.claude_money.is_none() {
             return true;
         }
-        let (covered_only, span_last) = drop_copies
+        let (covered_only, span_last, span_start) = drop_copies
             .get(&item.source_session_id)
-            .map_or((false, None), |(covered, last)| (*covered, last.as_deref()));
+            .map_or((false, None, None), |(covered, last, start)| {
+                (*covered, last.as_deref(), start.as_deref())
+            });
         if !content_held.contains(&item.source_session_id) && covered_only {
             return false;
         }
@@ -2233,7 +2243,7 @@ pub(crate) fn finish_page_planned(
         };
         // apply refuses before mutating, so a withheld item is unchanged:
         // its fold gets its own entity back (moved out above).
-        let emitted = super::emit::apply(item, &entity, span_last);
+        let emitted = super::emit::apply(item, &entity, span_last, span_start);
         if emitted {
             if let Some((counts, truncated)) = twin_tools.remove(&item.source_session_id) {
                 let mut rows = super::super::bounded_tool_usage_counts(&counts);
@@ -2355,7 +2365,7 @@ fn record_decided(held: bool, counts: Counts) {
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {
-    super::emit::apply(item, entity, None)
+    super::emit::apply(item, entity, None, None)
 }
 
 /// The identity row of each request a copied marker
