@@ -1143,7 +1143,7 @@ fn record_collection_complete(source: SnapshotSource, at: &str) {
 #[derive(Clone, Copy)]
 struct FinishEnv<'a> {
     source: SnapshotSource,
-    client: &'a super::SnapshotApiClient,
+    client: &'a crate::snapshot_sync::SnapshotApiClient,
     device: &'a LocalDeviceBinding,
     device_secret: &'a str,
     machine_id: &'a str,
@@ -2719,7 +2719,7 @@ fn settle_pass_and_markers(
             support_dir,
             source,
             upload_destination_namespace,
-            &super::enabled_snapshot_sources_in(device, support_dir),
+            &crate::snapshot_sync::enabled_snapshot_sources_in(device, support_dir),
         ) {
             // Every participant reads the next tier now; the final at background QoS.
             Ok(Some((wake, first_import))) => {
@@ -2946,7 +2946,7 @@ fn report_and_arm(
             let outside = cycle_owed_nothing
                 && loss_free
                 && upload_fully_settled
-                && super::prepare::upload_owes_nothing(
+                && crate::snapshot_sync::prepare::upload_owes_nothing(
                     source,
                     upload_progress,
                     support_dir,
