@@ -280,6 +280,7 @@ use backend_http::cli_error_message;
 use backend_http::control_token_validation_base_url;
 use backend_http::form_url_encode;
 pub(crate) use backend_http::is_production_api_base_url;
+pub(crate) use backend_http::is_trusted_api_base_url;
 pub(crate) use backend_http::loopback_base::developer_loopback_base;
 use backend_http::reattach_required_state;
 use backend_http::require_request_base_matches_binding;

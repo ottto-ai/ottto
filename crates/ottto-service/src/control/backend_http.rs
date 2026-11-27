@@ -571,7 +571,7 @@ pub(crate) fn is_production_api_base_url(value: &str) -> bool {
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
 }
 
-fn is_trusted_api_base_url(value: &str) -> bool {
+pub(crate) fn is_trusted_api_base_url(value: &str) -> bool {
     if value.contains('@') || value.contains('?') || value.contains('#') {
         return false;
     }
