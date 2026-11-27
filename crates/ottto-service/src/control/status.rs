@@ -234,14 +234,17 @@ fn observe_setup_run_read<T>(
 /// The device credential check for a Mac with no enabled app. Uploads and
 /// local-health passes need an app's relay token, so without one nothing tells
 /// this Mac that Ottto disconnected it. The heartbeat thread calls this every
-/// `IDLE_CREDENTIAL_CHECK_INTERVAL` while no app is enabled.
+/// `IDLE_CREDENTIAL_CHECK_INTERVAL` while no app is enabled, and after the
+/// Mac wakes from sleep.
 ///
 /// The check is one read-only `GET /api/v1/telemetry/devices/{id}/status` with
 /// this Mac's device id and secret: no source, usage or local data, nothing
 /// written on either side, no token. Only an authoritative answer is recorded,
 /// the same way as for agent reads: a refused credential marks the setup run
 /// rejected with a refused device (`account` and `status` then read
-/// reconnect-required), and a usable one clears an earlier rejection. No
+/// reconnect-required), and a usable one clears an earlier device refusal
+/// (never a "setup run ended" rejection, which the device answer can't
+/// prove anything about). No
 /// answer (network, 429, 5xx, an older server without the route) changes
 /// nothing.
 pub(crate) fn probe_idle_device_credential(daemon: &LocalDaemon) {
@@ -264,7 +267,7 @@ pub(crate) fn probe_idle_device_credential_with(
     };
     match check(&start.binding.api_base_url) {
         IdleCredentialAnswer::Usable => {
-            let _ = daemon.record_setup_run_read_accepted(&start);
+            let _ = daemon.record_device_credential_accepted(&start);
         }
         IdleCredentialAnswer::Refused => {
             let _ = daemon.record_setup_run_read_rejected(

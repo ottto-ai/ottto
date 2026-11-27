@@ -1788,6 +1788,29 @@ mod tests {
     }
 
     #[test]
+    fn a_usable_device_answer_never_clears_an_ended_setup_run() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record ended run");
+
+        crate::control::probe_idle_device_credential_with(&daemon, |_| {
+            crate::control::IdleCredentialAnswer::Usable
+        });
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert!(latest_setup_run_read_rejection(&status.local_health_events).is_some());
+        let health = status.canonical_health.as_ref().expect("health");
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+    }
+
+    #[test]
     fn idle_credential_check_ignores_answers_that_prove_nothing() {
         let run = read_binding("run_1");
         let daemon = daemon()

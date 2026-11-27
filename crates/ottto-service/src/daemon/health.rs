@@ -252,6 +252,26 @@ impl LocalDaemon {
     /// binding run concurrently, so a slow read that succeeded before the
     /// run ended can finish after a later read recorded the rejection, and
     /// its success says nothing about that newer answer.
+    /// A usable answer from the device-credential status route proves only
+    /// the device. It clears a device refusal, never a "setup run ended" one,
+    /// which only a new sign-in or an accepted setup-run read clears.
+    pub(crate) fn record_device_credential_accepted(
+        &self,
+        start: &SetupRunReadStart,
+    ) -> Result<(), LocalApiError> {
+        let device_refused = {
+            let state = self.state()?;
+            latest_setup_run_read_rejection(&state.local_health_events).is_some_and(|current| {
+                current.rejection == TerminalRefreshRejection::DeviceRejected
+            })
+        };
+        if !device_refused {
+            return Ok(());
+        }
+        // Clears only if that refusal is still the one this check started from.
+        self.record_setup_run_read_accepted(start)
+    }
+
     pub(crate) fn record_setup_run_read_accepted(
         &self,
         start: &SetupRunReadStart,

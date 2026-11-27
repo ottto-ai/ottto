@@ -57,9 +57,9 @@ short status messages; command output in those messages has local paths
 removed.
 
 A connected Mac with no enabled app sends no health reports. Instead it checks
-its sign-in with Ottto every 15 minutes. That check is one read-only request to
-the device status endpoint, carrying only this Mac's device id and device
-secret. It sends no source, usage or local data, and nothing is written on
+its sign-in with Ottto once an hour and after the Mac wakes from sleep. That
+check is one read-only request to the device status endpoint, carrying only
+this Mac's device id and device secret. It sends no source, usage or local data, and nothing is written on
 either side. If Ottto refuses the device, `ottto account` and `ottto status`
 report that the Mac needs to reconnect.
 

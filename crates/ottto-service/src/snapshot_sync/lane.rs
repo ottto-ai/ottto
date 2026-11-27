@@ -50,6 +50,7 @@ use super::ONE_SHOT_SYNC_IN_FLIGHT;
 use super::SNAPSHOT_SYNC_INTERVAL;
 use super::SNAPSHOT_SYNC_LOCK;
 use super::SNAPSHOT_SYNC_WORKER_STACK_BYTES;
+use std::time::SystemTime;
 
 #[cfg(test)]
 use super::is_snapshot_fingerprint;
@@ -300,12 +301,28 @@ pub(super) fn local_cadence_phase_offset(interval: Duration) -> Duration {
 /// Ottto. The check rides the local-health pass (every
 /// `LOCAL_HEALTH_PROJECTION_INTERVAL`); this only spaces it out, so there is no
 /// timer of its own.
-pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The wall clock moved this much more than the monotonic clock between two
+/// passes: the Mac slept (the monotonic clock stops during sleep on macOS).
+pub(super) const WAKE_GAP: Duration = Duration::from_secs(2 * 60);
 
 /// Whether this pass runs the idle credential check: the first pass with no
-/// enabled app, then once per [`IDLE_CREDENTIAL_CHECK_INTERVAL`].
-pub(super) fn idle_credential_check_due(last: Option<Instant>, now: Instant) -> bool {
-    last.is_none_or(|last| now.saturating_duration_since(last) >= IDLE_CREDENTIAL_CHECK_INTERVAL)
+/// enabled app, the first pass after the Mac wakes, then once per
+/// [`IDLE_CREDENTIAL_CHECK_INTERVAL`] of awake time. A wake needs at least
+/// [`WAKE_GAP`] of sleep, so a lid that opens and closes can't storm.
+pub(super) fn idle_credential_check_due(last: Option<Instant>, now: Instant, woke: bool) -> bool {
+    woke || last
+        .is_none_or(|last| now.saturating_duration_since(last) >= IDLE_CREDENTIAL_CHECK_INTERVAL)
+}
+
+/// Whether the Mac slept between two passes, from how much further the wall
+/// clock moved than the monotonic one. A wall clock set back never counts.
+pub(super) fn woke_between(previous: (Instant, SystemTime), now: (Instant, SystemTime)) -> bool {
+    let awake = now.0.saturating_duration_since(previous.0);
+    now.1
+        .duration_since(previous.1)
+        .is_ok_and(|wall| wall.saturating_sub(awake) >= WAKE_GAP)
 }
 
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
@@ -313,13 +330,17 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
         .name("ottto-local-health-sync".to_string())
         .spawn(move || {
             let mut last_idle_credential_check: Option<Instant> = None;
+            let mut last_pass: Option<(Instant, SystemTime)> = None;
             loop {
+                let this_pass = (Instant::now(), SystemTime::now());
+                let woke = last_pass.is_some_and(|previous| woke_between(previous, this_pass));
+                last_pass = Some(this_pass);
                 match upload_local_health_projection_now(&daemon) {
                     // No app is enabled, so no local-health upload checks this
                     // Mac's credential. Check it on its own, spaced out.
                     Err(error) if error.downcast_ref::<NoHeartbeatSource>().is_some() => {
                         let now = Instant::now();
-                        if idle_credential_check_due(last_idle_credential_check, now) {
+                        if idle_credential_check_due(last_idle_credential_check, now, woke) {
                             last_idle_credential_check = Some(now);
                             crate::control::probe_idle_device_credential(&daemon);
                         }
@@ -1441,27 +1462,63 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod idle_credential_check_tests {
     use super::idle_credential_check_due;
+    use super::woke_between;
     use super::Duration;
     use super::Instant;
+    use super::SystemTime;
     use super::IDLE_CREDENTIAL_CHECK_INTERVAL;
+    use super::WAKE_GAP;
 
     #[test]
-    fn idle_credential_check_runs_first_then_once_per_interval() {
+    fn idle_credential_check_runs_first_then_hourly_and_on_wake() {
+        assert_eq!(IDLE_CREDENTIAL_CHECK_INTERVAL, Duration::from_secs(60 * 60));
         let start = Instant::now();
-        assert!(idle_credential_check_due(None, start));
-        assert!(!idle_credential_check_due(Some(start), start));
+        assert!(idle_credential_check_due(None, start, false));
+        assert!(!idle_credential_check_due(Some(start), start, false));
         assert!(!idle_credential_check_due(
             Some(start),
-            start + IDLE_CREDENTIAL_CHECK_INTERVAL - Duration::from_secs(1)
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL - Duration::from_secs(1),
+            false
         ));
         assert!(idle_credential_check_due(
             Some(start),
-            start + IDLE_CREDENTIAL_CHECK_INTERVAL
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL,
+            false
         ));
+        // A wake checks at once.
+        assert!(idle_credential_check_due(Some(start), start, true));
         // A clock that reads earlier than the last check never fires early.
         assert!(!idle_credential_check_due(
             Some(start + Duration::from_secs(5)),
-            start
+            start,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_wake_is_a_wall_clock_jump_beyond_awake_time() {
+        let mono = Instant::now();
+        let wall = SystemTime::now();
+        let minute = Duration::from_secs(60);
+        // A normal one-minute pass.
+        assert!(!woke_between((mono, wall), (mono + minute, wall + minute)));
+        // Asleep for an hour between passes.
+        assert!(woke_between(
+            (mono, wall),
+            (mono + minute, wall + minute + Duration::from_secs(3600))
+        ));
+        // Just under the gap does not count.
+        assert!(!woke_between(
+            (mono, wall),
+            (
+                mono + minute,
+                wall + minute + WAKE_GAP - Duration::from_secs(1)
+            )
+        ));
+        // A wall clock set back never counts.
+        assert!(!woke_between(
+            (mono, wall),
+            (mono + minute, wall - Duration::from_secs(3600))
         ));
     }
 }
