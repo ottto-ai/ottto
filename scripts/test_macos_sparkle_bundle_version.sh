@@ -58,6 +58,7 @@ cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_
 cp "$ROOT/scripts/macos_app_binary.sh" "$repo/scripts/macos_app_binary.sh"
 cp "$ROOT/scripts/macos_license_notices.sh" "$repo/scripts/macos_license_notices.sh"
 cp "$ROOT/scripts/macos_release_archive.sh" "$repo/scripts/macos_release_archive.sh"
+cp "$ROOT/scripts/macos_privacy_gate.py" "$repo/scripts/macos_privacy_gate.py"
 # shellcheck source=scripts/macos_license_notices.sh
 source "$ROOT/scripts/macos_license_notices.sh"
 sparkle_license="licenses/Sparkle-$OTTTO_SPARKLE_LICENSE_VERSION-LICENSE"
@@ -675,6 +676,47 @@ if ! jq -e --arg version "$OTTTO_SPARKLE_LICENSE_VERSION" --arg revision "$spark
   cat "$output_dir/ottto-local-platform-sbom.cdx.json" >&2
   exit 1
 fi
+
+# [behaviour] --stage prepare stops before any signing and leaves the unsigned
+# app and binaries immutable for the privacy gate. --stage finish signs only
+# files that match a clean gate record, and refuses before signing without one.
+: > "$ORDER_LOG"
+staged_output="$TMP_DIR/staged-output"
+release_env bash "$repo/scripts/macos_package.sh" --stage prepare \
+  --app-root "$app_root" --app-source-commit "$private_commit" \
+  --version "0.1.92-rc2" --channel stable-candidate --release-notes "Staged fixture" \
+  --output-dir "$staged_output" >"$TMP_DIR/prepare.out" 2>&1 || {
+    cat "$TMP_DIR/prepare.out" >&2
+    echo "Prepare stage failed" >&2
+    exit 1
+  }
+if grep -q '^codesign ' "$ORDER_LOG" || [[ -e "$staged_output/Ottto-macos-arm64.dmg" ]]; then
+  echo "--stage prepare must stop before signing and packaging" >&2
+  exit 1
+fi
+for staged in Ottto.app ottto ottto-service; do
+  if [[ "$(stat -f %Sf "$staged_output/$staged")" != *uchg* ]]; then
+    echo "--stage prepare must leave $staged immutable" >&2
+    exit 1
+  fi
+done
+mkdir -m 700 "$TMP_DIR/empty-privacy-state"
+for finish_args in "" "--privacy-state $TMP_DIR/empty-privacy-state"; do
+  # shellcheck disable=SC2086 # Split the optional flag and its value.
+  if release_env bash "$repo/scripts/macos_package.sh" --stage finish $finish_args \
+    --app-root "$app_root" --app-source-commit "$private_commit" \
+    --version "0.1.92-rc2" --channel stable-candidate --release-notes "Staged fixture" \
+    --output-dir "$staged_output" >"$TMP_DIR/finish.out" 2>&1; then
+    echo "--stage finish must refuse without a clean privacy gate record" >&2
+    exit 1
+  fi
+done
+grep -Fq "The prepared files are not the ones the privacy gate checked" "$TMP_DIR/finish.out"
+if grep -q '^codesign ' "$ORDER_LOG"; then
+  echo "A refused finish stage signed code" >&2
+  exit 1
+fi
+chflags -R nouchg "$staged_output"
 
 # commit_app_fixture <message>: commit the app fixture and print the commit.
 commit_app_fixture() {

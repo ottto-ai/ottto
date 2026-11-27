@@ -965,6 +965,7 @@ def check_public_skeleton_contracts() -> None:
         "scripts/macos_manifest_signature.sh",
         "scripts/macos_release_gate.sh",
         "scripts/macos_release_source_check.sh",
+        "scripts/macos_release_gh_isolation.sh",
         "scripts/macos_release_verification_folder.sh",
         "scripts/macos_public_rc_evidence_template.sh",
         "scripts/macos_public_rc_gate.sh",

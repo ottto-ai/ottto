@@ -1858,6 +1858,69 @@ fn test_pending_device_credential(
     }
 }
 
+#[test]
+#[serial]
+fn prior_secret_goes_only_to_the_backend_that_issued_it() {
+    let prior = |owner_base: Option<&str>| PriorDeviceCredential {
+        machine_id: Some("machine_test".to_string()),
+        device_id: "device-prior".to_string(),
+        device_sources: vec!["codex".to_string()],
+        device_secret: "synthetic".to_string(),
+        owner: owner_base.map(|base| LocalCredentialOwner {
+            user_id: "user".to_string(),
+            organization_id: "org".to_string(),
+            api_base_url: base.to_string(),
+        }),
+        snapshot_namespace: "a".repeat(64),
+    };
+    let production = prior(Some("https://ottto.net/backend"));
+    assert!(prior_issued_by(&production, "https://api.ottto.net", None));
+    assert!(prior_issued_by(
+        &production,
+        "https://ottto.net/backend/",
+        None
+    ));
+    assert!(!prior_issued_by(
+        &production,
+        "https://staging.example",
+        None
+    ));
+    assert!(!prior_issued_by(&production, "http://127.0.0.1:8000", None));
+
+    let local = prior(Some("http://127.0.0.1:8000"));
+    assert!(prior_issued_by(&local, "http://127.0.0.1:8000/", None));
+    assert!(!prior_issued_by(&local, "https://api.ottto.net", None));
+
+    // No recorded owner: only the configured backend, production by default.
+    let _lock = lock_backend_test_env();
+    let _api_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+    let unknown = prior(None);
+    assert!(prior_issued_by(&unknown, "https://api.ottto.net", None));
+    assert!(prior_issued_by(&unknown, "https://ottto.net/backend", None));
+    assert!(!prior_issued_by(&unknown, "https://staging.example", None));
+    assert!(!prior_issued_by(&unknown, "http://127.0.0.1:8000", None));
+    let _developer = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://127.0.0.1:8000");
+    assert!(prior_issued_by(&unknown, "http://127.0.0.1:8000", None));
+    assert!(!prior_issued_by(&unknown, "https://api.ottto.net", None));
+    // With a saved connection, an owner-less credential goes only to its backend.
+    assert!(prior_issued_by(
+        &unknown,
+        "https://staging.example",
+        Some("https://staging.example/")
+    ));
+    assert!(!prior_issued_by(
+        &unknown,
+        "https://api.ottto.net",
+        Some("https://staging.example")
+    ));
+    // A recorded owner always wins over the saved connection.
+    assert!(!prior_issued_by(
+        &production,
+        "https://staging.example",
+        Some("https://staging.example")
+    ));
+}
+
 fn test_setup_claim_request_authority(
     prior_secret: &str,
 ) -> PendingDeviceCredentialRequestAuthority {
@@ -5830,6 +5893,65 @@ fn idle_credential_check_sends_nothing_when_the_saved_backend_changed() {
 
 #[test]
 #[serial]
+fn claim_completion_withholds_a_prior_credential_issued_by_another_backend() {
+    let support_root = telemetry_key_store_root("claim-other-backend-device");
+    let secret_root = telemetry_key_store_root("claim-other-backend-secret");
+    fs::create_dir_all(&secret_root).expect("secret root");
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+    FileDeviceStore::default()
+        .save_envelope(&LocalDeviceEnvelope {
+            device: LocalDeviceBinding {
+                device_id: "device_other_backend".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            continuity: DeviceCredentialContinuity {
+                owner: Some(LocalCredentialOwner {
+                    user_id: "user_other".to_string(),
+                    organization_id: "org_other".to_string(),
+                    api_base_url: "https://api.ottto.net".to_string(),
+                }),
+                snapshot_namespace: None,
+            },
+        })
+        .expect("persist relay device issued by production");
+    fs::write(
+        secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "prior-secret-other-backend",
+    )
+    .expect("persist relay secret fallback");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+    let address = listener.local_addr().expect("claim backend address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept claim complete");
+        let request = read_complete_http_request(&mut stream);
+        write_json_response(&mut stream, 200, "OK", "{}");
+        request
+    });
+    let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+    let claim = PendingAuthClaim {
+        claim_code: "claim_other_backend".to_string(),
+        claim_token: "token_other_backend".to_string(),
+        nonce: "nonce_other_backend".to_string(),
+        claim_url: "https://ottto.net/setup/claim?code=claim_other_backend".to_string(),
+        expires_at: "2026-05-05T09:30:00Z".to_string(),
+    };
+    // Only the request body matters here; the stub's reply is not a full
+    // completion, so the call itself returns an error.
+    let _ = complete_setup_claim(&claim, &test_machine(), None);
+    let request = server.join().expect("claim server");
+    let body: serde_json::Value =
+        serde_json::from_str(http_request_body(&request)).expect("claim request json");
+
+    assert!(body.get("prior_device_secret").is_none(), "{body}");
+    assert!(body.get("relay_device_id").is_none(), "{body}");
+}
+
+#[test]
+#[serial]
 fn claim_completion_request_sends_existing_keychain_proof_stably_across_retries() {
     let support_root = telemetry_key_store_root("claim-complete-request-device");
     let secret_root = telemetry_key_store_root("claim-complete-request-device-secret");
@@ -7716,6 +7838,69 @@ fn release_manifest_deserialization_requires_update_and_rollback_metadata() {
         .expect("manifest object")
         .remove("rollback");
     assert!(serde_json::from_value::<ReleaseManifest>(manifest).is_err());
+}
+
+#[test]
+fn release_urls_must_be_on_the_install_host() {
+    for url in [
+        "https://install.ottto.net/ottto-local-platform/releases/dev/latest",
+        "https://INSTALL.ottto.net/a",
+        "https://install.ottto.net",
+    ] {
+        assert!(trusted_release_url(url, None), "{url}");
+    }
+    for url in [
+        "http://install.ottto.net/a",
+        "https://install.ottto.net.example/a",
+        "https://install.ottto.net@example.com/a",
+        "https://install.ottto.net\\@example.com/a",
+        "https://example.com/install.ottto.net/a",
+        "https://install.ottto.net:8443/a",
+        "http://localhost/a",
+        "http://localhost.example/a",
+        "http://127.0.0.1:8080/a",
+        "ftp://install.ottto.net/a",
+        "",
+    ] {
+        assert!(!trusted_release_url(url, None), "{url}");
+    }
+    let developer = Some("http://127.0.0.1:8080/manifest.json");
+    assert!(trusted_release_url(
+        "http://127.0.0.1:8080/releases/a",
+        developer
+    ));
+    assert!(!trusted_release_url(
+        "http://127.0.0.1:9090/releases/a",
+        developer
+    ));
+    assert!(!trusted_release_url(
+        "http://127.0.0.1:8080.example/a",
+        developer
+    ));
+}
+
+#[test]
+fn update_state_offers_no_download_from_a_manifest_on_another_host() {
+    let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
+    manifest.rollback.immutable_prefix =
+        "https://downloads.example/releases/dev/latest".to_string();
+    manifest.artifacts[0].url =
+        "https://downloads.example/releases/dev/latest/Ottto-macos-universal.dmg".to_string();
+    let state = update_state_from_manifest(
+        manifest,
+        "0.1.0".to_string(),
+        ReleaseChannel::Dev,
+        Some("2026-05-20T00:00:00Z".to_string()),
+        Some("deadbeef".to_string()),
+        InstallOwner::Homebrew,
+    );
+
+    assert_eq!(state.status, UpdateStatus::Unknown);
+    assert_eq!(state.download_url, None);
+    assert_eq!(
+        state.reason.as_deref(),
+        Some("release manifest has invalid rollback immutable_prefix")
+    );
 }
 
 #[test]
