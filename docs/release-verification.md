@@ -558,6 +558,11 @@ The signing job runs only on the release host's per-run runner:
   `--run-id <run id>` admits exactly that folder.
 - Checkout runs with `HOME` set to an empty folder under `RUNNER_TEMP`, so it
   copies no account Git configuration and names no home path.
+- `gh` reads only the job token. The first step points `GH_CONFIG_DIR` at an
+  empty folder under `RUNNER_TEMP`, and every step that runs `gh` (directly or
+  through a script) sets `GH_TOKEN: ${{ github.token }}`, so no runner account
+  login can stand in for a missing token
+  (`scripts/test_workflow_gh_token.py`, in the public surface checks).
 - Host paths come from the runner's own environment, never from workflow
   variables (a step's environment is printed): `OTTTO_MACOS_APP_ROOT` (the app
   source), `OTTTO_STABLE_CANDIDATE_RC_EVIDENCE` (the redacted RC evidence file,

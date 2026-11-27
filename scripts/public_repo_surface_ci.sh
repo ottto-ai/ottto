@@ -316,6 +316,7 @@ run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
 run_step M "test macOS release archives" bash scripts/test_macos_release_archive.sh
 run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step P "test workflow runner label policy" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_workflow_runner_policy.py
+run_step P "test workflow gh token policy" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_workflow_gh_token.py
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
 run_step B "test macOS notarization artifact selection" bash scripts/test_macos_notarize_filter.sh
 run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
