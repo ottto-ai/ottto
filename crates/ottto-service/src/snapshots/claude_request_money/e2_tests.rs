@@ -73,7 +73,7 @@ pub(super) fn parse(
     let mut items = read_items(path, birth, index, lines);
     // The page's copy decision, as the scan runs it; `publish` decides again
     // over the whole page, where a parsed witness proves its own requests.
-    decide_page_copies(&mut items, index, None);
+    decide_page_copies(&mut items, index);
     items.remove(0)
 }
 /// Parse without the copy decision: a held copy reaches the page undecided,
@@ -229,7 +229,7 @@ fn publish(
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index, None);
+    decide_page_copies(&mut items, index);
     if let Some(read) = read {
         attach_page(&mut items, read);
         side_calls_page(
@@ -1802,7 +1802,7 @@ fn tag_owned_with_held(
     index: &ScanIndex,
     expected_held: usize,
 ) -> Vec<SnapshotItem> {
-    decide_page_copies(&mut items, index, None);
+    decide_page_copies(&mut items, index);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
@@ -3830,7 +3830,7 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
             // As the scan runs it: the page's copy decision before telemetry attaches.
-            decide_page_copies(&mut items, &index, None);
+            decide_page_copies(&mut items, &index);
             let read = sidecar(&[
                 row("unmarked-own", 1, 20),
                 row("b", 2, 30),

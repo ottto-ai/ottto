@@ -194,7 +194,7 @@ fn run_page(
     let mut index = index_holding(&dir, copied);
     accepted_receipt(&mut index, &dir);
     let mut items = read_file(&path, &index, lines);
-    decide_page_copies(&mut items, &index, None);
+    decide_page_copies(&mut items, &index);
     let read = sidecar(rows);
     attach_page(&mut items, &read);
     check(&items);
@@ -353,7 +353,7 @@ fn decide_pass(index: &mut ScanIndex, path: &Path) -> Vec<SnapshotItem> {
         line("own", &at(101), 20),
     ];
     let mut items = read_file(path, index, &lines);
-    decide_page_copies(&mut items, index, None).apply(index);
+    decide_page_copies(&mut items, index).apply(index);
     items
 }
 fn fold(items: &[SnapshotItem]) -> &FileFold {

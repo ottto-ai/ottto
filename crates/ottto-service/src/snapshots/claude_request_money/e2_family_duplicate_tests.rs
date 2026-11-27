@@ -66,7 +66,7 @@ fn page(index: &ScanIndex, files: &[(PathBuf, Vec<Value>)]) -> BTreeMap<String, 
             parse(path, birth, index, lines)
         })
         .collect::<Vec<_>>();
-    decide_page_copies(&mut items, index, None);
+    decide_page_copies(&mut items, index);
     items
         .iter()
         .map(|item| {

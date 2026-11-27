@@ -15,7 +15,7 @@ use crate::snapshots::claude_history_upgrade::{
 };
 use crate::snapshots::claude_money_birth_store::{location_key, LocationKey};
 use crate::snapshots::claude_request_census::claude_request_hash;
-use crate::snapshots::claude_request_identity::{AcceptedBuckets, LentSlot};
+use crate::snapshots::claude_request_identity::LentSlot;
 use crate::snapshots::upload_context_receipt::receipt_binds_bytes;
 use crate::snapshots::{
     claude_index_path_family_member, claude_index_path_member_ref, claude_snapshot_family_root_ref,
@@ -43,9 +43,8 @@ pub(super) fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> 
 /// file's parse on this page, else its census record bound to its index
 /// entry's fingerprint. Requests no current revision holds count and are
 /// disclosed. Unresolved prefixes count immediately. All the page's cross-session
-/// checks share one completing census walk per folder. Runs in both gate modes;
-/// dark only counts. Returns the removals to store (gate on only): the caller
-/// applies them to the index
+/// checks share one completing census walk per folder. Returns the removals
+/// to store: the caller applies them to the index
 /// (`CopyRemovalUpdates::apply`). Removals precede ordinary accepted-share
 /// reconciliation. Single-page callers (tests) plan the content-twin holds
 /// over `items`.
@@ -53,10 +52,9 @@ pub(super) fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> 
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
-    accepted: Option<&AcceptedBuckets>,
 ) -> CopyRemovalUpdates {
     let content_held = page_content_holds(items, index);
-    decide_page_copies_planned(items, index, accepted, &content_held, &BTreeSet::new())
+    decide_page_copies_planned(items, index, &content_held, &BTreeSet::new())
 }
 
 /// Sessions the page withholds for an absent content twin, decided once over
@@ -80,7 +78,6 @@ pub(crate) fn page_content_holds(items: &[SnapshotItem], index: &ScanIndex) -> B
 pub(crate) fn decide_page_copies_planned(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
-    _accepted: Option<&AcceptedBuckets>,
     content_held: &BTreeSet<String>,
     newer_build_held: &BTreeSet<String>,
 ) -> CopyRemovalUpdates {
@@ -304,10 +301,9 @@ struct CopyOwner {
     census: Option<crate::snapshots::claude_request_census::ClaudeRequestCensusRecord>,
     groups: Vec<(LocationKey, Box<[u64]>)>,
 }
-pub(in crate::snapshots) type Links = BTreeMap<String, String>;
 #[derive(Default)]
 pub(in crate::snapshots) struct Carriers {
-    pub(in crate::snapshots) links: Links,
+    pub(in crate::snapshots) links: BTreeMap<String, String>,
     pub(in crate::snapshots) unknown: BTreeSet<String>,
     pub(in crate::snapshots) unreadable: BTreeSet<String>,
     pub(in crate::snapshots) unreadable_streak: BTreeSet<String>,
@@ -785,7 +781,7 @@ pub(super) fn mark_settled_counted_copies(index: &mut ScanIndex) {
 }
 
 #[cfg(test)]
-pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
+pub(super) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
     CopyOwnership::capture(previous).reconcile(next, &mut |_| Carriers::default());
 }
 

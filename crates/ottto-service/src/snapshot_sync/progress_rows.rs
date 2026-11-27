@@ -576,8 +576,9 @@ fn decode_identity_503_pending<'de, D: serde::Deserializer<'de>>(
         .filter(|keys| keys.iter().all(|key| is_snapshot_fingerprint(key))))
 }
 
-/// What a save's compare-and-swap reads from the on-disk progress: the writer
-/// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
+/// What the legacy JSON fixture saver's compare-and-swap reads from the on-disk
+/// progress: the writer stamp and the quarantine claims to merge. Other fields
+/// are skipped, not kept. Tests only; the native store does not use it.
 #[cfg(test)]
 #[derive(Deserialize)]
 pub(super) struct SnapshotUploadProgressCas {
