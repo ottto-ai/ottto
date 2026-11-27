@@ -60,10 +60,10 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
                 "census_stream",
                 claude_request_census::decode_index(Cursor::new(bytes)).unwrap(),
             ),
-            // Streaming lenient reader: ScanIndex::load and the CAS read.
+            // Streaming lenient reader: ScanIndex::load and a direct legacy decode probe.
             ("load", ScanIndex::load(&path).unwrap()),
             (
-                "streaming_cas",
+                "legacy_decode",
                 lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
                     .unwrap(),
             ),
@@ -103,7 +103,7 @@ fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
         let streamed =
             lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed").unwrap();
         let loaded = ScanIndex::load(&path).unwrap();
-        for (reader, decoded) in [("streaming_cas", &streamed), ("load", &loaded)] {
+        for (reader, decoded) in [("legacy_decode", &streamed), ("load", &loaded)] {
             let label = format!("{layout}/{reader}");
             assert!(decoded.decode_holds_file("held-opaque"), "{label}");
             assert!(

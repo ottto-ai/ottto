@@ -222,7 +222,7 @@ impl ReofferServer {
                         _ => None,
                     };
                     if let Some(status) = outage {
-                        bounded_native_response(&mut stream, status, "{}");
+                        loopback_response(&mut stream, status, "{}");
                         continue;
                     }
                     let references = items
@@ -344,7 +344,7 @@ impl ReofferServer {
                     }
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                bounded_native_response(&mut stream, "200 OK", &response.to_string());
+                loopback_response(&mut stream, "200 OK", &response.to_string());
             }
         });
         Self {

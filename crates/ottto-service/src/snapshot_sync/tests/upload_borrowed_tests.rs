@@ -32,7 +32,7 @@ fn upload_attempt_matches_cloned_batch_bytes() {
     assert!(!raw.claude_usage_request_ids.is_empty());
     let index = ScanIndex::default();
     let mut emitted = vec![raw.clone()];
-    e2::decide_page_copies(&mut emitted, &index, None);
+    e2::decide_page_copies(&mut emitted, &index);
     assert!(e2::finish_page(
         &mut emitted,
         &index,

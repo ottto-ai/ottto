@@ -1951,6 +1951,19 @@ fn portable_carrier_bodies(items: &[SnapshotItem], base: &Path) -> BTreeMap<Stri
 /// A newer forced carrier holds dependent copies until recovery can emit the same bodies as a healthy run.
 #[test]
 fn forced_newer_carrier_holds_dependent_copies_until_readable() {
+    // Past the holder's six-hour growth Full claim.
+    forced_newer_carrier_recovery(7 * 60 * 60);
+}
+
+/// [money] [regress] Recovery soon after the hold reads the carrier before
+/// its holder, and still equals the healthy run in every field, start
+/// included: the session keeps its earliest start whichever file carries it.
+#[test]
+fn forced_newer_carrier_recovered_within_the_hour_equals_cold_full() {
+    forced_newer_carrier_recovery(30 * 60);
+}
+
+fn forced_newer_carrier_recovery(retry_after: u64) {
     use crate::snapshots::e2_pipeline_scan_fixture::{
         forced_needs_native_for_test, set_future_tail_fact_for_test, tail_counter_for_test,
     };
@@ -2037,8 +2050,7 @@ fn forced_newer_carrier_holds_dependent_copies_until_readable() {
         index.activate_upload_context("e2-synthetic-destination".into());
         set_future_tail_fact_for_test(&mut index, &key, false);
         let scanner = carrier_scanner(&index);
-        // The held page may have used the holder's six-hour growth Full claim.
-        let retry_at = crate::scan_clock::utc_seconds() + 7 * 60 * 60;
+        let retry_at = crate::scan_clock::utc_seconds() + retry_after;
         let mut recovered = with_scan_clock(retry_at, || {
             c.raw(&scanner, index.clone(), 100, true, &[holder])
         });

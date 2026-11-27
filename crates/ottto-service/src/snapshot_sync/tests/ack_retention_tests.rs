@@ -195,7 +195,7 @@ pub(super) fn exact_ack(
 }
 
 #[test]
-fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
+fn quarantine_preserves_other_acks_and_contexts_after_reload() {
     let f = AckFixture::native(true);
     let (_, mut progress) = f.load();
     let fingerprint = &f.item.snapshot_fingerprint;
@@ -266,7 +266,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
 }
 
 #[test]
-fn every_progress_save_prunes_contexts_without_body_witnesses() {
+fn progress_save_prunes_contexts_without_body_witnesses() {
     let f = AckFixture::new(true);
     let (_, mut progress) = f.load();
     let contexts = BTreeMap::from([(f.item.snapshot_fingerprint.clone(), "b".repeat(64))]);
@@ -1973,22 +1973,27 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
         "/src/snapshot_sync/ack_retention.rs"
     ))
     .expect("ACK retirement source");
-    let parent = std::fs::read_to_string(
-        if std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/snapshot_sync/finish.rs"
-        ))
-        .exists()
-        {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync/finish.rs")
-        } else {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync.rs")
-        },
-    )
-    .expect("snapshot_sync source");
-    let production = &parent[..parent
+    let parent = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/snapshot_sync/finish.rs"
+    ))
+    .expect("snapshot_sync finish source");
+    // The finish module's production text: the parent before its tests, then
+    // every child file of `finish/`, so a move into a child keeps the pins.
+    let mut production = parent[..parent
         .find("\n#[cfg(test)]\nmod tests {")
-        .unwrap_or(parent.len())];
+        .unwrap_or(parent.len())]
+        .to_owned();
+    let children = concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync/finish");
+    if let Ok(entries) = std::fs::read_dir(children) {
+        let mut paths: Vec<_> = entries
+            .map(|entry| entry.expect("finish child").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            production.push_str(&std::fs::read_to_string(&path).expect("finish child source"));
+        }
+    }
     assert!(
         module.contains("pub(super) struct AckRetirementPlan(BTreeSet<String>);"),
         "the plan field stays private to ack_retention"

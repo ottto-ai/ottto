@@ -6312,8 +6312,8 @@ fn codex_first_prompt_fallback_is_filtered() {
     fs::write(
         &continuation_path,
         concat!(
-            "{\"timestamp\":\"2026-07-29T08:39:04Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019fac62-33a0-7750-a4fc-9a7f9621993c\"}}\n",
-            "{\"timestamp\":\"2026-07-29T08:40:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Continue the SAME Phase-2 PR 2.14 Codex session and worktree.\"}}\n",
+            "{\"timestamp\":\"2026-07-29T08:39:04Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019fac62-0000-7000-8000-000000000001\"}}\n",
+            "{\"timestamp\":\"2026-07-29T08:40:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Continue the SAME Codex session and worktree.\"}}\n",
             "{\"timestamp\":\"2026-07-29T08:41:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.6\"}}}\n"
         ),
     )

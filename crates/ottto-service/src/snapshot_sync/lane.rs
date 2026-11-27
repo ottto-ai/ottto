@@ -1019,10 +1019,16 @@ pub(super) fn snapshot_api_base_url_from(
     // Read/parse/cap errors are not an absent binding: never redirect secrets
     // to the environment/default destination after a persisted binding fails.
     let connection = crate::local_resource_diagnostics::connection_binding_read(connection)?;
-    Ok(normalize_api_base_url(
-        connection.map(|binding| binding.api_base_url),
-        env_value,
-    ))
+    let api_base_url =
+        normalize_api_base_url(connection.map(|binding| binding.api_base_url), env_value);
+    // Uploads carry this Mac's device credential, so they go only to a backend
+    // the control path also trusts.
+    if !crate::control::is_trusted_api_base_url(&api_base_url) {
+        return Err(anyhow!(
+            "connection binding names an untrusted Ottto backend"
+        ));
+    }
+    Ok(api_base_url)
 }
 
 pub(super) fn normalize_api_base_url(

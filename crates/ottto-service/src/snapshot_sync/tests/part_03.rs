@@ -1366,7 +1366,7 @@ fn endpoint_load_failure_during_scan_is_local_state() {
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
     let device = LocalDeviceBinding {
         sources: vec!["pi".into()],
-        ..bounded_native_device()
+        ..synthetic_device_binding()
     };
     FileDeviceStore::default().save(&device).unwrap();
     let daemon = test_daemon(&"a".repeat(64));
@@ -1400,18 +1400,18 @@ fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
     let store = FileConnectionStore::new(&path);
     let mut bytes = serde_json::to_vec(&serde_json::json!({
         "setup_run_id": "synthetic", "setup_run_token_expires_at": "synthetic",
-        "machine_id": null, "api_base_url": "https://custom.invalid"
+        "machine_id": null, "api_base_url": "https://api.ottto.net"
     }))
     .unwrap();
     bytes.resize(64 * 1024, b' ');
     fs::write(&path, &bytes).unwrap();
     assert_eq!(
         snapshot_api_base_url_from(store.load(), None).unwrap(),
-        "https://custom.invalid"
+        "https://api.ottto.net"
     );
     bytes.push(b' ');
     fs::write(&path, &bytes).unwrap();
-    for env in [None, Some("https://fallback.invalid".to_owned())] {
+    for env in [None, Some("https://ottto.net/backend".to_owned())] {
         let mut client_created = false;
         let result = snapshot_api_base_url_from(store.load(), env).map(|base| {
             client_created = true;
@@ -1421,8 +1421,42 @@ fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
         assert!(!client_created);
     }
     assert_eq!(
-        snapshot_api_base_url_from(Ok(None), Some("https://fallback.invalid".into())).unwrap(),
-        "https://fallback.invalid"
+        snapshot_api_base_url_from(Ok(None), Some("https://api.ottto.net/".into())).unwrap(),
+        "https://api.ottto.net"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn upload_destination_must_be_a_trusted_backend() {
+    use std::fs;
+    let root = test_dir("upload-destination-trust");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("connection.json");
+    let store = FileConnectionStore::new(&path);
+    for base in [
+        "https://custom.invalid",
+        "http://upload.invalid",
+        "https://api.ottto.net.invalid",
+    ] {
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "setup_run_id": "synthetic", "setup_run_token_expires_at": "synthetic",
+                "machine_id": null, "api_base_url": base
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            snapshot_api_base_url_from(store.load(), None).is_err(),
+            "{base}"
+        );
+    }
+    assert!(snapshot_api_base_url_from(Ok(None), Some("https://fallback.invalid".into())).is_err());
+    assert_eq!(
+        snapshot_api_base_url_from(Ok(None), None).unwrap(),
+        "https://api.ottto.net"
     );
     fs::remove_dir_all(root).unwrap();
 }

@@ -1391,10 +1391,10 @@ fn cloud_replies_link_only_the_paired_web_origin() {
 }
 
 /// [behaviour] A queued native approval in the server's approval.v4 shape: the service signs the
-/// server's exact payload bytes and posts R5 as `{approval_id, signature}` with an unpadded
-/// base64url signature, which is what the server's approval route verifies.
+/// server's exact payload bytes and posts the approval body as `{approval_id, signature}` with an
+/// unpadded base64url signature, which is what the server's approval route verifies.
 #[test]
-fn approval_payload_is_signed_unchanged_and_posted_as_the_r5_body() {
+fn approval_payload_is_signed_unchanged_and_posted_as_the_approval_body() {
     use super::agent::{approval_body, checked_approval, ApprovalScope, CheckedApproval};
     use super::server::approval_audience;
     let attempt_id = "44444444-4444-4444-8444-444444444444";
@@ -1506,9 +1506,9 @@ fn approval_payload_is_signed_unchanged_and_posted_as_the_r5_body() {
 }
 
 /// [behaviour] The server's approval signing vector passes the service's fact checks unchanged,
-/// and the R5 body carries its approval ID and signature exactly as the server accepts them.
+/// and the approval body carries its approval ID and signature exactly as the server accepts them.
 #[test]
-fn approval_signing_vector_reaches_r5_unchanged() {
+fn approval_signing_vector_reaches_the_approval_body_unchanged() {
     use super::agent::{approval_body, checked_approval, ApprovalScope};
     let vector = fixture(APPROVAL_SIGNATURE);
     let payload_b64 = text(&vector, "payload_b64");

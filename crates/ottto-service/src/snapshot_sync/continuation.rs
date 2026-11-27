@@ -1417,8 +1417,9 @@ pub(super) fn continuation_finish_inputs<'a>(
 }
 
 /// The continuation inputs of a just-finished ordinary Codex
-/// page, taken before its finish. `finish_sync_source` never reads the
-/// attribution context, so moving it out changes nothing for the finish.
+/// page, taken before its finish. The finish still binds whatever context is
+/// left (`bind_context`); a continuation page takes the context out first, so
+/// its finish binds none, as it would for a page without one.
 /// Called only while continuation pages are enabled and a ticket was minted.
 pub(super) fn take_continuation_inputs(
     preparation: &mut SourcePreparation,

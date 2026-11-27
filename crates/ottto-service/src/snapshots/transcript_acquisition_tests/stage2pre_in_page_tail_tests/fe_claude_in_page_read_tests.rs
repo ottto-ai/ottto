@@ -1392,7 +1392,7 @@ fn fe_claude_full_without_admission_keeps_strict_completion() {
 
 /// Persistence must preserve the exclusion even without a census record and after key drift.
 #[test]
-fn fe_claude_prefix_provenance_round_trips_without() {
+fn fe_claude_prefix_provenance_round_trips_without_a_census_record() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

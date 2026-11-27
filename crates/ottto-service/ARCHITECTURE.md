@@ -184,9 +184,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   copy uploads stay independent, so ACK order can leave a temporary gap.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. The first on-page file of a session carries its
-  summed body and keeps its own start; the body's last-activity clock is the
-  latest of every on-page file of that session, and only a later request clock
-  sets its end. A selected content twin pulls every live
+  summed body; its start is the earliest and its last-activity clock the latest
+  of every on-page file of that session, whichever file carries it, and only a
+  later request clock sets its end. A selected content twin pulls every live
   overlapping census main, and a selected main file (not history-held)
   pulls every live census content twin sharing a request hash. Ordinary discovery
   acquires pulled files through the existing history and resident admission gates.
@@ -796,7 +796,8 @@ except that a fn with an unchanged body may have a signature rustfmt re-wrapped 
 have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
 change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
 multiplicity; modules with moved items reject every added glob and every added explicit binding
-beside an item-level macro call; edits to listed validator files that anchor on moved code are
+beside an item-level macro call, except exact calls of the import-free macros the script lists and
+calls inside an `impl` block; edits to listed validator files that anchor on moved code are
 reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
 `scripts/test_id_renames.tsv`, and its never-retry decision stays the same).

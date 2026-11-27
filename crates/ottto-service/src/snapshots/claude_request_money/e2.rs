@@ -1,8 +1,7 @@
 //! `e2` request-owned Claude money from the native resolved-response fold.
 //! Native resolution owns counts; this module only decides copies, attaches
 //! reported telemetry cost and side calls, and emits one literal body per
-//! session. The upload gate is ON; DARK test arms never change an item, a
-//! scan identity, parser scope or body witness.
+//! session.
 //!
 //! Layout: `copies` (copy decisions and stored copy ownership) and
 //! `telemetry` (attach and side calls). This file keeps the fold state,
@@ -1895,16 +1894,8 @@ pub(crate) enum TelemetryRead {
     Failed,
 }
 
-/// DARK comparison happens after today's authoritative body fold. Only the
-/// explicit gate permits mutation; one summed entity is emitted per session
-/// (path twins sum). A failed telemetry read never yields a "complete"
-/// body; `hold_claude_history_for_unread_telemetry` keeps that page's owed history files owed.
-///
-/// Returns the sessions whose entity was withheld (held twin, uncertified,
-/// identity already tagged, overflow). Their items stay on the page
-/// unchanged so the caller holds them (`hold_request_owned`): a removed item
-/// would let the page settle its file without a body. Gate off: empty.
-/// Single-chunk callers (tests) plan the content-twin holds over `items`.
+/// `finish_page_planned` for a single-chunk page (tests): plans the
+/// content-twin holds over `items`.
 #[cfg(test)]
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
@@ -1940,8 +1931,17 @@ pub(crate) struct PageCopyHolds<'a> {
     pub(crate) newer_build: &'a BTreeSet<String>,
 }
 
-/// `finish_page` for one evidence chunk of a page whose content-twin holds
-/// were decided once over the whole page.
+/// Finishes one evidence chunk of a page whose content-twin holds were
+/// decided once over the whole page. Runs after today's authoritative body
+/// fold; one summed entity is emitted per session (path twins sum). A failed
+/// telemetry read never yields a "complete" body;
+/// `hold_claude_history_for_unread_telemetry` keeps that page's owed history
+/// files owed.
+///
+/// Returns the sessions whose entity was withheld (held twin, uncertified,
+/// identity already tagged, overflow). Their items stay on the page
+/// unchanged so the caller holds them (`hold_request_owned`): a removed item
+/// would let the page settle its file without a body.
 pub(crate) fn finish_page_planned(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
@@ -1997,8 +1997,9 @@ pub(crate) fn finish_page_planned(
     claude_request_identity::inherit_root_accounts(items, true);
 
     // Per session: whether every fold is a covered copy, and the latest last
-    // clock over its folds, which the emitted body keeps.
-    let mut drop_copies = BTreeMap::<String, (bool, Option<String>)>::new();
+    // clock and earliest start over its folds, which the emitted body keeps
+    // whichever file carries it.
+    let mut drop_copies = BTreeMap::<String, (bool, Option<String>, Option<String>)>::new();
     for item in items.iter() {
         if let Some(fold) = item.claude_money.as_deref() {
             let covered = fold.first_own.is_none()
@@ -2011,15 +2012,22 @@ pub(crate) fn finish_page_planned(
                         .observations(&item.source_session_id)
                         .any(|(location, _)| location != here)
                 });
-            let (covered_only, last) = drop_copies
+            let (covered_only, last, start) = drop_copies
                 .entry(item.source_session_id.clone())
-                .or_insert((true, None));
+                .or_insert((true, None, None));
             *covered_only &= covered;
             if let Some(clock) = item.source_last_activity_at.as_deref() {
                 if last.as_deref().map_or(true, |current| {
                     super::super::timestamp_is_after(clock, current)
                 }) {
                     *last = Some(clock.to_owned());
+                }
+            }
+            if let Some(clock) = item.source_started_at.as_deref() {
+                if start.as_deref().map_or(true, |current| {
+                    super::super::timestamp_is_before(clock, current)
+                }) {
+                    *start = Some(clock.to_owned());
                 }
             }
         }
@@ -2218,9 +2226,11 @@ pub(crate) fn finish_page_planned(
         if item.claude_money.is_none() {
             return true;
         }
-        let (covered_only, span_last) = drop_copies
+        let (covered_only, span_last, span_start) = drop_copies
             .get(&item.source_session_id)
-            .map_or((false, None), |(covered, last)| (*covered, last.as_deref()));
+            .map_or((false, None, None), |(covered, last, start)| {
+                (*covered, last.as_deref(), start.as_deref())
+            });
         if !content_held.contains(&item.source_session_id) && covered_only {
             return false;
         }
@@ -2233,7 +2243,7 @@ pub(crate) fn finish_page_planned(
         };
         // apply refuses before mutating, so a withheld item is unchanged:
         // its fold gets its own entity back (moved out above).
-        let emitted = super::emit::apply(item, &entity, span_last);
+        let emitted = super::emit::apply(item, &entity, span_last, span_start);
         if emitted {
             if let Some((counts, truncated)) = twin_tools.remove(&item.source_session_id) {
                 let mut rows = super::super::bounded_tool_usage_counts(&counts);
@@ -2355,7 +2365,7 @@ fn record_decided(held: bool, counts: Counts) {
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {
-    super::emit::apply(item, entity, None)
+    super::emit::apply(item, entity, None, None)
 }
 
 /// The identity row of each request a copied marker

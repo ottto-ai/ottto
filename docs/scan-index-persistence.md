@@ -134,6 +134,12 @@ read; conversion adds no admission gate and requires no transcript re-read hours
 
 ## Active reader behavior
 
+Historical: this section records reader release N's legacy JSON path. A daemon
+now converts each source's v1 index to the state-v2 SQLite store and uses the
+store from then on (see [State-v2 store](#state-v2-store)); the legacy path below
+is what a load without a support directory, such as a unit test or tool, still
+takes.
+
 This is the reader component. It reads legacy logical-schema-2 JSON and storage
 format 1, and always writes legacy JSON with the existing semantic serializer.
 After a sharded load, the next synchronous save atomically replaces the manifest
@@ -293,6 +299,12 @@ qualification of every old record decoder. Shared integration must replace the
 source guard with its integrated-reader compatibility coverage where appropriate.
 
 ## Replacement and validation boundaries
+
+Historical: this section records reader release N's legacy JSON path. A daemon
+now converts each source's v1 index to the state-v2 SQLite store and uses the
+store from then on (see [State-v2 store](#state-v2-store)); the legacy path below
+is what a load without a support directory, such as a unit test or tool, still
+takes.
 
 Caller holds the existing checkpoint flock across open, semantic decode, full
 semantic CAS/claim merge and legacy replacement. Retain the exact loaded root

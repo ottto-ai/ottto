@@ -459,7 +459,7 @@ pub(crate) struct OwnedSourceScan {
     /// `step` calls into the result.
     pub(in crate::snapshots) continuation_ticket:
         Option<sampled_scan::codex_cursor::CodexCursorTicket>,
-    /// LD: this pass's line observer, if one is registered.
+    /// Line delivery: this pass's line observer, if one is registered.
     pub(in crate::snapshots) line_delivery: Option<line_delivery::LineDelivery>,
     pub(in crate::snapshots) codex_versions: Option<Arc<codex_version::CodexVersionFeed>>,
     /// Launch evidence for the source fingerprint when no attribution context
