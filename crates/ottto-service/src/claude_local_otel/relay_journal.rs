@@ -7,29 +7,37 @@
 //!
 //! Each line is a one-byte kind (`a` API, `t` trace) followed by the row's
 //! JSON exactly as its per-session file stores it. A drain first renames the
-//! journal to `prev` and keeps `prev` until a drain at least a minute later,
-//! so rows already on disk keep an on-disk copy until their per-session writes
-//! have long been written back (no fsync of those writes). Such a drain
-//! replaces `prev`, or removes it when the journal is empty, so `prev` never
-//! outlives retention. The first drain in a process replays `prev`, then the
-//! journal. A replay or a crash mid-drain can copy rows twice; the
-//! per-session decoders drop identical rows. A torn line (a crash mid-append,
-//! so never acknowledged) is never copied. Rows a per-session file refuses
-//! wait in the journal until it accepts them.
+//! journal to a new numbered `prev` file and keeps each `prev` file until a
+//! drain at least a minute after its own rows reached their per-session files,
+//! so rows keep an on-disk copy until those writes have long been written back
+//! (no fsync of those writes, and no copy of the journal; a new `prev` file is
+//! synced while an earlier one is still kept, as the old copy was). That later
+//! drain removes it, also with an empty journal, so a `prev` file never
+//! outlives retention and frequent drains never grow one. The first drain in a
+//! process replays every `prev` file, oldest first (the single `prev` an
+//! earlier release kept comes first), then the journal. A replay or a crash
+//! mid-drain can copy rows twice; the per-session decoders drop identical
+//! rows. A torn line (a crash mid-append, so never acknowledged) is never
+//! copied. Rows a per-session file refuses wait in the journal until it
+//! accepts them.
 use super::*;
+use std::collections::VecDeque;
 use std::ops::Range;
 
 /// Under `local-otel`, so an uninstall removes it with the stores; outside
 /// both store directories, so no stem listing or support inspection reads it.
 const JOURNAL: &str = "local-otel/claude-code-relay-journal.jsonl";
-const PREV: &str = "local-otel/claude-code-relay-journal.prev.jsonl";
+/// Holds the journal and the `prev` files: `<PREV_STEM>.<n>.jsonl`, or
+/// `<PREV_STEM>.jsonl` for the single `prev` an earlier release kept.
+const PREV_DIR: &str = "local-otel";
+const PREV_STEM: &str = "claude-code-relay-journal.prev";
 /// Drained at each scan start, the journal holds about one interval of rows.
 /// A request that takes it this far past its length after the last drain
 /// (scans stalled) drains it inline; nothing is ever refused or dropped for
 /// size.
 pub(super) const DRAIN_AT_BYTES: u64 = 16 * 1024 * 1024;
-/// `prev` is replaced or removed only once its rows reached their per-session
-/// files at least this long ago; a sooner drain adds the journal to `prev`.
+/// A `prev` file is removed only once its rows reached their per-session
+/// files at least this long ago.
 const PREV_MIN_AGE: Duration = Duration::from_secs(60);
 /// One counts-only local alarm per drain while refused rows exceed this size.
 const KEPT_ALERT_BYTES: u64 = 32 * 1024 * 1024;
@@ -52,9 +60,12 @@ impl Kind {
 /// One support directory's journal facts, held under `append_lock`.
 #[derive(Default)]
 pub(super) struct State {
-    /// When a drain last appended rows from `prev` to the per-session files;
-    /// `None` until `prev` is replayed in this process.
-    pub(super) prev_drained: Option<Instant>,
+    /// The `prev` files on disk, oldest first, each with when its rows reached
+    /// their per-session files; `None` until the first drain in this process
+    /// replays them.
+    pub(super) prev: Option<VecDeque<(PathBuf, Instant)>>,
+    /// The number the next `prev` file takes.
+    next_prev: u64,
     /// Rows waiting because their per-session file refused them: per file,
     /// (rows, bytes).
     pub(super) kept: BTreeMap<PathBuf, (u64, u64)>,
@@ -68,8 +79,63 @@ pub(super) fn journal_path(support_dir: &Path) -> PathBuf {
     support_dir.join(JOURNAL)
 }
 
-pub(super) fn prev_path(support_dir: &Path) -> PathBuf {
-    support_dir.join(PREV)
+pub(super) fn prev_path(support_dir: &Path, number: u64) -> PathBuf {
+    let name = match number {
+        0 => format!("{PREV_STEM}.jsonl"),
+        number => format!("{PREV_STEM}.{number}.jsonl"),
+    };
+    support_dir.join(PREV_DIR).join(name)
+}
+
+/// Every `prev` file on disk, oldest first, with its number.
+fn prev_files(support_dir: &Path) -> std::io::Result<Vec<(u64, PathBuf)>> {
+    let entries = match fs::read_dir(support_dir.join(PREV_DIR)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(middle) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PREV_STEM)?.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        let number = match middle.strip_prefix('.') {
+            None if middle.is_empty() => 0,
+            Some(digits) if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+                match digits.parse() {
+                    Ok(number) if number > 0 => number,
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        found.push((number, entry.path()));
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The total size of the `prev` files; `None` when there are none.
+pub(super) fn prev_bytes(support_dir: &Path) -> Option<u64> {
+    let files = prev_files(support_dir).ok()?;
+    let sizes = files
+        .iter()
+        .filter_map(|(_, path)| fs::symlink_metadata(path).ok());
+    (!files.is_empty()).then(|| sizes.map(|metadata| metadata.len()).sum())
+}
+
+/// The `prev` files this process keeps, for a test to age them.
+#[cfg(test)]
+pub(super) fn tracked_prev_for_test<'a>(
+    handles: &'a mut AppendHandles,
+    support_dir: &Path,
+) -> &'a mut VecDeque<(PathBuf, Instant)> {
+    let state = handles.journals.get_mut(support_dir).unwrap();
+    state.prev.as_mut().unwrap()
 }
 
 #[cfg(test)]
@@ -197,53 +263,77 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
         return Ok(());
     }
     let started = Instant::now();
-    let (journal, prev) = (journal_path(support_dir), prev_path(support_dir));
+    let journal = journal_path(support_dir);
     let state = handles
         .journals
         .entry(support_dir.to_path_buf())
         .or_default();
-    let drained_at = state.prev_drained;
     let current = read_present(&journal).context("read Claude relay journal")?;
     // Until the rewrite below, a failed attempt leaves the journal as read.
     state.len_after_drain = current.len() as u64;
-    let keep_prev = drained_at.is_none_or(|at| at.elapsed() < PREV_MIN_AGE)
-        && fs::symlink_metadata(&prev).is_ok();
     let mut input = Vec::new();
-    if keep_prev {
-        // Not replayed yet in this process, or its rows reached their files
-        // too recently to drop: keep `prev` and add the journal to it.
-        if drained_at.is_none() {
-            input = fs::read(&prev).context("read previous Claude relay journal")?;
-            if ends_inside_row(&input) == Some(true) {
-                input.push(b'\n');
-            }
-        } else if current.is_empty() {
-            return Ok(());
-        }
-        if !current.is_empty() {
-            let mut file = open_private_append(&mut handles.prepared, &prev)?;
-            append_lines(&mut file, &current)?;
-            // The journal is cut next; after a restart its rows may be in
-            // `prev` alone.
-            file.sync_data()
-                .context("sync previous Claude relay journal")?;
-        }
-    } else if current.is_empty() {
-        if drained_at.is_some() {
-            // `prev`'s rows reached their per-session files at least a minute
-            // ago; a later replay must not recreate files retention removed.
-            let removed = fs::remove_file(&prev);
+    let mut new_prev = Vec::new();
+    // While an earlier `prev` file is kept, its rows reached their files less
+    // than a minute ago: the new one is synced, as the copy into `prev` was.
+    let sync_new;
+    if let Some(prev) = &mut state.prev {
+        // These rows reached their per-session files at least a minute ago; a
+        // later replay must not recreate files retention removed.
+        while let Some((path, _)) = prev
+            .front()
+            .filter(|(_, drained)| drained.elapsed() >= PREV_MIN_AGE)
+        {
+            let removed = fs::remove_file(path);
             if removed
                 .as_ref()
                 .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
             {
                 removed.context("remove previous Claude relay journal")?;
             }
+            prev.pop_front();
         }
-        return Ok(());
+        if current.is_empty() {
+            return Ok(());
+        }
+        sync_new = !prev.is_empty();
     } else {
-        // `prev`'s rows reached their per-session files at least a minute ago.
-        fs::rename(&journal, &prev).context("rotate Claude relay journal")?;
+        // Not replayed yet in this process: every `prev` file, oldest first,
+        // then the journal.
+        let found = prev_files(support_dir).context("list previous Claude relay journals")?;
+        if found.is_empty() && current.is_empty() {
+            return Ok(());
+        }
+        sync_new = !found.is_empty();
+        for (number, path) in found {
+            let mut bytes = fs::read(&path).context("read previous Claude relay journal")?;
+            if ends_inside_row(&bytes) == Some(true) {
+                bytes.push(b'\n');
+            }
+            input.append(&mut bytes);
+            state.next_prev = state.next_prev.max(number + 1);
+            new_prev.push(path);
+        }
+    }
+    if !current.is_empty() {
+        // The journal becomes the newest `prev` file: a rename, no copy, so
+        // the rows stay on disk under one name or the other.
+        let number = state.next_prev.max(1);
+        let path = prev_path(support_dir, number);
+        fs::rename(&journal, &path).context("rotate Claude relay journal")?;
+        state.next_prev = number + 1;
+        if sync_new {
+            let synced = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.sync_data());
+            if synced.is_err() {
+                // Untracked, it would never be replayed: replay every `prev`
+                // file at the next drain.
+                state.prev = None;
+            }
+            synced.context("sync previous Claude relay journal")?;
+        }
+        new_prev.push(path);
     }
     input.extend_from_slice(&current);
 
@@ -278,8 +368,8 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
             }
         }
     }
-    // The journal now holds only refused rows, in arrival order; `prev` keeps
-    // every row until a later drain replaces it.
+    // The journal now holds only refused rows, in arrival order; the `prev`
+    // files keep every row until a later drain removes them.
     kept.sort_by_key(|range| range.start);
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -296,8 +386,15 @@ pub(super) fn drain_locked(handles: &mut AppendHandles, support_dir: &Path) -> R
         .journals
         .entry(support_dir.to_path_buf())
         .or_default();
-    // A journal that could not be rewritten replays `prev` at the next drain.
-    state.prev_drained = rewritten.is_ok().then(Instant::now);
+    if rewritten.is_ok() {
+        let drained = Instant::now();
+        let prev = state.prev.get_or_insert_with(VecDeque::new);
+        prev.extend(new_prev.into_iter().map(|path| (path, drained)));
+    } else {
+        // A journal that could not be rewritten replays every `prev` file at
+        // the next drain.
+        state.prev = None;
+    }
     state.kept = kept_files;
     state.len_after_drain = kept.iter().map(|range| range.len() as u64).sum();
     let (kept_rows, kept_bytes) = kept_totals(handles);
@@ -327,13 +424,17 @@ pub(super) fn kept_totals(handles: &AppendHandles) -> (u64, u64) {
     kept.fold((0, 0), |(rows, bytes), &(r, b)| (rows + r, bytes + b))
 }
 
-/// Whether a row for `stem` is still in the journal or in `prev`, which a
-/// restart replays until a drain removes it. An unreadable file counts as
-/// waiting.
+/// Whether a row for `stem` is still in the journal or in a `prev` file,
+/// which a restart replays until a drain removes it. An unreadable file or
+/// directory counts as waiting.
 pub(super) fn waits_for(support_dir: &Path, stem: &str) -> bool {
     let targets = telemetry_member_paths(support_dir, stem);
-    let paths = [journal_path(support_dir), prev_path(support_dir)];
-    paths.iter().any(|path| match read_present(path) {
+    let Ok(prev) = prev_files(support_dir) else {
+        return true;
+    };
+    let mut paths =
+        std::iter::once(journal_path(support_dir)).chain(prev.into_iter().map(|(_, path)| path));
+    paths.any(|path| match read_present(&path) {
         Ok(bytes) => lines(&bytes, support_dir)
             .flatten()
             .any(|line| targets.contains(&line.target)),
