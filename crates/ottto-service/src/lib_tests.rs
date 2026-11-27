@@ -1808,6 +1808,24 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        // A device refusal on top of the ended run, then a usable answer,
+        // still leaves the ended run recorded.
+        crate::control::probe_idle_device_credential_with(&daemon, |_| {
+            crate::control::IdleCredentialAnswer::Refused
+        });
+        crate::control::probe_idle_device_credential_with(&daemon, |_| {
+            crate::control::IdleCredentialAnswer::Usable
+        });
+        let status = daemon.status(TOKEN).expect("status");
+        assert!(latest_setup_run_read_rejection(&status.local_health_events).is_some());
+        assert!(status
+            .canonical_health
+            .as_ref()
+            .expect("health")
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
     }
 
     #[test]

@@ -194,34 +194,22 @@ impl LocalDaemon {
         rejection: TerminalRefreshRejection,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
+        let current = latest_setup_run_read_rejection(&state.local_health_events);
         if !state.binds_setup_run(binding)
-            || latest_setup_run_read_rejection(&state.local_health_events)
+            || current
+                .as_ref()
                 .is_some_and(|current| current.rejection == rejection)
         {
             return Ok(());
         }
-        let (code, message) = match rejection {
-            TerminalRefreshRejection::SetupRunEnded => (
-                SETUP_RUN_ENDED_READ_REJECTION,
-                "Ottto ended this Mac's setup run; agent reads stop until it reconnects",
-            ),
-            TerminalRefreshRejection::DeviceRejected => (
-                DEVICE_REJECTED_READ_REJECTION,
-                "Ottto refused this Mac's device credential for agent reads",
-            ),
-        };
-        push_local_health_event(
-            &mut state,
-            "SetupRunReadRejected",
-            "setup_run_read_rejected",
-            LocalHealthAuthority::Backend,
-            serde_json::json!({
-                "kind": "setup_run_read_rejected",
-                "rejection": code,
-                "message": message,
-                "current": true
-            }),
-        );
+        // Only one setup-read event is kept, so a device refusal that replaces
+        // a current ended run carries it; a later usable device answer then
+        // gives the ended run back instead of clearing it.
+        let setup_run_ended = rejection == TerminalRefreshRejection::DeviceRejected
+            && current.is_some_and(|current| {
+                current.rejection == TerminalRefreshRejection::SetupRunEnded
+            });
+        push_setup_run_read_rejected(&mut state, rejection, setup_run_ended);
         Ok(())
     }
 
@@ -246,32 +234,57 @@ impl LocalDaemon {
         )
     }
 
+    /// A usable answer from the device-credential status route proves only
+    /// the device. It clears a device refusal that is still the one the check
+    /// started from, never a "setup run ended" answer: a refusal that had
+    /// replaced an ended run gives the ended run back instead. Only a new
+    /// sign-in or an accepted setup-run read clears an ended run.
+    pub(crate) fn record_device_credential_accepted(
+        &self,
+        start: &SetupRunReadStart,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        let Some(setup_run_ended) = latest_setup_run_read_event(&state.local_health_events)
+            .filter(|event| {
+                event.event_type == "SetupRunReadRejected"
+                    && event.sequence == start.revision
+                    && event
+                        .payload
+                        .get("rejection")
+                        .and_then(|value| value.as_str())
+                        == Some(DEVICE_REJECTED_READ_REJECTION)
+            })
+            .map(|event| {
+                event
+                    .payload
+                    .get("setup_run_ended")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            })
+        else {
+            return Ok(());
+        };
+        if !state.binds_setup_run(&start.binding) {
+            return Ok(());
+        }
+        if setup_run_ended {
+            push_setup_run_read_rejected(
+                &mut state,
+                TerminalRefreshRejection::SetupRunEnded,
+                false,
+            );
+        } else {
+            push_setup_run_read_recovered(&mut state);
+        }
+        Ok(())
+    }
+
     /// Clear a recorded setup-run read rejection after a successful read
     /// that started with the current binding. Only the rejection that was
     /// already current when the read started is cleared: reads of one
     /// binding run concurrently, so a slow read that succeeded before the
     /// run ended can finish after a later read recorded the rejection, and
     /// its success says nothing about that newer answer.
-    /// A usable answer from the device-credential status route proves only
-    /// the device. It clears a device refusal, never a "setup run ended" one,
-    /// which only a new sign-in or an accepted setup-run read clears.
-    pub(crate) fn record_device_credential_accepted(
-        &self,
-        start: &SetupRunReadStart,
-    ) -> Result<(), LocalApiError> {
-        let device_refused = {
-            let state = self.state()?;
-            latest_setup_run_read_rejection(&state.local_health_events).is_some_and(|current| {
-                current.rejection == TerminalRefreshRejection::DeviceRejected
-            })
-        };
-        if !device_refused {
-            return Ok(());
-        }
-        // Clears only if that refusal is still the one this check started from.
-        self.record_setup_run_read_accepted(start)
-    }
-
     pub(crate) fn record_setup_run_read_accepted(
         &self,
         start: &SetupRunReadStart,
@@ -284,19 +297,56 @@ impl LocalDaemon {
         {
             return Ok(());
         }
-        push_local_health_event(
-            &mut state,
-            "SetupRunReadRecovered",
-            "setup_run_read_recovered",
-            LocalHealthAuthority::Backend,
-            serde_json::json!({
-                "kind": "setup_run_read_recovered",
-                "message": "Ottto accepted this Mac's setup run for agent reads",
-                "current": true
-            }),
-        );
+        push_setup_run_read_recovered(&mut state);
         Ok(())
     }
+}
+
+fn push_setup_run_read_rejected(
+    state: &mut DaemonState,
+    rejection: TerminalRefreshRejection,
+    setup_run_ended: bool,
+) {
+    let (code, message) = match rejection {
+        TerminalRefreshRejection::SetupRunEnded => (
+            SETUP_RUN_ENDED_READ_REJECTION,
+            "Ottto ended this Mac's setup run; agent reads stop until it reconnects",
+        ),
+        TerminalRefreshRejection::DeviceRejected => (
+            DEVICE_REJECTED_READ_REJECTION,
+            "Ottto refused this Mac's device credential for agent reads",
+        ),
+    };
+    let mut payload = serde_json::json!({
+        "kind": "setup_run_read_rejected",
+        "rejection": code,
+        "message": message,
+        "current": true
+    });
+    if setup_run_ended {
+        payload["setup_run_ended"] = serde_json::Value::Bool(true);
+    }
+    push_local_health_event(
+        state,
+        "SetupRunReadRejected",
+        "setup_run_read_rejected",
+        LocalHealthAuthority::Backend,
+        payload,
+    );
+}
+
+fn push_setup_run_read_recovered(state: &mut DaemonState) {
+    push_local_health_event(
+        state,
+        "SetupRunReadRecovered",
+        "setup_run_read_recovered",
+        LocalHealthAuthority::Backend,
+        serde_json::json!({
+            "kind": "setup_run_read_recovered",
+            "message": "Ottto accepted this Mac's setup run for agent reads",
+            "current": true
+        }),
+    );
 }
 
 fn push_local_health_upload_event(
