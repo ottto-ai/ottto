@@ -77,12 +77,15 @@ fi
 {
   grep -Fq 'source "$SCRIPT_DIR/macos_companion_entitlements.sh"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must source the Companion entitlement policy"
-  grep -Fq 'COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
+  grep -Fq 'COMPANION_ENTITLEMENTS_SOURCE="$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must read the shared Companion entitlements from the app subtree"
-  if ! grep -Fq '"HEAD:$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
-    ! grep -Fq 'hash-object -- "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT"; then
+  if ! grep -Fq '"HEAD:$COMPANION_ENTITLEMENTS_SOURCE"' "$PACKAGE_SCRIPT" ||
+    ! grep -Fq 'hash-object -- "$COMPANION_ENTITLEMENTS_SOURCE"' "$PACKAGE_SCRIPT"; then
     fail "macOS packaging must bind the Companion entitlements to the private source commit"
   fi
+  # Signing tools read the committed blob from a neutral folder, not the app checkout path.
+  grep -Fq 'mac_app_git cat-file blob "$COMPANION_ENTITLEMENTS_BLOB" > "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT" ||
+    fail "macOS packaging must sign with the committed Companion entitlements copy"
   grep -Fq 'ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must validate the Companion entitlements before building"
   [[ "$(grep -c -- '--entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT")" -eq 2 ]] ||

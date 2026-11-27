@@ -143,18 +143,27 @@ fn drain_moves_rows_in_order_with_one_append_per_file() {
     relay_journal::keep_rows_waiting_for_test(false);
 }
 
-/// [behaviour] The first drain in a process replays `prev`, then the
-/// journal, before any reader; `prev` then holds both until a later drain.
+/// [behaviour] The first drain in a process replays every `prev` file, oldest
+/// first by number (an earlier release's single `prev` first), then the
+/// journal, before any reader. The journal becomes the next `prev` file; the
+/// replayed ones stay until a later drain.
 #[test]
-fn startup_drain_replays_prev_then_the_journal() {
+fn startup_drain_replays_every_prev_file_then_the_journal() {
     let dir = ScratchDir::new("relay-journal-startup");
-    let (older, newer) = (api("s-start", "r1"), api("s-start", "r2"));
-    let owner = trace("s-start", "r2");
-    let (journal, prev) = (
-        relay_journal::journal_path(&dir),
-        relay_journal::prev_path(&dir),
-    );
-    fs::create_dir_all(prev.parent().unwrap()).unwrap();
+    let rows = [
+        api("s-start", "r0"),
+        api("s-start", "r1"),
+        api("s-start", "r2"),
+    ];
+    let newer = api("s-start", "r3");
+    let owner = trace("s-start", "r3");
+    let journal = relay_journal::journal_path(&dir);
+    // Numbered 9 and 10: a name order would replay 10 first.
+    let prev = [0, 9, 10].map(|number| relay_journal::prev_path(&dir, number));
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    for (path, row) in prev.iter().zip(&rows) {
+        fs::write(path, tagged(std::slice::from_ref(row))).unwrap();
+    }
     let left = [
         &b"a"[..],
         line(&newer).as_slice(),
@@ -162,57 +171,90 @@ fn startup_drain_replays_prev_then_the_journal() {
         line(&owner).as_slice(),
     ]
     .concat();
-    fs::write(&prev, [&b"a"[..], line(&older).as_slice()].concat()).unwrap();
     fs::write(&journal, &left).unwrap();
     let (_, counts) = observe(|| relay_journal::drain_locked(&mut handles(), &dir).unwrap());
-    assert_eq!(counts.otlp_relay_journal_drained_rows_cumulative, 3);
+    assert_eq!(counts.otlp_relay_journal_drained_rows_cumulative, 5);
     assert_eq!(
         fs::read(evidence_path(&dir, "s-start")).unwrap(),
-        [line(&older), line(&newer)].concat()
+        [line(&rows[0]), line(&rows[1]), line(&rows[2]), line(&newer)].concat()
     );
     assert_eq!(
         fs::read(trace_evidence_path(&dir, "s-start")).unwrap(),
         line(&owner)
     );
     assert!(journal_bytes(&dir).is_empty());
-    assert_eq!(
-        fs::read(&prev).unwrap(),
-        [&b"a"[..], line(&older).as_slice(), &left].concat()
-    );
+    for (path, row) in prev.iter().zip(&rows) {
+        assert_eq!(fs::read(path).unwrap(), tagged(std::slice::from_ref(row)));
+    }
+    assert_eq!(fs::read(relay_journal::prev_path(&dir, 11)).unwrap(), left);
 }
 
-/// [behaviour] A drain renames the journal to `prev` and keeps `prev` until a
-/// drain at least a minute later replaces it, so drained rows keep an on-disk
-/// copy until their per-session writes have been written back.
+/// [behaviour] Each drain renames the journal to a new `prev` file, so a drain
+/// within the minute neither copies the journal nor grows an earlier `prev`
+/// file. A `prev` file is removed only once its own rows reached their
+/// per-session files a minute ago, and holds its stems' unlinks until then.
 #[test]
-fn prev_is_kept_until_a_later_drain_replaces_it() {
+fn each_drain_keeps_its_own_prev_file_for_a_minute() {
     let dir = ScratchDir::new("relay-journal-rotate");
     let mut handles = handles();
     relay_journal::keep_rows_waiting_for_test(true);
-    let prev = relay_journal::prev_path(&dir);
+    let prev = |number| relay_journal::prev_path(&dir, number);
     let rows = [api("s-r", "r1"), api("s-r", "r2"), api("s-r", "r3")];
-    let tagged = |row: &ClaudeLocalOtelEvidence| [&b"a"[..], line(row).as_slice()].concat();
     let store = |handles: &mut AppendHandles, row: &ClaudeLocalOtelEvidence| {
         relay_journal::append(handles, &dir, relay_journal::Kind::Api, [("s-r", row)]).unwrap();
         relay_journal::drain_locked(handles, &dir).unwrap();
     };
     store(&mut handles, &rows[0]);
-    assert_eq!(fs::read(&prev).unwrap(), tagged(&rows[0]));
-    // A drain within the minute adds to `prev` instead of replacing it.
+    assert_eq!(fs::read(prev(1)).unwrap(), tagged(&rows[..1]));
     store(&mut handles, &rows[1]);
-    assert_eq!(
-        fs::read(&prev).unwrap(),
-        [tagged(&rows[0]), tagged(&rows[1])].concat()
-    );
-    let state = handles.journals.get_mut(&dir.to_path_buf()).unwrap();
-    state.prev_drained = Instant::now().checked_sub(Duration::from_secs(61));
+    assert_eq!(fs::read(prev(1)).unwrap(), tagged(&rows[..1]));
+    assert_eq!(fs::read(prev(2)).unwrap(), tagged(&rows[1..2]));
+    // Only the first file's rows reached their per-session file a minute ago.
+    let tracked = relay_journal::tracked_prev_for_test(&mut handles, &dir);
+    tracked[0].1 = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
     store(&mut handles, &rows[2]);
-    assert_eq!(fs::read(&prev).unwrap(), tagged(&rows[2]));
+    assert!(!prev(1).exists());
+    assert_eq!(fs::read(prev(2)).unwrap(), tagged(&rows[1..2]));
+    assert_eq!(fs::read(prev(3)).unwrap(), tagged(&rows[2..]));
+    assert!(relay_journal::waits_for(&dir, &telemetry_stem("s-r")));
     assert_eq!(
         fs::read(evidence_path(&dir, "s-r")).unwrap(),
         rows.iter().map(line).collect::<Vec<_>>().concat()
     );
     relay_journal::keep_rows_waiting_for_test(false);
+}
+
+/// [regress] A crash after a drain renamed the journal and before any
+/// per-session append leaves the rows in a `prev` file alone. The next start
+/// replays them, and the readers see each row once, as after a clean drain.
+#[test]
+fn a_crash_after_the_rename_replays_its_rows_once() {
+    let dir = ScratchDir::new("relay-journal-crash-renamed");
+    relay_journal::keep_rows_waiting_for_test(true);
+    capture_claude_api_request_logs(&dir, &api_log_body(), "application/x-protobuf").unwrap();
+    let traces = trace_body(vec![llm_span("req-renamed", Some("agent-a"))]);
+    capture_claude_llm_request_traces(&dir, &traces, "application/x-protobuf").unwrap();
+    let journal = journal_bytes(&dir);
+    fs::rename(
+        relay_journal::journal_path(&dir),
+        relay_journal::prev_path(&dir, 1),
+    )
+    .unwrap();
+    // A new process.
+    let (_, counts) = observe(|| relay_journal::drain_locked(&mut handles(), &dir).unwrap());
+    relay_journal::keep_rows_waiting_for_test(false);
+    assert_eq!(counts.otlp_relay_journal_drained_rows_cumulative, 2);
+    assert_eq!(
+        fs::read(relay_journal::prev_path(&dir, 1)).unwrap(),
+        journal
+    );
+
+    let report = load_claude_api_request_evidence_report(&dir, ["sess-protobuf".to_string()]);
+    assert!(report.health.is_complete());
+    assert_eq!(report.evidence["sess-protobuf"].len(), 1);
+    let report = load_claude_trace_ownership_evidence(&dir, ["sess-traces".to_string()]);
+    assert!(report.is_complete());
+    assert_eq!(report.evidence["sess-traces"].len(), 1);
 }
 
 /// [regress] A crash after the per-session appends replays every row from
@@ -288,7 +330,8 @@ fn torn_journal_lines_are_skipped_without_blocking_the_rest() {
 
 /// [behaviour] One per-session file refuses: its rows wait in the journal,
 /// alone and in order, and count as kept; the other files drain once; once
-/// `prev` rotates, only that stem's unlink is held; once the file accepts,
+/// the drained row's `prev` file is removed, only that stem's unlink is held;
+/// once the file accepts,
 /// its rows move once.
 #[test]
 fn a_refusing_file_keeps_only_its_rows_and_holds_only_its_stem() {
@@ -327,13 +370,14 @@ fn a_refusing_file_keeps_only_its_rows_and_holds_only_its_stem() {
     let held = pair("s-bad");
     let stem = telemetry_stem("s-bad");
     assert!(!unlink_telemetry_pair_locked(&mut handles, &dir, &stem, &held).unwrap());
-    // `prev` still holds the drained row until a drain a minute later
-    // replaces it with the journal, which holds only the refused rows.
+    // A `prev` file still holds the drained row until a drain a minute later
+    // removes it; that drain moves the refused rows to a new `prev` file.
     let freed = pair("s-good");
     let stem = telemetry_stem("s-good");
     assert!(!unlink_telemetry_pair_locked(&mut handles, &dir, &stem, &freed).unwrap());
-    let state = handles.journals.get_mut(&dir.to_path_buf()).unwrap();
-    state.prev_drained = Instant::now().checked_sub(Duration::from_secs(61));
+    for (_, drained) in relay_journal::tracked_prev_for_test(&mut handles, &dir) {
+        *drained = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+    }
     relay_journal::drain_locked(&mut handles, &dir).unwrap();
     assert!(unlink_telemetry_pair_locked(&mut handles, &dir, &stem, &freed).unwrap());
 
@@ -507,8 +551,8 @@ fn a_refused_backlog_past_the_alert_size_raises_a_local_alarm() {
     assert_eq!(journal_bytes(&dir), backlog);
 }
 
-/// [regress] `prev` holds its stems' unlinks while it exists. Once its rows
-/// reached their files a minute ago, a drain with an empty journal removes it,
+/// [regress] A `prev` file holds its stems' unlinks while it exists. Once its
+/// rows reached their files a minute ago, a drain with an empty journal removes it,
 /// so a restart after retention removed a pair never recreates the pair.
 #[test]
 fn an_idle_prev_is_removed_so_a_restart_never_recreates_a_removed_pair() {
@@ -519,7 +563,10 @@ fn an_idle_prev_is_removed_so_a_restart_never_recreates_a_removed_pair() {
     let rows = [("s-old", &row)];
     relay_journal::append(&mut handles, &dir, relay_journal::Kind::Api, rows).unwrap();
     relay_journal::drain_locked(&mut handles, &dir).unwrap();
-    let (prev, file) = (relay_journal::prev_path(&dir), evidence_path(&dir, "s-old"));
+    let (prev, file) = (
+        relay_journal::prev_path(&dir, 1),
+        evidence_path(&dir, "s-old"),
+    );
     let stem = telemetry_stem("s-old");
     let pair = || TelemetryPair {
         request_ids: BTreeSet::new(),
@@ -535,8 +582,9 @@ fn an_idle_prev_is_removed_so_a_restart_never_recreates_a_removed_pair() {
     relay_journal::drain_locked(&mut handles, &dir).unwrap();
     assert!(prev.exists());
 
-    let state = handles.journals.get_mut(&dir.to_path_buf()).unwrap();
-    state.prev_drained = Instant::now().checked_sub(Duration::from_secs(61));
+    for (_, drained) in relay_journal::tracked_prev_for_test(&mut handles, &dir) {
+        *drained = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+    }
     relay_journal::drain_locked(&mut handles, &dir).unwrap();
     assert!(!prev.exists());
     // Already gone is fine.
@@ -561,10 +609,11 @@ fn a_fragment_ending_in_a_space_is_ended_before_the_next_row() {
     let file = evidence_path(&dir, "s-frag");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(&file, fragment).unwrap();
-    // A crash also left `prev` ending in a tagged fragment; a restart replays it.
+    // A crash also left an earlier release's `prev` ending in a tagged fragment;
+    // a restart replays it.
     let rows = [api("s-frag", "r1"), api("s-frag", "r2")];
     fs::write(
-        relay_journal::prev_path(&dir),
+        relay_journal::prev_path(&dir, 0),
         [&b"a"[..], fragment].concat(),
     )
     .unwrap();

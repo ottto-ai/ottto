@@ -4099,7 +4099,7 @@ fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request
     branch_by("2.0.99");
 }
 #[test]
-fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
+fn e2_pipeline_branch_written_by_the_current_claude_code_is_skipped() {
     // `claude --version` observed on 2026-10-26: 2.1.310 (Claude Code).
     branch_by("2.1.310");
 }
@@ -4762,7 +4762,7 @@ pub(in crate::snapshot_sync) use codex_tail_oracle_tests::{
 };
 
 #[test]
-fn e2_page_never_creates_p1_ledger_or_diagnostics() {
+fn e2_page_never_creates_ledger_or_diagnostics() {
     with_e2(|| {
         let mut corpus = Corpus::new("e2-without-p1");
         corpus.root(ROOT, &line(ROOT, "req-real", AT, 10));

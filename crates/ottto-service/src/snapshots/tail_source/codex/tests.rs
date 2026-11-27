@@ -776,6 +776,183 @@ fn codex_content_loads_back_from_its_session_facts() {
     );
 }
 
+/// [money] The Codex prelude fact is written as v1 unless it carries a
+/// sealed start a later build counted (v2: the v1 fields, then one
+/// length-prefixed extension). A sealed extension, of this layout or a later
+/// one, loads with no hold and no Full and is written back byte for byte,
+/// also after the file grows and this build reads on; the start sends the
+/// breakdown that build sealed, or none when it proved none. A provisional
+/// extension is dropped: the fact is written back as its v1 bytes and the
+/// start sends what it sends today. An extension outside its header rules is
+/// corrupt; a newer fact version holds.
+#[test]
+fn a_sealed_codex_start_survives_a_rollback_unchanged() {
+    use crate::snapshots::session_start::{SessionStartState, CODEX_PARTS_METHOD};
+    let (reduction, certificate) = parse(&lines(3));
+    let page = (Collection::SessionFacts, 5);
+    let v1 = stage_reduction::<Codex>(&reduction, &certificate, &identity()).pages[&page].clone();
+    assert_eq!(v1[..2], [5, 1], "kind 5, written as version 1");
+    let staged = |version: u8, tail: &[u8]| {
+        let mut staged = stage_reduction::<Codex>(&reduction, &certificate, &identity());
+        let mut bytes = vec![5, version];
+        bytes.extend_from_slice(&v1[2..]);
+        bytes.extend_from_slice(tail);
+        staged.pages.insert(page, bytes);
+        staged
+    };
+    let len_prefixed =
+        |bytes: &[u8]| Enc::count_write(usize::MAX, |e| e.len_prefixed(bytes)).unwrap();
+    // The fact page a save writes, and the request-1 breakdown the start sends.
+    let saved = |acc: &SnapshotAccumulator| {
+        super::super::fact_pages(acc)
+            .unwrap()
+            .into_iter()
+            .find(|(kind, _)| *kind == 5)
+            .unwrap()
+            .1
+    };
+    let first_request = |acc: &SnapshotAccumulator| {
+        SessionStartState::clone(&acc.session_start)
+            .finish(true, Some(100), CODEX_PARTS_METHOD, None, None, None)
+            .and_then(|start| {
+                start.first_request_uncached_input_tokens.map(|uncached| {
+                    (
+                        uncached,
+                        start.first_request_cache_read_tokens,
+                        start.first_request_cache_write_5m_tokens,
+                        start.first_request_cache_write_1h_tokens,
+                    )
+                })
+            })
+    };
+    let today = loaded(&staged(1, &[]));
+    assert_eq!(
+        saved(&today),
+        v1,
+        "v1 loads and saves back to its own bytes"
+    );
+    let sent_today = first_request(&today);
+    assert!(sent_today.is_some(), "today's build sends a breakdown here");
+    let extension = SessionStartState::codex_start_extension_for_test;
+    let token_state = len_prefixed(b"token state");
+    let proven = (7, 3, Some(2), None);
+    let sealed = [
+        (
+            "sealed proven",
+            extension(1, 1, 1, Some(proven), &token_state),
+            Some((7, Some(3), Some(2), None)),
+        ),
+        (
+            "sealed unproven",
+            extension(1, 1, 2, None, &token_state),
+            None,
+        ),
+        (
+            "later layout, sealed unproven",
+            extension(2, 1, 2, None, b"what a later layout appends"),
+            None,
+        ),
+    ];
+    for (label, bytes, sends) in sealed {
+        let file = staged(2, &len_prefixed(&bytes));
+        assert_eq!(cause(&file), None, "{label}: loads, no hold, no Full");
+        let mut back = loaded(&file);
+        assert_eq!(
+            saved(&back),
+            file.pages[&page],
+            "{label}: saved byte for byte"
+        );
+        assert_eq!(first_request(&back), sends, "{label}: the sealed breakdown");
+        // The file grows: this build reads on (its v1 part may change), and
+        // the sealed extension is written back unchanged.
+        for line in turn(3) {
+            apply_codex_line(&serde_json::from_str(&line).unwrap(), &mut back);
+        }
+        let grown = saved(&back);
+        assert_eq!(grown[..2], [5, 2], "{label}: still version 2");
+        assert!(
+            grown.ends_with(&len_prefixed(&bytes)),
+            "{label}: the extension is kept byte for byte"
+        );
+        assert_eq!(first_request(&back), sends, "{label}: after growth");
+    }
+    for (label, bytes) in [
+        ("provisional", extension(1, 0, 0, None, &token_state)),
+        (
+            "later layout, provisional",
+            extension(2, 0, 0, None, b"more"),
+        ),
+    ] {
+        let back = loaded(&staged(2, &len_prefixed(&bytes)));
+        assert_eq!(saved(&back), v1, "{label}: written back as v1");
+        assert_eq!(
+            first_request(&back),
+            sent_today,
+            "{label}: today's breakdown"
+        );
+    }
+    let mut trailing = extension(1, 1, 2, None, &token_state);
+    trailing.push(0);
+    for (label, tail) in [
+        ("no extension", Vec::new()),
+        ("short", vec![4, 1]),
+        (
+            "after the extension",
+            [
+                len_prefixed(&extension(1, 1, 2, None, &token_state)),
+                vec![0],
+            ]
+            .concat(),
+        ),
+        (
+            "layout 0",
+            len_prefixed(&extension(0, 1, 2, None, &token_state)),
+        ),
+        (
+            "seal 2",
+            len_prefixed(&extension(1, 2, 2, None, &token_state)),
+        ),
+        (
+            "request1 3",
+            len_prefixed(&extension(1, 1, 3, None, &token_state)),
+        ),
+        (
+            "provisional with request1",
+            len_prefixed(&extension(1, 0, 2, None, &token_state)),
+        ),
+        (
+            "sealed without request1",
+            len_prefixed(&extension(1, 1, 0, None, &token_state)),
+        ),
+        (
+            "proven without breakdown",
+            len_prefixed(&extension(1, 1, 1, None, &token_state)),
+        ),
+        (
+            "unproven with breakdown",
+            len_prefixed(&extension(1, 1, 2, Some(proven), &token_state)),
+        ),
+        (
+            "provisional with breakdown",
+            len_prefixed(&extension(1, 0, 0, Some(proven), &token_state)),
+        ),
+        (
+            "layout 1, bytes after the token state",
+            len_prefixed(&trailing),
+        ),
+    ] {
+        assert_eq!(
+            cause(&staged(2, &tail)),
+            Some(ReconstructCause::Corrupt),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        cause(&staged(3, &[0])),
+        Some(ReconstructCause::INCOMPATIBLE)
+    );
+}
+
 fn marker_line(minute: usize) -> serde_json::Value {
     json!({"type":"compacted","timestamp":at(minute)})
 }

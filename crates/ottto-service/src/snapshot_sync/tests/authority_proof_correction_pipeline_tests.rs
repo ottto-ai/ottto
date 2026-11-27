@@ -3117,7 +3117,7 @@ fn apc_r2_redrain(
 #[serial(source_manifests)]
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
-fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
+fn sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-r2-shed", false);
     let grant = fixture.pre_flip_grant();
@@ -3178,7 +3178,7 @@ fn r2_sidecar_only_revision_move_then_a_shed_page_keeps_no_op_members_owed() {
 #[test]
 #[serial(source_manifests)]
 #[serial(client_report)]
-fn r2_sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
+fn sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();

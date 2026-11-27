@@ -1,8 +1,8 @@
 //! A source's continuation from the state database. RAM keeps no reduction
 //! of a source with a Tail codec on a database route: a read that continues
-//! a file loads its committed Tail head, checks the head's identity, then the
-//! file against the head's certificate, then streams the pages (the session
-//! facts among them), validates the decoded state, and installs the read's
+//! a file loads its committed Tail head, checks identity and the session
+//! fact tags, then tests the file's certificate. It streams the other pages,
+//! validates the decoded state, and installs the read's
 //! live inputs. Content is never read back from the file: a quiet restart
 //! reads 0 transcript bytes.
 //!
@@ -30,7 +30,7 @@ use super::counters;
 use super::seam::TailBase;
 use super::{HeadIdentity, LiveLoadError, ReconstructCause, TailSource};
 use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
-use crate::snapshots::state_v2::{self, Hold};
+use crate::snapshots::state_v2::{self, Collection, Hold, TailHead};
 use crate::snapshots::*;
 use crate::transcript_acquisition::{CertificateRefusal, FullReason, Scope};
 use crate::transcript_cache::Retained;
@@ -318,7 +318,17 @@ fn load_with_bytes<S: TailSource>(
             crate::local_resource_diagnostics::tail_loaded(source.api_slug(), hit.page_bytes);
             return (Load::Reused(hit.retained, base), hit.page_bytes);
         }
-        Err(Miss::Future | Miss::FutureFact) => ("held", None, Load::Held(HoldKind::NewerBuild)),
+        Err(miss @ (Miss::Future | Miss::FutureFact)) => {
+            count_newer_build(
+                source,
+                if matches!(miss, Miss::Future) {
+                    "head"
+                } else {
+                    "fact"
+                },
+            );
+            ("held", None, Load::Held(HoldKind::NewerBuild))
+        }
         Err(Miss::LiveUnavailable) => ("held", None, Load::Held(HoldKind::LiveUnavailable)),
         // Valid stored state for a file that changed: an ordinary Full. A
         // shorter file is main's counted Full; no floor holds it.
@@ -391,9 +401,42 @@ fn reconstruct_outcome(cause: ReconstructCause) -> &'static str {
     }
 }
 
-/// The stored reduction, its base and the bytes read, or why not. The
-/// session facts load here, with the pages, only for a read that continues
-/// the file.
+pub(super) fn count_newer_build(source: SnapshotSource, label: &'static str) {
+    counters::bump(source, "tail_held_newer_build", label);
+}
+
+pub(super) fn check_fact_tags(
+    index: &ScanIndex,
+    key: &str,
+    head: &TailHead,
+    mut keep: impl FnMut(u64, Vec<u8>),
+) -> anyhow::Result<()> {
+    let mut corrupt = false;
+    state_v2::load_tail_pages(
+        index,
+        key,
+        head,
+        |c| c == Collection::SessionFacts,
+        |_, page, bytes| {
+            match super::Fact::tag(page, &mut super::Dec::new(&bytes)) {
+                Ok(_) => keep(page, bytes),
+                Err(ReconstructCause::Incompatible(_)) => return Err(Hold::Future.into()),
+                Err(_) => corrupt = true,
+            }
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(!corrupt, "tail_page");
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::snapshots) static UNAVAILABLE_LIVE_ONCE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The stored reduction, its base and the bytes read, or why not.
 fn stored<S: TailSource>(
     index: &ScanIndex,
     key: &str,
@@ -416,12 +459,23 @@ fn stored<S: TailSource>(
         return Err(Miss::MetadataOnly);
     }
     let toggled = id.check(&head.body).map_err(Miss::Reconstruct)?;
+    // Check only tags before the certificate and reuse the page bytes on a hit.
+    let mut facts = Vec::new();
+    let fact_tags = check_fact_tags(index, key, &head, |page, bytes| facts.push((page, bytes)));
+    if fact_tags
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<Hold>())
+        == Some(&Hold::Future)
+    {
+        return Err(Miss::FutureFact);
+    }
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     let decoded = S::decode_head(head.revision, &head.body, &mut acc).map_err(Miss::Reconstruct)?;
     if conflict_owed(index, &fresh.path, &acc) {
         return Err(Miss::ConflictOwed);
     }
-    // The file against the certificate, before any page.
+    // The file against the certificate, before decoding reduction pages.
     let cert = &decoded.certificate;
     // Bind the ctime to the indexed read that minted this certificate, as for
     // census_base_bound; unavailable birth never binds (same_birth semantics).
@@ -457,23 +511,33 @@ fn stored<S: TailSource>(
     let mut base = TailBase::new(&head.body).with_write_generation(head.write_generation);
     let mut failed = None;
     let mut page_bytes = 0u64;
-    let pages = state_v2::load_tail(index, key, &head, |collection, page, bytes| {
+    let mut visit = |collection, page, bytes: Vec<u8>| {
         page_bytes = page_bytes.saturating_add(bytes.len() as u64);
         S::decode_page(collection, page, &bytes, &mut acc)
             .and_then(|()| base.observe::<S>(collection, page, &bytes))
             .map_err(|cause| {
-                failed = Some((collection, cause));
+                failed = Some(cause);
                 anyhow::anyhow!("tail_page")
             })
+    };
+    let pages = state_v2::load_tail_pages(
+        index,
+        key,
+        &head,
+        |c| c != Collection::SessionFacts,
+        &mut visit,
+    )
+    .and(fact_tags)
+    .and_then(|()| {
+        for (page, bytes) in facts {
+            visit(Collection::SessionFacts, page, bytes)?;
+        }
+        Ok(())
     });
     if pages.is_err() {
-        return Err(match failed {
-            Some((state_v2::Collection::SessionFacts, ReconstructCause::Incompatible(_))) => {
-                Miss::FutureFact
-            }
-            Some((_, cause)) => Miss::Reconstruct(cause),
-            None => Miss::Reconstruct(ReconstructCause::Corrupt),
-        });
+        return Err(Miss::Reconstruct(
+            failed.unwrap_or(ReconstructCause::Corrupt),
+        ));
     }
     // The reduction's collections only: `Revisions` is the file's freshness
     // debt (G7), never a reduction page (`load_tail` skips it too).
@@ -489,6 +553,18 @@ fn stored<S: TailSource>(
         LiveLoadError::Unavailable => Miss::LiveUnavailable,
         LiveLoadError::Reconstruct(cause) => Miss::Reconstruct(cause),
     })?;
+    #[cfg(test)]
+    if UNAVAILABLE_LIVE_ONCE.with(|target| {
+        let mut target = target.borrow_mut();
+        if target.as_ref() == Some(&fresh.path) {
+            *target = None;
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(Miss::LiveUnavailable);
+    }
     let mut reduction = CachedJsonlReduction::stored(acc, decoded.report, decoded.scalars);
     if toggled {
         reduction.scrub_context_digest();

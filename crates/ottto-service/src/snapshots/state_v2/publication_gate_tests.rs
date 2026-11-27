@@ -113,8 +113,12 @@ fn missing_store_adoption_clears_the_blocker_and_recovers_orphan_shards() {
 #[test]
 fn claude_raw_hold_survives_a_native_save_and_cold_reload() {
     let f = fixture(SnapshotSource::ClaudeCode);
-    let held = s::lenient_decode::read_bounded(
-        br#"{"schema_version":2,"accepted_snapshot_fingerprint_ledger_version":2,"files":{"opaque":{"size_bytes":[]}}}"#,
+    let held = s::lenient_decode::read(
+        std::io::Cursor::new(
+            br#"{"schema_version":2,"accepted_snapshot_fingerprint_ledger_version":2,"files":{"opaque":{"size_bytes":[]}}}"#,
+        ),
+        "cas",
+        "unattributed",
     )
     .unwrap();
     assert!(!held.decode_holds.is_empty());

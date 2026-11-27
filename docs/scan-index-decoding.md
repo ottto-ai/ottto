@@ -78,12 +78,11 @@ file unchanged. Ambiguous duplicate fields also refuse. Each refused decode
 emits one content-free fixed-category containment line; the future-ledger path
 keeps its existing once-per-source alarm. Recovery requires a compatible decoder
 or reviewed repair that preserves custody. Do not delete the index: that is a
-Missing origin, and forfeits its acceptance and history evidence. Bounded selected CAS
-keeps its existing byte cap and 8,192-node/depth-64 admission. A save also checks
+Missing origin, and forfeits its acceptance and history evidence. A save also checks
 that its output will admit the same holds after restart; if dropping optional
 input would violate that fraction, it refuses with the original file unchanged.
 
-Both CAS readers use the same record policies as load. New opaque debt or an
+CAS uses the same record policies as load. New opaque debt or an
 incompatible negative-state repair found only at CAS requires reload before a
 write. Matching holds permit unrelated commits and retain their exact raw slots.
 

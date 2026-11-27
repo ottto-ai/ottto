@@ -184,15 +184,28 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    refresh_setup_run_token_checked(api_base_url, connection, |_| Ok(()))
+}
+
+/// The only helper that sends the long-lived device secret. `check` refuses a refresh answer
+/// before it is used (cloud setup requires the same run and organization).
+pub(in crate::control) fn refresh_setup_run_token_checked(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    check: impl FnOnce(&SetupRunRefreshResponse) -> Result<(), LocalApiError>,
+) -> Result<RefreshedSetupRunToken, LocalApiError> {
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
     // co-resident attacker who tampers that file could otherwise exfiltrate the
     // secret to their own host. Gate the base through the same trusted-base
     // validator every other secret-bearing egress in this file uses, BEFORE
-    // touching the device secret. Fail closed: both callers map an `Err` to a
-    // reconnect/backend error, so an untrusted base never releases the secret.
+    // touching the device secret. Never trust a base because it appears in the
+    // cloud web-origin pairs: those choose web pages only. Fail closed: callers
+    // map an `Err` to a reconnect/backend error, so an untrusted base never
+    // releases the secret.
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
+    let api_base_url = api_base_url.as_str();
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()
@@ -204,7 +217,7 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
         .map_err(|_| LocalApiError::SetupRunConnectionMissing)?;
 
     let url = api_url_with_base(
-        &api_base_url,
+        api_base_url,
         &format!(
             "/api/v1/setup-runs/{}/local-client/refresh",
             connection.setup_run_id
@@ -215,6 +228,7 @@ pub(in crate::control) fn refresh_setup_run_token_via_device_secret(
         "device_secret": device_secret,
     });
     let response: SetupRunRefreshResponse = backend_post_json(&url, &body, &[])?;
+    check(&response)?;
     let mut refreshed = connection.clone();
     if let Some(setup_run_id) = response
         .setup_run_id
@@ -322,6 +336,15 @@ pub(in crate::control) fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<SetupRunCredentials, LocalApiError> {
+    setup_run_token_for_connection_with_refresh(connection, || {
+        refresh_setup_run_token_via_device_secret(api_base_url, connection)
+    })
+}
+
+pub(in crate::control) fn setup_run_token_for_connection_with_refresh(
+    connection: &LocalConnectionBinding,
+    refresh: impl FnOnce() -> Result<RefreshedSetupRunToken, LocalApiError>,
+) -> Result<SetupRunCredentials, LocalApiError> {
     crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
         .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
@@ -329,14 +352,10 @@ pub(in crate::control) fn setup_run_token_for_connection(
             setup_run_token: token,
             connection: connection.clone(),
         }),
-        Err(_) => {
-            refresh_setup_run_token_via_device_secret(api_base_url, connection).map(|refreshed| {
-                SetupRunCredentials {
-                    setup_run_token: refreshed.setup_run_token,
-                    connection: refreshed.connection,
-                }
-            })
-        }
+        Err(_) => refresh().map(|refreshed| SetupRunCredentials {
+            setup_run_token: refreshed.setup_run_token,
+            connection: refreshed.connection,
+        }),
     }
 }
 

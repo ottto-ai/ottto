@@ -157,6 +157,45 @@ set to `browser`, the account/setup binding is stale, or the repair touches
 credential or auth-adjacent material, present the browser/setup next action and
 stop.
 
+## Cloud Connectors
+
+When the user asks to connect Amazon Bedrock billing, run:
+
+```bash
+ottto cloud connect --source bedrock --json --watch
+```
+
+The user's request authorizes creating the AWS stack. Use their AWS CLI
+sign-in and add `--profile NAME` if they use one. The stack creates one
+read-only role. Add `--metrics` only if they ask for CloudWatch usage numbers
+and `--reconnect` only if they ask to replace an existing connection.
+
+When `approval_required` appears, tell the user where to approve, using
+`detail.where` and `detail.browser_url` when present. The user approves in
+the Ottto app with Touch ID or in the browser with their passkey.
+
+Follow the final `next_action`:
+
+- `use_web` or `approve_in_browser` → Share `connect_url`.
+- `set_up_on_mac` → Ask the user to open Ottto Settings and set up command-line connect.
+- `fix_aws_sign_in` → Ask the user to sign in to AWS and then run `resume.argv`.
+- `run_again` → Run `resume.argv` when the user is ready. Keep its
+  `--request-id`: it resumes the same attempt instead of creating a new stack.
+- `restart` → Explain the change and ask before replacing the open setup.
+- For other actions, relay `message`.
+
+Show `cleanup.argv` when present; it appears only for a stack whose attempt
+Ottto ended without saving. Run it only if the user asks. When `cleanup` has
+`settle_argv` instead, the attempt may still be saving: run that cancel command
+before suggesting any cleanup. If the outcome is unclear, run `status_argv`.
+Use `ottto cloud status --source bedrock --json` to find an attempt,
+`ottto cloud status --attempt ID --json` to read it, and
+`ottto cloud cancel --attempt ID --json` if the user asks to cancel.
+
+Google Vertex AI setup starts at <https://app.ottto.net/connections>.
+Keep AWS keys, session tokens, setup links, paste codes and Mac setup codes
+out of chat and agent tools.
+
 ## Diagnostics, Update, And Uninstall
 
 Collect local redacted diagnostics:

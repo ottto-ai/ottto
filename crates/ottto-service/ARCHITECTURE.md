@@ -485,7 +485,12 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   session facts (title, first prompt, workspace, opening settings; Codex also stores its agent
   label and prelude) among them: no transcript byte is
   read back for content. A refusal is a counted Full; only a newer build's
-  head holds. An equal-size mtime move at or before the indexed read's nonzero ctime can
+  head holds. The Codex prelude fact is v1, or v2 (v1 followed by one length-prefixed
+  extension) for a start a later build counted and sealed. This build keeps a sealed
+  extension of any layout (the header is the same in all), writes it back byte for byte
+  on every save and sends the request-1 breakdown it sealed (none when it proved none);
+  it drops a provisional one and writes v1. That build can therefore roll back to this one with no hold, no Full and no
+  change in what a sealed start sends. `codex_start_fact` counts staged v1 and v2 facts. An equal-size mtime move at or before the indexed read's nonzero ctime can
   restore from that read's certificate when size and stored mtime bind it to the entry,
   births are known and equal, and both bounded sample digests match. This removes a
   whole-file read for retention touches; ordinary later writes still read Full. A first
@@ -525,9 +530,13 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   determine identity. Path-only Workspace v1 facts remain readable; only bound Workspace facts
   write v2. OpeningSettings has its own v2: the v1 payload followed by the request-1 MCP schema
   count, written only when that count is present (a measured zero included); without it the
-  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact as
-  future state: a per-file hold that keeps the checkpoint, loses no data and re-reads nothing
-  until a compatible build returns. No historical sessions are selected just to enrich metadata.
+  fact stays v1. Other fact kinds stay v1. An older reader holds a file with any v2 fact it
+  cannot read. The per-file hold keeps the checkpoint and changes no money. Even if the file
+  changed or was pulled as a forced family member (twin or native), it never reads Full. Such
+  a member is unknown for copy ownership, so copies that depend on it are withheld for that
+  pass. Builds released before this protection could read such a
+  file once in full and keep only the facts they knew. No historical sessions are selected just
+  to enrich metadata.
 - Claude Desktop store discovery reads ordinary directories at any depth, retaining
   symlink rejection and the per-scan entry budget. Its identity census token enters a
   session fingerprint only when that session carries original Desktop identity evidence.
@@ -721,7 +730,7 @@ or sit beside it, and not all of them say what the code does:
 | `snapshots/` | The local read path: discovery, file readers, reduction to usage, the scan index, the state database and the wire model. No network. |
 | `snapshot_sync/` | The upload cycle per source. Usage flows one way, to the server; the cycle also handles the server's answers and check-in. |
 | `snapshot_client.rs` | The main HTTP client for the Ottto server: snapshot uploads and most other relay calls. A few calls are made elsewhere (`control/backend_http.rs`). |
-| `snapshot_retry.rs` | Response size limits and bounded JSON reads. It holds no retry logic; that is in `snapshot_sync/retry.rs` and `net_resilience.rs`. |
+| `snapshot_retry.rs` | Response size limits. It holds no retry logic; that is in `snapshot_sync/retry.rs` and `net_resilience.rs`. |
 | `retry_tls.rs` | The TLS connector behind the daemon's HTTP agents. |
 | `snapshot_audit.rs` | The `snapshot-audit` command: a privacy-safe local report. |
 | `snapshot_watcher.rs`, `snapshot_roots.rs` | The file-system watcher, and the folders each source is scanned and watched in. |
@@ -980,6 +989,83 @@ also require a CLI token. Cached agent status checks caller authority alone.
 Public updates and backend-token commands use their own handler paths. Identity
 commands keep their handler-side authorization and invalidate pending launch
 handoffs before mutation.
+
+## Cloud connect signer channel
+
+`control/cloud_connect` is the service side of connecting a cloud account from this Mac. The
+Ottto app holds the Secure Enclave keys and signs; the service talks to the Ottto server and
+never sees a key.
+
+- **Channel.** A second Mach service, `net.ottto.service.signer`, separate from the control
+  listener. The service renders it into its LaunchAgent (`MachServices` and
+  `serve-xpc --signer-mach-service`) only when an app bundle installed it, and opens it only
+  when its own signature is the release `ottto-service` (identifier and Developer ID team) and
+  no `OTTTO_COMPANION_*` override is set. There is no dev, ad-hoc or socket mode. A listener
+  that cannot start is logged and leaves the signer unavailable; the control listener and socket
+  keep serving.
+- **Peers.** Each peer must run as this user and pass
+  `xpc_connection_set_peer_code_signing_requirement`; libxpc then checks every message it delivers.
+  The app and service requirements pin their respective identifiers, the team, and the Apple
+  Developer ID leaf and intermediate CA.
+- **Wire.** JSON `{"signer_protocol":1,"id","command","args"}` in, `{"signer_protocol":1,"id",
+  "ok","result"|"error":{"code","status"?,"outcome_unknown"?}}` out. The shared fixture
+  `fixtures/cloud_connect/signer_wire_v1.json` holds every command and result byte for byte; the
+  service tests and the Mac app's tests both read it. Every connection sends `signer_hello`
+  first; its result names this Mac's `binding` (device, generation, organization) and the
+  server's `agent_connect` status, each null when unknown. The service refuses anything else on
+  a connection without a hello. The
+  commands (`cloud_sign_poll`, `cloud_sign_result`, `cloud_keys_claim_start`,
+  `cloud_keys_claim_status`, `cloud_keys_enroll_prepare`, `cloud_keys_enroll`,
+  `cloud_keys_revoke`) exist only here, never on the control channel.
+- **Signed writes.** A prepare builds the body once, hashes
+  `method + "\n" + route template + "\n" + body` with the literal `{setup_run_id}`, gets a
+  device challenge for that hash, checks the challenge's signed facts (version, challenge id,
+  run, organization, operation, attempt, hash, and an expiry within the operation's lifetime),
+  and freezes body and challenge on the connection. The body and hashes match the server's
+  enrollment vector, vendored unchanged as `fixtures/cloud_connect/enroll_wire_v1.json`. The
+  send uses those bytes and `{challenge_id}.{signature}` proofs, after the signature shape and
+  required proofs are checked locally. Revoke signs the empty `DELETE` body the same way; the
+  server answers it with an empty 204. When the server specifically refuses the run token, the
+  service refreshes and resends the identical request only if the run and organization both
+  match the original binding. An ambiguous enrollment response requires a claim-state readback.
+- **Browser claim.** The service selects the web origin from the (API, web) pair of the API
+  bound to the claim request. It returns a link only for that origin's
+  `/setup/cloud-keys?claim=…` route with the returned UUID and a valid forward key code.
+  Source compiles only the production pair. A non-stable candidate build may add one staging
+  pair with `OTTTO_CLOUD_STAGING_PAIR="<api origin>|<web origin>"` at build time; the stable
+  packaging path refuses to build with it set. The pair chooses web links and the approval
+  `aud` (the paired web host) only. Which APIs receive credentials, including the device secret
+  on token refresh, stays `validated_api_base_url`'s decision, which trusts that staging API
+  only in such a build.
+- **Sign queue.** In memory only: a device proof lives until its challenge expires and an
+  approval until its `sign_by`; one request per approval id, and a new approval supersedes the
+  attempt's older one once the replacement passes the expiry check. Expiry bounds the queue; the
+  server's attempt limits bound how many requests arrive. A request goes to the first verified
+  connection that polls it, only that connection's answer counts, and a DER shape check guards signatures.
+  An ended connection drops its prepares and returns its requests to the queue.
+- **Wake.** A new request can trigger a wake if no hello or wake attempt occurred in the last
+  three seconds. The service checks its app bundle and runs `open -g -a <app> ottto://cloud/sign`.
+  This unauthenticated hint carries no data. The app obtains requests over verified XPC.
+- **Template.** The CLI selects the template ID, compares the server's template metadata with
+  the compiled pin table in `ottto-protocol`, and builds the template URL from the pin. A missing
+  or different pin stops before any AWS write. The service does not fetch templates.
+- **Downgrade.** Reinstall and open the older signed Ottto app so it re-renders and bootstraps
+  its LaunchAgent. Swapping only the service binary is unsupported because the installed job
+  retains the signer Mach service and passes a flag the older binary cannot parse.
+
+- **CLI.** Command-scoped local-control requests require the CLI token. Passive attempt
+  status never presents an approval. Ensure, submit and cancel obtain a fresh app device
+  signature over the frozen HTTP request, with the literal attempt placeholder in the
+  digest for attempt-specific routes. One lost reply or invalid proof can retry with
+  a fresh challenge and the same request body. The native approval queue offers at most
+  four new approvals per minute, and a retained answer allows an identical approval
+  retry after readback. The daemon checks the approval's attempt, revision and AWS
+  account before it reaches the app.
+- **AWS.** The CLI checks the same compiled template pin as the daemon and uses a
+  single exported AWS credential session for identity and CloudFormation. Setup
+  state lives on the server. A resume re-reads the attempt and reconciles the verified
+  stack ARN before submission. Cancellation can return a separate delete command for
+  an ARN verified in the relevant account.
 
 ## Local health diagnostics
 

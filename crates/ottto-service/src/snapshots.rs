@@ -615,6 +615,8 @@ pub struct SourceScanResult {
     pub census_residue_index_key_count: usize,
     pub census_residue_archived_rollout_count: usize,
     pub snapshots: Vec<SnapshotItem>,
+    /// Forced Claude twins held for a newer build on this acquisition page.
+    pub(crate) newer_build_held: BTreeSet<String>,
     /// Exact selection deferrals from this page, diagnostic only; never persisted.
     pub(crate) claude_queued_family_deferred_paths: BTreeSet<claude_money_birth_store::LocationKey>,
     pending_finalization: Vec<PendingIndexFinalization>,

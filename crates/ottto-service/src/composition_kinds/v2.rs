@@ -737,6 +737,13 @@ const CODEX_INJECTED_PREFIXES: [(&str, Part); 7] = [
     ("<heartbeat", Part::Other),
 ];
 
+pub(super) fn codex_agent_message(ctx: &LineCtx) -> Verdict {
+    if let Some(verdict) = request_1(ctx) {
+        return verdict;
+    }
+    prompt(ctx, true)
+}
+
 pub(super) fn codex_message(ctx: &LineCtx, role: &str, label: ContentLabel, text: &str) -> Verdict {
     if !matches!(role, "developer" | "user") {
         return Verdict::Skip(SkipReason::NotMeasured);

@@ -24,6 +24,10 @@ pub(in crate::snapshots) fn seed_full_job_template(
     };
     let (head, since) = match load() {
         Ok(loaded) => loaded,
+        Err(error) if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::Future) => {
+            load::count_newer_build(acc.source, "head");
+            return Err(error);
+        }
         Err(error) if error.is::<state_v2::UnreadableHead>() => {
             counters::bump(acc.source, "job_template_skipped", "stored_state");
             return Ok(());
@@ -32,6 +36,13 @@ pub(in crate::snapshots) fn seed_full_job_template(
         Err(error) => return Err(error),
     };
     if let Some(head) = &head {
+        if !head.metadata_only
+            && let Err(error) = load::check_fact_tags(index, &key, head, |_, _| {})
+            && error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::Future)
+        {
+            load::count_newer_build(acc.source, "fact");
+            return Err(error);
+        }
         restore_job(head, candidate, acc);
         if acc.job_template.is_some() {
             return Ok(());

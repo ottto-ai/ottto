@@ -11,7 +11,7 @@ Commands:
   agent-status       Refresh one source status using the lower-level source noun
   context            Print cloud context for AI agents
   costs              Print cloud cost breakdown for AI agents
-  cloud              Show cloud connector status; connect clouds on the web
+  cloud              Connect clouds and show their status
   sessions           Print cloud sessions for AI agents
   recommendations    Print Advisor recommendations for AI agents
   provider-impact    Print provider-impact events for AI agents
@@ -216,13 +216,15 @@ Options:
   -h, --help
           Print help
 ### ottto cloud --help
-Show cloud connector status; connect clouds on the web
+Connect clouds and show their status
 
 Usage: ottto cloud [OPTIONS] <COMMAND>
 
 Commands:
-  status  Show configured cloud connector status; makes no changes
-  help    Print this message or the help of the given subcommand(s)
+  connect  Connect Amazon Bedrock billing from this Mac
+  status   Show connectors and any setup in progress
+  cancel   Cancel a setup started from this Mac
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --json             Print one final JSON object and no human summary text
@@ -232,9 +234,30 @@ Options:
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
 
-Connect or change AWS and Google Cloud connectors in the web app: https://app.ottto.net/apps
+Google Vertex AI: connect at https://app.ottto.net/connections
+### ottto cloud connect --help
+Connect Amazon Bedrock billing from this Mac
+
+Usage: ottto cloud connect [OPTIONS] --source <SOURCE>
+
+Options:
+      --json               Print one final JSON object and no human summary text
+      --socket <SOCKET>    Override the ottto-service Unix socket path
+      --source <SOURCE>    Cloud billing source [possible values: bedrock, vertex]
+      --metrics            Also read Bedrock usage numbers from CloudWatch
+      --token <TOKEN>      Override the local-control token for CLI and agent requests
+      --no-autostart       Do not kickstart the standard per-user ottto-service
+      --reconnect          Replace the AWS account already connected
+      --restart            Drop this Mac's open setup and start a new one
+      --watch              Emit NDJSON progress events and a final event; requires --json
+      --profile <PROFILE>  AWS CLI profile to use
+      --timeout <SECONDS>  Stop waiting after this many seconds [default: 1200]
+      --verbose            Show AWS CLI error text on this terminal
+  -h, --help               Print help
+
+Uses your AWS CLI sign-in to create one read-only role, then waits for you to approve saving it with Touch ID or a passkey. Run the same command again to resume.
 ### ottto cloud status --help
-Show configured cloud connector status; makes no changes
+Show connectors and any setup in progress
 
 Usage: ottto cloud status [OPTIONS]
 
@@ -242,6 +265,20 @@ Options:
       --json             Print one final JSON object and no human summary text
       --socket <SOCKET>  Override the ottto-service Unix socket path
       --source <SOURCE>  [possible values: bedrock, vertex]
+      --attempt <ID>     Cloud setup attempt UUID
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto cloud cancel --help
+Cancel a setup started from this Mac
+
+Usage: ottto cloud cancel [OPTIONS] --attempt <ID>
+
+Options:
+      --attempt <ID>     Cloud setup attempt UUID
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
       --token <TOKEN>    Override the local-control token for CLI and agent requests
       --no-autostart     Do not kickstart the standard per-user ottto-service
       --watch            Emit NDJSON progress events and a final event; requires --json

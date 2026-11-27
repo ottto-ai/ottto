@@ -302,6 +302,11 @@ pub fn execute_local_uninstall(
         return execution_result(plan, report);
     }
 
+    // Held until this uninstall returns: CLI autostart and every install take
+    // the same per-user lock, so none can load the job again from its plist
+    // between the unload below and the plist's removal.
+    let _service_lifecycle = hold_service_lifecycle(home, &mut report);
+
     if options.stop_companion_process {
         stop_process("Ottto", &mut report);
     } else {
@@ -346,6 +351,28 @@ pub fn execute_local_uninstall(
     );
 
     execution_result(plan, report)
+}
+
+/// How long an uninstall waits for an install or autostart to finish its
+/// own lifecycle step before it goes ahead without the lock.
+const UNINSTALL_LIFECYCLE_WAIT: Duration = Duration::from_secs(10);
+
+/// The per-user service lifecycle lock, or `None` (with a warning) when it
+/// cannot be taken in time; the uninstall still proceeds.
+fn hold_service_lifecycle(
+    home: &Path,
+    report: &mut CleanupReport,
+) -> Option<crate::service_lifecycle::ServiceLifecycleTransaction> {
+    match crate::service_lifecycle::ServiceLifecycleTransaction::acquire(
+        home,
+        UNINSTALL_LIFECYCLE_WAIT,
+    ) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            report.warn(format!("service lifecycle lock not taken: {error}"));
+            None
+        }
+    }
 }
 
 /// Who may delete the support directory during this uninstall.
@@ -845,6 +872,37 @@ fn remove_cleanup_target(target: CleanupTarget, report: &mut CleanupReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An uninstall's lifecycle lock makes autostart and install wait: no
+    /// other step can load the job while it is held.
+    #[test]
+    fn uninstall_holds_the_service_lifecycle_lock() {
+        let home = std::env::temp_dir().join(format!(
+            "ottto-uninstall-lifecycle-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut report = CleanupReport::new();
+        let held = hold_service_lifecycle(&home, &mut report);
+        assert!(held.is_some(), "{:?}", report.warnings);
+        let other =
+            crate::service_lifecycle::ServiceLifecycleTransaction::acquire(&home, Duration::ZERO);
+        assert!(other.is_err_and(|error| error
+            .downcast_ref::<crate::service_lifecycle::ServiceLifecycleBusy>()
+            .is_some()));
+        drop(held);
+        assert!(
+            crate::service_lifecycle::ServiceLifecycleTransaction::acquire(&home, Duration::ZERO)
+                .is_ok()
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn launchservices_inventory_finds_all_companion_registrations() {

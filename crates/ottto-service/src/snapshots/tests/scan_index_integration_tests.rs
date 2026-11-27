@@ -76,7 +76,7 @@ impl Fixture {
         object["bytes"] = json!(payload.len());
     }
     fn read(&self) -> ScanIndex {
-        read_scan_index_representation(&self.root, "load", "claude_code", None).unwrap()
+        read_scan_index_representation(&self.root, "load", "claude_code").unwrap()
     }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(

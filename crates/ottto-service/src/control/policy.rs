@@ -30,9 +30,13 @@ pub(super) fn policy(command: &LocalControlCommand) -> CommandPolicy {
         | Command::ClaudeAccountStartBrowserReconnect { .. }
         | Command::CodexAccountRemove { .. }
         | Command::CodexAccountReconnect { .. } => (Access::Local, true),
-        Command::SessionLaunchConsume { .. } | Command::SessionLaunchReport { .. } => {
-            (Access::LocalCli, false)
-        }
+        Command::SessionLaunchConsume { .. }
+        | Command::SessionLaunchReport { .. }
+        | Command::CloudConnectStatus { .. }
+        | Command::CloudConnectEnsure { .. }
+        | Command::CloudConnectSubmit { .. }
+        | Command::CloudConnectPoll { .. }
+        | Command::CloudConnectCancel { .. } => (Access::LocalCli, false),
         Command::AgentStatusCached { .. } => (Access::LocalNoPoisonCheck, false),
         Command::UpdateCheck => (Access::Public, false),
         // Admission does nothing for these two: their handlers' backend-token,

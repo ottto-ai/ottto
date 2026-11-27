@@ -832,18 +832,6 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
-    use std::io::Read;
-    let mut normalized = Vec::new();
-    let mut reader = CensusRead::new(bytes);
-    reader.read_to_end(&mut normalized)?;
-    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
-}
-
-pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
-    super::lenient_decode::read_bounded(bytes)
-}
-
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.

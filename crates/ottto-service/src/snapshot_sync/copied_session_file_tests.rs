@@ -1917,6 +1917,233 @@ fn local_only_carrier() -> (Corpus, ScanIndex, [PathBuf; 3]) {
     (c, index, paths)
 }
 
+fn forced_carrier_corpus() -> (Corpus, ScanIndex, PathBuf, PathBuf) {
+    let (mut c, index, [holder, _, carrier]) = local_only_carrier();
+    append(
+        &holder,
+        &resumed(ROOT, &[("holder-append", D.1, RESUME_WRITER)]),
+    );
+    c.write_at(
+        &file(THIRD),
+        &resumed(THIRD, &[B, ("own-branch", D.1, RESUME_WRITER)]),
+        C.1,
+    );
+    c.write_at(&file(LATE), &line(LATE, "independent", AT, 10), BORN);
+    (c, index, holder, carrier)
+}
+
+fn portable_carrier_bodies(items: &[SnapshotItem], base: &Path) -> BTreeMap<String, Vec<u8>> {
+    items
+        .iter()
+        .map(|item| {
+            let text = serde_json::to_string(item)
+                .unwrap()
+                .replace(&*base.to_string_lossy(), "<corpus>");
+            let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("source_file_fingerprint");
+            object.remove("snapshot_fingerprint");
+            (item.source_session_id.clone(), canonical(&value))
+        })
+        .collect()
+}
+
+/// A newer forced carrier holds dependent copies until recovery can emit the same bodies as a healthy run.
+#[test]
+fn forced_newer_carrier_holds_dependent_copies_until_readable() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        forced_needs_native_for_test, set_future_tail_fact_for_test, tail_counter_for_test,
+    };
+    use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
+    use crate::snapshots::state_v2::tail_head_reduction_for_test;
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (healthy, index, holder, carrier) = forced_carrier_corpus();
+        let scanner = carrier_scanner(&index);
+        let mut expected = healthy.raw(&scanner, index, 100, true, &[holder]);
+        assert!(scanner.paths().contains(&carrier));
+        expected.enrich(&healthy);
+        expected.finish();
+        let expected_third_requests = body(&expected, THIRD).unwrap().request_count;
+        assert!(body(&expected, LATE).is_some());
+
+        let (c, mut index, holder, carrier) = forced_carrier_corpus();
+        let key = carrier.to_string_lossy();
+        set_future_tail_fact_for_test(&mut index, &key, true);
+        assert!(!forced_needs_native_for_test(&index, &carrier));
+        assert!(e2::carrier_group_owned_for_test(
+            &index,
+            &holder.to_string_lossy()
+        ));
+        let head = tail_head_reduction_for_test(&index, &key);
+        let held_count = tail_counter_for_test("tail_held_newer_build", "forced_twin");
+        let scanner = carrier_scanner(&index);
+        e2::take_diag();
+        let mut held = c.raw(
+            &scanner,
+            index.clone(),
+            100,
+            true,
+            std::slice::from_ref(&holder),
+        );
+        assert!(scanner.paths().contains(&holder));
+        assert!(!scanner.paths().contains(&carrier));
+        assert_eq!(
+            tail_counter_for_test("tail_held_newer_build", "forced_twin"),
+            held_count + 1
+        );
+        held.enrich(&c);
+        assert_withheld(&held, THIRD, "the forced carrier is unknown on this page");
+        assert!(e2::take_diag().contains_key("request_owned_held"));
+        let mut sent = twin(&held);
+        sent.finish();
+        assert!(body(&sent, THIRD).is_none() && body(&sent, LATE).is_some());
+        for item in &sent.scan.snapshots {
+            let oracle = body(&expected, &item.source_session_id).unwrap();
+            assert!(item.request_count <= oracle.request_count);
+        }
+        index = settle(&c, &index, held, &mut e2_progress());
+        // The newer reduction and facts stay as written; only the freshness
+        // debt the page's ACK drained may change.
+        assert_eq!(tail_head_reduction_for_test(&index, &key), head);
+
+        // A later page, the carrier still newer: it is held again, never a
+        // positive carrier from stored state, and the copy stays withheld.
+        index.activate_upload_context("e2-synthetic-destination".into());
+        let scanner = carrier_scanner(&index);
+        let mut later = c.raw(
+            &scanner,
+            index.clone(),
+            100,
+            true,
+            std::slice::from_ref(&holder),
+        );
+        assert!(!scanner.paths().contains(&carrier));
+        later.enrich(&c);
+        assert_withheld(
+            &later,
+            THIRD,
+            "the newer carrier stays unknown on a later page",
+        );
+        let mut later_sent = twin(&later);
+        later_sent.finish();
+        assert!(body(&later_sent, THIRD).is_none());
+        index = settle(&c, &index, later, &mut e2_progress());
+        assert_eq!(tail_head_reduction_for_test(&index, &key), head);
+
+        index.activate_upload_context("e2-synthetic-destination".into());
+        set_future_tail_fact_for_test(&mut index, &key, false);
+        let scanner = carrier_scanner(&index);
+        // The held page may have used the holder's six-hour growth Full claim.
+        let retry_at = crate::scan_clock::utc_seconds() + 7 * 60 * 60;
+        let mut recovered = with_scan_clock(retry_at, || {
+            c.raw(&scanner, index.clone(), 100, true, &[holder])
+        });
+        assert!(scanner.paths().contains(&carrier));
+        recovered.enrich(&c);
+        let mut retried = twin(&recovered);
+        retried.finish();
+        assert_eq!(
+            retried
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == THIRD)
+                .count(),
+            1
+        );
+        assert_eq!(
+            body(&retried, THIRD).unwrap().request_count,
+            expected_third_requests
+        );
+        let mut actual = portable_carrier_bodies(&sent.scan.snapshots, &c.base);
+        for (session, value) in portable_carrier_bodies(&retried.scan.snapshots, &c.base) {
+            assert!(
+                actual.insert(session, value).is_none(),
+                "session was already emitted"
+            );
+        }
+        assert_eq!(
+            actual,
+            portable_carrier_bodies(&expected.scan.snapshots, &healthy.base)
+        );
+        // The quiet pass keeps the recovery's clock: time never runs backwards.
+        let mut quiet = with_scan_clock(retry_at + 60, || {
+            let settled = settle(&c, &index, recovered, &mut e2_progress());
+            ready(&c, &carrier_scanner(&settled), settled, 100, true)
+        });
+        quiet.finish();
+        // Control: the same settle and quiet pass on a never-held corpus.
+        let (control, control_index, control_holder, _) = forced_carrier_corpus();
+        let control_scanner = carrier_scanner(&control_index);
+        let mut first = control.raw(
+            &control_scanner,
+            control_index.clone(),
+            100,
+            true,
+            &[control_holder],
+        );
+        first.enrich(&control);
+        let mut control_quiet = with_scan_clock(retry_at + 60, || {
+            let settled = settle(&control, &control_index, first, &mut e2_progress());
+            ready(&control, &carrier_scanner(&settled), settled, 100, true)
+        });
+        control_quiet.finish();
+        assert_eq!(
+            body(&quiet, THIRD).is_some(),
+            body(&control_quiet, THIRD).is_some(),
+            "after recovery the quiet pass matches a never-held corpus"
+        );
+    });
+}
+
+/// A forced carrier with a missing live input still reads Full on the holder's page.
+#[test]
+fn forced_carrier_with_unavailable_live_input_still_reads_full() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        tail_counter_for_test, twin_diagnostics, unavailable_tail_live_once_for_test,
+    };
+    use crate::transcript_acquisition::ReadMode;
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let run = |unavailable| {
+        with_e2(|| {
+            let (c, index, holder, carrier) = forced_carrier_corpus();
+            let _trace = twin_diagnostics::begin("forced carrier");
+            twin_diagnostics::register(&carrier, "carrier");
+            let scanner = carrier_scanner(&index);
+            let held = tail_counter_for_test("tail_db_loads", "held");
+            if unavailable {
+                unavailable_tail_live_once_for_test(&carrier);
+            }
+            let mut page = c.raw(&scanner, index, 100, true, &[holder]);
+            assert_eq!(
+                tail_counter_for_test("tail_db_loads", "held"),
+                held + u64::from(unavailable)
+            );
+            let reads = scanner.acquisitions.lock().unwrap();
+            let acquired = reads.iter().find(|read| read.path == carrier).unwrap();
+            assert_eq!(matches!(acquired.mode, ReadMode::Full(_)), unavailable);
+            assert_eq!(
+                twin_diagnostics::context().contains("Held forced_twin=true native_fallback"),
+                unavailable
+            );
+            drop(reads);
+            page.enrich(&c);
+            page.finish();
+            portable_carrier_bodies(&page.scan.snapshots, &c.base)
+        })
+    };
+    let healthy = run(false);
+    assert!(healthy.contains_key(THIRD));
+    assert_eq!(run(true), healthy);
+}
+
 /// A failed save withholds the copy and recovery offers the same bodies without a request-count increase.
 #[test]
 fn failed_save_holds_twin_carried_copy_until_baseline_recovers() {

@@ -2156,18 +2156,21 @@ start, at each scan start, and inline when a request takes the journal 16 MiB
 past its length after the last drain (scans stalled; nothing is refused or
 dropped for size). Rows a drain could not move set that length, so a refused
 backlog never drains on each request. A drain first renames the journal to a
-`prev` file and keeps it until a drain at least a minute later replaces it, so
-rows keep an on-disk copy until their per-session writes have been written
-back; a drain at least a minute later with an empty journal removes `prev`, so
-an idle `prev` lives about one scan interval. The first drain after a start
-replays `prev`, then the journal. A drain that adds the journal to `prev` syncs
-`prev` before it cuts the journal.
+new numbered `prev` file (`claude-code-relay-journal.prev.<n>.jsonl`), with no
+copy, and keeps each `prev` file until a drain at least a minute
+after its own rows reached their per-session files, so rows keep an on-disk
+copy until those writes have been written back. That drain removes it, also
+with an empty journal, so frequent drains never grow a `prev` file and an idle
+one lives about one scan interval. While an earlier `prev` file is still kept, a
+drain syncs the new one before it answers again. The first drain after a start replays every
+`prev` file, oldest first (the single `claude-code-relay-journal.prev.jsonl` an
+earlier release kept comes first), then the journal.
 Readers read only the per-session files, after a drain. A replay or a crash
 mid-drain can copy rows twice; the readers drop identical rows. A torn line
 from a crash mid-append, in the journal or a per-session file, is ended before
 the next append and never joins a full row: text after the last newline is
 padding only when it is all whitespace. Retention holds a session's files while
-the journal or `prev` holds one of its rows, so a later replay never recreates
+the journal or a `prev` file holds one of its rows, so a later replay never recreates
 files retention removed. Rows a per-session file refuses wait in the journal
 until that file accepts them, and only that session's files stay held. While
 they pass 32 MiB, each drain emits one `local_resources`
@@ -2181,8 +2184,8 @@ row accepted after one scan-start drain wakes the pass that follows the next
 drain. `ottto-service snapshot-audit` never drains: with Claude sidecars
 supplied and rows waiting in the journal it prints one stderr line that its
 input is incomplete, with the waiting row count. The doctor's support
-inspection reports the journal's and `prev`'s sizes (`relay_journal_bytes`,
-`relay_journal_prev_bytes`); the stores it samples hold rows as of the last
+inspection reports the journal's size and the `prev` files' total
+(`relay_journal_bytes`, `relay_journal_prev_bytes`); the stores it samples hold rows as of the last
 drain.
 
 The same `process_retained_cache_lifecycle_totals` row carries these cumulative

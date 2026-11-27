@@ -60,17 +60,12 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
                 "census_stream",
                 claude_request_census::decode_index(Cursor::new(bytes)).unwrap(),
             ),
-            // Streaming lenient reader: ScanIndex::load and the unbounded CAS.
+            // Streaming lenient reader: ScanIndex::load and the CAS read.
             ("load", ScanIndex::load(&path).unwrap()),
             (
                 "streaming_cas",
                 lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
                     .unwrap(),
-            ),
-            // Bounded reader: the capped index read.
-            (
-                "bounded_cas",
-                claude_request_census::decode_bounded_index(bytes).unwrap(),
             ),
         ];
         for (reader, decoded) in decoded {
@@ -107,13 +102,8 @@ fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
         fs::write(&path, &bytes).unwrap();
         let streamed =
             lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed").unwrap();
-        let bounded = claude_request_census::decode_bounded_index(&bytes).unwrap();
         let loaded = ScanIndex::load(&path).unwrap();
-        for (reader, decoded) in [
-            ("streaming_cas", &streamed),
-            ("bounded_cas", &bounded),
-            ("load", &loaded),
-        ] {
+        for (reader, decoded) in [("streaming_cas", &streamed), ("load", &loaded)] {
             let label = format!("{layout}/{reader}");
             assert!(decoded.decode_holds_file("held-opaque"), "{label}");
             assert!(

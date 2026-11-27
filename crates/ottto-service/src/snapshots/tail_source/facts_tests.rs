@@ -138,11 +138,33 @@ fn a_long_first_prompt_goes_through_fragments() {
     assert_eq!(facts(&taken)[1].as_deref(), Some(long.as_str()));
 }
 
-/// [behaviour] A session fact of a version this build does not know is a
-/// newer build's: the file holds as for a future revision, with no
-/// reconstruction, no Full and the head untouched.
+/// An unknown fact version holds an unchanged Claude file and keeps its head.
 #[test]
 fn an_unknown_fact_version_holds_the_file() {
+    assert_unknown_fact_version_holds(|_| {});
+}
+
+/// An unknown fact version holds a rewritten Claude file before Full admission.
+#[test]
+fn an_unknown_fact_version_holds_a_rewritten_file() {
+    assert_unknown_fact_version_holds(|path| std::fs::write(path, b"{}\n").unwrap());
+}
+
+/// An unknown fact version also holds an appended Claude file.
+#[test]
+fn an_unknown_fact_version_holds_an_appended_file() {
+    use std::io::Write as _;
+    assert_unknown_fact_version_holds(|path| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+    });
+}
+
+fn assert_unknown_fact_version_holds(edit: impl FnOnce(&Path)) {
     let mut route = route();
     let (mut tail, _native) = route.complete("a.jsonl", &lines(3), None, |_| {});
     let key = tail.key_for_test().to_owned();
@@ -155,14 +177,18 @@ fn an_unknown_fact_version_holds_the_file() {
     title[1] = 2;
     state_v2::stage_tail(&route.path, &key, staged).unwrap();
     route.save(false);
-    let head = route.head(&key).unwrap().body;
-    let (load, records) = loaded(&route, &route.dir.join("a.jsonl"), &key);
+    let head = state_v2::tail_head_bytes_for_test(&route.index, &key);
+    let path = route.dir.join("a.jsonl");
+    edit(&path);
+    let before = counters::total("tail_held_newer_build", "fact");
+    let (load, records) = loaded(&route, &path, &key);
     assert!(matches!(
         load,
         Load::Held(crate::snapshots::tail_source::load::HoldKind::NewerBuild)
     ));
     assert_eq!(counted(&records), ("held".into(), vec![]));
-    assert_eq!(route.head(&key).unwrap().body, head);
+    assert_eq!(counters::total("tail_held_newer_build", "fact"), before + 1);
+    assert_eq!(state_v2::tail_head_bytes_for_test(&route.index, &key), head);
 }
 
 /// [format] The request-1 MCP schema count rides in the opening-settings fact

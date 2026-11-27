@@ -550,6 +550,61 @@ fn is_trusted_api_base_url(value: &str) -> bool {
         || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
         || value.starts_with("http://localhost")
         || value.starts_with("http://127.0.0.1")
+        || staging_pair().is_some_and(|(api, _)| value == api)
+}
+
+/// The one staging deployment a non-stable candidate build may trust, as `(API origin, web
+/// origin)`. It exists only when the build sets `OTTTO_CLOUD_STAGING_PAIR="<api>|<web>"`; the
+/// stable packaging path refuses to build with it set, so stable releases trust production only.
+/// Source code names no staging host.
+pub(super) fn staging_pair() -> Option<(&'static str, &'static str)> {
+    #[cfg(test)]
+    let test_pair = TEST_STAGING_PAIR.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let test_pair = None;
+    test_pair.or_else(|| option_env!("OTTTO_CLOUD_STAGING_PAIR").and_then(parse_staging_pair))
+}
+
+/// `<api>|<web>`: two distinct bare `https://` origins (host and optional port, no path, query,
+/// fragment or credentials), neither of them production. Anything else compiles in no pair.
+pub(super) fn parse_staging_pair(value: &str) -> Option<(&str, &str)> {
+    let (api, web) = value.split_once('|')?;
+    let origin = |origin: &str| {
+        origin.strip_prefix("https://").is_some_and(|authority| {
+            !authority.is_empty()
+                && !authority.starts_with([':', '.', '-'])
+                && authority
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-:".contains(&byte))
+        })
+    };
+    (origin(api)
+        && origin(web)
+        && api != web
+        && !is_production_api_base_url(api)
+        && web != "https://app.ottto.net")
+        .then_some((api, web))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STAGING_PAIR: std::cell::Cell<Option<(&'static str, &'static str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `test` on this thread as if the build had compiled in `pair`.
+#[cfg(test)]
+pub(super) fn with_test_staging_pair<T>(
+    pair: (&'static str, &'static str),
+    test: impl FnOnce() -> T,
+) -> T {
+    let pair = parse_staging_pair(&format!("{}|{}", pair.0, pair.1))
+        .map(|_| pair)
+        .expect("a well-formed test staging pair");
+    TEST_STAGING_PAIR.with(|cell| cell.set(Some(pair)));
+    let result = test();
+    TEST_STAGING_PAIR.with(|cell| cell.set(None));
+    result
 }
 
 pub(super) fn api_url_with_base(api_base_url: &str, path: &str) -> String {
@@ -595,6 +650,52 @@ pub(super) fn backend_post_json_with_timeout<T: DeserializeOwned>(
         .send_json(body)
         .map_err(|error| backend_error_from_ureq(url, error))?;
     backend_success(url, response)?
+        .into_json()
+        .map_err(|error| backend_response_unexpected(url, error.to_string()))
+}
+
+/// Sends `body` byte for byte (or no body) within `timeout`. A signed write's challenge hashes the
+/// exact body, so the HTTP client must not serialize it again. Callers choose how to read a
+/// refusal; `backend_send_raw_json` uses the standard backend error.
+pub(super) fn backend_send_raw(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<ureq::Response, Box<ureq::Error>> {
+    let mut request = crate::retry_tls::credential_agent()
+        .request(method, url)
+        .set("Accept", "application/json")
+        .timeout(timeout);
+    for (key, value) in headers {
+        request = request.set(key, value);
+    }
+    match body {
+        Some(body) => request
+            .set("Content-Type", "application/json")
+            .send_bytes(body),
+        None => request.call(),
+    }
+    .map_err(Box::new)
+}
+
+/// `backend_send_raw` with the standard backend error. A 2xx answer decodes as JSON, and an empty
+/// 204 answer as JSON null.
+pub(super) fn backend_send_raw_json<T: DeserializeOwned>(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> Result<T, LocalApiError> {
+    let response = backend_send_raw(method, url, body, headers, BACKEND_REQUEST_TIMEOUT)
+        .map_err(|error| backend_error_from_ureq(url, *error))?;
+    let response = backend_success(url, response)?;
+    if response.status() == 204 {
+        return serde_json::from_str("null")
+            .map_err(|error| backend_response_unexpected(url, error.to_string()));
+    }
+    response
         .into_json()
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }

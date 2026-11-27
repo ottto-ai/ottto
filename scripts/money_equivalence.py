@@ -773,6 +773,12 @@ def verified_summary(names, uncompared, base_sha, head_sha, seconds):
             f"{seconds:.1f}s. Family vector/Pi remain ignored.\n")
 
 
+def base_line(ref, base_sha, explicit):
+    """The comparison base actually used; an empty input shows blank in the step env."""
+    source = "explicit" if explicit else "fork point of " + ref
+    return f"MONEY_EQUIVALENCE_BASE {base_sha} ({source})"
+
+
 def require_distinct_commits(base_sha, head_sha):
     """A base that is the head compares the head with itself and proves nothing."""
     if base_sha == head_sha:
@@ -811,6 +817,7 @@ def main():
         # Compare against the branch's fork point, not the base tip: later
         # base changes are not this branch's.
         base_sha = output(["git", "merge-base", base_sha, "HEAD"])
+    print(base_line(ref, base_sha, explicit), flush=True)
     head_sha = output(["git", "rev-parse", "HEAD"])
     require_distinct_commits(base_sha, head_sha)
     require_disjoint_head_only()

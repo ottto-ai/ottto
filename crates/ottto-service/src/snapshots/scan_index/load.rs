@@ -167,7 +167,7 @@ impl ScanIndex {
             )
         } else {
             let decoded =
-                read_scan_index_representation(path, "load", scan_index_source_label(source), None)
+                read_scan_index_representation(path, "load", scan_index_source_label(source))
                     .map_err(|error| match error.downcast::<lenient_decode::Error>() {
                         Ok(error) => error,
                         Err(error)

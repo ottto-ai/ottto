@@ -773,6 +773,12 @@ const CODEX_INJECTED_USER_PREFIXES: [&str; 3] = [
     "<user_instructions>",
 ];
 
+/// Text another agent sent this Codex thread (an inbound `agent_message`):
+/// a prompt written by an agent. kinds_version 2 only.
+pub(crate) fn codex_agent_message(ctx: &LineCtx) -> Verdict {
+    v2::codex_agent_message(ctx)
+}
+
 /// A `message` record: a developer message as a whole (`label` is `Absent`
 /// and `text` unused), or one text block of a user message. kinds_version 2
 /// readers pass every text block of both roles with its label.

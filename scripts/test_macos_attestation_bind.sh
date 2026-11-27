@@ -324,6 +324,54 @@ if ! cmp -s "$first_bind" "$manifest"; then
   exit 1
 fi
 
+# [behaviour] --verify-only checks a sealed, read-only folder: it passes when the
+# manifest already carries the binding and writes nothing there.
+run_verify_only() {
+  (
+    cd "$ELSEWHERE"
+    OTTTO_RELEASE_SOURCE_REF=refs/tags/v0.1.0 "$BINDER" --verify-only \
+      --manifest "$1" \
+      --subject-checksums "$2" \
+      --repo ottto-ai/ottto \
+      --signer-workflow .github/workflows/macos-stable-release.yml
+  )
+}
+SEALED="$TMP_DIR/sealed folder"
+mkdir -p "$SEALED"
+for name in Ottto-macos-arm64.dmg ottto-macos-arm64.zip ottto-service-macos-arm64.zip \
+  ottto-local-platform-sbom.cdx.json release-manifest.json install-macos.sh subject.checksums.txt; do
+  cp "$REL/$name" "$SEALED/$name"
+done
+listing_before="$(ls -A "$SEALED")"
+chmod -R a-w "$SEALED"
+if ! run_verify_only "$SEALED/release-manifest.json" "$SEALED/subject.checksums.txt" >"$TMP_DIR/verify.out" 2>&1; then
+  chmod -R u+w "$SEALED"
+  echo "--verify-only refused a correctly bound sealed folder: $(cat "$TMP_DIR/verify.out")" >&2
+  exit 1
+fi
+chmod -R u+w "$SEALED"
+if [[ "$(ls -A "$SEALED")" != "$listing_before" ]] || ! cmp -s "$first_bind" "$SEALED/release-manifest.json"; then
+  echo "--verify-only wrote into the sealed folder" >&2
+  exit 1
+fi
+# A manifest without the binding fails, and is left as it was.
+jq '.supply_chain.sbom.verification_command = "not verified yet"' "$SEALED/release-manifest.json" \
+  > "$TMP_DIR/unbound.json"
+cp "$TMP_DIR/unbound.json" "$SEALED/release-manifest.json"
+(
+  cd "$SEALED"
+  shasum -a 256 Ottto-macos-arm64.dmg ottto-macos-arm64.zip ottto-service-macos-arm64.zip \
+    ottto-local-platform-sbom.cdx.json release-manifest.json install-macos.sh > subject.checksums.txt
+)
+if run_verify_only "$SEALED/release-manifest.json" "$SEALED/subject.checksums.txt" >"$TMP_DIR/verify.out" 2>&1; then
+  echo "--verify-only accepted a manifest without the attestation binding" >&2
+  exit 1
+fi
+if ! cmp -s "$TMP_DIR/unbound.json" "$SEALED/release-manifest.json"; then
+  echo "--verify-only changed a manifest it refused" >&2
+  exit 1
+fi
+
 failed_manifest="$REL/failed-manifest.json"
 cp "$manifest" "$failed_manifest"
 jq '.supply_chain.slsa_build.verified = false | .supply_chain.sbom.verified = false' \

@@ -77,12 +77,14 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, load_head, load_job_head, load_revisions, load_tail,
-    observe_tail, observe_tails, retire_tail, set_aside_tail, stage_job, stage_tail,
-    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_job_head, load_revisions,
+    load_tail_pages, observe_tail, observe_tails, retire_tail, set_aside_tail, stage_job,
+    stage_tail, tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
-pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
+pub(in crate::snapshots) use runtime::tail_route::{
+    load_tail, staged_head_for_test, LOAD_HEAD_CALLS,
+};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
 #[allow(
     unused_imports,
@@ -659,14 +661,48 @@ pub(crate) use import::{with_carrier_head_error_for_test, with_carrier_store_err
 
 #[cfg(test)]
 pub(crate) fn seed_unreadable_tail_head_for_test(index: &ScanIndex, key: &str) {
+    replace_tail_head_bytes_for_test(index, key, &[0]);
+}
+
+/// Replace only the persisted head. The fixture reloads the index afterward.
+#[cfg(test)]
+pub(crate) fn replace_tail_head_bytes_for_test(index: &ScanIndex, key: &str, head: &[u8]) {
     seed_tail_head_for_test(index, |tx| {
-        tail::put_head_for_test(tx, key.as_bytes(), &[0])
+        tail::put_head_for_test(tx, key.as_bytes(), head)
     });
 }
 
 #[cfg(test)]
 pub(crate) fn seed_future_carrier_head_for_test(index: &ScanIndex, key: &str) {
     seed_tail_head_for_test(index, |tx| tail::future_head_for_test(tx, key.as_bytes()));
+}
+
+#[cfg(test)]
+pub(crate) fn tail_head_bytes_for_test(index: &ScanIndex, key: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        bytes = tail::head_bytes_for_test(&mut tx, key.as_bytes()).unwrap();
+    });
+    bytes
+}
+
+/// The committed head's reduction, revision and reduction membership, without
+/// the freshness debt (`Revisions`), which a held file's debt bookkeeping may
+/// change.
+#[cfg(test)]
+pub(crate) fn tail_head_reduction_for_test(
+    index: &ScanIndex,
+    key: &str,
+) -> (u32, Vec<u8>, Vec<(String, u64)>) {
+    let head = load_head(index, key, u32::MAX).unwrap().unwrap();
+    let table = head
+        .table
+        .iter()
+        .filter(|(collection, _)| **collection != Collection::Revisions)
+        .map(|(collection, entry)| (format!("{collection:?}"), entry.pages))
+        .collect();
+    (head.revision, head.body, table)
 }
 
 #[cfg(test)]
