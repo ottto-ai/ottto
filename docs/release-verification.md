@@ -324,11 +324,17 @@ finding.
 | Lane | Workflow upload (`upload` profile) | Publisher (`publish` profile) |
 |---|---|---|
 | `candidate` | `app_dmg`, `cli_zip`, `service_zip`, `sbom`, `launch_smoke`, `manifest`, `manifest_sig`, `checksums`, `privacy_receipt` | the upload set without `privacy_receipt`; `appcast` optional |
-| `stable` | candidate set plus `installer`, `formula`, `rc_evidence` | the upload set without `privacy_receipt`, plus `clean_machine_evidence` and `appcast` |
+| `stable` | candidate set plus `installer`, `formula`, `rc_evidence` | the upload set without `privacy_receipt`, plus `clean_machine_evidence` and `appcast`; with `--stage pre-hosted`, `appcast` only, and `clean_machine_evidence` is refused |
 | `manual` | candidate set plus `installer`, `formula` | the upload set without `privacy_receipt`; `appcast`, `rc_evidence` and `clean_machine_evidence` are refused |
 
-`python3 -I scripts/macos_privacy_gate.py roles --profile <profile> --lane <lane>`
+`python3 -I scripts/macos_privacy_gate.py roles --profile <profile> --lane <lane> [--stage pre-hosted]`
 prints the role table for a lane as JSON.
+
+`--stage pre-hosted` goes with `--profile publish --lane stable` only. It is
+the privacy check of the immutable stage of a two-stage stable publish (see
+Verify Stable Closeout), which runs before the clean-machine QA summary
+exists: the summary is not a role then, so a summary in the folder is an
+unexpected file. The final publish, without `--stage`, still requires it.
 
 ### Scan command and response
 
@@ -336,7 +342,7 @@ prints the role table for a lane as JSON.
 python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder> \
   [--lane candidate|stable|manual] [--appcast present|absent] \
   [--seal-from <folder>] [--markers-fd <n> | --markers-store <file>] \
-  [--response-fd <n>] [--state <folder>] [--stage attest-1|attest-2] \
+  [--response-fd <n>] [--state <folder>] [--stage attest-1|attest-2|pre-hosted] \
   [--machine-name-fd <n>] \
   [--run-id <id> --run-attempt <n> --job-record <file>]   # logs profile only, all three
 ```
@@ -344,7 +350,8 @@ python3 -I scripts/macos_privacy_gate.py scan --profile <profile> --root <folder
 Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
 `attest` (the attestation subjects, SBOM and checksums; `--stage attest-1`
-or `--stage attest-2` is required), `upload`, `publish`, `dispatch` and
+or `--stage attest-2` is required), `upload`, `publish` (`--stage pre-hosted`
+for the immutable stage of a stable publish), `dispatch` and
 `logs` (one job's complete logs from one run attempt, see Job logs below).
 `dispatch` reads the
 workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
@@ -712,6 +719,42 @@ copies only allowlisted fields, so the record's notes never reach the release
 folder. The gate refuses a private record anywhere in that folder and any
 symlink in it, and fails if it cannot read the whole folder; publishers that
 upload an explicit file list add defense in depth.
+
+A stable release is published in two stages, because the hosted installer
+downloads only from the immutable versioned prefix, so its clean-machine lane
+can only run once that prefix exists:
+
+1. **Pre-hosted (immutable) stage.** Fill every check except the
+   `hosted_installer` ones, which stay `not_run` with that owner's status and
+   the top-level status. Write the pre-hosted summary outside the release
+   folder and run the pre-hosted gate:
+
+   ```bash
+   macos_stable_qa_summary.sh \
+     --record <private-folder>/stable-clean-machine-qa.record.json \
+     --manifest release-manifest.json \
+     --stage pre-hosted --output <private-folder>/stable-clean-machine-qa.pre-hosted.json
+   macos_stable_closeout_gate.sh --manifest release-manifest.json \
+     --stage pre-hosted --evidence <private-folder>/stable-clean-machine-qa.pre-hosted.json
+   ```
+
+   The pre-hosted summary has the final schema plus `"stage": "pre-hosted"`.
+   The pre-hosted gate applies every final rule, except that each required
+   `hosted_installer` check must be exactly `{"result":"not_run"}`; it refuses
+   a release folder that already holds `stable-clean-machine-qa.json`. The
+   publisher then uploads the immutable versioned prefix without the summary,
+   and nothing points to it yet: no appcast, no `latest` pointer.
+2. **Hosted lane.** The hosted installer lane runs live against that prefix
+   and its checks are filled in the private record.
+3. **Final stage.** Write the final summary beside the manifest (without
+   `--stage`) and run the final gate (without `--stage`), which refuses a
+   summary with a `stage` field. The publisher adds the summary as the one
+   late file in the prefix and then promotes the release.
+
+A hosted lane failure after the immutable stage burns that version; the next
+release uses the next patch number. `macos_stable_closeout_gate.sh
+--supports-stages` prints `pre-hosted final`; a gate without that option has
+only the single final stage.
 
 To check a published summary, download it beside its manifest and run the
 gate. `environment.host_class` says where QA ran: `clean_vm` (a clean guest

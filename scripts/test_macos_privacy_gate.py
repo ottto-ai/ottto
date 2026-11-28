@@ -1269,6 +1269,38 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertEqual(json.loads(result.stdout)["verdict"], "incomplete")
 
+    def test_pre_hosted_publish_stage(self):
+        # The immutable stage of a two-stage stable publish runs before the clean-machine QA
+        # summary exists: the summary is not a role then, and the final publish still needs it.
+        result = self.run_gate(["roles", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        roles = json.loads(result.stdout)
+        self.assertIn("appcast", roles["required"])
+        self.assertNotIn("clean_machine_evidence", roles["required"])
+        self.assertNotIn("clean_machine_evidence", roles["optional"])
+        final_required, _ = g.lane_roles("publish", "stable", "present")
+        stage_required, _ = g.lane_roles("publish", "stable", "present", "pre-hosted")
+        self.assertEqual(final_required - stage_required, {"clean_machine_evidence"})
+        self.assertEqual(stage_required - final_required, set())
+        for profile, lane in (("publish", "candidate"), ("publish", "manual"), ("upload", "stable"), ("attest", "stable")):
+            with self.assertRaises(g.GateError):
+                g.lane_roles(profile, lane, None, "pre-hosted")
+        root = os.path.join(self.tmp, "release")
+        os.mkdir(root)
+        for args in (["scan", "--profile", "publish", "--lane", "candidate", "--stage", "pre-hosted", "--root", root],
+                     ["scan", "--profile", "upload", "--lane", "stable", "--stage", "pre-hosted", "--root", root],
+                     ["scan", "--profile", "attest", "--lane", "stable", "--stage", "pre-hosted", "--root", root],
+                     ["roles", "--profile", "publish", "--lane", "manual", "--stage", "pre-hosted"]):
+            self.assertEqual(self.run_gate(args).returncode, 2, args)
+        with open(os.path.join(root, g.ROLE_FILES["clean_machine_evidence"]), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        stage = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted", "--root", root])
+        self.assertEqual(stage.returncode, 3)
+        self.assertIn(b"code=unexpected_file count=1", stage.stderr)
+        final = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--root", root])
+        self.assertEqual(final.returncode, 3)
+        self.assertNotIn(b"code=unexpected_file", final.stderr)
+
     def build_app(self, root):
         app = os.path.join(root, "Ottto.app", "Contents")
         for folder in ("MacOS", "Helpers", "Resources", "Frameworks/Sparkle.framework/Versions/B"):

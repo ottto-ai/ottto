@@ -1804,10 +1804,14 @@ def sparkle_expected():
 CHECKSUM_SUBJECTS = ("app_dmg", "cli_zip", "service_zip", "sbom", "manifest")
 
 
-def lane_roles(profile, lane, appcast=None):
-    """(required, optional) role sets for a profile and lane."""
+def lane_roles(profile, lane, appcast=None, stage=None):
+    """(required, optional) role sets for a profile and lane. A stable publish with stage
+    pre-hosted (the immutable stage of a two-stage publish) runs before the clean-machine QA
+    summary exists: the summary is not a role then, so a summary in the folder is refused."""
     if lane not in LANES:
         raise GateError("lane")
+    if stage is not None and (stage != "pre-hosted" or profile != "publish" or lane != "stable"):
+        raise GateError("stage_lane")
     base = {"app_dmg", "cli_zip", "service_zip", "sbom", "launch_smoke", "manifest", "manifest_sig", "checksums"}
     if lane in ("stable", "manual"):
         base |= {"installer", "formula"}
@@ -1819,6 +1823,8 @@ def lane_roles(profile, lane, appcast=None):
         if lane == "stable":
             if appcast == "absent":
                 raise GateError("appcast_lane")
+            if stage == "pre-hosted":
+                return base | {"appcast"}, set()
             return base | {"clean_machine_evidence", "appcast"}, set()
         if lane == "manual":
             if appcast == "present":
@@ -2161,7 +2167,7 @@ def run_profile(args, gate, policy):
                 raise GateError("expect_app")
             context["expect_app"] = args.expect_app
     else:
-        required, optional = lane_roles(profile, args.lane, args.appcast)
+        required, optional = lane_roles(profile, args.lane, args.appcast, publish_stage(args))
     if args.seal_from:
         source_present = {r for r in required | optional
                           if os.path.lexists(os.path.join(args.seal_from, ROLE_FILES[r]))}
@@ -2631,8 +2637,13 @@ def check_selectors(policy, markers):
         raise GateError("selector_private")
 
 
+def publish_stage(args):
+    """The publish stage (pre-hosted or None); --stage also names the attest stages."""
+    return args.stage if args.stage == "pre-hosted" else None
+
+
 def command_roles(args):
-    required, optional = lane_roles(args.profile, args.lane, args.appcast)
+    required, optional = lane_roles(args.profile, args.lane, args.appcast, publish_stage(args))
     print(json.dumps({"profile": args.profile, "lane": args.lane,
                       "required": {r: ROLE_FILES[r] for r in sorted(required)},
                       "optional": {r: ROLE_FILES[r] for r in sorted(optional)}}, sort_keys=True))
@@ -2689,7 +2700,7 @@ def main(argv=None):
     scan.add_argument("--state")
     scan.add_argument("--scratch")
     scan.add_argument("--host-literals", choices=("on", "off"), default="on")
-    scan.add_argument("--stage", choices=("attest-1", "attest-2"))
+    scan.add_argument("--stage", choices=("attest-1", "attest-2", "pre-hosted"))
     scan.add_argument("--machine-name-fd", type=int)
     scan.add_argument("--run-id")
     scan.add_argument("--run-attempt")
@@ -2705,13 +2716,17 @@ def main(argv=None):
     roles.add_argument("--profile", choices=("attest", "upload", "publish"), required=True)
     roles.add_argument("--lane", choices=LANES, required=True)
     roles.add_argument("--appcast", choices=("present", "absent"))
+    roles.add_argument("--stage", choices=("pre-hosted",))
     record = sub.add_parser("check-record")
     record.add_argument("--state", required=True)
     record.add_argument("--root", required=True)
     args = parser.parse_args(argv)
     if args.command == "scan" and args.profile in ("attest", "upload", "publish") and not args.lane:
         parser.error("--lane is required for this profile")
-    if args.command == "scan" and (args.profile == "attest") != (args.stage is not None):
+    if args.command in ("scan", "roles") and args.stage == "pre-hosted":
+        if args.profile != "publish" or args.lane != "stable":
+            parser.error("--stage pre-hosted goes with --profile publish --lane stable only")
+    elif args.command == "scan" and (args.profile == "attest") != (args.stage is not None):
         parser.error("--stage attest-1|attest-2 goes with --profile attest only")
     if args.command == "scan":
         log_args = [value is not None for value in (args.run_id, args.run_attempt, args.job_record)]
