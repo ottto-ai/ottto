@@ -527,9 +527,11 @@ AWS/CDN prerequisites before publish:
    manifest to publish.
 11. Generate the Homebrew tap formula from the exact manifest. Nothing is
     uploaded to the immutable versioned prefix yet: the publisher runs the
-    closeout gate first, and an existing versioned prefix must already hold
-    the exact final file set and bytes, so an early upload leaves the version
-    unable to take its summary. To test the formula before publishing, use an
+    closeout gate first (the pre-hosted gate for the immutable stage of a
+    two-stage publish, see Two-stage publish below), and an existing
+    versioned prefix must already hold the exact file set and bytes, so an
+    early upload outside those stages leaves the version unable to take its
+    summary. To test the formula before publishing, use an
     isolated QA tap that holds the unmodified generated formula, and seed a
     disposable `HOMEBREW_CACHE` with the verified stable archives from this
     release folder under the cache file names Homebrew derives from the
@@ -555,7 +557,8 @@ AWS/CDN prerequisites before publish:
 14. Never edit the signed manifest: it already names
     `stable-clean-machine-qa.json` as its `evidence_path` (the only summary
     name the tools accept). Write the public summary beside the manifest from
-    the record, then run the closeout gate before the immutable CDN upload:
+    the record, then run the closeout gate before the immutable CDN upload
+    (single-stage publish; for two stages see Two-stage publish below):
 
     ```bash
     ./scripts/macos_stable_qa_summary.sh \
@@ -572,6 +575,8 @@ AWS/CDN prerequisites before publish:
     standard release publisher. It verifies the signed manifest and the
     required release inventory, generates the appcast, and uploads the
     complete set to the immutable versioned prefix.
+    When the hosted installer lane must run against the real prefix, publish
+    in two stages instead (see Two-stage publish below).
 17. Update the stable `latest/` pointer only after download, checksum, stapler,
     Gatekeeper, install, service, update, uninstall, rollback, and closeout-gate
     evidence are attached to the release record.
@@ -592,9 +597,61 @@ AWS/CDN prerequisites before publish:
 
 `macos_stable_closeout_gate.sh` is the final stable release evidence gate. It
 does not replace signing, notarization, `macos_release_gate.sh`, or
-`macos_stable_preflight.sh`; it runs on the finished release folder before
-anything is uploaded to the immutable stable prefix and before stable `latest`
-promotion.
+`macos_stable_preflight.sh`. In a single-stage publish it runs on the finished
+release folder before anything is uploaded to the immutable stable prefix. In
+a two-stage publish (below), its pre-hosted stage runs before the immutable
+upload and its final stage before the summary is added. Both come before
+stable `latest` promotion.
+
+### Two-stage publish
+
+The hosted installer downloads only from the immutable versioned prefix, so
+its clean-machine lane cannot run before that prefix exists. A stable release
+then publishes in two stages:
+
+1. **Pre-hosted (immutable) stage.** Every check except the `hosted_installer`
+   ones is filled; those stay `not_run`, with that owner's status and the
+   top-level status. Write the pre-hosted summary outside the release folder
+   and run the pre-hosted gate on it:
+
+   ```bash
+   ./scripts/macos_stable_qa_summary.sh \
+     --record <private-folder>/stable-clean-machine-qa.record.json \
+     --manifest dist/macos/release-manifest.json \
+     --stage pre-hosted --output <private-folder>/stable-clean-machine-qa.pre-hosted.json
+   ./scripts/macos_stable_closeout_gate.sh \
+     --manifest dist/macos/release-manifest.json \
+     --stage pre-hosted --evidence <private-folder>/stable-clean-machine-qa.pre-hosted.json
+   ```
+
+   The pre-hosted summary has the final schema plus `"stage": "pre-hosted"`.
+   Both scripts need `hosted_installer` in the manifest's
+   `supported_install_owners` and `required_install_owners`; a release
+   without the hosted installer lane is published in a single stage. The
+   pre-hosted gate applies every final rule, except that each required
+   `hosted_installer` check must be exactly `{"result":"not_run"}`. It
+   refuses a release folder that already holds
+   `stable-clean-machine-qa.json`, and a pre-hosted summary that is a
+   symlink, has more than one hard link, or lies in the release folder
+   (compared by filesystem identity, so symlinked and case-aliased paths
+   count). Its last line is `Stable closeout pre-hosted gate passed for
+   <version> (<commit>)`. The publisher runs the release privacy gate with
+   `--profile publish --lane stable --stage pre-hosted`, then uploads the
+   immutable versioned prefix without the summary. The versioned
+   `appcast.xml` is part of that immutable set; the channel's `latest`
+   appcast and pointer are updated only after the final gate.
+2. **Hosted lane.** The hosted installer lane runs live against that prefix
+   and its checks are filled in the private record.
+3. **Final stage.** Write the final summary beside the manifest and run the
+   final gate, both without `--stage`; the final gate refuses a summary with a
+   `stage` field. The publisher re-verifies the bytes already in the prefix,
+   adds the summary as the one late file (the manifest's `evidence_path`
+   names it there) and then promotes the release.
+
+A hosted lane failure after the immutable stage burns that version; the next
+release uses the next patch number. `macos_stable_closeout_gate.sh
+--supports-stages` prints `pre-hosted final`; a gate without that option has
+only the single final stage.
 
 The release manifest must carry:
 

@@ -1269,6 +1269,57 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertEqual(json.loads(result.stdout)["verdict"], "incomplete")
 
+    def test_pre_hosted_publish_stage(self):
+        # The immutable stage of a two-stage stable publish runs before the clean-machine QA
+        # summary exists: the summary is not a role then, and the final publish still needs it.
+        result = self.run_gate(["roles", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        roles = json.loads(result.stdout)
+        self.assertIn("appcast", roles["required"])
+        self.assertNotIn("clean_machine_evidence", roles["required"])
+        self.assertNotIn("clean_machine_evidence", roles["optional"])
+        final_required, _ = g.lane_roles("publish", "stable", "present")
+        stage_required, _ = g.lane_roles("publish", "stable", "present", "pre-hosted")
+        self.assertEqual(final_required - stage_required, {"clean_machine_evidence"})
+        self.assertEqual(stage_required - final_required, set())
+        for profile, lane in (("publish", "candidate"), ("publish", "manual"), ("upload", "stable"), ("attest", "stable")):
+            with self.assertRaises(g.GateError):
+                g.lane_roles(profile, lane, None, "pre-hosted")
+        root = os.path.join(self.tmp, "release")
+        os.mkdir(root)
+        for args in (["scan", "--profile", "publish", "--lane", "candidate", "--stage", "pre-hosted", "--root", root],
+                     ["scan", "--profile", "upload", "--lane", "stable", "--stage", "pre-hosted", "--root", root],
+                     ["scan", "--profile", "attest", "--lane", "stable", "--stage", "pre-hosted", "--root", root],
+                     ["roles", "--profile", "publish", "--lane", "manual", "--stage", "pre-hosted"]):
+            self.assertEqual(self.run_gate(args).returncode, 2, args)
+        with open(os.path.join(root, g.ROLE_FILES["clean_machine_evidence"]), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        stage = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted", "--root", root])
+        self.assertEqual(stage.returncode, 3)
+        self.assertIn(b"code=unexpected_file count=1", stage.stderr)
+        final = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--root", root])
+        self.assertEqual(final.returncode, 3)
+        self.assertNotIn(b"code=unexpected_file", final.stderr)
+
+    def test_pre_hosted_seal_from_refuses_the_summary(self):
+        # Sealing copies role files only, so the pre-hosted stage checks the source folder for the
+        # summary first (under any case); the final publish copies it as a role.
+        for name in (g.ROLE_FILES["clean_machine_evidence"], "Stable-Clean-Machine-QA.json"):
+            source = tempfile.mkdtemp(dir=self.tmp)
+            with open(os.path.join(source, name), "w", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            sealed = os.path.join(self.tmp, "sealed")
+            stage = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted",
+                                   "--seal-from", source, "--root", sealed])
+            self.assertEqual(stage.returncode, 3, stage.stderr)
+            self.assertIn(b"code=unexpected_file count=1", stage.stderr)
+            self.assertFalse(os.path.lexists(sealed))
+        final = self.run_gate(["scan", "--profile", "publish", "--lane", "stable",
+                               "--seal-from", source, "--root", sealed])
+        self.assertEqual(final.returncode, 3, final.stderr)
+        self.assertNotIn(b"code=unexpected_file", final.stderr)
+        self.assertFalse(os.path.lexists(sealed))
+
     def build_app(self, root):
         app = os.path.join(root, "Ottto.app", "Contents")
         for folder in ("MacOS", "Helpers", "Resources", "Frameworks/Sparkle.framework/Versions/B"):

@@ -352,6 +352,21 @@ mutate() {
   mv "$tmp_dir/mutated.json" "$dir/stable-clean-machine-qa.json"
 }
 
+# [contract] --stage final is the default gate: the same exit status and the
+# same output bytes for every case below.
+expect_explicit_final_same() {
+  local dir="$1"
+  local output="$2"
+  local expected_code="$3"
+  local code=0
+  "$GATE" --manifest "$dir/release-manifest.json" --stage final >"$tmp_dir/explicit-final.out" 2>&1 || code=$?
+  if [[ "$code" != "$expected_code" ]] || ! cmp -s "$output" "$tmp_dir/explicit-final.out"; then
+    echo "The gate with --stage final differs from the default gate (exit $code, expected $expected_code)" >&2
+    diff "$output" "$tmp_dir/explicit-final.out" >&2 || true
+    exit 1
+  fi
+}
+
 expect_pass() {
   local dir="$1"
   local output="$tmp_dir/pass.out"
@@ -361,6 +376,7 @@ expect_pass() {
     cat "$output" >&2
     exit 1
   fi
+  expect_explicit_final_same "$dir" "$output" 0
   local needle
   for needle in "$@"; do
     if ! grep -qF -- "$needle" "$output"; then
@@ -379,10 +395,13 @@ expect_failure() {
   local dir="$1"
   local message="$2"
   local output="$tmp_dir/failure.out"
-  if "$GATE" --manifest "$dir/release-manifest.json" >"$output" 2>&1; then
+  local code=0
+  "$GATE" --manifest "$dir/release-manifest.json" >"$output" 2>&1 || code=$?
+  if [[ "$code" == 0 ]]; then
     echo "Expected closeout gate to fail: $message" >&2
     exit 1
   fi
+  expect_explicit_final_same "$dir" "$output" "$code"
   if ! grep -qF -- "$message" "$output"; then
     echo "Closeout gate failure is missing: $message" >&2
     cat "$output" >&2
@@ -425,6 +444,14 @@ fi
 
 expect_pass "$base_dir" \
   "Stable closeout gate passed for 0.1.7 (244f7ea90a7a): stable-clean-machine-qa.json (host class signing_mac; 64 passed in this release, 0 carried)"
+# [contract] The final gate's whole output is this one line.
+printf '%s\n' "Stable closeout gate passed for 0.1.7 (244f7ea90a7a): stable-clean-machine-qa.json (host class signing_mac; 64 passed in this release, 0 carried)" \
+  > "$tmp_dir/base-expected.out"
+if ! cmp -s "$tmp_dir/pass.out" "$tmp_dir/base-expected.out"; then
+  echo "The final gate output changed" >&2
+  diff "$tmp_dir/base-expected.out" "$tmp_dir/pass.out" >&2 || true
+  exit 1
+fi
 
 dir="$(new_case static-artifact-checks)"
 mutate "$dir" '(.install_owners[] | select(.owner == "homebrew") | .checks.formula_syntax.method) = "static"
@@ -878,5 +905,291 @@ expect_failure "$dir" "Stable closeout manifest version must be X.Y.Z"
 dir="$(new_case dev-channel)"
 jq '.channel = "dev"' "$base_dir/release-manifest.json" > "$dir/release-manifest.json"
 expect_failure "$dir" "Stable closeout requires channel=stable"
+
+# --- two stages: pre-hosted, then final --------------------------------------
+
+# [contract] The publisher's capability probe.
+if [[ "$("$GATE" --supports-stages)" != "pre-hosted final" ]]; then
+  echo "--supports-stages must print: pre-hosted final" >&2
+  exit 1
+fi
+
+pre_hosted_dir="$tmp_dir/pre-hosted-evidence"
+mkdir -p "$pre_hosted_dir"
+# The base summary as the pre-hosted stage writes it: the hosted lane has not run.
+PRE_HOSTED_FILTER='.stage = "pre-hosted"
+  | .status = "not_run"
+  | (.install_owners[] | select(.owner == "hosted_installer")) |= (.status = "not_run" | .checks |= map_values({result: "not_run"}))'
+
+# new_pre_hosted_case <name>: a release folder without the summary; the
+# pre-hosted summary is pre_hosted_evidence <name>, outside every release folder.
+new_pre_hosted_case() {
+  local dir
+  dir="$(new_case "$1")"
+  jq "$PRE_HOSTED_FILTER" "$dir/stable-clean-machine-qa.json" > "$pre_hosted_dir/$1.json"
+  rm "$dir/stable-clean-machine-qa.json"
+  printf '%s' "$dir"
+}
+
+pre_hosted_evidence() {
+  printf '%s' "$pre_hosted_dir/$1.json"
+}
+
+mutate_pre_hosted() {
+  jq "$2" "$(pre_hosted_evidence "$1")" > "$tmp_dir/mutated.json"
+  mv "$tmp_dir/mutated.json" "$(pre_hosted_evidence "$1")"
+}
+
+# run_pre_hosted <dir> <evidence> <output>: the gate's exit status.
+run_pre_hosted() {
+  local code=0
+  "$GATE" --manifest "$1/release-manifest.json" --stage pre-hosted --evidence "$2" >"$3" 2>&1 || code=$?
+  return "$code"
+}
+
+expect_pre_hosted_failure() {
+  local dir="$1"
+  local evidence="$2"
+  local message="$3"
+  local output="$tmp_dir/pre-hosted-failure.out"
+  if run_pre_hosted "$dir" "$evidence" "$output"; then
+    echo "Expected the pre-hosted gate to fail: $message" >&2
+    exit 1
+  fi
+  if ! grep -qF -- "$message" "$output"; then
+    echo "Pre-hosted gate failure is missing: $message" >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  if grep -qiF -- "SYNTHETIC-PRIVATE-MARKER" "$output" || grep -qF -- "$tmp_dir" "$output"; then
+    echo "Pre-hosted gate diagnostics repeat a private marker or a path" >&2
+    cat "$output" >&2
+    exit 1
+  fi
+}
+
+# [contract] Pre-hosted pass: every non-hosted check passed, every hosted check
+# exactly not run, no summary beside the manifest. The last line is fixed.
+dir="$(new_pre_hosted_case pre-hosted-pass)"
+if ! run_pre_hosted "$dir" "$(pre_hosted_evidence pre-hosted-pass)" "$tmp_dir/pre-hosted-pass.out"; then
+  echo "Expected the pre-hosted gate to pass" >&2
+  cat "$tmp_dir/pre-hosted-pass.out" >&2
+  exit 1
+fi
+if [[ "$(tail -n 1 "$tmp_dir/pre-hosted-pass.out")" != "Stable closeout pre-hosted gate passed for 0.1.7 (244f7ea90a7a)" ]]; then
+  echo "Pre-hosted gate last line changed" >&2
+  cat "$tmp_dir/pre-hosted-pass.out" >&2
+  exit 1
+fi
+grep -qxF "stable-closeout: pre-hosted summary (host class signing_mac; 44 passed in this release, 20 hosted_installer checks not run yet)" \
+  "$tmp_dir/pre-hosted-pass.out"
+if grep -qF -- "$tmp_dir" "$tmp_dir/pre-hosted-pass.out"; then
+  echo "Pre-hosted gate output names a path" >&2
+  exit 1
+fi
+
+# [regression] A hosted check that passed is refused in the pre-hosted stage:
+# the hosted lane can only run against the uploaded immutable prefix.
+not_run_exactly='must be exactly {"result":"not_run"} in the pre-hosted stage'
+dir="$(new_pre_hosted_case pre-hosted-hosted-passed)"
+mutate_pre_hosted pre-hosted-hosted-passed \
+  '(.install_owners[] | select(.owner == "hosted_installer") | .checks.wrapper_download) = {result: "passed", method: "live"}'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hosted-passed)" "hosted_installer.wrapper_download $not_run_exactly"
+
+dir="$(new_pre_hosted_case pre-hosted-hosted-method)"
+mutate_pre_hosted pre-hosted-hosted-method \
+  '(.install_owners[] | select(.owner == "hosted_installer") | .checks.install) = {result: "not_run", method: "live"}'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hosted-method)" "hosted_installer.install $not_run_exactly"
+
+# The final summary (hosted lane passed) is not a pre-hosted summary.
+dir="$(new_pre_hosted_case pre-hosted-all-passed)"
+jq '.stage = "pre-hosted"' "$base_dir/stable-clean-machine-qa.json" > "$(pre_hosted_evidence pre-hosted-all-passed)"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-all-passed)" "is not a schema 2 summary of this manifest"
+
+for field in top hosted; do
+  dir="$(new_pre_hosted_case "pre-hosted-status-$field")"
+  if [[ "$field" == top ]]; then
+    mutate_pre_hosted "pre-hosted-status-$field" '.status = "passed"'
+  else
+    mutate_pre_hosted "pre-hosted-status-$field" '(.install_owners[] | select(.owner == "hosted_installer") | .status) = "passed"'
+  fi
+  expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence "pre-hosted-status-$field")" "is not a schema 2 summary of this manifest"
+done
+
+# [regression] Every other check must still have passed in this release.
+dir="$(new_pre_hosted_case pre-hosted-homebrew-not-run)"
+mutate_pre_hosted pre-hosted-homebrew-not-run \
+  '(.install_owners[] | select(.owner == "homebrew") | .checks.logout_json) = {result: "not_run"}'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-homebrew-not-run)" "still contains template placeholders: the pre-hosted summary"
+
+dir="$(new_pre_hosted_case pre-hosted-app-not-run)"
+mutate_pre_hosted pre-hosted-app-not-run \
+  '(.install_owners[] | select(.owner == "app_bundle") | .checks.move_service_to_app) = {result: "not_run", method: "live"}'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-app-not-run)" "still contains template placeholders: the pre-hosted summary"
+
+dir="$(new_pre_hosted_case pre-hosted-app-status)"
+mutate_pre_hosted pre-hosted-app-status '(.install_owners[] | select(.owner == "app_bundle") | .status) = "not_run"'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-app-status)" "still contains template placeholders: the pre-hosted summary"
+
+dir="$(new_pre_hosted_case pre-hosted-carried)"
+mutate_pre_hosted pre-hosted-carried "$(carry app_bundle move_service_to_app 0.1.6)"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-carried)" \
+  "app_bundle.move_service_to_app is carried; carry is not accepted until verified carry ships"
+
+dir="$(new_pre_hosted_case pre-hosted-static-runtime)"
+mutate_pre_hosted pre-hosted-static-runtime '(.install_owners[] | select(.owner == "homebrew") | .checks.install.method) = "static"'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-static-runtime)" "homebrew.install $must_pass"
+
+# [regression] The summary beside the manifest is refused in the pre-hosted
+# stage: it would be uploaded with the immutable prefix.
+beside_error="stable-clean-machine-qa.json must not be beside the manifest"
+dir="$(new_pre_hosted_case pre-hosted-summary-beside)"
+cp "$base_dir/stable-clean-machine-qa.json" "$dir/"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-summary-beside)" "$beside_error"
+
+dir="$(new_pre_hosted_case pre-hosted-evidence-beside)"
+cp "$(pre_hosted_evidence pre-hosted-evidence-beside)" "$dir/stable-clean-machine-qa.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-evidence-beside)" "$beside_error"
+
+# The pre-hosted summary lives outside the release folder, as a plain file.
+dir="$(new_pre_hosted_case pre-hosted-evidence-inside)"
+mkdir -p "$dir/notes"
+cp "$(pre_hosted_evidence pre-hosted-evidence-inside)" "$dir/notes/pre-hosted.json"
+expect_pre_hosted_failure "$dir" "$dir/notes/pre-hosted.json" "The pre-hosted summary must live outside the release folder"
+expect_pre_hosted_failure "$dir" "$dir/../pre-hosted-evidence-inside/notes/pre-hosted.json" \
+  "The pre-hosted summary must live outside the release folder"
+
+dir="$(new_pre_hosted_case pre-hosted-evidence-link)"
+ln -s "$(pre_hosted_evidence pre-hosted-evidence-link)" "$tmp_dir/pre-hosted-link.json"
+expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-link.json" "The pre-hosted summary is missing or is not a single plain file"
+expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-missing.json" "The pre-hosted summary is missing or is not a single plain file"
+
+dir="$(new_pre_hosted_case pre-hosted-no-stage)"
+mutate_pre_hosted pre-hosted-no-stage 'del(.stage)'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-no-stage)" "The pre-hosted gate needs a pre-hosted summary"
+
+dir="$(new_pre_hosted_case pre-hosted-other-stage)"
+mutate_pre_hosted pre-hosted-other-stage '.stage = "final"'
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-other-stage)" "The pre-hosted gate needs a pre-hosted summary"
+
+# Every other final rule still applies: release-folder symlinks and private records.
+dir="$(new_pre_hosted_case pre-hosted-symlink)"
+ln -s "$(pre_hosted_evidence pre-hosted-symlink)" "$dir/qa-link.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-symlink)" "$symlink_error"
+
+dir="$(new_pre_hosted_case pre-hosted-private-record)"
+printf '{"evidence_kind": "private_record"}\n' > "$dir/qa.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-private-record)" "$record_error"
+
+# [regression] A summary with a stage field is refused by the final gate,
+# including the pre-hosted summary copied beside the manifest.
+dir="$(new_case final-with-stage)"
+mutate "$dir" '.stage = "pre-hosted"'
+expect_failure "$dir" "Stable clean-machine QA evidence has a stage field"
+
+dir="$(new_case final-with-final-stage)"
+mutate "$dir" '.stage = "final"'
+expect_failure "$dir" "Stable clean-machine QA evidence has a stage field"
+
+dir="$(new_pre_hosted_case final-with-pre-hosted-summary)"
+cp "$(pre_hosted_evidence final-with-pre-hosted-summary)" "$dir/stable-clean-machine-qa.json"
+expect_failure "$dir" "Stable clean-machine QA evidence has a stage field"
+
+# Usage: --evidence only with --stage pre-hosted, which needs it; two stages only.
+expect_usage_error() {
+  local message="$1"
+  local code=0
+  shift
+  "$GATE" "$@" >"$tmp_dir/usage.out" 2>&1 || code=$?
+  if [[ "$code" != 2 ]] || ! grep -qF -- "$message" "$tmp_dir/usage.out"; then
+    echo "Expected usage error (exit 2, got $code): $message" >&2
+    cat "$tmp_dir/usage.out" >&2
+    exit 1
+  fi
+}
+expect_usage_error "--stage pre-hosted requires --evidence" --manifest "$base_dir/release-manifest.json" --stage pre-hosted
+expect_usage_error "--evidence goes with --stage pre-hosted only" \
+  --manifest "$base_dir/release-manifest.json" --evidence "$(pre_hosted_evidence pre-hosted-pass)"
+expect_usage_error "--evidence goes with --stage pre-hosted only" \
+  --manifest "$base_dir/release-manifest.json" --stage final --evidence "$(pre_hosted_evidence pre-hosted-pass)"
+expect_usage_error "--stage must be pre-hosted or final" --manifest "$base_dir/release-manifest.json" --stage hosted
+# [regression] A missing or empty operand is a usage error, not a shell abort.
+expect_usage_error "--stage requires a value" --manifest "$base_dir/release-manifest.json" --stage
+expect_usage_error "--stage requires a value" --manifest "$base_dir/release-manifest.json" --stage ""
+expect_usage_error "--evidence requires a value" --manifest "$base_dir/release-manifest.json" --stage pre-hosted --evidence
+expect_usage_error "--evidence requires a value" --manifest "$base_dir/release-manifest.json" --stage pre-hosted --evidence ""
+
+# [regression] The release folder is found by filesystem identity, not by the
+# spelling of the path: a symlinked parent folder that leads into it is refused.
+outside_error="The pre-hosted summary must live outside the release folder"
+dir="$(new_pre_hosted_case pre-hosted-linked-parent)"
+cp "$(pre_hosted_evidence pre-hosted-linked-parent)" "$dir/pre-hosted.json"
+ln -s "$dir" "$tmp_dir/release-folder-link"
+expect_pre_hosted_failure "$dir" "$tmp_dir/release-folder-link/pre-hosted.json" "$outside_error"
+# [regression] A symlink followed by ".." is resolved before the "..".
+dir="$(new_pre_hosted_case pre-hosted-link-dotdot)"
+mkdir -p "$dir/notes"
+cp "$(pre_hosted_evidence pre-hosted-link-dotdot)" "$dir/pre-hosted.json"
+ln -s "$dir/notes" "$tmp_dir/release-notes-link"
+expect_pre_hosted_failure "$dir" "$tmp_dir/release-notes-link/../pre-hosted.json" "$outside_error"
+# A symlinked folder that resolves outside the release folder is accepted.
+dir="$(new_pre_hosted_case pre-hosted-linked-outside)"
+ln -s "$pre_hosted_dir" "$tmp_dir/evidence-folder-link"
+if ! run_pre_hosted "$dir" "$tmp_dir/evidence-folder-link/pre-hosted-linked-outside.json" "$tmp_dir/linked-outside.out"; then
+  echo "Expected the pre-hosted gate to accept evidence in a symlinked folder outside the release folder" >&2
+  cat "$tmp_dir/linked-outside.out" >&2
+  exit 1
+fi
+
+# [regression] A case alias of the release folder names the same folder on a
+# case-insensitive volume (the macOS default). Skipped where names are case-sensitive.
+dir="$(new_pre_hosted_case pre-hosted-case-alias)"
+case_alias="$tmp_dir/cases/PRE-HOSTED-CASE-ALIAS"
+if [[ -d "$case_alias" ]]; then
+  cp "$(pre_hosted_evidence pre-hosted-case-alias)" "$dir/pre-hosted.json"
+  expect_pre_hosted_failure "$dir" "$case_alias/pre-hosted.json" "$outside_error"
+  cp "$base_dir/stable-clean-machine-qa.json" "$tmp_dir/cases/Pre-Hosted-Case-Alias/STABLE-CLEAN-MACHINE-QA.json"
+  expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-case-alias)" "$beside_error"
+else
+  echo "skip: case-alias cases need a case-insensitive volume"
+fi
+
+# [regression] A hard link into the release folder is the same file under another name.
+dir="$(new_pre_hosted_case pre-hosted-hard-link)"
+ln "$(pre_hosted_evidence pre-hosted-hard-link)" "$dir/qa-copy.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hard-link)" "The pre-hosted summary is missing or is not a single plain file"
+
+# [regression] The gate reads the exact path it checked: a name with a trailing
+# newline is not the name without it.
+dir="$(new_pre_hosted_case pre-hosted-newline-name)"
+newline_evidence="$(pre_hosted_evidence pre-hosted-newline-name)"$'\n'
+jq '(.install_owners[] | select(.owner == "hosted_installer") | .checks.install) = {result: "passed", method: "live"}' \
+  "$(pre_hosted_evidence pre-hosted-newline-name)" > "$newline_evidence"
+expect_pre_hosted_failure "$dir" "$newline_evidence" "hosted_installer.install $not_run_exactly"
+
+# A relative evidence path that starts with a dash is a file, not an option.
+dir="$(new_pre_hosted_case pre-hosted-dash-name)"
+cp "$(pre_hosted_evidence pre-hosted-dash-name)" "$pre_hosted_dir/-dash.json"
+if ! (cd "$pre_hosted_dir" && "$GATE" --manifest "$dir/release-manifest.json" --stage pre-hosted --evidence -dash.json \
+  >"$tmp_dir/dash.out" 2>&1); then
+  echo "Expected the pre-hosted gate to read a relative path that starts with a dash" >&2
+  cat "$tmp_dir/dash.out" >&2
+  exit 1
+fi
+
+# [regression] The pre-hosted stage needs the hosted installer lane in the
+# manifest: supported and required. Without it, publish in a single stage.
+hosted_owner_error="The pre-hosted stage needs hosted_installer in the manifest's supported_install_owners"
+dir="$(new_pre_hosted_case pre-hosted-no-hosted-owner)"
+jq '.supported_install_owners -= ["hosted_installer"]
+  | .quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+  "$dir/release-manifest.json" > "$tmp_dir/manifest.json"
+mv "$tmp_dir/manifest.json" "$dir/release-manifest.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-no-hosted-owner)" "$hosted_owner_error"
+dir="$(new_pre_hosted_case pre-hosted-hosted-not-required)"
+jq '.quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+  "$dir/release-manifest.json" > "$tmp_dir/manifest.json"
+mv "$tmp_dir/manifest.json" "$dir/release-manifest.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hosted-not-required)" "$hosted_owner_error"
 
 echo "macos_stable_closeout_gate tests passed"
