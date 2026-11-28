@@ -103,6 +103,7 @@ pub use self::telemetry_only::upload_agent_status_snapshots;
 pub use self::telemetry_only::upload_local_health_projection_now;
 use self::telemetry_only::upload_local_health_projection_reporting;
 use self::telemetry_only::LocalHealthRefreshHeld;
+use self::telemetry_only::NoHeartbeatSource;
 mod status;
 
 /// Rest-heap diagnostics: counted poison scopes and fingerprints, or None while busy.

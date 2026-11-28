@@ -31,6 +31,7 @@ use super::Instant;
 use super::LocalDaemon;
 use super::LocalDeviceBinding;
 use super::Mutex;
+use super::NoHeartbeatSource;
 use super::Path;
 use super::Result;
 use super::ScanIndex;
@@ -49,6 +50,7 @@ use super::ONE_SHOT_SYNC_IN_FLIGHT;
 use super::SNAPSHOT_SYNC_INTERVAL;
 use super::SNAPSHOT_SYNC_LOCK;
 use super::SNAPSHOT_SYNC_WORKER_STACK_BYTES;
+use std::time::SystemTime;
 
 #[cfg(test)]
 use super::is_snapshot_fingerprint;
@@ -295,20 +297,106 @@ pub(super) fn local_cadence_phase_offset(interval: Duration) -> Duration {
     }
 }
 
+/// How often a Mac with no enabled app checks its device credential with
+/// Ottto. The check rides the local-health pass (every
+/// `LOCAL_HEALTH_PROJECTION_INTERVAL`); this only spaces it out, so there is no
+/// timer of its own.
+pub(super) const IDLE_CREDENTIAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// After a check that got no answer (the network is often not back right
+/// after a wake), the next try comes this much later instead of an hour.
+pub(super) const IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER: Duration = Duration::from_secs(5 * 60);
+
+/// Quick retries allowed after an answer or a wake; after that, a check that
+/// keeps getting no answer (an older server without the route, 429, 5xx, no
+/// network) waits the normal hour.
+pub(super) const IDLE_CREDENTIAL_SOON_RETRIES: u32 = 2;
+
+/// What the hourly gate counts from after a check at `now`: `now`, or, when
+/// the check got no answer, a point that makes the next check due after
+/// [`IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER`].
+pub(super) fn idle_credential_check_anchor(now: Instant, answered: bool) -> Instant {
+    if answered {
+        return now;
+    }
+    now.checked_sub(IDLE_CREDENTIAL_CHECK_INTERVAL - IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER)
+        .unwrap_or(now)
+}
+
+/// Whether a check that just ran should be retried soon: only when it got no
+/// answer and quick retries are left. An answer or a wake refills them.
+pub(super) fn next_idle_soon_retry(left: &mut u32, answered: bool, woke: bool) -> bool {
+    if answered || woke {
+        *left = IDLE_CREDENTIAL_SOON_RETRIES;
+    }
+    if answered || *left == 0 {
+        return false;
+    }
+    *left -= 1;
+    true
+}
+
+/// The wall clock moved this much more than the monotonic clock between two
+/// passes: the Mac slept (the monotonic clock stops during sleep on macOS).
+pub(super) const WAKE_GAP: Duration = Duration::from_secs(2 * 60);
+
+/// Whether this pass runs the idle credential check: the first pass with no
+/// enabled app, the first pass after the Mac wakes, then once per
+/// [`IDLE_CREDENTIAL_CHECK_INTERVAL`] of awake time. A wake needs at least
+/// [`WAKE_GAP`] of sleep, so a lid that opens and closes can't storm.
+pub(super) fn idle_credential_check_due(last: Option<Instant>, now: Instant, woke: bool) -> bool {
+    woke || last
+        .is_none_or(|last| now.saturating_duration_since(last) >= IDLE_CREDENTIAL_CHECK_INTERVAL)
+}
+
+/// Whether the Mac slept between two passes, from how much further the wall
+/// clock moved than the monotonic one. A wall clock set back never counts.
+pub(super) fn woke_between(previous: (Instant, SystemTime), now: (Instant, SystemTime)) -> bool {
+    let awake = now.0.saturating_duration_since(previous.0);
+    now.1
+        .duration_since(previous.1)
+        .is_ok_and(|wall| wall.saturating_sub(awake) >= WAKE_GAP)
+}
+
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-local-health-sync".to_string())
-        .spawn(move || loop {
-            if let Err(error) = upload_local_health_projection_now(&daemon) {
-                if !local_health_upload_can_wait_quietly(&error) {
-                    eprintln!(
-                        "local health projection upload skipped: {}",
-                        safe_error(&error)
-                    );
+        .spawn(move || {
+            let mut soon_retries_left = IDLE_CREDENTIAL_SOON_RETRIES;
+            let mut last_idle_credential_check: Option<Instant> = None;
+            let mut last_pass: Option<(Instant, SystemTime)> = None;
+            loop {
+                let this_pass = (Instant::now(), SystemTime::now());
+                let woke = last_pass.is_some_and(|previous| woke_between(previous, this_pass));
+                last_pass = Some(this_pass);
+                match upload_local_health_projection_now(&daemon) {
+                    // No app is enabled, so no local-health upload checks this
+                    // Mac's credential. Check it on its own, spaced out.
+                    Err(error) if error.downcast_ref::<NoHeartbeatSource>().is_some() => {
+                        let now = Instant::now();
+                        if idle_credential_check_due(last_idle_credential_check, now, woke) {
+                            let answer = crate::control::probe_idle_device_credential(&daemon);
+                            let answered =
+                                answer != Some(crate::control::IdleCredentialAnswer::NoProof);
+                            let soon_retry =
+                                next_idle_soon_retry(&mut soon_retries_left, answered, woke);
+                            last_idle_credential_check =
+                                Some(idle_credential_check_anchor(now, !soon_retry));
+                        }
+                    }
+                    Err(error) => {
+                        if !local_health_upload_can_wait_quietly(&error) {
+                            eprintln!(
+                                "local health projection upload skipped: {}",
+                                safe_error(&error)
+                            );
+                        }
+                    }
+                    Ok(()) => {}
                 }
+                crate::control::reconcile_setup_scan_in_background(&daemon);
+                std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
             }
-            crate::control::reconcile_setup_scan_in_background(&daemon);
-            std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
     Ok(())
@@ -1414,4 +1502,104 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("HOME is not set"))
+}
+
+#[cfg(test)]
+mod idle_credential_check_tests {
+    use super::idle_credential_check_anchor;
+    use super::idle_credential_check_due;
+    use super::next_idle_soon_retry;
+    use super::woke_between;
+    use super::Duration;
+    use super::Instant;
+    use super::SystemTime;
+    use super::IDLE_CREDENTIAL_CHECK_INTERVAL;
+    use super::IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER;
+    use super::WAKE_GAP;
+
+    #[test]
+    fn idle_credential_check_runs_first_then_hourly_and_on_wake() {
+        assert_eq!(IDLE_CREDENTIAL_CHECK_INTERVAL, Duration::from_secs(60 * 60));
+        let start = Instant::now();
+        assert!(idle_credential_check_due(None, start, false));
+        assert!(!idle_credential_check_due(Some(start), start, false));
+        assert!(!idle_credential_check_due(
+            Some(start),
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL - Duration::from_secs(1),
+            false
+        ));
+        assert!(idle_credential_check_due(
+            Some(start),
+            start + IDLE_CREDENTIAL_CHECK_INTERVAL,
+            false
+        ));
+        // A wake checks at once.
+        assert!(idle_credential_check_due(Some(start), start, true));
+        // A clock that reads earlier than the last check never fires early.
+        assert!(!idle_credential_check_due(
+            Some(start + Duration::from_secs(5)),
+            start,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_check_with_no_answer_retries_after_minutes_not_an_hour() {
+        let start = Instant::now() + IDLE_CREDENTIAL_CHECK_INTERVAL;
+        let answered = idle_credential_check_anchor(start, true);
+        assert_eq!(answered, start);
+        let unanswered = idle_credential_check_anchor(start, false);
+        assert!(!idle_credential_check_due(
+            Some(unanswered),
+            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER - Duration::from_secs(1),
+            false
+        ));
+        assert!(idle_credential_check_due(
+            Some(unanswered),
+            start + IDLE_CREDENTIAL_RETRY_AFTER_NO_ANSWER,
+            false
+        ));
+    }
+
+    #[test]
+    fn quick_retries_are_capped_until_an_answer_or_a_wake() {
+        let mut left = super::IDLE_CREDENTIAL_SOON_RETRIES;
+        // An older server without the route keeps answering 404: two quick
+        // retries, then hourly.
+        assert!(next_idle_soon_retry(&mut left, false, false));
+        assert!(next_idle_soon_retry(&mut left, false, false));
+        assert!(!next_idle_soon_retry(&mut left, false, false));
+        assert!(!next_idle_soon_retry(&mut left, false, false));
+        // A wake refills them; an answer refills them and needs no retry.
+        assert!(next_idle_soon_retry(&mut left, false, true));
+        assert!(!next_idle_soon_retry(&mut left, true, false));
+        assert_eq!(left, super::IDLE_CREDENTIAL_SOON_RETRIES);
+    }
+
+    #[test]
+    fn a_wake_is_a_wall_clock_jump_beyond_awake_time() {
+        let mono = Instant::now();
+        let wall = SystemTime::now();
+        let minute = Duration::from_secs(60);
+        // A normal one-minute pass.
+        assert!(!woke_between((mono, wall), (mono + minute, wall + minute)));
+        // Asleep for an hour between passes.
+        assert!(woke_between(
+            (mono, wall),
+            (mono + minute, wall + minute + Duration::from_secs(3600))
+        ));
+        // Just under the gap does not count.
+        assert!(!woke_between(
+            (mono, wall),
+            (
+                mono + minute,
+                wall + minute + WAKE_GAP - Duration::from_secs(1)
+            )
+        ));
+        // A wall clock set back never counts.
+        assert!(!woke_between(
+            (mono, wall),
+            (mono + minute, wall - Duration::from_secs(3600))
+        ));
+    }
 }

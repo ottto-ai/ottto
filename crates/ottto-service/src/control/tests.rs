@@ -5846,6 +5846,53 @@ fn account_binding_payloads_include_the_account_scope_discriminator() {
 
 #[test]
 #[serial]
+fn idle_credential_check_sends_nothing_when_the_saved_backend_changed() {
+    let _lock = lock_backend_test_env();
+    let support_root = telemetry_key_store_root("idle-check-backend-changed");
+    let secret_root = telemetry_key_store_root("idle-check-backend-changed-secret");
+    fs::create_dir_all(&secret_root).expect("secret root");
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+    FileDeviceStore::default()
+        .save(&LocalDeviceBinding {
+            device_id: "device_idle".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        })
+        .expect("persist relay device");
+    fs::write(
+        secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "idle-check-secret",
+    )
+    .expect("persist relay secret fallback");
+    // A sign-in moved this Mac to another backend after the check read its
+    // binding.
+    FileConnectionStore::default()
+        .save(&LocalConnectionBinding {
+            setup_run_id: "setup_run_new".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        })
+        .expect("persist new connection");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind previous backend");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let previous_base = format!("http://{}", listener.local_addr().expect("address"));
+    let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &previous_base);
+
+    assert_eq!(
+        idle_device_credential_answer(&previous_base),
+        IdleCredentialAnswer::NoProof
+    );
+    assert!(
+        listener.accept().is_err(),
+        "nothing may reach the previous backend"
+    );
+}
+
+#[test]
+#[serial]
 fn claim_completion_withholds_a_prior_credential_issued_by_another_backend() {
     let support_root = telemetry_key_store_root("claim-other-backend-device");
     let secret_root = telemetry_key_store_root("claim-other-backend-secret");

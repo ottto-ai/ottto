@@ -357,6 +357,20 @@ mod tests;
 
 impl std::error::Error for LocalHealthRefreshHeld {}
 
+/// No local-health pass: no app is enabled, so this Mac has no source to
+/// mint a relay token for. The heartbeat thread then runs the idle device
+/// credential check instead (`control::probe_idle_device_credential`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoHeartbeatSource;
+
+impl std::fmt::Display for NoHeartbeatSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("registered device has no enabled sources")
+    }
+}
+
+impl std::error::Error for NoHeartbeatSource {}
+
 pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
     let _stage = StageWindow::begin("unknown", "offpass_local_health");
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -364,7 +378,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
         return Err(anyhow!("machine identity is missing"));
     };
     let Some(source) = heartbeat_source(&device) else {
-        return Err(anyhow!("registered device has no enabled sources"));
+        return Err(anyhow::Error::new(NoHeartbeatSource));
     };
     let client = SnapshotApiClient::new(snapshot_api_base_url()?);
     upload_local_health_projection_reporting(
@@ -656,7 +670,9 @@ pub(super) fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> boo
     {
         return true;
     }
-    if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
+    if error.downcast_ref::<LocalHealthRefreshHeld>().is_some()
+        || error.downcast_ref::<NoHeartbeatSource>().is_some()
+    {
         return true;
     }
     let safe = safe_error(error);
