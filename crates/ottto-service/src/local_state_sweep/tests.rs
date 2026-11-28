@@ -201,6 +201,20 @@ fn grammar_accepts_only_proven_artifacts() {
             42,
             Some(0),
         ),
+        (
+            "claude_code-scan-index-v3.corrupt.12.34.json",
+            INDEX,
+            ArtifactKind::Quarantine,
+            12,
+            Some(34),
+        ),
+        (
+            "codex-scan-index-v3-upload-progress.corrupt.12.34.json",
+            PROGRESS,
+            ArtifactKind::Quarantine,
+            12,
+            Some(34),
+        ),
     ];
     for (name, base, kind, pid, name_nanos) in accepted {
         assert_eq!(
@@ -236,8 +250,10 @@ fn grammar_accepts_only_proven_artifacts() {
         "claude_code-scan-index.json.12.tmp",
         "codex-scan-index-attribution-labels-v3.json.12.tmp",
         "pi-upload-progress-v2.json.12.tmp",
-        "claude_code-scan-index-v3.corrupt.12.34.json",
-        "codex-scan-index-v3-upload-progress.corrupt.12.34.json",
+        "claude_code-scan-index-v3.corrupt.override.12.34.json",
+        "codex-scan-index-v3-upload-progress.corrupt.12.034.json",
+        "pi-terminal-status-v1.corrupt.12.34.json",
+        "pi-scan-index-v2.corrupt.12.34.json",
         "claude_code-scan-index-v3.cleared.12.34.json",
         "claude_code-scan-index-v3.tmp.12.34.json",
         "pi-terminal-status-v1.json.12.tmp",
@@ -563,6 +579,126 @@ fn hardlinked_temp_is_kept() {
     assert!(orphan.exists() && other_name.exists());
 }
 
+/// Truncation preserves history and cooldown evidence for old quarantines.
+#[test]
+fn old_quarantines_are_truncated_in_place_without_changing_evidence() {
+    let f = fixture();
+    let stamped = SystemTime::now();
+    let nanos = stamped.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let index_path = f.dest.join(format!("{INDEX}.json"));
+    let copies = [INDEX, PROGRESS].map(|base| {
+        write(&f.dest.join(format!("{base}.lock")), b"");
+        let path = f
+            .dest
+            .join(format!("{base}.corrupt.{DEAD_PID}.{nanos}.json"));
+        write(&path, b"quarantine");
+        path
+    });
+    let inodes = copies
+        .each_ref()
+        .map(|path| fs::metadata(path).unwrap().ino());
+    let policy = Policy {
+        now: stamped + QUARANTINE_MIN_AGE + Duration::from_secs(60),
+        ..now()
+    };
+    let evidence = || {
+        (
+            crate::snapshot_sync::claude_quarantine_history_for_test(&index_path),
+            crate::snapshots::scan_index_rebuilt_recently_for_test(&index_path, stamped).unwrap(),
+            crate::snapshots::scan_index_rebuilt_recently_for_test(&index_path, policy.now)
+                .unwrap(),
+        )
+    };
+    assert_eq!(evidence(), (true, true, false));
+    let recent = apply(&f.support, &later());
+    assert_eq!(recent.skipped.recent, 2);
+    assert_eq!(recent.quarantine_truncated.files, 0);
+
+    let plan = sweep(&f.support, Mode::Plan, &policy, true);
+    assert_eq!(plan.candidates, 2);
+    assert!(plan
+        .entries
+        .iter()
+        .all(|entry| entry.outcome == EntryOutcome::WouldTruncate));
+    for path in &copies {
+        assert_eq!(fs::read(path).unwrap(), b"quarantine");
+    }
+
+    let report = apply(&f.support, &policy);
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.quarantine_truncated.files, 2);
+    assert_eq!(report.quarantine_truncated.bytes, 20);
+    let line = report.log_line("startup").unwrap();
+    assert!(line.contains("\"quarantine_truncated\":{\"files\":2,\"bytes\":20}"));
+    for (path, ino) in copies.iter().zip(inodes) {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.ino(), ino);
+        assert_eq!(metadata.len(), 0);
+    }
+    assert_eq!(evidence(), (true, true, false));
+    assert_eq!(apply(&f.support, &policy).quarantine_truncated.files, 0);
+}
+
+/// Future-stamped, linked and foreign-owned quarantine entries keep their contents.
+#[test]
+fn unsafe_and_future_quarantine_entries_are_untouched() {
+    let f = fixture();
+    let policy = Policy {
+        now: SystemTime::now() + QUARANTINE_MIN_AGE + Duration::from_secs(60),
+        ..now()
+    };
+    let future = (policy.now + Duration::from_secs(60))
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    write(&f.dest.join(format!("{INDEX}.lock")), b"");
+    let future_copy = f
+        .dest
+        .join(format!("{INDEX}.corrupt.{DEAD_PID}.{future}.json"));
+    let hard = f.dest.join(format!("{INDEX}.corrupt.{DEAD_PID}.1.json"));
+    let link = f.dest.join(format!("{INDEX}.corrupt.{DEAD_PID}.2.json"));
+    let target = f.root.join("target");
+    write(&future_copy, b"future");
+    write(&target, b"linked");
+    fs::hard_link(&target, &hard).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let report = apply(&f.support, &policy);
+    assert_eq!(report.quarantine_truncated.files, 0);
+    assert_eq!(report.skipped.recent, 1);
+    assert_eq!(report.skipped.unsafe_entry, 2);
+    assert_eq!(fs::read(&future_copy).unwrap(), b"future");
+    assert_eq!(fs::read(&hard).unwrap(), b"linked");
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+
+    let name = format!("{INDEX}.corrupt.{DEAD_PID}.3.json");
+    let foreign = f.dest.join(&name);
+    write(&foreign, b"foreign");
+    // Model a different file owner at the candidate seam without requiring chown.
+    let foreign_policy = Policy {
+        uid: policy.uid ^ 1,
+        ..policy
+    };
+    let mut sweep = Sweep {
+        mode: Mode::Apply,
+        policy: &foreign_policy,
+        started: Instant::now(),
+        record_entries: true,
+        report: SweepReport::default(),
+        deadline_checks: 0,
+    };
+    let directory = File::open(&f.dest).unwrap();
+    let (verdict, _, lock) = sweep.consider(
+        directory.as_raw_fd(),
+        &name,
+        &parse_artifact(&name).unwrap(),
+    );
+    assert!(matches!(verdict, Verdict::Skip(SkipReason::UnsafeEntry)));
+    assert_eq!(lock, LockState::NotChecked);
+    assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+}
+
 #[test]
 fn non_matching_names_and_other_folders_are_untouched() {
     let f = fixture();
@@ -577,8 +713,8 @@ fn non_matching_names_and_other_folders_are_untouched() {
         "claude_code-scan-index-v3.json.012.tmp",
         "claude_code-scan-index-v3.json.12.tmp.bak",
         "claude_code-scan-index-v3.json.tmp",
-        "claude_code-scan-index-v3.corrupt.12.34.json",
-        "codex-scan-index-v3-upload-progress.corrupt.12.34.json",
+        "claude_code-scan-index-v3.corrupt.override.12.34.json",
+        "codex-scan-index-v3-upload-progress.corrupt.12.034.json",
         "claude_code-scan-index-v2.json.12.tmp",
         "pi-terminal-status-v1.json.12.tmp",
         "README",

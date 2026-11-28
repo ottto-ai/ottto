@@ -234,6 +234,11 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         .is_some_and(|stamp| now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS))
 }
 
+#[cfg(test)]
+pub(crate) fn scan_index_rebuilt_recently_for_test(path: &Path, now: SystemTime) -> Result<bool> {
+    scan_index_rebuilt_recently(path, now)
+}
+
 // User Repair override: one explicit,
 // interactive Repair of a paused source passes the 24-hour guard once. The
 // override rebuild is the ordinary gated rebuild (quarantined origin, so the

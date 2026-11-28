@@ -264,15 +264,21 @@ pub(super) fn hydrate_checkpoint(
     record_memory(name, window);
 }
 
+pub(super) const BASELINE_RETENTION: Duration = Duration::from_secs(14 * 86400);
+
 pub(super) fn baseline(path: &Path) {
-    let age = std::fs::metadata(super::fence::sibling(path, ".v1-readonly"))
+    let metadata = std::fs::symlink_metadata(super::fence::sibling(path, ".v1-readonly"))
         .ok()
+        .filter(|m| m.is_file());
+    let age = metadata
+        .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| SystemTime::now().duration_since(t).ok());
     event("baseline_age_s", &age.map(|d| d.as_secs()));
     event(
         "baseline_14day_escalation_alarm",
-        &age.map(|age| age >= Duration::from_secs(14 * 86400)),
+        &age.zip(metadata)
+            .map(|(age, m)| m.len() > 0 && age >= BASELINE_RETENTION),
     );
 }
 

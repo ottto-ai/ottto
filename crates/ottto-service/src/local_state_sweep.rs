@@ -1,9 +1,9 @@
-//! Removes snapshot checkpoint temp files that a daemon left behind when it
-//! died mid-save.
+//! Removes abandoned snapshot checkpoint temp files and clears old quarantine
+//! copies while preserving their names.
 //!
-//! Every artifact recognized here is created and then renamed or removed by
-//! its writer while that writer holds a non-blocking exclusive flock on the
-//! canonical checkpoint's `<base>.lock` sibling:
+//! Writers create, rename or remove these artifacts while holding a
+//! non-blocking exclusive flock on the canonical checkpoint's `<base>.lock`
+//! sibling:
 //!
 //! - `<base>.json.<pid>.tmp`: `ScanIndex::save_internal` under
 //!   `CheckpointLock`, and `SnapshotUploadProgress::save`
@@ -12,6 +12,8 @@
 //!   under `SnapshotProgressLock`.
 //! - `<base>.cleared.<pid>.<nanos>.json`: `SnapshotUploadProgress::clear`,
 //!   under `SnapshotProgressLock`.
+//! - `<base>.corrupt.<pid>.<nanos>.json`: scan index and upload progress
+//!   quarantine, under their respective checkpoint locks.
 //!
 //! Taking the same lock therefore proves no writer is between creating and
 //! settling such a file. Only a single-link lock file owned by this user is
@@ -19,7 +21,7 @@
 //! The lock is necessary but not trusted alone: the file must also be an
 //! old, single-link regular file owned by this user whose recorded writer
 //! pid no longer exists, and its identity must be unchanged immediately
-//! before the unlink. Any doubt keeps the file.
+//! before the change. Any doubt keeps the file.
 //!
 //! Holding a free lock is not harmless either: every writer takes it
 //! without blocking, so a save that another daemon starts while the sweep
@@ -36,7 +38,7 @@
 //! whose executable was deleted or replaced is known by its kernel name.
 //! The startup pass runs before this daemon starts any worker of its own.
 //! What remains is a daemon launched between the last process-table read
-//! and the unlink, a window of a few syscalls;
+//! and the file change, a window of a few syscalls;
 //! launchd starts one instance per label, so that needs a second, manually
 //! started daemon racing the first one's startup, and even then its save
 //! only fails once and is retried on its next cycle.
@@ -49,11 +51,11 @@
 //! one level deep, through directory descriptors that never follow symlinks.
 //! The support directory itself is opened one component at a time from `/`,
 //! so a symlink anywhere on its path, or a `.`, `..`, empty or trailing-slash
-//! component, skips the whole pass. Canonical checkpoints, lock files,
-//! quarantined `*.corrupt.*` copies, directories and anything else are never
-//! removed, and no lock file is ever created. Startup and the hidden
-//! `local-state-sweep` command share this code; the command's plan mode
-//! takes no locks and changes nothing.
+//! component, skips the whole pass. Quarantined copies are truncated in place
+//! after seven days, leaving their names as history and cooldown evidence.
+//! Canonical checkpoints, lock files and directories are kept, and no lock
+//! file is ever created. Startup and the hidden `local-state-sweep` command
+//! share this code. The command's plan mode takes no locks and changes nothing.
 //!
 //! The time budget is checked before every directory entry, path component
 //! and candidate, and no directory is fsynced: an unlink lost to a crash is
@@ -82,6 +84,7 @@ mod tests;
 /// Exact `SnapshotSource::api_slug` values.
 const SOURCES: [&str; 3] = ["claude_code", "codex", "pi"];
 const MIN_AGE: Duration = Duration::from_secs(60 * 60);
+const QUARANTINE_MIN_AGE: Duration = Duration::from_secs(7 * 86400);
 const MAX_DIR_ENTRIES: usize = 10_000;
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 const SCHEMA_VERSION: u32 = 1;
@@ -97,15 +100,24 @@ enum ArtifactKind {
     TerminalTemp,
     /// `<base>.cleared.<pid>.<nanos>.json`
     ClearedTombstone,
+    /// `<base>.corrupt.<pid>.<nanos>.json`
+    Quarantine,
 }
 
 /// Canonical base suffixes and the artifacts their writers are proven to
 /// create only under the base's lock.
 const BASES: [(&str, &[ArtifactKind]); 3] = [
-    ("-scan-index-v3", &[ArtifactKind::PidTemp]),
+    (
+        "-scan-index-v3",
+        &[ArtifactKind::PidTemp, ArtifactKind::Quarantine],
+    ),
     (
         "-scan-index-v3-upload-progress",
-        &[ArtifactKind::PidTemp, ArtifactKind::ClearedTombstone],
+        &[
+            ArtifactKind::PidTemp,
+            ArtifactKind::ClearedTombstone,
+            ArtifactKind::Quarantine,
+        ],
     ),
     ("-terminal-status-v1", &[ArtifactKind::TerminalTemp]),
 ];
@@ -115,7 +127,7 @@ struct Artifact {
     base: String,
     kind: ArtifactKind,
     pid: i32,
-    name_nanos: Option<u64>,
+    name_nanos: Option<u128>,
 }
 
 fn parse_artifact(name: &str) -> Option<Artifact> {
@@ -142,23 +154,25 @@ fn parse_artifact(name: &str) -> Option<Artifact> {
     None
 }
 
-fn parse_artifact_suffix(kind: ArtifactKind, rest: &str) -> Option<(i32, Option<u64>)> {
-    let pid_and_nanos = |middle: &str| {
-        let (pid, nanos) = middle.split_once('.')?;
-        Some((parse_pid(pid)?, Some(parse_nanos(nanos)?)))
-    };
-    match kind {
+fn parse_artifact_suffix(kind: ArtifactKind, rest: &str) -> Option<(i32, Option<u128>)> {
+    let prefix = match kind {
         ArtifactKind::PidTemp => {
             let pid = rest.strip_prefix(".json.")?.strip_suffix(".tmp")?;
-            Some((parse_pid(pid)?, None))
+            return Some((parse_pid(pid)?, None));
         }
-        ArtifactKind::TerminalTemp => {
-            pid_and_nanos(rest.strip_prefix(".tmp.")?.strip_suffix(".json")?)
-        }
-        ArtifactKind::ClearedTombstone => {
-            pid_and_nanos(rest.strip_prefix(".cleared.")?.strip_suffix(".json")?)
-        }
+        ArtifactKind::TerminalTemp => ".tmp.",
+        ArtifactKind::ClearedTombstone => ".cleared.",
+        ArtifactKind::Quarantine => ".corrupt.",
+    };
+    let (pid, nanos) = rest
+        .strip_prefix(prefix)?
+        .strip_suffix(".json")?
+        .split_once('.')?;
+    let nanos = parse_nanos(nanos)?;
+    if kind != ArtifactKind::Quarantine && nanos > u128::from(u64::MAX) {
+        return None;
     }
+    Some((parse_pid(pid)?, Some(nanos)))
 }
 
 /// A writer's `std::process::id()`: plain decimal in `1..=i32::MAX`.
@@ -174,15 +188,15 @@ fn parse_pid(value: &str) -> Option<i32> {
 }
 
 /// A writer's nanoseconds since the epoch, or `0` for a pre-epoch clock.
-fn parse_nanos(value: &str) -> Option<u64> {
+fn parse_nanos(value: &str) -> Option<u128> {
     if value.is_empty()
-        || value.len() > 20
+        || value.len() > 39
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
-    value.parse::<u64>().ok()
+    value.parse::<u128>().ok()
 }
 
 fn is_destination_name(name: &str) -> bool {
@@ -666,6 +680,8 @@ impl SkipCounts {
 enum EntryOutcome {
     Removed,
     WouldRemove,
+    Truncated,
+    WouldTruncate,
     Skipped,
     Error,
 }
@@ -713,9 +729,16 @@ struct EntryReport {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct Truncation {
+    files: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
 struct SweepReport {
     removed: u64,
     bytes_removed: u64,
+    quarantine_truncated: Truncation,
     /// Plan mode: files that passed every check except the lock.
     candidates: u64,
     candidate_bytes: u64,
@@ -735,12 +758,14 @@ impl SweepReport {
             stage: &'static str,
             removed: u64,
             bytes_removed: u64,
+            quarantine_truncated: &'a Truncation,
             skipped: &'a SkipCounts,
             errors: u64,
             time_budget_exhausted: bool,
             other_daemon_check: OtherDaemonState,
         }
         if self.removed == 0
+            && self.quarantine_truncated.files == 0
             && self.skipped.total() == 0
             && self.errors == 0
             && !self.time_budget_exhausted
@@ -752,6 +777,7 @@ impl SweepReport {
             stage,
             removed: self.removed,
             bytes_removed: self.bytes_removed,
+            quarantine_truncated: &self.quarantine_truncated,
             skipped: &self.skipped,
             errors: self.errors,
             time_budget_exhausted: self.time_budget_exhausted,
@@ -930,6 +956,9 @@ enum LockFailure {
 enum Verdict {
     Removed,
     WouldRemove,
+    Truncated { synced: bool },
+    WouldTruncate,
+    Unchanged,
     Skip(SkipReason),
     Error,
 }
@@ -1007,11 +1036,24 @@ impl Sweep<'_> {
                 self.report.bytes_removed += bytes;
                 (EntryOutcome::Removed, None)
             }
-            Verdict::WouldRemove => {
+            Verdict::WouldRemove | Verdict::WouldTruncate => {
                 self.report.candidates += 1;
                 self.report.candidate_bytes += bytes;
-                (EntryOutcome::WouldRemove, None)
+                let outcome = if matches!(verdict, Verdict::WouldTruncate) {
+                    EntryOutcome::WouldTruncate
+                } else {
+                    EntryOutcome::WouldRemove
+                };
+                (outcome, None)
             }
+            Verdict::Truncated { synced } => {
+                self.report.quarantine_truncated.files += 1;
+                self.report.quarantine_truncated.bytes =
+                    self.report.quarantine_truncated.bytes.saturating_add(bytes);
+                self.report.errors += u64::from(!synced);
+                (EntryOutcome::Truncated, None)
+            }
+            Verdict::Unchanged => return,
             Verdict::Skip(reason) => {
                 self.report.skipped.add(*reason);
                 (EntryOutcome::Skipped, Some(*reason))
@@ -1280,6 +1322,10 @@ impl Sweep<'_> {
         if !first.is_regular() || first.uid != self.policy.uid || first.nlink != 1 {
             return not_checked(Verdict::Skip(SkipReason::UnsafeEntry), bytes);
         }
+        let quarantine = artifact.kind == ArtifactKind::Quarantine;
+        if quarantine && bytes == 0 {
+            return not_checked(Verdict::Unchanged, bytes);
+        }
         let Ok(lock_name) = CString::new(format!("{}.lock", artifact.base)) else {
             return not_checked(Verdict::Error, bytes);
         };
@@ -1298,14 +1344,26 @@ impl Sweep<'_> {
             }
             Err(_) => return not_checked(Verdict::Error, bytes),
         };
-        if !self.old_enough(&first, artifact.name_nanos) {
+        let min_age = if quarantine {
+            QUARANTINE_MIN_AGE
+        } else {
+            self.policy.min_age
+        };
+        if !self.old_enough(&first, artifact.name_nanos, min_age) {
             return not_checked(Verdict::Skip(SkipReason::Recent), bytes);
         }
         if !self.writer_gone(artifact.pid) {
             return not_checked(Verdict::Skip(SkipReason::LivePid), bytes);
         }
         if self.mode == Mode::Plan {
-            return not_checked(Verdict::WouldRemove, bytes);
+            return not_checked(
+                if quarantine {
+                    Verdict::WouldTruncate
+                } else {
+                    Verdict::WouldRemove
+                },
+                bytes,
+            );
         }
         if self.other_daemon_may_run() {
             return not_checked(Verdict::Skip(SkipReason::OtherDaemon), bytes);
@@ -1334,6 +1392,9 @@ impl Sweep<'_> {
         if !self.writer_gone(artifact.pid) {
             return acquired(Verdict::Skip(SkipReason::LivePid));
         }
+        if quarantine {
+            return acquired(Self::truncate_quarantine(dir, &c_name, &first));
+        }
         if unsafe { libc::unlinkat(dir, c_name.as_ptr(), 0) } != 0 {
             let error = std::io::Error::last_os_error();
             return acquired(if error.kind() == ErrorKind::NotFound {
@@ -1343,6 +1404,35 @@ impl Sweep<'_> {
             });
         }
         acquired(Verdict::Removed)
+    }
+
+    fn truncate_quarantine(dir: RawFd, name: &CStr, expected: &Identity) -> Verdict {
+        let fd = match open_at(
+            dir,
+            name,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        ) {
+            Ok(fd) => fd,
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Verdict::Skip(SkipReason::Changed);
+            }
+            Err(_) => return Verdict::Error,
+        };
+        match stat_fd(fd.as_raw_fd()) {
+            Ok(opened) if opened == *expected => {}
+            Ok(_) => return Verdict::Skip(SkipReason::Changed),
+            Err(_) => return Verdict::Error,
+        }
+        let file = File::from(fd);
+        if file.set_len(0).is_err() {
+            return Verdict::Error;
+        }
+        Verdict::Truncated {
+            synced: file.sync_all().is_ok(),
+        }
     }
 
     /// Non-blocking exclusive flock on the existing canonical lock file. The
@@ -1387,7 +1477,7 @@ impl Sweep<'_> {
 
     /// The newest of every timestamp, including one recorded in the name,
     /// must be at least `min_age` old. A future timestamp is never old.
-    fn old_enough(&self, identity: &Identity, name_nanos: Option<u64>) -> bool {
+    fn old_enough(&self, identity: &Identity, name_nanos: Option<u128>, min_age: Duration) -> bool {
         const NANOS: i128 = 1_000_000_000;
         let Ok(now) = self.policy.now.duration_since(UNIX_EPOCH) else {
             return false;
@@ -1400,9 +1490,12 @@ impl Sweep<'_> {
             newest = newest.max(to_nanos(birthtime));
         }
         if let Some(name_nanos) = name_nanos {
-            newest = newest.max(i128::from(name_nanos));
+            let Ok(name_nanos) = i128::try_from(name_nanos) else {
+                return false;
+            };
+            newest = newest.max(name_nanos);
         }
-        newest <= now && now - newest >= self.policy.min_age.as_nanos() as i128
+        newest <= now && now - newest >= min_age.as_nanos() as i128
     }
 
     /// Only a pid that is not ours and that the kernel says does not exist.
@@ -1427,7 +1520,7 @@ fn sweep(support_dir: &Path, mode: Mode, policy: &Policy, record_entries: bool) 
 
 /// Best-effort startup pass over the daemon's own support directory. Call
 /// before any snapshot worker starts. Never fails or panics; logs one
-/// content-free line only when it removed, skipped or failed something.
+/// content-free line only when it changes, skips or fails something.
 pub fn sweep_local_state_at_startup() {
     let support_dir = ottto_core::default_support_dir();
     let report = startup_report(&support_dir, Policy::production);
@@ -1630,13 +1723,15 @@ fn local_state_sweep_command(
             .unwrap_or_default();
         writeln!(
             out,
-            "removed {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}, other daemon check {other_daemon_check}",
+            "removed {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}, other daemon check {other_daemon_check}, quarantine truncated {} ({} bytes)",
             report.removed,
             report.bytes_removed,
             report.candidates,
             report.candidate_bytes,
             report.skipped.total(),
-            report.errors
+            report.errors,
+            report.quarantine_truncated.files,
+            report.quarantine_truncated.bytes,
         )?;
     }
     Ok(())

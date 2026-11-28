@@ -443,7 +443,7 @@ pub(crate) struct LockedStore {
 fn cstring(bytes: &[u8]) -> Result<std::ffi::CString> {
     std::ffi::CString::new(bytes).context("scan_index_invalid_component")
 }
-fn open_at(dir: &File, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
+pub(super) fn open_at(dir: &File, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -465,7 +465,7 @@ fn rename_at(from: &File, a: &std::ffi::CStr, to: &File, b: &std::ffi::CStr) -> 
         Ok(())
     }
 }
-fn unlink_at(dir: &File, name: &std::ffi::CStr) -> io::Result<()> {
+pub(super) fn unlink_at(dir: &File, name: &std::ffi::CStr) -> io::Result<()> {
     if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1514,7 +1514,7 @@ impl Seek for LogicalReader {
 }
 
 // Uses directory handles throughout; never follows manifest/provider paths.
-fn visit_storage_directory(
+pub(super) fn visit_storage_directory(
     dir: &File,
     mut visit: impl FnMut(&std::ffi::CStr) -> Result<()>,
 ) -> Result<()> {

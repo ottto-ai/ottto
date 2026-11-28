@@ -121,9 +121,9 @@ still require platform qualification before routing or enabling conversion.
 Verified completion covers the current DB/WAL/SHM, the removed migration
 backup and any erasure copy an interrupted attempt left (`.vacuum` and its
 journal, WAL and shared-memory files; `vacuum_remnant_inventory`), which the
-next attempt deletes first. The retained read-only v1 baseline is an explicit policy exception:
-it is never used to resurrect a forgotten file, and its 14-day hard age raises
-an escalation alarm. Uninstall deletes the DB/WAL/SHM, v1-readonly and private
+next attempt deletes first. The preserved v1 baseline has separate cleanup and
+inventory. A nonempty baseline at least 14 days old raises an escalation alarm
+until cleanup clears its bytes. Uninstall deletes the DB/WAL/SHM, v1-readonly and private
 remnants under its existing cleanup owner; source removal and forget keep them. Temporary remnants and external restart records have
 separate inventory/cleanup owners; a DB VACUUM does not certify their erasure.
 APFS snapshots and physical SSD erasure are outside the promise. No application
@@ -589,10 +589,19 @@ DB identity/generation against the closed-over source snapshot while holding the
 progress lock through database fsync and fence publication. Original inventory
 commitments and the copied `v1-readonly` baseline are verified before publication.
 There is one retained pre-import baseline, including its referenced immutable
-shards; saves and hydration create no additional backup copies. The baseline
-retains its explicit erasure exception and 14-day hard-age escalation. Uninstall
+shards; saves and hydration create no additional backup copies. With a published
+fence, an open store and a committed save in this process, maintenance truncates
+the baseline to zero bytes at a modification age of 14 days and empties the
+preserved shard directory. Both names remain as prior-history evidence. A build
+resuming an unpublished import still verifies the original bytes. Uninstall
 deletes it and its shards immediately alongside the DB/WAL/SHM, import remnants,
 exact ACK companion and restart records; turning a source off and forget keep them.
+
+The startup sweep truncates ordinary scan-index and upload-progress quarantine
+copies to zero bytes when the newest of the filename timestamp, mtime, ctime and
+available birth time is at least seven days old. The sweep requires the existing
+checkpoint lock, an exited writer, and stable same-user single-link regular files.
+The retained names still establish prior history and the scan-index rebuild cooldown.
 
 Schema revision one uses the forward-only `user_version` runner and checks
 `minimum_writer_capability` before writes. Nonempty revision-zero layouts are
@@ -606,6 +615,9 @@ Uninstall also removes the exact ACK companion. Maintenance reports
 its count/bytes through `ack_receipt_inventory`; inventory alone grants no recovery
 or GC authority. Baseline age/escalation gauges refresh after import preservation,
 on authenticated saves and at maintenance/load boundaries.
+`baseline_truncated` counts baseline files truncated and bytes cleared from the
+baseline and its shards. The startup sweep reports `quarantine_truncated` with
+the file and byte counts for quarantine copies.
 
 Each steady save publishes its complete dirty delta in one `BEGIN IMMEDIATE` /
 `COMMIT`: progress, census, evidence, ACK retirement, shared references, restart
