@@ -44,9 +44,16 @@ pub enum TemplatePinId {
 pub const TEMPLATE_ORIGIN: &str =
     "https://ottto-cloud-connect-templates.s3.us-east-1.amazonaws.com";
 
-/// Add the immutable object version and its digest after the template is published.
-/// An absent pin keeps CLI setup disabled for that template.
-const TEMPLATE_PINS: &[(TemplatePinId, TemplatePin)] = &[];
+/// Immutable object versions and their digests, published once. An absent pin keeps CLI setup
+/// disabled for that template. Bedrock v1 was published on 2026-11-26.
+const TEMPLATE_PINS: &[(TemplatePinId, TemplatePin)] = &[(
+    TemplatePinId::BedrockCliReadRoleV1,
+    TemplatePin {
+        key: "aws/bedrock-cli-read-role/v1.yaml",
+        version_id: "vUH0V9yZ..edgC8.NbRuKkgm6pONEyCS",
+        sha256: "b4b5fd6045ee2c9172c1547f759529bf8c1c1d922735e64f54e42a1cf98bd474",
+    },
+)];
 
 /// One published template object version and the SHA-256 of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,5 +221,20 @@ mod tests {
         for (_, compiled) in TEMPLATE_PINS {
             assert!(compiled.url().is_some(), "{compiled:?}");
         }
+    }
+
+    #[test]
+    fn bedrock_cli_template_is_pinned_to_the_published_version() {
+        let id = TemplatePinId::BedrockCliReadRoleV1;
+        let key = "aws/bedrock-cli-read-role/v1.yaml";
+        let version = "vUH0V9yZ..edgC8.NbRuKkgm6pONEyCS";
+        let sha = "b4b5fd6045ee2c9172c1547f759529bf8c1c1d922735e64f54e42a1cf98bd474";
+        assert!(id.matches_metadata(key, version, sha));
+        assert!(!id.matches_metadata(key, version, SHA));
+        assert!(!id.matches_metadata(key, "other", sha));
+        assert_eq!(
+            id.pin().and_then(TemplatePin::url),
+            Some(format!("{TEMPLATE_ORIGIN}/{key}?versionId={version}")),
+        );
     }
 }
