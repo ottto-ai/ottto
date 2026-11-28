@@ -26,6 +26,7 @@ const SOURCE: SnapshotSource = SnapshotSource::Codex;
 const PRELUDE: u64 = 5;
 const GROWN: &str = "019a0c2a-8e11-7222-8333-94444555a001";
 const QUIET: &str = "019a0c2a-8e11-7222-8333-94444555a002";
+const PROVEN: &str = "019a0c2a-8e11-7222-8333-94444555a004";
 const CONTROL: &str = "019a0c2a-8e11-7222-8333-94444555a003";
 
 #[derive(Deserialize, Serialize)]
@@ -37,8 +38,8 @@ struct Manifest {
     control_key: String,
     /// Closed turns each file holds now.
     turns: BTreeMap<String, usize>,
-    /// The length-prefixed sealed start every prelude fact ends with.
-    sealed: Vec<u8>,
+    /// The length-prefixed sealed start each file's prelude fact ends with.
+    sealed: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -154,7 +155,8 @@ fn seal(index: &ScanIndex, path: &Path, root: &Path, sealed: &[u8]) {
             assert_eq!(
                 bytes[..2],
                 [5, 1],
-                "the prelude fact as this build writes it"
+                "this build writes sealed Codex starts itself: seal the fixture's \
+                 starts natively and drop this splice"
             );
             bytes[1] = 2;
             bytes.extend_from_slice(sealed);
@@ -192,20 +194,48 @@ fn write_codex_per_file_carry_fixture() {
     fs::create_dir_all(&parent).unwrap();
     let corpus_root = dir.join("sessions");
     fs::create_dir(&corpus_root).unwrap();
-    let grown = write_rollout(&corpus_root, GROWN, 3);
-    let quiet = write_rollout(&corpus_root, QUIET, 2);
-    let tail_keys = vec![local_index_key(&grown), local_index_key(&quiet)];
-    // A sealed start with no proven request-1 breakdown, at layout 1.
-    let token_state = Enc::count_write(usize::MAX, |e| e.len_prefixed(b"token state")).unwrap();
-    let extension = SessionStartState::codex_start_extension_for_test(1, 1, 2, None, &token_state);
+    let len_prefixed =
+        |bytes: &[u8]| Enc::count_write(usize::MAX, |e| e.len_prefixed(bytes)).unwrap();
+    let token_state = len_prefixed(b"token state");
+    let extension = SessionStartState::codex_start_extension_for_test;
+    // Each file: its session, closed turns, whether it grows before the
+    // previous release runs, and its sealed start. One grown file's start is
+    // sealed at a layout this build does not know, the other's with a proven
+    // request-1 breakdown; the quiet file's has no proven breakdown.
+    let files = [
+        (
+            GROWN,
+            3,
+            true,
+            extension(2, 1, 2, None, b"what a later layout appends"),
+        ),
+        (
+            PROVEN,
+            3,
+            true,
+            extension(1, 1, 1, Some((7, 3, Some(2), None)), &token_state),
+        ),
+        (QUIET, 2, false, extension(1, 1, 2, None, &token_state)),
+    ];
+    let (mut tail_keys, mut turns, mut sealed, mut growing) =
+        (Vec::new(), BTreeMap::new(), BTreeMap::new(), Vec::new());
+    for (session, count, grows, start) in files {
+        let key = local_index_key(&write_rollout(&corpus_root, session, count));
+        turns.insert(key.clone(), count);
+        sealed.insert(key.clone(), len_prefixed(&start));
+        if grows {
+            growing.push(key.clone());
+        }
+        tail_keys.push(key);
+    }
     let mut manifest = Manifest {
         index_path: parent.join("codex-test-scan-index.json"),
         control_key: local_index_key(&rollout(&corpus_root, CONTROL)),
-        turns: BTreeMap::from([(tail_keys[0].clone(), 3), (tail_keys[1].clone(), 2)]),
+        turns,
         tail_keys,
         corpus_root,
         support,
-        sealed: Enc::count_write(usize::MAX, |e| e.len_prefixed(&extension)).unwrap(),
+        sealed,
     };
     let index =
         ScanIndex::load_for_snapshot_source(&manifest.index_path, SOURCE, &manifest.support)
@@ -217,7 +247,7 @@ fn write_codex_per_file_carry_fixture() {
             &index,
             Path::new(key),
             &manifest.corpus_root,
-            &manifest.sealed,
+            &manifest.sealed[key],
         );
     }
     index.save(&manifest.index_path).unwrap();
@@ -228,7 +258,7 @@ fn write_codex_per_file_carry_fixture() {
             let (format, prelude) = stored(&index, key);
             assert_eq!(format.facts.get(&PRELUDE), Some(&2), "{format:?}");
             assert!(
-                prelude.ends_with(&manifest.sealed),
+                prelude.ends_with(&manifest.sealed[key]),
                 "the sealed start is stored"
             );
             (key.clone(), format)
@@ -236,9 +266,10 @@ fn write_codex_per_file_carry_fixture() {
         .collect();
     state_v2::clean_checkpoint_for_test(&index);
 
-    let first = manifest.tail_keys[0].clone();
-    grow(&mut manifest, &first);
-    // A fresh file proves collection can progress past both held files.
+    for key in &growing {
+        grow(&mut manifest, key);
+    }
+    // A fresh file proves collection can progress past every held file.
     write_rollout(&manifest.corpus_root, CONTROL, 2);
     fs::write(
         dir.join("manifest.json"),
@@ -274,8 +305,9 @@ fn verify_codex_per_file_carry_reupgrade() {
             "{key}: prelude fact version"
         );
         assert!(
-            prelude.ends_with(&manifest.sealed),
-            "the previous release dropped or changed a sealed Codex start"
+            prelude.ends_with(&manifest.sealed[key]),
+            "Codex (sealed start, {key}): the previous release dropped or changed a sealed \
+             Codex start extension"
         );
     }
     let mut continuations = BTreeMap::new();
@@ -321,7 +353,7 @@ fn verify_codex_per_file_carry_reupgrade() {
     }
     for key in &manifest.tail_keys {
         assert!(
-            stored(&index, key).1.ends_with(&manifest.sealed),
+            stored(&index, key).1.ends_with(&manifest.sealed[key]),
             "the target dropped a sealed Codex start"
         );
     }
