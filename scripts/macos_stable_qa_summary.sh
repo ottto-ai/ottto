@@ -24,8 +24,10 @@ on the manifest afterwards.
 A stable release is published in two stages, because the hosted installer
 downloads only from the immutable versioned prefix. --stage pre-hosted writes
 the pre-hosted summary for the immutable stage: the same schema plus
-"stage":"pre-hosted", written to --output outside the release folder (the
-final summary is the one late file in that prefix). It refuses unless every
+"stage":"pre-hosted", written create-only (unless --force) to --output
+outside the release folder, compared by filesystem identity (the final summary
+is the one late file in that prefix). The manifest must list hosted_installer
+as supported and required. It refuses unless every
 hosted_installer check in the record is not_run, the hosted_installer owner
 status and the top-level status are not_run, and every other owner passed
 with every check passed in this release. Run macos_stable_closeout_gate.sh
@@ -55,12 +57,16 @@ while [[ $# -gt 0 ]]; do
       MANIFEST="${2:?--manifest requires a value}"
       shift 2
       ;;
-    --stage)
-      STAGE="${2:?--stage requires a value}"
-      shift 2
-      ;;
-    --output)
-      OUTPUT="${2:?--output requires a value}"
+    --stage|--output)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "stable-qa-summary: $1 requires a value" >&2
+        exit 2
+      fi
+      if [[ "$1" == "--stage" ]]; then
+        STAGE="$2"
+      else
+        OUTPUT="$2"
+      fi
       shift 2
       ;;
     --force)
@@ -223,6 +229,17 @@ manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
 record_manifest = obj(record.get("manifest"), "record manifest")
 if record_manifest.get("sha256") != manifest_sha:
     die("QA record is bound to a different manifest")
+if pre_hosted:
+    # The hosted lane runs after the immutable stage only when the manifest
+    # advertises and requires the hosted installer owner.
+    manifest_gate = (manifest.get("quality_gates") or {}).get("stable_clean_machine_qa") or {}
+    supported = manifest.get("supported_install_owners")
+    required = manifest_gate.get("required_install_owners") if isinstance(manifest_gate, dict) else None
+    if not (isinstance(supported, list) and HOSTED_OWNER in supported
+            and isinstance(required, list) and HOSTED_OWNER in required):
+        die("pre-hosted: the manifest must list hosted_installer in supported_install_owners and "
+            "stable_clean_machine_qa.required_install_owners; publish a release without the hosted "
+            "installer lane in a single stage")
 environment = obj(record.get("environment"), "record environment")
 owners = record.get("install_owners")
 if not isinstance(owners, list):
@@ -348,12 +365,18 @@ if pre_hosted:
     if aliased(output_arg, manifest_dir):
         die("the pre-hosted summary path must not be or pass through a symlink", code=2)
     output_path = output_arg.resolve()
-    if inside(output_path, manifest_dir):
+    if not output_path.parent.is_dir():
+        die("the pre-hosted summary folder is missing", code=2)
+    # Folders compare by filesystem identity, not by spelling: a case alias
+    # (macOS volumes are usually case-insensitive) names the same folder.
+    if inside(output_path, manifest_dir) or any(
+        same_file(folder, manifest_dir) for folder in (output_path.parent, *output_path.parent.parents)
+    ):
         die("the pre-hosted summary must live outside the release folder", code=2)
     if output_path == record_path or same_file(output_path, record_path):
         die("the pre-hosted summary must not replace the private QA record", code=2)
-    if not output_path.parent.is_dir():
-        die("the pre-hosted summary folder is missing", code=2)
+    if any(same_file(output_path, manifest_dir / name) for name in release_names if name not in ("", ".", "..")):
+        die("the pre-hosted summary would replace the manifest or another release file", code=2)
     output_label = "the pre-hosted summary"
     if output_path.exists() and not force:
         die("the pre-hosted summary already exists, pass --force to replace it", code=2)
@@ -377,7 +400,16 @@ try:
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         stream.write(text)
     os.chmod(temp_name, 0o644)
-    os.replace(temp_name, output_path)
+    if pre_hosted and not force:
+        # Create-only: a hard link never replaces an existing file, so of two
+        # concurrent runs only one installs its summary.
+        try:
+            os.link(temp_name, output_path)
+        except FileExistsError:
+            die("the pre-hosted summary already exists, pass --force to replace it", code=2)
+        os.unlink(temp_name)
+    else:
+        os.replace(temp_name, output_path)
 except BaseException as error:
     if temp_name and os.path.exists(temp_name):
         os.unlink(temp_name)

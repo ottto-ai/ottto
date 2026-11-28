@@ -1301,6 +1301,25 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(final.returncode, 3)
         self.assertNotIn(b"code=unexpected_file", final.stderr)
 
+    def test_pre_hosted_seal_from_refuses_the_summary(self):
+        # Sealing copies role files only, so the pre-hosted stage checks the source folder for the
+        # summary first (under any case); the final publish copies it as a role.
+        for name in (g.ROLE_FILES["clean_machine_evidence"], "Stable-Clean-Machine-QA.json"):
+            source = tempfile.mkdtemp(dir=self.tmp)
+            with open(os.path.join(source, name), "w", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            sealed = os.path.join(self.tmp, "sealed")
+            stage = self.run_gate(["scan", "--profile", "publish", "--lane", "stable", "--stage", "pre-hosted",
+                                   "--seal-from", source, "--root", sealed])
+            self.assertEqual(stage.returncode, 3, stage.stderr)
+            self.assertIn(b"code=unexpected_file count=1", stage.stderr)
+            self.assertFalse(os.path.lexists(sealed))
+        final = self.run_gate(["scan", "--profile", "publish", "--lane", "stable",
+                               "--seal-from", source, "--root", sealed])
+        self.assertEqual(final.returncode, 3, final.stderr)
+        self.assertNotIn(b"code=unexpected_file", final.stderr)
+        self.assertFalse(os.path.lexists(sealed))
+
     def build_app(self, root):
         app = os.path.join(root, "Ottto.app", "Contents")
         for folder in ("MacOS", "Helpers", "Resources", "Frameworks/Sparkle.framework/Versions/B"):

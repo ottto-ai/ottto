@@ -493,6 +493,59 @@ expect_summary_error 2 "--output goes with --stage pre-hosted only" \
   --record "$stage_record" --manifest "$stage_manifest" --output "$private_dir/refused.json"
 expect_summary_error 2 "--stage must be pre-hosted or final" \
   --record "$stage_record" --manifest "$stage_manifest" --stage hosted --output "$private_dir/refused.json"
+# [regression] A missing or empty operand is a usage error, not a shell abort.
+expect_summary_error 2 "--stage requires a value" --record "$stage_record" --manifest "$stage_manifest" --stage
+expect_summary_error 2 "--stage requires a value" --record "$stage_record" --manifest "$stage_manifest" --stage ""
+expect_summary_error 2 "--output requires a value" --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output
+expect_summary_error 2 "--output requires a value" --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output ""
+
+stage_manifest_sha="$(shasum -a 256 "$stage_manifest" | awk '{print $1}')"
+# [regression] The release folder is found by filesystem identity: a case alias
+# names the same folder on a case-insensitive volume (the macOS default), even
+# with --force. Skipped where names are case-sensitive.
+stage_alias="$tmp_dir/TWO-STAGE-RELEASE"
+if [[ -d "$stage_alias" ]]; then
+  expect_summary_error 2 "the pre-hosted summary must live outside the release folder" \
+    --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output "$stage_alias/pre-hosted.json"
+  expect_summary_error 2 "the pre-hosted summary must live outside the release folder" \
+    --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output "$stage_alias/release-manifest.json" --force
+  if [[ -e "$stage_dir/pre-hosted.json" ]]; then
+    echo "A pre-hosted summary was written through a case alias of the release folder" >&2
+    exit 1
+  fi
+else
+  echo "skip: case-alias cases need a case-insensitive volume"
+fi
+# [regression] A hard link to the manifest outside the folder is still the manifest.
+ln "$stage_manifest" "$private_dir/manifest-hard-link.json"
+expect_summary_error 2 "the pre-hosted summary would replace the manifest or another release file" \
+  --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output "$private_dir/manifest-hard-link.json" --force
+rm "$private_dir/manifest-hard-link.json"
+[[ "$(shasum -a 256 "$stage_manifest" | awk '{print $1}')" == "$stage_manifest_sha" ]]
+
+# [regression] The pre-hosted stage needs the hosted installer lane in the
+# manifest: supported and required. Without it, publish in a single stage.
+for omission in both required; do
+  omission_dir="$tmp_dir/no-hosted-$omission"
+  mkdir -p "$omission_dir"
+  if [[ "$omission" == both ]]; then
+    jq '.supported_install_owners -= ["hosted_installer"]
+      | .quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+      "$stage_manifest" > "$omission_dir/release-manifest.json"
+  else
+    jq '.quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+      "$stage_manifest" > "$omission_dir/release-manifest.json"
+  fi
+  jq --arg sha "$(shasum -a 256 "$omission_dir/release-manifest.json" | awk '{print $1}')" '.manifest.sha256 = $sha' \
+    "$stage_record" > "$private_dir/no-hosted.record.json"
+  expect_summary_error 1 "the manifest must list hosted_installer in supported_install_owners" \
+    --record "$private_dir/no-hosted.record.json" --manifest "$omission_dir/release-manifest.json" \
+    --stage pre-hosted --output "$private_dir/refused.json"
+done
+if [[ -e "$private_dir/refused.json" ]]; then
+  echo "A refused pre-hosted summary was written" >&2
+  exit 1
+fi
 
 # After the hosted lane passes, the final summary goes beside the manifest with
 # no stage field, and the final gate passes; the pre-hosted gate now refuses.

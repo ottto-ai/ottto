@@ -32,10 +32,13 @@ validates its shape but does not accept it until verified carry ships.
 
 Stages. A stable release is published in two stages, because the hosted
 installer downloads only from the immutable versioned prefix:
-  pre-hosted  before the immutable upload. --evidence names the pre-hosted
-              summary (macos_stable_qa_summary.sh --stage pre-hosted), which
-              lives outside the release folder; stable-clean-machine-qa.json
-              must not be beside the manifest yet. Every final rule applies,
+  pre-hosted  before the immutable upload. The manifest must list
+              hosted_installer as supported and required. --evidence names
+              the pre-hosted summary (macos_stable_qa_summary.sh --stage
+              pre-hosted): one plain file (no symlink, no hard links) outside
+              the release folder, compared by filesystem identity;
+              stable-clean-machine-qa.json must not be beside the manifest
+              yet. Every final rule applies,
               except that each required hosted_installer check is exactly
               {"result":"not_run"}, the hosted_installer owner status and the
               top-level status are not_run, and the summary has
@@ -121,12 +124,16 @@ while [[ $# -gt 0 ]]; do
       MANIFEST="${2:?--manifest requires a value}"
       shift 2
       ;;
-    --stage)
-      STAGE="${2:?--stage requires a value}"
-      shift 2
-      ;;
-    --evidence)
-      EVIDENCE="${2:?--evidence requires a value}"
+    --stage|--evidence)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "$1 requires a value" >&2
+        exit 2
+      fi
+      if [[ "$1" == "--stage" ]]; then
+        STAGE="$2"
+      else
+        EVIDENCE="$2"
+      fi
       shift 2
       ;;
     --list-never-carry-checks)
@@ -416,27 +423,90 @@ if [[ -n "$symlinks" ]]; then
 fi
 
 if [[ "$STAGE" == "pre-hosted" ]]; then
-  # The immutable stage uploads the release folder without the summary; the
-  # final stage adds it as the one late file. A summary already beside the
-  # manifest would be uploaded early and could never be replaced.
-  if [[ -e "$manifest_dir/stable-clean-machine-qa.json" || -L "$manifest_dir/stable-clean-machine-qa.json" ]]; then
-    echo "The pre-hosted stage runs before the final summary: stable-clean-machine-qa.json must not be beside the manifest" >&2
-    exit 1
-  fi
-  if [[ -L "$EVIDENCE" || ! -f "$EVIDENCE" ]]; then
-    echo "The pre-hosted summary is missing or is not a plain file" >&2
-    exit 1
-  fi
-  if ! evidence_dir="$(macos_release_manifest_dir "$EVIDENCE" 2>/dev/null)" || [[ -z "$evidence_dir" ]]; then
-    echo "The pre-hosted summary folder is not readable" >&2
-    exit 1
-  fi
-  if [[ "$evidence_dir" == "$manifest_dir" || "$evidence_dir" == "$manifest_dir"/* ]]; then
-    echo "The pre-hosted summary must live outside the release folder" >&2
-    exit 1
-  fi
-  evidence_path="$evidence_dir/$(basename "$EVIDENCE")"
+  # Every later read uses exactly this pathname; a relative one gets ./ so no
+  # tool takes it for an option.
+  case "$EVIDENCE" in
+    /*) evidence_path="$EVIDENCE" ;;
+    *) evidence_path="./$EVIDENCE" ;;
+  esac
   evidence_name="the pre-hosted summary"
+  # Folders are compared by filesystem identity, not by spelling, so a
+  # symlinked or case-aliased folder cannot hide the release folder.
+  stage_status=0
+  python3 - "$MANIFEST" "$evidence_path" <<'PY' || stage_status=$?
+import json
+import os
+import stat
+import sys
+
+manifest_path, evidence_path = sys.argv[1], sys.argv[2]
+SUMMARY_NAME = "stable-clean-machine-qa.json"
+HOSTED_OWNER = "hosted_installer"
+
+
+def identity(path):
+    st = os.stat(path)
+    return st.st_dev, st.st_ino
+
+
+try:
+    with open(manifest_path, "rb") as stream:
+        manifest = json.loads(stream.read().decode("utf-8"))
+    gate = manifest["quality_gates"]["stable_clean_machine_qa"]
+    # The hosted lane runs after the immutable stage only when the manifest
+    # advertises and requires the hosted installer owner.
+    if HOSTED_OWNER not in manifest.get("supported_install_owners", []) \
+            or HOSTED_OWNER not in gate.get("required_install_owners", []):
+        sys.exit(3)
+    release_dir = os.path.dirname(os.path.abspath(manifest_path))
+    # The immutable stage uploads the release folder without the summary; the
+    # final stage adds it as the one late file. A summary already beside the
+    # manifest would be uploaded early and could never be replaced.
+    if os.path.lexists(os.path.join(release_dir, SUMMARY_NAME)):
+        sys.exit(4)
+    try:
+        st = os.lstat(evidence_path)
+    except FileNotFoundError:
+        sys.exit(5)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        sys.exit(5)
+    release = identity(release_dir)
+    folder = os.path.realpath(os.path.dirname(os.path.abspath(evidence_path)))
+    while True:
+        if identity(folder) == release:
+            sys.exit(6)
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(7)
+PY
+  case "$stage_status" in
+    0) ;;
+    3)
+      echo "The pre-hosted stage needs hosted_installer in the manifest's supported_install_owners and stable_clean_machine_qa.required_install_owners; publish a release without the hosted installer lane in a single stage" >&2
+      exit 1
+      ;;
+    4)
+      echo "The pre-hosted stage runs before the final summary: stable-clean-machine-qa.json must not be beside the manifest" >&2
+      exit 1
+      ;;
+    5)
+      echo "The pre-hosted summary is missing or is not a single plain file (no symlink, no hard links)" >&2
+      exit 1
+      ;;
+    6)
+      echo "The pre-hosted summary must live outside the release folder" >&2
+      exit 1
+      ;;
+    *)
+      echo "The pre-hosted summary or the release folder is not readable" >&2
+      exit 1
+      ;;
+  esac
 else
   # The summary is a plain file name beside the manifest, never a path or a symlink.
   if ! evidence_path="$(macos_release_path "$manifest_dir" "stable-clean-machine-qa.json")" || [[ ! -f "$evidence_path" ]]; then
@@ -563,9 +633,21 @@ placeholder_filter='.. | strings | select(. == "not_run" or test("^TODO"))'
 if [[ "$STAGE" == "pre-hosted" ]]; then
   # The hosted lane has not run yet: its checks, its owner status and the
   # top-level status are checked for exact values below instead.
-  placeholder_filter='del(.status) | .install_owners |= map(if .owner == "hosted_installer" then del(.status, .checks) else . end) | '"$placeholder_filter"
+  # Shapes the filter does not expect are left in place for the schema check.
+  placeholder_filter='(if type == "object" then
+      del(.status)
+      | (.install_owners | arrays) |= map(if type == "object" and .owner == "hosted_installer" then del(.status, .checks) else . end)
+    else . end)
+    | '"$placeholder_filter"
 fi
-if jq -e "$placeholder_filter" "$evidence_path" >/dev/null 2>&1; then
+# jq -e: 0 found a placeholder, 4 found none; anything else is an error.
+placeholder_status=0
+jq -e "$placeholder_filter" "$evidence_path" >/dev/null 2>&1 || placeholder_status=$?
+if [[ "$STAGE" == "pre-hosted" && "$placeholder_status" != 0 && "$placeholder_status" != 4 ]]; then
+  echo "Stable clean-machine QA evidence could not be checked for template placeholders: $evidence_name" >&2
+  exit 1
+fi
+if [[ "$placeholder_status" == 0 ]]; then
   echo "Stable clean-machine QA evidence still contains template placeholders: $evidence_name" >&2
   exit 1
 fi

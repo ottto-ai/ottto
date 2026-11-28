@@ -557,7 +557,8 @@ AWS/CDN prerequisites before publish:
 14. Never edit the signed manifest: it already names
     `stable-clean-machine-qa.json` as its `evidence_path` (the only summary
     name the tools accept). Write the public summary beside the manifest from
-    the record, then run the closeout gate before the immutable CDN upload:
+    the record, then run the closeout gate before the immutable CDN upload
+    (single-stage publish; for two stages see Two-stage publish below):
 
     ```bash
     ./scripts/macos_stable_qa_summary.sh \
@@ -596,9 +597,11 @@ AWS/CDN prerequisites before publish:
 
 `macos_stable_closeout_gate.sh` is the final stable release evidence gate. It
 does not replace signing, notarization, `macos_release_gate.sh`, or
-`macos_stable_preflight.sh`; it runs on the finished release folder before
-anything is uploaded to the immutable stable prefix and before stable `latest`
-promotion.
+`macos_stable_preflight.sh`. In a single-stage publish it runs on the finished
+release folder before anything is uploaded to the immutable stable prefix. In
+a two-stage publish (below), its pre-hosted stage runs before the immutable
+upload and its final stage before the summary is added. Both come before
+stable `latest` promotion.
 
 ### Two-stage publish
 
@@ -622,14 +625,21 @@ then publishes in two stages:
    ```
 
    The pre-hosted summary has the final schema plus `"stage": "pre-hosted"`.
-   The pre-hosted gate applies every final rule, except that each required
-   `hosted_installer` check must be exactly `{"result":"not_run"}`, and it
+   Both scripts need `hosted_installer` in the manifest's
+   `supported_install_owners` and `required_install_owners`; a release
+   without the hosted installer lane is published in a single stage. The
+   pre-hosted gate applies every final rule, except that each required
+   `hosted_installer` check must be exactly `{"result":"not_run"}`. It
    refuses a release folder that already holds
-   `stable-clean-machine-qa.json`. Its last line is `Stable closeout
-   pre-hosted gate passed for <version> (<commit>)`. The publisher runs the
-   release privacy gate with `--profile publish --lane stable --stage
-   pre-hosted`, then uploads the immutable versioned prefix without the
-   summary. Nothing points to it yet: no appcast, no `latest` pointer.
+   `stable-clean-machine-qa.json`, and a pre-hosted summary that is a
+   symlink, has more than one hard link, or lies in the release folder
+   (compared by filesystem identity, so symlinked and case-aliased paths
+   count). Its last line is `Stable closeout pre-hosted gate passed for
+   <version> (<commit>)`. The publisher runs the release privacy gate with
+   `--profile publish --lane stable --stage pre-hosted`, then uploads the
+   immutable versioned prefix without the summary. The versioned
+   `appcast.xml` is part of that immutable set; the channel's `latest`
+   appcast and pointer are updated only after the final gate.
 2. **Hosted lane.** The hosted installer lane runs live against that prefix
    and its checks are filled in the private record.
 3. **Final stage.** Write the final summary beside the manifest and run the

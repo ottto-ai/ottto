@@ -1061,8 +1061,8 @@ expect_pre_hosted_failure "$dir" "$dir/../pre-hosted-evidence-inside/notes/pre-h
 
 dir="$(new_pre_hosted_case pre-hosted-evidence-link)"
 ln -s "$(pre_hosted_evidence pre-hosted-evidence-link)" "$tmp_dir/pre-hosted-link.json"
-expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-link.json" "The pre-hosted summary is missing or is not a plain file"
-expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-missing.json" "The pre-hosted summary is missing or is not a plain file"
+expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-link.json" "The pre-hosted summary is missing or is not a single plain file"
+expect_pre_hosted_failure "$dir" "$tmp_dir/pre-hosted-missing.json" "The pre-hosted summary is missing or is not a single plain file"
 
 dir="$(new_pre_hosted_case pre-hosted-no-stage)"
 mutate_pre_hosted pre-hosted-no-stage 'del(.stage)'
@@ -1113,5 +1113,77 @@ expect_usage_error "--evidence goes with --stage pre-hosted only" \
 expect_usage_error "--evidence goes with --stage pre-hosted only" \
   --manifest "$base_dir/release-manifest.json" --stage final --evidence "$(pre_hosted_evidence pre-hosted-pass)"
 expect_usage_error "--stage must be pre-hosted or final" --manifest "$base_dir/release-manifest.json" --stage hosted
+# [regression] A missing or empty operand is a usage error, not a shell abort.
+expect_usage_error "--stage requires a value" --manifest "$base_dir/release-manifest.json" --stage
+expect_usage_error "--stage requires a value" --manifest "$base_dir/release-manifest.json" --stage ""
+expect_usage_error "--evidence requires a value" --manifest "$base_dir/release-manifest.json" --stage pre-hosted --evidence
+expect_usage_error "--evidence requires a value" --manifest "$base_dir/release-manifest.json" --stage pre-hosted --evidence ""
+
+# [regression] The release folder is found by filesystem identity, not by the
+# spelling of the path: a symlinked parent folder that leads into it is refused.
+outside_error="The pre-hosted summary must live outside the release folder"
+dir="$(new_pre_hosted_case pre-hosted-linked-parent)"
+cp "$(pre_hosted_evidence pre-hosted-linked-parent)" "$dir/pre-hosted.json"
+ln -s "$dir" "$tmp_dir/release-folder-link"
+expect_pre_hosted_failure "$dir" "$tmp_dir/release-folder-link/pre-hosted.json" "$outside_error"
+# A symlinked folder that resolves outside the release folder is accepted.
+dir="$(new_pre_hosted_case pre-hosted-linked-outside)"
+ln -s "$pre_hosted_dir" "$tmp_dir/evidence-folder-link"
+if ! run_pre_hosted "$dir" "$tmp_dir/evidence-folder-link/pre-hosted-linked-outside.json" "$tmp_dir/linked-outside.out"; then
+  echo "Expected the pre-hosted gate to accept evidence in a symlinked folder outside the release folder" >&2
+  cat "$tmp_dir/linked-outside.out" >&2
+  exit 1
+fi
+
+# [regression] A case alias of the release folder names the same folder on a
+# case-insensitive volume (the macOS default). Skipped where names are case-sensitive.
+dir="$(new_pre_hosted_case pre-hosted-case-alias)"
+case_alias="$tmp_dir/cases/PRE-HOSTED-CASE-ALIAS"
+if [[ -d "$case_alias" ]]; then
+  cp "$(pre_hosted_evidence pre-hosted-case-alias)" "$dir/pre-hosted.json"
+  expect_pre_hosted_failure "$dir" "$case_alias/pre-hosted.json" "$outside_error"
+  cp "$base_dir/stable-clean-machine-qa.json" "$tmp_dir/cases/Pre-Hosted-Case-Alias/STABLE-CLEAN-MACHINE-QA.json"
+  expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-case-alias)" "$beside_error"
+else
+  echo "skip: case-alias cases need a case-insensitive volume"
+fi
+
+# [regression] A hard link into the release folder is the same file under another name.
+dir="$(new_pre_hosted_case pre-hosted-hard-link)"
+ln "$(pre_hosted_evidence pre-hosted-hard-link)" "$dir/qa-copy.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hard-link)" "The pre-hosted summary is missing or is not a single plain file"
+
+# [regression] The gate reads the exact path it checked: a name with a trailing
+# newline is not the name without it.
+dir="$(new_pre_hosted_case pre-hosted-newline-name)"
+newline_evidence="$(pre_hosted_evidence pre-hosted-newline-name)"$'\n'
+jq '(.install_owners[] | select(.owner == "hosted_installer") | .checks.install) = {result: "passed", method: "live"}' \
+  "$(pre_hosted_evidence pre-hosted-newline-name)" > "$newline_evidence"
+expect_pre_hosted_failure "$dir" "$newline_evidence" "hosted_installer.install $not_run_exactly"
+
+# A relative evidence path that starts with a dash is a file, not an option.
+dir="$(new_pre_hosted_case pre-hosted-dash-name)"
+cp "$(pre_hosted_evidence pre-hosted-dash-name)" "$pre_hosted_dir/-dash.json"
+if ! (cd "$pre_hosted_dir" && "$GATE" --manifest "$dir/release-manifest.json" --stage pre-hosted --evidence -dash.json \
+  >"$tmp_dir/dash.out" 2>&1); then
+  echo "Expected the pre-hosted gate to read a relative path that starts with a dash" >&2
+  cat "$tmp_dir/dash.out" >&2
+  exit 1
+fi
+
+# [regression] The pre-hosted stage needs the hosted installer lane in the
+# manifest: supported and required. Without it, publish in a single stage.
+hosted_owner_error="The pre-hosted stage needs hosted_installer in the manifest's supported_install_owners"
+dir="$(new_pre_hosted_case pre-hosted-no-hosted-owner)"
+jq '.supported_install_owners -= ["hosted_installer"]
+  | .quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+  "$dir/release-manifest.json" > "$tmp_dir/manifest.json"
+mv "$tmp_dir/manifest.json" "$dir/release-manifest.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-no-hosted-owner)" "$hosted_owner_error"
+dir="$(new_pre_hosted_case pre-hosted-hosted-not-required)"
+jq '.quality_gates.stable_clean_machine_qa.required_install_owners -= ["hosted_installer"]' \
+  "$dir/release-manifest.json" > "$tmp_dir/manifest.json"
+mv "$tmp_dir/manifest.json" "$dir/release-manifest.json"
+expect_pre_hosted_failure "$dir" "$(pre_hosted_evidence pre-hosted-hosted-not-required)" "$hosted_owner_error"
 
 echo "macos_stable_closeout_gate tests passed"

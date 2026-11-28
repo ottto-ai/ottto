@@ -2169,6 +2169,17 @@ def run_profile(args, gate, policy):
     else:
         required, optional = lane_roles(profile, args.lane, args.appcast, publish_stage(args))
     if args.seal_from:
+        # Sealing copies only role files, so a summary in the source folder of the pre-hosted
+        # publish stage would be dropped silently: it is refused here, under any case.
+        if publish_stage(args) == "pre-hosted":
+            try:
+                names = os.listdir(args.seal_from)
+            except OSError:
+                raise Incomplete("seal_source")
+            summary = ROLE_FILES["clean_machine_evidence"].casefold()
+            count = sum(1 for name in names if name.casefold() == summary)
+            if count:
+                gate.finding(profile, "structure", "unexpected_file", count)
         source_present = {r for r in required | optional
                           if os.path.lexists(os.path.join(args.seal_from, ROLE_FILES[r]))}
         if required - source_present - {"privacy_receipt"}:

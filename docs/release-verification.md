@@ -351,7 +351,8 @@ Profiles: `unsigned` (`Ottto.app`, `ottto`, `ottto-service` before signing),
 `notary` (one of `app_notary_zip`, `app_dmg`, `cli_zip`, `service_zip`),
 `attest` (the attestation subjects, SBOM and checksums; `--stage attest-1`
 or `--stage attest-2` is required), `upload`, `publish` (`--stage pre-hosted`
-for the immutable stage of a stable publish), `dispatch` and
+for the immutable stage of a stable publish; with `--seal-from`, the source
+folder is checked for the summary before sealing), `dispatch` and
 `logs` (one job's complete logs from one run attempt, see Job logs below).
 `dispatch` reads the
 workflow inputs from `OTTTO_DISPATCH_VERSION`, `OTTTO_DISPATCH_CHANNEL`,
@@ -720,14 +721,16 @@ folder. The gate refuses a private record anywhere in that folder and any
 symlink in it, and fails if it cannot read the whole folder; publishers that
 upload an explicit file list add defense in depth.
 
-A stable release is published in two stages, because the hosted installer
-downloads only from the immutable versioned prefix, so its clean-machine lane
-can only run once that prefix exists:
+The commands above are the single-stage publish: the gate runs on the
+finished release folder before anything is uploaded. When the hosted installer
+lane is in the manifest, a stable release is published in two stages instead,
+because the hosted installer downloads only from the immutable versioned
+prefix, so its clean-machine lane can only run once that prefix exists:
 
 1. **Pre-hosted (immutable) stage.** Fill every check except the
    `hosted_installer` ones, which stay `not_run` with that owner's status and
    the top-level status. Write the pre-hosted summary outside the release
-   folder and run the pre-hosted gate:
+   folder (create-only unless `--force`) and run the pre-hosted gate:
 
    ```bash
    macos_stable_qa_summary.sh \
@@ -739,11 +742,19 @@ can only run once that prefix exists:
    ```
 
    The pre-hosted summary has the final schema plus `"stage": "pre-hosted"`.
-   The pre-hosted gate applies every final rule, except that each required
-   `hosted_installer` check must be exactly `{"result":"not_run"}`; it refuses
-   a release folder that already holds `stable-clean-machine-qa.json`. The
-   publisher then uploads the immutable versioned prefix without the summary,
-   and nothing points to it yet: no appcast, no `latest` pointer.
+   Both scripts need `hosted_installer` in the manifest's
+   `supported_install_owners` and `required_install_owners`; a release
+   without the hosted installer lane is published in a single stage. The
+   pre-hosted gate applies every final rule, except that each required
+   `hosted_installer` check must be exactly `{"result":"not_run"}`. It
+   refuses a release folder that already holds `stable-clean-machine-qa.json`,
+   and a pre-hosted summary that is a symlink, has more than one hard link,
+   or lies in the release folder. Folders compare by filesystem identity, so
+   a symlinked or case-aliased path into the release folder counts as inside
+   it; a symlinked folder that resolves outside it is accepted. The publisher
+   then uploads the immutable versioned prefix without the summary. The
+   versioned `appcast.xml` is part of that immutable set; the channel's
+   `latest` appcast and pointer are updated only after the final gate.
 2. **Hosted lane.** The hosted installer lane runs live against that prefix
    and its checks are filled in the private record.
 3. **Final stage.** Write the final summary beside the manifest (without
