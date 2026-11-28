@@ -512,8 +512,11 @@ if "$CLOSEOUT_GATE" --manifest "$stage_manifest" --stage pre-hosted --evidence "
   exit 1
 fi
 grep -qF "stable-clean-machine-qa.json must not be beside the manifest" "$tmp_dir/stage-late.out"
-# With hosted checks passed, the record no longer makes a pre-hosted summary.
-expect_summary_error 1 "every hosted_installer check must be not_run" \
+# With the hosted lane filled, the record no longer makes a pre-hosted summary.
+expect_summary_error 1 "the hosted_installer owner status must be not_run" \
   --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output "$private_dir/refused.json"
+expect_summary_error 1 "every hosted_installer check must be not_run" \
+  --record "$(stage_record_with '.status = "not_run" | (.install_owners[] | select(.owner == "hosted_installer") | .status) = "not_run"')" \
+  --manifest "$stage_manifest" --stage pre-hosted --output "$private_dir/refused.json"
 
 echo "macos_stable_qa_summary tests passed"
