@@ -1175,9 +1175,24 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
     let mut browser_claim_completed = false;
     let mut claim_code_auth_completed = false;
     let mut last_setup_payload: Option<serde_json::Value> = None;
+    // A completed claim is reported by the Setup round that follows it, never
+    // by the deadline: approval can land in the last seconds, and AuthComplete
+    // itself can take over a minute.
+    let mut setup_round_owed = false;
 
     loop {
-        if setup_timed_out(started_at, timeout) {
+        if setup_timed_out(started_at, timeout) && !setup_round_owed {
+            // The wait ended while this run's browser claim still looked
+            // pending. If the account is connected after all, report it through
+            // one last Setup round instead of a timeout.
+            if browser_claim.is_some()
+                && !browser_claim_completed
+                && account_reads_connected(&invocation)
+            {
+                browser_claim_completed = true;
+                setup_round_owed = true;
+                continue;
+            }
             return print_setup_payload(
                 invocation.request.request_id.clone(),
                 setup_timeout_payload(browser_claim.as_ref(), last_setup_payload, args.timeout),
@@ -1189,6 +1204,7 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
             match complete_browser_claim(&invocation, claim) {
                 SetupAuthCompletion::Completed => {
                     browser_claim_completed = true;
+                    setup_round_owed = true;
                     if invocation.output_mode == OutputMode::Human {
                         println!("Browser approval received. Continuing setup.");
                     }
@@ -1211,6 +1227,7 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
         let setup_request =
             request_like(&invocation, setup_command(&args, claim_code_auth_completed));
         print_progress(&setup_request, invocation.output_mode);
+        setup_round_owed = false;
         match request_with_autostart(&invocation, &setup_request) {
             Ok(response) if response.ok => {
                 let payload = response.payload.unwrap_or(serde_json::Value::Null);
@@ -1269,6 +1286,7 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
                     match complete_pending_browser_claim(&invocation, claim_code) {
                         SetupAuthCompletion::Completed => {
                             claim_code_auth_completed = true;
+                            setup_round_owed = true;
                             if invocation.output_mode == OutputMode::Human {
                                 println!("Browser approval received. Continuing setup.");
                             }
@@ -1327,6 +1345,24 @@ fn setup_command(args: &SetupArgs, claim_code_auth_completed: bool) -> LocalCont
         setup_run_id: args.setup_run_id.clone(),
         api_base_url: args.api_base_url.clone(),
     }
+}
+
+/// One `account` read at the deadline. Any failure reads as not connected, so
+/// the caller keeps its timeout answer.
+fn account_reads_connected(invocation: &Invocation) -> bool {
+    let request = request_like(invocation, LocalControlCommand::Account);
+    match request_with_autostart(invocation, &request) {
+        Ok(response) if response.ok => response
+            .payload
+            .as_ref()
+            .is_some_and(account_payload_is_connected),
+        _ => false,
+    }
+}
+
+fn account_payload_is_connected(payload: &serde_json::Value) -> bool {
+    payload.get("state").and_then(|value| value.as_str()) == Some("connected")
+        && payload.get("user").is_some_and(|value| !value.is_null())
 }
 
 fn setup_timed_out(started_at: Instant, timeout: Duration) -> bool {
@@ -3656,6 +3692,228 @@ mod tests {
             actual[0].get("claim_code").and_then(|value| value.as_str()),
             Some("claim_01HXBROWSER")
         );
+    }
+
+    /// One scripted daemon reply: the command it must answer, how long to hold
+    /// the reply, and the response.
+    struct ScriptedReply {
+        command: &'static str,
+        delay: Duration,
+        response: serde_json::Value,
+    }
+
+    fn reply(command: &'static str, response: serde_json::Value) -> ScriptedReply {
+        ScriptedReply {
+            command,
+            delay: Duration::ZERO,
+            response,
+        }
+    }
+
+    fn ok_reply(payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"request_id": "req_fake", "ok": true, "payload": payload, "error": null})
+    }
+
+    fn error_reply(code: &str, detail: &str) -> serde_json::Value {
+        serde_json::json!({
+            "request_id": "req_fake",
+            "ok": false,
+            "payload": null,
+            "error": {"code": code, "message": "scripted", "retryable": false, "details": {"detail": detail}},
+        })
+    }
+
+    /// Runs `ottto setup --json --no-browser --timeout <timeout_seconds>`
+    /// against a fake daemon that answers `script` in order, and returns the
+    /// exit code and the commands the daemon saw.
+    #[cfg(unix)]
+    fn run_setup_against(script: Vec<ScriptedReply>, timeout_seconds: u64) -> (i32, Vec<String>) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ottto-setup-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind fake daemon socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fake daemon");
+        let server = thread::spawn(move || {
+            let mut seen = Vec::new();
+            let give_up = Instant::now() + Duration::from_secs(20);
+            for step in script {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(_) if Instant::now() < give_up => {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(_) => return seen,
+                    }
+                };
+                stream.set_nonblocking(false).expect("blocking fake stream");
+                let mut request = String::new();
+                stream.read_to_string(&mut request).expect("read request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&request).expect("request is JSON");
+                let command = request["command"].as_str().unwrap_or_default().to_string();
+                assert_eq!(command, step.command, "daemon saw {seen:?} then {command}");
+                seen.push(command);
+                thread::sleep(step.delay);
+                stream
+                    .write_all(step.response.to_string().as_bytes())
+                    .expect("write response");
+            }
+            seen
+        });
+        let invocation = Invocation {
+            socket: path.clone(),
+            request: LocalControlRequest {
+                request_id: "req_setup_test".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("test-token".to_string()),
+                client_kind: Some(ottto_protocol::LocalClientKind::Cli),
+                client_install_owner: None,
+                command: setup_command(&setup_test_args(timeout_seconds), false),
+            },
+            output_mode: OutputMode::Json,
+            auto_start: false,
+        };
+        let code = run_setup(invocation, setup_test_args(timeout_seconds));
+        let seen = server.join().expect("fake daemon joins");
+        let _ = std::fs::remove_file(&path);
+        (code, seen)
+    }
+
+    fn setup_test_args(timeout: u64) -> SetupArgs {
+        SetupArgs {
+            claim_code: None,
+            no_browser: true,
+            no_wait: false,
+            timeout,
+            setup_run_id: None,
+            api_base_url: None,
+            json: true,
+        }
+    }
+
+    fn claim_started() -> serde_json::Value {
+        ok_reply(serde_json::json!({
+            "claim_code": "claim_test",
+            "claim_url": "https://ottto.net/setup/claim?code=claim_test",
+            "nonce": "nonce_test",
+            "expires_at": "2026-11-27T12:00:00Z",
+        }))
+    }
+
+    fn setup_completed() -> serde_json::Value {
+        ok_reply(serde_json::json!({
+            "status": "completed",
+            "already_connected": true,
+            "setup_run_id": "setup_test",
+            "next_question": null,
+            "next_action": null,
+            "actions": [],
+        }))
+    }
+
+    fn account(state: &str) -> serde_json::Value {
+        let user = (state == "connected").then(|| serde_json::json!({"id": "user_test"}));
+        ok_reply(serde_json::json!({"state": state, "user": user}))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_reports_a_claim_that_completes_past_the_deadline() {
+        let (code, seen) = run_setup_against(
+            vec![
+                reply("setup", error_reply("needs_user_action", "sign in")),
+                reply("auth_start", claim_started()),
+                ScriptedReply {
+                    command: "auth_complete",
+                    delay: Duration::from_millis(1_300),
+                    response: ok_reply(serde_json::json!({})),
+                },
+                reply("setup", setup_completed()),
+            ],
+            1,
+        );
+        assert_eq!(seen, ["setup", "auth_start", "auth_complete", "setup"]);
+        assert_eq!(code, 0, "a completed claim must not end as timed_out");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_timeout_rereads_the_account_while_the_claim_looks_pending() {
+        let (code, seen) = run_setup_against(
+            vec![
+                reply("setup", error_reply("needs_user_action", "sign in")),
+                reply("auth_start", claim_started()),
+                reply(
+                    "auth_complete",
+                    error_reply("needs_user_action", "setup claim is pending"),
+                ),
+                reply("account", account("connected")),
+                reply("setup", setup_completed()),
+            ],
+            1,
+        );
+        assert_eq!(
+            seen,
+            ["setup", "auth_start", "auth_complete", "account", "setup"]
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_still_times_out_when_the_account_is_not_connected() {
+        let (code, seen) = run_setup_against(
+            vec![
+                reply("setup", error_reply("needs_user_action", "sign in")),
+                reply("auth_start", claim_started()),
+                reply(
+                    "auth_complete",
+                    error_reply("needs_user_action", "setup claim is pending"),
+                ),
+                reply("account", account("claim_pending")),
+            ],
+            1,
+        );
+        assert_eq!(seen, ["setup", "auth_start", "auth_complete", "account"]);
+        assert_eq!(code, CliErrorCode::TimedOut.exit_code());
+    }
+
+    #[test]
+    fn account_payload_is_connected_needs_a_connected_user() {
+        let connected = serde_json::json!({
+            "state": "connected",
+            "user": {"id": "user_test", "email": null},
+            "organization": null,
+            "connected_at": "2026-11-27T00:00:00Z",
+            "last_refreshed_at": null,
+            "message": null,
+        });
+        assert!(account_payload_is_connected(&connected));
+        let mut no_user = connected.clone();
+        no_user["user"] = serde_json::Value::Null;
+        assert!(!account_payload_is_connected(&no_user));
+        for state in [
+            "claim_pending",
+            "reattach_required",
+            "not_connected",
+            "error",
+        ] {
+            let mut other = connected.clone();
+            other["state"] = serde_json::Value::String(state.to_string());
+            assert!(!account_payload_is_connected(&other), "{state}");
+        }
+        assert!(!account_payload_is_connected(&serde_json::Value::Null));
     }
 
     #[test]

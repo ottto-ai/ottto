@@ -15,6 +15,12 @@ If setup completes, exit code `0` means the Mac is connected. If setup needs
 browser or user action, the CLI can still return a parseable JSON payload with a
 nonzero exit code.
 
+`--timeout` bounds the wait for browser approval. An approval that lands at the
+end of the wait still ends as connected. Setup finishes the round that reports
+the approved claim before it checks the deadline. Setup also reads the account
+once at the deadline while the claim still looks pending. A `timed_out` result
+therefore means this Mac was not connected when the wait ended.
+
 ## Headless Setup
 
 Agents and SSH sessions should skip browser auto-open and return the claim
