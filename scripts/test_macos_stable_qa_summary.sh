@@ -516,6 +516,12 @@ if [[ -d "$stage_alias" ]]; then
 else
   echo "skip: case-alias cases need a case-insensitive volume"
 fi
+# [regression] A symlink followed by ".." is resolved before the "..".
+mkdir -p "$stage_dir/notes"
+ln -s "$stage_dir/notes" "$tmp_dir/stage-notes-link"
+expect_summary_error 2 "the pre-hosted summary must live outside the release folder" \
+  --record "$stage_record" --manifest "$stage_manifest" --stage pre-hosted --output "$tmp_dir/stage-notes-link/../pre-hosted.json"
+rmdir "$stage_dir/notes"
 # [regression] A hard link to the manifest outside the folder is still the manifest.
 ln "$stage_manifest" "$private_dir/manifest-hard-link.json"
 expect_summary_error 2 "the pre-hosted summary would replace the manifest or another release file" \

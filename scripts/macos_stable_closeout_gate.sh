@@ -458,7 +458,9 @@ try:
     if HOSTED_OWNER not in manifest.get("supported_install_owners", []) \
             or HOSTED_OWNER not in gate.get("required_install_owners", []):
         sys.exit(3)
-    release_dir = os.path.dirname(os.path.abspath(manifest_path))
+    # Physical paths: realpath resolves each symlink before a following "..",
+    # as the readers' open() does; abspath would collapse ".." first.
+    release_dir = os.path.dirname(os.path.realpath(manifest_path))
     # The immutable stage uploads the release folder without the summary; the
     # final stage adds it as the one late file. A summary already beside the
     # manifest would be uploaded early and could never be replaced.
@@ -471,7 +473,7 @@ try:
     if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
         sys.exit(5)
     release = identity(release_dir)
-    folder = os.path.realpath(os.path.dirname(os.path.abspath(evidence_path)))
+    folder = os.path.dirname(os.path.realpath(evidence_path))
     while True:
         if identity(folder) == release:
             sys.exit(6)

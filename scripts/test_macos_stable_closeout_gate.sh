@@ -1126,6 +1126,12 @@ dir="$(new_pre_hosted_case pre-hosted-linked-parent)"
 cp "$(pre_hosted_evidence pre-hosted-linked-parent)" "$dir/pre-hosted.json"
 ln -s "$dir" "$tmp_dir/release-folder-link"
 expect_pre_hosted_failure "$dir" "$tmp_dir/release-folder-link/pre-hosted.json" "$outside_error"
+# [regression] A symlink followed by ".." is resolved before the "..".
+dir="$(new_pre_hosted_case pre-hosted-link-dotdot)"
+mkdir -p "$dir/notes"
+cp "$(pre_hosted_evidence pre-hosted-link-dotdot)" "$dir/pre-hosted.json"
+ln -s "$dir/notes" "$tmp_dir/release-notes-link"
+expect_pre_hosted_failure "$dir" "$tmp_dir/release-notes-link/../pre-hosted.json" "$outside_error"
 # A symlinked folder that resolves outside the release folder is accepted.
 dir="$(new_pre_hosted_case pre-hosted-linked-outside)"
 ln -s "$pre_hosted_dir" "$tmp_dir/evidence-folder-link"
