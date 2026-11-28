@@ -634,18 +634,19 @@ fn census_continuation_rejects_unproven_native_bases() {
                 .get(&key)
                 .unwrap()
                 .unverified_for_test());
-            let due = next.files[&key].unverified_deadline().unwrap();
+            // A later idle pass, past the retired hourly interval, reads nothing.
+            let later = sampled_scan::now_seconds() + 3_601;
             let saved = session.save_reload(&mut next);
-            sampled_scan::set_test_now(Some(due + 1));
+            sampled_scan::set_test_now(Some(later));
             let (quiet, _, quiet_modes) = scan(saved);
             sampled_scan::set_test_now(None);
-            assert_eq!(quiet_modes, (0, 0, 1));
+            assert_eq!(quiet_modes, (0, 0, 0));
             assert!(!quiet
                 .claude_request_census
                 .get(&key)
                 .unwrap()
                 .unverified_for_test());
-            assert!(!quiet.files[&key].has_unverified_source());
+            assert!(!quiet.files[&key].has_sampled_tag());
             assert_eq!(
                 continuation_for_test(SnapshotSource::ClaudeCode, &scanner.cache, &quiet, &key)
                     .unwrap()

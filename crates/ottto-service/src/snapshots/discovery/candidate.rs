@@ -105,8 +105,9 @@ pub(in crate::snapshots) struct ScanCensus {
     pub(in crate::snapshots) observed_index_keys: BTreeSet<String>,
     pub(in crate::snapshots) removed_index_keys: BTreeSet<String>,
     /// The subset of `removed_index_keys` that are Claude census members
-    /// found absent beneath a still-present parent (N). Only these may drop
-    /// their unverified audit debt with their entry at the page merge.
+    /// found absent beneath a still-present parent (N). They skip growth
+    /// revalidation and retire their request-census record with their entry
+    /// at the page merge.
     pub(in crate::snapshots) claude_vanished_index_keys: BTreeSet<String>,
     /// Count-only parse-selection reasons for this page's candidates. A scan
     /// object has one source; Claude and Codex count here, nothing else does.
@@ -542,7 +543,6 @@ pub(crate) enum CandidateParseReason {
     TerminalDisposition,
     NewFile,
     AuthorityQuarantine,
-    Audit,
     BodyWitnessAdoption,
     UploadContext,
     ActivityOrQuarantineRetry,
@@ -556,12 +556,11 @@ pub(crate) enum CandidateParseReason {
     ForcedFamily,
 }
 
-pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
+pub(crate) const CANDIDATE_PARSE_REASON_COUNT: usize = 14;
 pub(crate) const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "terminal_disposition",
     "new_file",
     "authority_quarantine",
-    "audit",
     "body_witness_adoption",
     "upload_context",
     "activity_or_quarantine_retry",

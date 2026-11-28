@@ -46,25 +46,22 @@ pub(crate) enum AdminCause {
     Memo,
     /// A new file after a fresh index without prior-history evidence.
     NewFileFreshIndex,
-    Audit,
     #[default]
     Other,
 }
-const CAUSES: [&str; 8] = [
+const CAUSES: [&str; 7] = [
     "fingerprint_object",
     "fingerprint_unattributed",
     "adoption",
     "rearm",
     "memo",
     "new_file_fresh_index",
-    "audit",
     "other",
 ];
 /// Selection-time labels of a read: its restore outcome and retry provenance.
 #[derive(Clone, Copy, Debug, Default)]
 struct Context {
     restore: Option<&'static str>,
-    audit_cap: bool,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct Cells {
@@ -285,11 +282,9 @@ pub(crate) fn read(
         add(source, row + field, amount);
     }
 }
-/// Right after selection: the Tail restore outcome (`bypass`, `miss`,
-/// `hit_discarded_by_cap` or `hit`), with `(seal, indexed size, opening
-/// extent)` on a kept hit, and an outstanding audit-cap clear.
+/// Right after selection: the Tail restore outcome (`bypass`, `miss` or
+/// `hit`), with `(seal, indexed size, opening extent)` on a kept hit.
 pub(crate) fn read_context(key: &str, restore: &'static str, extent: Option<(u64, u64, u64)>) {
-    let audit_cap = super::rearm_cause::audit_cap_cleared(key);
     let restore = match extent.filter(|_| restore == "hit") {
         Some((seal, indexed, opening)) => match (seal < indexed, opening > indexed) {
             (true, true) => "hit.both",
@@ -303,15 +298,13 @@ pub(crate) fn read_context(key: &str, restore: &'static str, extent: Option<(u64
         if let Some(tag) = tags.files.get_mut(key) {
             tag.3 = Context {
                 restore: Some(restore),
-                audit_cap,
             };
         }
     });
 }
 /// Every completed body read, with or without an acquisition plan
 /// `(mode, native bytes)`. An `admin_other` read counts under
-/// `<cause>.<mode>`, `<cause>.restore.<outcome>` and
-/// `<cause>.retry.audit_cap_clear`. Without a plan its parser bytes count under
+/// `<cause>.<mode>` and `<cause>.restore.<outcome>`. Without a plan its parser bytes count under
 /// `no_plan`, never in `read`, so the planned rows still reconcile.
 pub(crate) fn admin_read(
     source: &str,
@@ -341,9 +334,6 @@ pub(crate) fn admin_read(
         let labels = [
             Some(mode),
             context.restore.map(|outcome| format!("restore.{outcome}")),
-            context
-                .audit_cap
-                .then(|| "retry.audit_cap_clear".to_owned()),
         ];
         for label in labels.into_iter().flatten() {
             let cells = tags.admin[slot]
@@ -645,7 +635,6 @@ mod tests {
             (C::Rearm, "rearm"),
             (C::Memo, "memo"),
             (C::NewFileFreshIndex, "new_file_fresh_index"),
-            (C::Audit, "audit"),
             (C::Other, "other"),
         ];
         for (n, (cause, name)) in (1u64..).zip(cases) {
@@ -704,13 +693,6 @@ mod tests {
             ),
             ("hit", None, full, "hit", "full:state_missing"),
             ("miss", None, full, "miss", "full:state_missing"),
-            (
-                "hit_discarded_by_cap",
-                Some((5, 10, 12)),
-                full,
-                "hit_discarded_by_cap",
-                "full:state_missing",
-            ),
             ("bypass", None, None, "bypass", "no_plan"),
         ];
         for (restore, extent, plan, outcome, mode) in cases {
@@ -727,32 +709,5 @@ mod tests {
             }
             assert!(page.get("read").is_none(), "{outcome}");
         }
-    }
-
-    /// [behaviour] Retry provenance: a read selected while its entry carries
-    /// an audit-cap clear; other reads carry none.
-    #[test]
-    fn admin_other_read_counts_retry_provenance() {
-        use crate::local_resource_diagnostics::rearm_cause::{self, Cause};
-        let mut entry = crate::snapshots::ScanIndexEntry {
-            source_file_fingerprint: "old".into(),
-            ..Default::default()
-        };
-        rearm_cause::clear("cap", &mut entry, Cause::AuditCapDelay);
-        let read_once = |key: &str, token| {
-            selected("pi", key.into(), token, AdminCause::Other);
-            read_context(key, "bypass", None);
-            admin_read("pi", key, None, 4);
-        };
-        for key in ["cap", "plain"] {
-            read_once(key, Token::AdminOther);
-        }
-        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
-        let labels = page["admin_other_read"].as_object().unwrap();
-        assert_eq!(labels["other.retry.audit_cap_clear"]["native_bytes"], 4);
-        assert_eq!(labels["other.retry.audit_cap_clear"]["files"], 1);
-        assert_eq!(labels["other.no_plan"]["files"], 2);
-        assert_eq!(labels["other.restore.bypass"]["native_bytes"], 8);
-        assert_eq!(labels.len(), 3);
     }
 }

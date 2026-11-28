@@ -121,7 +121,7 @@ struct Run {
     index: ScanIndex,
     result: SourceScanResult,
     modes: (usize, usize, usize),
-    reasons: [usize; 11],
+    reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
     native_bytes: u64,
 }
 fn raw_scan(
@@ -188,14 +188,20 @@ fn raw_scan_at(
             injected = true;
             after_start(&mut scan);
         }
-        let (modes, reasons, native_bytes) =
-            scan.sampling.as_ref().map_or(((0, 0, 0), [0; 11], 0), |c| {
+        let (modes, reasons, native_bytes) = scan.sampling.as_ref().map_or(
+            (
+                (0, 0, 0),
+                [0; crate::transcript_acquisition::FULL_REASON_COUNT],
+                0,
+            ),
+            |c| {
                 (
                     (c.full_files, c.tail_files, c.unchanged_files),
                     c.full_reasons,
                     c.native_bytes,
                 )
-            });
+            },
+        );
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete { index, scan, .. } => {
@@ -407,6 +413,7 @@ fn seed_predecessor_from(
 }
 // Both branches execute the real scanner. Unsupported CI verifies Full fallback;
 // only the separately compiler-bound supported run verifies actual reuse.
+#[track_caller]
 fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
         reuse
@@ -683,8 +690,11 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     assert_oracle(&f, &recovered, held);
 }
 
+/// [behaviour] A cached context survives telemetry-only cycles: the Tail's
+/// verification time stays, and an older build's complete tag on the entry is
+/// dropped without any read.
 #[test]
-fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
+fn cached_context_survives_telemetry_only_cycles() {
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -694,72 +704,42 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     assert_layout_mode(tail.modes, (0, 1, 0));
     let prior = settle(tail);
     let key = local_index_key(&f.path);
-    let debt = prior.files[&key].audit_obligation(now_seconds());
-    assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
+    assert!(!prior.files[&key].has_sampled_tag());
     // Claude continues from its route's head; the RAM-era test read its copy.
     let old_full = continuation(SOURCE, &cache, &prior, &key).map(|c| c.last_full_verified());
     f.write_rows(
         false,
         &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
     );
-    let (unchanged, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}))
-    });
+    let unchanged = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
     assert_layout_mode(unchanged.modes, (0, 0, 1));
     assert_oracle(&f, &unchanged, prior);
     let prior = settle(unchanged);
-    assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
-    assert_eq!(
-        continuation(SOURCE, &cache, &prior, &key).and_then(|c| c.audit_debt()),
-        debt
-    );
+    assert!(!prior.files[&key].has_sampled_tag());
     assert_eq!(
         continuation(SOURCE, &cache, &prior, &key).map(|c| c.last_full_verified()),
         old_full
     );
-    let page = diagnostics
-        .iter()
-        .find(|row| row["stage"] == "native_collection_page")
-        .unwrap();
-    assert_eq!(
-        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"], 0,
-        "telemetry refresh is not a scheduled audit retirement"
-    );
-    // Force a legitimately due existing obligation without changing intervals.
-    let mut due = prior;
-    let now = now_seconds();
-    let fingerprint = due.files[&key].source_file_fingerprint.clone();
-    assert!(due.stage_sampled_audit(
-        &key,
-        &fingerprint,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: now.saturating_sub(1)
-        }
+    // An older build's complete tag, long past its deadline: a tagged entry is
+    // not an owed revision and no audit selects it, so the unchanged file is
+    // not read at all (the old `1` here was the audit's quiet re-check).
+    let mut tagged = prior;
+    tagged.files.get_mut(&key).unwrap().scan_identity_version = Some(format!(
+        "{LOCAL_SCAN_INDEX_IDENTITY_VERSION}+sampled_unverified:v2:1:c"
     ));
-    let (audited, diagnostics) = crate::local_resource_diagnostics::capture(|| {
-        raw_scan(&f, due, Some(cache.clone()), |_| {})
-    });
-    assert_layout_mode(audited.modes, (0, 0, 1));
+    let upgraded = raw_scan(&f, tagged, Some(cache.clone()), |_| {});
+    assert_layout_mode(upgraded.modes, (0, 0, 0));
     assert_eq!(
-        audited.reasons[FullReason::AuditDue.slot()],
+        upgraded.reasons[FullReason::AuditDue.slot()],
         0,
-        "audit age never labels a native Full, even without a checkpoint"
-    );
-    let page = diagnostics
-        .iter()
-        .find(|row| row["stage"] == "native_collection_page")
-        .unwrap();
-    assert_eq!(
-        page["counts"]["sampled_acquisition"]["index_state_at_page_end"]["audit_quiet_retired"],
-        u64::from(crate::heap_layout_bound::layout_supported()),
-        "only the due, sampled validation retires the obligation"
+        "no Full is ever labelled an audit"
     );
     assert_eq!(
-        continuation(SOURCE, &cache, &audited.index, &key).and_then(|c| c.audit_debt()),
-        None
+        upgraded.index.files[&key].scan_identity_version.as_deref(),
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
     );
     assert_eq!(
-        continuation(SOURCE, &cache, &audited.index, &key).map(|c| c.last_full_verified()),
+        continuation(SOURCE, &cache, &upgraded.index, &key).map(|c| c.last_full_verified()),
         old_full
     );
 }

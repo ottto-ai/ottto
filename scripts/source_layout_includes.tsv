@@ -56,7 +56,6 @@ crates/ottto-service/src/snapshots/tests.rs	include	tests/e2_identity_pipeline_t
 crates/ottto-service/src/snapshots/tests.rs	include	tests/load_containment_tests.rs
 crates/ottto-service/src/snapshots/tests.rs	include	tests/reread_trigger_content_tests.rs
 crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs	path	retain_release_tests.rs
-crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs	path	sampled_audit/quiet_retirement_tests.rs
 crates/ottto-service/src/snapshots/upload_context_receipt_tests.rs	path	tests/privacy_flip_launch_tests.rs
 crates/ottto-service/src/snapshots/upload_context_receipt_tests.rs	path	privacy_flip_tests.rs
 crates/ottto-service/src/snapshots/upload_context_receipt_tests.rs	path	tests/upload_context_released_entry_fixture.rs

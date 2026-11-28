@@ -23,7 +23,8 @@ pub(in crate::snapshots) struct AccountMoveObservations {
 /// line in `discovery_retention!` and `unverified`, and its line in `owes`.
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) struct DiscoveryRetention<'a> {
-    /// Entries; an unverified sampled generation (`sampled_audit`) is owed.
+    /// Entries; one that owes a parse (an empty source fingerprint) is owed
+    /// (`sampled_audit::path_requires_verification`).
     pub(in crate::snapshots) files: &'a SharedMap<String, ScanIndexEntry>,
     /// Confirmed-empty keys: a nonempty entry with no final group outside
     /// this set is owed (`sampled_audit::path_requires_verification`).

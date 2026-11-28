@@ -121,15 +121,12 @@ HEAD_ONLY_FIXTURES = (
     "claude_status_s26_consented_pass",
 )
 
-# Every cycle each fixed row runs. The two bounded drain rows (c11_both,
-# c11_marker) are listed at their full length too, so a drain that gets
-# shorter or longer fails coverage instead of passing on both sides.
+# Every cycle each fixed row runs.
 _TRACE_CYCLES = {
     "c01_claude": 2, "c01_codex": 2, "c01_pi": 2,
     "c02": 2, "c03": 2, "c04": 2, "c04_cold": 1, "c05": 5,
     "c06_dropped": 2, "c06_lost_ack": 2, "c06_selected_save": 2,
-    "c07": 2, "c08": 2, "c09": 3, "c10": 3, "c11_account_hold": 2,
-    "c11_both": 16, "c11_marker": 17, "c12": 10, "c12_cold": 1,
+    "c07": 2, "c08": 2, "c09": 3, "c10": 3, "c12": 10, "c12_cold": 1,
     "c13": 3, "c13_cold": 1,
 }
 # Every cycle of every run of the five scheduling rows. A run's traces are

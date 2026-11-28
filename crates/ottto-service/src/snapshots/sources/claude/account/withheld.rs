@@ -809,7 +809,7 @@ impl ScanIndex {
             match previous.files.get(key) {
                 Some(committed) => {
                     let mut committed = committed.clone();
-                    // Account retry preserves its sampled audit obligation;
+                    // Account retry preserves its sealed-prefix tag;
                     // authority/family-only holds keep their existing restore
                     // semantics.
                     if let Some(working) = self.files.get(key).filter(|_| {
@@ -819,7 +819,7 @@ impl ScanIndex {
                                 .get(key)
                                 .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
                     }) {
-                        committed.carry_sampled_audit(working);
+                        committed.carry_prefix_provenance(working);
                     }
                     // A cleared working entry keeps its re-arm debt.
                     if reparse
@@ -905,22 +905,19 @@ impl ScanIndex {
 
     /// A partial checkpoint keeps the traversal after scanned keys were
     /// dequeued. Requeue new or source-changed revisions this save did not
-    /// keep; restored audit-due entries wait for the next walk so their
-    /// selection priority cannot starve the remaining census.
+    /// keep.
     pub(crate) fn requeue_unkept_scanned_keys(
         &mut self,
         source: SnapshotSource,
         working: &ScanIndex,
         locally_held: &BTreeSet<String>,
     ) {
-        let audit_now = sampled_scan::now_seconds();
         let unkept = working
             .files
             .iter()
             .filter(|(key, entry)| {
                 self.files.get(*key).map_or(true, |kept| {
                     kept.source_file_fingerprint != entry.source_file_fingerprint
-                        && !kept.audit_requires_full(audit_now)
                 }) && !working.file_is_held(key, entry, locally_held)
             })
             .map(|(key, _)| key.clone())
@@ -1288,7 +1285,7 @@ mod tests {
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
             for pass in 0..5 {
                 assert_eq!(
-                    index.candidate_decision_at(&file, 300),
+                    index.candidate_decision(&file),
                     CandidateDecision::Skip,
                     "post-memo backward clamp pass {pass} must not select a transcript read"
                 );
@@ -1364,7 +1361,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(
-                index.candidate_decision_at(&file, 300),
+                index.candidate_decision(&file),
                 CandidateDecision::Parse,
                 "{cause}"
             );

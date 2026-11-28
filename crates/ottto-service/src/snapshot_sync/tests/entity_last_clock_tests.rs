@@ -176,7 +176,7 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
         let progress_path = snapshot_upload_progress_path(&index_path);
         progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        checkpoint_partial_snapshot_index_with_audit_release(
+        checkpoint_partial_snapshot_index_with_hold_release(
             &p.index,
             &prior,
             &progress,

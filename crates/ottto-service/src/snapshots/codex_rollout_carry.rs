@@ -96,7 +96,7 @@ impl ScanIndex {
     }
 
     /// Physical equality refines the ordinary decision without replacing its
-    /// audit, evidence, exact-body/context or sidecar dependency authority.
+    /// evidence, exact-body/context or sidecar dependency authority.
     /// `side_moved` is set when the rollout is physically unchanged but its
     /// stored reduction binding differs from the current side facts: true when
     /// the head stored no binding at all, false otherwise.
@@ -104,7 +104,6 @@ impl ScanIndex {
         &self,
         candidate: &mut CandidateFile,
         metadata: &CodexTitleMetadata,
-        now: u64,
         body_witness_adoption: bool,
         side_moved: &mut Option<bool>,
     ) -> Result<Option<(File, CandidateDecision, Option<CandidateParseReason>)>> {
@@ -143,7 +142,7 @@ impl ScanIndex {
             .source_file_fingerprint
             .clone_from(&entry.source_file_fingerprint);
         let (decision, reason) =
-            self.candidate_decision_with_reason_gated(&logical, now, body_witness_adoption);
+            self.candidate_decision_with_reason_gated(&logical, body_witness_adoption);
         // A set-aside still uses the ordinary identity/read path before its
         // existing decision-chain override; a physical proof grants no release.
         Ok(

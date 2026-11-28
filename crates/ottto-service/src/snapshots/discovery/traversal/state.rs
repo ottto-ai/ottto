@@ -427,36 +427,20 @@ impl ScanResidueWitness {
     }
 }
 
-/// Starts `source`'s pass: the context quiet retirements bind to, and removal
-/// of the retired record directory beside `index_path` when this process
-/// holds the state-directory lock.
+/// Starts `source`'s pass: records it, and removes the retired record
+/// directory beside `index_path` when this process holds the state-directory
+/// lock.
 #[cfg(unix)]
 pub(crate) fn begin_source_pass(
     cache: &sampled_scan::SharedCache,
     support_dir: &Path,
     source: SnapshotSource,
     index_path: &Path,
-    namespace: &crate::transcript_acquisition::Scope,
-    identity_capture: bool,
 ) {
-    cache.quiet_begin_pass(source, index_path, namespace, identity_capture);
+    cache.note_pass_begun(source);
     if crate::locked_state_dir::held_for(support_dir).is_some() {
         cache.remove_retired_records(source, index_path);
     }
-}
-
-/// After the pass's final index save: this source's quiet retirements commit
-/// their marker through a second index save. A crash or a process without the
-/// state-directory lock leaves them scheduled.
-#[cfg(unix)]
-pub(crate) fn after_source_save(
-    cache: &sampled_scan::SharedCache,
-    support_dir: &Path,
-    source: SnapshotSource,
-    index: &mut ScanIndex,
-    index_path: &Path,
-) {
-    cache.quiet_reconcile(support_dir, source, index, index_path);
 }
 
 #[cfg(test)]

@@ -2576,7 +2576,7 @@ fn retry_case(conflict: bool) {
         let progress_path = snapshot_upload_progress_path(&index_path);
         progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        checkpoint_partial_snapshot_index_with_audit_release(
+        checkpoint_partial_snapshot_index_with_hold_release(
             &p.index,
             &committed,
             &progress,
@@ -6539,7 +6539,7 @@ fn settle_answering(
             cutoff_candidates: &page.cutoff_candidates,
             transport_fully_settled: settled.fully_settled,
             body_drains: Default::default(),
-            audit_release: None,
+            hold_release: None,
         },
     );
     accept_upload_context_acks_for_test(

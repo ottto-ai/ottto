@@ -183,9 +183,9 @@ fn apply_claude_reported_usage_with_index_and_rows(
     let legacy_request_owners = ownership.and_then(Result::ok);
 
     // Only FE-published sealed prefixes are excluded. Ordinary
-    // EOF-recomposed Tail/Unchanged bodies keep positive proof/posture behavior
-    // while still owing their Full audit. Request-census tail records used directly, without
-    // a complete current native body, remain observation-only evidence.
+    // EOF-recomposed Tail/Unchanged bodies keep positive proof/posture behavior.
+    // Request-census tail records used directly, without a complete current
+    // native body, remain observation-only evidence.
     // Bind prefix provenance by exact revision as well as physical path: a
     // logical family can differ from its index key, and the census record can be missing.
     let uncertified_revisions = index

@@ -5,7 +5,6 @@ use crate::transcript_acquisition::Checkpoint;
 
 pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const ENTRY_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const CACHE_ENTRIES: usize = 256;
 
 pub(crate) struct Retained<S> {
     pub(crate) checkpoint: Checkpoint,

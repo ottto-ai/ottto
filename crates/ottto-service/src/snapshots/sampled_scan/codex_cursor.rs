@@ -24,8 +24,7 @@ use super::super::*;
 use super::{state_bytes, SharedCache};
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{
-    AuditDebt, Checkpoint, FullReason, LossyPrefixIdentity, PrefixRefusal, Scope,
-    AUDIT_INTERVAL_SECONDS, SAMPLE_BYTES,
+    Checkpoint, FullReason, LossyPrefixIdentity, PrefixRefusal, Scope, SAMPLE_BYTES,
 };
 use std::os::unix::fs::FileExt;
 
@@ -907,7 +906,7 @@ impl HeapLayoutBound for FinishGrant {
 impl FinishGrant {
     /// Shared with in-page reads: callers must first pass the held-FD
     /// sealed-prefix certificate. This grants finish identity only; it does
-    /// not grant a checkpoint, audit credit, proof or admission.
+    /// not grant a checkpoint, Full credit, proof or admission.
     pub(in crate::snapshots) fn certified(dev: u64, ino: u64, extent: u64) -> Self {
         Self::Certified(SealedPrefix { dev, ino, extent })
     }
@@ -1059,11 +1058,8 @@ macro_rules! cursor_counters {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         pub(in crate::snapshots) struct Counters {
             $($(#[$doc])* pub(in crate::snapshots) $event: u64,)+
-            /// Largest `now - due` of an `audit_overdue` completion, in seconds.
-            pub(in crate::snapshots) audit_overdue_max_age_seconds: u64,
-
         }
-        crate::heap_layout_bound::fields!(Counters; $($event,)+ audit_overdue_max_age_seconds);
+        crate::heap_layout_bound::fields!(Counters; $($event,)+);
     };
 }
 crate::local_resource_diagnostics::codex_cursor_events!(cursor_counters);
@@ -1740,8 +1736,6 @@ pub(in crate::snapshots) enum PauseEnd {
 #[must_use]
 pub(in crate::snapshots) struct Publication {
     certified: bool,
-    /// `now - due` when it certified at or after its audit deadline.
-    overdue_age: Option<u64>,
     /// This read's withheld final record was applied at genuine EOF.
     eof_applied: bool,
 }
@@ -1758,13 +1752,12 @@ impl Publication {
 
 /// A completed attempt on a file that did not grow withheld an unterminated
 /// record after `offset` (N2). The sealed completion never counts it, so the
-/// index must not treat the full length as read: the caller stages `debt`
-/// and, when it retained the prefix copy, records the entry at `offset` so
-/// the next page tails `[offset, L)` with main's EOF behavior.
+/// index must not treat the full length as read: when the caller retained the
+/// prefix copy, it records the entry at `offset` so the next page tails
+/// `[offset, L)` with main's EOF behavior.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::snapshots) struct SealedFragment {
     pub(in crate::snapshots) offset: u64,
-    pub(in crate::snapshots) debt: AuditDebt,
 }
 
 /// How a cursor job's attempt ended at its frozen extent (§e.2 with C1).
@@ -1777,8 +1770,8 @@ pub(in crate::snapshots) enum JobEnd {
         publication: Publication,
         fragment: Option<SealedFragment>,
     },
-    /// Every object check held but the read was lossy: publish uncertified
-    /// with debt staged, exactly like today's lossy full read. A grown file
+    /// Every object check held but the read was lossy: publish uncertified,
+    /// exactly like today's lossy full read. A grown file
     /// publishes only through the same-object identity proof
     /// (`FinishGrant::LossySameObject`), revalidated in `finish`.
     Uncertified {
@@ -1789,8 +1782,7 @@ pub(in crate::snapshots) enum JobEnd {
     /// Nothing from this attempt is published or committed and its path
     /// stays pending: a necessary invalidation (replacement, shrink,
     /// same-size edit, held-FD sample mismatch, unknown witness, dependency
-    /// or counting change; counted), a tail past its audit deadline, or
-    /// unavailable evidence; the last two are uncounted.
+    /// or counting change; counted), or unavailable evidence (uncounted).
     Restart,
     /// The attempt was invalidated `MEMBER_CHANGED_AFTER` times in a row:
     /// disclose this strict debt and release the path.
@@ -2408,13 +2400,9 @@ pub(in crate::snapshots) fn finish_job(
         result => result,
     };
     // N2: on a quiescent file the withheld record will not be completed by
-    // an append; its bytes stay owed. The deadline is the read's own audit
-    // cadence (verified = start), so this never loops faster than audits.
+    // an append; its bytes stay owed.
     let fragment = (parser.reader.sealed_fragment() && !grown).then(|| SealedFragment {
         offset: read_start.saturating_add(parser.reader.last_complete_line_end()),
-        debt: AuditDebt {
-            due_unix_seconds: meta.started.saturating_add(AUDIT_INTERVAL_SECONDS),
-        },
     });
     // A parentless created thread is proven only by its complete physical
     // stream, so `finish` holds it on the withheld record; the memo keeps
@@ -2446,7 +2434,6 @@ pub(in crate::snapshots) fn finish_job(
                     cursor.counters.sealed_fragment_withheld += 1;
                 }
             }
-            Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
             Err(None) => cursor.counters.jobs_deferred_inputs += 1,
             Err(Some(PrefixRefusal::Invalidated(_) | PrefixRefusal::Dependency)) => {
                 member_changed = invalidated(cursor, &meta.key);
@@ -2485,27 +2472,19 @@ pub(in crate::snapshots) fn finish_job(
         job.parser.reader.sealed_prefix = Some(FinishGrant::LossySameObject(identity));
     }
     match result {
-        Ok(checkpoint) => {
-            let overdue_age = checkpoint
-                .audit_debt()
-                .filter(|debt| debt.due_unix_seconds <= now)
-                .map(|debt| now - debt.due_unix_seconds);
-            JobEnd::Certified {
-                checkpoint,
-                grown,
-                publication: Publication {
-                    certified: true,
-                    overdue_age,
-                    eof_applied,
-                },
-                fragment,
-            }
-        }
+        Ok(checkpoint) => JobEnd::Certified {
+            checkpoint,
+            grown,
+            publication: Publication {
+                certified: true,
+                eof_applied,
+            },
+            fragment,
+        },
         Err(Some(PrefixRefusal::Lossy)) => JobEnd::Uncertified {
             grown,
             publication: Publication {
                 certified: false,
-                overdue_age: None,
                 eof_applied,
             },
             fragment,
@@ -2655,7 +2634,6 @@ pub(in crate::snapshots) fn arm_group_member(
                 reader.reader.get_mut(),
                 None,
                 scope,
-                None,
                 super::now_seconds(),
             )
             .map_err(|_| GroupEnd::Strict)?;
@@ -3123,7 +3101,6 @@ impl SharedCache {
                 parked_entries: fixed(cursor.parked.len() as u64),
                 invalidation_entries: fixed(cursor.invalidations.len() as u64),
                 rotation_waiters: fixed(cursor.rotation.waiting.len() as u64),
-                lifetime_audit_overdue_max_age_seconds: fixed(now.audit_overdue_max_age_seconds),
             },
         }))
     }
@@ -3459,11 +3436,6 @@ impl SharedCache {
             }
             if finished && publication.eof_applied {
                 counters.eof_record_applied += 1;
-            }
-            if let Some(age) = publication.overdue_age.filter(|_| finished) {
-                counters.audit_overdue += 1;
-                counters.audit_overdue_max_age_seconds =
-                    counters.audit_overdue_max_age_seconds.max(age);
             }
         });
     }
@@ -4852,7 +4824,6 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     }
     targets.pending_finalization.push(PendingIndexFinalization {
         withheld_content: None,
-        sampled_audit_verified: false,
         codex_pending_recovery: index
             .files
             .get(&index_key)

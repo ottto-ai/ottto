@@ -195,11 +195,6 @@ impl OwnedSourceScan {
             "memo_hits": self.sampling.as_ref().map(|s| s.cache.counters_for_test().memo_hits),
             "parked_hits": self.sampling.as_ref().map(|s| s.cache.counters_for_test().parked_hits),
             "jobs_state_bound": self.sampling.as_ref().map(|s| s.cache.counters_for_test().jobs_state_bound),
-            "audit_marker_count": self.index.files.values().filter(|e| e.has_unverified_source()).count(),
-            "audit_slots": self.sampling.as_ref().map(|s| s.audit_slots),
-            "audits_started": self.sampling.as_ref().map(|s| s.audits_started),
-            "audits_completed": self.sampling.as_ref().map(|s| s.audits_completed),
-            "audit_cap_delay": self.sampling.as_ref().map(|s| s.audit_cap_delay),
         })
     }
 }
@@ -237,8 +232,7 @@ fn empty_scan_projection_is_read_only() {
         "active_key": null, "join_active": false, "candidates": 0,
         "traversal_pending": 0, "scanned_file_count": 0, "scanned_session_count": 0,
         "snapshots": 0, "pending_finalization": [], "sampled_read_bytes": null,
-        "memo_records": null, "memo_hits": null, "parked_hits": null, "jobs_state_bound": null, "lease_held": false, "full_files": null, "tail_files": null, "unchanged_files": null, "audit_slots": null, "audits_started": null,
-        "audits_completed": null, "audit_cap_delay": null, "audit_marker_count": 0,
+        "memo_records": null, "memo_hits": null, "parked_hits": null, "jobs_state_bound": null, "lease_held": false, "full_files": null, "tail_files": null, "unchanged_files": null,
     });
     assert_eq!(scan.trace_projection(), expected);
     assert_eq!(scan.trace_projection(), expected);
@@ -318,36 +312,5 @@ impl ScanIndex {
         json!({"holds":holds,"owed":owed,"pending":pending,"debt":debt,
             "copy_wait":copy_wait,
             "content_twins":self.claude_request_census.records().filter(|(_, r)| r.is_twin()).count()})
-    }
-
-    /// Seed the same held-at-cap state used by quiet-retirement controls.
-    /// These are index-only unavailable keys; no file is created or opened.
-    pub(crate) fn oracle_hold_at_audit_cap(
-        &mut self,
-        path: &Path,
-        deferred: &BTreeMap<String, u64>,
-        due: u64,
-    ) {
-        let key = local_index_key(path);
-        let fingerprint = self.files[&key].source_file_fingerprint.clone();
-        assert!(self.record_claude_account_deferred_holds(
-            [(key.as_str(), fingerprint.as_str())],
-            deferred
-        ));
-        assert!(self.claude_account_deferred_holds.contains_key(&key));
-        for n in 0..crate::transcript_cache::CACHE_ENTRIES {
-            let synthetic = format!("/synthetic-held-unavailable/{n}.jsonl");
-            let mut entry = self.files[&key].clone();
-            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-            self.files.insert(synthetic.clone(), entry);
-            assert!(self.stage_sampled_audit(
-                &synthetic,
-                &fingerprint,
-                crate::transcript_acquisition::AuditDebt {
-                    due_unix_seconds: due
-                }
-            ));
-        }
-        self.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
     }
 }

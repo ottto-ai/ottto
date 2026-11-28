@@ -147,9 +147,8 @@ fn acquire_items_with(
     Vec<SnapshotItem>,
 ) {
     let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
-    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
     let mode = parser
-        .prepare_acquisition(old.map(Box::new), scope, debt, now)
+        .prepare_acquisition(old.map(Box::new), scope, now)
         .unwrap();
     let guards = parser
         .reader
@@ -420,7 +419,7 @@ fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     }
 }
 #[test]
-fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
+fn cache_lifecycle_native_retention_preserves_body_and_verification() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -443,20 +442,14 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
     let (mut parser, expected, scope) = native_parser(&fixture, SnapshotSource::ClaudeCode);
     assert_eq!(
         parser
-            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .prepare_acquisition(old.map(Box::new), &scope, 101)
             .unwrap(),
         ReadMode::Tail
     );
     while !parser.step().unwrap() {}
     let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
-    assert_eq!(
-        certificate
-            .checkpoint
-            .audit_debt()
-            .unwrap()
-            .due_unix_seconds,
-        3700
-    );
+    // A Tail carries the Full's verification time; it earns no credit.
+    assert_eq!(certificate.checkpoint.last_full_verified(), 100);
     let parsed = parser
         .finish(
             &expected,
@@ -482,7 +475,7 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
 }
 
 #[test]
-fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
+fn sampled_native_partial_eof_or_copy_refusal_keeps_the_certificate() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -507,33 +500,15 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
             let (mut parser, expected, scope) = native_parser(&fixture, source);
             assert_eq!(
                 parser
-                    .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+                    .prepare_acquisition(old.map(Box::new), &scope, 101)
                     .unwrap(),
                 ReadMode::Tail
-            );
-            assert_eq!(
-                parser
-                    .reader
-                    .acquisition
-                    .as_ref()
-                    .unwrap()
-                    .audit_obligation()
-                    .unwrap()
-                    .due_unix_seconds,
-                3700
             );
             while !parser.step().unwrap() {}
             let certificate = parser.retain_reduction(&scope, 101).unwrap().unwrap();
             // A partial final row stays past the sealed checkpoint.
             assert_eq!(certificate.unsealed, partial);
-            assert_eq!(
-                certificate
-                    .checkpoint
-                    .audit_debt()
-                    .unwrap()
-                    .due_unix_seconds,
-                3700
-            );
+            assert_eq!(certificate.checkpoint.last_full_verified(), 100);
             let mut items = parser
                 .finish(
                     &expected,
@@ -567,7 +542,7 @@ fn sampled_native_wrong_provider_cache_refuses_reuse() {
     let scope = Scope("synthetic-native-ClaudeCode".into());
     assert!(matches!(
         parser
-            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .prepare_acquisition(old.map(Box::new), &scope, 101)
             .unwrap(),
         ReadMode::Full(_)
     ));
@@ -614,7 +589,7 @@ const LINEAGE_APPENDS: [(LineageUsage, LineageUsage); 2] = [
 /// The reduction a sampled full read retains, before `retain_reduction`.
 fn lineage_state(fixture: &Fixture, metadata: &CodexTitleMetadata) -> SnapshotAccumulator {
     let (mut parser, _, scope) = native_parser_with(fixture, SnapshotSource::Codex, metadata);
-    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+    parser.prepare_acquisition(None, &scope, 100).unwrap();
     while !parser.step().unwrap() {}
     parser.accumulator.clone()
 }
@@ -858,17 +833,6 @@ struct ScanFixture {
     file: Fixture,
 }
 impl ScanFixture {
-    // Claude audit fixtures need no private prompt. Codex discovery requires
-    // its real session_meta header, which also carries a private replay window.
-    fn without_prompt(self) -> Self {
-        let header: Value =
-            serde_json::from_str(&fs::read_to_string(&self.file.0).unwrap()).unwrap();
-        if header["type"] == "user" {
-            fs::write(&self.file.0, b"").unwrap();
-        }
-        self
-    }
-
     fn new(source: SnapshotSource) -> Self {
         let file = Fixture::new(source);
         let dir = file.0.with_extension("scan-fixture");
@@ -1132,7 +1096,7 @@ fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value 
 }
 
 #[test]
-fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
+fn sampled_production_both_scanners_reuse_native_state_across_restart() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1169,7 +1133,8 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
             index = next;
         }
         let key = local_index_key(&fixture.file.0);
-        let due = index.files[&key].unverified_deadline().unwrap();
+        let plain = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_owned());
+        assert_eq!(index.files[&key].scan_identity_version, plain);
         let index_path = fixture.dir.join("index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
         // RAM loss: a restart keeps only the state database.
@@ -1177,28 +1142,20 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         *restarted.test_route.lock().unwrap() = cache.test_route.lock().unwrap().take();
         let cache = restarted;
         let loaded = ScanIndex::load(&index_path).unwrap();
-        assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
-        // A cold unchanged no-op may wait until its due hour, but RAM loss must
-        // not erase the independent deadline. Due selection overrides skip.
-        let (mut loaded, idle, _) =
+        assert_eq!(loaded.files[&key].scan_identity_version, plain);
+        // The unchanged file stays quiet after RAM loss, and a day later
+        // too: no age re-reads it Full.
+        let (loaded, idle, modes) =
             production_scan(&fixture, source, loaded, Some(cache.clone()), "account-a");
         assert!(idle.snapshots.is_empty());
-        assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
-        loaded
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .set_unverified_deadline(1);
-        let (audited, corrected, modes) =
+        assert_eq!(modes.0, 0, "no Full after restart {source:?}");
+        sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 86_400));
+        let (later, idle, modes) =
             production_scan(&fixture, source, loaded, Some(cache), "account-a");
-        assert_eq!(modes, (1, 0, 0));
-        assert!(!audited.files[&key].has_unverified_source());
-        let (_, full, _) =
-            production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
-        assert_eq!(
-            production_body(source, corrected),
-            production_body(source, full)
-        );
+        sampled_scan::set_test_now(None);
+        assert!(idle.snapshots.is_empty());
+        assert_eq!(modes.0, 0, "no Full a day later {source:?}");
+        assert_eq!(later.files[&key].scan_identity_version, plain);
     }
 }
 
@@ -1455,38 +1412,9 @@ fn sampled_production_account_scope_change_and_new_priority_force_real_full_repl
     );
     let key = local_index_key(&fixture.file.0);
     assert!(index.files[&key].codex_applied_tier_receipt_required);
-    assert!(!index.files[&key].has_unverified_source());
+    assert!(!index.files[&key].has_sampled_tag());
     let (_, full, _) = production_scan(&fixture, source, ScanIndex::default(), None, "account-a");
     assert_eq!(production_body(source, scan), production_body(source, full));
-}
-#[test]
-fn sampled_production_old_idle_source_remains_eligible_for_due_audit() {
-    use std::time::{Duration, UNIX_EPOCH};
-    let source = SnapshotSource::ClaudeCode;
-    let fixture = ScanFixture::new(source);
-    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
-    let (mut index, _, _) = production_scan(&fixture, source, ScanIndex::default(), None, "a");
-    let key = local_index_key(&fixture.file.0);
-    let fingerprint = index.files[&key].source_file_fingerprint.clone();
-    assert!(index.stage_sampled_audit(
-        &key,
-        &fingerprint,
-        crate::transcript_acquisition::AuditDebt {
-            due_unix_seconds: 1
-        }
-    ));
-    let file = OpenOptions::new()
-        .write(true)
-        .open(&fixture.file.0)
-        .unwrap();
-    file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
-        .unwrap();
-    let (audited, scan, _) = production_scan(&fixture, source, index, None, "a");
-    assert!(
-        !scan.snapshots.is_empty(),
-        "all three native age gates must permit due verification"
-    );
-    assert!(!audited.files[&key].has_unverified_source());
 }
 /// [money] A retained reduction whose priority decisions all hold reuses; one
 /// holding a priority decision an earlier build applied from Codex logs re-reads
@@ -1503,7 +1431,7 @@ fn sampled_native_logs_priority_decision_rereads_in_full() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     assert_eq!(
         parser
-            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .prepare_acquisition(old.map(Box::new), &scope, 101)
             .unwrap(),
         ReadMode::Unchanged
     );
@@ -1518,7 +1446,7 @@ fn sampled_native_logs_priority_decision_rereads_in_full() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     assert!(matches!(
         parser
-            .prepare_acquisition(old.map(Box::new), &scope, None, 101)
+            .prepare_acquisition(old.map(Box::new), &scope, 101)
             .unwrap(),
         ReadMode::Full(_)
     ));
@@ -1882,9 +1810,6 @@ fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit(
         let admission = serde_json::to_string(counts).unwrap();
         assert!(!admission.contains("expired"));
         assert!(!admission.contains("evicted"));
-        assert!(rows
-            .iter()
-            .all(|row| row["stage"] != "sampled_audit_pace_alarm"));
     }
 }
 
@@ -1941,45 +1866,17 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
                 assert_eq!(events["full_reasons"], json!({"state_missing": modes.0}));
                 println!("RESOURCE_V2_COLD_FIXTURE {record}");
             }
-            let gauges = &counters["index_state_at_page_end"];
-            assert_eq!(
-                gauges["pending_audits"],
-                next.files
-                    .values()
-                    .filter(|entry| entry.has_unverified_source())
-                    .count()
-            );
-            let now = sampled_scan::now_seconds();
-            assert_eq!(
-                gauges["overdue_audits"],
-                next.files
-                    .values()
-                    .filter(|entry| entry.audit_requires_full(now))
-                    .count()
-            );
-            assert_eq!(
-                gauges["oldest_due_age_seconds"],
-                next.files
-                    .values()
-                    .filter_map(|entry| entry.audit_obligation(now))
-                    .map(|debt| now.saturating_sub(debt.due_unix_seconds))
-                    .max()
-                    .unwrap_or(0)
-            );
-            for key in ["pending_audits", "overdue_audits", "oldest_due_age_seconds"] {
-                assert!(events.get(key).is_none());
-                assert!(counters.get(key).is_none());
-            }
+            // The retired audit fields and gauges are gone from the page.
+            assert!(counters.get("index_state_at_page_end").is_none());
             for key in [
-                "priority_full_replays",
                 "audits_started",
                 "audits_completed",
                 "max_start_overdue_seconds",
                 "max_completion_overdue_seconds",
             ] {
-                assert!(events[key].is_u64());
-                assert!(gauges.get(key).is_none());
+                assert!(events.get(key).is_none(), "{key}");
             }
+            assert!(events["priority_full_replays"].is_u64());
 
             assert_eq!(
                 bytes.0,
@@ -2001,39 +1898,6 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             }
             index = next;
         }
-        let key = local_index_key(&f.file.0);
-        let due = sampled_scan::now_seconds();
-        let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            sampled_scan::transition_fixture::with_scan_clock(due + 7, || {
-                production_scan_at_with_setup(
-                    &f,
-                    source,
-                    index,
-                    Some(cache.clone()),
-                    "resource-fixture",
-                    NOW,
-                    |scan| {
-                        // The entry is observed, but its next read is outside
-                        // this page. Only the close-time clock sees it overdue.
-                        scan.identified_candidates.clear();
-                        scan.census.observed_index_keys.insert(key.clone());
-                        scan.audit_now = due - 1;
-                        let entry = scan.index.files.get_mut(&key).unwrap();
-                        entry.set_unverified_deadline(due);
-                        assert!(!entry.audit_requires_full(scan.audit_now));
-                    },
-                );
-            });
-        });
-        let page = records
-            .iter()
-            .find(|row| row["stage"] == "native_collection_page")
-            .unwrap();
-        let gauges = &page["counts"]["sampled_acquisition"]["index_state_at_page_end"];
-        assert_eq!(gauges["pending_audits"], 1);
-        assert_eq!(gauges["overdue_audits"], 1);
-        assert_eq!(gauges["oldest_due_age_seconds"], 7);
-
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
         });
@@ -2073,9 +1937,9 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
             Some(cache.clone()),
             "scan-pressure",
         );
-        // More cold admissions than the shared count cap. Their old source
-        // timestamps must not promote them over the recent active session.
-        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+        // Many cold admissions. Their old source timestamps must not
+        // promote them over the recent active session.
+        for _ in 0..272 {
             let historical = ScanFixture::new(source);
             historical
                 .file
@@ -2127,7 +1991,7 @@ fn side_certificate_reports_unsealed_without_cache_events() {
     let certify = |fixture: &Fixture| {
         let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
         assert!(matches!(
-            parser.prepare_acquisition(None, &scope, None, 100).unwrap(),
+            parser.prepare_acquisition(None, &scope, 100).unwrap(),
             ReadMode::Full(_)
         ));
         while !parser.step().unwrap() {}
@@ -2135,7 +1999,7 @@ fn side_certificate_reports_unsealed_without_cache_events() {
     };
     let retain = |fixture: &Fixture| {
         let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
-        parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+        parser.prepare_acquisition(None, &scope, 100).unwrap();
         while !parser.step().unwrap() {}
         parser.retain_reduction(&scope, 100).unwrap().unwrap()
     };
@@ -2175,6 +2039,9 @@ fn side_certificate_reports_unsealed_without_cache_events() {
 }
 
 mod stage2pre_in_page_tail_tests;
+
+#[cfg(unix)]
+mod sampled_read_oracle_tests;
 
 /// Codex rollout with two compaction shapes: a marker followed by an exact
 /// repeat of the last record (not counted) and a zero-size record (skipped)
@@ -2545,10 +2412,6 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     assert_eq!(body, oracle(&fixture, source));
     assert_eq!(uploaded_cache_breaks(&body), breaks(70));
 }
-
-#[cfg(unix)]
-#[path = "sampled_audit/quiet_retirement_tests.rs"]
-mod audit_retirement_tests;
 
 /// [regress] A new file was incorrectly counted as a recordless content change.
 #[test]

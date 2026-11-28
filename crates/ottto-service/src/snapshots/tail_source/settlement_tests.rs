@@ -96,7 +96,6 @@ pub(super) fn finalize(
     scan.snapshots = items;
     scan.pending_finalization.push(PendingIndexFinalization {
         withheld_content: None,
-        sampled_audit_verified: false,
         codex_pending_recovery: false,
         index_key: key.to_owned(),
         source_file_fingerprint: "a".repeat(64),
@@ -130,7 +129,7 @@ fn a_first_read_crash_reads_whole_again() {
     let path = route.dir.join("a.jsonl");
     let (decision, _) = route
         .index
-        .candidate_decision_with_reason_at(&candidate(&path), NOW);
+        .candidate_decision_with_reason(&candidate(&path));
     assert_eq!(decision, CandidateDecision::Parse);
     let (load, records) = loaded(&route, &path, &key);
     assert!(matches!(load, Load::Cold(None)));
@@ -152,7 +151,7 @@ fn a_head_ahead_of_progress_resumes_from_the_head() {
     route.index.files.insert(key.clone(), behind);
     let (decision, _) = route
         .index
-        .candidate_decision_with_reason_at(&candidate(&path), NOW);
+        .candidate_decision_with_reason(&candidate(&path));
     assert_eq!(decision, CandidateDecision::Parse);
     let (load, _) = loaded(&route, &path, &key);
     let Load::Reused(taken, Some(_)) = load else {
@@ -216,7 +215,7 @@ fn a_load_earns_no_credit() {
         panic!("the committed head is reused");
     };
     let mut parser = route.open(&path);
-    let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), None, NOW + 1_000) else {
+    let Ok(mode) = parser.prepare_acquisition(Some(taken), &scope(), NOW + 1_000) else {
         panic!("the read prepares");
     };
     assert!(matches!(mode, ReadMode::Tail));
@@ -273,7 +272,7 @@ fn a_proven_change_names_its_full() {
     std::fs::write(&path, lines(3).join("\n") + "\n").unwrap();
     let mut parser = route.open(&path);
     let Ok(ReadMode::Full(FullReason::StateMissing)) =
-        parser.prepare_acquisition(None, &scope(), None, NOW)
+        parser.prepare_acquisition(None, &scope(), NOW)
     else {
         panic!("no checkpoint");
     };
@@ -292,7 +291,6 @@ fn the_shipped_selections_reuse_stored_state() {
     let reuses_stored = |reason, grew| reuses_stored(&index, "a.jsonl", reason, grew, false);
     for reason in [
         CandidateParseReason::TranscriptChanged,
-        CandidateParseReason::Audit,
         CandidateParseReason::UnknownOutcome,
         CandidateParseReason::SourceChanged,
         CandidateParseReason::Rearmed,
@@ -303,7 +301,6 @@ fn the_shipped_selections_reuse_stored_state() {
         assert!(reuses_stored(Some(reason), false), "{reason:?}");
     }
     assert!(!late_evidence(CandidateParseReason::TranscriptChanged));
-    assert!(!late_evidence(CandidateParseReason::Audit));
     for reason in [
         CandidateParseReason::NewFile,
         CandidateParseReason::UploadContext,

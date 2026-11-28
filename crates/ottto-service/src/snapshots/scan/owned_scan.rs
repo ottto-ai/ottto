@@ -176,7 +176,6 @@ struct FamilyFacts<'a> {
     source: SnapshotSource,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
-    audit_now: u64,
     discovery_growth: &'a crate::snapshots::discovery_growth::Page,
     /// The walk saw every directory and file, so its observed keys are the
     /// whole family membership.
@@ -248,7 +247,7 @@ fn schedule_claude_twins(
                 &mut ScanCensus::default(),
                 facts.window(index),
             )
-            .map(|(twin, _)| index.candidate_decision_with_reason_at(&twin, facts.audit_now));
+            .map(|(twin, _)| index.candidate_decision_with_reason(&twin));
             seed.is_none_or(|(decision, _)| decision == CandidateDecision::Parse)
                 .then_some((
                     candidate.path.as_path(),
@@ -406,8 +405,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) roots: Vec<PathBuf>,
     pub(in crate::snapshots) index: ScanIndex,
     pub(in crate::snapshots) collected_at: String,
-    /// One clock sample for this page's audit selection and retirement decisions.
-    pub(in crate::snapshots) audit_now: u64,
     pub(in crate::snapshots) backfill_window_days: u64,
     pub(in crate::snapshots) file_limit: usize,
     /// See `SourceScanResult::first_read_progress`.
@@ -639,7 +636,6 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
-            audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
             first_read_progress: false,
@@ -747,7 +743,6 @@ impl OwnedSourceScan {
             return blocked;
         }
 
-        let audit_now = sampled_scan::now_seconds();
         // Every source: a non-Claude page emits only its retained-cache events.
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::page()
@@ -930,7 +925,8 @@ impl OwnedSourceScan {
                 file_limit,
             );
         }
-        let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
+        let growth_wake =
+            sampled_audit::expired_growth_claims(source, index, sampled_scan::now_seconds());
         #[cfg(test)]
         trace_projection::permute_candidates(index.traversal.as_mut().expect("traversal"));
         let tier_gate = TierGate::new(source, index);
@@ -990,8 +986,8 @@ impl OwnedSourceScan {
         // The turn a freshness page owes alternates census (C) and ordinary
         // (O) work while queued work neither of those selects waits: F C F O;
         // with no such work it stays F C F C. Fresh keeps its cadence. An
-        // ordinary turn is dedicated too: due audits, then queued non-member,
-        // non-fresh paths (archives, plain re-reads). Order only.
+        // ordinary turn is dedicated too: queued non-member, non-fresh paths
+        // (archives, plain re-reads). Order only.
         let ordinary_turn = source == SnapshotSource::Codex
             && selection_limit > 0
             && traversal.codex_freshness_yield
@@ -1036,20 +1032,6 @@ impl OwnedSourceScan {
             let ordinary_only = |candidate: &ScanTraversalPath| {
                 !candidate.census_member && !codex_fresh_data_pending(candidate, index)
             };
-            if ordinary_turn {
-                traversal.pending_candidates.retain(|candidate| {
-                    let due = pending_paths.len() < limit
-                        && index
-                            .files
-                            .get(&local_index_key(&candidate.path))
-                            .is_some_and(|entry| entry.audit_requires_full(audit_now))
-                        && ordinary_only(candidate);
-                    if due {
-                        pending_paths.push(candidate.clone());
-                    }
-                    !due
-                });
-            }
             // A fresh page first gives up to half its slots to fresh plain
             // rollouts in queue order, so a hinted compressed backlog cannot
             // hold recent sessions back. The rest stays FIFO, archives included.
@@ -1105,7 +1087,7 @@ impl OwnedSourceScan {
             }
         }
         // Freeze dedicated primary work, retry riders and census fill here;
-        // later hints and audits cannot displace the selected prefix.
+        // later hints cannot displace the selected prefix.
         let selection_limit = if freshness_page || census_page || ordinary_turn {
             pending_paths.len()
         } else {
@@ -1127,20 +1109,7 @@ impl OwnedSourceScan {
                 !due
             });
         }
-        while pending_paths.len() < selection_limit {
-            let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
-                index
-                    .files
-                    .get(&local_index_key(&candidate.path))
-                    .is_some_and(|entry| entry.audit_requires_full(audit_now))
-            }) else {
-                break;
-            };
-            if let Some(candidate) = traversal.pending_candidates.remove(position) {
-                pending_paths.push(candidate);
-            }
-        }
-        let audited = pending_paths.len();
+        let prioritized = pending_paths.len();
         for _ in pending_paths.len()..hinted_budget {
             let Some(position) = traversal
                 .pending_candidates
@@ -1178,10 +1147,11 @@ impl OwnedSourceScan {
             // to the page's singleton budget before any re-read (a watcher
             // hint for a path this generation already processed), so each
             // page completes a first read and re-reads cannot starve one.
-            // Audits keep their place; the order is otherwise unchanged.
+            // Earlier priority selections keep their place; the order is
+            // otherwise unchanged.
             // Queued retry leases ride ahead of this order.
             let (members, rereads): (Vec<_>, Vec<_>) = pending_paths
-                .split_off(audited)
+                .split_off(prioritized)
                 .into_iter()
                 .partition(|candidate| candidate.census_member);
             pending_paths.extend(members);
@@ -1464,7 +1434,6 @@ impl OwnedSourceScan {
             source,
             census_unix_seconds,
             backfill_window_days,
-            audit_now,
             discovery_growth: &resource_probe.discovery_growth,
             membership_authoritative: claude_family_membership_is_authoritative,
             twin_groups: &claude_twin_groups,
@@ -1526,7 +1495,6 @@ impl OwnedSourceScan {
             roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
-            audit_now,
             backfill_window_days,
             file_limit,
             first_read_progress,
@@ -1692,7 +1660,6 @@ fn retry_grown_file(
     flags: &BTreeMap<String, (bool, bool)>,
     candidate: &CandidateFile,
     census: &mut ScanCensus,
-    cap_delay: bool,
 ) {
     if retry_file_once(index, flags, candidate, None) {
         return;
@@ -1710,9 +1677,6 @@ fn retry_grown_file(
         .get(&key)
         .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some())
     {
-        if cap_delay {
-            sampled_audit::queue_cap_retry(index, candidate);
-        }
         sampled_scan::codex_cursor::release_path(index, candidate, true, true);
     } else {
         sampled_scan::codex_cursor::dequeue(index, candidate);

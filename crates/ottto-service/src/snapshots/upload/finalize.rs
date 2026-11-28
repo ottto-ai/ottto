@@ -7,7 +7,6 @@ use crate::snapshots::*;
 #[derive(Debug, Clone)]
 pub(in crate::snapshots) struct PendingIndexFinalization {
     pub(in crate::snapshots) withheld_content: Option<withheld_account::Seen>,
-    pub(in crate::snapshots) sampled_audit_verified: bool,
     pub(in crate::snapshots) codex_pending_recovery: bool,
     pub(in crate::snapshots) index_key: String,
     pub(in crate::snapshots) source_file_fingerprint: String,
@@ -213,19 +212,6 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
             .map(snapshot_file_upload_body_set_hex);
-        if pending.sampled_audit_verified {
-            crate::local_resource_diagnostics::sampled_audit_comparison(
-                source.api_slug(),
-                (
-                    final_group_fingerprint.as_deref(),
-                    pending.previous_snapshot_fingerprint.as_deref(),
-                ),
-                (
-                    final_upload_body_witness.as_deref(),
-                    pending.previous_upload_body_witness.as_deref(),
-                ),
-            );
-        }
         let quarantine_retry_required = result.snapshots.iter().any(|snapshot| {
             snapshot.source_file_fingerprint.as_deref()
                 == Some(pending.source_file_fingerprint.as_str())
@@ -523,4 +509,4 @@ pub(in crate::snapshots) fn snapshot_semantic_activity_at(item: &SnapshotItem) -
         .map(|(_, value)| value.to_string())
 }
 
-crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; withheld_content, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);

@@ -586,8 +586,8 @@ fn claude_queued_member_deleted_while_its_remove_hint_is_deduped_retires_as_remo
     assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
 }
 
-/// A deleted Claude subagent of a quarantined family, carrying unverified
-/// audit debt, in a forced family reparse while membership is not
+/// A deleted Claude subagent of a quarantined family, carrying an older
+/// build's sampled tag, in a forced family reparse while membership is not
 /// authoritative (a rejected symlink keeps it so here). The forced
 /// enumeration re-adds it from the index every such generation.
 #[cfg(unix)]
@@ -620,11 +620,7 @@ impl ForcedFamilyFixture {
         index.insert_retry_pending_claude_authority_for_test(FORCED_ROOT);
         let mut entry = super::super::tests::manifest_index_entry(Some("held-member-body"));
         entry.source_file_fingerprint = "held-member-revision".to_string();
-        entry.scan_identity_version = Some(format!(
-            "{}:4000000000",
-            super::super::sampled_audit::UNVERIFIED_IDENTITY
-        ));
-        assert!(entry.has_unverified_source());
+        tag_as_older_build(&mut entry);
         index
             .files
             .insert(local_index_key(&self.member_path), entry);
@@ -634,17 +630,17 @@ impl ForcedFamilyFixture {
 
 /// [behaviour] N-T3: main records the forced member's NotFound as loss in every such
 /// generation. With the parent present the first one is a removal that
-/// retires the entry together with its unverified audit marker
-/// (counted), so the next generation no longer enumerates the member and
-/// records no NotFound at all.
+/// retires the entry, tag and snapshot incidence included, through the
+/// ordinary absence exit, so the next generation no longer enumerates the
+/// member and records no NotFound at all.
 #[cfg(unix)]
 #[test]
 fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
     let fixture = ForcedFamilyFixture::new("absence-forced-family");
     let member_key = local_index_key(&fixture.member_path);
     let mut index = fixture.index();
-    // Audit retirement keeps snapshot incidence; proven absence now releases the
-    // unfulfillable account hold without granting body/ACK credit.
+    // Proven absence releases the unfulfillable account hold without
+    // granting body/ACK credit.
     let held = std::collections::BTreeSet::from(["held-member-body".to_string()]);
     index
         .file_snapshot_fingerprints
@@ -657,7 +653,7 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
     assert!(index
         .claude_account_deferred_holds
         .contains_key(&member_key));
-    assert!(index.files[&member_key].has_unverified_source());
+    assert!(index.files[&member_key].has_sampled_tag());
     for (at, now) in [(LATER, 1_600), (RETRY, 2_200)] {
         super::super::sampled_scan::set_test_now(Some(now));
         let (result, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -673,10 +669,7 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
         // temporary stage/carrier, including zero on the next generation.
         // Count across ALL records so a second emitter cannot hide behind
         // a different stage when these paths run alongside the aged-growth checks.
-        for (key, expected) in [
-            ("audit_retired_absent", serde_json::json!({"events": 1})),
-            ("withheld_hold_released", serde_json::json!({"deleted": 1})),
-        ] {
+        for (key, expected) in [("withheld_hold_released", serde_json::json!({"deleted": 1}))] {
             let emissions = rows
                 .iter()
                 .filter(|row| row["counts"].get(key).is_some())
@@ -697,9 +690,8 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
         assert_eq!(sites, expected_sites, "{at}: retired once");
         assert_eq!(events, [[0; 4], [retired, 0, 0, 0], [0; 4]], "{at}");
         assert_eq!(
-            vanished,
-            [[0; VANISHED], [retired, 0], [0; VANISHED]],
-            "{at}: the dropped audit debt is counted once"
+            vanished, [[0; VANISHED]; 3],
+            "{at}: no request-census record to drop"
         );
         assert!(
             pages.iter().all(|page| page.disappeared_file_count == 0),
@@ -711,15 +703,13 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
         assert_eq!(traversal.counts.symlink_rejected_count, 1);
         assert!(
             !index.files.contains_key(&member_key),
-            "{at}: the entry and its marker are gone"
+            "{at}: the entry and its tag are gone"
         );
-        assert!(!index
-            .files
-            .values()
-            .any(|entry| entry.has_unverified_source()));
+        assert!(!index.files.values().any(|entry| entry.has_sampled_tag()));
         assert_eq!(
             index.file_snapshot_fingerprints.get(&member_key),
-            Some(&held)
+            None,
+            "{at}: the ordinary exit drops incidence, as for an untagged entry"
         );
         assert_eq!(
             index
@@ -734,7 +724,7 @@ fn claude_deleted_audit_debt_member_of_forced_quarantined_family_is_removal() {
 }
 
 /// The missing-parent member is now a removal at its own NotFound; the
-/// ancestor's nomination still retires its audit debt only once. Retain
+/// ancestor's nomination still retires it only once. Retain
 /// the historical test ID for discovery compatibility.
 #[cfg(unix)]
 #[test]
@@ -750,7 +740,7 @@ fn claude_audit_debt_member_below_missing_parent_stays_loss_and_retires_by_its_a
     expected_sites[1][Site::CandidateForcedIndex.index()] = [0, 1];
     assert_eq!(sites, expected_sites);
     assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-    assert_eq!(vanished, [[0; VANISHED], [1, 0], [0; VANISHED]]);
+    assert_eq!(vanished, [[0; VANISHED]; 3]);
     assert_eq!(
         pages
             .iter()
@@ -918,7 +908,7 @@ fn claude_member_of_deleted_directory_stays_loss_at_its_not_found() {
     let dir = crate::test_scratch::ScratchDir::new("absence-queued-subtree");
     let root = fs::canonicalize(&dir).unwrap();
     let (mut index, project, paths) = queued_directory_index(&root);
-    unverified(index.files.get_mut(&local_index_key(&paths[1])).unwrap());
+    tag_as_older_build(index.files.get_mut(&local_index_key(&paths[1])).unwrap());
     fs::remove_dir_all(&project).unwrap();
     let (((mut index, page), sites), vanished) = observe_vanished(|| {
         observe_sites(|| {
@@ -945,7 +935,7 @@ fn claude_member_of_deleted_directory_stays_loss_at_its_not_found() {
         "retirement invents no replacement usage"
     );
     assert!(index.traversal.is_none());
-    assert_eq!(vanished, [[0; VANISHED], [1, 2], [0; VANISHED]]);
+    assert_eq!(vanished, [[0; VANISHED], [2], [0; VANISHED]]);
     for path in &paths {
         let key = local_index_key(path);
         assert!(
@@ -990,7 +980,7 @@ fn claude_member_of_deleted_directory_stays_loss_at_its_not_found() {
 /// family's quarantine, witness, pending and holds exactly as the reviewed
 /// remove-hint retirement of the same member does. N adds no quarantine
 /// rule, so no held body is released by it, and the failure count moves at
-/// most once. Only the vanished member's own entry and marker go (N2).
+/// most once. Only the vanished member's own entry and tag go.
 #[cfg(unix)]
 #[test]
 fn claude_member_removal_matches_remove_hint_for_quarantined_family() {
@@ -1065,12 +1055,14 @@ fn claude_vanished_member_drops_its_request_census_record_and_counts_it() {
         .claude_request_census_for_test()
         .get(&second_key)
         .is_none());
-    assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
+    assert_eq!(vanished, [[0; VANISHED], [1], [0; VANISHED]]);
 }
 
-/// [behaviour] The audit-debt path also drops the member's request-census
-/// record with its entry and counts both retirements, while the
-/// member's snapshot fingerprints stay.
+/// [behaviour] A member carrying an older build's sampled tag follows the
+/// ordinary vanished path: its request-census record goes with its entry
+/// (counted), and so does its snapshot incidence, as for an untagged member.
+/// Its ACKed history stays: every body the server accepted is still recorded
+/// as accepted when the entry goes.
 #[test]
 fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
     for account_held in [false, true] {
@@ -1105,18 +1097,20 @@ fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_
                 .is_some(),
             "precondition: the real parse recorded the member's census"
         );
+        // The raw page helper runs no upload finalization, so it records no
+        // incidence: seed the member's accepted body.
+        let acked = std::collections::BTreeSet::from(["member-body".to_string()]);
+        index
+            .file_snapshot_fingerprints
+            .insert(second_key.clone(), acked.clone());
+        index.record_accepted_snapshot_fingerprints(&acked);
         let entry = index.files.get_mut(&second_key).unwrap();
-        entry.scan_identity_version = Some(format!(
-            "{}:4000000000",
-            super::super::sampled_audit::UNVERIFIED_IDENTITY
-        ));
-        assert!(entry.has_unverified_source());
+        tag_as_older_build(entry);
         if account_held {
             index
                 .claude_account_deferred_holds
                 .insert(second_key.clone(), entry.source_file_fingerprint.clone());
         }
-        let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
         fs::remove_file(&second_path).unwrap();
         super::super::sampled_scan::set_test_now(Some(1_000));
         let ((pages, sites), vanished) = observe_vanished(|| {
@@ -1126,7 +1120,7 @@ fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_
                     assert!(index
                         .claude_account_deferred_holds
                         .contains_key(&second_key));
-                    assert!(index.files[&second_key].has_unverified_source());
+                    assert!(index.files[&second_key].has_sampled_tag());
                     assert!(index
                         .claude_request_census_for_test()
                         .get(&second_key)
@@ -1152,17 +1146,20 @@ fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_
         assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
         assert!(
             !index.files.contains_key(&second_key),
-            "the entry and its marker are gone"
+            "the entry and its tag are gone"
         );
         assert!(index
             .claude_request_census_for_test()
             .get(&second_key)
             .is_none());
-        assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
-        assert_eq!(
-            index.file_snapshot_fingerprints.get(&second_key),
-            fingerprints_before.as_ref()
-        );
+        assert_eq!(vanished, [[0; VANISHED], [1], [0; VANISHED]]);
+        assert_eq!(index.file_snapshot_fingerprints.get(&second_key), None);
+        for fingerprint in &acked {
+            assert!(
+                index.accepted_snapshot_fingerprint_recorded(fingerprint),
+                "ACKed history is kept"
+            );
+        }
         assert!(index.files.contains_key(&local_index_key(&first_path)));
     }
 }
@@ -1233,7 +1230,7 @@ fn claude_selected_member_deleted_before_open_retires_through_the_page_merge() {
     expected_sites[1][Site::Open.index()] = [0, 1];
     assert_eq!(sites, expected_sites);
     assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-    assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
+    assert_eq!(vanished, [[0; VANISHED], [1], [0; VANISHED]]);
     assert!(
         pages.iter().all(|page| page.disappeared_file_count == 0),
         "a member deleted before its open beneath its present parent is not loss"
@@ -1728,19 +1725,21 @@ fn walk_nominates_unlisted_keys_and_a_partial_read_retires_no_present_key() {
     assert_eq!(retired(&walk(Some(true))), absent, "type read error");
 }
 
-fn unverified(entry: &mut super::super::ScanIndexEntry) {
+/// An older build's sampled tag (v1 form, kept as stored by a load). It no
+/// longer changes selection or retirement.
+fn tag_as_older_build(entry: &mut super::super::ScanIndexEntry) {
     entry.scan_identity_version = Some(format!(
         "{}:4000000000",
         super::super::sampled_audit::UNVERIFIED_IDENTITY
     ));
-    assert!(entry.has_unverified_source());
+    assert!(entry.has_sampled_tag());
 }
 
 /// [behaviour] A key the page's directory read did not list and that is
-/// proven absent is retired once by the page-end owner, by custody: no
-/// hold and audit-only debt retire; a decode hold keeps the entry, its
-/// audit marker and any account obligation with no deletion credit; an
-/// account hold alone waits for its own absence sequence.
+/// proven absent is retired once by the page-end owner, by custody: an
+/// entry with no hold retires, an older build's tag or not; a decode hold
+/// keeps the entry, its tag and any account obligation with no deletion
+/// credit; an account hold alone waits for its own absence sequence.
 #[cfg(unix)]
 #[test]
 fn claude_directory_proof_retires_unlisted_keys_by_custody() {
@@ -1754,22 +1753,22 @@ fn claude_directory_proof_retires_unlisted_keys_by_custody() {
         claude_line("a1111111-1111-4111-8111-111111111111", "r"),
     )
     .unwrap();
-    // (stem, audit, decode, account, retired by the first walk, by F4).
+    // (stem, tagged, decode, account, retired by the first walk, by F4).
     let rows = [
         ("none", false, false, false, true, true),
-        ("audit", true, false, false, true, true),
+        ("tagged", true, false, false, true, true),
         ("decode", false, true, false, false, false),
-        ("audit-decode", true, true, false, false, false),
+        ("tagged-decode", true, true, false, false, false),
         ("account", false, false, true, false, true),
         ("account-decode", false, true, true, false, false),
-        ("account-audit-decode", true, true, true, false, false),
+        ("account-tagged-decode", true, true, true, false, false),
     ];
     let key = |stem: &str| local_index_key(&project.join(format!("{stem}.jsonl")));
     let mut index = ScanIndex::default();
-    for (stem, audit, decode, account, _, _) in rows {
+    for (stem, tagged, decode, account, _, _) in rows {
         let mut entry = super::super::tests::manifest_index_entry(Some(stem));
-        if audit {
-            unverified(&mut entry);
+        if tagged {
+            tag_as_older_build(&mut entry);
         }
         index.files.insert(key(stem), entry);
         if decode {
@@ -1790,7 +1789,7 @@ fn claude_directory_proof_retires_unlisted_keys_by_custody() {
             index
                 .files
                 .get(&key(stem))
-                .is_some_and(|entry| entry.has_unverified_source()),
+                .is_some_and(|entry| entry.has_sampled_tag()),
             index.claude_account_deferred_holds.contains_key(&key(stem)),
         )
     };
@@ -1799,15 +1798,14 @@ fn claude_directory_proof_retires_unlisted_keys_by_custody() {
         observe_vanished(|| claude_page(&mut index, &root, NOW, 10, &[]))
     });
     assert_eq!(
-        vanished,
-        [[0; VANISHED], [1, 0], [0; VANISHED]],
-        "only the audit-only key drops its debt"
+        vanished, [[0; VANISHED]; 3],
+        "a directory proof drops no request-census record here"
     );
-    for (stem, audit, _, account, retired, _) in rows {
+    for (stem, tagged, _, account, retired, _) in rows {
         let expected = if retired {
             (false, false, false)
         } else {
-            (true, audit, account)
+            (true, tagged, account)
         };
         assert_eq!(held(&index, stem), expected, "first walk: {stem}");
     }
@@ -1822,11 +1820,11 @@ fn claude_directory_proof_retires_unlisted_keys_by_custody() {
         claude_page(&mut index, &root, RETRY, 10, &[])
     });
     super::super::sampled_scan::set_test_now(None);
-    for (stem, audit, _, account, _, retired) in rows {
+    for (stem, tagged, _, account, _, retired) in rows {
         let expected = if retired {
             (false, false, false)
         } else {
-            (true, audit, account)
+            (true, tagged, account)
         };
         assert_eq!(held(&index, stem), expected, "after F4: {stem}");
     }
@@ -1892,9 +1890,12 @@ fn claude_directory_proof_keeps_listed_names_and_drops_stale_twins() {
 
 /// [behaviour] Positive recreation wins on the same page: a key that its
 /// directory's complete read did not list, recreated before the page's
-/// secure absence proof, is not retired. Its entry and audit marker stay,
-/// and the page counts no vanished retirement, lost usage or account
-/// release. The control without the recreation retires it once.
+/// secure absence proof, is not retired by that proof: the page counts no
+/// vanished retirement, lost usage or account release. An older build's tag
+/// no longer retains the unobserved entry: the clean generation's
+/// reconciliation drops it as it drops an untagged one, and the next walk
+/// lists the recreated file again. The control without the recreation
+/// retires it once.
 #[cfg(unix)]
 #[test]
 fn claude_directory_proof_yields_to_same_page_recreation() {
@@ -1921,7 +1922,7 @@ fn claude_directory_proof_yields_to_same_page_recreation() {
         let key = local_index_key(&path);
         let mut index = ScanIndex::default();
         let mut entry = super::super::tests::manifest_index_entry(Some(RECREATED));
-        unverified(&mut entry);
+        tag_as_older_build(&mut entry);
         index.files.insert(key.clone(), entry);
         let (listed, recreated, mut project_read) = (project.clone(), path.clone(), false);
         let recreation = move |directory: &Path, _: bool| {
@@ -1941,23 +1942,28 @@ fn claude_directory_proof_yields_to_same_page_recreation() {
         assert_eq!(path.exists(), recreate);
         if !recreate {
             assert!(!index.files.contains_key(&key), "the control retires");
-            assert_eq!(vanished, [[0; VANISHED], [1, 0], [0; VANISHED]]);
+            assert_eq!(vanished, [[0; VANISHED]; 3]);
             continue;
         }
-        assert!(index
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.has_unverified_source()));
+        assert!(
+            !index.files.contains_key(&key),
+            "reconciliation drops the unobserved entry, tag or not"
+        );
         assert_eq!(vanished, [[0; VANISHED]; 3], "no vanished retirement");
         for row in &rows {
             for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
                 assert!(row["counts"].get(count).is_none(), "{count}: {row}");
             }
         }
+        claude_generation(&mut index, &root, RETRY, 10, &[]);
+        assert!(
+            index.files.contains_key(&key),
+            "the next walk lists the recreated file"
+        );
     }
 
     // Exercise ordinary entries on both sides of the NEW directory
-    // witness, separately from the audit-only row above. The recreated
+    // witness, separately from the tagged row above. The recreated
     // paths remain eligible under the existing first-read window.
     for before_proof in [true, false] {
         let dir = crate::test_scratch::ScratchDir::new("absence-directory-recreation");
@@ -2013,7 +2019,7 @@ fn claude_directory_proof_yields_to_same_page_recreation() {
         assert_eq!(sites, expected);
         assert_eq!(page.disappeared_file_count, usize::from(before_proof));
         assert_eq!(page.census_complete, !before_proof);
-        assert_eq!(vanished[1], [0, if before_proof { 0 } else { 2 }]);
+        assert_eq!(vanished[1], [if before_proof { 0 } else { 2 }]);
         for (path, fingerprint) in paths.iter().zip(&previous) {
             let key = local_index_key(path);
             assert_eq!(index.files.contains_key(&key), before_proof);

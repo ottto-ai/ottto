@@ -1,34 +1,25 @@
-//! Audit status lives in the existing per-file index, never in a new ledger.
-#[cfg(unix)]
-pub(in crate::snapshots) mod quiet_retirement;
-
+//! Sampled-read state kept in the per-file index: the sealed-prefix tag,
+//! the owed-parse listing rule, absence proofs and growth retention.
 use super::*;
-use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
-use crate::transcript_cache::CACHE_ENTRIES;
 
-// v1 did not distinguish an ordinary Tail from a published FE prefix.
+// Older builds wrote a sampled audit deadline into the EXISTING version
+// string: `<stem>v1:<due>`, or `<stem>v2:<due>:<c|p>` where `c` is a complete
+// native recomposition and `p` a sealed prefix. Only the sealed-prefix tag
+// still has a meaning; a load strips every complete (`c`) tag back to the
+// plain version. No new inline or persisted field.
 #[cfg(test)]
 pub(super) const UNVERIFIED_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v1";
 const UNVERIFIED_STEM: &str = "semantic_sync:v2+sampled_unverified:";
 const PROVENANCE_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v2";
-
-// Deadline and provenance occupy the EXISTING version string. c = complete
-// native recomposition; p = sealed prefix. No new inline or persisted field.
 const MAX_MARKER_BYTES: usize = 64;
-pub(super) fn marker(due: u64) -> String {
-    provenance_marker(due, false)
+
+/// The sealed-prefix tag as this build writes it. The deadline field stays
+/// in the string, always 0, so older readers still decode it.
+fn prefix_marker() -> String {
+    format!("{PROVENANCE_IDENTITY}:0:p")
 }
-fn provenance_marker(due: u64, prefix: bool) -> String {
-    use std::fmt::Write;
-    let mut value = String::with_capacity(MAX_MARKER_BYTES);
-    write!(
-        &mut value,
-        "{PROVENANCE_IDENTITY}:{due}:{}",
-        if prefix { "p" } else { "c" }
-    )
-    .expect("bounded marker formats");
-    value
-}
+
+/// Decode-only: an older build's v2 tag, as (deadline, sealed prefix).
 fn decode_marker(version: &str) -> Option<(u64, bool)> {
     let (due, provenance) = version
         .strip_prefix(PROVENANCE_IDENTITY)?
@@ -48,158 +39,52 @@ fn decode_marker(version: &str) -> Option<(u64, bool)> {
     ))
 }
 impl ScanIndexEntry {
-    pub(super) fn has_unverified_source(&self) -> bool {
+    /// The version string carries a sampled tag, from this build or an older
+    /// one. A tagged entry is not an owed revision.
+    pub(super) fn has_sampled_tag(&self) -> bool {
         self.scan_identity_version
             .as_deref()
             .is_some_and(|version| version.starts_with(UNVERIFIED_STEM))
     }
-    /// FE writes every prefix tag under the sampled stem, and replay keeps stem
-    /// entries, so only a stem can carry a prefix. A stem fails closed unless
+    /// FE writes every prefix tag under the sampled stem, and replay keeps
+    /// prefix-tagged entries, so only a stem can carry a prefix. A stem fails closed unless
     /// it decodes as a v2 c tag; None and legacy identities are not prefixes.
     pub(super) fn has_prefix_provenance(&self) -> bool {
-        self.has_unverified_source()
+        self.has_sampled_tag()
             && self
                 .scan_identity_version
                 .as_deref()
                 .is_some_and(|version| !matches!(decode_marker(version), Some((_, false))))
     }
-    pub(super) fn unverified_deadline(&self) -> Option<u64> {
-        if !self.has_unverified_source() {
-            return None;
-        }
-        let version = self.scan_identity_version.as_deref()?;
-        Some(
-            decode_marker(version)
-                .map(|(due, _)| due)
-                .unwrap_or_else(|| {
-                    // Preserve a v1 deadline, but never infer complete provenance.
-                    version
-                        .strip_prefix(UNVERIFIED_STEM)
-                        .and_then(|tail| tail.strip_prefix("v1:"))
-                        .filter(|due| {
-                            !due.is_empty() && due.bytes().all(|byte| byte.is_ascii_digit())
-                        })
-                        .and_then(|due| due.parse().ok())
-                        .unwrap_or(0)
-                }),
-        )
-    }
-    pub(super) fn set_unverified_deadline(&mut self, due: u64) {
-        self.scan_identity_version = Some(provenance_marker(due, self.has_prefix_provenance()));
-    }
-    /// Only an existing sampled stem carries provenance. A missing or legacy
-    /// identity still reads as prefix until re-recorded, but an ordinary
-    /// record never mints `p`; FE marks its prefix after `record`.
-    pub(super) fn carried_audit_version(&self) -> String {
-        if self.has_unverified_source() {
-            provenance_marker(
-                self.unverified_deadline().unwrap_or(0),
-                self.has_prefix_provenance(),
-            )
+    /// Only an existing prefix tag is carried. A missing or legacy identity
+    /// is re-recorded plain, and an ordinary record never mints `p`; FE marks
+    /// its prefix after `record`.
+    pub(super) fn carried_identity_version(&self) -> String {
+        if self.has_prefix_provenance() {
+            prefix_marker()
         } else {
             LOCAL_SCAN_INDEX_IDENTITY_VERSION.into()
         }
     }
-    pub(super) fn carry_sampled_audit(&mut self, working: &Self) {
-        if let Some(version) = self.sampled_audit_carry(working) {
-            self.scan_identity_version = Some(version);
+    /// Keep `working`'s sealed-prefix tag on this entry.
+    pub(super) fn carry_prefix_provenance(&mut self, working: &Self) {
+        if self.carry_prefix_provenance_changes(working) {
+            self.scan_identity_version = Some(prefix_marker());
         }
     }
-    /// Whether `carry_sampled_audit(working)` would change this entry. By
-    /// value: the carry rewrites even this entry's own v1 marker in v2 form.
-    pub(super) fn carry_sampled_audit_changes(&self, working: &Self) -> bool {
-        self.sampled_audit_carry(working)
-            .is_some_and(|version| self.scan_identity_version.as_deref() != Some(&*version))
-    }
-    fn sampled_audit_carry(&self, working: &Self) -> Option<String> {
-        let due = working.unverified_deadline()?;
-        Some(provenance_marker(
-            self.unverified_deadline().map_or(due, |old| old.min(due)),
-            self.has_prefix_provenance() || working.has_prefix_provenance(),
-        ))
-    }
-    pub(super) fn audit_obligation(&self, now: u64) -> Option<AuditDebt> {
-        if !self.has_unverified_source() {
-            return None;
-        }
-        let deadline = self
-            .unverified_deadline()
-            .filter(|deadline| {
-                *deadline > 0
-                    && now
-                        .checked_add(AUDIT_INTERVAL_SECONDS)
-                        .is_some_and(|latest| *deadline <= latest)
-            })
-            .unwrap_or(now);
-        Some(AuditDebt {
-            due_unix_seconds: deadline,
-        })
-    }
-    pub(super) fn audit_requires_full(&self, now: u64) -> bool {
-        self.audit_obligation(now)
-            .is_some_and(|debt| now >= debt.due_unix_seconds)
+    /// Whether `carry_prefix_provenance(working)` would change this entry.
+    pub(super) fn carry_prefix_provenance_changes(&self, working: &Self) -> bool {
+        working.has_prefix_provenance() && !self.has_prefix_provenance()
     }
     pub(super) fn retain_history_evidence(&self) -> bool {
-        self.codex_history_is_protected() || self.has_unverified_source()
+        self.codex_history_is_protected()
     }
 }
 impl ScanIndex {
-    /// Existing obligations are never evicted. Imported over-cap populations
-    /// must drain before any new marker can be admitted.
-    pub(super) fn can_stage_sampled_audit(&self, key: &str) -> bool {
-        self.files
-            .get(key)
-            .is_some_and(ScanIndexEntry::has_unverified_source)
-            || self
-                .files
-                .values()
-                .filter(|entry| entry.has_unverified_source())
-                .take(CACHE_ENTRIES)
-                .count()
-                < CACHE_ENTRIES
-    }
-
-    pub(super) fn retire_quiet_audit(&mut self, key: &str, fingerprint: &str) -> bool {
-        let Some(entry) = self.files.get_mut(key).filter(|entry| {
-            entry.source_file_fingerprint == fingerprint
-                && entry.has_unverified_source()
-                && !entry.has_prefix_provenance()
-        }) else {
-            return false;
-        };
-        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-        true
-    }
-
-    /// Called only by a current validated native source completion. Entry/source
-    /// equality fences an older completion; the existing writer owns lock/CAS.
-    /// A delivery ACK never calls this method as source-verification authority.
-    pub(super) fn stage_sampled_audit(
-        &mut self,
-        key: &str,
-        source_fingerprint: &str,
-        debt: AuditDebt,
-    ) -> bool {
-        if !self.can_stage_sampled_audit(key) {
-            return false;
-        }
-        let Some(entry) = self
-            .files
-            .get_mut(key)
-            .filter(|entry| entry.source_file_fingerprint == source_fingerprint)
-        else {
-            return false;
-        };
-        let due = entry
-            .unverified_deadline()
-            .map_or(debt.due_unix_seconds, |old| old.min(debt.due_unix_seconds));
-        entry.set_unverified_deadline(due);
-        true
-    }
     /// This caller just finished a progress-complete, EOF-revalidated native Full or
     /// Tail recomposition. FE never retains a prefix reduction in the cache,
     /// so a Tail here replays a complete retained baseline, not an FE body.
-    /// Keep the audit debt: complete provenance is not Full-audit credit.
+    /// It clears a sealed-prefix tag.
     pub(super) fn complete_native_recomposition(
         &mut self,
         key: &str,
@@ -217,18 +102,10 @@ impl ScanIndex {
                 crate::local_resource_diagnostics::cache_lifecycle::Event::PrefixTagCleared,
             );
         }
-        entry.scan_identity_version = Some(
-            entry
-                .unverified_deadline()
-                .map(marker)
-                .unwrap_or_else(|| LOCAL_SCAN_INDEX_IDENTITY_VERSION.into()),
-        );
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
         true
     }
     pub(super) fn mark_sealed_prefix(&mut self, key: &str, source_fingerprint: &str) -> bool {
-        if !self.can_stage_sampled_audit(key) {
-            return false;
-        }
         let Some(entry) = self
             .files
             .get_mut(key)
@@ -236,30 +113,17 @@ impl ScanIndex {
         else {
             return false;
         };
-        entry.scan_identity_version = Some(provenance_marker(
-            entry.unverified_deadline().unwrap_or(0),
-            true,
-        ));
-        true
-    }
-    pub(super) fn complete_full_audit(&mut self, key: &str, source_fingerprint: &str) -> bool {
-        if !self.complete_native_recomposition(key, source_fingerprint) {
-            return false;
-        }
-        self.files
-            .get_mut(key)
-            .expect("validated entry")
-            .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        entry.scan_identity_version = Some(prefix_marker());
         true
     }
 }
 
-/// An accepted sampled generation must be verified even after its activity
-/// ages out. The existing bounded walk remains its sole scheduler. Other old
-/// files keep the configured window, and secure opens/file caps still apply.
-/// A nonempty file with no final snapshot group that is not confirmed empty
-/// (its group was cleared for re-parse) is owed the same way, so every listing
-/// and age gate keeps it until a parse restores the group.
+/// A file whose index entry owes a parse keeps every listing and age gate:
+/// an empty source fingerprint (an explicit re-parse), or a nonempty file
+/// with no final snapshot group that is not confirmed empty (its group was
+/// cleared for re-parse), until a parse restores the group. The existing
+/// bounded walk remains its sole scheduler; secure opens and file caps still
+/// apply.
 pub(super) fn path_requires_verification(
     files: &SharedMap<String, ScanIndexEntry>,
     confirmed_empty: &BTreeSet<String>,
@@ -267,8 +131,7 @@ pub(super) fn path_requires_verification(
 ) -> bool {
     let key = local_index_key(path);
     files.get(&key).is_some_and(|entry| {
-        entry.has_unverified_source()
-            || entry.source_file_fingerprint.is_empty()
+        entry.source_file_fingerprint.is_empty()
             || (entry.size_bytes > 0
                 && entry.last_snapshot_fingerprint.is_none()
                 && !confirmed_empty.contains(&key))
@@ -295,41 +158,45 @@ pub(super) fn path_requires_recovery(
             }))
 }
 
-fn marker_storage_oversized(entry: &ScanIndexEntry) -> bool {
-    entry.has_unverified_source()
-        && entry
-            .scan_identity_version
-            .as_ref()
-            .is_some_and(|tag| tag.capacity() > MAX_MARKER_BYTES)
+/// What the load does with one entry's stored version string: an older
+/// build's complete (`c`) tag becomes the plain version, and an oversized
+/// prefix tag is rewritten in its bounded form. `None`: kept as stored.
+fn normalized_version(entry: &ScanIndexEntry) -> Option<String> {
+    let version = entry.scan_identity_version.as_ref()?;
+    if !entry.has_sampled_tag() {
+        None
+    } else if !entry.has_prefix_provenance() {
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into())
+    } else if version.capacity() > MAX_MARKER_BYTES {
+        Some(prefix_marker())
+    } else {
+        None
+    }
 }
 
-/// Runs every Claude and Codex scan, so an index with nothing to normalize
-/// stays shared with the committed baseline.
+/// Runs on every index load and every Claude and Codex scan, in memory only:
+/// the next ordinary save writes the result. It reads no file and changes no
+/// fingerprint. An index with nothing to normalize stays shared with the
+/// committed baseline.
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
-    if !index.files.values().any(marker_storage_oversized) {
+    if !index
+        .files
+        .values()
+        .any(|entry| normalized_version(entry).is_some())
+    {
         return;
     }
     for (_, entry) in index.files.slots_mut() {
-        if marker_storage_oversized(entry) {
-            entry.make_mut().set_unverified_deadline(0);
+        if let Some(version) = normalized_version(entry) {
+            entry.make_mut().scan_identity_version = Some(version);
         }
     }
-}
-
-/// The durable audit debt the next read of `key` carries. A debt alone never
-/// selects a Full (`ReadPlan::prepare`): a read with a stored or retained copy
-/// continues from it, and the debt travels in that read's checkpoint.
-pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
-    index
-        .files
-        .get(key)
-        .and_then(|entry| entry.audit_obligation(now))
 }
 
 impl SourceScanResult {
     /// Queue a discoverable retry for a released account hold's acquisition
     /// before upload/save: no stored copy discharges its debt.
-    pub(crate) fn preserve_released_account_audits(
+    pub(crate) fn preserve_released_account_holds(
         &self,
         index: &mut ScanIndex,
         previous: &ScanIndex,
@@ -340,15 +207,12 @@ impl SourceScanResult {
         for (key, _) in self.completed_parses() {
             if !previous.claude_account_deferred_holds.contains_key(key)
                 || index.claude_account_deferred_holds.contains_key(key)
-                || !index
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| !entry.has_unverified_source())
+                || !index.files.contains_key(key)
             {
                 continue;
             }
             // This existing explicit-reparse witness survives traversal resets
-            // and ages. It never labels an audit/clock Full or grants credit.
+            // and ages. It never labels a Full or grants credit.
             index
                 .files
                 .get_mut(key)
@@ -377,20 +241,22 @@ impl SourceScanResult {
 mod tests {
     use super::*;
 
-    fn entry() -> ScanIndexEntry {
+    const PLAIN: &str = LOCAL_SCAN_INDEX_IDENTITY_VERSION;
+
+    fn entry(version: Option<&str>) -> ScanIndexEntry {
         serde_json::from_value(json!({
             "size_bytes": 1, "modified_unix_seconds": 1,
             "modified_unix_nanos": 1, "source_file_fingerprint": "source",
             "last_snapshot_fingerprint": null,
-            "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
+            "scan_identity_version": version,
         }))
         .unwrap()
     }
-    fn candidate() -> CandidateFile {
+    fn candidate(name: &str) -> CandidateFile {
         CandidateFile {
             physical_identity: None,
             scan_root: PathBuf::from("/synthetic"),
-            path: PathBuf::from("/synthetic/session.jsonl"),
+            path: PathBuf::from(format!("/synthetic/{name}.jsonl")),
             size_bytes: 1,
             modified_unix_seconds: 1,
             modified_unix_nanos: 1,
@@ -403,294 +269,167 @@ mod tests {
             withheld_content_stamp: None,
         }
     }
-    fn index() -> ScanIndex {
+    /// One confirmed-empty entry per stored version, keyed by its name.
+    fn index(cases: &[(&str, Option<&str>)]) -> ScanIndex {
         let mut index = ScanIndex::default();
-        let key = local_index_key(&candidate().path);
-        index.files.insert(key.clone(), entry());
-        index.confirmed_empty_files.insert(key);
+        for (name, version) in cases {
+            let key = local_index_key(&candidate(name).path);
+            index.files.insert(key.clone(), entry(*version));
+            index.confirmed_empty_files.insert(key);
+        }
         index
     }
-    #[test]
-    fn cap_retry_keeps_durable_custody_without_a_traversal_or_marker() {
-        let mut index = index();
-        let candidate = candidate();
-        let key = local_index_key(&candidate.path);
-        assert!(index.traversal.is_none());
-        assert!(!path_requires_verification(
-            &index.files,
-            &index.confirmed_empty_files,
-            &candidate.path
-        ));
-        queue_cap_retry(&mut index, &candidate);
-        let mut loaded: ScanIndex =
-            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        assert!(loaded.traversal.is_none());
-        assert!(path_requires_verification(
-            &loaded.files,
-            &loaded.confirmed_empty_files,
-            &candidate.path
-        ));
-        assert!(!loaded.files[&key].has_unverified_source());
-        assert_eq!(loaded.files[&key].size_bytes, 1);
-        // Same-process provenance survives the index round-trip until an
-        // actual Full completes; merely queuing the retry emits no Full.
-        let probe = crate::local_resource_diagnostics::Probe::start();
-        assert!(probe.rearm_fulls().is_empty());
-        let full = crate::transcript_acquisition::ReadMode::Full(
-            crate::transcript_acquisition::FullReason::StateMissing,
-        );
-        probe.rearm_full_selected(&key, full);
-        probe.rearm_full_completed(&key, full, 3);
-        assert_eq!(
-            serde_json::to_value(probe.rearm_fulls()).unwrap(),
-            json!({"rearm_cleared{audit_cap_delay}": {"count": 1, "completed_native_bytes": 3}})
-        );
-        loaded.files.remove(&key);
-        queue_cap_retry(&mut loaded, &candidate);
-        assert!(!loaded.files.contains_key(&key), "no invented membership");
+    fn version(index: &ScanIndex, name: &str) -> Option<String> {
+        index.files[&local_index_key(&candidate(name).path)]
+            .scan_identity_version
+            .clone()
+    }
+    fn complete_tag(due: u64) -> String {
+        format!("{PROVENANCE_IDENTITY}:{due}:c")
+    }
+    fn prefix_tag(due: u64) -> String {
+        format!("{PROVENANCE_IDENTITY}:{due}:p")
     }
 
     #[test]
-    fn marked_population_admission_and_quiet_retirement_share_the_cap() {
-        let mut index = index();
-        for n in 0..CACHE_ENTRIES {
-            let key = format!("missing-{n}");
-            index.files.insert(key.clone(), entry());
-            assert!(index.stage_sampled_audit(
-                &key,
-                "source",
-                AuditDebt {
-                    due_unix_seconds: 200
-                }
-            ));
-        }
-        let key = local_index_key(&candidate().path);
-        assert!(!index.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 200
-            }
-        ));
-        assert!(!index.mark_sealed_prefix(&key, "source"));
-        assert!(index.stage_sampled_audit(
-            "missing-0",
-            "source",
-            AuditDebt {
-                due_unix_seconds: 100
-            }
-        ));
-        assert!(index.mark_sealed_prefix("missing-0", "source"));
-        assert!(
-            !index.retire_quiet_audit("missing-0", "source"),
-            "prefix cannot retire"
-        );
-        assert!(!index.retire_quiet_audit("missing-1", "stale"));
-        assert!(index.retire_quiet_audit("missing-1", "source"));
-        assert!(index.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 200
-            }
-        ));
+    fn the_sampled_stem_extends_the_current_plain_version() {
         assert_eq!(
+            UNVERIFIED_STEM.strip_suffix("+sampled_unverified:"),
+            Some(PLAIN)
+        );
+        assert!(PROVENANCE_IDENTITY.starts_with(UNVERIFIED_STEM));
+        assert!(UNVERIFIED_IDENTITY.starts_with(UNVERIFIED_STEM));
+        assert!(prefix_marker().len() <= MAX_MARKER_BYTES);
+        assert_eq!(decode_marker(&prefix_marker()), Some((0, true)));
+    }
+
+    /// [money] A stored complete tag, due or not, loads as the plain version
+    /// in memory: no fingerprint or size changes and no parse is selected,
+    /// before or after the strip. A prefix tag and an older build's v1 or
+    /// malformed tag stay as stored: they keep the sealed-prefix census
+    /// exclusion, fail closed. A tag on a plain part that is not current is
+    /// not a sampled tag and keeps today's owed-revision path.
+    #[test]
+    fn a_load_strips_only_complete_tags_without_a_read() {
+        let old_plain = "semantic_sync:v1+sampled_unverified:v2:200:c".to_owned();
+        let complete_past = complete_tag(1);
+        let complete_future = complete_tag(u64::MAX);
+        let prefix = prefix_tag(200);
+        let v1 = format!("{UNVERIFIED_IDENTITY}:200");
+        let malformed = format!("{UNVERIFIED_STEM}v2:later:c");
+        let cases = [
+            ("plain", Some(PLAIN)),
+            ("complete-past", Some(complete_past.as_str())),
+            ("complete-future", Some(complete_future.as_str())),
+            ("prefix", Some(prefix.as_str())),
+            ("v1", Some(v1.as_str())),
+            ("malformed", Some(malformed.as_str())),
+            ("old-plain", Some(old_plain.as_str())),
+            ("none", None),
+        ];
+        let mut index = index(&cases);
+        let decisions = |index: &ScanIndex| {
+            cases
+                .iter()
+                .map(|(name, _)| index.candidate_decision(&candidate(name)))
+                .collect::<Vec<_>>()
+        };
+        let before = decisions(&index);
+        let fingerprints = |index: &ScanIndex| {
             index
                 .files
                 .values()
-                .filter(|entry| entry.has_unverified_source())
-                .count(),
-            CACHE_ENTRIES
+                .map(|entry| (entry.source_file_fingerprint.clone(), entry.size_bytes))
+                .collect::<Vec<_>>()
+        };
+        let stored = fingerprints(&index);
+        normalize_marker_storage(&mut index);
+        assert_eq!(fingerprints(&index), stored);
+        assert_eq!(decisions(&index), before, "the strip selects nothing");
+        for name in ["plain", "complete-past", "complete-future"] {
+            assert_eq!(version(&index, name).as_deref(), Some(PLAIN), "{name}");
+            assert_eq!(
+                index.candidate_decision(&candidate(name)),
+                CandidateDecision::Skip,
+                "{name}: no audit parse at any time"
+            );
+        }
+        for (name, kept) in [("prefix", &prefix), ("v1", &v1), ("malformed", &malformed)] {
+            assert_eq!(version(&index, name).as_ref(), Some(kept), "{name}");
+            let key = local_index_key(&candidate(name).path);
+            assert!(index.files[&key].has_prefix_provenance(), "{name}");
+            assert_eq!(
+                index.candidate_decision(&candidate(name)),
+                CandidateDecision::Skip,
+                "{name}"
+            );
+        }
+        assert_eq!(version(&index, "old-plain"), Some(old_plain.clone()));
+        assert_eq!(
+            index.candidate_decision_with_reason(&candidate("old-plain")),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::LegacyIdentity)
+            ),
+            "an old plain part keeps the owed-revision path"
         );
-        assert!(index.files["missing-0"].has_unverified_source());
+        assert_eq!(version(&index, "none"), None);
+        let again = index.clone();
+        normalize_marker_storage(&mut index);
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            serde_json::to_value(&again).unwrap(),
+            "a second load changes nothing"
+        );
     }
 
+    /// [money] Oracle: a file indexed under a complete tag, then a new build
+    /// loads it. The stored store still holds the tag; the load strips it in
+    /// memory, the next ordinary save writes the plain version, and a
+    /// restart loads the same plain entry with the same fingerprint.
     #[test]
-    fn sampled_audit_oldest_deadline_not_ack_or_tail_controls_idle_selection() {
-        let mut index = index();
-        let candidate = candidate();
-        let key = local_index_key(&candidate.path);
-        assert!(!index.stage_sampled_audit(
-            &key,
-            "stale",
-            AuditDebt {
-                due_unix_seconds: 200
-            }
-        ));
-        assert!(index.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 200
-            }
-        ));
-        assert!(index.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 300
-            }
-        ));
-        assert_eq!(
-            index.files[&key]
-                .audit_obligation(100)
-                .unwrap()
-                .due_unix_seconds,
-            200
-        );
-        assert_eq!(
-            index.candidate_decision_at(&candidate, 199),
-            CandidateDecision::Skip
-        );
-        assert_eq!(
-            index.candidate_decision_at(&candidate, 200),
-            CandidateDecision::Parse
-        );
-        let subset = index.committable_subset(&index.clone(), &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(
-            subset.files[&key]
-                .audit_obligation(100)
-                .unwrap()
-                .due_unix_seconds,
-            200
-        );
-        assert!(!index.complete_full_audit(&key, "older-source"));
-        assert!(index.files[&key].has_unverified_source());
-        assert!(index.complete_full_audit(&key, "source"));
-        assert!(!index.files[&key].has_unverified_source());
-    }
-    #[test]
-    fn sampled_audit_malformed_and_replay_markers_remain_due_without_resetting_index() {
-        for malformed in [
-            json!(null),
-            json!(0),
-            json!(-1),
-            json!("later"),
-            json!({"due":200}),
-            json!(u64::MAX),
-        ] {
-            let mut raw = serde_json::to_value(entry()).unwrap();
-            raw["scan_identity_version"] = json!(format!("{UNVERIFIED_IDENTITY}:{}", malformed));
-            let mut index = index();
-            let key = local_index_key(&candidate().path);
-            index
-                .files
-                .insert(key.clone(), serde_json::from_value(raw).unwrap());
-            assert!(index.files[&key].audit_requires_full(100));
-            index.prepare_historical_replay("new-generation".into());
-            assert!(index.files[&key].audit_requires_full(100));
-            assert_eq!(index.files.len(), 1);
-        }
-        let mut index = index();
-        let key = local_index_key(&candidate().path);
-        index.files.get_mut(&key).unwrap().scan_identity_version = Some(UNVERIFIED_IDENTITY.into());
-        index.record(candidate(), None, ScanParseOutcome::ConfirmedEmpty);
-        assert_eq!(index.files[&key].unverified_deadline(), Some(0));
-        index.prepare_historical_replay("replay".into());
-        assert!(index.files[&key].audit_requires_full(100));
-    }
-    #[test]
-    fn sampled_audit_shed_body_retains_newer_debt_with_previous_delivery_authority() {
-        let mut previous = index();
-        let key = local_index_key(&candidate().path);
-        let old = "a".repeat(64);
-        let new = "b".repeat(64);
-        previous.confirmed_empty_files.remove(&key);
-        previous
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .last_snapshot_fingerprint = Some(old.clone());
-        previous
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .source_file_fingerprint = "old-source".into();
-        previous
-            .file_snapshot_fingerprints
-            .insert(key.clone(), BTreeSet::from([old.clone()]));
-        let mut working = previous.clone();
-        working
-            .files
-            .get_mut(&key)
-            .unwrap()
-            .last_snapshot_fingerprint = Some(new.clone());
-        working.files.get_mut(&key).unwrap().source_file_fingerprint = "new-source".into();
-        working
-            .file_snapshot_fingerprints
-            .insert(key.clone(), BTreeSet::from([new.clone()]));
-        assert!(working.stage_sampled_audit(
-            &key,
-            "new-source",
-            AuditDebt {
-                due_unix_seconds: 200
-            }
-        ));
-        let shed = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(
-            shed.files[&key].last_snapshot_fingerprint.as_deref(),
-            Some(old.as_str())
-        );
-        assert_eq!(shed.files[&key].source_file_fingerprint, "old-source");
-        assert_eq!(
-            shed.files[&key]
-                .audit_obligation(100)
-                .unwrap()
-                .due_unix_seconds,
-            200
-        );
-        let accepted =
-            working.committable_subset(&previous, &BTreeSet::from([new]), &BTreeMap::new());
-        assert_eq!(accepted.files[&key].source_file_fingerprint, "new-source");
-        assert!(accepted.files[&key].has_unverified_source());
-    }
-    #[test]
-    fn sampled_audit_missing_source_and_existing_cas_cannot_erase_obligation() {
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "ottto-audit-index-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&root).unwrap();
+    fn a_stored_complete_tag_is_gone_after_the_next_save() {
+        let root = crate::test_scratch::unique_path("ottto-sampled-tag-upgrade");
+        fs::create_dir_all(&root).unwrap();
         let path = root.join("index.json");
-        let mut index = index();
-        let key = local_index_key(&candidate().path);
-        index.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 200,
-            },
-        );
-        index.remove_file_entry(&key);
-        assert!(index.files.contains_key(&key));
+        let complete = complete_tag(200);
+        let prefix = prefix_tag(200);
+        let mut index = index(&[
+            ("complete", Some(complete.as_str())),
+            ("prefix", Some(prefix.as_str())),
+        ]);
         index.save_fixture(&path).unwrap();
-        let mut older = ScanIndex::load(&path).unwrap();
-        let mut current = ScanIndex::load(&path).unwrap();
-        assert!(current.files[&key].has_unverified_source());
-        current.stage_sampled_audit(
-            &key,
-            "source",
-            AuditDebt {
-                due_unix_seconds: 150,
-            },
-        );
-        current.save(&path).unwrap();
-        older.complete_full_audit(&key, "source");
-        assert!(older.save(&path).is_err());
-        let loaded = ScanIndex::load(&path).unwrap();
+        let (raw, _) = ScanIndex::load_inner(&path, None).unwrap();
+        assert_eq!(version(&raw, "complete"), Some(complete));
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(version(&loaded, "complete").as_deref(), Some(PLAIN));
+        assert_eq!(version(&loaded, "prefix"), Some(prefix.clone()));
+        loaded.save(&path).unwrap();
+        let (raw, _) = ScanIndex::load_inner(&path, None).unwrap();
+        assert_eq!(version(&raw, "complete").as_deref(), Some(PLAIN));
+        assert_eq!(version(&raw, "prefix"), Some(prefix));
+        let restarted = ScanIndex::load(&path).unwrap();
+        let key = local_index_key(&candidate("complete").path);
+        assert_eq!(restarted.files[&key].source_file_fingerprint, "source");
         assert_eq!(
-            loaded.files[&key]
-                .audit_obligation(100)
-                .unwrap()
-                .due_unix_seconds,
-            150
+            restarted.candidate_decision(&candidate("complete")),
+            CandidateDecision::Skip
         );
         fs::remove_dir_all(root).unwrap();
         crate::snapshots::state_v2::close_removed_routes_for_test();
+    }
+
+    #[test]
+    fn an_oversized_prefix_tag_is_rewritten_bounded() {
+        let mut oversized = String::with_capacity(4 * MAX_MARKER_BYTES);
+        oversized.push_str(&prefix_tag(200));
+        let mut index = index(&[("prefix", None)]);
+        let key = local_index_key(&candidate("prefix").path);
+        index.files.get_mut(&key).unwrap().scan_identity_version = Some(oversized);
+        normalize_marker_storage(&mut index);
+        let version = index.files[&key].scan_identity_version.clone().unwrap();
+        assert_eq!(version, prefix_marker());
+        assert!(index.files[&key].has_prefix_provenance());
     }
 }
 
@@ -710,62 +449,45 @@ mod provenance_tests {
         index
     }
     #[test]
-    fn prefix_provenance_survives_record_replay_and_deadline_carry() {
+    fn prefix_provenance_survives_record_replay_and_carry() {
         let mut index = index();
-        index
-            .files
-            .get_mut("file")
-            .unwrap()
-            .set_unverified_deadline(200);
         assert!(index.mark_sealed_prefix("file", "source"));
+        assert!(index.files["file"].has_prefix_provenance());
         let mut ordinary = self::index();
+        assert!(ordinary.files["file"].carry_prefix_provenance_changes(&index.files["file"]));
         ordinary
             .files
             .get_mut("file")
             .unwrap()
-            .set_unverified_deadline(300);
-        ordinary
-            .files
-            .get_mut("file")
-            .unwrap()
-            .carry_sampled_audit(&index.files["file"]);
+            .carry_prefix_provenance(&index.files["file"]);
         assert!(ordinary.files["file"].has_prefix_provenance());
-        assert_eq!(ordinary.files["file"].unverified_deadline(), Some(200));
-        let mut carried: ScanIndexEntry =
+        assert!(!ordinary.files["file"].carry_prefix_provenance_changes(&index.files["file"]));
+        assert!(!index.files["file"].carry_prefix_provenance_changes(&self::index().files["file"]));
+        let carried: ScanIndexEntry =
             serde_json::from_value(serde_json::to_value(&index.files["file"]).unwrap()).unwrap();
-        carried.scan_identity_version = Some(carried.carried_audit_version());
-        carried.set_unverified_deadline(150);
-        assert!(carried.has_prefix_provenance());
-        assert_eq!(carried.unverified_deadline(), Some(150));
+        assert_eq!(carried.carried_identity_version(), prefix_marker());
         index.prepare_historical_replay("replay".into());
         assert!(index.files["file"].has_prefix_provenance());
-        assert_eq!(index.files["file"].unverified_deadline(), Some(200));
     }
     #[test]
-    fn prefix_clear_requires_exact_fingerprint_and_keeps_tail_audit_debt() {
+    fn prefix_clear_requires_exact_fingerprint() {
         let mut index = index();
-        index
-            .files
-            .get_mut("file")
-            .unwrap()
-            .set_unverified_deadline(200);
+        assert!(!index.mark_sealed_prefix("file", "stale"));
+        assert!(!index.files["file"].has_prefix_provenance());
         assert!(index.mark_sealed_prefix("file", "source"));
         assert!(!index.complete_native_recomposition("file", "stale"));
-        assert!(!index.complete_full_audit("file", "stale"));
         assert!(index.files["file"].has_prefix_provenance());
         assert!(index.complete_native_recomposition("file", "source"));
         assert!(!index.files["file"].has_prefix_provenance());
-        assert_eq!(index.files["file"].unverified_deadline(), Some(200));
-        assert!(index.mark_sealed_prefix("file", "source"));
-        assert!(index.complete_full_audit("file", "source"));
-        assert!(!index.files["file"].has_prefix_provenance());
-        assert!(!index.files["file"].has_unverified_source());
+        assert_eq!(
+            index.files["file"].scan_identity_version.as_deref(),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        );
     }
 
-    /// `record` carries only an existing sampled stem. A replay-reset
-    /// or legacy entry (never a prefix) re-recorded without
-    /// verification or obligation becomes the clean identity; the same
-    /// completion's FE mark still tags `p`.
+    /// `record` carries only an existing prefix tag. A replay-reset or
+    /// legacy entry (never a prefix) re-recorded becomes the plain identity;
+    /// the same completion's FE mark still tags `p`.
     #[test]
     fn ordinary_record_never_mints_prefix_but_fe_mark_after_record_does() {
         let candidate = CandidateFile {
@@ -784,12 +506,18 @@ mod provenance_tests {
             withheld_content_stamp: None,
         };
         let key = local_index_key(&candidate.path);
-        for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
+        let complete = format!("{PROVENANCE_IDENTITY}:200:c");
+        for reset in [
+            None,
+            Some("semantic_sync:v1"),
+            Some("unknown-provenance"),
+            Some(complete.as_str()),
+        ] {
             let mut entry = index().files.remove("file").unwrap().into_inner();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
                 !entry.has_prefix_provenance(),
-                "{reset:?}: SOURCE Option 1: a non-stem identity is not a prefix"
+                "{reset:?}: a non-stem or complete identity is not a prefix"
             );
             let mut ordinary = ScanIndex::default();
             ordinary.files.insert(key.clone(), entry);
@@ -804,22 +532,12 @@ mod provenance_tests {
                 "{reset:?}"
             );
             assert!(!entry.has_prefix_provenance(), "{reset:?}");
-            assert!(!entry.has_unverified_source(), "{reset:?}: no audit debt");
-            assert!(entry.audit_obligation(100).is_none(), "{reset:?}");
             assert_eq!(counts.prefix_tag_clears, 0, "{reset:?}");
             marked.record(candidate.clone(), None, ScanParseOutcome::ConfirmedEmpty);
             assert!(marked.mark_sealed_prefix(&key, "source"));
-            assert!(marked.files[&key].has_unverified_source(), "{reset:?}");
             assert!(marked.files[&key].has_prefix_provenance(), "{reset:?}");
         }
     }
-}
-
-/// Keep a provisionally retired path selectable if partial-save reconciliation
-/// restores its marker. Preserve the actual read's root: guessing from nested
-/// roots could change the acquisition scope. A committed retirement skips it.
-pub(super) fn queue_quiet_retirement(index: &mut ScanIndex, key: &str, scan_root: PathBuf) {
-    queue_pending(index, Path::new(key), || scan_root, false, false);
 }
 
 /// The one deduplicated pending-candidate insert. Callers keep their own side
@@ -848,32 +566,9 @@ fn queue_pending(
     }
 }
 
-/// A cap delay is still owed: persist an age-bypassing retry without advancing
-/// the committed file size or claiming source/census completion.
-pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) {
-    // The queue can disappear on a context-changing traversal replacement.
-    // Reuse the existing durable reparse witness at every age/open gate and
-    // in partial saves; keep the committed size and marker population intact.
-    let key = local_index_key(&candidate.path);
-    if let Some(entry) = index.files.get_mut(&key) {
-        crate::local_resource_diagnostics::rearm_cause::clear(
-            &key,
-            entry,
-            crate::local_resource_diagnostics::rearm_cause::Cause::AuditCapDelay,
-        );
-    }
-    queue_pending(
-        index,
-        &candidate.path,
-        || candidate.scan_root.clone(),
-        true,
-        true,
-    );
-}
-
 /// Positive removal only: a file or intermediate directory is NotFound beneath
 /// a readable ancestor securely reached from a configured, readable root.
-/// Missing roots, symlinks and permission errors keep the audit and account debt.
+/// Missing roots, symlinks and permission errors keep the account debt.
 /// This is absence authority, never source verification or census credit.
 pub(super) fn proven_absent(path: &Path, roots: &[PathBuf]) -> bool {
     absence_parent(path, roots).is_some()
@@ -1419,8 +1114,8 @@ pub(super) fn defer_growth_read(
     }
 }
 
-/// Only native completion calls this; opens, length equality, progress saves,
-/// audit retirement and delivery ACKs do not settle source growth.
+/// Only native completion calls this; opens, length equality, progress saves
+/// and delivery ACKs do not settle source growth.
 pub(super) fn settle_growth(index: &mut ScanIndex, key: &str) {
     if growth_active(index) {
         let generation = index.generation;
@@ -1715,7 +1410,8 @@ fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool>
 
 /// Identity has already been checked by open_and_identify and ReadPlan.
 /// Rewrites/shrinks keep their own counted cause; a missing reusable checkpoint
-/// takes the existing Full only after a durable six-hour claim.
+/// (or a census-verify read, which declines one) takes the existing Full only
+/// after a durable six-hour claim.
 pub(super) fn growth_read_admitted(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
@@ -2015,34 +1711,6 @@ mod growth_tests {
         assert_eq!(sums, [&serde_json::json!({"stats": 2, "uncertain": 1})]);
     }
 
-    /// [money] Growth settlement keeps a progress restart's audit debt.
-    #[test]
-    fn progress_restart_growth_settlement_keeps_audit_debt() {
-        let fixture = Fixture::new();
-        let mut index = fixture.index();
-        fixture.grow();
-        assert!(revalidate_growth(
-            &mut index,
-            &fixture.key,
-            std::slice::from_ref(&fixture.root),
-            &mut (0, 0)
-        ));
-        // A progress checkpoint can advance working bytes before settlement.
-        index.files.get_mut(&fixture.key).unwrap().size_bytes = 11;
-        let mut index = restart(&index);
-        index.traversal.as_mut().unwrap().pending_candidates.clear();
-        index
-            .files
-            .get_mut(&fixture.key)
-            .unwrap()
-            .set_unverified_deadline(40 * 86400 + 10);
-        settle_growth(&mut index, &fixture.key);
-        assert!(
-            index.files[&fixture.key].has_unverified_source(),
-            "growth settlement does not erase audit debt"
-        );
-    }
-
     /// [off=main] f3 off preserves v1 age and bytes.
     #[test]
     fn off_preserves_v1_age_and_bytes() {
@@ -2331,14 +1999,8 @@ mod growth_tests {
             assert!(growth_active(&index));
             let candidate = identified_for_source(&fixture, &index, source.snapshot());
             let mut file = open_candidate_beneath_root(&candidate).unwrap();
-            let plan = ReadPlan::prepare(
-                &mut file,
-                None,
-                &Scope("daemon-growth-load".into()),
-                None,
-                100,
-            )
-            .unwrap();
+            let plan = ReadPlan::prepare(&mut file, None, &Scope("daemon-growth-load".into()), 100)
+                .unwrap();
             assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
             assert!(growth_read_admitted_at(
                 &mut index,

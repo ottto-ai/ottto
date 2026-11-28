@@ -150,7 +150,7 @@ fn lc_reread(index: &mut ScanIndex) -> BTreeMap<String, Option<CandidateParseRea
         candidate.modified_unix_seconds = entry.modified_unix_seconds;
         candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap_or_default();
         candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
-        let (decision, reason) = index.candidate_decision_with_reason_at(&candidate, 0);
+        let (decision, reason) = index.candidate_decision_with_reason(&candidate);
         if decision == CandidateDecision::Parse {
             reread.insert(key.clone(), reason);
         }

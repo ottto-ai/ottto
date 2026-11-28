@@ -1,6 +1,6 @@
 //! Process-local clear provenance. Never serialized with an index or upload.
 //! Sync reloads indexes between pages, so skipped entry fields are insufficient.
-use crate::snapshots::{CandidateParseReason, ScanIndex, ScanIndexEntry};
+use crate::snapshots::{CandidateParseReason, ScanIndex};
 use crate::transcript_acquisition::ReadMode;
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
@@ -12,9 +12,8 @@ pub(crate) enum Cause {
     ContextChanged,
     TerminalUnhealthyRetry,
     CarryInvalidation,
-    AuditCapDelay,
 }
-const CAUSES: [(Cause, &str); 5] = [
+const CAUSES: [(Cause, &str); 4] = [
     (
         Cause::NoRetainedTraversal,
         "rearm_cleared{no_retained_traversal}",
@@ -28,7 +27,6 @@ const CAUSES: [(Cause, &str); 5] = [
         Cause::CarryInvalidation,
         "rearm_cleared{carry_invalidation}",
     ),
-    (Cause::AuditCapDelay, "rearm_cleared{audit_cap_delay}"),
 ];
 #[derive(Default)]
 struct Tags(BTreeMap<String, Cause>);
@@ -57,17 +55,14 @@ fn with_tags<T>(f: impl FnOnce(&mut Tags) -> T) -> T {
 pub(crate) fn retain(index: &ScanIndex) {
     with_tags(|tags| tags.retain(index));
 }
-pub(crate) fn clear(key: &str, entry: &mut ScanIndexEntry, cause: Cause) {
+#[cfg(test)]
+pub(crate) fn clear(key: &str, entry: &mut crate::snapshots::ScanIndexEntry, cause: Cause) {
     if !entry.source_file_fingerprint.is_empty() {
         with_tags(|tags| {
             tags.0.insert(key.to_owned(), cause);
         });
     }
     entry.source_file_fingerprint.clear();
-}
-/// The outstanding clear of `key` is the audit-cap delay.
-pub(crate) fn audit_cap_cleared(key: &str) -> bool {
-    with_tags(|tags| tags.0.get(key) == Some(&Cause::AuditCapDelay))
 }
 pub(crate) fn reproven(key: &str) {
     with_tags(|tags| {
@@ -208,7 +203,7 @@ mod tests {
     fn unrelated_fulls_and_reproven_files_have_no_label() {
         let key = "unrelated-full";
         let probe = super::super::Probe::start();
-        let mode = ReadMode::Full(FullReason::AuditDue);
+        let mode = ReadMode::Full(FullReason::SameSizeEdit);
         probe.rearm_full_selected(key, mode);
         probe.rearm_full_completed(key, mode, 456);
         assert!(probe.rearm_fulls().is_empty());

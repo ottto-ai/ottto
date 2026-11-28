@@ -1,9 +1,9 @@
 // Durable holder-forced twins: acquisition cost and page/money parity.
-// Lives beside Disk so save/reload and after_source_save stay real.
+// Lives beside Disk so save/reload stays real.
 use super::*;
 use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    continuation_for_test, damage_tail_for_test, forced_needs_native_for_test, pace_cap_for_test,
+    continuation_for_test, damage_tail_for_test, forced_needs_native_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_store;
 use crate::snapshots::sampled_scan::transition_fixture::{
@@ -569,125 +569,66 @@ fn forced_twin_last_clock_is_equal_on_tail_full_and_restart() {
     });
 }
 
-/// [money] Two delays fall back to native on the same page: (a) cap pacing
-/// and (b) an unfunded completion. (c) A future head holds the twin and the
-/// session's dependent body until recovery can match cold Full.
-/// A restart without audit capacity holds the session until its holder joins.
+/// [money] A future head holds the twin and the session's dependent body
+/// until recovery can match cold Full.
 #[test]
-fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
+fn forced_verified_twin_with_a_future_head_stays_on_its_page() {
     if !supported("forced_twin_page") {
         return;
     }
     with_e2(|| {
-        for arm in ["cap", "completion", "future"] {
-            let mut f = Twin::new(&format!("forced-twin-{arm}"), true);
-            diag::round(0);
-            append(&f.twin, &line(ROOT, "own-later", AT, 9));
-            input_clock(&f.twin);
-            if arm == "future" {
-                use crate::snapshots::state_v2::{
-                    replace_tail_head_bytes_for_test, seed_future_carrier_head_for_test,
-                    tail_head_bytes_for_test,
-                };
+        use crate::snapshots::state_v2::{
+            replace_tail_head_bytes_for_test, seed_future_carrier_head_for_test,
+            tail_head_bytes_for_test,
+        };
 
-                let source = SnapshotSource::ClaudeCode;
-                f.prior = f.disk.commit(&f.owner.cache, source, &mut f.prior);
-                let route = f.disk.path(source);
-                let readable_head = tail_head_bytes_for_test(&f.prior, &f.key);
-                seed_future_carrier_head_for_test(&f.prior, &f.key);
-                f.prior = ScanIndex::load(route).unwrap();
-                let future_head = tail_head_bytes_for_test(&f.prior, &f.key);
+        let mut f = Twin::new("forced-twin-future", true);
+        diag::round(0);
+        append(&f.twin, &line(ROOT, "own-later", AT, 9));
+        input_clock(&f.twin);
+        let source = SnapshotSource::ClaudeCode;
+        f.prior = f.disk.commit(&f.owner.cache, source, &mut f.prior);
+        let route = f.disk.path(source);
+        let readable_head = tail_head_bytes_for_test(&f.prior, &f.key);
+        seed_future_carrier_head_for_test(&f.prior, &f.key);
+        f.prior = ScanIndex::load(route).unwrap();
+        let future_head = tail_head_bytes_for_test(&f.prior, &f.key);
 
-                f.force("holder-later");
-                let restart = f.restart();
-                let mut held = f.page_as(&restart, "restart");
-                assert!(restart.paths().contains(&f.holder));
-                assert!(!restart.paths().contains(&f.twin));
-                assert!(held.scan.newer_build_held.contains(&f.key));
-                with_scan_clock(f.now.get(), || held.enrich(&f.c));
-                assert_withheld(&held, ROOT, "the holder needs the newer-build twin");
-                assert!(held
-                    .disposition
-                    .request_owned_hold_reasons
-                    .contains_key("absent_content_twin"));
-                let mut sent = twin(&held);
-                let holds = with_scan_clock(f.now.get(), || sent.finish());
-                assert!(holds.progress_blocking);
-                assert!(body(&sent, ROOT).is_none());
+        f.force("holder-later");
+        let restart = f.restart();
+        let mut held = f.page_as(&restart, "restart");
+        assert!(restart.paths().contains(&f.holder));
+        assert!(!restart.paths().contains(&f.twin));
+        assert!(held.scan.newer_build_held.contains(&f.key));
+        with_scan_clock(f.now.get(), || held.enrich(&f.c));
+        assert_withheld(&held, ROOT, "the holder needs the newer-build twin");
+        assert!(held
+            .disposition
+            .request_owned_hold_reasons
+            .contains_key("absent_content_twin"));
+        let mut sent = twin(&held);
+        let holds = with_scan_clock(f.now.get(), || sent.finish());
+        assert!(holds.progress_blocking);
+        assert!(body(&sent, ROOT).is_none());
 
-                let cold = E2ScanFixture::capturing_identity();
-                let cold_page = f.settle(&cold, "cold", f.page_as(&cold, "cold"), None);
-                let reference = mixed_route(&cold_page, &e2_progress(), Mode::ColdFull);
-                let committed = held.committed.clone();
-                let prior = with_scan_clock(f.now.get(), || {
-                    settle(&f.c, &committed, held, &mut e2_progress())
-                });
-                assert_eq!(tail_head_bytes_for_test(&prior, &f.key), future_head);
+        let cold = E2ScanFixture::capturing_identity();
+        let cold_page = f.settle(&cold, "cold", f.page_as(&cold, "cold"), None);
+        let reference = mixed_route(&cold_page, &e2_progress(), Mode::ColdFull);
+        let committed = held.committed.clone();
+        let prior = with_scan_clock(f.now.get(), || {
+            settle(&f.c, &committed, held, &mut e2_progress())
+        });
+        assert_eq!(tail_head_bytes_for_test(&prior, &f.key), future_head);
 
-                // Replace the incompatible envelope with a readable one,
-                // keeping the transcript and its committed pages in place.
-                replace_tail_head_bytes_for_test(&prior, &f.key, &readable_head);
-                f.prior = ScanIndex::load(route).unwrap();
-                f.now.set(f.now.get() + 7 * 60 * 60);
-                diag::round("recovery");
-                let restart = f.restart();
-                let page = f.page_as(&restart, "restart");
-                f.settle(&restart, "restart", page, Some(&reference));
-                continue;
-            }
-            if arm == "completion" {
-                // Held-new custody has a census and committed head but no
-                // entry: it bypasses the cap gate and would pend at completion.
-                assert!(f.prior.files.remove(&f.key).is_some());
-            }
-            f.force("holder-later");
-            let mut restart = f.restart();
-            if arm != "future" {
-                f.owner.set_audit_slots(0);
-                restart.set_audit_slots(0);
-            }
-            if arm == "cap" {
-                pace_cap_for_test(&f.owner, &f.twin);
-                pace_cap_for_test(&restart, &f.twin);
-            }
-            let cold = E2ScanFixture::capturing_identity();
-            let mut pages = f.pages(&cold, &restart, f.page(&f.owner));
-            f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
-            if arm != "future" {
-                // Depends on the content-session co-scheduling fix landing
-                // first: a pre-acquisition holder deferral must hold the whole
-                // session, even when its pulled twin completes natively.
-                let held_page = &mut pages[2];
-                with_scan_clock(f.now.get(), || {
-                    held_page.enrich(&f.c);
-                    held_page.finish();
-                });
-                let held = mixed_route(held_page, &e2_progress(), Mode::DiskRestore);
-                assert!(
-                    !held.snapshots.contains_key(ROOT),
-                    "the deferred holder holds the session; no partial body publishes"
-                );
-                let prior = with_scan_clock(f.now.get(), || {
-                    f.disk.commit(
-                        &held_page.cache,
-                        SnapshotSource::ClaudeCode,
-                        &mut held_page.index,
-                    )
-                });
-                restart.set_audit_slots(256);
-                diag::round("retry");
-                diag::owner("restart");
-                pages[2] = with_scan_clock(f.now.get(), || {
-                    f.c.raw(&restart, prior, 2, true, std::slice::from_ref(&f.holder))
-                });
-            }
-            let pages = f.compare(&cold, &restart, pages);
-            assert!(!pages[2].index.files[&f.key]
-                .scan_identity_version
-                .as_deref()
-                .unwrap()
-                .contains("sampled_unverified"));
-        }
+        // Replace the incompatible envelope with a readable one,
+        // keeping the transcript and its committed pages in place.
+        replace_tail_head_bytes_for_test(&prior, &f.key, &readable_head);
+        f.prior = ScanIndex::load(route).unwrap();
+        f.now.set(f.now.get() + 7 * 60 * 60);
+        diag::round("recovery");
+        let restart = f.restart();
+        let page = f.page_as(&restart, "restart");
+        f.settle(&restart, "restart", page, Some(&reference));
     });
 }
 

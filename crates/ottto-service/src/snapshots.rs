@@ -399,10 +399,9 @@ pub use wire::{
     SNAPSHOT_QUARANTINE_CONTRACT_VERSION, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
 };
 
+pub(crate) use discovery::traversal::state::begin_source_pass;
 #[cfg(test)]
 use discovery::traversal::state::SettledScanResidue;
-#[cfg(unix)]
-pub(crate) use discovery::traversal::state::{after_source_save, begin_source_pass};
 #[cfg(test)]
 pub(crate) use discovery::traversal::state::{
     begin_continuation_read_ranges_for_test, take_continuation_read_ranges_for_test,
@@ -2039,7 +2038,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
 }
 crate::heap_layout_bound::unit_enum!(true;
     CandidateDecision: Skip | Migrate | Parse | ReconcileLegacy;
-    CandidateParseReason: TerminalDisposition | NewFile | AuthorityQuarantine | Audit
+    CandidateParseReason: TerminalDisposition | NewFile | AuthorityQuarantine
         | BodyWitnessAdoption | UploadContext | ActivityOrQuarantineRetry | TranscriptChanged
         | CodexCapture | UnknownOutcome | LegacyActivity | LegacyIdentity | Rearmed
         | SourceChanged | ForcedFamily;

@@ -92,7 +92,6 @@ impl OwnedSourceScan {
             let decision = self.index.codex_unchanged_decision(
                 &mut candidate,
                 &self.codex_title_metadata,
-                self.audit_now,
                 true,
                 &mut side_moved,
             );
@@ -208,9 +207,7 @@ impl OwnedSourceScan {
             // A twin-only forced member that owes only adoption keeps that
             // reason, so the history gate can hold the whole twin group.
             Some(true)
-                if self
-                    .index
-                    .candidate_decision_with_reason_at(&candidate, self.audit_now)
+                if self.index.candidate_decision_with_reason(&candidate)
                     == (
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::BodyWitnessAdoption),
@@ -225,12 +222,9 @@ impl OwnedSourceScan {
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::ForcedFamily),
             ),
-            // Use the same audit clock as slot preparation.
-            None => self.index.candidate_decision_in_window(
-                &candidate,
-                self.audit_now,
-                &mut source_change,
-            ),
+            None => self
+                .index
+                .candidate_decision_in_window(&candidate, &mut source_change),
         };
         if let Some((logical, reason)) = logical_decision {
             decision = logical;
@@ -384,6 +378,8 @@ impl OwnedSourceScan {
         // Counted once the page actually reads the file: a fence
         // or deferral below does not inflate the read diagnostics.
         let mut planned_mode = None;
+        // The planned read is the queued census-verify re-read.
+        let mut planned_census_verify = false;
         if let Some(context) = self
             .sampling
             .as_mut()
@@ -474,7 +470,6 @@ impl OwnedSourceScan {
                     .reduction_dependencies_available
                     .observe(reduction_sidecar.is_some());
                 if let Some(reduction_sidecar) = reduction_sidecar {
-                    let debt = sampled_audit::debt_for_key(&self.index, &key, self.audit_now);
                     let protected_entry = self.index.files.get(&key);
                     context
                         .admission
@@ -482,9 +477,8 @@ impl OwnedSourceScan {
                         .observe(protected_entry.is_some());
                     let protected =
                         protected_entry.is_some_and(ScanIndexEntry::codex_history_is_protected);
-                    // Audit population/deadlines never gate ordinary
-                    // restore. The legacy prefix/proof paths retain their
-                    // own rules. A same-process `e2`-held read may
+                    // The legacy prefix/proof paths keep their own
+                    // rules. A same-process `e2`-held read may
                     // reuse only its own certificate, without authority.
                     // On Claude's database route a forced member reads natively
                     // only for evidence stored state cannot supply.
@@ -495,27 +489,13 @@ impl OwnedSourceScan {
                                 &key,
                             ));
                     let forced_twin = forced_twin && !forced_native;
-                    // A pulled twin must finish on its holder's page. Native
-                    // acquisition avoids both cap pacing and unfunded completion.
+                    // A pulled twin must finish on its holder's page.
                     let mut allow_sample = (self.index.files.contains_key(&key)
                         || e2_held_new_file)
                         && !protected
-                        && !forced_native
-                        && !(forced_twin
-                            && (context.audit_slots == 0
-                                || !self.index.can_stage_sampled_audit(&key)));
-                    context
-                        .admission
-                        .audit_metadata_supported
-                        .observe(context.audit_metadata_supported);
+                        && !forced_native;
                     context.admission.protected_history.observe(protected);
                     context.admission.forced_family.observe(forced_family);
-
-                    context.admission.audit_debt_present.observe(debt.is_some());
-                    context
-                        .admission
-                        .audit_slot_available
-                        .observe(context.audit_slots > 0);
                     let scope = context.file_scope(self.source, &candidate, &reduction_sidecar);
                     // On a Tail route a read loads the committed Tail.
                     #[cfg(unix)]
@@ -540,10 +520,16 @@ impl OwnedSourceScan {
                     {
                         tail_source::counters::bump(self.source, "tail_bootstrap_full", "new_file");
                     }
+                    // A re-armed read of a held census record: `reuses_stored`
+                    // declined the stored state, so a Full with no other
+                    // reason is counted on the page as `census_verify`.
+                    let census_verify = allow_sample
+                        && parse_reason == Some(CandidateParseReason::Rearmed)
+                        && claude_request_census::holds_for_verifying_read(&self.index, &key);
                     #[cfg(unix)]
                     let mut tail_proven_full = None;
                     #[cfg(unix)]
-                    let (mut retained, debt) = match tail_load {
+                    let retained = match tail_load {
                         Some(route) => {
                             let (loaded, loaded_bytes) = tail_source::load_candidate(
                                 self.source,
@@ -574,7 +560,7 @@ impl OwnedSourceScan {
                                         );
                                     }
                                     retained_offset = Some(retained.checkpoint.sealed_offset());
-                                    (Some(retained), debt)
+                                    Some(retained)
                                 }
                                 // A pulled twin falls back to this page's native read.
                                 tail_source::load::Load::Held(
@@ -586,7 +572,7 @@ impl OwnedSourceScan {
                                         "Held forced_twin=true native_fallback".into()
                                     });
                                     allow_sample = false;
-                                    (None, debt)
+                                    None
                                 }
                                 // Untouched, held as residue. A newer build's
                                 // state cannot progress here: non-progressing
@@ -621,7 +607,7 @@ impl OwnedSourceScan {
                                 tail_source::load::Load::Cold(proven) => {
                                     tail_restore = "miss";
                                     tail_proven_full = proven;
-                                    (None, debt)
+                                    None
                                 }
                             }
                         }
@@ -631,61 +617,20 @@ impl OwnedSourceScan {
                                 sampled_scan::ram_miss_class(
                                     &self.index,
                                     &key,
-                                    context.cache.quiet_registered(self.source),
+                                    context.cache.pass_begun(self.source),
                                 ),
                             );
-                            (None, debt)
+                            None
                         }
-                        None => (None, debt),
+                        None => None,
                     };
-                    // The cap funds NEW obligations, never a global restore
-                    // gate. Marked files Tail; quiet debt-free copies reuse.
-                    if allow_sample
-                        // Account-held reparses belong to withheld_reparse;
-                        // central staging still bounds fresh audit markers.
-                        && !self.index.claude_account_deferred_holds.contains_key(&key)
-                        && context.audit_slots == 0
-                        && self.index.files.contains_key(&key)
-                        && !self.index
-                            .files
-                            .get(&key)
-                            .is_some_and(ScanIndexEntry::has_unverified_source)
-                        && !retained.as_ref().is_some_and(|old| {
-                            old.checkpoint.audit_debt().is_none()
-                                && old.checkpoint.sealed_offset() == candidate.size_bytes
-                                && old.checkpoint.scope() == &scope
-                                && old
-                                    .checkpoint
-                                    .stamp_matches(parser.reader.reader.get_ref())
-                                    .unwrap_or(false)
-                        })
-                    {
-                        if !context.cap_candidate(&key) {
-                            #[cfg(test)]
-                            twin_diagnostics::event(&candidate.path, || {
-                                "defer pre-acquisition cap_retry cap_candidate=false slots=0".into()
-                            });
-                            sampled_audit::queue_cap_retry(&mut self.index, &candidate);
-                            self.census.record_unreadable_file(
-                                UnreadableCause::Reduction,
-                                &candidate.path,
-                            );
-                            return;
-                        }
-                        allow_sample = false;
-                    }
                     #[cfg(test)]
                     twin_diagnostics::event(&candidate.path, || {
                         format!(
-                        "sampling forced_family={forced_family} forced_native={forced_native} forced_twin={forced_twin} allow={allow_sample} slots={} can_stage={}",
-                        context.audit_slots, self.index.can_stage_sampled_audit(&key),
+                        "sampling forced_family={forced_family} forced_native={forced_native} forced_twin={forced_twin} allow={allow_sample}",
                     )
                     });
                     context.admission.sampling_allowed.observe(allow_sample);
-                    // Only the cap turns sampling off after a kept hit.
-                    if !allow_sample && retained.take().is_some() {
-                        tail_restore = "hit_discarded_by_cap";
-                    }
                     context.admission.prepare_started =
                         context.admission.prepare_started.saturating_add(1);
                     let census_base_bound = retained
@@ -718,7 +663,6 @@ impl OwnedSourceScan {
                     let mode = match parser.prepare_acquisition(
                         retained,
                         &scope,
-                        debt,
                         sampled_scan::now_seconds(),
                     ) {
                         Ok(mode) => mode,
@@ -762,30 +706,16 @@ impl OwnedSourceScan {
                     if self.source == SnapshotSource::Codex {
                         sampled_scan::configure_tier_replay(&mut parser, &candidate, &self.index);
                     }
-                    let audit_due = parser
-                        .reader
-                        .acquisition
-                        .as_ref()
-                        .and_then(|plan| plan.metrics().audit_due)
-                        .or_else(|| {
-                            // A grown Full without an older obligation
-                            // still owes a quiet audit. Prepare its bound
-                            // now, never from the discarded checkpoint.
-                            (self.source == SnapshotSource::ClaudeCode
-                                && allow_sample
-                                && matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)))
-                            .then(|| {
-                                sampled_scan::now_seconds().saturating_add(
-                                    crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-                                )
-                            })
-                        });
-                    planned_mode = Some((mode, audit_due));
+                    planned_mode = Some(mode);
+                    planned_census_verify = census_verify
+                        && mode
+                            == crate::transcript_acquisition::ReadMode::Full(
+                                crate::transcript_acquisition::FullReason::StateMissing,
+                            );
                     file_sampling = Some(sampled_scan::Active {
                         key: key.clone(),
                         scope,
                         mode,
-                        audit_due,
                         tier_prefix_replay: false,
                         census_base_bound,
                         resident_loaded_bytes,
@@ -808,7 +738,7 @@ impl OwnedSourceScan {
                 // yet main still reads and publishes this file. A file
                 // larger than the singleton budget therefore pages as a
                 // cursor-only job: a fresh `Full` acquisition with no
-                // retained state and no debt input, used only for the
+                // retained state, used only for the
                 // job's object certificate. Its completion keeps no
                 // checkpoint and no copy, so it is never source-verified.
                 let reduction_sidecar = sampled_scan::reduction_dependencies(
@@ -826,30 +756,26 @@ impl OwnedSourceScan {
                     let scope = context.file_scope(self.source, &candidate, &reduction_sidecar);
                     context.admission.prepare_started =
                         context.admission.prepare_started.saturating_add(1);
-                    let mode = match parser.prepare_acquisition(
-                        None,
-                        &scope,
-                        None,
-                        sampled_scan::now_seconds(),
-                    ) {
-                        Ok(mode) => mode,
-                        Err(_) => {
-                            context.admission.prepare_failed =
-                                context.admission.prepare_failed.saturating_add(1);
-                            self.census.record_unreadable_file(
-                                UnreadableCause::Reduction,
-                                &candidate.path,
-                            );
-                            return;
-                        }
-                    };
+                    let mode =
+                        match parser.prepare_acquisition(None, &scope, sampled_scan::now_seconds())
+                        {
+                            Ok(mode) => mode,
+                            Err(_) => {
+                                context.admission.prepare_failed =
+                                    context.admission.prepare_failed.saturating_add(1);
+                                self.census.record_unreadable_file(
+                                    UnreadableCause::Reduction,
+                                    &candidate.path,
+                                );
+                                return;
+                            }
+                        };
                     sampled_scan::configure_tier_replay(&mut parser, &candidate, &self.index);
-                    planned_mode = Some((mode, None));
+                    planned_mode = Some(mode);
                     file_sampling = Some(sampled_scan::Active {
                         key: key.clone(),
                         scope,
                         mode,
-                        audit_due: None,
                         tier_prefix_replay: false,
                         census_base_bound: false,
                         resident_loaded_bytes,
@@ -875,14 +801,15 @@ impl OwnedSourceScan {
             sampled_audit::defer_growth_read(&mut self.index, &mut self.census, &candidate);
             return;
         }
-        if planned_mode.is_none_or(|(mode, _)| {
-            matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
-        }) && let Err(error) = tail_source::seed_full_job_template(
-            &self.index,
-            &candidate,
-            &[],
-            &mut parser.accumulator,
-        ) {
+        if planned_mode
+            .is_none_or(|mode| matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)))
+            && let Err(error) = tail_source::seed_full_job_template(
+                &self.index,
+                &candidate,
+                &[],
+                &mut parser.accumulator,
+            )
+        {
             tail_source::counters::bump(self.source, "tail_db_loads", "held");
             if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::Future) {
                 self.hold_newer_tail(key, forced_family);
@@ -968,8 +895,8 @@ impl OwnedSourceScan {
             return;
         }
         if let Some(context) = self.sampling.as_mut() {
-            if let Some((mode, audit_due)) = planned_mode {
-                context.record_mode(mode, audit_due);
+            if let Some(mode) = planned_mode {
+                context.record_mode(mode, planned_census_verify);
                 context.same_size_touch_proven +=
                     usize::from(active.parser.reader.acquisition.as_ref().is_some_and(
                         crate::transcript_acquisition::ReadPlan::same_size_touch_proven,
@@ -1472,7 +1399,7 @@ impl OwnedSourceScan {
         // file). A held file that only owes the upgrade is skipped with
         // its old stamp, and so is one that also owes only its upload
         // context. A held file selected for another reason (re-arm,
-        // family, audit, authority, a rebuilt or replayed index) still
+        // family, authority, a rebuilt or replayed index) still
         // parses for its local work, but none of its bodies
         // is emitted and its upload tuple stays (`veto_claude_history_emission`).
         // A new Claude file held only by this page's budget is skipped too.
@@ -1484,13 +1411,9 @@ impl OwnedSourceScan {
             let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                 && (self
                     .index
-                    .candidate_requires_only_body_witness_adoption(candidate, self.audit_now)
+                    .candidate_requires_only_body_witness_adoption(candidate)
                     || (self.source == SnapshotSource::ClaudeCode
-                        && claude_copy_prefix_reread::unchanged_requested(
-                            &self.index,
-                            candidate,
-                            self.audit_now,
-                        )));
+                        && claude_copy_prefix_reread::unchanged_requested(&self.index, candidate)));
             let history = if self.source == SnapshotSource::ClaudeCode {
                 self.index.claude_history_upgrade_decision(
                     candidate,

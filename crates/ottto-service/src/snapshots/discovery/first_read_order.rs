@@ -2,8 +2,8 @@
 //! replay) is pending, each root-walk end stably reorders the queued non-hint
 //! entries in the positions they already hold. Order only: nothing is added,
 //! dropped, capped or delayed, hint entries keep their slots and every
-//! selection tier still picks by predicate, so retry, fresh, audit, hint and
-//! census precedence are unchanged.
+//! selection tier still picks by predicate, so retry, fresh, hint and census
+//! precedence are unchanged.
 //!
 //! Codex and Pi opt into newest mtime first in the durable source table;
 //! Claude keeps FIFO. An unknown mtime counts as newest.

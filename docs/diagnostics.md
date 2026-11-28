@@ -234,8 +234,7 @@ semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
 full/tail/unchanged selection counts describe acquisition decisions, including
 repeated or subsequently failed plans; they are not distinct file counts.
 `completed_native_bytes` counts completed sampled JSONL read plans.
-`completed_guard_bytes` also includes actual returned head/boundary bytes from
-quiet-retirement validation attempts, including attempts that keep their debt.
+`completed_guard_bytes` counts the head/boundary sample bytes those plans read.
 Other failed reads, joined-file replay, discovery, headers, sidecars and
 independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
@@ -245,17 +244,12 @@ and upload. A capped/partial page is still a completed page.
 When sampling is present, `page_events` records existing full-read reasons as a
 sparse map of closed snake_case keys (`state_missing`, `audit_due`,
 `clock_changed`, `scope_changed`, `invalid_checkpoint`, `replaced`, `shrunk`,
-`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`).
-Their sum equals `full_selections`. It also records `priority_full_replays`,
-`audits_started` (a Full whose audit debt was already due; one that only carries
-a later-due debt is not counted), `audits_completed`, `max_start_overdue_seconds`
-and `max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
-record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
-existing index calculations. These three fields are state gauges. The same
-object adds page-event counts `audit_quiet_retired` and `audit_cap_full`.
-To keep the existing native page under its 4 KiB budget, `audit_cap_delay`
-emits a separate nonzero-only `sampled_audit_cap_delay` record on this carrier;
-`pace_evicted` is emitted by `sampled_audit_pace_alarm`. A nonzero-only
+`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`,
+`census_verify`). Their sum equals `full_selections`; `audit_due` is retained
+for older records and is always zero now. `census_verify` is the queued re-read
+of a file whose unverified identity-incomplete census record holds its root
+(its outcomes are `census_hold_release_full` below): it reads Full, never from
+stored state, so it can verify the record. It also records `priority_full_replays`. A nonzero-only
 `same_size_touch_proven` record counts same-size files whose moved mtime an
 unchanged write generation count proved a touch, so they continued from stored
 state instead of a `same_size_edit` Full. Values remain exact.
@@ -273,51 +267,6 @@ count decisions, not distinct files. A held created thread re-read because its
 hold memo's side facts moved is not counted. Side-file changes do not wake the
 walk gate, so these show up on the next walk, and with the gate off on every
 walk.
-Full counts actual per-file cap fallbacks; refused prefix/lossy completions and
-paced candidates count as delays. The RAM
-pace is six hours per key, 256 fixed slots, oldest-evicted on overflow. Its
-SystemTime clock expires on backwards time or jumps beyond 30 days. A restart
-allows at most one extra cap Full per key. Existing marked Tails stay enabled.
-A positive Full count emits `sampled_audit_cap_alarm` immediately (`> 0`);
-positive `pace_evicted` emits its own `sampled_audit_pace_alarm` immediately.
-Delayed paths keep their committed size and clear the existing source
-fingerprint as a durable reparse witness. It remains age-exempt across partial
-saves, restarts and context-changing traversal replacements; the watcher queue
-alone is not its custody.
-The clear uses the process-local rearm wrapper: a later Full reports
-`rearm_cleared{audit_cap_delay}` with its count and completed native bytes.
-That tag survives an index reload in the same process; a process restart loses
-the diagnostic tag while retaining the persisted retry witness.
-
-Due complete-c quiet retirement requires both samples, stable EOF/stamp and native
-completion/RAM admission. The scheduling marker remains until a second index save clears it. The existing diagnostics carrier then emits
-`sampled_audit_retirement` with `audit_quiet_retired` and `pending_audits`.
-The page's retirement count is zero while that receipt remains outstanding.
-A failed save keeps the obligation scheduled.
-Freed slots become usable on the next committed scan; the current page reserves
-them because partial-save reconciliation can restore an unacknowledged marker.
-Quiet retirement keeps the old Full verification time and grants no
-`audits_completed`, source, census or ACK credit.
-Before the deadline, incidental telemetry-only Unchanged reuse keeps the exact
-index and checkpoint debt. A cap Full keeps its frozen acquisition extent even
-though it cannot sample; independent grown-prefix/marker refusals still apply.
-
-`audit_retired_absent{events}` counts an obligation retired on positively proven absence:
-ENOENT on a no-follow descriptor chain from a readable configured root.
-A missing intermediate directory counts only beneath the nearest securely
-opened readable ancestor; all pinned directories are revalidated. Symlinks,
-dangling links, unreadable/missing roots and other errors keep it owed. Codex-protected history
-remains retained; this counter grants no Full or source/census credit. Account
-removal also emits `withheld_hold_released{deleted}`. Ordinary unavailable audit
-markers are never evicted.
-The absence predicate is shared with the hardened account-hold proof. The
-`audit_retired_absent` and deleted-hold counts currently use temporary traversal
-point carriers; integration must replace them with the shared account/absence
-diagnostics, preserving both retirement paths without double counting.
-Both keys and their count meanings are shared with the integrated diagnostics.
-Deleted-hold tokens aren't reported until the shared withheld-account
-bookkeeping lands. Whichever change integrates second must use one emitter for
-each count; the deletion fixture pins one emission per key, then none on retry.
 The sampled acquisition objects are absent when sampling is null.
 
 Additive version 2 Claude counts on the existing page/check-in carrier classify
@@ -719,7 +668,6 @@ they reset at process start and never decide anything.
 | `tail_publish{dropped}` | A lossy or unsealed completion staged nothing. |
 | `tail_full_encode{failed}` | Encoding failed, or a finish-only or live field was already set at PRE, and the file alone was set aside (`encode`). |
 | `tail_refold{reason}` | A file selected for late evidence (`source_changed`, `rearmed`, `forced_family`, `authority_quarantine`, `activity_or_quarantine_retry`) that loaded its stored state, counted at the load: every re-fold, whether or not its body then differs from the ACKed one. A body that differs is sent as an ordinary update on the head CAS, the body a native read sends; an identical one sends nothing. A set-aside file, or one with a body waiting on a server retry (a head-CAS conflict), reads natively instead and is not counted. |
-| `quiet_retirement{staged,save_failed}` | Quiet audit retirement. A failed second save restores the marker and stays staged. A committed retirement is `sampled_audit_retirement`'s. |
 
 Each existing `native_collection_page` row also carries scalar
 `counts.tail_loads` and `counts.tail_load_bytes`: successful Tail hits on that
@@ -896,8 +844,8 @@ Claude/Pi walk, candidate revalidation and open, and the Codex roster. A key owe
 discoverable and observed whatever its age while it is owed, so reconciliation
 never prunes it. Its growth goes through the counted Tail path. Only a validated
 catch-up or a proven, counted removal releases it, and it is never a Full cause.
-Whole-file size no longer limits admission. Registered sources today are the unverified
-sampled-generation marker (any source) and Claude withheld-account holds. A new
+Whole-file size no longer limits admission. Registered sources today are a sealed-prefix
+or older-build sampled tag (any source) and Claude withheld-account holds. A new
 owed source (a Codex owed-residue set, a compressed hold) registers as one field
 plus its lines in `discovery_retention!`, `unverified` and `owes`; it adds no
 separate exemption.
@@ -1004,8 +952,8 @@ Codex's already-known unterminated EOF fragment is excluded from grown retention
 and its fate/age population when a validated cursor certificate and retained
 prefix reduction bind the entire residual to the unchanged object. This RAM-only
 binding reuses discovery metadata (no additional stat), requires known birth,
-and grants no audit completion or custody release. The selector also requires
-the existing sampled fingerprint to match, after independent audit/context gates.
+and grants no Full credit or custody release. The selector also requires
+the existing sampled fingerprint to match, after independent context gates.
 Real extra bytes, termination, replacement or missing binding use the ordinary
 counted catch-up path; a length difference alone never proves a known fragment.
 
@@ -1035,7 +983,7 @@ identity/guard samples. It is recorded after reading, never used to select or
 pace a read, and drained per emitted page. It does not count Full reads, real
 appends/completed records, or in-preparation Skips with a retained witness.
 The literal never-Full bound describes the retained, valid prefix-cache case;
-true cache loss, unsupported layouts and due audits retain their separately
+true cache loss and unsupported layouts retain their separately
 named existing Full causes and are outside this Tail-repeat counter.
 
 
@@ -1058,9 +1006,8 @@ records its content witness immediately. Equal committed fingerprints never
 grant an ordinary Skip to a recorded hold without that CONTENT witness. Missing,
 refused or poisoned advisory state recovers through the existing counted parse;
 genuine authority/correction/rearm constraints retain priority. Unknown object
-generation (including missing birth identity) fails closed to that same path. A
-past-due sampled audit on such a key is deferred to its next counted re-parse
-(it cannot settle while held). Restored upload-context, body-witness adoption
+generation (including missing birth identity) fails closed to that same path.
+Restored upload-context, body-witness adoption
 and missing-activity repair debt likewise cannot settle an account hold on
 unchanged content. The completed CONTENT witness is scoped to the active body
 revision and upload context: within that authority it defers repeated local
@@ -1083,22 +1030,35 @@ existing bounded identity samples remain. No new persisted state or read occurs.
 Known gap: APFS birth-clamp continuation accepts an object with an identical [device,inode], length, bounded samples and evidence whose birth moved down to its mtime. A reused-inode replacement crafted to match all of these (unsampled interior differing) would inherit the withheld memo until binding or real change. APFS does not reuse inode numbers in normal operation; Linux cannot produce the signature. Counted by withheld_birth_clamp_accepted.
 The effect is a withheld memo Skip until binding or a real change, never a wrong upload; no unprivileged continuity witness is available (`st_gen` needs root). No ACK, census or money credit is granted.
 
-The virtual N1 audit delay is a **bounded/transient scheduling hold**, ending at
-its existing due time. Unknown identity or resource refusal grants no new Skip
-or completion credit. It applies only to an aged grown key admitted solely by the
-grown-since-committed retention arm. A recent grown key keeps main's immediate
-TranscriptChanged selection. At its retained due time, the aged key takes the
-existing Audit cause. When virtual deadlines convert to sampled markers,
-restoration carries the minimum owed due time, and only a successful secure
-open marks the slot attempted. Failed opens preserve the owed due time;
-stat-aware backoff and parking pace retries. The RAM backoff map admits 256 keys;
-longest-quiet eviction is counted and transfers the evicted owed deadline into
-the next slot, failing toward reading rather than dropping the obligation.
-
 `counts.withheld_hold_released` counts released holds: `deleted` (the held file
 was proved absent), `deleted_tokens` (its last-known withheld tokens, when
-available), and `resolved` (a parse bound the account). A held audit obligation
-is retired only after two consecutive rooted NotFound observations at least
+available), and `resolved` (a parse bound the account). A hold a parse
+releases on a page clears that entry's source fingerprint and queues it for one
+re-read before upload and save, because no stored copy discharges its debt;
+`sampled_audit_account_release{retry_queued}` counts those queued re-reads. The
+same pre-save step queues one re-read for an unverified identity-incomplete
+census record at its entry's current revision, which otherwise holds its root
+until a Full read. The attempt is keyed on the file's state as its index entry
+records it (length, modification time and birth; the re-arm itself changes none
+of these): one attempt per unchanged file per process, and a changed file is
+attempted again no sooner than six hours after its last attempt. Attempts are
+remembered in RAM only, for at most 4,096 files, so a restart allows one more
+attempt per file. The re-read reads Full as `census_verify`, and a loss-free one
+releases the root. When an attempt's read finishes on the same file state and
+leaves the record unverified (a parse that is never loss-free), the root stays
+held and the file is not read again until it changes.
+`census_hold_release_full{outcome}` counts these attempts as process totals on
+the existing `local snapshot census claude parse reasons` stderr line, after
+`identity_incomplete_holds_cleared_process_total`, one
+` census_hold_release_full{outcome="<name>"}=<count>` field per nonzero
+outcome: `attempted` (a re-read was queued), `verified` (its read finished on
+the same file state with the record verified, so the root is released),
+`unverifiable` (it finished with the record still unverified; counted once per
+file state) and `waiting` (owed, but the attempt memory was full of files it
+must remember, so it waits for a later page). A read's outcome is counted at
+the next pre-save step, so it shows on a later line; the line prints only on a
+page with one of its other reasons. Counts only, no path or id. A
+held account is retired only after two consecutive rooted NotFound observations at least
 600 seconds apart under the same validated parent, after a later directory
 walk has started and completed (details below). Elapsed witness time uses
 RAM-only monotonic `Instant`, independently of wall-clock corrections; an earlier
@@ -1110,10 +1070,10 @@ pins the nearest existing parent's descriptor and missing-component depth
 between probes; inode reuse cannot substitute a different parent. Presence,
 symlink/non-directory ancestors, permission errors, parent replacement,
 missing/unreadable roots or unavailable memo state reset the sequence and keep
-debt. Restart loses the witness and requires two new observations. Descriptor
+the hold. Restart loses the witness and requires two new observations. Descriptor
 open failures also fail closed. The memo admits at most 32 retained parent
 descriptors and at most one eighth of the process soft descriptor limit; failure
-to query the limit refuses admission. Unadmitted keys keep their debt and retry
+to query the limit refuses admission. Unadmitted keys keep their hold and retry
 on later inventory passes as admitted keys retire.
 The inventory probes at most 4,096 recorded holds at each Claude page end,
 including held-new keys, outside aggregate terminal authority. These are metadata-
@@ -1121,8 +1081,7 @@ only rooted openat walks, never transcript reads. A pinned parent on a removable
 root can delay eject for at least 600 seconds. Each discovered held-file presence
 check resets its witness using one key construction and memo lookup. Indexed reconciliation and removal hints
 share this eligibility gate; generic file removal preserves account holds.
-Retirement preserves audited fingerprint incidence and existing ACK custody,
-and counts `counts.audit_retired_absent.events` when it removes audit debt and
+Retirement preserves existing ACK custody and counts
 `Vanished::RequestCensusRemoved` when it removes a request-census record. It
 provides no Full, source, census, manifest, ACK or money completion credit.
 Codex-protected entries keep their separate protected history.
@@ -1164,7 +1123,7 @@ within a configured root keeps its **correctness hold**. Before age rejection,
 both bounded directory discovery and candidate gates (including watcher hints)
 reuse the birth/move owner's recorded physical generation (device/inode, known
 birth and append-compatible extent). Proven custody moves its hold, indexed
-audit debt, incidence, stored copy-removal groups/retry age, money marks and
+entry, incidence, stored copy-removal groups/retry age, money marks and
 advisory memo to the destination. Copy proofs naming the moved holder follow it.
 The owned committed baseline follows before held-result restoration. Moving
 custody grants no upload, ACK, census or release credit. An indexed destination
@@ -1208,8 +1167,7 @@ keeps the page line under its size bound): nonzero counts of why a body was
 read or uploaded, by one first cause. They are local diagnostics only; they
 gate, cap and upload nothing.
 
-- **Causes:** `append` (growth, including a due audit of a file that grew, or a
-  new file in a known index), `finalizer_revision`,
+- **Causes:** `append` (growth, or a new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
   `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
   `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
@@ -1237,19 +1195,16 @@ gate, cap and upload nothing.
   context, inode or sampled-byte move cannot be told apart. `adoption` is a
   non-money body-witness revision adoption, `rearm` a cleared entry
   fingerprint, `memo` an account memo-miss, `new_file_fresh_index` a new file
-  after a fresh index without prior-history evidence, `audit` a due audit of a
-  file that did not grow, and `other` the rest.
+  after a fresh index without prior-history evidence, and `other` the rest.
   - `<cause>.<mode>` is the actual acquisition mode: `unchanged`, `tail`,
     `full:<reason>`, or `no_plan`. A `no_plan` read counts its parser bytes and
     is never in `read`, so the planned modes sum to `read.admin_other`.
   - `<cause>.restore.<outcome>` is the Tail restore at selection: `miss` (cold
-    or held), `bypass` (no load), `hit_discarded_by_cap`, or `hit`. A kept `hit`
+    or held), `bypass` (no load), or `hit`. A kept `hit`
     compares the loaded seal and the plan's opening extent with the prior
     indexed size: `hit.indexed_gap` (seal below it), `hit.new_bytes` (extent
     above it), `hit.both` or `hit.neither`. A re-fold of a moved fingerprint
     should read 0 native bytes in `tail` or `unchanged`.
-  - `<cause>.retry.audit_cap_clear` marks a read selected while its entry
-    carries an audit-cap clear.
 
 Upload counts land on the line after the source's next page line.
 
@@ -1940,8 +1895,7 @@ keys are no longer emitted: `take_*`, `insert_*`,
 `reinsert_failed`, and in `sampled_acquisition.acquisition_admission`
 `cache_lookup_miss_unknown_origin`, `retained_entry`,
 `retained_entry_rejected_by_eligibility` and `comparison_target` (it never
-matched). `sampled_audit_account_release`
-no longer reports `marker_staged`.
+matched).
 
 All diagnostics are best-effort local stderr observations. Their counters never
 feed collection, proof, save, memory admission, account attribution or upload
@@ -2434,9 +2388,8 @@ growth can Tail a stale prefix until the next Full. Pi's writer is append-only,
 and its header rewrite reads Full. The shared
 `sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual` test
 pins it for Claude Code, Codex and Pi.
-Age and clock changes do not invalidate checkpoints. Admission of a new sampled
-obligation follows the shared audit cap: with no slot left, an unmarked change
-reads a counted cap Full (or waits); already-marked files keep Tailing.
+Age and clock changes do not invalidate checkpoints, and a checkpoint is never
+re-read Full on a timer.
 An indexed Pi file that changes without an available RAM reduction reads Full under the shared `state_missing`
 planner reason in `sampled_acquisition.page_events.full_reasons`.
 A Pi usage ledger has no key cap and is never truncated.

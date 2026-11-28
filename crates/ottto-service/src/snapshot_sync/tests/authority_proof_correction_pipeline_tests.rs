@@ -165,9 +165,9 @@ struct ApcFixture {
     listing_hour: std::cell::Cell<Option<i64>>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
-    /// Opt-in production account-audit release on settled pages, with no
+    /// Opt-in production account-hold release on settled pages, with no
     /// retained custody. Old APC tests keep their original finish.
-    audit_release: std::cell::Cell<bool>,
+    hold_release: std::cell::Cell<bool>,
 }
 
 impl ApcFixture {
@@ -195,7 +195,7 @@ impl ApcFixture {
             listing_hour: std::cell::Cell::new(None),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
-            audit_release: std::cell::Cell::new(false),
+            hold_release: std::cell::Cell::new(false),
         };
         for (session, path) in [
             (
@@ -447,8 +447,7 @@ impl ApcFixture {
     /// One bounded page with the same acquisition and retry clock.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         // The minute suffix identifies bounded pages of one synthetic visit.
-        // Keep their acquisition clock fixed so every member's one-hour
-        // audit becomes due together on the following visit.
+        // Keep their acquisition clock fixed across the visit.
         let now = OffsetDateTime::parse(collected_at, &Rfc3339)
             .unwrap()
             .unix_timestamp() as u64
@@ -748,7 +747,7 @@ impl ApcFixture {
             progress
                 .save_fixture(&self.progress_path)
                 .expect("persist upload progress");
-            checkpoint_partial_snapshot_index_with_audit_release(
+            checkpoint_partial_snapshot_index_with_hold_release(
                 &index,
                 &committed_index,
                 &progress,
@@ -808,7 +807,7 @@ impl ApcFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        // The production finish order. The opt-in account-audit release has
+        // The production finish order. The opt-in account-hold release has
         // no retained custody: a released hold's entry is cleared and queued
         // for retry.
         let fully_settled = finish_selected_settlement(
@@ -821,7 +820,7 @@ impl ApcFixture {
                 cutoff_candidates: &cutoff_candidates,
                 transport_fully_settled: settlement.fully_settled,
                 body_drains,
-                audit_release: self.audit_release.get().then_some(AccountAuditRelease {
+                hold_release: self.hold_release.get().then_some(AccountHoldRelease {
                     previous: &committed_index,
                     roots: std::slice::from_ref(&self.root),
                     backfill_window_days: 183,
@@ -3244,7 +3243,7 @@ fn sidecar_only_revision_move_then_a_held_page_keeps_no_op_members_owed() {
 /// Setup: withholds the owner proof of `held` for one
 /// accepting generation, so every other owed member drains and each held
 /// member's account hold is committed; then turns on the production
-/// account-audit release (no retained custody), restores the owner proof of
+/// account-hold release (no retained custody), restores the owner proof of
 /// `released` and runs one generation with `upload`. Returns that
 /// generation's pages and the first one that parsed every released member.
 fn apc_f1_hold_then_release(
@@ -3276,7 +3275,7 @@ fn apc_f1_hold_then_release(
         last.index.claude_account_deferred_hold_count() >= held.len(),
         "each held member's account hold is committed"
     );
-    fixture.audit_release.set(true);
+    fixture.hold_release.set(true);
     fixture
         .withheld_owners
         .borrow_mut()
@@ -3298,7 +3297,7 @@ fn apc_f1_hold_then_release(
     (pages, release)
 }
 
-/// On the release page: the audit release cleared each released member's
+/// On the release page: the hold release cleared each released member's
 /// saved revision after its drain. Each stays owed under the same proof with
 /// its pre-drain pair in the saved index reloaded from disk (the restart),
 /// and the page is not fully settled.
@@ -3321,7 +3320,7 @@ fn apc_f1_released_members_stay_owed(
             page.index.files[&keys[member]]
                 .source_file_fingerprint
                 .is_empty(),
-            "{label}: the account-audit release cleared {member}'s saved revision"
+            "{label}: the account-hold release cleared {member}'s saved revision"
         );
         assert!(owed.contains(member), "{label}: {member} stays owed");
         assert_eq!(
@@ -3340,7 +3339,7 @@ fn apc_f1_released_members_stay_owed(
 /// released member is still owed after them (the matching-carried control):
 /// every drain certifies the revision its saved entry has
 /// (`apc_r2_drained_pairs`), and each released member drains again on its
-/// exact ACK or as a no-op. The audit-release retry re-reads a cleared entry
+/// exact ACK or as a no-op. The hold-release retry re-reads a cleared entry
 /// without its prior body tuple, so the body may be offered again (this
 /// harness keeps no durable upload ledger between accepting pages), but only
 /// the same exact body: tokens and cost are unchanged.
@@ -3402,7 +3401,7 @@ fn apc_f1_redrain(
 
 /// [regress] Last owed member, exact ACK. The owed
 /// member's committed account hold is released on a settled page and its corrected body is
-/// ACKed, which drains the last owed member. The production account-audit
+/// ACKed, which drains the last owed member. The production account-hold
 /// release then finds no retained custody: it clears the member's saved
 /// revision and queues a retry. The save keeps the record with the member
 /// owed under the same proof and its pre-drain pair, never a cleared record
@@ -3414,7 +3413,7 @@ fn apc_f1_redrain(
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]
 #[serial(source_manifests)]
-fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
+fn f1_released_account_hold_clear_keeps_the_last_owed_member_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -3459,7 +3458,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 
 /// [regress] Proven no-op, with another member still
 /// owed. Agent b's corrected body is its accepted body, so its release page no-op-drains it
-/// without an upload, and the account-audit release then clears its saved
+/// without an upload, and the account-hold release then clears its saved
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
@@ -3469,7 +3468,7 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// The last-owed and permanent-refusal cases distinguish the ordering.
 #[test]
 #[serial(source_manifests)]
-fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
+fn f1_released_account_hold_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -3532,7 +3531,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 
 /// [regress] The released member's body is
 /// permanently refused on a fully settled page, so the post-selection settlement drains the
-/// last owed member. The account-audit release then clears its saved
+/// last owed member. The account-hold release then clears its saved
 /// revision. That drain joins the finish restore: the member stays owed with
 /// its pre-drain pair, and drains again at the revision its saved entry has
 /// once the retry re-reads it.
@@ -3544,7 +3543,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 #[serial(source_manifests)]
 // A rejected entity records Poisoned in the shared client_report counters.
 #[serial(client_report)]
-fn f1_released_account_hold_audit_clear_keeps_a_permanent_refusal_drain_owed() {
+fn f1_released_account_hold_clear_keeps_a_permanent_refusal_drain_owed() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
     let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let _source_manifests = SourceManifestTestGuard::new();

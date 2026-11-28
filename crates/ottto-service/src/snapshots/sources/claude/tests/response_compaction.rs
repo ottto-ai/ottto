@@ -229,9 +229,8 @@ pub(in crate::snapshots) fn acquire_items(
 ) {
     let scope = Scope("r1a-native".into());
     let (mut parser, expected) = native_parser(path);
-    let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
     let mode = parser
-        .prepare_acquisition(old.map(Box::new), &scope, debt, now)
+        .prepare_acquisition(old.map(Box::new), &scope, now)
         .unwrap();
     while !parser.step().unwrap() {}
     let acquisition = parser.retain_reduction(&scope, now).unwrap().unwrap();

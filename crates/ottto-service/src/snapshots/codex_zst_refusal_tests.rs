@@ -207,7 +207,6 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
             .prepare_acquisition(
                 None,
                 &crate::transcript_acquisition::Scope("fixture".into()),
-                None,
                 1
             )
             .is_err());

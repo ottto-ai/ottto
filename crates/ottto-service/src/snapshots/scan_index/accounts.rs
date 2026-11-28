@@ -618,7 +618,7 @@ impl ScanIndex {
         let indexed = self.files.contains_key(to);
         if let Some(entry) = self.files.remove(from) {
             if let Some(current) = self.files.get_mut(to) {
-                current.carry_sampled_audit(&entry);
+                current.carry_prefix_provenance(&entry);
             } else {
                 self.files.insert_shared(to.to_owned(), entry);
             }

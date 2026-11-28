@@ -728,7 +728,7 @@ impl ScanIndex {
     /// Called only at an index settlement boundary. A following save either
     /// commits both exact body state and owed progress, or commits neither.
     /// Pass the returned drains to `restore_unselected_claude_proof_body_drains`
-    /// after the last selection and the account-audit release.
+    /// after the last selection.
     pub(crate) fn settle_claude_proof_corrections(
         &mut self,
         previous: &ScanIndex,

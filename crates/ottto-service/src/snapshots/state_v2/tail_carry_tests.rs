@@ -47,7 +47,11 @@ fn seed(f: &Fixture) -> ScanIndex {
     let mut entry = progress_row();
     entry.last_snapshot_fingerprint = Some("e".repeat(64));
     entry.last_upload_body_witness = Some("f".repeat(64));
-    entry.set_unverified_deadline(11);
+    // A sealed-prefix tag travels with the entry.
+    entry.scan_identity_version = Some(format!(
+        "{}+sampled_unverified:v2:0:p",
+        crate::snapshots::LOCAL_SCAN_INDEX_IDENTITY_VERSION
+    ));
     index.files.insert(FILE.into(), entry);
     index
         .file_snapshot_fingerprints
@@ -94,8 +98,7 @@ fn assert_pair(index: &ScanIndex, moved: bool) {
         entry.last_upload_body_witness.as_deref(),
         Some("f".repeat(64).as_str())
     );
-    assert!(entry.has_unverified_source());
-    assert_eq!(entry.unverified_deadline(), Some(11));
+    assert!(entry.has_prefix_provenance());
     assert!(index.confirmed_empty_files.contains(live));
     assert!(!index.confirmed_empty_files.contains(absent));
     assert!(index.v2().growth_retention.contains_key(live));

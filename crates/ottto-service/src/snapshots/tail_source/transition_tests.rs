@@ -114,9 +114,7 @@ pub(super) fn complete<S: FixtureSource>(
 ) -> (PendingTail, Result<ParsedJsonlFile>) {
     let mut parser = open::<S>(path);
     assert!(matches!(
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap(),
+        parser.prepare_acquisition(None, &scope(), NOW).unwrap(),
         ReadMode::Full(_)
     ));
     while !parser.step().unwrap() {}
@@ -301,7 +299,7 @@ fn stored_read_under(
         panic!("the committed head is reused with its base");
     };
     let mut parser = open::<Codex>(path);
-    let Ok(mode) = parser.prepare_acquisition(Some(taken), scope, None, NOW) else {
+    let Ok(mode) = parser.prepare_acquisition(Some(taken), scope, NOW) else {
         panic!("the read prepares");
     };
     if !matches!(mode, ReadMode::Unchanged) {
@@ -312,9 +310,7 @@ fn stored_read_under(
 
 fn cold_items(path: &Path) -> Value {
     let mut parser = open::<Codex>(path);
-    parser
-        .prepare_acquisition(None, &scope(), None, NOW)
-        .unwrap();
+    parser.prepare_acquisition(None, &scope(), NOW).unwrap();
     while !parser.step().unwrap() {}
     test_finish_items(parser, path, SnapshotSource::Codex)
 }
@@ -725,9 +721,7 @@ fn codex_cold(route: &Route, paths: &[PathBuf]) -> RouteResult {
     let mut items = Vec::new();
     for path in paths {
         let mut parser = open::<Codex>(path);
-        let mode = parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
+        let mode = parser.prepare_acquisition(None, &scope(), NOW).unwrap();
         assert!(matches!(mode, ReadMode::Full(_)));
         while !parser.step().unwrap() {}
         let (_, native) = finish::<Codex>(route, path, parser, None, |_| {});
@@ -963,9 +957,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
     let before = CodexTitleMetadata::default();
     for path in &paths {
         let mut parser = open_with(path, &before);
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
+        parser.prepare_acquisition(None, &scope(), NOW).unwrap();
         while !parser.step().unwrap() {}
         let (tail, native) = route.finish_under::<Codex>(path, parser, None, |_| {}, &scope());
         assert!(!native.as_ref().unwrap().snapshots.is_empty());
@@ -1004,9 +996,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
         let base = match loaded {
             Load::Cold(None) if n == 0 => {
                 assert!(matches!(
-                    parser
-                        .prepare_acquisition(None, &scope(), None, NOW)
-                        .unwrap(),
+                    parser.prepare_acquisition(None, &scope(), NOW).unwrap(),
                     ReadMode::Full(_)
                 ));
                 None
@@ -1014,7 +1004,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
             Load::Reused(taken, Some(base)) if n != 0 => {
                 assert!(matches!(
                     parser
-                        .prepare_acquisition(Some(taken), &scope(), None, NOW)
+                        .prepare_acquisition(Some(taken), &scope(), NOW)
                         .unwrap_or_else(|_| panic!("unchanged session prepares Tail")),
                     ReadMode::Tail
                 ));
@@ -1026,9 +1016,7 @@ fn codex_sidecar_change_after_commit_equals_cold_full_in_totals_and_placement() 
         let (_, native) = route.finish_under::<Codex>(path, parser, base, |_| {}, &scope());
         resumed.extend(native.unwrap().snapshots);
         let mut parser = open_with(path, &after);
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
+        parser.prepare_acquisition(None, &scope(), NOW).unwrap();
         while !parser.step().unwrap() {}
         let (_, native) = route.finish_under::<Codex>(path, parser, None, |_| {}, &scope());
         cold.extend(native.unwrap().snapshots);

@@ -381,14 +381,11 @@ fn holder_older_than_35_days_stays_proven() {
 
 /// One indexed file `key` with a census record, money marks and a stored
 /// copy removal naming the indexed holder `holder`, which has its own.
-fn lifetime_index(key: &str, holder: &str, unverified: bool) -> ScanIndex {
+fn lifetime_index(key: &str, holder: &str) -> ScanIndex {
     let mut index = ScanIndex::default();
     // No uploaded body: absence settles no ACK evidence.
     let mut entry = money_entry('a', 0);
     entry.last_snapshot_fingerprint = None;
-    if unverified {
-        entry.scan_identity_version = Some(sampled_audit::marker(1));
-    }
     index.files.insert(key.into(), entry);
     index.files.insert(holder.into(), money_entry('b', 0));
     let census = index.claude_request_census_mut_for_test();
@@ -421,10 +418,9 @@ fn lifetime_kept(index: &ScanIndex, key: &str) -> [bool; 4] {
     ]
 }
 
-/// [money] H2. Each positive-absence exit (main reconciliation, the vanished
-/// audit-debt exit, `remove_file_entry`) drops the file's entry, census
-/// record, money marks and stored copy removals together, and nothing of the
-/// holder it named. An uncertain absence (unverified source) keeps them all.
+/// [money] H2. Each positive-absence exit (main reconciliation,
+/// `remove_file_entry`) drops the file's entry, census record, money marks and
+/// stored copy removals together, and nothing of the holder it named.
 #[test]
 fn every_absence_exit_drops_census_marks_and_removals() {
     let key = "/money/projects/-repo/a-copy.jsonl";
@@ -443,23 +439,16 @@ fn every_absence_exit_drops_census_marks_and_removals() {
         );
     };
 
-    let mut index = lifetime_index(key, holder, false);
+    let mut index = lifetime_index(key, holder);
     assert_eq!(lifetime_kept(&index, key), kept);
     index.remove_file_entry(key);
     assert_eq!(lifetime_kept(&index, key), gone, "remove_file_entry");
     holder_kept(&index);
 
-    let mut index = lifetime_index(key, holder, true);
-    index.remove_file_entry(key);
-    assert_eq!(lifetime_kept(&index, key), kept, "uncertain absence");
-    assert!(index.retire_vanished_claude_audit_debt_entry(key));
-    assert_eq!(lifetime_kept(&index, key), gone, "audit-debt exit");
-    holder_kept(&index);
-
     let scratch = crate::test_scratch::ScratchDir::new("money-absence-exit");
     let root = scratch.join("projects");
     std::fs::create_dir_all(&root).unwrap();
-    let mut index = lifetime_index(key, holder, false);
+    let mut index = lifetime_index(key, holder);
     ensure_bounded_traversal(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&root),
@@ -534,7 +523,7 @@ fn rename_keeps_whole_record() {
     let from = "/money/projects/-repo/a-copy.jsonl";
     let to = "/money/projects/-repo/b-moved.jsonl";
     let holder = "/money/projects/-repo/z-holder.jsonl";
-    let mut index = lifetime_index(from, holder, false);
+    let mut index = lifetime_index(from, holder);
     let birth = ClaudeRequestBirth {
         unix_seconds: 1_700_000_000,
         device: 1,
@@ -555,7 +544,7 @@ fn rename_keeps_whole_record() {
     assert_eq!(lifetime_kept(&index, to), [true; 4]);
     assert_eq!(lifetime_kept(&index, from), [false; 4]);
 
-    let mut index = lifetime_index(from, holder, false);
+    let mut index = lifetime_index(from, holder);
     index.files.insert(to.into(), money_entry('c', 0));
     let own = money_record('c', vec![7]);
     index

@@ -42,7 +42,7 @@ pub(in crate::snapshots::tail_source) fn parse_lines(
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     let scope = scope();
     let mut parser = fixture::parser(source, &path, std::fs::File::open(&path).unwrap(), apply);
-    let mode = parser.prepare_acquisition(None, &scope, None, NOW).unwrap();
+    let mode = parser.prepare_acquisition(None, &scope, NOW).unwrap();
     assert!(matches!(mode, ReadMode::Full(_)));
     let (reduction, checkpoint) = fixture::finish_record(&mut parser, &scope, NOW);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -171,9 +171,7 @@ impl Route {
         let path = self.dir.join(name);
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         let mut parser = self.open(&path);
-        parser
-            .prepare_acquisition(None, &scope(), None, NOW)
-            .unwrap();
+        parser.prepare_acquisition(None, &scope(), NOW).unwrap();
         while !parser.step().unwrap() {}
         self.finish(&path, parser, base, at_pre)
     }

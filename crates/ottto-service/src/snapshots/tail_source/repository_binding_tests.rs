@@ -99,7 +99,7 @@ fn unchanged_finish<S: TailSource>(
     };
     assert!(matches!(
         parser
-            .prepare_acquisition(Some(taken), &scope(), None, NOW)
+            .prepare_acquisition(Some(taken), &scope(), NOW)
             .unwrap(),
         crate::transcript_acquisition::ReadMode::Unchanged
     ));
@@ -146,9 +146,7 @@ fn capture_restore<S: TailSource>(
         .collect();
     fs::write(&path, lines.join("\n") + "\n").unwrap();
     let mut parser = native_cold::parser(S::SOURCE, &path, File::open(&path).unwrap(), apply);
-    parser
-        .prepare_acquisition(None, &scope(), None, NOW)
-        .unwrap();
+    parser.prepare_acquisition(None, &scope(), NOW).unwrap();
     while !parser.step().unwrap() {}
     assert_eq!(
         parser.accumulator.workspace_path.as_deref(),

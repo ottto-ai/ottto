@@ -52,8 +52,8 @@ pub(in crate::snapshots) fn legacy_head_missing(index: &ScanIndex, key: &str) ->
     proven_legacy(index, key) && tail_source::stored_codex_legacy_totals(index, key).is_none()
 }
 
-/// Stat-only; groups normally have no member reductions. Audit and repair
-/// debt cannot authorize conversion of unchanged accepted history.
+/// Stat-only; groups normally have no member reductions. Repair debt cannot
+/// authorize conversion of unchanged accepted history.
 pub(in crate::snapshots) fn unchanged_legacy(index: &ScanIndex, path: &Path) -> bool {
     let key = local_index_key(path);
     unchanged_legacy_with(index, &key, || {

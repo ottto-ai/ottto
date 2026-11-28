@@ -73,30 +73,9 @@ impl ScanIndex {
             .files
             .get(key)
             .is_some_and(ScanIndexEntry::codex_history_is_protected);
-        let audit = self
-            .files
-            .get(key)
-            .is_some_and(ScanIndexEntry::has_unverified_source);
-        if audit {
-            if protected {
-                self.files
-                    .get_mut(key)
-                    .expect("audit entry")
-                    .scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-            } else {
-                // Preserve incidence handling: retiring audit debt
-                // does not itself grant authority to prune its fingerprints.
-                self.retire_vanished_claude_audit_debt_entry(key);
-            }
-            crate::local_resource_diagnostics::audit_retired_absent("claude_code");
-            disappearance_diagnostics::vanished(
-                SnapshotSource::ClaudeCode,
-                disappearance_diagnostics::Vanished::AuditDebtDropped,
-            );
-        }
         self.claude_account_deferred_holds.remove(key);
         self.withheld_memo.released_deleted(key);
-        if !protected && !audit {
+        if !protected {
             self.remove_file_entry_unless_held(key);
         }
         if census_record && self.claude_request_census.get(key).is_none() {
@@ -105,39 +84,6 @@ impl ScanIndex {
                 disappearance_diagnostics::Vanished::RequestCensusRemoved,
             );
         }
-        true
-    }
-
-    /// Retire a Claude entry whose file vanished beneath its
-    /// still-present parent together with its unverified audit marker.
-    /// Only the page merge calls this, and only for keys the scanner settled
-    /// as such a removal; `remove_file_entry` keeps audit debt for every
-    /// other caller. Codex-protected entries are never retired here. The
-    /// key's snapshot fingerprints and account hold stay, because each
-    /// removal path ends in the state main already reaches for the same key:
-    /// main's reconciliation keeps an audit-debt entry and its fingerprints
-    /// forever, so this path drops only the entry with its lifetime facts
-    /// (`drop_file_entry`) and its marker, while a
-    /// vanished entry without audit debt goes through `remove_file_entry`,
-    /// which drops its fingerprints and hold just as main's reconciliation
-    /// does at the next healthy terminal. The hold is later dropped by a
-    /// complete census. Returns false, retiring nothing, for an entry
-    /// without audit debt or one a decode hold keeps.
-    pub(in crate::snapshots) fn retire_vanished_claude_audit_debt_entry(
-        &mut self,
-        key: &str,
-    ) -> bool {
-        if !self.persistence_available() || self.decode_holds_file(key) {
-            return false;
-        }
-
-        if !self.files.get(key).is_some_and(|entry| {
-            entry.has_unverified_source() && !entry.codex_history_is_protected()
-        }) {
-            return false;
-        }
-        self.drop_file_entry(key);
-        self.terminal_jsonl_dispositions.remove(key);
         true
     }
 
@@ -199,13 +145,6 @@ impl ScanIndex {
         }
 
         if self.decode_holds_file(key) {
-            return;
-        }
-        if self
-            .files
-            .get(key)
-            .is_some_and(ScanIndexEntry::has_unverified_source)
-        {
             return;
         }
         self.drop_file_entry(key);

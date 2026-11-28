@@ -318,8 +318,7 @@ fn lossy_identity_grant_revalidates_held_object_and_selected_path() {
         let mut file = OpenOptions::new().read(true).open(&temp.0).unwrap();
         let scope = Scope("lossy-grant".into());
         let mut plan =
-            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, None, 100)
-                .unwrap();
+            crate::transcript_acquisition::ReadPlan::prepare(&mut file, None, &scope, 100).unwrap();
         let frozen = plan.frozen_length();
         plan.observe_complete_records(lines).unwrap();
         let (refusal, identity) = plan.commit_sealed_prefix_or_lossy_identity(
@@ -783,7 +782,7 @@ fn page_steps(
 struct Selections {
     modes: Modes,
     unchanged: usize,
-    full_reasons: [usize; 11],
+    full_reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
 }
 
 /// `page_steps` that also reports `Selections`.
@@ -1177,9 +1176,10 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         return;
     }
     let clock = TestClock;
-    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
-    // Ordinary checkpoint admission/completion ignores age, while debt
-    // and the original verification time remain owed across later Tails.
+    // An hour: the interval of the retired periodic audit.
+    let interval = 3_600;
+    // Checkpoint admission and completion ignore age; the original
+    // verification time stays across later Tails and no debt is written.
     const B: u64 = 2048;
     with_test_limits(B, 8192, 64, || {
         // (i) and (ii): a short page interval, well inside the deadline.
@@ -1244,7 +1244,7 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
         );
         let (next, scan, modes) =
             page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
-        // (ii) a tail from `s` while the deadline permits.
+        // (ii) a tail from `s`.
         assert_eq!(modes, (0, 1));
         assert!(!scan.snapshots.is_empty());
         let tailed = head(&next, &key).expect("tail head");
@@ -1254,9 +1254,9 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
 
         // (iii) scaled `L > L_max` for two large files, both appended every
         // page, pages 600 s apart so each read of `ceil(L/B)` pages outlives
-        // the interval. Rotation, not a monopoly (K7): the files alternate,
-        // each initial Full certifies, then both progress through overdue
-        // ordinary Tails without requiring a new census generation or audit.
+        // the old interval. Rotation, not a monopoly (K7): the files
+        // alternate, each initial Full certifies, then both progress through
+        // ordinary Tails past that interval without a new census generation.
         let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 80)]);
         let sessions = [SESSION, SESSION_B];
         let keys = sessions.map(|session| local_index_key(&fixture.file(session)));
@@ -1292,17 +1292,13 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                     if next.sealed_offset > prior.sealed_offset {
                         assert!(!scan.snapshots.is_empty(), "completed Tail publishes");
                         assert_eq!(next.verified_unix_seconds, prior.verified_unix_seconds);
-                        assert_eq!(
-                            next.audit_debt_unix_seconds, prior.audit_debt_unix_seconds,
-                            "no audit credit"
-                        );
+                        assert_eq!(next.audit_debt_unix_seconds, None, "no debt written");
                         if now >= prior.verified_unix_seconds + interval {
                             overdue_tail_progress.insert(key.clone(), (now, next.sealed_offset));
                         }
                     }
                 }
             }
-            assert_eq!(counter(&cache, |c| c.jobs_audit_restarted), 0);
             if counter(&cache, |c| c.jobs_started) > started {
                 let key = cache.cursor_job_key().expect("the new job paused");
                 let file = keys.iter().position(|known| *known == key).unwrap();
@@ -1313,18 +1309,16 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
                 let key = paused.expect("a paused job completed");
                 let (t_start, open_length) = opened[&key];
                 let checkpoint = head(&index, &key).expect("certificate");
-                assert!(
-                    !scan.snapshots.is_empty(),
-                    "each audit completion publishes"
-                );
+                assert!(!scan.snapshots.is_empty(), "each completion publishes");
                 assert!(checkpoint.sealed_offset <= open_length);
-                // No deadline reset: verified at read start, still due.
+                // Verified at the read's start; a read that outlived the
+                // old interval completes without debt or a restart.
                 assert_eq!(checkpoint.verified_unix_seconds, t_start);
-                assert_eq!(checkpoint.audit_debt_unix_seconds, Some(t_start + interval));
-                let due = index.files[&key]
-                    .audit_obligation(now)
-                    .map(|debt| debt.due_unix_seconds);
-                assert!(due.is_some_and(|due| due <= t_start + interval && due <= now));
+                assert_eq!(checkpoint.audit_debt_unix_seconds, None);
+                assert!(
+                    now >= t_start + interval,
+                    "the read outlived the old interval"
+                );
                 completions.push((key, now, checkpoint.sealed_offset));
             } else if modes.1 == 0 {
                 assert!(scan.snapshots.is_empty(), "paused job publishes nothing");
@@ -1345,7 +1339,7 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             counters(&cache)
         );
         assert_ne!(completions[0].0, completions[1].0, "both files served");
-        assert!(tails > 0, "overdue appends keep tailing");
+        assert!(tails > 0, "appends past the old interval keep tailing");
         assert_eq!(overdue_tail_progress.len(), 2, "neither file starves");
         for (key, completed_at, certified_offset) in completions {
             let (tailed_at, tailed_offset) = overdue_tail_progress[&key];
@@ -1359,8 +1353,6 @@ fn active_member_larger_than_budget_appended_every_page_audit_semantics() {
             );
         }
         assert!(counter(&cache, |c| c.deferred_next_generation) > 0);
-        assert_eq!(counter(&cache, |c| c.audit_overdue), 2);
-        assert!(counter(&cache, |c| c.audit_overdue_max_age_seconds) > 0);
     });
 }
 
@@ -1955,7 +1947,7 @@ fn incomplete_sidecar_census_pages_cursor_only_and_publishes_unverified() {
         assert!(!index
             .files
             .get(&key)
-            .is_some_and(ScanIndexEntry::has_unverified_source));
+            .is_some_and(ScanIndexEntry::has_sampled_tag));
         assert!(index
             .traversal
             .as_ref()
@@ -2073,7 +2065,7 @@ fn unavailable_resume_never_spins_and_ends_after_bounded_pages() {
 /// stamp, reader at that extent) the job applies the buffered record with
 /// main's trailing-line rule, reading no byte: a valid record is counted
 /// once, on the certified page, and the file is verified like main's full
-/// read, so later pages skip it, also past the audit interval. No copy is
+/// read, so later pages skip it, also an hour later. No copy is
 /// kept: the applied record lies past the certified prefix `[0, s)`, so
 /// every such job is non-retainable and converges through the index alone.
 /// An invalid unterminated record stays pending with no line loss on either route.
@@ -2083,7 +2075,7 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
         return;
     }
     let clock = TestClock;
-    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    let interval = 3_600;
     let valid = {
         let mut line = token_line(41);
         line.pop();
@@ -2155,11 +2147,11 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
                 !index
                     .files
                     .get(&key)
-                    .is_some_and(ScanIndexEntry::has_unverified_source),
+                    .is_some_and(ScanIndexEntry::has_sampled_tag),
                 "{case}: verified like main's full read"
             );
-            // No debt was staged, so crossing the audit interval re-reads
-            // nothing: the size decision skips the file.
+            // Nothing re-reads it an hour later: the size decision skips
+            // the file.
             for _ in 0..3 {
                 now += interval + 1;
                 clock.set(now);
@@ -2174,7 +2166,7 @@ fn quiescent_unterminated_last_record_is_applied_at_genuine_eof() {
     }
 }
 
-/// Pages one cursor job to its certified end, `I/2` apart, from census
+/// Pages one cursor job to its certified end, half an hour apart, from census
 /// generation `page_number + 1`, each page on `cache`'s route. With
 /// `append_mid_read`, the file grows after the job's first page. Returns the
 /// index, the clock at the job's open and at its commit, and the opening
@@ -2187,7 +2179,12 @@ fn certify_job(
     now: &mut u64,
     page_number: &mut u64,
     append_mid_read: bool,
-) -> (ScanIndex, u64, u64, [usize; 11]) {
+) -> (
+    ScanIndex,
+    u64,
+    u64,
+    [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
+) {
     certify_job_with(fixture, cache, index, clock, now, page_number, |fixture| {
         if append_mid_read {
             fixture.append(SESSION, &token_line(41));
@@ -2205,9 +2202,14 @@ fn certify_job_with(
     now: &mut u64,
     page_number: &mut u64,
     mid_read: impl FnOnce(&ScanRoot),
-) -> (ScanIndex, u64, u64, [usize; 11]) {
+) -> (
+    ScanIndex,
+    u64,
+    u64,
+    [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
+) {
     let mut mid_read = Some(mid_read);
-    let step = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS / 2;
+    let step = 1_800;
     let certified = counter(cache, |c| c.jobs_certified);
     let mut opened = None;
     for _ in 0..64 {
@@ -2248,7 +2250,7 @@ fn certify_job_with(
 /// write generation counts: the count never enters the stamp a Full's commit
 /// compares. The job that certifies is verified at its own commit with no
 /// debt, and its opening and commit clocks, Full reasons, job counts, head
-/// verification, debt and marker are the same with counts as without.
+/// verification, debt and sampled tag are the same with counts as without.
 #[test]
 fn a_touch_during_an_in_flight_full_earns_the_credit_it_earns_without_counts() {
     use crate::transcript_acquisition::{Generations, UseGenerations};
@@ -2293,15 +2295,15 @@ fn a_touch_during_an_in_flight_full_earns_the_credit_it_earns_without_counts() {
                 counter(&cache, |c| c.jobs_certified),
                 complete.verified_unix_seconds,
                 complete.audit_debt_unix_seconds,
-                index.files[&key].unverified_deadline(),
+                index.files[&key].has_sampled_tag(),
             )
         })
     };
     let without = outcome(Generations::Off);
-    let (_, committed, _, _, certified, verified, debt, marker) = without;
+    let (_, committed, _, _, certified, verified, debt, tagged) = without;
     assert_eq!(certified, 1);
     assert_eq!(verified, committed, "the certified read verifies at commit");
-    assert_eq!((debt, marker), (None, None));
+    assert_eq!((debt, tagged), (None, false));
     assert_eq!(outcome(Generations::Simulated), without);
 }
 
@@ -2328,43 +2330,31 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 }
 
 /// AD-1 at scan level (AD-T6, AD-T7). A quiescent singleton larger than the
-/// page budget is read by a cursor job that outlives the audit interval
-/// (`I/2` per page). Its complete read of the unchanged object verifies at
-/// commit: no overdue audit, no marker (a seeded past-due one is cleared),
-/// and its head is verified at the commit clock. `grown` (AD-T7):
-/// an append after the job's first page keeps the grown arm (overdue, due
-/// marker); the next generation's audit of the now stable file converges.
+/// page budget is read by a cursor job that outlives an hour (half an hour
+/// per page). Its complete read of the unchanged object verifies at commit,
+/// with no restart, debt or sampled tag, and its head is verified at the
+/// commit clock. `grown` (AD-T7): an append after the job's first page keeps
+/// the grown arm (verified at the read's start, still no debt or tag); the
+/// next read of the now stable file converges.
 ///
-/// Selection semantics after convergence: in later census generations, past
-/// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
-/// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
-/// is selected. After R2's gate removal, a later append reuses the
-/// head as Tail even beyond `commit + I`.
+/// Selection semantics after convergence: in later census generations, an
+/// hour or more apart, the scheduler skips the file (`Skip`: same
+/// fingerprint), so no acquisition opens it. A later append reuses the head
+/// as Tail however old its verification is.
 #[test]
 fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
     let clock = TestClock;
-    let interval = crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
-    for case in ["unmarked", "due marker", "grown"] {
+    // An hour: the interval of the retired periodic audit.
+    let interval = 3_600;
+    for case in ["stable", "grown"] {
         let fixture = ScanRoot::new(40);
         let key = local_index_key(&fixture.file(SESSION));
         let mut now = 1_900_000_000_u64;
         clock.set(now);
         let mut index = ScanIndex::default();
-        if case == "due marker" {
-            // A recorded entry (read in page) that owes an audit already due.
-            index = page(
-                &fixture,
-                ScanIndex::default(),
-                Some(Arc::new(SharedCache::default())),
-            )
-            .0;
-            let entry = index.files.get_mut(&key).unwrap();
-            entry.set_unverified_deadline(now - 1);
-            assert!(entry.audit_requires_full(now));
-        }
         let cache = Arc::new(SharedCache::default());
         // The limits under which this fixture's certified cursor read stages
         // its head (`tail_eof_record_adding_first_priority_tier_…`).
@@ -2384,19 +2374,15 @@ fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             assert_eq!(reasons[reason.slot()], 1, "{case}: {reasons:?}");
             assert!(
                 committed >= opened + interval,
-                "{case}: the read outlived I"
+                "{case}: the read outlived an hour"
             );
             let mut jobs = 1;
             if case == "grown" {
-                // AD-T7: the grown arm, as before AD-1.
-                assert_eq!(counter(&cache, |c| c.audit_overdue), 1, "{case}");
+                // AD-T7: the grown arm, as before AD-1, without debt.
                 let grown = head(&index, &key).expect("grown prefix");
                 assert_eq!(grown.verified_unix_seconds, opened, "{case}");
-                assert_eq!(
-                    index.files[&key].unverified_deadline(),
-                    Some(opened + interval),
-                    "{case}: due marker"
-                );
+                assert_eq!(grown.audit_debt_unix_seconds, None, "{case}");
+                assert!(!index.files[&key].has_sampled_tag(), "{case}: no tag");
                 // Keep AD-1's stable Full-completion control distinct from
                 // R2's valid-checkpoint Tail case below. No continuation
                 // survives this explicit release and head retirement; missing
@@ -2415,29 +2401,28 @@ fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     false,
                 );
                 index = next;
-                // Selection is due, but checkpoint absence is the Full cause.
+                // The append selects it; checkpoint absence is the Full cause.
                 assert_eq!(
                     reasons[FullReason::StateMissing.slot()],
                     1,
                     "{case}: {reasons:?}"
                 );
-                assert!(committed >= opened + interval, "{case}: audit outlived I");
+                assert!(committed >= opened + interval, "{case}: outlived an hour");
                 jobs = 2;
             }
             let committed = now;
             assert_eq!(counter(&cache, |c| c.jobs_certified), jobs, "{case}");
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
-            let overdue = u64::from(case == "grown");
-            assert_eq!(counter(&cache, |c| c.audit_overdue), overdue, "{case}");
+            assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0, "{case}");
             assert!(
-                !index.files[&key].has_unverified_source(),
-                "{case}: verified, no marker"
+                !index.files[&key].has_sampled_tag(),
+                "{case}: verified, no tag"
             );
             let complete = head(&index, &key).expect("complete head");
             assert_eq!(complete.verified_unix_seconds, committed, "{case}");
             assert_eq!(complete.audit_debt_unix_seconds, None, "{case}");
             assert_eq!(complete.sealed_offset, fixture.len(SESSION), "{case}");
-            // Later generations past `commit + I`: the scheduler's `Skip`.
+            // Later generations an hour or more apart: the scheduler's `Skip`.
             for _ in 0..3 {
                 now += interval + 1;
                 clock.set(now);
@@ -2445,7 +2430,7 @@ fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 let candidate = unchanged_candidate(&fixture, &index);
                 assert_eq!(candidate.size_bytes, fixture.len(SESSION));
                 assert_eq!(
-                    index.candidate_decision_with_reason_at(&candidate, now),
+                    index.candidate_decision_with_reason(&candidate),
                     (CandidateDecision::Skip, None),
                     "{case}"
                 );
@@ -2465,7 +2450,7 @@ fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             }
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
             // A valid head is not reread for its age: the next append
-            // selects Tail even after the old audit horizon.
+            // selects Tail.
             assert!(now >= committed + interval);
             let before = fixture.len(SESSION);
             fixture.append(SESSION, &token_line(90));
@@ -2506,19 +2491,85 @@ fn quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
             assert!(tailed.sealed_offset > complete.sealed_offset, "{case}");
             assert_eq!(
                 tailed.verified_unix_seconds, committed,
-                "{case}: no audit credit"
+                "{case}: a Tail earns no Full credit"
             );
-            assert_eq!(
-                tailed.audit_debt_unix_seconds,
-                Some(committed + interval),
-                "{case}: original verification determines debt, not Tail time"
-            );
-            assert_eq!(
-                next.files[&key].unverified_deadline(),
-                Some(committed + interval)
-            );
+            assert_eq!(tailed.audit_debt_unix_seconds, None, "{case}: no debt");
+            assert!(!next.files[&key].has_sampled_tag(), "{case}: no tag");
         });
     }
+}
+
+/// [money] A paged Codex cursor job that runs past an hour after its start
+/// (where a Tail would once have refused as audit-due and restarted as a
+/// Full) continues to its certified end: one job, no restart or deferral, a
+/// head verified at its commit with no debt or sampled tag, and money equal
+/// to the cold Full of the same file.
+#[test]
+fn cursor_job_past_the_old_audit_deadline_continues_and_equals_cold_full() {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, scan_money};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    let mut now = 1_900_000_000_u64;
+    clock.set(now);
+    let fixture = ScanRoot::new(40);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    let (index, published, published_page) = with_test_limits(2048, 8192, 64, || {
+        let mut index = ScanIndex::default();
+        let mut published = None;
+        let mut opened = None;
+        for page_number in 1..=64 {
+            clock.set(now);
+            let started = counter(&cache, |c| c.jobs_started);
+            let (next, scan, _) = page_selections(
+                &fixture,
+                routed(index, &cache),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                &collected_at(page_number),
+                |_| {},
+                10_000,
+            );
+            index = next;
+            if counter(&cache, |c| c.jobs_started) > started {
+                opened = Some(now);
+            }
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                published = Some((scan, page_number));
+                break;
+            }
+            assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
+            now += 1_800;
+        }
+        let (published, published_page) =
+            published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        let opened = opened.expect("a cursor job opened");
+        assert!(now >= opened + 3_600, "the job ran past the old deadline");
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1, "no restart");
+        assert_eq!(counter(&cache, |c| c.jobs_invalidated), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), 0);
+        let complete = head(&index, &key).expect("complete head");
+        assert_eq!(complete.sealed_offset, fixture.len(SESSION));
+        assert_eq!(complete.verified_unix_seconds, now);
+        assert_eq!(complete.audit_debt_unix_seconds, None);
+        assert!(!index.files[&key].has_sampled_tag());
+        (index, published, published_page)
+    });
+    // The cold Full of the same bytes, collected at the publishing page's
+    // time, so only the read path differs.
+    let (cold_index, cold, _) = page_at(
+        &fixture,
+        ScanIndex::default(),
+        Some(Arc::new(SharedCache::default())),
+        "cursor-fixture",
+        &collected_at(published_page),
+    );
+    money_oracle::assert_equivalent(
+        &scan_money(SnapshotSource::Codex, &cold_index, &cold),
+        &scan_money(SnapshotSource::Codex, &index, &published),
+    );
 }
 
 /// A tail-mode cursor job whose genuine-EOF

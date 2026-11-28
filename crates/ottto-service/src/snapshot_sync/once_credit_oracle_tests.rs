@@ -1755,12 +1755,8 @@ fn head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     let restored = home.cycle(&server, &recording);
     assert_untouched(&restored);
     assert_eq!(*server.placement.lock().unwrap(), placed);
-    // No file owes an audit, so only D's hold can select a read below, and a
-    // Full read cannot stand in for the due retry.
-    assert_eq!(
-        restored.steps.last().unwrap()["before"]["audit_marker_count"],
-        0
-    );
+    // Only D's hold can select a read below, and a Full read cannot stand in
+    // for the due retry.
 
     // Past 6 h on both clocks the dominated hold is due, and its head is gone:
     // the retry re-reads D's unchanged file without a Full read and POSTs the
@@ -2936,168 +2932,6 @@ fn codex_singleton_park_keeps_the_previous_body() {
     );
     assert_redisclosed(&held, &quiet);
     assert_eq!(*server.placement.lock().unwrap(), placement);
-}
-
-fn fragment_corpus(home: &OracleHome) {
-    let mut rows = Vec::new();
-    for n in 0..30 {
-        let mut pair = codex_member(
-            IDENTITY_PIPELINE_ROOT,
-            &format!("fragment-{n}"),
-            10,
-            10 * (n + 1),
-            "2026-11-01T07:00:00Z",
-        );
-        if n == 0 {
-            rows.push(pair.remove(0));
-        } else {
-            pair.remove(0);
-        }
-        rows.extend(pair);
-    }
-    home.write_rows(&rows);
-    // A valid trailing JSON record would be applied at genuine EOF. Invalid
-    // unterminated bytes stay withheld, producing a real cursor fragment.
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(home.transcript())
-        .unwrap()
-        .write_all(b"{\"type\":")
-        .unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(home.transcript())
-        .unwrap()
-        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 3600))
-        .unwrap();
-}
-
-fn finish_fragment(
-    home: &mut OracleHome,
-    server: &OracleServer,
-    recording: &Recording,
-    outlive: bool,
-) -> Cycle {
-    for page in 0..64 {
-        let cycle = home.cycle(server, recording);
-        if !cycle.gate["pending_finalization"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-        {
-            assert!(cycle.gate["pending_finalization"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|row| row["parse_complete"] == true));
-            return cycle;
-        }
-        assert!(cycle.before.is_empty() && cycle.finalized.is_empty() && cycle.batches.is_empty());
-        if page == 0 && outlive {
-            home.now = NOW + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS + 1;
-        }
-    }
-    panic!("fragment file did not reach native completion");
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none() {
-    for outlive in [false, true] {
-        let recording = Recording::start();
-        let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
-        let mut home = OracleHome::new(SnapshotSource::Codex, &server);
-        home.row = if outlive { "c11_both" } else { "c11_marker" };
-        home.small_page = true;
-        fragment_corpus(&home);
-        let new = finish_fragment(&mut home, &server, &recording, outlive);
-        assert_eq!(new.before.len(), 1);
-        assert_eq!(new.before[0].input_tokens, 300);
-        let slots = crate::transcript_cache::CACHE_ENTRIES as u64;
-        assert_eq!(new.steps[0]["before"]["audit_slots"], slots);
-        assert_eq!(
-            last_counter(&new, "audit_slots"),
-            slots - 1,
-            "fragment alone, or an outlived Full obligation plus fragment, reserves one slot"
-        );
-        assert_eq!(last_counter(&new, "audit_cap_delay"), 0);
-        if !outlive {
-            // The future marker already exists. A same-byte stat edit forces
-            // another Full; marker carry survives record() before staging.
-            std::fs::File::options()
-                .write(true)
-                .open(home.transcript())
-                .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 1800))
-                .unwrap();
-            let existing = finish_fragment(&mut home, &server, &recording, false);
-            assert_eq!(existing.steps[0]["before"]["audit_slots"], slots - 1);
-            assert_eq!(
-                last_counter(&existing, "audit_slots"),
-                slots - 1,
-                "an existing marker reserves no second slot"
-            );
-        }
-    }
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
-    let recording = Recording::start();
-    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
-    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
-    home.row = "c11_account_hold";
-    let cold = home.cycle(&server, &recording);
-    assert!(cold.finish.is_ok());
-    assert_durable(&cold);
-    let deferred = cold
-        .finalized
-        .iter()
-        .map(|item| (item.snapshot_fingerprint.clone(), item.input_tokens))
-        .collect::<BTreeMap<_, _>>();
-    let mut index = cold.index.clone();
-    index.oracle_hold_at_audit_cap(
-        &home.transcript(),
-        &deferred,
-        NOW + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
-    );
-    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    index.save_fixture(&home.index_path()).unwrap();
-    let row = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
-        "version":"2.1.309","timestamp":"2026-11-01T07:03:00Z","requestId":"held-growth",
-        "message":{"id":"held-growth-message","model":"claude-haiku-4-5",
-            "usage":{"input_tokens":130,"output_tokens":13}}});
-    writeln!(
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(home.transcript())
-            .unwrap(),
-        "{row}"
-    )
-    .unwrap();
-    let held = home.cycle(&server, &recording);
-    assert_eq!(held.steps[0]["before"]["audit_slots"], 0);
-    assert_eq!(last_counter(&held, "full_files"), 0);
-    assert_eq!(last_counter(&held, "tail_files"), 1);
-    assert_eq!(
-        last_counter(&held, "audit_cap_delay"),
-        0,
-        "account custody bypasses the refusal despite an unfunded new marker"
-    );
-    assert_eq!(
-        last_counter(&held, "audit_marker_count"),
-        crate::transcript_cache::CACHE_ENTRIES as u64,
-        "the held retry cannot stage another marker"
-    );
-    assert_eq!(
-        held.before.len(),
-        1,
-        "held retry reaches complete native publication"
-    );
-    assert_eq!(held.before[0].input_tokens, 160);
 }
 
 // Distinct telemetry ids per root; native copied ids retain their original bytes.
@@ -4812,8 +4646,6 @@ mod money_equivalence_tests {
         codex_group_park_rediscloses_without_reading();
         codex_singleton_memo_keeps_the_previous_body();
         codex_singleton_park_keeps_the_previous_body();
-        fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
-        account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
         head_unstored_answers_hold_until_growth_earns_its_own_ack();
         identity_control_through_usage_identical_then_growth();
         scheduling_permutations_converge_to_the_same_bodies();

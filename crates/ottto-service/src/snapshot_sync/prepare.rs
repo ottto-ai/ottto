@@ -1167,14 +1167,7 @@ pub(super) fn prepare_sync_source_inner(
         request_identity_capture,
     );
     #[cfg(unix)]
-    crate::snapshots::begin_source_pass(
-        &daemon.transcript_cache,
-        support_dir,
-        source,
-        &index_path,
-        &sampled_scope,
-        request_identity_capture,
-    );
+    crate::snapshots::begin_source_pass(&daemon.transcript_cache, support_dir, source, &index_path);
     // A hint or listing request is a change: this pass walks.
     if !watcher_hints.paths.is_empty() {
         crate::snapshots::walk_idle::clear(source, "hint");

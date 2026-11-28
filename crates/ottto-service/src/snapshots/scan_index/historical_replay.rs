@@ -19,17 +19,14 @@ impl ScanIndex {
         self.upload_context_proof.entity_stamps.clear();
         // Replay resets delivery authority, not file-owned recovery evidence.
         // Otherwise a missing member or expired trace can silently shrink or
-        // reprice a previously joined contribution during ordinary replay.
+        // reprice a previously joined contribution during ordinary replay. A
+        // sealed-prefix tag is such evidence: the entry and its tag stay.
         self.files
-            .retain(|_, entry| entry.retain_history_evidence());
+            .retain(|_, entry| entry.retain_history_evidence() || entry.has_prefix_provenance());
         // Retired entries' ACK evidence resets with the entries it outlived.
         let active = self.active_effective_upload_body_witness_revision;
         for (_, entry) in self.files.slots_mut() {
             let entry = entry.make_mut();
-            if entry.has_unverified_source() {
-                let due = entry.unverified_deadline().unwrap_or(0);
-                entry.set_unverified_deadline(due);
-            }
             entry.last_snapshot_fingerprint = None;
             entry.last_upload_body_witness = None;
             claude_history_upgrade::re_owe(
@@ -37,7 +34,7 @@ impl ScanIndex {
                 0,
                 active,
             );
-            if !entry.has_unverified_source() {
+            if !entry.has_sampled_tag() {
                 entry.scan_identity_version = None;
             }
         }

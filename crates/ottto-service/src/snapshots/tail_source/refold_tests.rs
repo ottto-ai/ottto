@@ -66,10 +66,9 @@ fn a_refold_is_byte_equal_to_a_fresh_native_read() {
         let native = wire(&fresh(&route, &path));
         assert!(!native.is_empty());
         // The reason reaches only eligibility: one re-fold serves them all.
-        let unchanged = LATE.into_iter().chain([
-            CandidateParseReason::Audit,
-            CandidateParseReason::UnknownOutcome,
-        ]);
+        let unchanged = LATE
+            .into_iter()
+            .chain([CandidateParseReason::UnknownOutcome]);
         for reason in unchanged {
             assert!(
                 reuses_stored(&route.index, &key, Some(reason), false, false),

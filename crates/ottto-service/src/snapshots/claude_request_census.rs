@@ -5,7 +5,8 @@
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
 //! upload input. This module only produces, persists and measures records; no
-//! fence, coverage, posture or upload decision reads them. A record lives
+//! fence, coverage, posture or upload decision reads them. An
+//! identity-incomplete hold also queues one verifying re-read of its file. A record lives
 //! while its file is indexed (or is held-new custody) and leaves only with
 //! the file, at a positive-absence exit. No age, budget or pressure retires
 //! or refuses one. The narrowed
@@ -330,7 +331,7 @@ impl ClaudeRequestCensusRecord {
     /// A current native body can supersede an unverified census record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
-    /// Identity-incomplete records wait for a Full audit: saved-witness
+    /// Identity-incomplete records wait for a Full read: saved-witness
     /// reconstruction does not itself refuse their bodies.
     pub(crate) fn can_bind_recomposed_body(&self) -> bool {
         self.current_derivation()
@@ -342,7 +343,8 @@ impl ClaudeRequestCensusRecord {
     }
 
     /// An unverified identity-incomplete record holds its root until a
-    /// Full audit verifies its source (delay, never cancel).
+    /// Full read verifies its source (delay, never cancel). A quiet file gets
+    /// that read once per file state: [`take_hold_rereads`] queues it.
     pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
@@ -1931,13 +1933,271 @@ pub(crate) fn record_claude_request_census(
 
 /// Acquisition requires native evidence for missing or unbindable records,
 /// except verified loss-free twins may try the validated Tail loader. This
-/// grants no copy proof or body binding; identity-incomplete holds still audit.
+/// grants no copy proof or body binding; identity-incomplete holds still read
+/// natively.
 pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     index.claude_request_census.get(key).map_or(true, |record| {
         record.unverified_or_twin()
             && !record.can_bind_recomposed_body()
             && !record.verified_reusable_twin()
     })
+}
+
+/// Whether `key`'s record holds its root until a Full read verifies it. Such
+/// a re-read never continues from stored state: a re-fold cannot verify.
+pub(super) fn holds_for_verifying_read(index: &ScanIndex, key: &str) -> bool {
+    index
+        .claude_request_census
+        .get(key)
+        .is_some_and(ClaudeRequestCensusRecord::identity_incomplete_hold)
+}
+
+/// The most files the re-read attempt memory remembers.
+const HOLD_REREAD_KEYS: usize = 4_096;
+
+/// A file's state as its index entry records it: length, modification time
+/// and birth. Clearing the source fingerprint to re-arm a read leaves these
+/// unchanged, so the re-arm itself never looks like a file change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    modified_seconds: u64,
+    modified_nanos: Option<u64>,
+    birth_nanos: u64,
+}
+
+impl FileStamp {
+    fn of(entry: &ScanIndexEntry) -> Self {
+        Self {
+            size: entry.size_bytes,
+            modified_seconds: entry.modified_unix_seconds,
+            modified_nanos: entry.modified_unix_nanos,
+            birth_nanos: entry.opened_birth_nanos,
+        }
+    }
+}
+
+/// One verifying re-read this process queued for a file state.
+#[derive(Clone, Copy, Debug)]
+struct HoldAttempt {
+    stamp: FileStamp,
+    /// When it was queued: a changed file is attempted again only
+    /// `LISTING_OWED_PACE_SECONDS` later.
+    at: u64,
+    /// Its read finished and was judged: verified, counted unverifiable, or
+    /// superseded by a file change.
+    judged: bool,
+}
+
+// The verifying re-reads this process queued, by index key. RAM only, so a
+// restart may attempt each held file once more.
+crate::local_resource_diagnostics::process_static!(fn with_hold_attempts:
+    std::sync::Mutex<BTreeMap<String, HoldAttempt>> = std::sync::Mutex::new(BTreeMap::new()));
+
+/// The `census_hold_release_full` outcomes of the verifying re-reads, as
+/// process totals on the existing local census line. Diagnostics only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HoldReleaseFull {
+    /// Re-reads queued, one per held file state.
+    pub(super) attempted: u64,
+    /// Attempts whose read finished on the same file state with the record
+    /// verified: the root is no longer held.
+    pub(super) verified: u64,
+    /// Attempts whose read finished on the same file state and left the
+    /// record unverified: counted once, kept held, and not retried until the
+    /// file changes.
+    pub(super) unverifiable: u64,
+    /// Owed, but the attempt memory is full of files it must remember: they
+    /// wait for a later page.
+    pub(super) waiting: u64,
+}
+
+impl HoldReleaseFull {
+    fn outcomes(self) -> [(&'static str, u64); 4] {
+        [
+            ("attempted", self.attempted),
+            ("verified", self.verified),
+            ("unverifiable", self.unverifiable),
+            ("waiting", self.waiting),
+        ]
+    }
+}
+
+const NO_HOLD_RELEASE_FULL: HoldReleaseFull = HoldReleaseFull {
+    attempted: 0,
+    verified: 0,
+    unverifiable: 0,
+    waiting: 0,
+};
+
+crate::local_resource_diagnostics::process_static!(fn with_hold_release_full:
+    std::sync::Mutex<HoldReleaseFull> = std::sync::Mutex::new(NO_HOLD_RELEASE_FULL));
+
+/// This process's `census_hold_release_full` totals (test-thread local in
+/// unit tests).
+pub(super) fn census_hold_release_full_totals() -> HoldReleaseFull {
+    with_hold_release_full(|totals| {
+        *totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    })
+}
+
+/// The nonzero totals as ` census_hold_release_full{outcome="<name>"}=<count>`
+/// fields for the local census line; empty while all are zero.
+pub(super) fn census_hold_release_full_fields() -> String {
+    census_hold_release_full_totals()
+        .outcomes()
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!(" census_hold_release_full{{outcome=\"{name}\"}}={count}"))
+        .collect()
+}
+
+fn add_hold_release_full(counts: HoldReleaseFull) {
+    with_hold_release_full(|totals| {
+        let mut totals = totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        totals.attempted = totals.attempted.saturating_add(counts.attempted);
+        totals.verified = totals.verified.saturating_add(counts.verified);
+        totals.unverifiable = totals.unverifiable.saturating_add(counts.unverifiable);
+        totals.waiting = totals.waiting.saturating_add(counts.waiting);
+    });
+}
+
+/// One pre-save decision over the identity-incomplete holds.
+#[derive(Debug, Default)]
+pub(super) struct HoldRereads {
+    /// Keys owed one verifying re-read now, each marked attempted.
+    pub(super) queued: Vec<String>,
+    /// This decision's outcome counts; `attempted` is `queued.len()`.
+    pub(super) counts: HoldReleaseFull,
+}
+
+/// Judges finished attempts, then picks the holds owed a re-read. An attempt
+/// is keyed on the FILE state ([`FileStamp`]), not the record's revision, so
+/// a file whose parse is never loss-free is read Full once per state, never
+/// on a timer. A key qualifies when its record holds its root, its index
+/// entry is at the record's revision (an entry already cleared for a re-read
+/// does not match), it has no account hold (that path owns its retry), and
+/// this process has not attempted the file in its current state. A changed
+/// file waits `LISTING_OWED_PACE_SECONDS` after its last attempt (a floor
+/// for a file that keeps growing). At the memory bound, marks that no longer
+/// block anything are dropped first; a key that still finds no room waits.
+pub(super) fn take_hold_rereads(index: &ScanIndex, now: u64) -> HoldRereads {
+    let pace = super::LISTING_OWED_PACE_SECONDS;
+    with_hold_attempts(|attempts| {
+        let mut attempts = attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = HoldRereads::default();
+        for (key, attempt) in attempts.iter_mut().filter(|(_, attempt)| !attempt.judged) {
+            let Some(entry) = index.files.get(key.as_str()) else {
+                continue;
+            };
+            if FileStamp::of(entry) != attempt.stamp {
+                attempt.judged = true;
+                continue;
+            }
+            // The read finished once a parse wrote the entry and its record
+            // at one revision again.
+            let Some(record) = index
+                .claude_request_census
+                .get(key.as_str())
+                .filter(|record| fingerprint_matches(record, &entry.source_file_fingerprint))
+            else {
+                continue;
+            };
+            attempt.judged = true;
+            if record.current_derivation() && record.not_twin_or_retired() {
+                if record.unverified {
+                    out.counts.unverifiable += 1;
+                } else {
+                    out.counts.verified += 1;
+                }
+            }
+        }
+        for (key, record) in index.claude_request_census.records() {
+            if !record.identity_incomplete_hold()
+                || index
+                    .claude_account_deferred_holds
+                    .contains_key(key.as_str())
+            {
+                continue;
+            }
+            let Some(entry) = index
+                .files
+                .get(key.as_str())
+                .filter(|entry| fingerprint_matches(record, &entry.source_file_fingerprint))
+            else {
+                continue;
+            };
+            let stamp = FileStamp::of(entry);
+            if attempts.get(key.as_str()).is_some_and(|attempt| {
+                attempt.stamp == stamp || now < attempt.at.saturating_add(pace)
+            }) {
+                continue;
+            }
+            if attempts.len() >= HOLD_REREAD_KEYS && !attempts.contains_key(key.as_str()) {
+                attempts.retain(|key, attempt| {
+                    now < attempt.at.saturating_add(pace)
+                        || index
+                            .files
+                            .get(key.as_str())
+                            .is_some_and(|entry| FileStamp::of(entry) == attempt.stamp)
+                });
+                if attempts.len() >= HOLD_REREAD_KEYS {
+                    out.counts.waiting += 1;
+                    continue;
+                }
+            }
+            attempts.insert(
+                key.clone(),
+                HoldAttempt {
+                    stamp,
+                    at: now,
+                    judged: false,
+                },
+            );
+            out.queued.push(key.clone());
+        }
+        out.counts.attempted = out.queued.len() as u64;
+        out
+    })
+}
+
+impl super::SourceScanResult {
+    /// Queue one counted re-read for each identity-incomplete hold that owes
+    /// it ([`take_hold_rereads`]), before upload/save, through the same
+    /// explicit-reparse witness a released account hold uses: the entry's
+    /// source fingerprint is cleared and the file is hinted. The re-read
+    /// reads Full as `census_verify` ([`holds_for_verifying_read`]); a
+    /// loss-free one clears the hold. It grants no credit itself; its
+    /// outcomes add to the `census_hold_release_full` totals.
+    pub(crate) fn queue_identity_hold_rereads(
+        &self,
+        index: &mut ScanIndex,
+        roots: &[std::path::PathBuf],
+        backfill_window_days: u64,
+    ) {
+        let rereads = take_hold_rereads(index, super::sampled_scan::now_seconds());
+        add_hold_release_full(rereads.counts);
+        if rereads.queued.is_empty() {
+            return;
+        }
+        for key in &rereads.queued {
+            if let Some(entry) = index.files.get_mut(key) {
+                entry.source_file_fingerprint.clear();
+            }
+        }
+        let hints = rereads
+            .queued
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        self.enqueue_claude_discovery_hints(index, roots, backfill_window_days, &hints);
+    }
 }
 
 /// A parse that reaches no record after a failed finish leaves the key without
@@ -2622,7 +2882,7 @@ impl ScanIndex {
                         "body_witness": entry.last_upload_body_witness,
                         "confirmed_empty": self.confirmed_empty_files.contains(key),
                         "entities": self.file_snapshot_fingerprints.get(key),
-                        "unverified_source": entry.has_unverified_source(),
+                        "sampled_tag": entry.has_sampled_tag(),
                     }),
                 )
             })

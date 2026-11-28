@@ -126,7 +126,7 @@ pub(crate) use self::finish::checkpoint_page_for_test;
 #[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index;
 #[cfg(test)]
-use self::finish::checkpoint_partial_snapshot_index_with_audit_release;
+use self::finish::checkpoint_partial_snapshot_index_with_hold_release;
 #[cfg(test)]
 pub(crate) use self::finish::checkpoint_unselected_for_test;
 #[cfg(test)]
@@ -156,7 +156,7 @@ use self::finish::settle_upload_corrections_after_selection;
 use self::finish::upload_settled_without_account_holds;
 use self::finish::withdraw_source_manifest;
 #[cfg(test)]
-use self::finish::AccountAuditRelease;
+use self::finish::AccountHoldRelease;
 #[cfg(test)]
 use self::finish::LocalHoldSettlement;
 #[cfg(test)]
@@ -532,19 +532,6 @@ pub(crate) mod withheld_support {
 
     pub(crate) fn withheld_settled(index: &ScanIndex) -> bool {
         upload_settled_without_account_holds(index, true)
-    }
-
-    pub(crate) fn deferred_tokens(
-        scan: &crate::snapshots::SourceScanResult,
-    ) -> BTreeMap<String, u64> {
-        let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-        disposition.defer_sessions(
-            scan.snapshots
-                .iter()
-                .map(|item| item.source_session_id.clone())
-                .collect(),
-        );
-        disposition.account_deferred_tokens(&scan.snapshots)
     }
 }
 

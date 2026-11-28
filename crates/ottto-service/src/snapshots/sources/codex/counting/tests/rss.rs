@@ -71,7 +71,7 @@ struct SelectionCounts {
     tail_files: usize,
     unchanged_files: usize,
     // FullReason::slot() order; numeric counts only, no file identities.
-    full_reasons: [usize; 11],
+    full_reasons: [usize; crate::transcript_acquisition::FULL_REASON_COUNT],
     scanned_files: usize,
 }
 
