@@ -687,6 +687,13 @@ pub(crate) fn tail_head_bytes_for_test(index: &ScanIndex, key: &str) -> Vec<u8> 
     bytes
 }
 
+/// Fold the store's WAL into its database file, as a carry fixture leaves
+/// the store for another build to open.
+#[cfg(test)]
+pub(crate) fn clean_checkpoint_for_test(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| db.clean_checkpoint().unwrap());
+}
+
 /// The committed head's reduction, revision and reduction membership, without
 /// the freshness debt (`Revisions`), which a held file's debt bookkeeping may
 /// change.

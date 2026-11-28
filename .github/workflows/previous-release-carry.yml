@@ -2,9 +2,9 @@ name: Previous release carry
 
 # Rollback check against the previous release's source. On a writer-capability
 # raise, the previous release must refuse the target's stores without changing
-# a row. On every release, it must hold newer-format Tail files untouched while
-# collecting other files if it can open the store. The target then reads back
-# the protected state. Dispatch it on the release candidate:
+# a row. On every release, it must hold newer-format Claude and Codex Tail
+# files untouched while collecting other files if it can open the store. The
+# target then reads back the protected state. Dispatch it on the release candidate:
 #   gh workflow run previous-release-carry.yml -f target=<candidate sha>
 # `previous` defaults to the repository's first commit, the source of the last
 # release published before this repository's history began; pass the previous

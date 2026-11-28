@@ -10,10 +10,14 @@ or representation it does not know) and leave every row of every store table
 as it was. Finally the target opens both stores again and reads exactly what
 it wrote: re-upgrade equals no downgrade.
 
-For every release, the target also publishes a store with Claude Tail heads
-and session facts, then grows a transcript. If the previous release can open
-the store, it must collect a fresh transcript and preserve every row for files
-whose Tail format it cannot read. The target then resumes those checkpoints.
+For every release, the target also publishes one store per source (Claude
+and Codex) with Tail heads and session facts, then grows a transcript. The
+Codex store's prelude facts are version 2 sealed starts, the format a later
+build writes. If the previous release can open a store, it must collect a
+fresh transcript and preserve every row for files whose Tail format it cannot
+read. Each source's probe runs even when the other fails, and the job reports
+every failing source. The target then resumes those checkpoints and, for
+Codex, finds every sealed start unchanged.
 
 The previous release is a commit of this repository, given by full SHA; its
 signed build is macOS-only, so this builds the same commit's source.
@@ -193,7 +197,9 @@ mod previous_release_carry_probe_telemetry {
 PER_FILE_PROBE = r'''
 #[cfg(test)]
 mod previous_release_per_file_probe {
-    use super::{claude::Claude, read_fact_page, reduction_revision, ReconstructCause, TailSource};
+    use super::{
+        claude::Claude, codex::Codex, read_fact_page, ReconstructCause, TailSource,
+    };
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use crate::snapshots::state_v2::{self, Collection, Hold};
     use crate::snapshots::{
@@ -205,8 +211,6 @@ mod previous_release_per_file_probe {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-
-    const SOURCE: SnapshotSource = SnapshotSource::ClaudeCode;
 
     #[derive(Deserialize)]
     struct Manifest {
@@ -262,20 +266,22 @@ mod previous_release_per_file_probe {
         })
     }
 
-    fn newer_format(index: &ScanIndex, key: &str) -> Option<String> {
-        let head = match state_v2::load_head(index, key, reduction_revision(SOURCE)) {
+    fn newer_format<S: TailSource>(index: &ScanIndex, key: &str, name: &str) -> Option<String> {
+        let head = match state_v2::load_head(index, key, S::REDUCTION_REVISION) {
             Ok(Some(head)) => head,
             Err(error) if error.downcast_ref::<Hold>() == Some(&Hold::Future) => {
                 return Some("newer head".into());
             }
             Err(error) => {
-                panic!("previous release could not load the Claude Code Tail head: {error:#}")
+                panic!("previous release could not load the {name} Tail head: {error:#}")
             }
-            Ok(None) => panic!("committed Claude Code Tail head missing"),
+            Ok(None) => panic!("committed {name} Tail head missing"),
         };
-        let mut acc = SnapshotAccumulator::new(SOURCE);
-        Claude::decode_head(head.revision, &head.body, &mut acc)
-            .expect("previous release decodes a supported Claude Code Tail head");
+        let mut acc = SnapshotAccumulator::new(S::SOURCE);
+        S::decode_head(head.revision, &head.body, &mut acc)
+            .unwrap_or_else(|error| {
+                panic!("previous release decodes a supported {name} Tail head: {error:?}")
+            });
         let mut reason = None;
         state_v2::load_tail(index, key, &head, |collection, page, bytes| {
             if collection == Collection::SessionFacts {
@@ -284,17 +290,25 @@ mod previous_release_per_file_probe {
                     Err(ReconstructCause::Incompatible(_)) => {
                         reason = Some(format!("newer session fact at slot {page}"));
                     }
-                    Err(error) => panic!("previous release could not decode Claude Code session fact {page}: {error:?}"),
+                    Err(error) => panic!("previous release could not decode {name} session fact {page}: {error:?}"),
                 }
             }
             Ok(())
-        }).expect("previous release reads the committed Claude Code Tail pages");
+        }).unwrap_or_else(|error| {
+            panic!("previous release reads the committed {name} Tail pages: {error:#}")
+        });
         reason
     }
 
-    #[test]
-    fn holds_newer_tail_files() {
-        let root = PathBuf::from(std::env::var_os("OTTTO_PER_FILE_CARRY_DIR").unwrap());
+    /// The previous release opens the target's store (or refuses it whole),
+    /// collects a fresh file, and leaves every file it cannot read as it was.
+    fn holds_newer<S: TailSource>(
+        name: &str,
+        dir_var: &str,
+        marker: &str,
+        scan: impl FnOnce(&Manifest, ScanIndex) -> (ScanIndex, Vec<PathBuf>),
+    ) {
+        let root = PathBuf::from(std::env::var_os(dir_var).unwrap());
         let manifest: Manifest =
             serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
         let path = &manifest.index_path;
@@ -306,7 +320,7 @@ mod previous_release_per_file_probe {
         let assert_untouched = |key: &str, reason: &str| {
             assert!(
                 before[key] == rows(path, key),
-                "Claude Code ({reason}, {key}): the previous release rewrote a newer-format Tail file",
+                "{name} ({reason}, {key}): the previous release rewrote a newer-format Tail file",
             );
         };
         let index = match ScanIndex::load(path) {
@@ -327,51 +341,34 @@ mod previous_release_per_file_probe {
                     serde_json::to_vec(&manifest.tail_keys).unwrap(),
                 )
                 .unwrap();
-                println!("PREVIOUS_RELEASE_PER_FILE_STORE_REFUSED");
+                println!("{marker}_STORE_REFUSED");
                 return;
             }
             Err(error) => {
-                panic!("previous release failed to open the per-file carry store: {error:#}")
+                panic!("previous release failed to open the {name} per-file carry store: {error:#}")
             }
         };
         let held: BTreeMap<_, _> = before
             .keys()
             .copied()
-            .filter_map(|key| newer_format(&index, key).map(|reason| (key, reason)))
+            .filter_map(|key| newer_format::<S>(&index, key, name).map(|reason| (key, reason)))
             .collect();
-
-        let scanner = E2ScanFixture::clocked_collection();
-        scanner.begin_pass(SOURCE, &manifest.support, path);
-        let (mut index, mut scan, _) = scanner.scan(
-            std::slice::from_ref(&manifest.corpus_root),
-            &manifest.support,
-            index,
-            32,
-            true,
-            &BTreeMap::new(),
-            &[],
-        );
-        finalize_scan_after_policy(SOURCE, &mut scan, &mut index);
-        index
-            .save(path)
-            .expect("previous release saves the completed per-file scan");
-        let read = scanner.paths();
+        let (index, read) = scan(&manifest, index);
         for (&key, reason) in &held {
             assert_untouched(key, reason);
             assert!(
                 !read.iter().any(|path| path == Path::new(key)),
-                "Claude Code ({reason}, {key}): the previous release read a newer-format Tail file"
+                "{name} ({reason}, {key}): the previous release read a newer-format Tail file"
             );
         }
         assert!(
             read.iter()
                 .any(|path| path == Path::new(&manifest.control_key)),
-            "previous release did not read the fresh Claude Code control file"
+            "previous release did not read the fresh {name} control file"
         );
-        let control =
-            state_v2::load_head(&index, &manifest.control_key, reduction_revision(SOURCE))
-                .expect("previous release can open the saved control checkpoint")
-                .expect("previous release committed the control file's Tail head");
+        let control = state_v2::load_head(&index, &manifest.control_key, S::REDUCTION_REVISION)
+            .expect("previous release can open the saved control checkpoint")
+            .expect("previous release committed the control file's Tail head");
         assert!(!control.metadata_only);
         let held_keys: Vec<_> = held.keys().copied().collect();
         fs::write(
@@ -380,13 +377,74 @@ mod previous_release_per_file_probe {
         )
         .unwrap();
         println!(
-            "PREVIOUS_RELEASE_PER_FILE_HELD files_read={} files_held={}",
+            "{marker}_HELD files_read={} files_held={}",
             read.len(),
             held.len()
         );
     }
+
+    #[test]
+    fn holds_newer_tail_files() {
+        holds_newer::<Claude>(
+            "Claude Code",
+            "OTTTO_PER_FILE_CARRY_DIR",
+            "PREVIOUS_RELEASE_PER_FILE",
+            |manifest, index| {
+                let source = SnapshotSource::ClaudeCode;
+                let scanner = E2ScanFixture::clocked_collection();
+                scanner.begin_pass(source, &manifest.support, &manifest.index_path);
+                let (mut index, mut scan, _) = scanner.scan(
+                    std::slice::from_ref(&manifest.corpus_root),
+                    &manifest.support,
+                    index,
+                    32,
+                    true,
+                    &BTreeMap::new(),
+                    &[],
+                );
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                index
+                    .save(&manifest.index_path)
+                    .expect("previous release saves the completed per-file scan");
+                (index, scanner.paths())
+            },
+        );
+    }
+
+    #[test]
+    fn holds_newer_codex_tail_files() {
+        holds_newer::<Codex>(
+            "Codex",
+            "OTTTO_CODEX_PER_FILE_CARRY_DIR",
+            "PREVIOUS_RELEASE_CODEX_PER_FILE",
+            |manifest, index| {
+                let source = SnapshotSource::Codex;
+                let scanner = E2ScanFixture::default();
+                let (mut index, mut scan, _) = scanner.scan_other(
+                    source,
+                    std::slice::from_ref(&manifest.corpus_root),
+                    &manifest.support,
+                    index,
+                    true,
+                );
+                // The Tail store needs no capture-boundary pass, which older
+                // releases lack.
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                index
+                    .save(&manifest.index_path)
+                    .expect("previous release saves the completed per-file scan");
+                (index, scanner.paths())
+            },
+        );
+    }
 }
 '''
+
+# Each per-file leg: its label, the previous-release probe test, and its marker.
+PER_FILE_LEGS = (
+    ("Claude", "holds_newer_tail_files", "PREVIOUS_RELEASE_PER_FILE"),
+    ("Codex", "holds_newer_codex_tail_files", "PREVIOUS_RELEASE_CODEX_PER_FILE"),
+)
 
 CAPABILITY = re.compile(r"\(\s*(\d+),")
 LAYOUT = re.compile(r"\(\s*(\d+|[A-Z_]+_LAYOUT),")
@@ -457,11 +515,12 @@ def main():
         progress = root / "progress"
         telemetry = root / "telemetry"
         per_file = root / "per-file"
-        progress.mkdir(mode=0o700)
-        telemetry.mkdir(mode=0o700)
-        per_file.mkdir(mode=0o700)
+        codex_per_file = root / "per-file-codex"
+        for directory in (progress, telemetry, per_file, codex_per_file):
+            directory.mkdir(mode=0o700)
         env = dict(os.environ, OTTTO_PROGRESS_CARRY_DIR=str(progress),
-                   OTTTO_OTEL_CARRY_ROOT=str(telemetry), OTTTO_PER_FILE_CARRY_DIR=str(per_file))
+                   OTTTO_OTEL_CARRY_ROOT=str(telemetry), OTTTO_PER_FILE_CARRY_DIR=str(per_file),
+                   OTTTO_CODEX_PER_FILE_CARRY_DIR=str(codex_per_file))
 
         # The previous release's source, with only the probes appended.
         if subprocess.run(["git", "cat-file", "-e", args.previous + "^{commit}"],
@@ -498,6 +557,8 @@ def main():
 
         cargo_test(repo, "write_per_file_carry_fixture", env,
                    ["PER_FILE_CARRY_FIXTURE_WRITTEN"], ignored=True)
+        cargo_test(repo, "write_codex_per_file_carry_fixture", env,
+                   ["CODEX_PER_FILE_CARRY_FIXTURE_WRITTEN"], ignored=True)
         tail_source = old / "crates/ottto-service/src/snapshots/tail_source.rs"
         if not tail_source.is_file():
             raise RuntimeError("previous-release per-file probe requires snapshots/tail_source.rs")
@@ -507,18 +568,23 @@ def main():
             run(["rustup", "toolchain", "install", old_channel, "--profile", "minimal"])
         old_target = root / "old-target"
         old_env = dict(env, CARGO_TARGET_DIR=str(old_target), RUSTUP_TOOLCHAIN=old_channel)
-        try:
-            output = cargo_test(old, "previous_release_per_file_probe::holds_newer_tail_files",
-                                old_env, [])
-        except subprocess.CalledProcessError as error:
-            if error.returncode == 101:
+        failed = []
+        for label, test, marker in PER_FILE_LEGS:
+            try:
+                output = cargo_test(old, f"previous_release_per_file_probe::{test}", old_env, [])
+            except subprocess.CalledProcessError as error:
                 # Cargo uses 101 for both compilation errors and test failures.
-                error.add_note("See the previous-release per-file probe output above. "
-                               "The probe requires ScanIndex, E2ScanFixture, and the "
-                               "state_v2 Tail and session-fact readers in that source.")
-            raise
-        if not re.search(r"PREVIOUS_RELEASE_PER_FILE_(?:HELD|STORE_REFUSED)\b", output):
-            raise RuntimeError("previous-release per-file probe did not report a hold or refusal")
+                print(f"PER_FILE_LEG_FAILED {label} (exit {error.returncode}): see the "
+                      "previous-release probe output above. The probe requires ScanIndex, "
+                      "E2ScanFixture, and the state_v2 Tail and session-fact readers in "
+                      "that source.", flush=True)
+                failed.append(label)
+                continue
+            if not re.search(rf"{marker}_(?:HELD|STORE_REFUSED)\b", output):
+                print(f"PER_FILE_LEG_FAILED {label}: no hold or refusal reported", flush=True)
+                failed.append(label)
+        if failed:
+            raise RuntimeError("previous-release per-file probe failed for: " + ", ".join(failed))
         if store_wide:
             cargo_test(old, "previous_release_carry_probe_",
                        dict(old_env, OTTTO_OTEL_CARRY_INDEX=index_path),
@@ -535,7 +601,10 @@ def main():
                            "refused_opens_changed_no_row", "reupgrade_equals_no_downgrade"])
         cargo_test(repo, "verify_per_file_carry_reupgrade", env,
                    ["PER_FILE_CARRY_REUPGRADE_VERIFIED"], ignored=True)
-        checks.extend(["per_file_hold_untouched", "per_file_reupgrade"])
+        cargo_test(repo, "verify_codex_per_file_carry_reupgrade", env,
+                   ["CODEX_PER_FILE_CARRY_REUPGRADE_VERIFIED"], ignored=True)
+        checks.extend(["per_file_hold_untouched", "per_file_reupgrade",
+                       "codex_per_file_hold_untouched", "codex_per_file_reupgrade"])
         print(json.dumps({
             "status": "VERIFIED",
             "previous": args.previous,

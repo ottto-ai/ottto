@@ -254,10 +254,14 @@ previous release's real source with test probes appended.
   refuse the candidate's progress-row and telemetry-only stores without
   changing a row. The candidate then reads back exactly what it wrote.
 - For every release, the candidate commits Tail heads and session facts
-  and appends to a transcript. If the previous release can open the store,
-  its scan must collect a fresh transcript and hold each newer-format Tail
-  file untouched, even when that file has grown. The candidate then resumes
-  the preserved checkpoints.
+  for Claude and for Codex, one store each, and appends to a transcript in
+  each. The Codex prelude facts are version 2 sealed starts, the format a
+  later build writes. If the previous release can open a store, its scan
+  must collect a fresh transcript and hold each newer-format Tail file
+  untouched, even when that file has grown. The candidate then resumes the
+  preserved checkpoints and finds every sealed Codex start byte for byte.
+  Both sources are probed even when one fails, and the job names each
+  failing source.
 
 Dispatch it for each release candidate with `target=<candidate sha>` and
 `previous=<previous release's source sha>`.

@@ -11,6 +11,9 @@ use crate::snapshots::sampled_jsonl::CachedJsonlReduction;
 use crate::snapshots::state_v2::StagedFile;
 use serde_json::json;
 
+#[cfg(unix)]
+mod per_file_carry;
+
 pub(in crate::snapshots) const SESSION: &str = "019a0c2a-8e11-7222-8333-944445555777";
 
 fn at(minute: usize) -> String {
